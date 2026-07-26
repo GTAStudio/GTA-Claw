@@ -276,7 +276,144 @@ function New-SyntheticRepositoryRoot {
     }
 }
 
+function Get-TransitionCargoPackage {
+    param([string]$RepositoryPath)
+
+    $separator = [string][System.IO.Path]::DirectorySeparatorChar
+    $source = Join-Path $RepositoryRoot ($RepositoryPath.Replace("/", $separator))
+    $directory = Split-Path -Parent $source
+    while (
+        $directory.Length -ge $RepositoryRoot.Length -and
+        $directory.StartsWith($RepositoryRoot, [StringComparison]::OrdinalIgnoreCase)
+    ) {
+        $manifestPath = Join-Path $directory "Cargo.toml"
+        if (Test-Path -LiteralPath $manifestPath) {
+            $manifest = [System.IO.File]::ReadAllText($manifestPath)
+            $package = [regex]::Match(
+                $manifest,
+                "(?ms)^\[package\]\s*(.*?)(?=^\[|\z)"
+            )
+            if ($package.Success) {
+                $name = [regex]::Match(
+                    $package.Groups[1].Value,
+                    "(?m)^name\s*=\s*`"([^`"]+)`"\s*$"
+                )
+                if ($name.Success) {
+                    $relativeRoot = $directory.Substring($RepositoryRoot.Length).
+                        TrimStart($separator).
+                        Replace($separator, "/")
+                    return [pscustomobject][ordered]@{
+                        root = $relativeRoot
+                        name = $name.Groups[1].Value
+                    }
+                }
+            }
+        }
+        $parent = Split-Path -Parent $directory
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($parent, $directory)) {
+            break
+        }
+        $directory = $parent
+    }
+    return $null
+}
+
+function Install-TransitionEvidenceFixture {
+    param([string]$Root)
+
+    $packageFiles = @{}
+    $packageNames = @{}
+    $packageTargets = @{}
+    $standaloneFiles = New-Object System.Collections.Generic.List[string]
+    foreach ($ledgerPath in (Get-ChildItem -LiteralPath (Join-Path $SourceRoot "ledgers") -Filter "*.json")) {
+        $ledger = ConvertFrom-Json ([System.IO.File]::ReadAllText($ledgerPath.FullName))
+        foreach ($feature in $ledger.features) {
+            if ($feature.status -eq "unimplemented") {
+                continue
+            }
+            foreach ($artifact in $feature.acceptance_evidence.artifacts) {
+                $path = [string]$artifact.path
+                $package = Get-TransitionCargoPackage $path
+                if ($null -eq $package) {
+                    throw "transition evidence must belong to a Cargo package: $path"
+                }
+                $packageNames[$package.root] = $package.name
+                $packageFiles[$package.root] = @($packageFiles[$package.root]) + @($path)
+                $packageTargets[$package.root] = @($packageTargets[$package.root]) + @($path)
+            }
+            foreach ($pointer in @($feature.implementation_pointers)) {
+                $path = [string]$pointer.path
+                $package = Get-TransitionCargoPackage $path
+                if ($null -ne $package) {
+                    $packageNames[$package.root] = $package.name
+                    $packageFiles[$package.root] = @($packageFiles[$package.root]) + @($path)
+                } else {
+                    $standaloneFiles.Add($path)
+                }
+            }
+        }
+    }
+
+    $members = @(
+        "crates/synthetic",
+        "crates/decoy",
+        "crates/nonrunning",
+        "globbed/*"
+    ) + @($packageFiles.Keys | Sort-Object)
+    $memberLines = @($members | ForEach-Object { "  `"$_`"," })
+    $workspaceManifest = (
+        "[workspace]`nmembers = [`n" +
+        ($memberLines -join "`n") +
+        "`n]`nexclude = [`"vendored`"]`nresolver = `"3`"`n"
+    )
+    [System.IO.File]::WriteAllText(
+        (Join-Path $Root "Cargo.toml"),
+        $workspaceManifest,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+
+    $separator = [string][System.IO.Path]::DirectorySeparatorChar
+    foreach ($packagePath in ($packageFiles.Keys | Sort-Object)) {
+        $packageRoot = Join-Path $Root ($packagePath.Replace("/", $separator))
+        New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
+        $packageName = $packageNames[$packagePath]
+        $manifest = (
+            "[package]`nname = `"$packageName`"`nversion = `"0.0.0`"`nedition = `"2024`"`n"
+        )
+        $index = 0
+        foreach ($path in @($packageTargets[$packagePath] | Sort-Object -Unique)) {
+            $prefix = "$packagePath/"
+            $relative = $path.Substring($prefix.Length)
+            $manifest += (
+                "`n[[test]]`nname = `"transition-evidence-$index`"`n" +
+                "path = `"$relative`"`n"
+            )
+            $index += 1
+        }
+        [System.IO.File]::WriteAllText(
+            (Join-Path $packageRoot "Cargo.toml"),
+            $manifest,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        foreach ($path in @($packageFiles[$packagePath] | Sort-Object -Unique)) {
+            $relativePath = $path.Replace("/", $separator)
+            $source = Join-Path $RepositoryRoot $relativePath
+            $destination = Join-Path $Root $relativePath
+            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+            Copy-Item -LiteralPath $source -Destination $destination -Force
+        }
+    }
+    foreach ($path in @($standaloneFiles | Sort-Object -Unique)) {
+        $relativePath = $path.Replace("/", $separator)
+        $source = Join-Path $RepositoryRoot $relativePath
+        $destination = Join-Path $Root $relativePath
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+        Copy-Item -LiteralPath $source -Destination $destination -Force
+    }
+}
+
 New-SyntheticRepositoryRoot $SyntheticRoot
+Install-TransitionEvidenceFixture $SyntheticRoot
 
 # Sentinels spanning every subtree the synthetic cases cite. The fixture is built
 # once at startup and no case ever modifies it, so a missing file can only mean
@@ -514,7 +651,7 @@ function Set-ForgedTransition {
         -Pointers $Pointers `
         -KeepBaselineDifference:$KeepBaselineDifference
     Save-FirstLedger $CaseRoot $ledger
-    Set-ManifestStatusTotals $CaseRoot 46 0 1
+    Set-ManifestStatusTotals $CaseRoot 38 0 9
 }
 
 $validResult = Invoke-Validator $SourceRoot
@@ -555,7 +692,7 @@ $cases = @(
                     (New-Pointer $RealSourcePath "Registration is done; behaviour is not.")
                 )
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 46 1 0
+            Set-ManifestStatusTotals $caseRoot 38 1 8
         }
     },
     [ordered]@{
@@ -571,7 +708,7 @@ $cases = @(
                 -EvidenceStatus "partial" `
                 -Artifacts @()
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 46 1 0
+            Set-ManifestStatusTotals $caseRoot 38 1 8
         }
     },
     [ordered]@{
@@ -587,7 +724,7 @@ $cases = @(
                 -EvidenceStatus "accepted" `
                 -Artifacts @((New-Artifact $RealTestPath $RealTestName))
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 46 1 0
+            Set-ManifestStatusTotals $caseRoot 38 1 8
         }
     },
     [ordered]@{
@@ -604,7 +741,7 @@ $cases = @(
                 -Artifacts @((New-Artifact $RealTestPath $RealTestName)) `
                 -KeepBaselineDifference
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 46 1 0
+            Set-ManifestStatusTotals $caseRoot 38 1 8
         }
     },
     [ordered]@{
@@ -1760,7 +1897,7 @@ $cases = @(
                 [pscustomobject][ordered]@{ path = $RealTestPath }
             )
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 46 0 1
+            Set-ManifestStatusTotals $caseRoot 38 0 9
         }
     },
     [ordered]@{
@@ -1776,7 +1913,7 @@ $cases = @(
                 -Artifacts @()
             $ledger.features[0].acceptance_evidence.artifacts = @("crates/claw-security/tests/frozen_gateway_registry.rs")
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 46 0 1
+            Set-ManifestStatusTotals $caseRoot 38 0 9
         }
     },
     [ordered]@{
@@ -1848,7 +1985,7 @@ $cases = @(
     },
     [ordered]@{
         name = "status-totals-not-updated"
-        expected_message = "status_totals count 'unimplemented' must be '46'"
+        expected_message = "status_totals count 'unimplemented' must be '38'"
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
