@@ -5,6 +5,19 @@ use std::fmt::{self, Display, Formatter};
 
 use claw_protocol::{ClientCommand, PROTOCOL_VERSION, RuntimeDescriptor, ServerEvent};
 
+/// Process-wiring machinery for binaries that compose subsystems.
+///
+/// Gated behind the `composition` feature. Front-ends that link this crate
+/// only for [`Application`] and [`SystemProbe`] therefore do not inherit
+/// `claw-domain`, `secrecy` or `url`.
+///
+/// `test` is in the gate as well as the feature so that `cargo test -p
+/// claw-application` compiles and runs the composition suite instead of
+/// silently reporting success over 123 skipped tests. Under `cfg(test)` the
+/// three crates are supplied by dev-dependencies, which are not resolved into
+/// dependent lockfiles, so the gate costs consumers nothing.
+#[cfg(any(feature = "composition", test))]
+pub mod composition;
 /// Domain model shared by the agent runtime's ports.
 ///
 /// Gated behind the `runtime-ports` feature so that front-ends linking this

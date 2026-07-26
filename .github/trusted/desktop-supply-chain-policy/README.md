@@ -154,6 +154,41 @@ gh api repos/rust-skia/skia-binaries/releases/tags/<version> \
   --jq '.assets[] | select(.name | test("aarch64-apple-ios")) | [.name, .digest] | @tsv'
 ```
 
+#### Why the lockfile does not already cover this
+
+**The `Cargo.lock` checksum covers the crates.io package — it says nothing about the tarball
+fetched later. The lockfile describes the code that performs the download, not the thing
+downloaded.** This is the point most likely to be missed, because the checksum is a real control,
+correctly implemented, over something adjacent to the claim. `skia-bindings` 0.99.0 proves it in its
+own manifest: its `include` list is `Cargo.toml`, `bindings_docs.rs`, `build.rs`,
+`build_support/**/*.rs`, and `src/**`. The published `.crate` file cannot contain the artifact, so
+no checksum over it can cover the artifact.
+
+Three further facts, each verified against `rust-skia` at tag `0.99.0`, that a future session
+filling `PINNED_BUILD_ARTIFACTS` needs in order to fill it from the right source:
+
+- **The artifact host is a different repository from the crate source.** The crate declares
+  `repository = "https://github.com/rust-skia/rust-skia"`; the archive is served from
+  `rust-skia/skia-binaries`. Vetting the crate's project does not vet the artifact's host, and the
+  two have different contributor sets and release automation. Reasoning "rust-skia is well known"
+  vets the wrong thing.
+- **GitHub already serves a SHA-256 for every release asset, and the build never asks for it.** The
+  `gh api` command above reads `.digest` from the same host that serves the archive. So the missing
+  verification is a choice made by `skia-bindings`, not an unavoidable property of the ecosystem —
+  which is what makes the `file://` handover a use of available data rather than a workaround.
+- **`no-compile` is a Cargo feature, not an environment variable**, declared as `no-compile = []`
+  with the comment *"Panic when any compilation steps are required to run."* Anyone attempting to
+  forbid a fallback compile by exporting an environment variable will silently achieve nothing.
+
+The archive key is the first twenty hex characters of the `rust-skia` commit plus the target triple
+plus the sorted feature set. **It is not content-addressed and carries no digest**, so the URL alone
+can never establish what was served. `FORCE_SKIA_BUILD` does not fix this: it relocates the trust,
+because the Skia source archive, the many third-party repositories `git-sync-deps` clones, and the
+GN binary from `chrome-infra-packages.appspot.com` are each themselves unverified.
+
+These findings come from reading the pinned source rather than executing it; no Windows host can run
+a `skia-bindings` build for an Apple target, so the first real iOS build remains the proof.
+
 ### Mobile CI is not yet reachable
 
 `android-packaging.yml` and `ios-packaging.yml` are admitted workflow paths, but neither file
