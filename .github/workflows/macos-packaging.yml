@@ -144,11 +144,28 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo clippy --manifest-path desktop/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
-      - name: Test both Cargo workspaces natively
+      # Split from one `run: |` block deliberately. Under the default `bash -e`,
+      # a failure in the root workspace aborted the whole block and the desktop
+      # workspace was never tested at all -- adding --no-fail-fast alone would
+      # not have reached it. The arch gate stays in the first step and keeps its
+      # -e semantics, so a mismatched runner still aborts immediately.
+      - name: Test root workspace natively
         run: |
           test "$(uname -m)" = "${{ matrix.arch }}"
-          cargo test --workspace --all-targets --locked
-          cargo test --manifest-path desktop/Cargo.toml --workspace --all-targets --locked
+          cargo test --workspace --all-targets --locked --no-fail-fast
+
+      # --all-targets does not collect doctests. This is the only Intel macOS
+      # job in the repository, so without this step no doc example is ever
+      # executed on that host.
+      - name: Run root workspace doctests natively
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --doc --locked --no-fail-fast
+
+      # No --doc for this workspace: its only member is a bin crate with no lib
+      # target, so `--doc` would collect zero tests and report success.
+      - name: Test desktop workspace natively
+        if: ${{ !cancelled() }}
+        run: cargo test --manifest-path desktop/Cargo.toml --workspace --all-targets --locked --no-fail-fast
 
       - name: Smoke-test native desktop window backend
         timeout-minutes: 2

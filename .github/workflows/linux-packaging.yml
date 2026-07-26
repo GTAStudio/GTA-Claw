@@ -133,12 +133,21 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Format, check, lint, and test root workspace
+      - name: Format, check, and lint root workspace
         run: |
           cargo fmt --all -- --check
           cargo check --workspace --all-targets --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo test --workspace --all-targets --locked
+
+      # Split out so the doctest step below can run even when this one fails.
+      # No `!cancelled()` on this step: gating tests behind fmt/check/clippy is
+      # deliberate, and a `cargo check` failure means the tests cannot compile.
+      - name: Test root workspace
+        run: cargo test --workspace --all-targets --locked --no-fail-fast
+
+      - name: Run root workspace doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --doc --locked --no-fail-fast
 
       - name: Check root workspace at MSRV
         run: |
