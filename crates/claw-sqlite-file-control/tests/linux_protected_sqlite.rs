@@ -386,9 +386,25 @@ fn assert_service_credentials(identity: ServiceIdentity) {
     );
 }
 
-fn child_command(test_name: &str, identity: ServiceIdentity) -> Command {
-    let mut command =
-        Command::new(std::env::current_exe().expect("resolve current test executable"));
+fn provision_service_test_driver(fixture_root: &Path) -> PathBuf {
+    let source = std::env::current_exe().expect("resolve current test executable");
+    let driver = fixture_root.join("service-test-driver");
+    fs::copy(&source, &driver).expect("copy service test driver into traversable fixture");
+    std::os::unix::fs::chown(&driver, Some(0), Some(0))
+        .expect("assign service test driver to root");
+    fs::set_permissions(&driver, fs::Permissions::from_mode(0o555))
+        .expect("make service test driver immutable to the service identity");
+    let metadata = fs::symlink_metadata(&driver).expect("inspect service test driver");
+    assert!(metadata.file_type().is_file());
+    assert_eq!(metadata.uid(), 0);
+    assert_eq!(metadata.gid(), 0);
+    assert_eq!(metadata.mode() & 0o7777, 0o555);
+    assert_eq!(metadata.nlink(), 1);
+    driver
+}
+
+fn child_command(test_name: &str, identity: ServiceIdentity, driver: &Path) -> Command {
+    let mut command = Command::new(driver);
     command
         .arg("--exact")
         .arg(test_name)
@@ -716,6 +732,7 @@ async fn unix_excl_persistent_wal_uses_only_preprovisioned_entries() {
     assert_root_driver();
     let directory = fixture_tempdir();
     let identity = service_identity();
+    let child_driver = provision_service_test_driver(directory.path());
     let root = directory.path().join("protected");
     let namespace = provision_initialized_namespace(&root, identity).await;
     assert_namespace_contract(&namespace, identity, 0o750);
@@ -724,6 +741,7 @@ async fn unix_excl_persistent_wal_uses_only_preprovisioned_entries() {
     let output = child_command(
         "unix_excl_persistent_wal_uses_only_preprovisioned_entries",
         identity,
+        &child_driver,
     )
     .env(CHILD_ENV, CLEAN_CHILD)
     .env(DATABASE_ENV, &namespace.database)
@@ -840,6 +858,7 @@ async fn empty_files_are_not_a_complete_provisioning_contract() {
     assert_root_driver();
     let directory = fixture_tempdir();
     let identity = service_identity();
+    let child_driver = provision_service_test_driver(directory.path());
     let writable_root = directory.path().join("writable");
     let writable = provision_empty_namespace(&writable_root, identity, 0o770);
     assert_namespace_contract(&writable, identity, 0o770);
@@ -856,6 +875,7 @@ async fn empty_files_are_not_a_complete_provisioning_contract() {
     let writable_output = child_command(
         "empty_files_are_not_a_complete_provisioning_contract",
         identity,
+        &child_driver,
     )
     .env(CHILD_ENV, EMPTY_WRITABLE_CHILD)
     .env(DATABASE_ENV, &writable.database)
@@ -888,6 +908,7 @@ async fn empty_files_are_not_a_complete_provisioning_contract() {
     let locked_output = child_command(
         "empty_files_are_not_a_complete_provisioning_contract",
         identity,
+        &child_driver,
     )
     .env(CHILD_ENV, EMPTY_LOCKED_CHILD)
     .env(DATABASE_ENV, &locked.database)
@@ -973,6 +994,7 @@ async fn unix_excl_crash_recovery_preserves_fixed_entry_set() {
     assert_root_driver();
     let directory = fixture_tempdir();
     let identity = service_identity();
+    let child_driver = provision_service_test_driver(directory.path());
     let root = directory.path().join("protected");
     let ready = directory.path().join("child.ready");
     provision_control_file(&ready, identity);
@@ -985,6 +1007,7 @@ async fn unix_excl_crash_recovery_preserves_fixed_entry_set() {
     let child = child_command(
         "unix_excl_crash_recovery_preserves_fixed_entry_set",
         identity,
+        &child_driver,
     )
     .env(CHILD_ENV, CRASH_CHILD)
     .env(DATABASE_ENV, &namespace.database)
@@ -1032,6 +1055,7 @@ async fn unix_excl_crash_recovery_preserves_fixed_entry_set() {
     let output = child_command(
         "unix_excl_crash_recovery_preserves_fixed_entry_set",
         identity,
+        &child_driver,
     )
     .env(CHILD_ENV, RECOVER_CHILD)
     .env(DATABASE_ENV, &namespace.database)
