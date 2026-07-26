@@ -1916,10 +1916,15 @@ fn ios_resolve_and_verify_step(step_name: &str, target: &str, archive_var: &str)
 /// One `cargo build` step for a single admitted iOS Skia target, injecting the verified local
 /// archive named by `archive_var` through the supported `SKIA_BINARIES_URL=file://...` override,
 /// requesting cargo's `-vv` build-script output (plain `-v` suppresses it on a successful build),
-/// disabling ANSI color at the source, capturing it through `tee`, stripping any residual ANSI
-/// escape codes before grepping, proving that capture-and-strip pipeline finds something with a
-/// verified-nonzero positive control, and asserting on that captured log that the forced Skia
-/// download actually ran rather than silently falling back to a source build.
+/// disabling ANSI color at the source, capturing it through `tee` under a `pipefail`-protected
+/// shell (so a real `build.rs` failure cannot be masked by `tee`'s own exit status), stripping any
+/// residual ANSI escape codes before grepping, proving that capture-and-strip pipeline finds
+/// something with a verified-nonzero positive control, and asserting on that captured log that the
+/// forced Skia download actually ran rather than silently falling back to a source build. It also
+/// deletes any stale prior build-script output directory before the build (the freshness proof),
+/// then reads Cargo's own unconditionally-written output file directly and asserts it names both
+/// the exact injected pinned URL and the unpack marker — the stronger, primary evidence this
+/// module's Round 4 correction requires on top of the piped console log above.
 fn ios_build_step(step_name: &str, target: &str, archive_var: &str) -> String {
     let log_file = format!("build-{target}.log");
     let plain_log_file = format!("build-{target}.plain.log");
@@ -1931,6 +1936,8 @@ fn ios_build_step(step_name: &str, target: &str, archive_var: &str) -> String {
     ));
     step.push_str("          CARGO_TERM_COLOR: \"never\"\n");
     step.push_str("        run: |\n");
+    step.push_str("          set -o pipefail\n");
+    step.push_str("          rm -rf target/*/build/skia-bindings-*\n");
     step.push_str(&format!(
         "          cargo build --manifest-path ios/Cargo.toml --target {target} -vv --color never 2>&1 | tee {log_file}\n"
     ));
@@ -1950,6 +1957,13 @@ fn ios_build_step(step_name: &str, target: &str, archive_var: &str) -> String {
     step.push_str(&format!(
         "          ! grep -q \"DOWNLOAD AND INSTALL FAILED\" {plain_log_file}\n"
     ));
+    step.push_str(
+        "          output_file=$(find target -path \"*/build/skia-bindings-*/output\" | head -n1)\n",
+    );
+    step.push_str(&format!(
+        "          grep -q \"FROM: file://${{{{ env.{archive_var} }}}}\" \"$output_file\"\n"
+    ));
+    step.push_str("          grep -q \"UNPACKING ARCHIVE INTO\" \"$output_file\"\n");
     step
 }
 
@@ -5752,11 +5766,22 @@ fn ios_packaging_workflow_rejects_missing_download_log_evidence() {
 
     // Removed from the *simulator* build step specifically: it is the last step in the fixture, so
     // nothing after it can satisfy [`skia_download_path_is_verified_in_log`]'s forward scan the way
-    // a later step's own complete log-marker set otherwise could for an earlier step.
-    let missing_log_evidence = workflow.replace(
-        "          grep -q \"UNPACKING ARCHIVE INTO\" build-aarch64-apple-ios-sim.plain.log\n",
-        "",
-    );
+    // a later step's own complete log-marker set otherwise could for an earlier step. Both the
+    // piped-console-log check and the output-file receipt check assert `UNPACKING ARCHIVE INTO`, so
+    // both of the simulator step's occurrences must be removed for this fixture to actually lack the
+    // evidence entirely, rather than merely lacking it in one of two independent places. The second
+    // pattern is identical text in both build steps, so this also strips the device step's
+    // output-file assertion as a side effect; that step still carries its own unaffected
+    // plain-log `UNPACKING ARCHIVE INTO` line, so it remains fully compliant on its own merits.
+    let missing_log_evidence = workflow
+        .replace(
+            "          grep -q \"UNPACKING ARCHIVE INTO\" build-aarch64-apple-ios-sim.plain.log\n",
+            "",
+        )
+        .replace(
+            "          grep -q \"UNPACKING ARCHIVE INTO\" \"$output_file\"\n",
+            "",
+        );
     assert_ne!(
         missing_log_evidence, workflow,
         "missing-log-evidence fixture did not change anything"

@@ -84,6 +84,42 @@
 //! properties of the YAML; they are runtime facts about what a `curl` and a local file actually
 //! contain, and are covered by `resolve_build_artifact_pin`/`verify_local_build_artifact` in
 //! `policy.rs` and their own tests instead.
+//!
+//! ## A normal build's console output is not build-script evidence
+//!
+//! Measured against real `skia-bindings` 0.99.0 behavior: a plain `cargo build` genuinely prints
+//! nothing from a build script's own `println!` calls even on a fresh, uncached run — only
+//! `cargo build -vv` (or a build failure) echoes that output to the console at all, exactly what
+//! [`captures_verbose_build_log`] already requires. Cargo, however, writes a build script's
+//! complete captured stdout to `target/<...>/build/<pkgname>-<hash>/output` on **every** build
+//! script invocation, unconditionally, regardless of verbosity — a strictly more reliable evidence
+//! source than a piped console log, immune to both a plain build's suppressed echo and any
+//! pipe/`tee` exit-status concern (below). Two further conditions make that file trustworthy as
+//! *this run's* evidence rather than some earlier, possibly-unverified run's leftover: an admitted
+//! workflow must delete any stale prior copy of that directory before the build meant to recreate
+//! it ([`cleans_stale_build_script_output`] — the hash suffix cannot be checked literally, so
+//! deleting the whole directory beforehand is what makes anything found there afterward
+//! unambiguous), and it must then read that exact file and assert it names both the literal
+//! [`SKIA_UNPACK_LOG`] line and the specific injected pinned `file://` URL via
+//! [`SKIA_DOWNLOAD_FROM_LOG`] ([`asserts_from_pinned_url_in_output`]) — not merely that *some*
+//! download happened, but that it was *this* verified archive, not a stale cache, the other
+//! target's archive, or the crate's own unverified default resolution silently taking over
+//! ([`skia_download_receipt_is_verified_via_output_file`]). This check is additional to, not a
+//! replacement for, the piped-console-log evidence above.
+//!
+//! ## The step's own exit status is only trustworthy if nothing can mask it
+//!
+//! This module's stated primary proof rests on trusting a step's reported exit status. Two checks
+//! exist solely to keep that trust well-founded. First, a resolve-and-verify step or a
+//! Skia-resolving cargo step marked `continue-on-error: true` would let GitHub Actions report the
+//! *job* as successful even if that exact step failed, so this policy rejects either step outright
+//! for carrying it. Second, because [`captures_verbose_build_log`] already requires piping a
+//! Skia-resolving cargo step's output through `tee` to capture it, that pipeline's own reported
+//! exit status becomes `tee`'s (almost always zero) rather than `cargo`'s real one unless the
+//! shell is told `pipefail` ([`protects_pipeline_exit_status`]) — otherwise a real, forced-download
+//! failure inside `build.rs` (which `panic!`s on a verified failure, confirmed against the
+//! published source) could be silently swallowed by the pipe itself, even though the workflow's own
+//! doc comment and this module both already treat the step's exit status as the primary proof.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -146,6 +182,22 @@ const ANSI_CSI_STRIP_PATTERN: &str = r"\x1b\[";
 /// `test`/`[`) or `!= 0` (arithmetic `(( ))`/`[[ ]]`) — any one of the ways an author might spell
 /// "and it is not zero".
 const NONZERO_COMPARISONS: [&str; 3] = ["-gt 0", "-ne 0", "!= 0"];
+/// Literal build-script log line `skia-bindings` 0.99.0 prints immediately after
+/// [`SKIA_DOWNLOAD_ATTEMPTED_LOG`], naming the exact URL the download actually used (confirmed
+/// against the published source: `println!("  FROM: {url}");`, distinct from the unrelated
+/// `DOWNLOADING:` line the crate's own separate git-submodule fallback path prints). This is what
+/// [`asserts_from_pinned_url_in_output`] requires alongside the exact injected pinned `file://`
+/// expression: not merely that *some* download was attempted, but that it named this specific
+/// verified archive.
+const SKIA_DOWNLOAD_FROM_LOG: &str = "FROM:";
+/// The shell option proving a piped pipeline's exit status is not silently replaced by the last
+/// command in the pipe (almost always `tee`, exit code 0) — `set -o pipefail`, or a combined
+/// `set -eo pipefail`/`set -euo pipefail`.
+const PIPEFAIL_TOKEN: &str = "pipefail";
+/// The literal trailing path segment of Cargo's own build-script output-capture file — always
+/// named exactly `output`, with no extension — that [`reads_build_script_output_file`] requires
+/// alongside [`build_script_output_dir_hint`].
+const BUILD_SCRIPT_OUTPUT_FILE_HINT: &str = "/output";
 
 /// Immutable per-job context threaded through the step-level checks below.
 struct StepContext<'a> {
@@ -155,12 +207,13 @@ struct StepContext<'a> {
     sim: &'static str,
 }
 
-/// One workflow step's shell command text, effective (workflow + job + step) environment, and
-/// declared `working-directory`, if any.
+/// One workflow step's shell command text, effective (workflow + job + step) environment,
+/// declared `working-directory`, if any, and whether it carries `continue-on-error: true`.
 struct ParsedStep<'a> {
     run: Option<&'a str>,
     env: BTreeMap<String, String>,
     working_directory: Option<&'a str>,
+    continue_on_error: bool,
 }
 
 fn scalar_text(value: &YamlValue) -> Option<String> {
@@ -519,15 +572,24 @@ fn resolver_invocation_target(
     Ok(target)
 }
 
-/// Validates one step that invokes the trusted resolver: it must fetch with a fail-closed `curl`
-/// to a filename derived from the resolved URL (never a hardcoded literal), verify that exact
-/// local archive, and publish its verified absolute path under the fixed variable name for the
-/// target it resolved.
+/// Validates one step that invokes the trusted resolver: it must not carry
+/// `continue-on-error: true` (which would let the job succeed even if this exact step's resolve,
+/// fetch, or verify failed), must fetch with a fail-closed `curl` to a filename derived from the
+/// resolved URL (never a hardcoded literal), verify that exact local archive, and publish its
+/// verified absolute path under the fixed variable name for the target it resolved.
 fn validate_resolve_and_verify_step(
     ctx: &StepContext<'_>,
     index: usize,
     run: &str,
+    continue_on_error: bool,
 ) -> PolicyResult<&'static str> {
+    if continue_on_error {
+        return Err(PolicyError::new(format!(
+            "{}: job {} step {index} resolves a build-artifact pin with continue-on-error: \
+             true, so a failed resolve, fetch, or local verification would not fail the job",
+            ctx.path, ctx.job_id
+        )));
+    }
     let target = resolver_invocation_target(run, ctx.device, ctx.sim).map_err(|cause| {
         PolicyError::new(format!(
             "{}: job {} step {index}: {cause}",
@@ -588,6 +650,26 @@ fn validate_resolve_and_verify_step(
     Ok(target)
 }
 
+/// Returns the fixed archive-variable name(s) applicable to a Skia-resolving cargo step: the
+/// single variable for the exact target it names via `--target`, or both if it names neither (a
+/// host-target invocation, to which either verified archive may apply). Shared by
+/// [`validate_skia_injection_env`] and [`skia_download_receipt_is_verified_via_output_file`] so
+/// both agree on exactly which archive(s) a given step's evidence must name.
+fn candidate_archive_vars(run: &str, ctx: &StepContext<'_>) -> &'static [&'static str] {
+    let names_sim = exact_flag_token(run, "--target", ctx.sim);
+    let names_device = exact_flag_token(run, "--target", ctx.device);
+    if names_sim {
+        &[SKIA_ARCHIVE_IOS_SIM_VAR]
+    } else if names_device {
+        &[SKIA_ARCHIVE_IOS_DEVICE_VAR]
+    } else {
+        // A host-target step (no explicit --target aimed at either admitted iOS target): no
+        // specific pin applies to an unspecified host triple, so either established, verified
+        // archive is accepted, as long as one actually is.
+        &[SKIA_ARCHIVE_IOS_DEVICE_VAR, SKIA_ARCHIVE_IOS_SIM_VAR]
+    }
+}
+
 /// Validates one Skia-resolving cargo step's effective environment: it must force the pinned
 /// download path, point it at the verified local archive for exactly the target this step names
 /// (or, for a step naming no explicit target, either verified archive), and that archive's
@@ -610,18 +692,7 @@ fn validate_skia_injection_env(
         )));
     }
 
-    let names_sim = exact_flag_token(run, "--target", ctx.sim);
-    let names_device = exact_flag_token(run, "--target", ctx.device);
-    let candidate_vars: &[&str] = if names_sim {
-        &[SKIA_ARCHIVE_IOS_SIM_VAR]
-    } else if names_device {
-        &[SKIA_ARCHIVE_IOS_DEVICE_VAR]
-    } else {
-        // A host-target step (no explicit --target aimed at either admitted iOS target): no
-        // specific pin applies to an unspecified host triple, so either established, verified
-        // archive is accepted, as long as one actually is.
-        &[SKIA_ARCHIVE_IOS_DEVICE_VAR, SKIA_ARCHIVE_IOS_SIM_VAR]
-    };
+    let candidate_vars = candidate_archive_vars(run, ctx);
 
     let url = env
         .get(SKIA_BINARIES_URL_VAR)
@@ -775,6 +846,94 @@ fn skia_download_path_is_verified_in_log(steps: &[ParsedStep<'_>], from_index: u
     saw_attempted && saw_unpacked && saw_failure_check && saw_ansi_stripped && saw_positive_control
 }
 
+/// Returns whether `run` protects a piped exit status with a `pipefail` shell option
+/// ([`PIPEFAIL_TOKEN`]: `set -o pipefail`, or a combined `set -eo pipefail`/`set -euo pipefail`) —
+/// the only reason redirecting a Skia-resolving cargo step's own exit code through `| tee <log>`
+/// (already required by [`captures_verbose_build_log`]) does not silently replace it with `tee`'s
+/// own, almost always zero, exit code. Without this, a real `build.rs` failure from a rejected
+/// forced download could leave the step reporting success anyway, making that success meaningless
+/// as proof of anything — directly undermining this module's own stated primary proof (see the
+/// module doc comment) that the step's own exit status is trustworthy.
+fn protects_pipeline_exit_status(run: &str) -> bool {
+    contains_word_token(run, PIPEFAIL_TOKEN)
+}
+
+/// Computes the fixed, non-hash-suffixed fragment of Cargo's own build-script output-capture
+/// directory for the exact reviewed `skia-bindings` package — `build/<package-name>-` — derived
+/// from [`skia_bindings_package_name`] rather than hardcoded, consistent with this module's use of
+/// that same accessor everywhere else a literal package name would otherwise appear. The trailing
+/// hash segment Cargo appends is inherently unpredictable statically, so this hint is deliberately
+/// only the fixed prefix, not a full path.
+fn build_script_output_dir_hint() -> String {
+    format!("build/{}-", skia_bindings_package_name())
+}
+
+/// Returns whether `run` deletes any prior build-script output directory for this package before
+/// its own cargo invocation runs: an `rm` token together with `hint`
+/// ([`build_script_output_dir_hint`]). This is the freshness proof
+/// [`skia_download_receipt_is_verified_via_output_file`] requires: Cargo names this directory with
+/// an unpredictable hash suffix that cannot be checked literally, so deleting it beforehand is what
+/// makes any file found there afterward unambiguously written by *this* run, rather than a cached
+/// leftover from some earlier, unrelated, possibly-unverified build.
+fn cleans_stale_build_script_output(run: &str, hint: &str) -> bool {
+    contains_word_token(run, "rm") && run.contains(hint)
+}
+
+/// Returns whether `run` reads Cargo's own captured build-script output file — text naming both
+/// `hint` ([`build_script_output_dir_hint`]) and [`BUILD_SCRIPT_OUTPUT_FILE_HINT`] — rather than
+/// relying solely on the piped console log. Cargo writes this file unconditionally on every
+/// build-script invocation, regardless of `-v`/`-vv` verbosity (only the *console echo* of its
+/// contents needs `-vv`, or a build failure), so it is a strictly more reliable evidence source
+/// than a piped log for proving a normal, successful build actually ran the forced download path.
+fn reads_build_script_output_file(run: &str, hint: &str) -> bool {
+    run.contains(hint) && run.contains(BUILD_SCRIPT_OUTPUT_FILE_HINT)
+}
+
+/// Returns whether `run` asserts, against literal text naming both [`SKIA_DOWNLOAD_FROM_LOG`] and
+/// the exact `file://${{ env.VAR }}` expression this job's resolve-and-verify step publishes
+/// ([`expected_file_url`]), that the specific URL `skia-bindings` actually attempted this run was
+/// the verified local archive — not a stale cache entry, the other target's archive, or the
+/// crate's own unverified default resolution silently taking over. Whitespace-normalized
+/// ([`normalize_expression`]) on both sides, the same way [`validate_skia_injection_env`] compares
+/// an injected `SKIA_BINARIES_URL` value, so `${{ env.X }}` and `${{env.X}}` are equivalent.
+fn asserts_from_pinned_url_in_output(run: &str, var: &str) -> bool {
+    run.contains(SKIA_DOWNLOAD_FROM_LOG)
+        && normalize_expression(run).contains(&expected_file_url(var))
+}
+
+/// Returns whether, for the Skia-resolving cargo step at `build_index`, this job proves — through
+/// Cargo's own unconditionally-written build-script output file rather than the piped console log
+/// — that *this run's* forced download actually fetched the exact verified local archive for one
+/// of `candidate_vars`: some step at or before `build_index` deletes any stale prior output
+/// directory ([`cleans_stale_build_script_output`], the freshness proof, allowed in the same step
+/// since a `run: |` block naturally cleans immediately before the build it precedes), and some
+/// step at or after `build_index` both reads that file ([`reads_build_script_output_file`]) and
+/// asserts it contains [`SKIA_UNPACK_LOG`] and the exact pinned URL for one of `candidate_vars`
+/// ([`asserts_from_pinned_url_in_output`]).
+fn skia_download_receipt_is_verified_via_output_file(
+    steps: &[ParsedStep<'_>],
+    build_index: usize,
+    candidate_vars: &'static [&'static str],
+) -> bool {
+    let hint = build_script_output_dir_hint();
+    let cleaned = steps[..=build_index].iter().any(|step| {
+        step.run
+            .is_some_and(|run| cleans_stale_build_script_output(run, &hint))
+    });
+    if !cleaned {
+        return false;
+    }
+    steps[build_index..].iter().any(|step| {
+        step.run.is_some_and(|run| {
+            reads_build_script_output_file(run, &hint)
+                && run.contains(SKIA_UNPACK_LOG)
+                && candidate_vars
+                    .iter()
+                    .any(|var| asserts_from_pinned_url_in_output(run, var))
+        })
+    })
+}
+
 fn parse_steps<'a>(job: &'a YamlValue, job_env: &BTreeMap<String, String>) -> Vec<ParsedStep<'a>> {
     let steps = match get(job, "steps") {
         Some(YamlValue::Sequence(steps)) => steps.as_slice(),
@@ -790,10 +949,14 @@ fn parse_steps<'a>(job: &'a YamlValue, job_env: &BTreeMap<String, String>) -> Ve
                 _ => None,
             };
             let working_directory = string(get(step, "working-directory"));
+            let continue_on_error = get(step, "continue-on-error")
+                .and_then(scalar_text)
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"));
             ParsedStep {
                 run,
                 env,
                 working_directory,
+                continue_on_error,
             }
         })
         .collect()
@@ -826,7 +989,7 @@ fn validate_job_skia_injection(
         if !contains_word_token(run, RESOLVER_SUBCOMMAND) {
             continue;
         }
-        let target = validate_resolve_and_verify_step(&ctx, index, run)?;
+        let target = validate_resolve_and_verify_step(&ctx, index, run, step.continue_on_error)?;
         resolved_targets.insert(target, index);
     }
 
@@ -840,6 +1003,14 @@ fn validate_job_skia_injection(
             continue;
         }
         saw_ios_skia_step = true;
+        if step.continue_on_error {
+            return Err(PolicyError::new(format!(
+                "{path}: job {job_id} step {index} runs a Skia-resolving cargo command with \
+                 continue-on-error: true, so a forced-download verification failure raised \
+                 inside build.rs would not fail the job, defeating this module's own primary \
+                 proof that the step's exit status is trustworthy"
+            )));
+        }
         validate_skia_injection_env(&ctx, index, run, &step.env, &resolved_targets)?;
         if !captures_verbose_build_log(run) {
             return Err(PolicyError::new(format!(
@@ -847,6 +1018,15 @@ fn validate_job_skia_injection(
                  capturing its build output at cargo's -vv verbosity through tee; plain -v \
                  suppresses a build script's own log output on a successful build, so this is \
                  needed to ever prove the forced Skia download actually ran"
+            )));
+        }
+        if !protects_pipeline_exit_status(run) {
+            return Err(PolicyError::new(format!(
+                "{path}: job {job_id} step {index} pipes its -vv build output through tee \
+                 without a `pipefail` shell option (e.g. `set -o pipefail`); without it, a real \
+                 build.rs failure from a rejected forced download would be masked by tee's own \
+                 near-always-zero exit status, making this step's reported success meaningless \
+                 as proof of anything"
             )));
         }
         if !requests_color_never(run, &step.env) {
@@ -871,6 +1051,23 @@ fn validate_job_skia_injection(
                  line alone does not prove this, since a stale cache or a silent fallback source \
                  build can print that too, and a raw grep against an unstripped colorized log can \
                  silently find nothing even when the marker text is fully present"
+            )));
+        }
+        let candidate_vars = candidate_archive_vars(run, &ctx);
+        if !skia_download_receipt_is_verified_via_output_file(&steps, index, candidate_vars) {
+            let hint = build_script_output_dir_hint();
+            return Err(PolicyError::new(format!(
+                "{path}: job {job_id} step {index} never proves, by reading Cargo's own \
+                 captured build-script output file ({hint}*{BUILD_SCRIPT_OUTPUT_FILE_HINT}, \
+                 written unconditionally on every build-script invocation regardless of \
+                 verbosity) rather than relying solely on the piped console log, that this \
+                 run's forced download actually used the verified pinned archive: some step at \
+                 or before this one must delete any stale prior output directory for this \
+                 package first (the freshness proof — a cached leftover from an earlier, \
+                 possibly-unverified run would otherwise look identical), and some step at or \
+                 after this one must then assert that file contains both \
+                 {SKIA_DOWNLOAD_FROM_LOG:?} naming the exact injected pinned file:// URL and \
+                 {SKIA_UNPACK_LOG:?}"
             )));
         }
     }
@@ -970,10 +1167,12 @@ mod tests {
 
     use super::{
         ParsedStep, SKIA_ARCHIVE_IOS_DEVICE_VAR, SKIA_ARCHIVE_IOS_SIM_VAR,
-        contains_bare_hex_run_at_least, curl_output_token, exact_flag_token, has_fail_closed_curl,
-        is_curl_fail_flag, is_hardcoded_literal, is_skia_resolving_cargo_step,
-        publishes_absolute_archive_var, publishes_archive_var, requests_double_verbose,
-        targets_ios_skia_workspace,
+        asserts_from_pinned_url_in_output, build_script_output_dir_hint,
+        cleans_stale_build_script_output, contains_bare_hex_run_at_least, curl_output_token,
+        exact_flag_token, has_fail_closed_curl, is_curl_fail_flag, is_hardcoded_literal,
+        is_skia_resolving_cargo_step, protects_pipeline_exit_status,
+        publishes_absolute_archive_var, publishes_archive_var, reads_build_script_output_file,
+        requests_double_verbose, targets_ios_skia_workspace,
     };
 
     #[test]
@@ -1147,6 +1346,7 @@ mod tests {
                 run,
                 env: BTreeMap::new(),
                 working_directory,
+                continue_on_error: false,
             };
         assert!(targets_ios_skia_workspace(&step_for(
             Some("cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios"),
@@ -1171,5 +1371,85 @@ mod tests {
             None
         )));
         assert!(!targets_ios_skia_workspace(&step_for(None, None)));
+    }
+
+    #[test]
+    fn pipeline_exit_status_protection_requires_the_pipefail_token() {
+        assert!(protects_pipeline_exit_status(
+            "set -o pipefail\ncargo build -vv 2>&1 | tee out.log"
+        ));
+        assert!(protects_pipeline_exit_status(
+            "set -euo pipefail\ncargo build -vv 2>&1 | tee out.log"
+        ));
+        assert!(!protects_pipeline_exit_status(
+            "set -eu\ncargo build -vv 2>&1 | tee out.log"
+        ));
+        assert!(!protects_pipeline_exit_status(
+            "cargo build -vv 2>&1 | tee out.log"
+        ));
+    }
+
+    #[test]
+    fn build_script_output_dir_hint_is_derived_from_the_reviewed_package_name() {
+        assert_eq!(build_script_output_dir_hint(), "build/skia-bindings-");
+    }
+
+    #[test]
+    fn stale_output_cleaning_requires_an_rm_token_and_the_directory_hint() {
+        let hint = build_script_output_dir_hint();
+        assert!(cleans_stale_build_script_output(
+            "rm -rf target/*/build/skia-bindings-*",
+            &hint
+        ));
+        // `rm` must be a standalone token, not embedded in a longer word such as `confirm`.
+        assert!(!cleans_stale_build_script_output(
+            "confirm target/*/build/skia-bindings-* exists",
+            &hint
+        ));
+        assert!(!cleans_stale_build_script_output(
+            "rm -rf target/*/build/some-other-crate-*",
+            &hint
+        ));
+    }
+
+    #[test]
+    fn output_file_reading_requires_both_the_directory_hint_and_the_output_suffix() {
+        let hint = build_script_output_dir_hint();
+        assert!(reads_build_script_output_file(
+            "cat target/*/build/skia-bindings-*/output",
+            &hint
+        ));
+        assert!(!reads_build_script_output_file(
+            "cat target/*/build/skia-bindings-*/stderr",
+            &hint
+        ));
+        assert!(!reads_build_script_output_file(
+            "cat target/*/build/some-other-crate-*/output",
+            &hint
+        ));
+    }
+
+    #[test]
+    fn from_url_assertion_requires_both_the_from_marker_and_the_exact_pinned_expression() {
+        assert!(asserts_from_pinned_url_in_output(
+            "grep -q \"FROM: file://${{ env.SKIA_ARCHIVE_IOS_DEVICE }}\" \"$output_file\"",
+            SKIA_ARCHIVE_IOS_DEVICE_VAR
+        ));
+        // Whitespace-insensitive inside the `${{ }}` expression, consistent with
+        // `expected_file_url`/`normalize_expression` elsewhere in this module.
+        assert!(asserts_from_pinned_url_in_output(
+            "grep -q \"FROM: file://${{env.SKIA_ARCHIVE_IOS_DEVICE}}\" \"$output_file\"",
+            SKIA_ARCHIVE_IOS_DEVICE_VAR
+        ));
+        // The other target's expression must not satisfy this target's assertion.
+        assert!(!asserts_from_pinned_url_in_output(
+            "grep -q \"FROM: file://${{ env.SKIA_ARCHIVE_IOS_SIM }}\" \"$output_file\"",
+            SKIA_ARCHIVE_IOS_DEVICE_VAR
+        ));
+        // The exact pinned expression without the FROM: marker proves nothing either.
+        assert!(!asserts_from_pinned_url_in_output(
+            "grep -q \"file://${{ env.SKIA_ARCHIVE_IOS_DEVICE }}\" \"$output_file\"",
+            SKIA_ARCHIVE_IOS_DEVICE_VAR
+        ));
     }
 }

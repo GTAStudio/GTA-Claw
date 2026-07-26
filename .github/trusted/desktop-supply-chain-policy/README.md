@@ -329,6 +329,43 @@ measurement and is treated as a failure, never silently passed. Like the rest of
 a bounded textual-presence check, not a shell interpreter or a real log inspection: it raises the bar
 on what the workflow's own script must visibly do, it does not execute it.
 
+### A normal build's console output is not build-script evidence
+
+Measurement against the real `skia-bindings` 0.99.0 build script shows a plain `cargo build` never
+echoes its `println!` log lines — including `TRYING TO DOWNLOAD AND INSTALL SKIA BINARIES`,
+`  FROM: {url}`, and `UNPACKING ARCHIVE INTO: {dir}` — to the console at all, even on a fresh build
+with no cache. Only `cargo build -vv` (or reading Cargo's own unconditional capture file,
+`target/<profile>/build/skia-bindings-<hash>/output`, which every build always writes regardless of
+verbosity) surfaces them. A workflow step that runs a plain, non-`-vv` build and then greps its own
+console output for these markers is not proving anything: the grep finds nothing whether the download
+succeeded, failed silently into a fallback source build, or never ran at all, so this policy has never
+accepted that shape and continues to require the `-vv`-through-`tee` capture described above for any
+retained console-log check.
+
+### The step's own exit status is only trustworthy if nothing can mask it
+
+The strongest proof a forced Skia download actually happened is simpler than log parsing: with
+`FORCE_SKIA_BINARIES_DOWNLOAD=1` set, the build script itself `panic!`s when the forced download
+fails, which fails `cargo build` non-zero, which fails the step — no log inspection required. This is
+now the trust chain's primary enforcement; captured-log checks are corroboration layered on top of it,
+never a substitute for it. Two things can otherwise mask that exit status and are now rejected
+wherever a step resolves Skia: a `continue-on-error: true` step (GitHub Actions reports it as
+successful to the job regardless of the underlying command's real exit code), and a `-vv`-through-`tee`
+pipeline missing `set -o pipefail` (without it, a shell pipeline's exit status is its *last* command's
+— `tee`'s, which is nearly always zero — not cargo's, silently hiding a real build failure behind a
+log file that was still faithfully written).
+
+Because reading Cargo's own build-script output file requires no verbosity flag at all, this policy
+additionally requires a positive read of it: the step (or a later one in the same job) must locate
+`target/<profile>/build/skia-bindings-*/output`, assert it contains both `FROM:` immediately followed
+by the exact injected pinned `file://` expression for that step's own archive variable (not merely
+`FROM:` in isolation, which the fallback source-build path could print for something else) and
+`UNPACKING ARCHIVE INTO`, and — because Cargo reuses a fingerprinted build directory and will not
+rewrite `output` on a no-op rebuild — the job must first remove any stale prior output
+(`target/*/build/skia-bindings-*`) so that file's presence is proof of *this* run, not a leftover from
+a previous one. A cached, stale `output` file left over from an earlier successful run is treated as
+no evidence at all, exactly like a cached `Compiling skia-bindings` console line is.
+
 ### Current desktop clippy is Skia-free by construction, and untouched by this trust chain
 
 `desktop/apps/gta-claw-desktop/Cargo.toml` depends on `slint` with `default-features = false` and an
