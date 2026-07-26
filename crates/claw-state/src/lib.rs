@@ -43,7 +43,7 @@ mod tests {
             #[cfg(target_os = "macos")]
             {
                 let root = std::fs::canonicalize(std::env::temp_dir())?;
-                return ::tempfile::Builder::new().tempdir_in(root);
+                ::tempfile::Builder::new().tempdir_in(root)
             }
             #[cfg(not(target_os = "macos"))]
             {
