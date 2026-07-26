@@ -446,7 +446,7 @@ const SUPERSEDED_FINAL_DEPENDENCY_SHA256: [&str; 3] = [
 ];
 
 const P03B_SQLITE_FILE_CONTROL_MANIFEST_SHA256: &str =
-    "b2ce476ecc84143cfa0c071d6289ab35ec1f425ac4aa5af5fc47e6cc3258da82";
+    "12f3b3d87c1b21337285be2e320935539c4c52bdbb9b0c349e1f85fab658ea01";
 const P03B_SQLITE_FILE_CONTROL_MEMBER: &str = "crates/claw-sqlite-file-control";
 const FINAL_ROOT_DENY_SHA256: &str =
     "75dedb874582f2f6d32890e21cca11186112d13dd51f4140ada96c69989594d0";
@@ -462,7 +462,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-futures-core = "=0.3.32"
+futures-core = "=0.3.33"
 libsqlite3-sys = "0.37.0"
 sqlx.workspace = true
 tokio.workspace = true
