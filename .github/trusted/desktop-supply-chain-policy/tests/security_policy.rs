@@ -2670,7 +2670,7 @@ fn sqlite_file_control_synthetic_setup_is_idempotent() {
     }
 
     let noncanonical = P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen(
-        "futures-core = \"=0.3.32\"",
+        "futures-core = \"=0.3.33\"",
         "futures-core = \"=0.3.31\"",
         1,
     );
@@ -2695,21 +2695,21 @@ fn sqlite_file_control_synthetic_setup_is_idempotent() {
     );
 
     for (label, from, to) in [
-        ("dependency-removed", "futures-core = \"=0.3.32\"\n", ""),
+        ("dependency-removed", "futures-core = \"=0.3.33\"\n", ""),
         (
             "version-drift",
-            "futures-core = \"=0.3.32\"",
+            "futures-core = \"=0.3.33\"",
             "futures-core = \"=0.3.31\"",
         ),
         (
             "name-drift",
-            "futures-core = \"=0.3.32\"",
-            "futures-util = \"=0.3.32\"",
+            "futures-core = \"=0.3.33\"",
+            "futures-util = \"=0.3.33\"",
         ),
         (
             "broader-extra-dependency",
-            "futures-core = \"=0.3.32\"\n",
-            "futures-core = \"=0.3.32\"\nfutures-util = \"=0.3.32\"\n",
+            "futures-core = \"=0.3.33\"\n",
+            "futures-core = \"=0.3.33\"\nfutures-util = \"=0.3.33\"\n",
         ),
     ] {
         let drifted = P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen(from, to, 1);

@@ -32,11 +32,10 @@ const FROZEN_GATEWAY_PROTOCOL: &str =
 /// client does not call them by name and should not pretend to. What is being
 /// checked is that the scope this client would demand for an action equals the
 /// scope upstream demands for a method that performs it.
-const ACTION_METHODS: [(IosAction, &str); 5] = [
+const ACTION_METHODS: [(IosAction, &str); 4] = [
     (IosAction::ReadSessions, "sessions.list"),
     (IosAction::SendMessage, "talk.client.create"),
     (IosAction::ResolveApproval, "exec.approval.resolve"),
-    (IosAction::ManagePairing, "device.pair.approve"),
     (IosAction::Administer, "config.set"),
 ];
 

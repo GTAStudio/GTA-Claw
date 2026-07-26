@@ -1549,6 +1549,31 @@ mod tests {
         );
     }
 
+    /// `PairingRequired` is the one code whose advice cannot be recovered from
+    /// by retrying: this build ships no pairing screen, so an operator told to
+    /// wait or to retry will do so indefinitely. The other codes are covered by
+    /// the property assertions above, which hold for any correct message; this
+    /// one binds the code to its advice, because a message swapped in from a
+    /// neighbouring arm satisfies every property and is still wrong.
+    #[test]
+    fn pairing_required_directs_the_operator_to_another_client() {
+        let error =
+            UserError::from_authentication(Some(ConnectErrorDetailCode::PairingRequired), false);
+        let action = error.action().to_lowercase();
+
+        assert!(
+            action.contains("pairing") || action.contains("pair"),
+            "PairingRequired must name pairing as the remedy, got {:?}",
+            error.action()
+        );
+        assert!(
+            !action.contains("wait"),
+            "this build has no pairing screen, so advising the operator to wait leaves them \
+             stuck indefinitely; got {:?}",
+            error.action()
+        );
+    }
+
     #[test]
     fn every_detail_code_produces_a_non_empty_remedy() {
         for code in ALL_DETAIL_CODES {
