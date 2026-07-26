@@ -190,9 +190,33 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Pack the tested arm64 build for the container job
+        if: matrix.arch == 'arm64'
+        shell: bash
+        run: |
+          ./packaging/macos/transport.sh pack arm64 \
+            "$RUNNER_TEMP/macos-arm64-tested-build.tar"
+
+      # Uploaded as a tar rather than as a directory tree because
+      # actions/upload-artifact does not preserve file modes: every file comes
+      # back as 0644, which would strip the executable bit from
+      # Contents/MacOS/gta-claw-desktop and fail the app executable contract.
+      # This is deliberately a separate artifact from the browsable prototype
+      # above; that one is for humans, this one is the exact bytes the
+      # containers job signs.
+      - name: Upload the tested arm64 build
+        if: matrix.arch == 'arm64'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-arm64-tested-build-${{ github.sha }}
+          path: ${{ runner.temp }}/macos-arm64-tested-build.tar
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
   containers:
     name: Container assembly and release input
-    needs: source-policy
+    needs: [source-policy, native]
     runs-on: macos-15
     outputs:
       release-payload-sha256: ${{ steps.release-input.outputs.sha256 }}
@@ -204,9 +228,22 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build and validate the native arm64 app
+      - name: Download the arm64 build the native job tested
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: macos-arm64-tested-build-${{ github.sha }}
+          path: ${{ runner.temp }}/tested-build
+
+      # This job used to run build.sh, so the app that got packaged, signed and
+      # notarized was a second, independent build that no test had ever run
+      # against. Consuming the native job's output makes the packaged bytes the
+      # bytes that job tested on. Do not reintroduce a build here: it would
+      # silently restore that gap.
+      - name: Restore the tested arm64 app
         shell: bash
-        run: ./packaging/macos/build.sh native
+        run: |
+          ./packaging/macos/transport.sh unpack arm64 \
+            "$RUNNER_TEMP/tested-build/macos-arm64-tested-build.tar"
 
       - name: Build unsigned prototype DMG and PKG
         shell: bash
