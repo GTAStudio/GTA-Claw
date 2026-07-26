@@ -2295,6 +2295,9 @@ mod tests {
                 "crates/claw-protocol/build.rs".to_owned(),
                 "desktop/apps/gta-claw-desktop/build.rs".to_owned(),
                 "desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs".to_owned(),
+                // Same shape as the desktop build script above: a build script is
+                // not a `cargo test` target, so it is tracked but unreachable.
+                "ios/apps/gta-claw-ios-shell/build.rs".to_owned(),
             ])
         );
     }

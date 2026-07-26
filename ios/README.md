@@ -34,16 +34,22 @@ Everything below is a statement about a specific machine, not about the product.
 | Claim | Status |
 | --- | --- |
 | Compiles for the host target | **Verified**, Windows x86_64, rustc 1.97.0 |
-| `clippy -D warnings`, `fmt --check` clean | **Verified**, Windows x86_64 |
-| Compiles for `aarch64-apple-ios` | **Never done by anyone** |
-| Compiles for `aarch64-apple-ios-sim` | **Never done by anyone** |
-| Links with the Apple linker | **Never done by anyone** |
+| `clippy -D warnings`, `fmt --check` clean | **Verified**, Windows x86_64 and macOS arm64 |
+| Compiles for `aarch64-apple-ios` | **Verified in CI**, macos-15-arm64, Xcode 16.4 |
+| Compiles for `aarch64-apple-ios-sim` | **Verified in CI**, macos-15-arm64, Xcode 16.4 |
+| Links with the Apple linker | **Verified in CI** — `Mach-O 64-bit executable arm64` |
 | Runs on a simulator | **Never done** |
 | Runs on a device | **Never done** |
 | Completes a Gateway v4 handshake from iOS | **Never done** |
 
-`.github/workflows/ios-packaging.yml` is the job that would close the first
-three rows. It has never run, because it does not exist on `main` yet.
+The first five rows became true when `.github/workflows/ios-packaging.yml` first ran:
+both `cargo build --target aarch64-apple-ios` and `--target aarch64-apple-ios-sim`
+succeeded, and `file` reported `Mach-O 64-bit executable arm64` for each. That
+exercised `skia-bindings`, the five `objc2` crates and the real Apple linker.
+
+**A green build is still not a working app.** Nothing above launches the binary.
+The bottom three rows are the ones that would tell you it works, and they remain
+untested.
 
 A host-target `cargo check` is **not** an iOS build proof. It runs no Apple
 toolchain, no `xcrun`, no SDK, no target `clang` and no linker, so nothing that
