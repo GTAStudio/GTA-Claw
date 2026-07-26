@@ -61,8 +61,9 @@ version = "=0.16.1"
 name = "sha2"
 version = "=0.10.9"
 
-# Wasmtime/Cranelift's SHA-2 0.10 line requires generic-array 0.14, while
-# russh 0.62 mandates the 1.x line and enables its non-optional compat-0_14 bridge.
+# russh 0.62 requires generic-array 1.x, and the 1.x line depends on 0.14 through
+# its non-optional compat-0_14 bridge. The duplicate is therefore structural: no
+# version selection elsewhere in the graph can eliminate it.
 [[bans.skip]]
 name = "generic-array"
 version = "=0.14.7"

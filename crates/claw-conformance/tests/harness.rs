@@ -1527,7 +1527,7 @@ fn raised_ledger_status_without_evidence_is_rejected() {
 #[test]
 fn legitimate_ledger_transitions_do_not_require_frozen_hashes() {
     let fixture = Fixture::copy_upstream();
-    enable_transition_policy(&fixture.root, 37, 1, 9);
+    enable_transition_policy(&fixture.root, 45, 1, 1);
     let tests = fixture
         .root
         .join("crates")
@@ -1624,7 +1624,7 @@ fn legacy_schema_cannot_authorize_a_ledger_transition() {
 #[test]
 fn transition_manifest_policy_and_status_totals_are_accepted() {
     let fixture = Fixture::copy_upstream();
-    enable_transition_policy(&fixture.root, 39, 0, 8);
+    enable_transition_policy(&fixture.root, 47, 0, 0);
 
     let contract = Contract::load(&fixture.root).expect("load transition manifest");
     assert_eq!(contract.ledgers().len(), 3);
