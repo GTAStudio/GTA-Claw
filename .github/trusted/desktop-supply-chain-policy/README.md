@@ -295,8 +295,42 @@ base-to-head change names one of the exact 28 Bootstrap inputs:
    protected-base Git OID, normalized protected-base and candidate live SHA-256 values,
    candidate embedded-payload SHA-256, candidate semantic archive fingerprint, and a bounded
    non-empty rationale. The trusted manifest must name the decision ledger.
+3. **Standing preservation:** the protected base already carries a reviewed `[[standing]]` entry
+   for that path, the candidate ledger still carries the identical entry, and the embedded
+   historical payload for that path is unchanged. No candidate write of any kind is required.
 
-The schema-v1 ledger starts empty. Records use consecutive integer IDs, canonical field order,
+Options 1 and 2 both write inside the protected trust root, so an ordinary pull request cannot
+take either: `validate_protected_files` compares the whole trust-root tree and admits no
+exemption. Option 3 exists so that the routine case — a Final workspace resolving a new
+dependency while the historical archive stays frozen — is decided once, in a reviewed
+trust-root change, instead of once per pull request.
+
+A standing entry binds `path`, `base_oid` (provenance only), `snapshot_payload_sha256`,
+`snapshot_fingerprint`, and a bounded rationale. It deliberately records no per-change
+transition and is deliberately **not** re-bound to `manifest.base`, so the protected base
+advancing does not invalidate it and a queue of pending pull requests can land in any order.
+It binds archive-side facts only, which is what keeps it narrow:
+
+- coverage is read from the **protected base** ledger and additionally requires the identical
+  entry in the candidate ledger, so a candidate can neither mint coverage for itself nor keep
+  coverage it edited or dropped;
+- coverage requires the embedded payload for that path to be unchanged and to hash to
+  `snapshot_payload_sha256`;
+- coverage requires `snapshot_fingerprint` to equal the candidate archive's semantic
+  fingerprint, so rewriting *any* archived payload voids every standing entry at once and the
+  preservations must be re-taken alongside that synchronization.
+
+Standing entries are seeded for the 15 dependency-graph inputs in `BOOTSTRAP_FILES` — every
+`Cargo.toml`, every `Cargo.lock`, and `deny.toml`. The remaining 13 inputs (the seven
+workflows, `.github/CODEOWNERS`, `.cargo/audit.toml`, `.gitattributes`, `rust-toolchain.toml`,
+and `rustfmt.toml`) carry no standing entry and stay fully coupled: changing one still requires
+option 1 or option 2 and therefore a reviewed trust-root change.
+
+The schema-v1 ledger starts empty. `standing` is an optional key that is omitted entirely when
+there are no standing entries, so the canonical form stays unique. Standing entries use
+consecutive integer IDs and strictly ascending unique paths drawn from `BOOTSTRAP_FILES`.
+
+Records use consecutive integer IDs, canonical field order,
 lowercase full hashes, and deterministic ID order. The `(base_oid, path)` pair is a stable unique
 key, so rebasing or changing the same path again requires a new record bound to the current
 protected base. Existing records are an immutable prefix: they cannot be edited, deleted,
