@@ -349,6 +349,81 @@
                       "why":  "Package sits inside the workspace tree but is neither a member nor excluded and has no [workspace] table. Cargo REFUSES to build it (exit 101: \u0027current package believes it\u0027s in a workspace when it\u0027s not\u0027), so its tests can never run and it is not evidence. A directory-walking implementation would wrongly accept this."
                   },
                   {
+                      "name":  "peer8-default-bench-reject",
+                      "files":  {
+                                    "Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[test]]\nname = \"custom\"\npath = \"tests/custom.rs\"\nharness = false\n\n[workspace]\n",
+                                    "benches/bench.rs":  "#[test]\nfn bench_test() { assert!(true); }\n",
+                                    "examples/demo.rs":  "fn main() {}\n#[test]\nfn example_test() { assert!(true); }\n",
+                                    "src/bin/tool.rs":  "fn main() {}\n#[test]\nfn bin_test() { assert!(true); }\n",
+                                    "src/lib.rs":  "#[test]\nfn lib_test() { assert!(true); }\n",
+                                    "tests/custom.rs":  "fn main() {}\n#[test]\nfn harness_false_test() { assert!(true); }\n",
+                                    "tests/normal.rs":  "#[test]\nfn normal_test() { assert!(true); }\n"
+                                },
+                      "cite":  "benches/bench.rs",
+                      "expect":  "reject",
+                      "why":  "cargo test -- --list on this exact tree yields exactly lib_test, bin_test and normal_test; a default bench carries test = false, so its #[test] never runs"
+                  },
+                  {
+                      "name":  "peer8-default-example-reject",
+                      "files":  {
+                                    "Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[test]]\nname = \"custom\"\npath = \"tests/custom.rs\"\nharness = false\n\n[workspace]\n",
+                                    "benches/bench.rs":  "#[test]\nfn bench_test() { assert!(true); }\n",
+                                    "examples/demo.rs":  "fn main() {}\n#[test]\nfn example_test() { assert!(true); }\n",
+                                    "src/bin/tool.rs":  "fn main() {}\n#[test]\nfn bin_test() { assert!(true); }\n",
+                                    "src/lib.rs":  "#[test]\nfn lib_test() { assert!(true); }\n",
+                                    "tests/custom.rs":  "fn main() {}\n#[test]\nfn harness_false_test() { assert!(true); }\n",
+                                    "tests/normal.rs":  "#[test]\nfn normal_test() { assert!(true); }\n"
+                                },
+                      "cite":  "examples/demo.rs",
+                      "expect":  "reject",
+                      "why":  "cargo test -- --list on this exact tree yields exactly lib_test, bin_test and normal_test; a default example carries test = false, so its #[test] never runs"
+                  },
+                  {
+                      "name":  "peer8-enabled-integration-test-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[test]]\nname = \"custom\"\npath = \"tests/custom.rs\"\nharness = false\n\n[workspace]\n",
+                                    "benches/bench.rs":  "#[test]\nfn bench_test() { assert!(true); }\n",
+                                    "examples/demo.rs":  "fn main() {}\n#[test]\nfn example_test() { assert!(true); }\n",
+                                    "src/bin/tool.rs":  "fn main() {}\n#[test]\nfn bin_test() { assert!(true); }\n",
+                                    "src/lib.rs":  "#[test]\nfn lib_test() { assert!(true); }\n",
+                                    "tests/custom.rs":  "fn main() {}\n#[test]\nfn harness_false_test() { assert!(true); }\n",
+                                    "tests/normal.rs":  "#[test]\nfn normal_test() { assert!(true); }\n"
+                                },
+                      "cite":  "tests/normal.rs",
+                      "expect":  "accept",
+                      "why":  "cargo test -- --list on this exact tree yields exactly lib_test, bin_test and normal_test; the accepting control proving this tree is not rejecting every target"
+                  },
+                  {
+                      "name":  "peer8-harness-false-target-reject",
+                      "files":  {
+                                    "Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[test]]\nname = \"custom\"\npath = \"tests/custom.rs\"\nharness = false\n\n[workspace]\n",
+                                    "benches/bench.rs":  "#[test]\nfn bench_test() { assert!(true); }\n",
+                                    "examples/demo.rs":  "fn main() {}\n#[test]\nfn example_test() { assert!(true); }\n",
+                                    "src/bin/tool.rs":  "fn main() {}\n#[test]\nfn bin_test() { assert!(true); }\n",
+                                    "src/lib.rs":  "#[test]\nfn lib_test() { assert!(true); }\n",
+                                    "tests/custom.rs":  "fn main() {}\n#[test]\nfn harness_false_test() { assert!(true); }\n",
+                                    "tests/normal.rs":  "#[test]\nfn normal_test() { assert!(true); }\n"
+                                },
+                      "cite":  "tests/custom.rs",
+                      "expect":  "reject",
+                      "why":  "cargo test -- --list on this exact tree yields exactly lib_test, bin_test and normal_test; harness = false replaces libtest, so #[test] never runs - and cargo metadata still reports this target as test = true, which is why the manifest must be read"
+                  },
+                  {
+                      "name":  "peer8-src-bin-target-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[test]]\nname = \"custom\"\npath = \"tests/custom.rs\"\nharness = false\n\n[workspace]\n",
+                                    "benches/bench.rs":  "#[test]\nfn bench_test() { assert!(true); }\n",
+                                    "examples/demo.rs":  "fn main() {}\n#[test]\nfn example_test() { assert!(true); }\n",
+                                    "src/bin/tool.rs":  "fn main() {}\n#[test]\nfn bin_test() { assert!(true); }\n",
+                                    "src/lib.rs":  "#[test]\nfn lib_test() { assert!(true); }\n",
+                                    "tests/custom.rs":  "fn main() {}\n#[test]\nfn harness_false_test() { assert!(true); }\n",
+                                    "tests/normal.rs":  "#[test]\nfn normal_test() { assert!(true); }\n"
+                                },
+                      "cite":  "src/bin/tool.rs",
+                      "expect":  "accept",
+                      "why":  "cargo test -- --list on this exact tree yields exactly lib_test, bin_test and normal_test; a bin target defaults to test = true, so dropping benches and examples must not take src/bin with them"
+                  },
+                  {
                       "name":  "unambiguous-file-accept",
                       "files":  {
                                     "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",

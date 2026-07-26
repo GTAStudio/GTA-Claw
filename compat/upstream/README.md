@@ -11,7 +11,7 @@ and records, per feature row, whether GTA-Claw actually implements it.
 | `inventories/*.json` (10 files, 717 rows) | frozen, digest hardcoded in `validate.ps1` |
 | `feature-ledger.schema.json` | frozen, digest hardcoded in `validate.ps1` |
 | `enabled-test-oracle.json` (120 cases) | frozen, digest hardcoded in `validate.ps1` |
-| `reachability-corpus.json` (27 cases) | frozen, digest hardcoded in `validate.ps1` |
+| `reachability-corpus.json` (32 cases) | frozen, digest hardcoded in `validate.ps1` |
 | `manifest.json` | only `evidence_policy.status_totals` may change |
 | `ledgers/*.json` (3 files, 47 rows) | only `status`, `acceptance_evidence.status`, `acceptance_evidence.artifacts`, `implementation_pointers` and `known_differences` may change; every other field, **including `acceptance_evidence.required`**, is frozen by a digest hardcoded in `validate.ps1` |
 | `ledger-digests.sha256` | regenerated only by `validate.ps1 -WriteLedgerDigests` |
@@ -368,10 +368,18 @@ to `cargo metadata`, which keeps this trust root hermetic: it reads files and
 executes nothing. That is a deliberate trade. It costs exactness at the margins
 of cargo's auto-discovery rules, and it means the per-kind defaults above are a
 model of cargo rather than cargo's own answer — a model that was **wrong** once
-already, when `benches/` and `examples/` were treated as roots. Where the two
-differ today, this validator is the stricter side: `harness = false` cannot be
-expressed in `cargo metadata` at all, which still reports such a target as
-`test = true`.
+already, when `benches/` and `examples/` were treated as roots.
+
+The `harness = false` case is the one where the model was, for a time, the
+*stricter* side: it cannot be expressed in `cargo metadata` at all, which still
+reports such a target as `test = true`. Measured directly — a package carrying
+an explicit `harness = false` test target, a default example, a default bench, a
+`src/bin/` target, a lib and an ordinary integration test — `cargo metadata`
+reports `test = true` for the `harness = false` target, while
+`cargo test -- --list` yields exactly `lib_test`, `bin_test` and `normal_test`.
+Metadata alone therefore admits a target whose `#[test]` never runs. The harness
+now reads the manifest to overlay that field, so the two answers agree; the
+corpus pins all six of those paths so neither side can drift back.
 
 A tightening rule needs its false-positive cases pinned as much as its
 true-positive ones. Twelve of the fourteen accepting cases pin reachability — a
@@ -411,10 +419,11 @@ repository. Two implementations could agree 287/5 forever with both fixes never
 once compared. A whole-tree sweep is the highest-yield instrument for rules the
 tree exercises and no instrument at all for rules it does not.
 
-`reachability-corpus.json` holds 27 synthetic workspaces — 13 that must be
-accepted and 14 that must be rejected — each a complete set of files, a cited
-path and the expected verdict. It covers explicit `test = false` targets, the
-three `#[path]` base-directory rules, raw-string `#[path]`, `E0761` ambiguity in
+`reachability-corpus.json` holds 32 synthetic workspaces — 15 that must be
+accepted and 17 that must be rejected — each a complete set of files, a cited
+path and the expected verdict. It covers explicit `test = false` targets,
+`harness = false` targets, default examples and default benches, the three
+`#[path]` base-directory rules, raw-string `#[path]`, `E0761` ambiguity in
 both directions, package boundaries, and target roots in excluded and
 self-rooted workspaces.
 
