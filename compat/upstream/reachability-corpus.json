@@ -180,7 +180,7 @@
                   {
                       "name":  "peer1-explicit-bin-test-false-reject",
                       "files":  {
-                                    "Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"disabled\"\npath = \"src/disabled.rs\"\ntest = false\n",
+                                    "Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"disabled\"\npath = \"src/disabled.rs\"\ntest = false\n\n[workspace]\n",
                                     "src/disabled.rs":  "fn main() {}\n\n#[test]\nfn forged_evidence_test() {}\n",
                                     "src/lib.rs":  ""
                                 },

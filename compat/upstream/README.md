@@ -449,9 +449,11 @@ define — otherwise a case could name a real repository file and assert a verdi
 about something the fixture never contained — and that no path may contain a dot
 segment, so no replayer can be induced to write outside its fixture root.
 
-**This file is the single copy.** `crates/claw-conformance` is expected to load
-it from `compat/upstream/reachability-corpus.json`, exactly as it already loads
-`compat/upstream/enabled-test-oracle.json`, and to replay it against `cargo`.
+**This file is the single copy, and it now is one.** `crates/claw-conformance`
+loads it from `compat/upstream/reachability-corpus.json`, exactly as it already
+loads `compat/upstream/enabled-test-oracle.json`, and replays every case against
+`cargo` before comparing its own resolver's verdict to `expect`. The private
+duplicate that previously lived under that crate's fixtures has been deleted.
 A corpus that exists twice is not shared: it is two corpora that agree until one
 is edited, and the cheapest drift detector — comparing digests — is unavailable
 the moment the copies differ in whitespace or member order, which two independent
@@ -459,6 +461,21 @@ serializers will do immediately. The schema is deliberately additive-only for
 that reason; a reader may ignore `schema_version`, `purpose`, `rule`, `arbiter`,
 `implementations` and each case's `why` and still see `name`, `files`, `cite` and
 `expect`.
+
+Sharing the file has a cost that must be stated rather than discovered. The
+consumer asserts an exact case count, so **adding a case to this corpus is a
+change that cannot land on either side alone** — the same coupling that already
+applies to `enabled-test-oracle.json` and to `canonical_counts.artifact_json_files`,
+and the reason the artifact count needed a single atomic pull request across two
+owners. The coupling is worth keeping in the shrinking direction: without it,
+cases could be deleted to hide a disagreement in a tree where `validate.ps1` was
+bypassed. It is not worth paying in the growing direction, because a corpus is
+only useful if adding coverage is cheap, and every case added here exists because
+some rule was otherwise pinned by nothing. An exact equality is also strictly
+weaker than the digest this validator already enforces: it cannot detect a case
+being *replaced* by a weaker one at constant count. A lower bound on the consumer
+side preserves the anti-deletion property, drops the coupling on additions, and
+gives up nothing the digest does not already cover.
 
 #### A row may not rewrite its own acceptance bar
 

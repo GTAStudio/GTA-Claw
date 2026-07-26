@@ -48,7 +48,7 @@ $ExpectedOracleCorpusTrue = 46
 # expectations were produced by running cargo and rustc against each fixture, so
 # neither resolver is normative for reachability and neither may edit a case to
 # match itself. -WriteLedgerDigests cannot reach these constants.
-$ExpectedReachabilityCorpusDigest = "5351c75b794bc9291499b4f4f8ca4a239dde3c3af26906331d686f5e706a0ad7"
+$ExpectedReachabilityCorpusDigest = "70aec3e02f3885970ec37d61421fdc34ea932e591842d6a1669adf0e1f4880dd"
 $ExpectedReachabilityCorpusCases = 32
 $ExpectedReachabilityCorpusAccepting = 15
 $LedgerDigestFileName = "ledger-digests.sha256"
