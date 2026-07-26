@@ -44,7 +44,13 @@ concurrency:
 
 jobs:
   compile:
-    name: ${{ matrix.target }}
+    # The declared name is deliberately static. A matrix job must declare an
+    # explicit audited name, and a name containing a bare `${{ matrix.* }}`
+    # expression is refused because it could render a reserved check identity
+    # (workflows.rs: "dynamic workflow job name can render a reserved identity").
+    # GitHub still appends the matrix values to the rendered check name, so the
+    # two legs stay distinguishable without an expression here.
+    name: iOS cross compile
     runs-on: macos-15
     timeout-minutes: 45
     strategy:
