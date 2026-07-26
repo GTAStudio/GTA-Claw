@@ -4,14 +4,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write as _};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest as _, Sha256};
 use toml::Value as TomlValue;
 
 use crate::identity::canonical_caseless;
-use crate::input::{DEFAULT_FILE_LIMIT, SafeRoot, require_plain_path};
+use crate::input::{DEFAULT_FILE_LIMIT, SafeRoot, require_plain};
 use crate::ownership::{CODEOWNERS_PATH, is_codeowners_path_or_alias, validate_codeowners};
 use crate::{PolicyError, PolicyResult, error};
 
@@ -1640,17 +1640,49 @@ fn bootstrap_snapshot_delta(
     }
 }
 
-fn read_existing_bootstrap_snapshot(output: &Path) -> PolicyResult<Option<Vec<u8>>> {
-    let metadata = match fs::symlink_metadata(output) {
+struct BootstrapSnapshotOutput {
+    parent: PathBuf,
+    path: PathBuf,
+}
+
+fn resolve_bootstrap_snapshot_output(output: &Path) -> PolicyResult<BootstrapSnapshotOutput> {
+    let file_name = output.file_name().ok_or_else(|| {
+        PolicyError::new(format!(
+            "Bootstrap snapshot output has no file name: {}",
+            output.display()
+        ))
+    })?;
+    let lexical_parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(lexical_parent)
+        .map_err(|cause| error("canonicalize Bootstrap snapshot output directory", cause))?;
+    let metadata = fs::symlink_metadata(&parent)
+        .map_err(|cause| error("inspect Bootstrap snapshot output directory", cause))?;
+    if !metadata.is_dir() {
+        return Err(PolicyError::new(format!(
+            "Bootstrap snapshot output parent is not a directory: {}",
+            parent.display()
+        )));
+    }
+    let path = parent.join(file_name);
+    Ok(BootstrapSnapshotOutput { parent, path })
+}
+
+fn read_existing_bootstrap_snapshot(
+    output: &BootstrapSnapshotOutput,
+) -> PolicyResult<Option<Vec<u8>>> {
+    let metadata = match fs::symlink_metadata(&output.path) {
         Ok(metadata) => metadata,
         Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(cause) => return Err(error("inspect existing Bootstrap snapshot", cause)),
     };
-    require_plain_path(output)?;
+    require_plain(&metadata, &output.path)?;
     if !metadata.is_file() {
         return Err(PolicyError::new(format!(
             "existing Bootstrap snapshot is not a regular file: {}",
-            output.display()
+            output.path.display()
         )));
     }
     if metadata.len() > MAX_REPOSITORY_BYTES {
@@ -1658,8 +1690,8 @@ fn read_existing_bootstrap_snapshot(output: &Path) -> PolicyResult<Option<Vec<u8
             "existing Bootstrap snapshot exceeds {MAX_REPOSITORY_BYTES} bytes"
         )));
     }
-    let mut file =
-        File::open(output).map_err(|cause| error("open existing Bootstrap snapshot", cause))?;
+    let mut file = File::open(&output.path)
+        .map_err(|cause| error("open existing Bootstrap snapshot", cause))?;
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
     Read::by_ref(&mut file)
         .take(MAX_REPOSITORY_BYTES + 1)
@@ -1676,20 +1708,13 @@ fn read_existing_bootstrap_snapshot(output: &Path) -> PolicyResult<Option<Vec<u8
     Ok(Some(bytes))
 }
 
-fn stage_bootstrap_snapshot(output: &Path, bytes: &[u8]) -> PolicyResult<std::path::PathBuf> {
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
-    require_plain_path(parent)?;
-    let parent_metadata = fs::symlink_metadata(parent)
-        .map_err(|cause| error("inspect Bootstrap snapshot output directory", cause))?;
-    if !parent_metadata.is_dir() {
-        return Err(PolicyError::new(format!(
-            "Bootstrap snapshot output parent is not a directory: {}",
-            parent.display()
-        )));
-    }
+fn stage_bootstrap_snapshot(
+    output: &BootstrapSnapshotOutput,
+    bytes: &[u8],
+) -> PolicyResult<PathBuf> {
     for _ in 0..32 {
         let unique = NEXT_BOOTSTRAP_SNAPSHOT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let staged = parent.join(format!(
+        let staged = output.parent.join(format!(
             ".bootstrap-snapshot-{}-{unique}.tmp",
             std::process::id()
         ));
@@ -1728,8 +1753,8 @@ fn cleanup_staged_snapshot(staged: &Path, cause: PolicyError) -> PolicyError {
     }
 }
 
-fn replace_bootstrap_snapshot(staged: &Path, output: &Path) -> PolicyResult<()> {
-    if let Err(cause) = fs::rename(staged, output) {
+fn replace_bootstrap_snapshot(staged: &Path, output: &BootstrapSnapshotOutput) -> PolicyResult<()> {
+    if let Err(cause) = fs::rename(staged, &output.path) {
         return Err(cleanup_staged_snapshot(
             staged,
             error("replace Bootstrap snapshot", cause),
@@ -1743,9 +1768,10 @@ pub fn write_bootstrap_snapshot(
     root: &SafeRoot,
     output: &Path,
 ) -> PolicyResult<BootstrapSnapshotDelta> {
+    let output = resolve_bootstrap_snapshot_output(output)?;
     let generated = BootstrapSnapshotArchive::from_root(root)?;
     let generated_bytes = generated.serialize()?;
-    let existing_bytes = read_existing_bootstrap_snapshot(output)?;
+    let existing_bytes = read_existing_bootstrap_snapshot(&output)?;
     let existing = existing_bytes
         .as_deref()
         .map(BootstrapSnapshotArchive::parse)
@@ -1755,8 +1781,8 @@ pub fn write_bootstrap_snapshot(
     if existing_bytes.as_deref() == Some(generated_bytes.as_slice()) {
         return Ok(delta);
     }
-    let staged = stage_bootstrap_snapshot(output, &generated_bytes)?;
-    replace_bootstrap_snapshot(&staged, output)?;
+    let staged = stage_bootstrap_snapshot(&output, &generated_bytes)?;
+    replace_bootstrap_snapshot(&staged, &output)?;
     Ok(delta)
 }
 
@@ -1794,4 +1820,41 @@ pub const fn expected_bootstrap_fingerprint() -> &'static str {
 #[must_use]
 pub const fn canonical_desktop_lock() -> &'static [u8] {
     FINAL_DESKTOP_LOCK
+}
+
+#[cfg(test)]
+mod bootstrap_snapshot_output_tests {
+    use super::{
+        NEXT_BOOTSTRAP_SNAPSHOT_TEMP, Ordering, replace_bootstrap_snapshot,
+        resolve_bootstrap_snapshot_output, stage_bootstrap_snapshot,
+    };
+    use std::fs;
+
+    #[test]
+    fn staging_and_replace_share_the_canonical_output_parent() {
+        let unique = NEXT_BOOTSTRAP_SNAPSHOT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "gta-claw-bootstrap-output-{}-{unique}",
+            std::process::id()
+        ));
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("create canonical output test directory");
+        let lexical = nested.join("..").join("output.snapshot");
+        let output =
+            resolve_bootstrap_snapshot_output(&lexical).expect("resolve canonical output parent");
+
+        assert_eq!(
+            output.parent,
+            fs::canonicalize(&root).expect("canonicalize expected output parent")
+        );
+        let staged =
+            stage_bootstrap_snapshot(&output, b"snapshot").expect("stage snapshot test bytes");
+        assert_eq!(staged.parent(), Some(output.parent.as_path()));
+        replace_bootstrap_snapshot(&staged, &output).expect("replace snapshot test output");
+        assert_eq!(
+            fs::read(&output.path).expect("read replaced snapshot test output"),
+            b"snapshot"
+        );
+        fs::remove_dir_all(root).expect("remove canonical output test directory");
+    }
 }
