@@ -14,6 +14,8 @@ const POLICY_CRATE: &str = "crates/claw-repo-policy";
 const POLICY_MANIFEST: &str = "crates/claw-repo-policy/Cargo.toml";
 const POLICY_LIBRARY: &str = "crates/claw-repo-policy/src/lib.rs";
 const POLICY_TEST: &str = "crates/claw-repo-policy/tests/repository_policy.rs";
+const POLICY_TEST_SOURCE: &str =
+    include_str!("../../../../crates/claw-repo-policy/tests/repository_policy.rs");
 const UPSTREAM_WORKFLOW: &str = ".github/workflows/upstream-gateway-reference.yml";
 const RUST_WORKFLOW: &str = ".github/workflows/rust.yml";
 const POLICY_TEST_STEP_NAME: &str = "Reject JavaScript toolchain artifacts";
@@ -503,6 +505,12 @@ fn validate_policy_source(root: &SafeRoot) -> PolicyResult<()> {
                 "repository policy self-test contract is missing: {required:?}"
             )));
         }
+    }
+    let expected_source = POLICY_TEST_SOURCE.replace("\r\n", "\n");
+    if source != expected_source {
+        return Err(PolicyError::new(
+            "repository policy test source changed from the base-owned exact contract",
+        ));
     }
     Ok(())
 }

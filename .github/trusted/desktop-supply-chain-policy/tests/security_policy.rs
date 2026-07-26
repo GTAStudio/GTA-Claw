@@ -758,90 +758,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
         .expect("panic payload string")
 }
 
-const REPOSITORY_POLICY_MANIFEST: &str = r#"[package]
-name = "claw-repo-policy"
-description = "Repository-wide architecture policy gates for GTA Claw"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-
-[lints]
-workspace = true
-"#;
-
 const REPOSITORY_POLICY_MEMBER: &str = "crates/claw-repo-policy";
 const REPOSITORY_POLICY_PACKAGE: &str = "claw-repo-policy";
-
-const REPOSITORY_POLICY_TEST_FIXTURE: &str = r#"const FORBIDDEN_FILE_NAMES: &[&str] = &[
-    "package.json",
-    "package-lock.json",
-    "npm-shrinkwrap.json",
-    "yarn.lock",
-    "pnpm-lock.yaml",
-    "bun.lock",
-    "bun.lockb",
-    "deno.json",
-    "deno.jsonc",
-];
-const FORBIDDEN_DIRECTORY_NAMES: &[&str] = &["node_modules", ".yarn", ".pnpm-store"];
-const FORBIDDEN_EXTENSIONS: &[&str] =
-    &["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "node"];
-const FORBIDDEN_WORKFLOW_COMMANDS: &[&str] = &[
-    "node", "npm", "npx", "pnpm", "yarn", "bun", "deno", "corepack",
-];
-const LEGACY_RUNTIME_INVENTORY: &[&str] = &[
-    "Dockerfile",
-    "package-lock.json",
-    "package.json",
-    "src/auth/deviceFlow.ts",
-    "src/bot/teamsBot.ts",
-    "src/channels/discordGateway.ts",
-    "src/channels/messageProcessor.ts",
-    "src/channels/telegramPolling.ts",
-    "src/channels/whatsappWebhook.ts",
-    "src/config.ts",
-    "src/engine/copilotEngine.ts",
-    "src/engine/sessionManager.ts",
-    "src/engine/toolExecutor.ts",
-    "src/index.ts",
-    "src/loader/roleLoader.ts",
-    "src/loader/skillLoader.ts",
-    "src/server.ts",
-    "src/updater/sdkUpdater.ts",
-    "src/utils/logger.ts",
-    "src/utils/proxy.ts",
-    "src/utils/splitMessage.ts",
-    "tsconfig.json",
-];
-const ALLOWED_ADVERSARIAL_SHELL_FIXTURES: &[&str] =
-    &[".github/fixtures/security-tools/bash-env-poison.sh"];
-const ALLOWED_COMPAT_FIXTURES: &[&str] = &[];
-
-#[test]
-fn repository_legacy_javascript_surface_does_not_grow() {}
-
-#[test]
-fn new_typescript_path_outside_legacy_inventory_is_rejected() {
-    fixture.write("src/newFeature.ts", b"new");
-    assert_eq!(violations, ["src/newFeature.ts"]);
-}
-
-#[test]
-fn removing_allowlisted_legacy_entry_keeps_ratchet_green() {
-    fs::remove_file(fixture.path().join("src/index.ts")).unwrap();
-}
-
-#[test]
-fn workflow_commands_are_checked_without_rejecting_inert_search_patterns() {}
-
-#[test]
-fn tracked_symlink_and_gitlink_modes_are_rejected() {
-    let _ = b"120000 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let _ = b"160000 cccccccccccccccccccccccccccccccccccccccc";
-}
-"#;
 
 const ACTIVE_REPOSITORY_POLICY_WORKFLOW: &str = r#"name: pinned upstream Gateway reference
 
@@ -927,25 +845,61 @@ fn deactivate_repository_policy(tree: &TempTree) {
 }
 
 fn activate_repository_policy(tree: &TempTree) {
-    add_new_root_member(tree, REPOSITORY_POLICY_MEMBER, REPOSITORY_POLICY_MANIFEST);
-    fs::write(
-        tree.join(REPOSITORY_POLICY_MEMBER).join("src/lib.rs"),
-        "//! Repository-wide architecture policy gates for GTA Claw.\n",
-    )
-    .expect("write repository policy library");
-    fs::create_dir_all(tree.join(REPOSITORY_POLICY_MEMBER).join("tests"))
-        .expect("create repository policy tests");
-    fs::write(
-        tree.join(REPOSITORY_POLICY_MEMBER)
-            .join("tests/repository_policy.rs"),
-        REPOSITORY_POLICY_TEST_FIXTURE,
-    )
-    .expect("write repository policy test fixture");
+    let source_root = repo_root().join(REPOSITORY_POLICY_MEMBER);
+    let manifest =
+        fs::read_to_string(source_root.join("Cargo.toml")).expect("read real policy manifest");
+    add_new_root_member(tree, REPOSITORY_POLICY_MEMBER, &manifest);
+    for relative in ["src/lib.rs", "tests/repository_policy.rs"] {
+        let destination = tree.join(REPOSITORY_POLICY_MEMBER).join(relative);
+        fs::create_dir_all(
+            destination
+                .parent()
+                .expect("repository policy destination parent"),
+        )
+        .expect("create repository policy destination");
+        fs::copy(source_root.join(relative), destination)
+            .expect("copy real repository policy source");
+    }
     fs::write(
         tree.join(".github/workflows/upstream-gateway-reference.yml"),
         ACTIVE_REPOSITORY_POLICY_WORKFLOW,
     )
     .expect("write active repository policy workflow");
+}
+
+fn run_activated_repository_policy_tests(tree: &TempTree) {
+    let isolation = TempTree::new("repository-policy-execution");
+    for directory in ["target", "temp"] {
+        fs::create_dir_all(isolation.join(directory))
+            .expect("create repository policy execution isolation");
+    }
+    let cargo = env::var_os("CARGO").expect("Cargo exposes CARGO to tests");
+    let output = Command::new(cargo)
+        .args([
+            "test",
+            "--locked",
+            "--offline",
+            "--package",
+            REPOSITORY_POLICY_PACKAGE,
+            "--test",
+            "repository_policy",
+            "--",
+            "--skip",
+            "repository_legacy_javascript_surface_does_not_grow",
+        ])
+        .current_dir(&tree.path)
+        .env("CARGO_TARGET_DIR", isolation.join("target"))
+        .env("TMPDIR", isolation.join("temp"))
+        .env("TEMP", isolation.join("temp"))
+        .env("TMP", isolation.join("temp"))
+        .output()
+        .expect("execute copied repository policy tests");
+    assert!(
+        output.status.success(),
+        "copied repository policy tests failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn write_release_workspace(
@@ -3177,6 +3131,31 @@ fn root_gui_family_aliases_and_lock_packages_fail_closed() {
 }
 
 #[test]
+fn gui_family_prefix_boundary_has_an_exact_headless_diagnostic() {
+    let forbidden = final_tree("gui-family-prefix-forbidden");
+    let manifest = forbidden.join("crates/claw-domain/Cargo.toml");
+    let mut text = fs::read_to_string(&manifest).expect("read headless member manifest");
+    text.push_str("\n[dependencies.gtk4-helper]\nversion = \"=1.0.0\"\n");
+    fs::write(&manifest, text).expect("plant exact forbidden GUI-family prefix");
+    assert_eq!(
+        validate_final_static(
+            &SafeRoot::new(&forbidden.path).expect("open forbidden GUI-family fixture")
+        )
+        .expect_err("exact forbidden GUI-family prefix unexpectedly passed")
+        .to_string(),
+        "root/headless manifest contains forbidden GUI dependency: gtk4-helper"
+    );
+
+    let near = final_tree("gui-family-prefix-near");
+    let manifest = near.join("crates/claw-domain/Cargo.toml");
+    let mut text = fs::read_to_string(&manifest).expect("read headless near-miss manifest");
+    text.push_str("\n[dependencies.gtk5-helper]\nversion = \"=1.0.0\"\n");
+    fs::write(manifest, text).expect("plant admitted GUI-family near-miss");
+    validate_final_static(&SafeRoot::new(&near.path).expect("open GUI-family near-miss"))
+        .expect("a dependency outside the forbidden GUI-family boundary must remain admitted");
+}
+
+#[test]
 fn executable_security_fixtures_require_raw_lf_bytes() {
     let fixture_root = repo_root().join(".github/trusted/desktop-supply-chain-policy/policy/final");
     for path in [
@@ -3638,6 +3617,69 @@ fn base_owned_repository_ratchet_rejects_node_in_future_mobile_workflows() {
 }
 
 #[test]
+fn base_owned_repository_ratchet_requires_exact_inert_allowlist_path_and_line() {
+    const ALLOWED_LINE: &str =
+        "if grep -RInE '(^|[[:space:]])(npm|npx|node|bun|pnpm)([[:space:]]|$)' \\";
+
+    let trusted = final_tree("repository-inert-exact-base");
+    let candidate = final_tree("repository-inert-exact-candidate");
+    deactivate_repository_policy(&trusted);
+    deactivate_repository_policy(&candidate);
+    validate_repository_policy_transition(
+        &SafeRoot::new(&trusted.path).expect("open exact inert-line base"),
+        &SafeRoot::new(&candidate.path).expect("open exact inert-line candidate"),
+    )
+    .expect("the exact inert path/line pair must remain accepted");
+
+    for (label, path, replacement) in [
+        (
+            "wrong-path",
+            ".github/workflows/macos-packaging-copy.yml",
+            ALLOWED_LINE.to_owned(),
+        ),
+        (
+            "adjacent-line",
+            ".github/workflows/macos-packaging.yml",
+            format!("{ALLOWED_LINE}\n          npm ci"),
+        ),
+        (
+            "internal-whitespace",
+            ".github/workflows/macos-packaging.yml",
+            ALLOWED_LINE.replacen("if grep", "if  grep", 1),
+        ),
+        (
+            "content-suffix",
+            ".github/workflows/macos-packaging.yml",
+            format!("{ALLOWED_LINE} # near miss"),
+        ),
+    ] {
+        let trusted = final_tree(&format!("repository-inert-{label}-base"));
+        let candidate = final_tree(&format!("repository-inert-{label}-candidate"));
+        deactivate_repository_policy(&trusted);
+        deactivate_repository_policy(&candidate);
+        if path == ".github/workflows/macos-packaging.yml" {
+            replace(&candidate.join(path), ALLOWED_LINE, &replacement);
+        } else {
+            fs::write(candidate.join(path), format!("{replacement}\n"))
+                .expect("plant wrong-path inert line");
+        }
+
+        let error = validate_repository_policy_transition(
+            &SafeRoot::new(&trusted.path).expect("open inert-line base"),
+            &SafeRoot::new(&candidate.path).expect("open inert-line candidate"),
+        )
+        .expect_err("inert-line near miss unexpectedly passed")
+        .to_string();
+        assert!(
+            error.starts_with("candidate introduced new Node workflow/action violations:")
+                && error.contains(path)
+                && error.contains("forbidden workflow token npm"),
+            "{label} inert-line mutation failed through the wrong rule: {error}"
+        );
+    }
+}
+
+#[test]
 fn repository_policy_activation_requires_exact_shape_and_zero_node_workflows() {
     let trusted = final_tree("repository-policy-inactive-base");
     let candidate = final_tree("repository-policy-active-candidate");
@@ -3648,6 +3690,57 @@ fn repository_policy_activation_requires_exact_shape_and_zero_node_workflows() {
     let candidate_root = SafeRoot::new(&candidate.path).expect("open active policy candidate");
     validate_repository_policy_transition(&trusted_root, &candidate_root)
         .expect("accept the exact first repository-policy activation");
+    run_activated_repository_policy_tests(&candidate);
+
+    let array_candidate = final_tree("repository-policy-array-mutation");
+    deactivate_repository_policy(&array_candidate);
+    activate_repository_policy(&array_candidate);
+    replace(
+        &array_candidate.join("crates/claw-repo-policy/tests/repository_policy.rs"),
+        "    \"deno.jsonc\",\n",
+        "    \"deno.jsonc.changed\",\n",
+    );
+    assert_eq!(
+        validate_repository_policy_transition(
+            &trusted_root,
+            &SafeRoot::new(&array_candidate.path).expect("open array-mutation candidate"),
+        )
+        .expect_err("repository policy array mutation unexpectedly passed")
+        .to_string(),
+        "repository policy FORBIDDEN_FILE_NAMES changed from the base-owned contract"
+    );
+
+    for (label, from, to) in [
+        (
+            "no-op-body",
+            "fn inert_workflow_allowlist_requires_exact_path_and_line() {\n    const ALLOWED_PATH",
+            "fn inert_workflow_allowlist_requires_exact_path_and_line() {\n    assert!(true);\n}\n\nfn inert_workflow_allowlist_decoy_body() {\n    const ALLOWED_PATH",
+        ),
+        (
+            "comment-marker-decoy",
+            "#[test]\nfn adversarial_shell_fixture_allowlist_is_exact() {",
+            "// #[test]\n// fn adversarial_shell_fixture_allowlist_is_exact() {}\n#[test]\nfn adversarial_shell_fixture_marker_decoy() {",
+        ),
+    ] {
+        let mutated = final_tree(&format!("repository-policy-{label}"));
+        deactivate_repository_policy(&mutated);
+        activate_repository_policy(&mutated);
+        replace(
+            &mutated.join("crates/claw-repo-policy/tests/repository_policy.rs"),
+            from,
+            to,
+        );
+        assert_eq!(
+            validate_repository_policy_transition(
+                &trusted_root,
+                &SafeRoot::new(&mutated.path).expect("open exact-source mutation candidate"),
+            )
+            .expect_err("repository policy exact-source mutation unexpectedly passed")
+            .to_string(),
+            "repository policy test source changed from the base-owned exact contract",
+            "{label} mutation failed through the wrong diagnostic"
+        );
+    }
 
     fs::remove_file(candidate.join("crates/claw-repo-policy/tests/repository_policy.rs"))
         .expect("remove required policy self-tests");
@@ -3751,6 +3844,61 @@ fn root_workspace_growth_rejects_orphans_nested_locks_sources_and_gui() {
             "negative root workspace case unexpectedly passed: {case}"
         );
     }
+}
+
+#[test]
+fn nested_lockfile_boundaries_distinguish_final_and_bootstrap() {
+    let final_exact = final_tree("nested-lock-final-exact");
+    fs::write(
+        final_exact.join("crates/claw-domain/Cargo.lock"),
+        "version = 4\n",
+    )
+    .expect("plant nested Final lock");
+    assert_eq!(
+        validate_final_static(
+            &SafeRoot::new(&final_exact.path).expect("open nested Final lock fixture")
+        )
+        .expect_err("nested Final Cargo.lock unexpectedly passed")
+        .to_string(),
+        "Cargo.lock inventory contains unadmitted locations: [\"crates/claw-domain/Cargo.lock\"]"
+    );
+
+    let final_near = final_tree("nested-lock-final-near");
+    fs::write(
+        final_near.join("crates/claw-domain/Cargo.lock.bak"),
+        "near name\n",
+    )
+    .expect("plant Final lock near-name");
+    validate_final_static(&SafeRoot::new(&final_near.path).expect("open Final lock near-name"))
+        .expect("Cargo.lock near-name must not enter the Final lock inventory");
+
+    let bootstrap_exact = bootstrap_tree("nested-lock-bootstrap-exact");
+    fs::write(
+        bootstrap_exact.join("crates/claw-domain/Cargo.lock"),
+        "version = 4\n",
+    )
+    .expect("plant nested Bootstrap lock");
+    assert!(
+        !is_bootstrap_state(
+            &SafeRoot::new(&bootstrap_exact.path).expect("open nested Bootstrap lock fixture")
+        )
+        .expect("classify Bootstrap tree with nested lock"),
+        "BOOTSTRAP_LOCKS must reject an added exact nested Cargo.lock"
+    );
+
+    let bootstrap_near = bootstrap_tree("nested-lock-bootstrap-near");
+    fs::write(
+        bootstrap_near.join("crates/claw-domain/Cargo.lock.bak"),
+        "near name\n",
+    )
+    .expect("plant Bootstrap lock near-name");
+    assert!(
+        is_bootstrap_state(
+            &SafeRoot::new(&bootstrap_near.path).expect("open Bootstrap lock near-name")
+        )
+        .expect("classify Bootstrap tree with lock near-name"),
+        "Cargo.lock near-name must not enter BOOTSTRAP_LOCKS"
+    );
 }
 
 #[test]
@@ -4010,10 +4158,9 @@ fn run_git(git: &Path, cwd: &Path, args: &[&str]) -> String {
 
 #[test]
 fn trusted_git_manifest_covers_more_than_three_hundred_files() {
-    let Some(git) = env::var_os("GIT_BIN").map(PathBuf::from) else {
-        eprintln!("GIT_BIN is not set; hosted bootstrap requires and runs this test");
-        return;
-    };
+    let git = env::var_os("GIT_BIN")
+        .map(PathBuf::from)
+        .expect("GIT_BIN must be set so the Git-backed manifest branches execute");
     assert!(git.is_absolute());
     let fixture = TempTree::new("git-diff");
     let trusted = fixture.join("trusted");
@@ -4100,6 +4247,34 @@ fn trusted_git_manifest_covers_more_than_three_hundred_files() {
     );
     assert!(!is_policy_relevant("docs/source.pack"));
     let pack_root = candidate.join(".git/objects/pack");
+    for name in [
+        "policy-extension-control.pack",
+        "policy-extension-control.IDX",
+        "policy-extension-control.rev",
+    ] {
+        fs::write(pack_root.join(name), []).expect("write allowed Git pack extension control");
+    }
+    compute_manifest(&git, &trusted, &candidate, &isolated_home, &base, &head)
+        .expect("real Git pack, idx, and rev suffixes must remain accepted");
+
+    for name in [
+        "policy-extension-near.pack.bak",
+        "policy-extension-near.packx",
+        "policy-extensionless",
+    ] {
+        let path = pack_root.join(name);
+        fs::write(&path, []).expect("write forbidden Git pack near-name");
+        let error = compute_manifest(&git, &trusted, &candidate, &isolated_home, &base, &head)
+            .expect_err("forbidden Git pack near-name unexpectedly passed")
+            .to_string();
+        assert!(
+            error.contains("Git pack directory contains an unexpected entry:")
+                && error.contains(name),
+            "Git pack near-name failed through the wrong rule: {error}"
+        );
+        fs::remove_file(path).expect("remove forbidden Git pack near-name");
+    }
+
     let mut fake_packs = Vec::new();
     for index in 0..=MAX_GIT_PACK_FILES {
         let path = pack_root.join(format!("pack-fake-{index:03}.pack"));

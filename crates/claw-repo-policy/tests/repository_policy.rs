@@ -358,6 +358,161 @@ runs:
 }
 
 #[test]
+fn workflow_and_local_action_directory_indirections_are_known_and_skipped() {
+    // Windows directory junctions are name-surrogate reparse points that Rust
+    // 1.94 reports as symlinks. This does not claim that every reparse point is.
+    let workflow_root_target = TemporaryTree::new("workflow-root-target");
+    workflow_root_target.write("hidden.yml", b"npm ci\n");
+    let workflow_root = TemporaryTree::new("workflow-root-link");
+    workflow_root.write(
+        "regular/action.yml",
+        b"name: regular\nruns:\n  using: composite\n  steps:\n    - run: npm ci\n",
+    );
+    fs::create_dir_all(workflow_root.path().join(".github"))
+        .expect("create workflow-root link parent");
+    fs::create_dir_all(workflow_root.path().join("ordinary-control"))
+        .expect("create ordinary directory control");
+    let workflow_root_link = workflow_root.path().join(".github/workflows");
+    create_directory_indirection(workflow_root_target.path(), &workflow_root_link);
+    assert_directory_indirection_known_answer(
+        &workflow_root_link,
+        &workflow_root.path().join("ordinary-control"),
+    );
+    let mut violations = scan_workflows(workflow_root.path()).expect("scan indirect workflow root");
+    violations.extend(
+        scan_local_actions(workflow_root.path()).expect("scan regular action sibling control"),
+    );
+    violations.sort();
+    assert_eq!(
+        violations,
+        ["regular/action.yml:5: forbidden workflow token npm"]
+    );
+
+    let workflow_entry_target = TemporaryTree::new("workflow-entry-target");
+    workflow_entry_target.write("hidden.yml", b"npm ci\n");
+    let workflow_entry = TemporaryTree::new("workflow-entry-link");
+    workflow_entry.write(".github/workflows/sibling.yml", b"npm ci\n");
+    fs::create_dir_all(
+        workflow_entry
+            .path()
+            .join(".github/workflows/ordinary-control"),
+    )
+    .expect("create ordinary workflow entry control");
+    let workflow_entry_link = workflow_entry.path().join(".github/workflows/linked.yml");
+    create_directory_indirection(workflow_entry_target.path(), &workflow_entry_link);
+    assert_directory_indirection_known_answer(
+        &workflow_entry_link,
+        &workflow_entry
+            .path()
+            .join(".github/workflows/ordinary-control"),
+    );
+    assert_eq!(
+        scan_workflows(workflow_entry.path()).expect("scan indirect workflow entry"),
+        [".github/workflows/sibling.yml:1: forbidden workflow token npm"]
+    );
+
+    let local_action_target = TemporaryTree::new("local-action-target");
+    local_action_target.write(
+        "action.yml",
+        b"name: hidden\nruns:\n  using: composite\n  steps:\n    - run: npm ci\n",
+    );
+    let local_action = TemporaryTree::new("local-action-link");
+    local_action.write(
+        "regular/action.yml",
+        b"name: regular\nruns:\n  using: composite\n  steps:\n    - run: npm ci\n",
+    );
+    fs::create_dir_all(local_action.path().join("ordinary-control"))
+        .expect("create ordinary local-action control");
+    let local_action_link = local_action.path().join("linked-action");
+    create_directory_indirection(local_action_target.path(), &local_action_link);
+    assert_directory_indirection_known_answer(
+        &local_action_link,
+        &local_action.path().join("ordinary-control"),
+    );
+    assert_eq!(
+        scan_local_actions(local_action.path()).expect("scan indirect local action entry"),
+        ["regular/action.yml:5: forbidden workflow token npm"]
+    );
+}
+
+#[test]
+fn inert_workflow_allowlist_requires_exact_path_and_line() {
+    const ALLOWED_PATH: &str = ".github/workflows/macos-packaging.yml";
+    const ALLOWED_LINE: &str =
+        "if grep -RInE '(^|[[:space:]])(npm|npx|node|bun|pnpm)([[:space:]]|$)' \\";
+    assert!(
+        ALLOWED_INERT_WORKFLOW_LINES.contains(&(ALLOWED_PATH, ALLOWED_LINE)),
+        "the production inert-line allowlist changed from its audited path/line pair"
+    );
+    let mut violations = Vec::new();
+    scan_policy_document(ALLOWED_PATH, ALLOWED_LINE, &mut violations);
+    assert!(
+        violations.is_empty(),
+        "the exact inert line must stay allowed"
+    );
+
+    for (label, path, document, expected_line) in [
+        (
+            "wrong path",
+            ".github/workflows/macos-packaging-copy.yml",
+            ALLOWED_LINE.to_owned(),
+            1,
+        ),
+        (
+            "adjacent active line",
+            ALLOWED_PATH,
+            format!("{ALLOWED_LINE}\nnpm ci"),
+            2,
+        ),
+        (
+            "internal whitespace",
+            ALLOWED_PATH,
+            ALLOWED_LINE.replacen("if grep", "if  grep", 1),
+            1,
+        ),
+        (
+            "content suffix",
+            ALLOWED_PATH,
+            format!("{ALLOWED_LINE} # near miss"),
+            1,
+        ),
+    ] {
+        let mut violations = Vec::new();
+        scan_policy_document(path, &document, &mut violations);
+        assert!(
+            violations.iter().any(|violation| {
+                violation == &format!("{path}:{expected_line}: forbidden workflow token npm")
+            }),
+            "{label} escaped the exact inert-line allowlist: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn adversarial_shell_fixture_allowlist_is_exact() {
+    let fixture = TemporaryTree::new("adversarial-shell-boundary");
+    for relative in [
+        ".github/fixtures/security-tools/bash-env-poison.sh",
+        ".github/fixtures/security-tools/bash-env-poison-copy.sh",
+        ".github/fixtures/security-tools/nested/bash-env-poison.sh",
+    ] {
+        fixture.write(relative, b"#!/usr/bin/env bash\n");
+    }
+
+    assert_eq!(
+        scan_tree(
+            fixture.path(),
+            &[".github/fixtures/security-tools/bash-env-poison.sh"]
+        )
+        .expect("scan exact adversarial shell fixture allowlist"),
+        [
+            ".github/fixtures/security-tools/bash-env-poison-copy.sh (unapproved adversarial shell fixture)",
+            ".github/fixtures/security-tools/nested/bash-env-poison.sh (unapproved adversarial shell fixture)"
+        ]
+    );
+}
+
+#[test]
 fn container_definitions_cannot_reintroduce_a_node_runtime() {
     let fixture = TemporaryTree::new("containers");
     fixture.write(
@@ -898,6 +1053,66 @@ fn is_forbidden_file(path: &Path) -> bool {
         });
 
     forbidden_name || forbidden_extension
+}
+
+#[cfg(windows)]
+fn create_directory_indirection(target: &Path, link: &Path) {
+    let link = link.to_string_lossy().replace('/', "\\");
+    let target = target.to_string_lossy().replace('/', "\\");
+    let command = format!("mklink /J \"{link}\" \"{target}\"");
+    let output = Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J", &link, &target])
+        .output()
+        .expect("create Windows directory junction");
+    assert!(
+        output.status.success(),
+        "mklink /J failed for {command:?}: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+fn create_directory_indirection(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).expect("create directory symlink");
+}
+
+fn directory_entry_file_type(path: &Path) -> fs::FileType {
+    let parent = path.parent().expect("indirection has a parent");
+    let name = path.file_name().expect("indirection has a file name");
+    fs::read_dir(parent)
+        .expect("read indirection parent")
+        .map(|entry| entry.expect("read indirection entry"))
+        .find(|entry| entry.file_name() == name)
+        .expect("find indirection entry")
+        .file_type()
+        .expect("read indirection file type")
+}
+
+fn assert_directory_indirection_known_answer(link: &Path, ordinary: &Path) {
+    let link_type = directory_entry_file_type(link);
+    assert!(
+        link_type.is_symlink(),
+        "Rust must classify the planted directory indirection as a symlink"
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        let attributes = fs::symlink_metadata(link)
+            .expect("read junction metadata")
+            .file_attributes();
+        assert_ne!(
+            attributes & FILE_ATTRIBUTE_REPARSE_POINT,
+            0,
+            "mklink /J did not create a reparse point"
+        );
+    }
+
+    let ordinary_type = directory_entry_file_type(ordinary);
+    assert!(ordinary_type.is_dir());
+    assert!(!ordinary_type.is_symlink());
 }
 
 struct TemporaryTree {

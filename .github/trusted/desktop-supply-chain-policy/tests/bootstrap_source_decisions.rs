@@ -320,6 +320,22 @@ fn append_standing(tree: &TempTree, path: &str, payload_sha256: &str, fingerprin
     fs::write(ledger, text).expect("write fixture ledger");
 }
 
+fn replace_first_rationale_literal(tree: &TempTree, literal: &str) {
+    let ledger = tree.join(BOOTSTRAP_SOURCE_DECISIONS_PATH);
+    let mut text = fs::read_to_string(&ledger).expect("read rationale fixture ledger");
+    let start = text.find("rationale = ").expect("find rationale field");
+    let end = text[start..]
+        .find('\n')
+        .map(|offset| start + offset)
+        .expect("find rationale line ending");
+    text.replace_range(start..end, &format!("rationale = {literal}"));
+    fs::write(ledger, text).expect("write rationale fixture ledger");
+}
+
+fn replace_first_rationale(tree: &TempTree, rationale: &str) {
+    replace_first_rationale_literal(tree, &quote(rationale));
+}
+
 fn copy_directory(source: &Path, destination: &Path) {
     fs::create_dir_all(destination).expect("create fixture directory");
     for entry in fs::read_dir(source).expect("read fixture directory") {
@@ -623,6 +639,143 @@ fn malformed_schema_hash_duplicate_unsorted_and_noncanonical_ledgers_fail() {
             expected,
         );
     }
+}
+
+#[test]
+fn rationale_and_ledger_bounds_are_exact_for_decisions_and_standing_preservations() {
+    const MAX_RATIONALE_BYTES: usize = 512;
+    const MAX_DECISIONS: usize = 4096;
+    const MAX_LEDGER_BYTES: usize = 1024 * 1024;
+
+    for rationale_length in [1, MAX_RATIONALE_BYTES] {
+        let trusted = snapshot_fixture(&format!("ordinary-rationale-{rationale_length}-trusted"));
+        let candidate =
+            snapshot_fixture(&format!("ordinary-rationale-{rationale_length}-candidate"));
+        let mut decision = placeholder_decision(1, UPSTREAM_WORKFLOW);
+        decision.rationale = "A".repeat(rationale_length);
+        write_ledger(&trusted, std::slice::from_ref(&decision));
+        write_ledger(&candidate, &[decision]);
+        validate(&trusted, &candidate, &manifest([])).unwrap_or_else(|error| {
+            panic!("ordinary rationale length {rationale_length}: {error}")
+        });
+
+        let trusted = snapshot_fixture(&format!("standing-rationale-{rationale_length}-trusted"));
+        let candidate =
+            snapshot_fixture(&format!("standing-rationale-{rationale_length}-candidate"));
+        let rationale = "A".repeat(rationale_length);
+        replace_first_rationale(&trusted, &rationale);
+        replace_first_rationale(&candidate, &rationale);
+        validate(&trusted, &candidate, &manifest([])).unwrap_or_else(|error| {
+            panic!("standing rationale length {rationale_length}: {error}")
+        });
+    }
+
+    for (label, rationale) in [
+        ("empty", String::new()),
+        ("over-max", "A".repeat(MAX_RATIONALE_BYTES + 1)),
+    ] {
+        let trusted = snapshot_fixture(&format!("ordinary-rationale-{label}-trusted"));
+        let candidate = snapshot_fixture(&format!("ordinary-rationale-{label}-candidate"));
+        let mut decision = placeholder_decision(1, UPSTREAM_WORKFLOW);
+        decision.rationale = rationale.clone();
+        write_ledger(&candidate, &[decision]);
+        expect_error(
+            &trusted,
+            &candidate,
+            &manifest([('M', BOOTSTRAP_SOURCE_DECISIONS_PATH)]),
+            "rationale must be 1..=512 bytes of trimmed printable ASCII",
+        );
+
+        let trusted = snapshot_fixture(&format!("standing-rationale-{label}-trusted"));
+        let candidate = snapshot_fixture(&format!("standing-rationale-{label}-candidate"));
+        replace_first_rationale(&candidate, &rationale);
+        expect_error(
+            &trusted,
+            &candidate,
+            &manifest([('M', BOOTSTRAP_SOURCE_DECISIONS_PATH)]),
+            "rationale must be 1..=512 bytes of trimmed printable ASCII",
+        );
+    }
+
+    for kind in ["ordinary", "standing"] {
+        let trusted = snapshot_fixture(&format!("{kind}-rationale-control-trusted"));
+        let candidate = snapshot_fixture(&format!("{kind}-rationale-control-candidate"));
+        if kind == "ordinary" {
+            write_ledger(&candidate, &[placeholder_decision(1, UPSTREAM_WORKFLOW)]);
+        }
+        replace_first_rationale_literal(&candidate, "\"\\u0007\"");
+        expect_error(
+            &trusted,
+            &candidate,
+            &manifest([('M', BOOTSTRAP_SOURCE_DECISIONS_PATH)]),
+            "rationale must be 1..=512 bytes of trimmed printable ASCII",
+        );
+    }
+
+    let trusted = snapshot_fixture("standing-noncanonical-trusted");
+    let candidate = snapshot_fixture("standing-noncanonical-candidate");
+    append_bytes(&candidate, BOOTSTRAP_SOURCE_DECISIONS_PATH, b"\n");
+    expect_error(
+        &trusted,
+        &candidate,
+        &manifest([('M', BOOTSTRAP_SOURCE_DECISIONS_PATH)]),
+        "is not canonical",
+    );
+
+    let trusted = snapshot_fixture("standing-empty-trusted");
+    let candidate = snapshot_fixture("standing-empty-candidate");
+    fs::write(
+        candidate.join(BOOTSTRAP_SOURCE_DECISIONS_PATH),
+        "schema_version = 1\ndecisions = []\nstanding = []\n",
+    )
+    .expect("write empty standing array");
+    expect_error(
+        &trusted,
+        &candidate,
+        &manifest([('M', BOOTSTRAP_SOURCE_DECISIONS_PATH)]),
+        "standing must be omitted when empty",
+    );
+
+    let too_many = std::iter::repeat_n("0", MAX_DECISIONS + 1)
+        .collect::<Vec<_>>()
+        .join(",");
+    for (kind, ledger, expected) in [
+        (
+            "ordinary",
+            format!("schema_version = 1\ndecisions = [{too_many}]\n"),
+            "exceeds 4096 decisions",
+        ),
+        (
+            "standing",
+            format!("schema_version = 1\ndecisions = []\nstanding = [{too_many}]\n"),
+            "exceeds 4096 standing preservations",
+        ),
+    ] {
+        let trusted = snapshot_fixture(&format!("{kind}-count-trusted"));
+        let candidate = snapshot_fixture(&format!("{kind}-count-candidate"));
+        fs::write(candidate.join(BOOTSTRAP_SOURCE_DECISIONS_PATH), ledger)
+            .expect("write over-count decision ledger");
+        expect_error(
+            &trusted,
+            &candidate,
+            &manifest([('M', BOOTSTRAP_SOURCE_DECISIONS_PATH)]),
+            expected,
+        );
+    }
+
+    let trusted = snapshot_fixture("ledger-size-trusted");
+    let candidate = snapshot_fixture("ledger-size-candidate");
+    fs::write(
+        candidate.join(BOOTSTRAP_SOURCE_DECISIONS_PATH),
+        vec![b'#'; MAX_LEDGER_BYTES + 1],
+    )
+    .expect("write oversized decision ledger");
+    expect_error(
+        &trusted,
+        &candidate,
+        &manifest([('M', BOOTSTRAP_SOURCE_DECISIONS_PATH)]),
+        "candidate policy input exceeds 1048576 bytes",
+    );
 }
 
 #[test]
