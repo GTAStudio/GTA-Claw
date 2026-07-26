@@ -70,9 +70,9 @@ version = "=0.9.4"
 
 # russh 0.62 requires generic-array 1.x, and the 1.x line depends on 0.14 through
 # its non-optional compat-0_14 bridge. The duplicate is therefore structural: no
-# version selection elsewhere in the graph can eliminate it. Re-evaluate when
-# Cranelift migrates to SHA-2 0.11; remove only when the inverse tree also proves
-# that russh no longer requires the bridge.
+# version selection elsewhere in the graph can eliminate it. Owner: claw-nodes
+# maintainers. Remove when russh upstream drops compat-0_14, or when an audited
+# equivalent patch removes the bridge.
 [[bans.skip]]
 name = "generic-array"
 version = "=0.14.7"
