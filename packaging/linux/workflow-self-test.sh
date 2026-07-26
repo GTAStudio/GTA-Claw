@@ -488,7 +488,7 @@ validate_workflow() {
 
   assert_required_job \
     source-policy \
-    fbb6ea327ba44a95255f5e2f08ee460026f3953055a27539b2029fd112bf6f29 \
+    3d3607c094bdedd84163df7ad88299fe871c746469854c92b378d808d695e922 \
     "$(printf '%s\n' \
       'Checkout without credential persistence' \
       'Install native policy tools' \

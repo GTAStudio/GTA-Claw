@@ -43,6 +43,9 @@ lock_holder_job=
 lifecycle_gate_dir=
 lifecycle_lock_job=
 zombie_parent_job=
+transition_gate_dir=
+transition_stop_job=
+transition_rpm_job=
 
 install_policy_denial() {
   [[ ! -e /usr/sbin/policy-rc.d && ! -L /usr/sbin/policy-rc.d ]] ||
@@ -53,10 +56,62 @@ install_policy_denial() {
   policy_installed=1
 }
 
+begin_daemon_deactivation() {
+  transition_gate_dir="$(sudo mktemp -d /run/gta-claw/transition.XXXXXXXX)"
+  sudo chown gta-claw:gta-claw "$transition_gate_dir"
+  sudo chmod 0700 "$transition_gate_dir"
+  sudo tee "$transition_gate_dir/hold-stop" >/dev/null <<EOF
+#!/bin/sh
+set -eu
+touch '$transition_gate_dir/entered'
+while [ ! -e '$transition_gate_dir/release' ]; do
+  sleep 0.05
+done
+EOF
+  sudo chmod 0755 "$transition_gate_dir/hold-stop"
+  sudo mkdir -p /etc/systemd/system/gta-claw-daemon.service.d
+  sudo tee /etc/systemd/system/gta-claw-daemon.service.d/transition.conf >/dev/null <<EOF
+[Service]
+ExecStop=$transition_gate_dir/hold-stop
+TimeoutStopSec=30s
+EOF
+  sudo systemctl daemon-reload
+  sudo systemctl stop gta-claw-daemon.service &
+  transition_stop_job=$!
+  deadline=$((SECONDS + 10))
+  while ! sudo test -e "$transition_gate_dir/entered" ||
+    [[ "$(systemctl show -P ActiveState gta-claw-daemon.service)" != "deactivating" ]]; do
+    ((SECONDS < deadline)) ||
+      die "daemon did not enter the deactivating RPM fixture"
+    sleep 0.05
+  done
+}
+
+finish_daemon_deactivation() {
+  sudo rm -f /etc/systemd/system/gta-claw-daemon.service.d/transition.conf
+  sudo systemctl daemon-reload
+  sudo touch "$transition_gate_dir/release"
+  wait "$transition_stop_job"
+  transition_stop_job=
+  wait "$transition_rpm_job"
+  transition_rpm_job=
+  sudo rm -rf "$transition_gate_dir"
+  transition_gate_dir=
+}
+
 remove_policy_denial() {
   if [[ "$policy_installed" -eq 1 ]]; then
     sudo rm -f /usr/sbin/policy-rc.d
     policy_installed=0
+  fi
+  if [[ -n "$transition_gate_dir" ]]; then
+    sudo touch "$transition_gate_dir/release" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$transition_rpm_job" ]]; then
+    wait "$transition_rpm_job" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$transition_stop_job" ]]; then
+    wait "$transition_stop_job" >/dev/null 2>&1 || true
   fi
 }
 
@@ -64,6 +119,9 @@ cleanup() {
   remove_policy_denial
   if [[ -n "$lock_gate_dir" ]]; then
     sudo touch "$lock_gate_dir/release" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$transition_gate_dir" ]]; then
+    sudo rm -rf "$transition_gate_dir"
   fi
   if [[ -n "$lock_holder_job" ]]; then
     wait "$lock_holder_job" >/dev/null 2>&1 || true
@@ -930,6 +988,33 @@ rpm_upgrade_snapshot="$(state_identity_snapshot)"
 sudo rpm -Uvh --nodeps "$rpm2"
 assert_active_restart "$rpm_pid"
 assert_identity_preserved "$rpm_upgrade_snapshot"
+rpm_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+rpm_transition_snapshot="$(state_identity_snapshot)"
+rpm_transition_receipt="$(
+  stat -Lc '%d:%i:%s:%y:%z' /usr/libexec/gta-claw/gta-claw-daemon
+)"
+begin_daemon_deactivation
+[[ ! -e /run/gta-claw-state-init/replacement-fenced ]] ||
+  die "RPM transitional-state fixture started with a stale replacement fence"
+sudo rpm -Uvh --nodeps --replacepkgs "$rpm2" \
+  >/dev/null 2>&1 &
+transition_rpm_job=$!
+deadline=$((SECONDS + 10))
+while [[ ! -e /run/gta-claw-state-init/replacement-fenced ]]; do
+  kill -0 "$transition_rpm_job" >/dev/null 2>&1 ||
+    die "RPM transitional-state replacement exited before fencing"
+  ((SECONDS < deadline)) ||
+    die "RPM transitional-state replacement did not establish its fence"
+  sleep 0.05
+done
+[[ "$(systemctl show -P ActiveState gta-claw-daemon.service)" == "deactivating" ]] ||
+  die "RPM transitional-state fixture left deactivating before release"
+[[ "$(stat -Lc '%d:%i:%s:%y:%z' /usr/libexec/gta-claw/gta-claw-daemon)" == \
+  "$rpm_transition_receipt" ]] ||
+  die "RPM replaced the daemon before transitional stop completed"
+finish_daemon_deactivation
+assert_active_restart "$rpm_pid"
+assert_identity_preserved "$rpm_transition_snapshot"
 install_failure_dropin Unit 'RefuseManualStop=yes'
 rpm_pre_hash="$(sha256sum /usr/libexec/gta-claw/gta-claw-daemon)"
 if sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"; then

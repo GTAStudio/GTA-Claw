@@ -25,6 +25,14 @@ require_linux() {
   [[ "$(uname -s)" == "Linux" ]] || die "this operation requires Linux"
 }
 
+assert_no_protected_payload_path() {
+  local label="$1"
+  local listing="$2"
+  if grep -Eq '(^|/)(var/lib/gta-claw-protected)(/|$)' <<<"$listing"; then
+    die "$label owns the LinuxProtected namespace or a descendant"
+  fi
+}
+
 validate_release_version() {
   [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
     die "version must be numeric X.Y.Z: $1"

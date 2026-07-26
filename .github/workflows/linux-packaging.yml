@@ -105,7 +105,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "b2ce476ecc84143cfa0c071d6289ab35ec1f425ac4aa5af5fc47e6cc3258da82  crates/claw-sqlite-file-control/Cargo.toml" |
+          echo "12f3b3d87c1b21337285be2e320935539c4c52bdbb9b0c349e1f85fab658ea01  crates/claw-sqlite-file-control/Cargo.toml" |
             sha256sum -c -
           if grep -Eq 'test-hooks|public.*raw.?handle|raw.?handle.*public' \
             crates/claw-sqlite-file-control/Cargo.toml; then

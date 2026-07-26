@@ -9,16 +9,19 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 require_linux
-for tool in gcc jq patchelf python3 readelf rpm rpmbuild sha256sum tar; do
+for tool in dpkg-deb gcc jq patchelf python3 readelf rpm rpmbuild sha256sum tar; do
   require_tool "$tool"
 done
 [[ "$(sha256_file "$REPO_ROOT/crates/claw-sqlite-file-control/Cargo.toml")" == \
-  "b2ce476ecc84143cfa0c071d6289ab35ec1f425ac4aa5af5fc47e6cc3258da82" ]] ||
+  "12f3b3d87c1b21337285be2e320935539c4c52bdbb9b0c349e1f85fab658ea01" ]] ||
   die "protected SQLite file-control manifest hash changed"
 if grep -Eq 'test-hooks|public.*raw.?handle|raw.?handle.*public' \
   "$REPO_ROOT/crates/claw-sqlite-file-control/Cargo.toml"; then
   die "protected SQLite file-control manifest exposes a test or raw-handle feature"
 fi
+grep -F 'active | activating | reloading | deactivating)' \
+  "$SCRIPT_DIR/rpm/pre.in" >/dev/null ||
+  die "RPM pre-install does not classify transitional daemon states as restart intent"
 initialize_output_root
 work="$OUTPUT_ROOT/tests"
 ensure_output_directory "$work"
@@ -368,6 +371,7 @@ build_scriptlet_fixture() {
   local extra="$2"
   local file_extra="${3:-}"
   local header_extra="${4:-}"
+  local install_extra="${5:-}"
   local top="$work/rpm-$name"
   local spec="$top/SPECS/$name.spec"
   mkdir -p "$top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
@@ -390,7 +394,11 @@ build_scriptlet_fixture() {
       '%build' \
       '%install' \
       'mkdir -p %{buildroot}/usr/share/gta-claw-test' \
-      'printf fixture >%{buildroot}/usr/share/gta-claw-test/value' \
+      'printf fixture >%{buildroot}/usr/share/gta-claw-test/value'
+    if [[ -n "$install_extra" ]]; then
+      printf '%s\n' "$install_extra"
+    fi
+    printf '%s\n' \
       '%files' \
       '/usr/share/gta-claw-test/value'
     if [[ -n "$file_extra" ]]; then
@@ -426,6 +434,46 @@ ghost_rpm="$(
 )"
 if (reject_rpm_ghost_files "$ghost_rpm"); then
   die "RPM header policy accepted a ghost path"
+fi
+protected_root="$work/protected-payload"
+mkdir -p "$protected_root/var/lib/gta-claw-protected"
+printf 'forbidden\n' >"$protected_root/var/lib/gta-claw-protected/value"
+tar -czf "$work/protected-payload.tar.gz" -C "$protected_root" .
+if (assert_no_protected_payload_path \
+  "malicious native tar" \
+  "$(tar -tzf "$work/protected-payload.tar.gz")"); then
+  die "native tar member policy accepted the LinuxProtected namespace"
+fi
+protected_deb_root="$work/protected-deb"
+mkdir -p \
+  "$protected_deb_root/DEBIAN" \
+  "$protected_deb_root/var/lib/gta-claw-protected"
+printf '%s\n' \
+  'Package: gta-claw-protected-test' \
+  'Version: 1' \
+  'Architecture: all' \
+  'Maintainer: GTA Claw test' \
+  'Description: protected payload policy fixture' \
+  >"$protected_deb_root/DEBIAN/control"
+printf 'forbidden\n' >"$protected_deb_root/var/lib/gta-claw-protected/value"
+dpkg-deb --build "$protected_deb_root" "$work/protected-payload.deb" >/dev/null
+if (assert_no_protected_payload_path \
+  "malicious Debian package" \
+  "$(dpkg-deb --fsys-tarfile "$work/protected-payload.deb" | tar -tf -)"); then
+  die "Debian member policy accepted the LinuxProtected namespace"
+fi
+protected_rpm="$(
+  build_scriptlet_fixture \
+    gta-claw-protected-payload-test \
+    "" \
+    '/var/lib/gta-claw-protected/value' \
+    "" \
+    $'mkdir -p %{buildroot}/var/lib/gta-claw-protected\nprintf forbidden >%{buildroot}/var/lib/gta-claw-protected/value'
+)"
+if (assert_no_protected_payload_path \
+  "malicious RPM package" \
+  "$(rpm -qlp "$protected_rpm")"); then
+  die "RPM member policy accepted the LinuxProtected namespace"
 fi
 node_requirement_rpm="$(
   build_scriptlet_fixture \

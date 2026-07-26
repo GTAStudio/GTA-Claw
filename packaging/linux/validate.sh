@@ -149,14 +149,6 @@ assert_root_owned_tree() {
   [[ -z "$bad" ]] || die "$label contains non-root ownership: $bad"
 }
 
-assert_no_protected_payload_path() {
-  local label="$1"
-  local listing="$2"
-  if grep -Eq '(^|/)(var/lib/gta-claw-protected)(/|$)' <<<"$listing"; then
-    die "$label owns the LinuxProtected namespace or a descendant"
-  fi
-}
-
 assert_mode() {
   local root="$1"
   local path="$2"
