@@ -457,6 +457,146 @@ const PINNED_BUILD_ARTIFACTS: [(&str, &str, &str, &str, &str); 2] = [
     ),
 ];
 
+/// Read-only view of the reviewed build-artifact pins for cross-module structural checks -- for
+/// example, forbidding a workflow from duplicating one of these URLs or digests as a YAML
+/// literal instead of deriving it from `resolve-build-artifact`/`verify-build-artifact`.
+pub(crate) fn pinned_build_artifacts() -> &'static [(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+)] {
+    &PINNED_BUILD_ARTIFACTS
+}
+
+/// Maximum bytes read when verifying a prefetched build artifact against its reviewed pin.
+///
+/// This validator never fetches the archive itself, only verifies bytes a workflow already
+/// prefetched, but the read is still bounded well above any real Skia archive size so a hostile
+/// or corrupted file cannot force unbounded memory use.
+const MAX_BUILD_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Resolves the exact reviewed `(url, digest)` pin for `package`/`version`/`target`.
+///
+/// This is the machine-safe half of the build-artifact CLI contract: a mobile packaging workflow
+/// calls it to learn which URL to fetch and which digest to expect, and never inlines either
+/// value itself. The lookup is exact and fails closed: an unadmitted target, a missing pin, or --
+/// defensively, since `validate_build_artifact_pin_table` already forbids it in the production
+/// table -- a duplicated pin are all rejected rather than resolved by guessing.
+pub fn resolved_build_artifact_pin(
+    package: &str,
+    version: &str,
+    target: &str,
+) -> PolicyResult<(&'static str, &'static str)> {
+    if !admitted_skia_targets().contains(target) {
+        return Err(PolicyError::new(format!(
+            "build-artifact target is not admitted: {target}"
+        )));
+    }
+    let mut matches = PINNED_BUILD_ARTIFACTS
+        .iter()
+        .filter(|(p, v, t, _, _)| *p == package && *v == version && *t == target);
+    let Some((_, _, _, url, digest)) = matches.next() else {
+        return Err(PolicyError::new(format!(
+            "no reviewed build-artifact pin for {package} {version} {target}"
+        )));
+    };
+    if matches.next().is_some() {
+        return Err(PolicyError::new(format!(
+            "reviewed build-artifact pin is ambiguous (duplicated) for {package} {version} {target}"
+        )));
+    }
+    Ok((*url, *digest))
+}
+
+/// Converts an absolute local filesystem path into a `file://` URL, the form `SKIA_BINARIES_URL`
+/// accepts to populate `skia-bindings`' build-time cache without a network fetch.
+///
+/// Strips a Windows `\\?\` verbatim-path prefix (added by `Path::canonicalize` on Windows, where
+/// this validator's own test suite runs) and normalizes remaining separators, so the same logic
+/// produces a correct URL whether the workflow runs on the macOS runner it targets or is
+/// exercised by a hermetic test on any host.
+///
+/// Exposed so the URL construction is proven directly against synthetic paths, since a real
+/// pinned archive is too large to carry in this repository's test fixtures.
+pub fn build_artifact_file_url(path: &str) -> String {
+    let normalized = path
+        .strip_prefix(r"\\?\")
+        .unwrap_or(path)
+        .replace('\\', "/");
+    if let Some(rest) = normalized.strip_prefix('/') {
+        format!("file:///{rest}")
+    } else {
+        format!("file:///{normalized}")
+    }
+}
+
+/// Verifies `bytes` against a reviewed `expected_digest` (lowercase SHA-256), recomputing the
+/// digest from the bytes themselves rather than trusting any caller-supplied value.
+///
+/// Kept separate from [`verify_build_artifact`] so the digest comparison itself -- the actual
+/// security-relevant check -- is directly testable on small synthetic byte strings, since a real
+/// pinned Skia archive is far too large to carry in this repository's test fixtures.
+pub fn verify_artifact_bytes(expected_digest: &str, bytes: &[u8]) -> PolicyResult<()> {
+    let digest = sha256(bytes);
+    if digest != expected_digest {
+        return Err(PolicyError::new(format!(
+            "checksum mismatch: expected {expected_digest}, found {digest}"
+        )));
+    }
+    Ok(())
+}
+
+/// Verifies a locally prefetched build artifact against its reviewed pin and returns an absolute
+/// `file://` URL for it, ready to export as `SKIA_BINARIES_URL`.
+///
+/// Reads at most [`MAX_BUILD_ARTIFACT_BYTES`] and never trusts a caller-supplied digest: it
+/// always recomputes SHA-256 from the file's own bytes and compares it to the reviewed pin. Fails
+/// closed on a missing pin, an oversized file, or a checksum mismatch, so a `file://` URL is
+/// returned only when the bytes on disk are exactly the reviewed archive.
+pub fn verify_build_artifact(
+    package: &str,
+    version: &str,
+    target: &str,
+    file: &Path,
+) -> PolicyResult<String> {
+    let (_, expected_digest) = resolved_build_artifact_pin(package, version, target)?;
+    let metadata = fs::metadata(file).map_err(|cause| {
+        error(
+            &format!("inspect prefetched build artifact {}", file.display()),
+            cause,
+        )
+    })?;
+    if metadata.len() > MAX_BUILD_ARTIFACT_BYTES {
+        return Err(PolicyError::new(format!(
+            "prefetched build artifact exceeds size limit: {}",
+            file.display()
+        )));
+    }
+    let bytes = fs::read(file).map_err(|cause| {
+        error(
+            &format!("read prefetched build artifact {}", file.display()),
+            cause,
+        )
+    })?;
+    verify_artifact_bytes(expected_digest, &bytes).map_err(|cause| {
+        PolicyError::new(format!(
+            "prefetched build artifact {cause} for {package} {version} {target}"
+        ))
+    })?;
+    let absolute = file.canonicalize().map_err(|cause| {
+        error(
+            &format!("canonicalize prefetched build artifact {}", file.display()),
+            cause,
+        )
+    })?;
+    let path_text = absolute
+        .to_str()
+        .ok_or_else(|| PolicyError::new("prefetched build artifact path is not UTF-8"))?;
+    Ok(build_artifact_file_url(path_text))
+}
+
 const FORBIDDEN_GUI_NAMES: [&str; 11] = [
     "dioxus-desktop",
     "egui",

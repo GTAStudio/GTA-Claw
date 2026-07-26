@@ -11,6 +11,7 @@ use crate::identity::spoof_identity;
 use crate::input::sha256;
 use crate::input::{SafeRoot, compare_trees};
 use crate::ownership::CODEOWNERS_PATH;
+use crate::policy::pinned_build_artifacts;
 use crate::process::{CommandSpec, canonical_tool, run_checked};
 use crate::{PolicyError, PolicyResult, error};
 
@@ -76,13 +77,15 @@ const REQUIRED_WORKFLOWS: [&str; 8] = [
     ".github/workflows/windows-packaging.yml",
 ];
 
+/// Admitted-but-optional Android mobile packaging workflow path.
+const ANDROID_PACKAGING_PATH: &str = ".github/workflows/android-packaging.yml";
+/// Admitted-but-optional iOS mobile packaging workflow path.
+const IOS_PACKAGING_PATH: &str = ".github/workflows/ios-packaging.yml";
+
 /// Additional exact workflow paths admitted for the newly shipped mobile
 /// platforms. Each may be absent or present; nothing else may be present, and
 /// a present file is validated exactly like a required one.
-const ADMITTED_WORKFLOWS: [&str; 2] = [
-    ".github/workflows/android-packaging.yml",
-    ".github/workflows/ios-packaging.yml",
-];
+const ADMITTED_WORKFLOWS: [&str; 2] = [ANDROID_PACKAGING_PATH, IOS_PACKAGING_PATH];
 
 /// Parsed workflow identity used to prevent required-check spoofing.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -381,6 +384,187 @@ fn validate_ruleset_workflow_eligibility(workflow: &YamlValue) -> PolicyResult<(
     Ok(())
 }
 
+/// Cargo subcommands capable of running a build script and therefore fetching Skia.
+///
+/// Deliberately includes `cargo run` and `cargo rustc` alongside the more obvious `build`/
+/// `check`/`clippy`/`test`, since each also compiles (and therefore can trigger `build.rs`) the
+/// manifest it targets.
+const CARGO_BUILD_COMMANDS: [&str; 6] = [
+    "cargo build",
+    "cargo check",
+    "cargo clippy",
+    "cargo test",
+    "cargo run",
+    "cargo rustc",
+];
+
+/// Recursively flattens every YAML string scalar under `value` (including mapping keys) into
+/// `out`, one scalar per line, for the purpose of detecting what a step *executes*.
+///
+/// Skips the value under a `name:` key: a step's display name is never executed and is fully
+/// attacker-controlled free text, so treating it as evidence a command ran (or that a target flag
+/// was passed) would be a trivially gameable bypass -- e.g. a step named `resolve-build-artifact`
+/// or `aarch64-apple-ios` whose `run:` does nothing of the sort. Every other key (`run`, `env`,
+/// `with`, `working-directory`, ...) is still collected, mirroring `reject_tagged_yaml`'s
+/// recursive-descent shape.
+fn collect_yaml_strings(value: &YamlValue, out: &mut String) {
+    match value {
+        YamlValue::String(text) => {
+            out.push_str(text);
+            out.push('\n');
+        }
+        YamlValue::Mapping(values) => {
+            for (key, value) in values {
+                if matches!(key, YamlValue::String(key) if key == "name") {
+                    continue;
+                }
+                collect_yaml_strings(key, out);
+                collect_yaml_strings(value, out);
+            }
+        }
+        YamlValue::Sequence(values) => {
+            for value in values {
+                collect_yaml_strings(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn flattened_text(value: &YamlValue) -> String {
+    let mut text = String::new();
+    collect_yaml_strings(value, &mut text);
+    text
+}
+
+/// Requires a present `ios-packaging.yml` to actually consume the reviewed build-artifact
+/// resolver/verifier CLI contract instead of trusting `skia-bindings`' own unverified fetch, and
+/// forbids the exact unsafe shape that made an earlier iOS workflow unreviewable: a Cargo
+/// invocation against the iOS workspace for the host target, which carries no reviewed Skia pin
+/// and would silently fall through to that unverified fetch.
+///
+/// This is a structural/textual check, not a shell interpreter: it inspects every workflow key
+/// (`run`, `env`, `with`, `working-directory`, ...) as flattened text (excluding step `name`,
+/// which is never executed), and jobs/steps only enough to order-check Cargo invocations against
+/// `verify-build-artifact` within the same job. That is sound for *rejecting* an unsafe workflow
+/// shape reviewers actually see -- every pattern it forbids is forbidden regardless of which key
+/// or step it appears under -- but it assumes the YAML is read in good faith by a human reviewer
+/// alongside it, the same trust boundary every other check in this module relies on. It is not a
+/// defense against deliberate shell-level obfuscation (string concatenation that reassembles
+/// `https://` only at runtime, indirection through shell variables or aliases, or a build command
+/// this module's fixed allowlist does not name), nor against a later step replacing the verified
+/// file on disk after `verify-build-artifact` ran (a TOCTOU the CI execution environment, not a
+/// pre-merge text check, would need to close). Closing those would require either a full shell
+/// interpreter or moving resolve/fetch/verify/build execution behind a base-owned composite
+/// action the candidate workflow can only invoke, not inline -- out of scope for this change,
+/// which is confined to the trusted crate. In particular, ordering is judged by a step's position
+/// in its job's step list; a workflow that fans work across multiple jobs must give each job its
+/// own prefetch/verify steps, since state does not carry across job boundaries here.
+///
+/// Exposed so the contract's shape is proven directly against synthetic workflow fixtures rather
+/// than only indirectly through `validate_inventory`.
+pub fn validate_ios_packaging_build_artifact_contract(
+    workflow: &YamlValue,
+    path: &str,
+) -> PolicyResult<()> {
+    let whole_file = flattened_text(workflow);
+    if whole_file.contains("continue-on-error") {
+        return Err(PolicyError::new(format!(
+            "{path} must not hide a failed build-artifact prefetch/verify or Skia build behind continue-on-error"
+        )));
+    }
+    if !whole_file.contains("resolve-build-artifact")
+        || !whole_file.contains("verify-build-artifact")
+    {
+        return Err(PolicyError::new(format!(
+            "{path} must invoke both the reviewed resolve-build-artifact and verify-build-artifact \
+             commands before compiling Skia"
+        )));
+    }
+    let skia_binaries_url_lines = whole_file
+        .lines()
+        .filter(|line| line.contains("SKIA_BINARIES_URL"))
+        .collect::<Vec<_>>();
+    if skia_binaries_url_lines.is_empty() {
+        return Err(PolicyError::new(format!(
+            "{path} must inject the reviewed, verified archive by setting SKIA_BINARIES_URL from \
+             verify-build-artifact's output"
+        )));
+    }
+    if skia_binaries_url_lines
+        .iter()
+        .any(|line| line.contains("https://"))
+    {
+        return Err(PolicyError::new(format!(
+            "{path} must not set SKIA_BINARIES_URL to a direct network URL; export the verified \
+             local file:// path verify-build-artifact prints instead"
+        )));
+    }
+    if skia_binaries_url_lines
+        .iter()
+        .any(|line| !line.contains("verify-build-artifact"))
+    {
+        return Err(PolicyError::new(format!(
+            "{path} must derive every SKIA_BINARIES_URL assignment from verify-build-artifact's \
+             own output, not set it independently"
+        )));
+    }
+    for (_, _, _, url, digest) in pinned_build_artifacts() {
+        if whole_file.contains(url) {
+            return Err(PolicyError::new(format!(
+                "{path} must not duplicate the reviewed build-artifact URL as a YAML literal; \
+                 resolve it via resolve-build-artifact instead: {url}"
+            )));
+        }
+        if whole_file.contains(digest) {
+            return Err(PolicyError::new(format!(
+                "{path} must not duplicate the reviewed build-artifact digest as a YAML literal; \
+                 verify-build-artifact recomputes and checks it instead"
+            )));
+        }
+    }
+
+    let jobs = mapping(
+        get(workflow, "jobs")
+            .ok_or_else(|| PolicyError::new(format!("workflow has no jobs mapping: {path}")))?,
+    )
+    .ok_or_else(|| PolicyError::new(format!("workflow jobs are not a mapping: {path}")))?;
+    for (job_id, job) in jobs {
+        let job_id = string(Some(job_id)).unwrap_or("<unknown>");
+        let Some(YamlValue::Sequence(steps)) = get(job, "steps") else {
+            continue;
+        };
+        let mut verified = false;
+        for (index, step) in steps.iter().enumerate() {
+            let text = flattened_text(step);
+            let touches_ios_workspace =
+                text.contains("ios/Cargo.toml") || text.contains("apps/gta-claw-ios-shell");
+            let can_build = CARGO_BUILD_COMMANDS
+                .iter()
+                .any(|command| text.contains(command));
+            if touches_ios_workspace && can_build {
+                if !text.contains("aarch64-apple-ios") {
+                    return Err(PolicyError::new(format!(
+                        "{path} job {job_id} step {index} can compile the iOS workspace for the \
+                         host target, which has no reviewed Skia pin and would fall through to an \
+                         unverified fetch"
+                    )));
+                }
+                if !verified {
+                    return Err(PolicyError::new(format!(
+                        "{path} job {job_id} step {index} compiles the iOS workspace/Skia before \
+                         verify-build-artifact runs earlier in job {job_id}"
+                    )));
+                }
+            }
+            if text.contains("verify-build-artifact") {
+                verified = true;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn expected_workflow_files(root: &SafeRoot) -> PolicyResult<Vec<String>> {
     let files = root.list_tree(WORKFLOW_DIRECTORY, 32, MAX_WORKFLOW_TREE_BYTES)?;
     let actual = files
@@ -429,6 +613,9 @@ pub fn validate_inventory(root: &SafeRoot) -> PolicyResult<Vec<WorkflowIdentity>
         reject_tagged_yaml(&workflow, &path)?;
         if path == AUTHORITATIVE_PATH {
             validate_ruleset_workflow_eligibility(&workflow)?;
+        }
+        if path == IOS_PACKAGING_PATH {
+            validate_ios_packaging_build_artifact_contract(&workflow, &path)?;
         }
         let identity = parse_identity(&path, &workflow)?;
         let normalized = require_ascii_identity(&identity.workflow_name, "workflow name")?;

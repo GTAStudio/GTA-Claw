@@ -205,6 +205,69 @@ GN binary from `chrome-infra-packages.appspot.com` are each themselves unverifie
 These findings come from reading the pinned source rather than executing it; no Windows host can run
 a `skia-bindings` build for an Apple target, so the first real iOS build remains the proof.
 
+### A machine-safe resolver/verifier for the reviewed pin
+
+`PINNED_BUILD_ARTIFACTS` only has value if the archive it names is actually fetched, checked, and
+handed to `skia-bindings` without a workflow ever inlining the reviewed URL or digest as a YAML
+literal. The trusted CLI exposes two subcommands for exactly that, so `ios-packaging.yml` (or any
+admitted mobile workflow) can derive both values instead of duplicating them:
+
+```text
+# 1) Resolve which archive to fetch for the reviewed pin.
+cargo run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml -- \
+  resolve-build-artifact --package skia-bindings --version 0.99.0 \
+  --target aarch64-apple-ios --field url
+# -> the reviewed https:// URL, and nothing else, on stdout
+
+# 2) Fetch that URL (curl, wget, ...) to a local path. The trusted crate has no HTTP client and
+#    never performs this fetch itself.
+curl -sSL -f -o skia-device.tar.gz "$URL"
+
+# 3) Verify the prefetched bytes against the same reviewed pin and obtain a file:// URL.
+cargo run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml -- \
+  verify-build-artifact --package skia-bindings --version 0.99.0 \
+  --target aarch64-apple-ios --file skia-device.tar.gz --field skia-binaries-url
+# -> file:///.../skia-device.tar.gz, but only if the file's own recomputed SHA-256 matches the
+#    reviewed digest; otherwise a nonzero exit and a diagnostic naming package/version/target and,
+#    on a mismatch, both the expected and found digest
+
+# 4) Hand the verified local archive to skia-bindings without a network fetch.
+export SKIA_BINARIES_URL="$(cargo run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml -- verify-build-artifact --package skia-bindings --version 0.99.0 --target aarch64-apple-ios --file skia-device.tar.gz --field skia-binaries-url)"
+export FORCE_SKIA_BINARIES_DOWNLOAD=1
+cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios
+```
+
+Resolution is an exact `(package, version, target)` lookup against the same table
+`validate_build_artifact_pin_table` already guarantees has no duplicate or unadmitted rows; it fails
+closed, rather than guessing, on an unadmitted target, a package/version with no reviewed pin, or
+(defensively) an ambiguous duplicate. Verification never trusts a caller-supplied digest: it re-reads
+the file (bounded to 512 MiB) and recomputes its SHA-256 itself, so a `file://` URL is returned only
+for bytes that are exactly the reviewed archive; a corrupted, truncated, or substituted prefetch is
+rejected with both the expected and found digest, so the failure is reviewable from the job log
+alone. Both subcommands accept `--field` for scripting, or print a labeled record by default.
+
+`ios-packaging.yml`, once it exists, is held to this contract structurally rather than only by
+convention: `validate_ios_packaging_build_artifact_contract` rejects the file if it omits either
+subcommand, never sets `SKIA_BINARIES_URL` from `verify-build-artifact`'s own output (or sets it to a
+direct `https://` URL instead), duplicates a reviewed URL or digest as a YAML literal anywhere in the
+file, hides a failure behind `continue-on-error`, or lets any step compile the iOS workspace for the
+host target — the exact hazard an unscoped host `cargo clippy`/`build` against `ios/Cargo.toml`
+previously created — or before `verify-build-artifact` has already run earlier in the same job.
+Ordering is judged by a step's position within its job; a workflow that fans work across multiple
+jobs must repeat the prefetch/verify steps in each one, since this check does not model artifacts
+carried across job boundaries. It also does not treat a step's display `name:` as evidence of what
+it executes, since that text is never run and would otherwise be a trivial way to fake compliance.
+
+**This is a textual/structural check, not a shell interpreter, and reviewers should not read it as
+proof of safe execution.** It assumes the YAML is authored in good faith and read by a human
+alongside it — the same trust boundary every other check in this module relies on. It cannot defend
+against deliberate shell-level obfuscation (string concatenation that reassembles `https://` only at
+runtime, indirection through shell variables, or a build command outside its fixed allowlist), nor
+against a later step replacing the verified file on disk after `verify-build-artifact` already ran.
+Closing those would require either a full shell interpreter or moving resolve/fetch/verify/build
+execution behind a base-owned composite action the candidate workflow could only invoke, not inline
+— both out of scope for a change confined to this trusted crate.
+
 ### Mobile CI is not yet reachable
 
 `android-packaging.yml` and `ios-packaging.yml` are admitted workflow paths, but neither file
@@ -222,9 +285,10 @@ The `.github/workflows` directory is a closed inventory. Eight workflow files ar
 `.github/workflows/ios-packaging.yml` and `.github/workflows/android-packaging.yml`,
 are **admitted** for the shipped mobile platforms: each may be absent or present, and
 a present file is subjected to the same tagged-YAML, ASCII-identity, reserved-identity
-anti-spoofing, duplicate-name, and isolated-actionlint checks as a required one. No
-other path may appear at any depth, and no required path may be removed. Admitting a
-further workflow still requires an audited trust-root update.
+anti-spoofing, duplicate-name, and isolated-actionlint checks as a required one, and a
+present `ios-packaging.yml` is additionally held to the build-artifact resolver/verifier
+contract described above. No other path may appear at any depth, and no required path
+may be removed. Admitting a further workflow still requires an audited trust-root update.
 
 The root headless workspace remains extensible. A new canonical `crates/<name>` or
 `apps/<name>` member can pass without changing this trust root when it is explicitly

@@ -27,8 +27,9 @@ use desktop_supply_chain_policy::ownership::{
 };
 use desktop_supply_chain_policy::policy::{
     BootstrapSnapshotArchive, BootstrapSnapshotChangeStatus, bootstrap_fingerprint,
-    bootstrap_snapshot, expected_bootstrap_fingerprint, is_bootstrap_state,
-    validate_build_artifact_pin_table, validate_casefold_paths, validate_final_static,
+    bootstrap_snapshot, build_artifact_file_url, expected_bootstrap_fingerprint,
+    is_bootstrap_state, resolved_build_artifact_pin, validate_build_artifact_pin_table,
+    validate_casefold_paths, validate_final_static, verify_artifact_bytes, verify_build_artifact,
     write_bootstrap_snapshot, write_final_dependency_fixtures,
 };
 use desktop_supply_chain_policy::process::{CommandSpec, run, run_checked};
@@ -39,7 +40,7 @@ use desktop_supply_chain_policy::validation::{
 use desktop_supply_chain_policy::workflows::{
     AUTHORITATIVE_JOB_NAME, AUTHORITATIVE_PATH, AUTHORITATIVE_WORKFLOW_NAME, ActionlintTool,
     BOOTSTRAP_JOB_NAME, BOOTSTRAP_PATH, BOOTSTRAP_WORKFLOW_NAME, validate_final_workflows,
-    validate_inventory, validate_protected_files,
+    validate_inventory, validate_ios_packaging_build_artifact_contract, validate_protected_files,
 };
 
 mod mutations;
@@ -1888,6 +1889,42 @@ fn mobile_workflow_stub(name: &str, job_id: &str, job_name: &str) -> String {
     )
 }
 
+/// A minimal `ios-packaging.yml` that satisfies
+/// `validate_ios_packaging_build_artifact_contract`: it resolves and verifies the reviewed
+/// `skia-bindings` pin before compiling the iOS workspace for an admitted target, derives
+/// `SKIA_BINARIES_URL` from `verify-build-artifact`'s own output, and never sets
+/// `continue-on-error` or duplicates a pinned URL/digest literal.
+fn ios_packaging_workflow_stub(name: &str, job_id: &str, job_name: &str) -> String {
+    format!(
+        r#"name: "{name}"
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  {job_id}:
+    name: "{job_name}"
+    runs-on: macos-14
+    steps:
+      - name: Resolve reviewed Skia archive (device)
+        run: |
+          echo "URL=$(cargo run -- resolve-build-artifact --package skia-bindings --version 0.99.0 --target aarch64-apple-ios --field url)" >> "$GITHUB_ENV"
+      - name: Fetch reviewed Skia archive (device)
+        run: curl -sSL -f -o skia-device.tar.gz "$URL"
+      - name: Verify reviewed Skia archive (device)
+        run: |
+          echo "SKIA_BINARIES_URL=$(cargo run -- verify-build-artifact --package skia-bindings --version 0.99.0 --target aarch64-apple-ios --file skia-device.tar.gz --field skia-binaries-url)" >> "$GITHUB_ENV"
+      - name: Build device shell
+        run: cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios
+"#
+    )
+}
+
 #[test]
 fn mobile_packaging_workflows_are_admitted_but_the_inventory_stays_closed() {
     let base = copy_repo("mobile-inventory-baseline");
@@ -1908,15 +1945,15 @@ fn mobile_packaging_workflows_are_admitted_but_the_inventory_stays_closed() {
     ] {
         let tree = copy_repo(&format!("mobile-inventory-{label}"));
         for (index, path) in added.iter().enumerate() {
-            fs::write(
-                tree.join(path),
-                mobile_workflow_stub(
-                    &format!("mobile packaging {index}"),
-                    &format!("package{index}"),
-                    &format!("Mobile package {index}"),
-                ),
-            )
-            .expect("write admitted mobile workflow");
+            let name = format!("mobile packaging {index}");
+            let job_id = format!("package{index}");
+            let job_name = format!("Mobile package {index}");
+            let contents = if *path == ".github/workflows/ios-packaging.yml" {
+                ios_packaging_workflow_stub(&name, &job_id, &job_name)
+            } else {
+                mobile_workflow_stub(&name, &job_id, &job_name)
+            };
+            fs::write(tree.join(path), contents).expect("write admitted mobile workflow");
         }
         let identities =
             validate_inventory(&SafeRoot::new(&tree.path).expect("open admitted mobile tree"))
@@ -5309,4 +5346,493 @@ fn mobile_slint_release_cannot_diverge_from_the_protected_desktop_release() {
     );
     let root = SafeRoot::new(&agreed.path).expect("open agreed Slint fixture");
     validate_final_static(&root).expect("a matching Slint release is admitted");
+}
+
+// --- Trusted build-artifact resolver/verifier CLI contract ---------------------------------
+//
+// `resolved_build_artifact_pin` is a pure lookup against the reviewed pin table, so it is
+// exercised directly with the real `skia-bindings` 0.99.0 pins. `verify_artifact_bytes` and
+// `build_artifact_file_url` are exercised with small synthetic data, since a real pinned Skia
+// archive is far too large to carry in this repository's fixtures; `verify_build_artifact`
+// itself is then exercised only for its fail-closed paths (unknown pin, missing file, and a
+// real digest mismatch), which do not require the genuine archive bytes either.
+
+#[test]
+fn resolved_build_artifact_pin_is_exact_and_fails_closed() {
+    let (device_url, device_digest) =
+        resolved_build_artifact_pin("skia-bindings", "0.99.0", "aarch64-apple-ios")
+            .expect("the reviewed device pin resolves");
+    assert!(
+        device_url.starts_with("https://github.com/rust-skia/skia-binaries/"),
+        "got: {device_url}"
+    );
+    assert_eq!(device_digest.len(), 64, "got: {device_digest}");
+
+    let (sim_url, sim_digest) =
+        resolved_build_artifact_pin("skia-bindings", "0.99.0", "aarch64-apple-ios-sim")
+            .expect("the reviewed simulator pin resolves");
+    assert_ne!(
+        device_url, sim_url,
+        "the device and simulator rows must resolve to distinct archives"
+    );
+    assert_ne!(
+        device_digest, sim_digest,
+        "the device and simulator rows must resolve to distinct digests"
+    );
+
+    let error = resolved_build_artifact_pin("skia-bindings", "0.99.0", "x86_64-apple-ios")
+        .expect_err("an unadmitted target must not resolve to any pin");
+    assert!(
+        error.to_string().contains("target is not admitted"),
+        "an unadmitted target must fail closed with an actionable diagnostic, got: {error}"
+    );
+
+    let error = resolved_build_artifact_pin("skia-bindings", "0.1.0", "aarch64-apple-ios")
+        .expect_err("a version with no reviewed pin must not resolve");
+    assert!(
+        error.to_string().contains("no reviewed build-artifact pin"),
+        "got: {error}"
+    );
+
+    let error = resolved_build_artifact_pin("other-package", "0.99.0", "aarch64-apple-ios")
+        .expect_err("an unpinned package must not resolve");
+    assert!(
+        error.to_string().contains("no reviewed build-artifact pin"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn verify_artifact_bytes_recomputes_the_digest_and_never_trusts_it() {
+    let bytes = b"synthetic archive bytes used only to exercise the digest comparison";
+    let digest = desktop_supply_chain_policy::input::sha256(bytes);
+
+    verify_artifact_bytes(&digest, bytes)
+        .expect("bytes that truly hash to the expected digest are accepted");
+
+    let error = verify_artifact_bytes(&digest, b"different bytes entirely")
+        .expect_err("bytes that do not hash to the expected digest must fail closed");
+    let message = error.to_string();
+    assert!(
+        message.contains("checksum mismatch") && message.contains(&digest),
+        "the mismatch diagnostic must name the expected digest so it is reviewable, got: {message}"
+    );
+}
+
+#[test]
+fn build_artifact_file_url_normalizes_windows_and_unix_paths() {
+    assert_eq!(
+        build_artifact_file_url("/Users/runner/work/skia/skia-device.tar.gz"),
+        "file:///Users/runner/work/skia/skia-device.tar.gz"
+    );
+    assert_eq!(
+        build_artifact_file_url(r"D:\work\skia\skia-device.tar.gz"),
+        "file:///D:/work/skia/skia-device.tar.gz"
+    );
+    assert_eq!(
+        build_artifact_file_url(r"\\?\D:\work\skia\skia-device.tar.gz"),
+        "file:///D:/work/skia/skia-device.tar.gz",
+        "the Windows verbatim-path prefix must be stripped before URL construction"
+    );
+}
+
+#[test]
+fn verify_build_artifact_fails_closed_without_the_genuine_archive() {
+    let tree = TempTree::new("verify-build-artifact");
+
+    let missing = tree.join("does-not-exist.tar.gz");
+    let error = verify_build_artifact("skia-bindings", "0.99.0", "aarch64-apple-ios", &missing)
+        .expect_err("a nonexistent prefetched file must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("inspect prefetched build artifact"),
+        "got: {error}"
+    );
+
+    let unknown_target = tree.join("device.tar.gz");
+    fs::write(&unknown_target, b"irrelevant").expect("write placeholder file");
+    let error = verify_build_artifact(
+        "skia-bindings",
+        "0.99.0",
+        "x86_64-apple-ios",
+        &unknown_target,
+    )
+    .expect_err("an unadmitted target must fail closed before any file is even read");
+    assert!(
+        error.to_string().contains("target is not admitted"),
+        "got: {error}"
+    );
+
+    // Bytes that are not the genuine reviewed archive must never verify: this is the fail-closed
+    // path a corrupted or substituted prefetch must hit, proven here against the real device
+    // pin's digest without needing the multi-hundred-megabyte archive itself.
+    let wrong = tree.join("wrong.tar.gz");
+    fs::write(&wrong, b"not the reviewed skia-bindings archive").expect("write wrong archive");
+    let error = verify_build_artifact("skia-bindings", "0.99.0", "aarch64-apple-ios", &wrong)
+        .expect_err("bytes that are not the reviewed archive must not verify");
+    let message = error.to_string();
+    assert!(
+        message.contains("checksum mismatch") && message.contains("aarch64-apple-ios"),
+        "got: {message}"
+    );
+
+    // The simulator archive's bytes must not verify against the device row either -- the same
+    // bidirectional cross-target invariant `validate_build_artifact_pin_table` enforces for the
+    // pin table text is now enforced for prefetched artifact bytes too: swapping targets must
+    // never silently "verify" just because both rows are for the same reviewed release.
+    let (_, sim_digest) =
+        resolved_build_artifact_pin("skia-bindings", "0.99.0", "aarch64-apple-ios-sim")
+            .expect("simulator pin resolves");
+    let (_, device_digest) =
+        resolved_build_artifact_pin("skia-bindings", "0.99.0", "aarch64-apple-ios")
+            .expect("device pin resolves");
+    assert_ne!(
+        sim_digest, device_digest,
+        "fixture precondition: the two reviewed digests must differ"
+    );
+}
+
+// --- iOS packaging workflow build-artifact contract -----------------------------------------
+//
+// `validate_ios_packaging_build_artifact_contract` is exercised directly against synthetic YAML
+// fixtures (rather than through the full `validate_inventory`/`SafeRoot` machinery) so each
+// planted regression's rejection reason is asserted precisely.
+
+const RESOLVE_DEVICE_STEP: &str = r#"      - name: Resolve reviewed Skia archive (device)
+        run: |
+          echo "URL=$(cargo run -- resolve-build-artifact --package skia-bindings --version 0.99.0 --target aarch64-apple-ios --field url)" >> "$GITHUB_ENV"
+"#;
+
+const FETCH_DEVICE_STEP: &str = r#"      - name: Fetch reviewed Skia archive (device)
+        run: curl -sSL -f -o skia-device.tar.gz "$URL"
+"#;
+
+const VERIFY_DEVICE_STEP: &str = r#"      - name: Verify reviewed Skia archive (device)
+        run: |
+          echo "SKIA_BINARIES_URL=$(cargo run -- verify-build-artifact --package skia-bindings --version 0.99.0 --target aarch64-apple-ios --file skia-device.tar.gz --field skia-binaries-url)" >> "$GITHUB_ENV"
+"#;
+
+const BUILD_DEVICE_STEP: &str = r#"      - name: Build device shell
+        run: cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios
+"#;
+
+const RESOLVE_SIM_STEP: &str = r#"      - name: Resolve reviewed Skia archive (simulator)
+        run: |
+          echo "SIM_URL=$(cargo run -- resolve-build-artifact --package skia-bindings --version 0.99.0 --target aarch64-apple-ios-sim --field url)" >> "$GITHUB_ENV"
+"#;
+
+const FETCH_SIM_STEP: &str = r#"      - name: Fetch reviewed Skia archive (simulator)
+        run: curl -sSL -f -o skia-sim.tar.gz "$SIM_URL"
+"#;
+
+const VERIFY_SIM_STEP: &str = r#"      - name: Verify reviewed Skia archive (simulator)
+        run: |
+          echo "SKIA_BINARIES_URL=$(cargo run -- verify-build-artifact --package skia-bindings --version 0.99.0 --target aarch64-apple-ios-sim --file skia-sim.tar.gz --field skia-binaries-url)" >> "$GITHUB_ENV"
+"#;
+
+const BUILD_SIM_STEP: &str = r#"      - name: Build simulator shell
+        run: cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios-sim
+"#;
+
+/// Wraps `steps_yaml` (already-indented `- name: ...` step blocks) in a single-job iOS packaging
+/// workflow and parses it, so each test only needs to name which steps it includes and in what
+/// order.
+fn ios_contract_workflow(steps_yaml: &str) -> serde_yaml_ng::Value {
+    let text = format!(
+        r#"name: "iOS packaging"
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    name: "iOS packaging"
+    runs-on: macos-14
+    steps:
+{steps_yaml}"#
+    );
+    serde_yaml_ng::from_str(&text).expect("parse synthetic iOS workflow fixture")
+}
+
+const IOS_PACKAGING_PATH_FOR_TESTS: &str = ".github/workflows/ios-packaging.yml";
+
+#[test]
+fn compliant_ios_packaging_workflow_is_admitted() {
+    let steps = format!(
+        "{RESOLVE_DEVICE_STEP}{FETCH_DEVICE_STEP}{VERIFY_DEVICE_STEP}{BUILD_DEVICE_STEP}\
+         {RESOLVE_SIM_STEP}{FETCH_SIM_STEP}{VERIFY_SIM_STEP}{BUILD_SIM_STEP}"
+    );
+    let workflow = ios_contract_workflow(&steps);
+    validate_ios_packaging_build_artifact_contract(&workflow, IOS_PACKAGING_PATH_FOR_TESTS).expect(
+        "a workflow that resolves, prefetches, verifies, and injects both reviewed \
+                 targets before building them must be admitted",
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_without_any_prefetch_is_rejected() {
+    let workflow = ios_contract_workflow(BUILD_DEVICE_STEP);
+    let error =
+        validate_ios_packaging_build_artifact_contract(&workflow, IOS_PACKAGING_PATH_FOR_TESTS)
+            .expect_err(
+                "a workflow that never resolves or verifies the reviewed pin must be rejected",
+            );
+    assert!(
+        error.to_string().contains(
+            "must invoke both the reviewed resolve-build-artifact and verify-build-artifact"
+        ),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_with_hash_verification_omitted_is_rejected() {
+    // Resolves and fetches the archive but never runs verify-build-artifact before building --
+    // the workflow trusts an unverified download, which the same "must invoke both commands"
+    // invariant closes, distinct from the "no prefetch at all" case above only in that a fetch
+    // did occur.
+    let steps = format!("{RESOLVE_DEVICE_STEP}{FETCH_DEVICE_STEP}{BUILD_DEVICE_STEP}");
+    let workflow = ios_contract_workflow(&steps);
+    let error =
+        validate_ios_packaging_build_artifact_contract(&workflow, IOS_PACKAGING_PATH_FOR_TESTS)
+            .expect_err("a prefetch with no verification step must be rejected");
+    assert!(
+        error.to_string().contains("verify-build-artifact"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_with_verified_file_never_injected_is_rejected() {
+    // Resolves, fetches, and verifies -- but the verify step never assigns SKIA_BINARIES_URL, so
+    // the verified local archive is never handed to skia-bindings.
+    let verify_without_injection = r#"      - name: Verify reviewed Skia archive (device)
+        run: cargo run -- verify-build-artifact --package skia-bindings --version 0.99.0 --target aarch64-apple-ios --file skia-device.tar.gz
+"#;
+    let steps = format!(
+        "{RESOLVE_DEVICE_STEP}{FETCH_DEVICE_STEP}{verify_without_injection}{BUILD_DEVICE_STEP}"
+    );
+    let workflow = ios_contract_workflow(&steps);
+    let error =
+        validate_ios_packaging_build_artifact_contract(&workflow, IOS_PACKAGING_PATH_FOR_TESTS)
+            .expect_err("a verify step that never sets SKIA_BINARIES_URL must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("must inject the reviewed, verified archive"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_with_direct_network_url_is_rejected() {
+    let direct_url_step = r#"      - name: Set SKIA_BINARIES_URL directly
+        run: echo "SKIA_BINARIES_URL=https://example.invalid/not-a-reviewed-artifact.tar.gz" >> "$GITHUB_ENV"
+"#;
+    let steps = format!(
+        "{RESOLVE_DEVICE_STEP}{FETCH_DEVICE_STEP}{VERIFY_DEVICE_STEP}{direct_url_step}{BUILD_DEVICE_STEP}"
+    );
+    let workflow = ios_contract_workflow(&steps);
+    let error =
+        validate_ios_packaging_build_artifact_contract(&workflow, IOS_PACKAGING_PATH_FOR_TESTS)
+            .expect_err(
+                "a directly-assigned network URL must be rejected even if verification also ran",
+            );
+    assert!(
+        error.to_string().contains("direct network URL"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_with_raw_cargo_before_prefetch_is_rejected() {
+    // The build step runs first, before resolve/fetch/verify appear anywhere earlier in the job
+    // -- the exact PR #110-style ordering hazard, even though every required command eventually
+    // appears somewhere in the file.
+    let steps =
+        format!("{BUILD_DEVICE_STEP}{RESOLVE_DEVICE_STEP}{FETCH_DEVICE_STEP}{VERIFY_DEVICE_STEP}");
+    let workflow = ios_contract_workflow(&steps);
+    let error =
+        validate_ios_packaging_build_artifact_contract(&workflow, IOS_PACKAGING_PATH_FOR_TESTS)
+            .expect_err(
+                "a build step ordered before verification in the same job must be rejected",
+            );
+    assert!(
+        error
+            .to_string()
+            .contains("before verify-build-artifact runs earlier in job"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_with_continue_on_error_is_rejected() {
+    let hidden_failure_build_step = r#"      - name: Build device shell
+        run: cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios
+        continue-on-error: true
+"#;
+    let steps = format!(
+        "{RESOLVE_DEVICE_STEP}{FETCH_DEVICE_STEP}{VERIFY_DEVICE_STEP}{hidden_failure_build_step}"
+    );
+    let workflow = ios_contract_workflow(&steps);
+    let error =
+        validate_ios_packaging_build_artifact_contract(&workflow, IOS_PACKAGING_PATH_FOR_TESTS)
+            .expect_err(
+                "continue-on-error must never hide a failed prefetch, verify, or Skia build",
+            );
+    assert!(
+        error.to_string().contains("continue-on-error"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_with_literal_duplicate_pin_url_is_rejected() {
+    let comment_step = r#"      - name: Reference note
+        run: echo "see https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-gl-jpegd-jpege-metal-pdf-textlayout.tar.gz for background"
+"#;
+    let steps = format!(
+        "{RESOLVE_DEVICE_STEP}{FETCH_DEVICE_STEP}{VERIFY_DEVICE_STEP}{comment_step}{BUILD_DEVICE_STEP}"
+    );
+    let workflow = ios_contract_workflow(&steps);
+    let error = validate_ios_packaging_build_artifact_contract(
+        &workflow,
+        IOS_PACKAGING_PATH_FOR_TESTS,
+    )
+    .expect_err(
+        "a copy-pasted reviewed URL literal must be rejected even outside SKIA_BINARIES_URL",
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("must not duplicate the reviewed build-artifact URL"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_with_literal_duplicate_pin_digest_is_rejected() {
+    let comment_step = r#"      - name: Reference note
+        run: echo "expected digest 15e20f3265dfddd658f9ef0d0e30d50a73afccb88787812f65fb5e6cf4ec55c8"
+"#;
+    let steps = format!(
+        "{RESOLVE_DEVICE_STEP}{FETCH_DEVICE_STEP}{VERIFY_DEVICE_STEP}{comment_step}{BUILD_DEVICE_STEP}"
+    );
+    let workflow = ios_contract_workflow(&steps);
+    let error =
+        validate_ios_packaging_build_artifact_contract(&workflow, IOS_PACKAGING_PATH_FOR_TESTS)
+            .expect_err("a copy-pasted reviewed digest literal must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("must not duplicate the reviewed build-artifact digest"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_with_unscoped_host_target_build_is_rejected() {
+    // The exact PR #110-style hazard: a host clippy/build step against the iOS workspace with no
+    // admitted target flag, which would fall through to skia-bindings' own unverified fetch.
+    let unscoped_host_step = r#"      - name: Host clippy sanity check
+        run: cargo clippy --manifest-path ios/Cargo.toml --all-targets -- -D warnings
+"#;
+    let steps = format!(
+        "{RESOLVE_DEVICE_STEP}{FETCH_DEVICE_STEP}{VERIFY_DEVICE_STEP}{unscoped_host_step}{BUILD_DEVICE_STEP}"
+    );
+    let workflow = ios_contract_workflow(&steps);
+    let error =
+        validate_ios_packaging_build_artifact_contract(&workflow, IOS_PACKAGING_PATH_FOR_TESTS)
+            .expect_err(
+                "an unscoped host-target Cargo step against the iOS workspace must be rejected",
+            );
+    assert!(
+        error
+            .to_string()
+            .contains("host target, which has no reviewed Skia pin"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_cannot_launder_required_commands_through_step_names() {
+    // A step's `name:` is never executed. Naming steps after the required commands, with inert
+    // `run:` bodies that never actually invoke them, must not satisfy the "both commands ran"
+    // check -- closing a bypass where display text alone could fake compliance.
+    let laundered_resolve = r#"      - name: resolve-build-artifact
+        run: ":"
+"#;
+    let laundered_verify = r#"      - name: verify-build-artifact
+        run: echo "SKIA_BINARIES_URL=file:///tmp/unverified.tar.gz" >> "$GITHUB_ENV"
+"#;
+    let steps = format!("{laundered_resolve}{laundered_verify}{BUILD_DEVICE_STEP}");
+    let workflow = ios_contract_workflow(&steps);
+    let error =
+        validate_ios_packaging_build_artifact_contract(&workflow, IOS_PACKAGING_PATH_FOR_TESTS)
+            .expect_err(
+                "step names that merely mention the required commands, without a run body that \
+                 actually invokes them, must not be treated as evidence they ran",
+            );
+    assert!(
+        error.to_string().contains(
+            "must invoke both the reviewed resolve-build-artifact and verify-build-artifact"
+        ),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_cannot_launder_the_host_target_ban_through_a_step_name() {
+    // A step named after the admitted target, but whose `run:` never actually passes a `--target`
+    // flag, must still be rejected as an unscoped host-target build -- the display name is not
+    // evidence of what actually compiles.
+    let laundered_host_step = r#"      - name: aarch64-apple-ios
+        run: cargo build --manifest-path ios/Cargo.toml
+"#;
+    let steps = format!(
+        "{RESOLVE_DEVICE_STEP}{FETCH_DEVICE_STEP}{VERIFY_DEVICE_STEP}{laundered_host_step}"
+    );
+    let workflow = ios_contract_workflow(&steps);
+    let error =
+        validate_ios_packaging_build_artifact_contract(&workflow, IOS_PACKAGING_PATH_FOR_TESTS)
+            .expect_err(
+                "a step name containing the admitted target must not excuse a run body with no \
+                 target flag from the host-target ban",
+            );
+    assert!(
+        error
+            .to_string()
+            .contains("host target, which has no reviewed Skia pin"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_host_target_ban_also_covers_cargo_run_and_rustc() {
+    // `cargo run` and `cargo rustc` also compile (and can therefore trigger `build.rs`) the
+    // manifest they target, so an unscoped host invocation through either must be banned just
+    // like `cargo build`/`check`/`clippy`/`test`.
+    let host_rustc_step = r#"      - name: Host rustc probe
+        run: cargo rustc --manifest-path ios/Cargo.toml -p gta-claw-ios-shell
+"#;
+    let steps =
+        format!("{RESOLVE_DEVICE_STEP}{FETCH_DEVICE_STEP}{VERIFY_DEVICE_STEP}{host_rustc_step}");
+    let workflow = ios_contract_workflow(&steps);
+    let error =
+        validate_ios_packaging_build_artifact_contract(&workflow, IOS_PACKAGING_PATH_FOR_TESTS)
+            .expect_err(
+                "cargo rustc against the iOS workspace for the host target must be rejected",
+            );
+    assert!(
+        error
+            .to_string()
+            .contains("host target, which has no reviewed Skia pin"),
+        "got: {error}"
+    );
 }

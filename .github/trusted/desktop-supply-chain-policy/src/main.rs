@@ -10,7 +10,8 @@ use desktop_supply_chain_policy::changes::{compute_manifest, write_manifest};
 use desktop_supply_chain_policy::input::SafeRoot;
 use desktop_supply_chain_policy::metadata::linux_tools;
 use desktop_supply_chain_policy::policy::{
-    bootstrap_archive_fingerprint, verified_bootstrap_root_fingerprint, write_bootstrap_snapshot,
+    bootstrap_archive_fingerprint, resolved_build_artifact_pin,
+    verified_bootstrap_root_fingerprint, verify_build_artifact, write_bootstrap_snapshot,
     write_final_dependency_fixtures,
 };
 use desktop_supply_chain_policy::validation::{ValidationRequest, validate_request};
@@ -59,6 +60,20 @@ fn required_text(options: &mut BTreeMap<String, PathBuf>, key: &str) -> PolicyRe
         .into_os_string()
         .into_string()
         .map_err(|_| PolicyError::new(format!("option --{key} is not UTF-8")))
+}
+
+fn optional_text(
+    options: &mut BTreeMap<String, PathBuf>,
+    key: &str,
+) -> PolicyResult<Option<String>> {
+    match options.remove(key) {
+        None => Ok(None),
+        Some(value) => value
+            .into_os_string()
+            .into_string()
+            .map(Some)
+            .map_err(|_| PolicyError::new(format!("option --{key} is not UTF-8"))),
+    }
 }
 
 fn reject_unknown(options: &BTreeMap<String, PathBuf>) -> PolicyResult<()> {
@@ -169,6 +184,53 @@ fn validate(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
     Ok(())
 }
 
+fn resolve_build_artifact(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
+    let mut options = parse_options(values)?;
+    let package = required_text(&mut options, "package")?;
+    let version = required_text(&mut options, "version")?;
+    let target = required_text(&mut options, "target")?;
+    let field = optional_text(&mut options, "field")?;
+    reject_unknown(&options)?;
+    let (url, digest) = resolved_build_artifact_pin(&package, &version, &target)?;
+    match field.as_deref() {
+        Some("url") => println!("{url}"),
+        Some("digest") => println!("{digest}"),
+        Some(other) => {
+            return Err(PolicyError::new(format!(
+                "unknown resolve-build-artifact --field: {other}"
+            )));
+        }
+        None => println!(
+            "reviewed build-artifact resolved: package={package} version={version} target={target} url={url} digest={digest}"
+        ),
+    }
+    Ok(())
+}
+
+fn verify_build_artifact_command(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
+    let mut options = parse_options(values)?;
+    let package = required_text(&mut options, "package")?;
+    let version = required_text(&mut options, "version")?;
+    let target = required_text(&mut options, "target")?;
+    let file = required(&mut options, "file")?;
+    let field = optional_text(&mut options, "field")?;
+    reject_unknown(&options)?;
+    let skia_binaries_url = verify_build_artifact(&package, &version, &target, &file)?;
+    match field.as_deref() {
+        Some("skia-binaries-url") => println!("{skia_binaries_url}"),
+        Some(other) => {
+            return Err(PolicyError::new(format!(
+                "unknown verify-build-artifact --field: {other}"
+            )));
+        }
+        None => println!(
+            "reviewed build-artifact verified: package={package} version={version} target={target} path={} skia_binaries_url={skia_binaries_url}",
+            file.display()
+        ),
+    }
+    Ok(())
+}
+
 fn run() -> PolicyResult<()> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
@@ -181,6 +243,8 @@ fn run() -> PolicyResult<()> {
         Some("write-bootstrap-snapshot") => snapshot(arguments),
         Some("write-final-dependency-fixtures") => final_dependency_fixtures(arguments),
         Some("validate") => validate(arguments),
+        Some("resolve-build-artifact") => resolve_build_artifact(arguments),
+        Some("verify-build-artifact") => verify_build_artifact_command(arguments),
         Some(other) => Err(PolicyError::new(format!(
             "unknown validator command: {other}"
         ))),
