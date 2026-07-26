@@ -7,6 +7,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use desktop_supply_chain_policy::bootstrap_decisions::{
+    BootstrapSourceDecisionEvidence, validate_bootstrap_source_decisions,
+};
 use desktop_supply_chain_policy::changes::{
     ChangeManifest, ChangedPath, MAX_GIT_PACK_FILES, MAX_PULL_REQUEST_COMMITS, compute_manifest,
     has_policy_relevant_change, is_policy_relevant, read_manifest,
@@ -1211,6 +1214,21 @@ fn residual_bootstrap_coupling_does_not_shadow_repository_ratchet_diagnostic() {
     );
 }
 
+/// Bootstrap sources that carry no standing preservation and are not already byte-pinned by an
+/// earlier rule, so an otherwise-valid live change to one still reaches the residual diagnostic.
+///
+/// The other nine fully coupled sources are refused earlier and more strictly: CODEOWNERS by
+/// `validate_codeowners`/`validate_protected_files`, `rust.yml` and `macos-packaging.yml` by
+/// `validate_final_workflows`, the two policy workflows by `validate_protected_files`, and
+/// `.cargo/audit.toml`, `.gitattributes`, `rust-toolchain.toml` and `rustfmt.toml` by
+/// `validate_final_fixed_files`. Only these four can reach the residual through the full stack.
+const RESIDUAL_REACHABLE_SOURCES: [&str; 4] = [
+    ".github/workflows/docker-publish.yml",
+    ".github/workflows/linux-packaging.yml",
+    ".github/workflows/upstream-gateway-reference.yml",
+    ".github/workflows/windows-packaging.yml",
+];
+
 #[test]
 fn otherwise_valid_bootstrap_source_change_reaches_exact_residual_diagnostic() {
     let Some(actionlint) = local_actionlint() else {
@@ -1218,26 +1236,84 @@ fn otherwise_valid_bootstrap_source_change_reaches_exact_residual_diagnostic() {
         return;
     };
     let trusted = final_tree("residual-exact-trusted");
-    let candidate = final_tree("residual-exact-candidate");
+    for path in RESIDUAL_REACHABLE_SOURCES {
+        let label = path.rsplit('/').next().expect("Bootstrap source file name");
+        let candidate = final_tree(&format!("residual-exact-candidate-{label}"));
+        let source = candidate.join(path);
+        let mut source_bytes = fs::read(&source).expect("read candidate Bootstrap source");
+        source_bytes.extend_from_slice(b"\n# otherwise-valid Bootstrap source change\n");
+        fs::write(source, source_bytes).expect("write otherwise-valid source change");
+        let artifacts = TempTree::new(&format!("residual-exact-artifacts-{label}"));
+        let changes = artifacts.join("changes.json");
+        write_manifest(
+            &changes,
+            &ChangeManifest {
+                base: "1111111111111111111111111111111111111111".to_owned(),
+                head: "2222222222222222222222222222222222222222".to_owned(),
+                paths: vec![ChangedPath {
+                    status: 'M',
+                    path: path.to_owned(),
+                }],
+            },
+        )
+        .expect("write otherwise-valid source manifest");
+        let error = validate_request(&ValidationRequest {
+            trusted_root: trusted.path.clone(),
+            candidate_root: candidate.path.clone(),
+            changes,
+            metadata_tools: local_metadata_tools(),
+            actionlint: actionlint.clone(),
+            isolation_root: artifacts.join("isolation"),
+        })
+        .expect_err("silent Bootstrap source change unexpectedly passed")
+        .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "Bootstrap source change requires synchronized snapshot/fingerprint or a new bound preservation decision: {path}"
+            )
+        );
+    }
+}
+
+/// Twin of the residual test: the same otherwise-valid change on a standing-covered path must
+/// reach `preserved` through the full stack, writing nothing inside the protected trust root.
+///
+/// The pair is what pins the boundary. Alone, neither test says where the line is.
+#[test]
+fn otherwise_valid_standing_covered_source_change_reaches_preserved_instead() {
+    let Some(actionlint) = local_actionlint() else {
+        eprintln!("ACTIONLINT_BIN is not set; hosted bootstrap requires and runs this test");
+        return;
+    };
+    let trusted = final_tree("standing-preserved-trusted");
+    let candidate = final_tree("standing-preserved-candidate");
     let root_manifest = candidate.join("Cargo.toml");
     let mut manifest_bytes = fs::read(&root_manifest).expect("read candidate root manifest");
     manifest_bytes.extend_from_slice(b"\n# otherwise-valid Bootstrap source change\n");
-    fs::write(root_manifest, manifest_bytes).expect("write otherwise-valid source change");
-    let artifacts = TempTree::new("residual-exact-artifacts");
-    let changes = artifacts.join("changes.json");
-    write_manifest(
-        &changes,
-        &ChangeManifest {
-            base: "1111111111111111111111111111111111111111".to_owned(),
-            head: "2222222222222222222222222222222222222222".to_owned(),
-            paths: vec![ChangedPath {
-                status: 'M',
-                path: "Cargo.toml".to_owned(),
-            }],
-        },
+    fs::write(root_manifest, manifest_bytes).expect("write standing-covered source change");
+
+    let trusted_root = SafeRoot::new(&trusted.path).expect("open trusted root");
+    let candidate_root = SafeRoot::new(&candidate.path).expect("open candidate root");
+    compare_trees(
+        &trusted_root,
+        &candidate_root,
+        ".github/trusted/desktop-supply-chain-policy",
     )
-    .expect("write otherwise-valid source manifest");
-    let error = validate_request(&ValidationRequest {
+    .expect("a standing-covered change writes nothing inside the protected trust root");
+
+    let artifacts = TempTree::new("standing-preserved-artifacts");
+    let changes = artifacts.join("changes.json");
+    let manifest = ChangeManifest {
+        base: "1111111111111111111111111111111111111111".to_owned(),
+        head: "2222222222222222222222222222222222222222".to_owned(),
+        paths: vec![ChangedPath {
+            status: 'M',
+            path: "Cargo.toml".to_owned(),
+        }],
+    };
+    write_manifest(&changes, &manifest).expect("write standing-covered source manifest");
+    validate_request(&ValidationRequest {
         trusted_root: trusted.path.clone(),
         candidate_root: candidate.path.clone(),
         changes,
@@ -1245,11 +1321,16 @@ fn otherwise_valid_bootstrap_source_change_reaches_exact_residual_diagnostic() {
         actionlint,
         isolation_root: artifacts.join("isolation"),
     })
-    .expect_err("silent Bootstrap source change unexpectedly passed")
-    .to_string();
+    .expect("standing-covered Bootstrap source change passes the complete authoritative stack");
+
     assert_eq!(
-        error,
-        "Bootstrap source change requires synchronized snapshot/fingerprint or a new bound preservation decision: Cargo.toml"
+        validate_bootstrap_source_decisions(&trusted_root, &candidate_root, &manifest)
+            .expect("standing preservation covers the changed Bootstrap source"),
+        BootstrapSourceDecisionEvidence {
+            changed_paths: 1,
+            synchronized_paths: 0,
+            preserved_paths: 1,
+        }
     );
 }
 
