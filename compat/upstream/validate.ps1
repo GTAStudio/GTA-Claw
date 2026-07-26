@@ -44,6 +44,26 @@ $ExpectedSchemaDigest = "5fd454c7a1012e78410178bc44c02dc3201f46eed94d62c5dc811f4
 $ExpectedOracleCorpusDigest = "e8853b665f2d09e2d526dee5349b56223b249817df5872e408fc7a5d0b182c25"
 $ExpectedOracleCorpusCases = 120
 $ExpectedOracleCorpusTrue = 46
+# The shared reachability corpus is frozen on exactly the same terms. Its
+# expectations were produced by running cargo and rustc against each fixture, so
+# neither resolver is normative for reachability and neither may edit a case to
+# match itself. -WriteLedgerDigests cannot reach these constants.
+$ExpectedReachabilityCorpusDigest = "70aec3e02f3885970ec37d61421fdc34ea932e591842d6a1669adf0e1f4880dd"
+$ExpectedReachabilityCorpusCases = 32
+$ExpectedReachabilityCorpusAccepting = 15
+# The anti-forgery self-test is a trust-root artifact, not a convenience script.
+# Nothing in CI executes it today, and validate.ps1 previously only checked that
+# the file EXISTED: replacing all 113,996 bytes with "exit 0" left both this
+# script and the gutted self-test exiting 0, so the instrument that proves every
+# rejection rule still bites could be removed without any check noticing.
+#
+# The digest is taken over LF-normalised text on purpose. *.ps1 is NOT covered by
+# .gitattributes and core.autocrlf rewrites these bytes per platform, so a raw
+# byte digest would pass on a Windows checkout and fail under pwsh on Linux CI.
+# Frozen exactly like the schema and corpus digests: -WriteLedgerDigests cannot
+# reach this constant, so re-blessing a hollowed-out self-test takes a reviewed
+# edit to this line.
+$ExpectedSelfTestDigest = "bd96e4bc02328b0641587a9cccf4d4228cd715454a78041bbc681f99fd818b58"
 $LedgerDigestFileName = "ledger-digests.sha256"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
@@ -87,6 +107,7 @@ $ExpectedJsonPaths = @(
     "enabled-test-oracle.json",
     "feature-ledger.schema.json",
     "manifest.json",
+    "reachability-corpus.json",
     "inventories/channels.json",
     "inventories/clients.json",
     "inventories/config-domains.json",
@@ -237,7 +258,7 @@ $InventorySpecs = [ordered]@{
 }
 
 $ExpectedCanonicalCounts = [ordered]@{
-    artifact_json_files = 17
+    artifact_json_files = 18
     ledgers = 3
     feature_rows = 47
     inventory_files = 10
@@ -1705,8 +1726,8 @@ function Assert-EnabledTestOracle {
         }
         $actual = Test-DeclaresEnabledRustTest ([string]$case.source) ([string]$case.test)
         if ($actual -ne $case.expected) {
-            Fail ("enabled-test oracle drift on case '{0}': the shared corpus records {1} but this port returned {2}. " +
-                "crates/claw-conformance declares_enabled_test is normative; re-port Test-DeclaresEnabledRustTest before changing this corpus." -f
+            Fail (("enabled-test oracle drift on case '{0}': the shared corpus records {1} but this port returned {2}. " +
+                "crates/claw-conformance declares_enabled_test is normative; re-port Test-DeclaresEnabledRustTest before changing this corpus.") -f
                 $name, $case.expected, $actual)
         }
     }
@@ -1716,6 +1737,116 @@ function Assert-EnabledTestOracle {
     $digest = Get-ObjectDigest $Corpus
     if (-not (Test-OrdinalStringEqual $digest $ExpectedOracleCorpusDigest)) {
         Fail ("enabled-test-oracle digest mismatch; expected {0}, found {1}" -f $ExpectedOracleCorpusDigest, $digest)
+    }
+}
+
+function Assert-ReachabilityCorpusPath {
+    param(
+        [string]$Path,
+        [string]$Context
+    )
+    Assert-RelativeSourcePath $Path $Context
+    # Assert-RelativeSourcePath's character class admits "." and ".." as whole
+    # segments. A corpus key containing a dot segment would let any harness that
+    # materializes these fixtures write outside the fixture root, so reject them
+    # here rather than trusting every future replayer to notice.
+    foreach ($segment in $Path.Split("/")) {
+        if ((Test-OrdinalStringEqual $segment ".") -or (Test-OrdinalStringEqual $segment "..")) {
+            Fail "$Context '$Path' must not contain a dot segment"
+        }
+    }
+}
+
+function Assert-ReachabilityCorpus {
+    param([object]$Corpus)
+    # Structural and digest pin only. This function deliberately does NOT
+    # materialize the fixtures and replay them in-process: the resolver memoizes
+    # per-crate compiled-file sets in script-scoped caches, and seeding those
+    # caches from attacker-supplied fixture trees during a real validation run
+    # would be a forgery vector, not a convenience. Behavioural replay belongs in
+    # validate-self-test.ps1, where every case runs in an isolated child process
+    # against its own repository root.
+    Assert-ExactPropertySet $Corpus @(
+        "schema_version", "purpose", "rule", "arbiter", "implementations", "cases"
+    ) "reachability-corpus"
+    if ($Corpus.schema_version -ne 1) {
+        Fail "reachability-corpus schema_version must be 1"
+    }
+    $implementations = @($Corpus.implementations)
+    if ($implementations.Count -ne 2) {
+        Fail "reachability-corpus must record exactly the two resolvers it compares"
+    }
+    foreach ($implementation in $implementations) {
+        Assert-ExactPropertySet $implementation @("path", "entry_point") "reachability-corpus.implementations"
+    }
+    if (-not (Test-OrdinalStringEqual ([string]$implementations[0].path) "crates/claw-conformance/src/claims.rs") -or
+        -not (Test-OrdinalStringEqual ([string]$implementations[1].path) "compat/upstream/validate.ps1")) {
+        Fail "reachability-corpus must name claw-conformance and validate.ps1 as the two compared resolvers"
+    }
+    $cases = @($Corpus.cases)
+    if ($cases.Count -ne $ExpectedReachabilityCorpusCases) {
+        Fail ("reachability-corpus must contain exactly {0} cases; found {1}" -f $ExpectedReachabilityCorpusCases, $cases.Count)
+    }
+    $names = @{}
+    $accepting = 0
+    foreach ($case in $cases) {
+        Assert-ExactPropertySet $case @("name", "files", "cite", "expect", "why") "reachability-corpus case"
+        $name = [string]$case.name
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            Fail "reachability-corpus case name must not be empty"
+        }
+        if ($names.ContainsKey($name)) {
+            Fail "reachability-corpus case name '$name' is duplicated"
+        }
+        $names[$name] = $true
+        $expect = [string]$case.expect
+        if (-not (Test-OrdinalStringEqual $expect "accept") -and -not (Test-OrdinalStringEqual $expect "reject")) {
+            Fail "reachability-corpus case '$name' expect must be 'accept' or 'reject'"
+        }
+        if (Test-OrdinalStringEqual $expect "accept") {
+            $accepting += 1
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$case.why)) {
+            Fail "reachability-corpus case '$name' must record why the toolchain produces this verdict"
+        }
+        $fileNames = @($case.files.PSObject.Properties.Name)
+        if ($fileNames.Count -lt 2) {
+            Fail "reachability-corpus case '$name' must define a manifest and at least one source"
+        }
+        $hasManifest = $false
+        foreach ($fileName in $fileNames) {
+            Assert-ReachabilityCorpusPath $fileName ("reachability-corpus case '$name' file")
+            if ($fileName.EndsWith("Cargo.toml", [System.StringComparison]::Ordinal)) {
+                $hasManifest = $true
+            }
+        }
+        if (-not $hasManifest) {
+            Fail "reachability-corpus case '$name' must define at least one Cargo.toml"
+        }
+        # A case may only cite a file it actually defines. Without this a corpus
+        # case could cite a path that exists in the real repository and quietly
+        # assert a verdict about something the fixture never contained.
+        $cite = [string]$case.cite
+        Assert-ReachabilityCorpusPath $cite ("reachability-corpus case '$name' cite")
+        if (-not $cite.EndsWith(".rs", [System.StringComparison]::Ordinal)) {
+            Fail "reachability-corpus case '$name' must cite a .rs source"
+        }
+        $citeIsDefined = $false
+        foreach ($fileName in $fileNames) {
+            if (Test-OrdinalStringEqual $fileName $cite) {
+                $citeIsDefined = $true
+            }
+        }
+        if (-not $citeIsDefined) {
+            Fail "reachability-corpus case '$name' cites '$cite', which the case does not define"
+        }
+    }
+    if ($accepting -ne $ExpectedReachabilityCorpusAccepting) {
+        Fail ("reachability-corpus must record exactly {0} accepting cases; found {1}" -f $ExpectedReachabilityCorpusAccepting, $accepting)
+    }
+    $digest = Get-ObjectDigest $Corpus
+    if (-not (Test-OrdinalStringEqual $digest $ExpectedReachabilityCorpusDigest)) {
+        Fail ("reachability-corpus digest mismatch; expected {0}, found {1}" -f $ExpectedReachabilityCorpusDigest, $digest)
     }
 }
 
@@ -1777,7 +1908,7 @@ function Join-RepositoryRelativePath {
 }
 
 function Get-RustModReferencesInRange {
-    param([string[]]$Tokens, [int]$Start, [int]$End, [string[]]$Segments, [object]$Sink)
+    param([string[]]$Tokens, [int]$Start, [int]$End, [object[]]$Segments, [object]$Sink)
     $index = $Start
     while ($index -lt $End) {
         $attributeResult = Get-RustAttributes $Tokens $index $End
@@ -1792,26 +1923,30 @@ function Get-RustModReferencesInRange {
             ($index + 1) -lt $Tokens.Length -and $Tokens[$index + 1].StartsWith("i:", [StringComparison]::Ordinal)) {
             $name = $Tokens[$index + 1].Substring(2)
             $after = $index + 2
-            if ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] "{")) {
-                $close = Get-RustMatchingDelimiter $Tokens $after $End
-                if ($close -lt 0) { $close = $End }
-                Get-RustModReferencesInRange $Tokens ($after + 1) ([Math]::Min($close, $End)) ($Segments + @($name)) $Sink
-                $index = $close + 1
-                $matched = $true
-            } elseif ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] ";")) {
-                $pathAttribute = $null
-                $hasPathAttribute = $false
-                foreach ($attribute in $outer) {
-                    if ($attribute.path.Length -eq 1 -and (Test-OrdinalStringEqual $attribute.path[0] "path")) {
-                        $hasPathAttribute = $true
-                        foreach ($token in $attribute.tokens) {
-                            if ($token.StartsWith("s:", [StringComparison]::Ordinal)) {
-                                $pathAttribute = $token.Substring(2)
-                                break
-                            }
+            # A path attribute governs an inline 'mod name { }' exactly as it
+            # governs 'mod name;', so it has to be read before the two forms are
+            # told apart rather than inside the semicolon branch only.
+            $pathAttribute = $null
+            $hasPathAttribute = $false
+            foreach ($attribute in $outer) {
+                if ($attribute.path.Length -eq 1 -and (Test-OrdinalStringEqual $attribute.path[0] "path")) {
+                    $hasPathAttribute = $true
+                    foreach ($token in $attribute.tokens) {
+                        if ($token.StartsWith("s:", [StringComparison]::Ordinal)) {
+                            $pathAttribute = $token.Substring(2)
+                            break
                         }
                     }
                 }
+            }
+            if ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] "{")) {
+                $close = Get-RustMatchingDelimiter $Tokens $after $End
+                if ($close -lt 0) { $close = $End }
+                $segment = [ordered]@{ name = $name; path = $pathAttribute; hasPath = $hasPathAttribute }
+                Get-RustModReferencesInRange $Tokens ($after + 1) ([Math]::Min($close, $End)) ($Segments + @($segment)) $Sink
+                $index = $close + 1
+                $matched = $true
+            } elseif ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] ";")) {
                 [void]$Sink.Add([ordered]@{
                     segments = $Segments
                     name = $name
@@ -2092,6 +2227,15 @@ function Get-CrateTargetRootFiles {
     return ,$roots.ToArray()
 }
 
+function Get-AmbiguousModuleKey {
+    # Ambiguity markers share the reachable-set hashtable, so they need a prefix
+    # no repository-relative path can ever produce. This is a function rather
+    # than a variable so that any harness which lifts the reachability rule out
+    # of this file fails loudly instead of silently keying on the bare path.
+    param([string]$Path)
+    return ("!ambiguous-module:" + $Path)
+}
+
 function Get-CrateCompiledFileSet {
     param([string]$CrateDirectory, [string]$ManifestText)
     if ($script:CrateReachabilityCache.ContainsKey($CrateDirectory)) {
@@ -2111,10 +2255,29 @@ function Get-CrateCompiledFileSet {
         if ($null -eq $absolute) { continue }
         foreach ($reference in (Get-RustModuleReferences (Get-RepositoryFileText $absolute))) {
             $scope = $current.directory
+            $fileDirectory = Join-RepositoryRelativePath $current.file ".."
+            # A path attribute on an INLINE module renames the directory its
+            # children live in, so the enclosing scopes cannot be a list of plain
+            # module names. Cargo compiles
+            #   #[path = "actual"] mod outer { #[path = "proof.rs"] mod proof; }
+            # as actual/proof.rs and never as outer/proof.rs, and it resolves a
+            # top-level inline path against the directory holding the source file
+            # exactly as it does for 'mod name;'.
+            $scopeFailed = $false
+            $depth = 0
             foreach ($segment in $reference.segments) {
-                $scope = Join-RepositoryRelativePath $scope $segment
-                if ($null -eq $scope) { break }
+                if ($segment.hasPath) {
+                    if ($null -eq $segment.path) { $scopeFailed = $true; break }
+                    if ($depth -eq 0) { $base = $fileDirectory } else { $base = $scope }
+                    if ($null -eq $base) { $scopeFailed = $true; break }
+                    $scope = Join-RepositoryRelativePath $base $segment.path
+                } else {
+                    $scope = Join-RepositoryRelativePath $scope $segment.name
+                }
+                if ($null -eq $scope) { $scopeFailed = $true; break }
+                $depth = $depth + 1
             }
+            if ($scopeFailed) { continue }
             if ($null -eq $scope) { continue }
             $candidates = @()
             $childDirectory = $null
@@ -2132,7 +2295,7 @@ function Get-CrateCompiledFileSet {
                 # same-named file one directory deeper.
                 $base = $scope
                 if (@($reference.segments).Count -eq 0) {
-                    $base = Join-RepositoryRelativePath $current.file ".."
+                    $base = $fileDirectory
                 }
                 if ($null -eq $base) { continue }
                 $target = Join-RepositoryRelativePath $base $reference.path
@@ -2148,10 +2311,21 @@ function Get-CrateCompiledFileSet {
                     }
                 }
             } else {
-                $candidates = @(
-                    (Join-RepositoryRelativePath $scope ($reference.name + ".rs")),
-                    (Join-RepositoryRelativePath $scope ($reference.name + "/mod.rs"))
-                )
+                $fileCandidate = Join-RepositoryRelativePath $scope ($reference.name + ".rs")
+                $directoryCandidate = Join-RepositoryRelativePath $scope ($reference.name + "/mod.rs")
+                $fileExists = ($null -ne $fileCandidate) -and ($null -ne (Resolve-RepositoryFilePath $fileCandidate))
+                $directoryExists = ($null -ne $directoryCandidate) -and ($null -ne (Resolve-RepositoryFilePath $directoryCandidate))
+                if ($fileExists -and $directoryExists) {
+                    # rustc refuses this outright (E0761: file for module found at
+                    # both paths) and compiles NEITHER file, so blessing either
+                    # one would cite a test out of a crate that does not build.
+                    # Fail closed and remember both sides so the citation gets the
+                    # specific reason instead of a misleading 'not wired in'.
+                    $reachable[(Get-AmbiguousModuleKey $fileCandidate)] = $directoryCandidate
+                    $reachable[(Get-AmbiguousModuleKey $directoryCandidate)] = $fileCandidate
+                    continue
+                }
+                $candidates = @($fileCandidate, $directoryCandidate)
                 $childDirectory = Join-RepositoryRelativePath $scope $reference.name
             }
             foreach ($candidate in $candidates) {
@@ -2192,6 +2366,13 @@ function Assert-EvidenceFileIsCompiled {
             "is already built.")
     }
     $reachable = Get-CrateCompiledFileSet ([string]$crate.directory) ([string]$crate.text)
+    $ambiguityKey = Get-AmbiguousModuleKey $RelativePath
+    if ($reachable.ContainsKey($ambiguityKey)) {
+        Fail ("$Context acceptance evidence '$RelativePath' and '" + [string]$reachable[$ambiguityKey] + "' both " +
+            "answer the same 'mod' declaration. rustc rejects that ambiguity outright (E0761: file for module " +
+            "found at both paths) and compiles NEITHER file, so the crate does not build and the cited test can " +
+            "never run. Delete or rename one of the two files, then cite the survivor.")
+    }
     if (-not $reachable.ContainsKey($RelativePath)) {
         $crateLabel = $(if ([string]::IsNullOrEmpty([string]$crate.directory)) { "the repository root crate" } else { [string]$crate.directory })
         Fail ("$Context acceptance evidence '$RelativePath' is not reached by any cargo test target of $crateLabel. " +
@@ -2753,10 +2934,25 @@ if ($actualFilePaths.Count -ne $expectedFilePaths.Count -or
 }
 $missingJsonFiles = @($ExpectedJsonPaths | Where-Object { -not (Test-OrdinalContains $actualJsonPaths $_) })
 $unexpectedJsonFiles = @($actualJsonPaths | Where-Object { -not (Test-OrdinalContains $ExpectedJsonPaths $_) })
-if ($actualJsonPaths.Count -ne 17 -or
+if ($actualJsonPaths.Count -ne 18 -or
     $missingJsonFiles.Count -gt 0 -or
     $unexpectedJsonFiles.Count -gt 0) {
-    Fail "fixed JSON topology mismatch; missing=[$($missingJsonFiles -join ',')], unexpected=[$($unexpectedJsonFiles -join ',')]"
+    Fail ("fixed JSON topology mismatch; expected 18 JSON artifacts, found {0}; missing=[{1}], unexpected=[{2}]" -f
+        $actualJsonPaths.Count, ($missingJsonFiles -join ','), ($unexpectedJsonFiles -join ','))
+}
+
+# The self-test is the only thing that proves the rules below actually reject a
+# forgery, and nothing in CI runs it. Verify the instrument is intact before its
+# verdicts are relied on. Placed after the topology check so a MISSING self-test
+# is still reported as a topology failure rather than a digest mismatch, and the
+# comparison is over LF-normalised text so the answer is identical on Windows and
+# on Linux CI.
+$selfTestPath = Join-Path $Root "validate-self-test.ps1"
+$selfTestText = [System.IO.File]::ReadAllText($selfTestPath) -replace "`r`n", "`n"
+$selfTestDigest = Get-Sha256Text $selfTestText
+if (-not (Test-OrdinalStringEqual $selfTestDigest $ExpectedSelfTestDigest)) {
+    Fail ("validate-self-test.ps1 digest mismatch; expected {0}, found {1}. The anti-forgery self-test is a frozen trust-root artifact; regenerating it is a reviewed edit to `$ExpectedSelfTestDigest, never an automatic step." -f
+        $ExpectedSelfTestDigest, $selfTestDigest)
 }
 
 $documents = @{}
@@ -2768,6 +2964,7 @@ foreach ($relativePath in $ExpectedJsonPaths) {
 # any evidence is judged with it. A drifted oracle must never get the chance to
 # accept or reject a parity claim.
 Assert-EnabledTestOracle $documents["enabled-test-oracle.json"]
+Assert-ReachabilityCorpus $documents["reachability-corpus.json"]
 
 $baseline = $documents["baseline.json"]
 Assert-ExactPropertySet $baseline @("schema_version", "upstream", "stable_release", "gateway_protocol", "licensing") "baseline"

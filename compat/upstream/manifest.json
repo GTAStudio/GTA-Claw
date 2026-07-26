@@ -1,4 +1,4 @@
-﻿{
+{
     "schema_version":  1,
     "artifact_set":  "openclaw-upstream-compatibility-baseline",
     "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
@@ -66,7 +66,7 @@
                         }
                     ],
     "canonical_counts":  {
-                             "artifact_json_files":  17,
+                             "artifact_json_files":  18,
                              "ledgers":  3,
                              "feature_rows":  47,
                              "inventory_files":  10,
