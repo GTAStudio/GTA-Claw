@@ -223,6 +223,81 @@ fn an_operating_system_interrupt_shuts_a_real_process_down_cleanly() {
     assert_eq!(summary.joined, summary.spawned);
 }
 
+/// `SIGTERM` is the signal production actually sends.
+///
+/// `packaging/linux/systemd/gta-claw-daemon.service` sets `KillSignal=SIGTERM`,
+/// and `docker stop` and `kubectl delete` send it too. Handling only `SIGINT`
+/// would leave every one of those paths hitting the default disposition: the
+/// process would die at exit 143 with no drain, no stop line, and no evidence
+/// that a task had been abandoned. The interrupt test above cannot catch that,
+/// because it sends the one signal the old code handled.
+#[cfg(unix)]
+#[test]
+fn a_supervisor_termination_shuts_a_real_process_down_cleanly() {
+    let (mut child, mut reader) = started();
+    let pid = child.0.id().to_string();
+
+    let signalled = Command::new("kill")
+        .arg("-TERM")
+        .arg(&pid)
+        .status()
+        .expect("kill is available");
+    assert!(signalled.success(), "could not signal pid {pid}");
+
+    let summary = stopped(&mut child, &mut reader);
+
+    assert_eq!(
+        summary.reason, "terminate",
+        "a SIGTERM must be reported as a termination, not as an interrupt"
+    );
+    assert!(
+        summary.clean,
+        "the daemon did not stop cleanly: {summary:?}"
+    );
+    assert_eq!(summary.abandoned, 0);
+    assert_eq!(summary.drained, 12);
+    assert_eq!(
+        summary.joined, summary.spawned,
+        "a spawned task was not joined on a supervisor termination"
+    );
+}
+
+/// A terminated daemon must exit for its own reasons, not be killed.
+///
+/// Distinguishes a real drain from the failure this whole path exists to
+/// prevent: an unhandled `SIGTERM` leaves the process killed by signal 15, so
+/// asserting the stop line alone would not prove the handler ran.
+#[cfg(unix)]
+#[test]
+fn a_terminated_daemon_exits_successfully_rather_than_being_killed() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let (mut child, mut reader) = started();
+    let pid = child.0.id().to_string();
+
+    let signalled = Command::new("kill")
+        .arg("-TERM")
+        .arg(&pid)
+        .status()
+        .expect("kill is available");
+    assert!(signalled.success(), "could not signal pid {pid}");
+
+    let summary = stopped(&mut child, &mut reader);
+    assert_eq!(summary.reason, "terminate");
+
+    let status = child.0.wait().expect("the daemon process is waitable");
+
+    assert_eq!(
+        status.signal(),
+        None,
+        "the daemon was killed by a signal instead of draining"
+    );
+    assert!(
+        status.success(),
+        "the daemon exited unsuccessfully: {status:?}"
+    );
+}
+
 #[test]
 fn the_stop_line_parser_reads_every_field_independently() {
     let parsed = StopLine::parse(

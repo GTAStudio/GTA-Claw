@@ -381,6 +381,7 @@ pub struct DaemonBuilder {
     authorization_ttl: Duration,
     context_budget: usize,
     notes: Vec<String>,
+    extra: Vec<Arc<dyn Subsystem>>,
 }
 
 impl fmt::Debug for DaemonBuilder {
@@ -394,6 +395,7 @@ impl fmt::Debug for DaemonBuilder {
             .field("authorization_ttl", &self.authorization_ttl)
             .field("context_budget", &self.context_budget)
             .field("notes", &self.notes)
+            .field("extra_subsystems", &self.extra.len())
             .finish_non_exhaustive()
     }
 }
@@ -411,7 +413,23 @@ impl DaemonBuilder {
             authorization_ttl: Duration::from_secs(5),
             context_budget: 4 * 1024,
             notes: vec!["the operator prefers concise answers".to_owned()],
+            extra: Vec::new(),
         }
+    }
+
+    /// Adds a subsystem the daemon does not build for itself.
+    ///
+    /// This is the seam for anything that owns a real resource — a bound
+    /// `TcpListener` serving an HTTP router, for example. The subsystem is
+    /// ordered by the dependencies its own [`SubsystemDescriptor`] declares,
+    /// not by the order it is added in, and it is started, quiesced and shut
+    /// down exactly like a built-in one. Its background work must be spawned
+    /// through [`StartContext::spawner`] so it is counted in the task ledger,
+    /// and it should stop when [`StartContext::shutdown`] fires.
+    #[must_use]
+    pub fn with_subsystem(mut self, subsystem: Arc<dyn Subsystem>) -> Self {
+        self.extra.push(subsystem);
+        self
     }
 
     /// Uses `clock` instead of the process clock.
@@ -548,7 +566,7 @@ impl DaemonBuilder {
 
         // Declaring the graph, not the order. The order is derived from these
         // edges, so a new subsystem only has to say what it needs.
-        let subsystems: Vec<Arc<dyn Subsystem>> = vec![
+        let mut subsystems: Vec<Arc<dyn Subsystem>> = vec![
             Arc::new(PortSubsystem::new(well_known::observability(), &[])),
             Arc::new(PortSubsystem::new(
                 well_known::config(),
@@ -595,6 +613,8 @@ impl DaemonBuilder {
             Arc::clone(&gateway) as Arc<dyn Subsystem>,
             Arc::clone(&http) as Arc<dyn Subsystem>,
         ];
+
+        subsystems.extend(self.extra);
 
         let host = SubsystemHost::with_lifecycle(subsystems, lifecycle)?;
 

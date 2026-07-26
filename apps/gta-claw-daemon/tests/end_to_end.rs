@@ -10,9 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use claw_application::composition::{
-    Capability, CapabilitySet, Clock, ConfigPort, GatewayPort, GatewayRequest, HttpApiPort,
-    LifecyclePhase, ObservabilityPort, Principal, ProviderReply, Severity, ToolName, TurnEvent,
-    TurnEventSink,
+    BoxFuture, Capability, CapabilitySet, Clock, ConfigPort, GatewayPort, GatewayRequest,
+    HttpApiPort, LifecyclePhase, ObservabilityPort, Principal, ProviderReply, ServiceHandle,
+    Severity, StartContext, Subsystem, SubsystemDescriptor, SubsystemError, SubsystemId,
+    SubsystemKind, ToolName, TurnEvent, TurnEventSink, well_known,
 };
 use claw_domain::SessionId;
 use gta_claw_daemon::adapters::model::request_tool;
@@ -655,4 +656,129 @@ async fn the_turn_deadline_comes_from_configuration_read_at_the_start_of_the_tur
         .expect("the turn uses the new settings without a restart");
 
     assert!(daemon.stop().await.expect("the daemon stops").is_clean());
+}
+
+/// A subsystem supplied from outside the daemon, standing in for a real
+/// ingress that owns a bound socket.
+///
+/// Records every lifecycle callback so the test can prove the daemon drove it,
+/// and spawns one background task through the context's spawner so the task
+/// ledger has something to account for.
+#[derive(Debug, Default)]
+struct ExternalIngress {
+    events: Mutex<Vec<&'static str>>,
+}
+
+impl ExternalIngress {
+    fn id() -> SubsystemId {
+        SubsystemId::new("external-ingress").expect("a valid subsystem id")
+    }
+
+    fn record(&self, event: &'static str) {
+        self.events
+            .lock()
+            .expect("the recorder is usable")
+            .push(event);
+    }
+
+    fn events(&self) -> Vec<&'static str> {
+        self.events.lock().expect("the recorder is usable").clone()
+    }
+}
+
+impl Subsystem for ExternalIngress {
+    fn descriptor(&self) -> SubsystemDescriptor {
+        // Declares an edge on the engine, so the plan must place it last even
+        // though it is added to the builder before start is ever called.
+        SubsystemDescriptor::new(Self::id(), SubsystemKind::Ingress)
+            .depends_on(well_known::engine())
+    }
+
+    fn initialize<'a>(
+        &'a self,
+        _context: &'a StartContext,
+    ) -> BoxFuture<'a, Result<(), SubsystemError>> {
+        Box::pin(async move {
+            self.record("initialize");
+            Ok(())
+        })
+    }
+
+    fn start<'a>(
+        &'a self,
+        context: &'a StartContext,
+    ) -> BoxFuture<'a, Result<ServiceHandle, SubsystemError>> {
+        Box::pin(async move {
+            self.record("start");
+
+            let shutdown = context.shutdown();
+            context.spawner().spawn(
+                "external-ingress",
+                Box::pin(async move {
+                    shutdown.triggered().await;
+                }),
+            )?;
+
+            Ok(ServiceHandle::inert(Self::id()))
+        })
+    }
+
+    fn shutdown<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
+        Box::pin(async move {
+            self.record("shutdown");
+            Ok(())
+        })
+    }
+}
+
+/// A caller must be able to add a subsystem the daemon does not build itself.
+///
+/// This is the seam an HTTP server that owns a real listener plugs into: the
+/// daemon starts it, orders it by its declared dependencies, counts its task,
+/// and shuts it down with everything else.
+#[tokio::test]
+async fn an_externally_supplied_subsystem_is_started_ordered_and_shut_down() {
+    let ingress = Arc::new(ExternalIngress::default());
+    let mut daemon = Daemon::builder()
+        .clock(Arc::new(SteppedClock::new()))
+        .with_subsystem(Arc::clone(&ingress) as Arc<dyn Subsystem>)
+        .build()
+        .expect("the composition builds with an added subsystem");
+
+    let order = daemon.start_order();
+    let position = order
+        .iter()
+        .position(|id| id == "external-ingress")
+        .expect("the added subsystem is in the plan");
+    let engine = order
+        .iter()
+        .position(|id| id == well_known::engine().as_str())
+        .expect("the engine is in the plan");
+
+    assert!(
+        engine < position,
+        "the declared dependency did not order the added subsystem: {order:?}"
+    );
+
+    let handles = daemon.start().await.expect("the daemon starts");
+    assert!(
+        handles
+            .iter()
+            .any(|handle| handle.subsystem().as_str() == "external-ingress"),
+        "the added subsystem reported no service handle"
+    );
+    assert_eq!(ingress.events(), vec!["initialize", "start"]);
+
+    let summary = daemon.stop().await.expect("the daemon stops");
+
+    assert_eq!(ingress.events(), vec!["initialize", "start", "shutdown"]);
+    assert_eq!(
+        summary.tasks().terminated(),
+        summary.tasks().spawned(),
+        "the added subsystem's task was not joined"
+    );
+    assert!(
+        summary.tasks().spawned() > 0,
+        "no task was spawned, so the join assertion above proves nothing"
+    );
 }

@@ -1,11 +1,17 @@
-//! Process-level control: argument parsing, the ready contract, and the two
-//! ways a run ends.
+//! Process-level control: argument parsing, the ready contract, and the ways a
+//! run ends.
 //!
-//! The daemon stops for exactly two reasons: an operating-system interrupt, or
-//! an explicit `shutdown` line on the control channel. Reaching the end of the
-//! control channel is *not* one of them — a daemon started with its standard
-//! input closed must keep serving, which is what the process-lifecycle test
-//! asserts.
+//! The daemon stops for an operating-system stop signal or an explicit
+//! `shutdown` line on the control channel. Reaching the end of the control
+//! channel is *not* one of them — a daemon started with its standard input
+//! closed must keep serving, which is what the process-lifecycle test asserts.
+//!
+//! Both of the signals a supervisor uses are handled, and the distinction
+//! matters: `SIGTERM` is what `systemd` (`KillSignal=SIGTERM` in
+//! `packaging/linux/systemd/gta-claw-daemon.service`), `docker stop` and
+//! `kubectl delete` send, while `SIGINT` is what an interactive Ctrl-C sends.
+//! Handling only the latter would leave the packaged service to die at the
+//! default disposition, with no drain and no stop summary.
 
 use std::io::{self, Write};
 
@@ -30,7 +36,13 @@ pub enum DaemonMode {
 /// Why a run ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StopTrigger {
+    /// A supervisor asked the process to terminate.
+    ///
+    /// `SIGTERM` on unix; a console close or system shutdown on Windows.
+    Terminate,
     /// An operating-system interrupt arrived.
+    ///
+    /// `SIGINT` on unix; Ctrl-C or Ctrl-Break on Windows.
     Interrupt,
     /// The control channel carried [`SHUTDOWN_COMMAND`].
     Control,
@@ -41,8 +53,93 @@ impl StopTrigger {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Terminate => "terminate",
             Self::Interrupt => "interrupt",
             Self::Control => "control",
+        }
+    }
+}
+
+/// The operating-system stop signals, installed and held for a whole run.
+///
+/// Installed *before* the daemon starts serving, so a supervisor that stops the
+/// process during startup is still observed rather than being left to the
+/// default disposition. Dropping this value uninstalls the handlers.
+pub struct StopSignals {
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+    #[cfg(windows)]
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+    #[cfg(windows)]
+    ctrl_close: tokio::signal::windows::CtrlClose,
+    #[cfg(windows)]
+    ctrl_shutdown: tokio::signal::windows::CtrlShutdown,
+}
+
+impl StopSignals {
+    /// Installs the handlers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] when a handler cannot be installed. Reporting
+    /// that here rather than at stop time means the failure is visible before
+    /// the daemon claims to be ready.
+    #[cfg(unix)]
+    pub fn install() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            terminate: signal(SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// Installs the handlers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] when a handler cannot be installed.
+    #[cfg(windows)]
+    pub fn install() -> io::Result<Self> {
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+
+        Ok(Self {
+            ctrl_c: ctrl_c()?,
+            ctrl_break: ctrl_break()?,
+            ctrl_close: ctrl_close()?,
+            ctrl_shutdown: ctrl_shutdown()?,
+        })
+    }
+
+    /// Waits for whichever stop signal arrives first.
+    ///
+    /// A signal stream that ends is treated as "this signal will never arrive"
+    /// rather than as a stop, so a closed stream cannot shut the daemon down.
+    #[cfg(unix)]
+    pub async fn recv(&mut self) -> StopTrigger {
+        tokio::select! {
+            Some(()) = self.terminate.recv() => StopTrigger::Terminate,
+            Some(()) = self.interrupt.recv() => StopTrigger::Interrupt,
+            else => std::future::pending().await,
+        }
+    }
+
+    /// Waits for whichever stop signal arrives first.
+    ///
+    /// A signal stream that ends is treated as "this signal will never arrive"
+    /// rather than as a stop, so a closed stream cannot shut the daemon down.
+    #[cfg(windows)]
+    pub async fn recv(&mut self) -> StopTrigger {
+        tokio::select! {
+            Some(()) = self.ctrl_close.recv() => StopTrigger::Terminate,
+            Some(()) = self.ctrl_shutdown.recv() => StopTrigger::Terminate,
+            Some(()) = self.ctrl_c.recv() => StopTrigger::Interrupt,
+            Some(()) = self.ctrl_break.recv() => StopTrigger::Interrupt,
+            else => std::future::pending().await,
         }
     }
 }
@@ -103,20 +200,17 @@ pub async fn await_control(reader: impl tokio::io::AsyncRead + Unpin) -> Option<
 
 /// Waits for whichever stop reason arrives first.
 ///
-/// # Errors
-///
-/// Returns an [`io::Error`] when the interrupt handler cannot be installed.
-pub async fn await_stop(control: impl tokio::io::AsyncRead + Unpin) -> io::Result<StopTrigger> {
-    let interrupt = tokio::signal::ctrl_c();
-
+/// Takes the signals by reference because they must have been installed before
+/// the daemon started serving; see [`StopSignals::install`].
+pub async fn await_stop(
+    signals: &mut StopSignals,
+    control: impl tokio::io::AsyncRead + Unpin,
+) -> StopTrigger {
     tokio::select! {
-        result = interrupt => {
-            result?;
-            Ok(StopTrigger::Interrupt)
-        }
+        trigger = signals.recv() => trigger,
         trigger = await_control(control) => {
             match trigger {
-                Some(trigger) => Ok(trigger),
+                Some(trigger) => trigger,
                 // The channel ended. Park here rather than returning, so an
                 // inherited null stdin cannot shut the daemon down.
                 None => std::future::pending().await,
@@ -133,12 +227,17 @@ pub async fn await_stop(control: impl tokio::io::AsyncRead + Unpin) -> io::Resul
 ///
 /// # Errors
 ///
-/// Returns an error when the composition cannot be built or started, when the
-/// stop signal cannot be awaited, or when the output cannot be written.
+/// Returns an error when a stop-signal handler cannot be installed, when the
+/// composition cannot be built or started, or when the output cannot be
+/// written.
 pub async fn serve(
     mut output: impl Write,
     control: impl tokio::io::AsyncRead + Unpin,
 ) -> Result<StopSummary, Box<dyn std::error::Error>> {
+    // Installed before anything is started. A supervisor that stops the process
+    // during startup is then still observed, instead of the signal reaching the
+    // default disposition and killing the process mid-start with no drain.
+    let mut signals = StopSignals::install()?;
     let application = Application::new(NativeSystemProbe);
     let mut daemon = Daemon::builder().build()?;
 
@@ -148,7 +247,7 @@ pub async fn serve(
     writeln!(output, "{}", application.health())?;
     output.flush()?;
 
-    let trigger = await_stop(control).await?;
+    let trigger = await_stop(&mut signals, control).await;
     let summary = daemon.stop().await?;
 
     writeln!(
@@ -171,7 +270,10 @@ pub async fn serve(
 mod tests {
     use std::time::Duration;
 
-    use super::{DaemonMode, SHUTDOWN_COMMAND, StopTrigger, await_control, parse_mode, probe};
+    use super::{
+        DaemonMode, SHUTDOWN_COMMAND, StopSignals, StopTrigger, await_control, await_stop,
+        parse_mode, probe,
+    };
 
     #[test]
     fn normal_mode_is_persistent_and_probe_is_explicit() {
@@ -232,9 +334,89 @@ mod tests {
     }
 
     #[test]
-    fn the_two_stop_reasons_are_reported_differently() {
+    fn every_stop_reason_is_reported_differently() {
+        assert_eq!(StopTrigger::Terminate.label(), "terminate");
         assert_eq!(StopTrigger::Interrupt.label(), "interrupt");
         assert_eq!(StopTrigger::Control.label(), "control");
+
+        let labels = [
+            StopTrigger::Terminate.label(),
+            StopTrigger::Interrupt.label(),
+            StopTrigger::Control.label(),
+        ];
+        let mut unique = labels.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "two stop reasons share a label, so a supervisor cannot tell them apart"
+        );
+
+        assert_ne!(StopTrigger::Terminate, StopTrigger::Interrupt);
+        assert_ne!(StopTrigger::Terminate, StopTrigger::Control);
         assert_ne!(StopTrigger::Interrupt, StopTrigger::Control);
+    }
+
+    /// A supervisor stop must not be reported as an interactive interrupt.
+    ///
+    /// `systemd`, `docker stop` and `kubectl delete` all send `SIGTERM`, so
+    /// collapsing it onto `interrupt` would make the packaged service's stop
+    /// reason indistinguishable from a developer pressing Ctrl-C.
+    #[test]
+    fn a_supervisor_termination_is_not_labelled_as_an_interrupt() {
+        assert_ne!(
+            StopTrigger::Terminate.label(),
+            StopTrigger::Interrupt.label()
+        );
+    }
+
+    /// Installing the handlers must succeed before the daemon claims readiness.
+    ///
+    /// Runs on a current-thread runtime because the handlers are registered
+    /// against the runtime's signal driver, which is what `serve` does too.
+    #[tokio::test]
+    async fn the_stop_signal_handlers_install_on_this_platform() {
+        let signals = StopSignals::install().expect("stop-signal handlers install");
+
+        drop(signals);
+    }
+
+    /// The control channel must still win when no signal arrives.
+    ///
+    /// Guards the `select!` rewrite: if the signal arm resolved eagerly rather
+    /// than parking, this would report a signal reason instead of `control`.
+    #[tokio::test]
+    async fn a_control_shutdown_still_stops_when_no_signal_arrives() {
+        let mut signals = StopSignals::install().expect("stop-signal handlers install");
+
+        let trigger = tokio::time::timeout(
+            Duration::from_secs(5),
+            await_stop(&mut signals, "shutdown\n".as_bytes()),
+        )
+        .await
+        .expect("the control channel resolves the stop");
+
+        assert_eq!(trigger, StopTrigger::Control);
+    }
+
+    /// An idle control channel and no signal must not resolve to anything.
+    ///
+    /// The positive control above proves this fixture *can* report a stop, so a
+    /// timeout here means "nothing stopped it", not "the fixture is inert".
+    #[tokio::test]
+    async fn neither_an_ended_channel_nor_silence_stops_the_daemon() {
+        let mut signals = StopSignals::install().expect("stop-signal handlers install");
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(250),
+            await_stop(&mut signals, "status\n".as_bytes()),
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "the daemon stopped for {outcome:?} without a signal or a shutdown line"
+        );
     }
 }

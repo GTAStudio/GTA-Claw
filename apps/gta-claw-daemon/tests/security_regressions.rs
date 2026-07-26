@@ -628,6 +628,7 @@ fn a_builder_never_formats_the_provider_url_before_the_guard_has_seen_it() {
          provider_addresses: [203.0.113.10], \
          authorization_ttl: 5s, \
          context_budget: 4096, \
-         notes: [\"the operator prefers concise answers\"], .. }"
+         notes: [\"the operator prefers concise answers\"], \
+         extra_subsystems: 0, .. }"
     );
 }
