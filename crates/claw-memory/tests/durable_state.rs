@@ -338,6 +338,28 @@ fn corrupt_state_is_quarantined_byte_for_byte_and_recreated() {
 }
 
 #[test]
+fn stale_write_temporaries_are_removed_under_the_scope_lock() {
+    let root = TempDir::new("stale-temporary");
+    let scope = scope("stale-temporary-scope");
+    let store = DurableMemoryStore::new(root.path(), 500, 500).expect("valid limits");
+    store
+        .add(&scope, MemoryTarget::Memory, "first", 1)
+        .expect("create state");
+    let state = only_state_file(root.path(), "memory");
+    let file_name = state
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("UTF-8 state name");
+    let stale = state.with_file_name(format!(".{file_name}.gta-claw.tmp.1.0"));
+    fs::write(&stale, vec![0_u8; 1024]).expect("create simulated crash leftover");
+
+    store
+        .add(&scope, MemoryTarget::Memory, "second", 2)
+        .expect("write after stale temporary");
+    assert!(!stale.exists());
+}
+
+#[test]
 fn reduced_configs_preserve_valid_data_without_exposing_over_capacity_context() {
     let root = TempDir::new("reduced-config");
     let scope = scope("reduced");

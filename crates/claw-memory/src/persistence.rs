@@ -641,6 +641,7 @@ struct TemporaryArtifact {
 
 impl TemporaryArtifact {
     fn create(destination: &Path, label: &str) -> Result<(Self, File), PersistenceError> {
+        cleanup_stale_temporaries(destination, label)?;
         for _ in 0..128 {
             let sequence = FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let file_name = destination
@@ -709,6 +710,53 @@ impl TemporaryArtifact {
             Err(source) => Err(source),
         }
     }
+}
+
+fn cleanup_stale_temporaries(destination: &Path, label: &str) -> Result<(), PersistenceError> {
+    let parent = destination
+        .parent()
+        .expect("prepared destination always has a parent");
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    let prefix = format!(".{file_name}.gta-claw.{label}.");
+    let mut removed = false;
+    for entry in
+        fs::read_dir(parent).map_err(|source| PersistenceError::io("scan", parent, source))?
+    {
+        let entry =
+            entry.map_err(|source| PersistenceError::io("read entry in", parent, source))?;
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|source| PersistenceError::io("inspect stale temporary", &path, source))?;
+        if metadata.is_dir() && !is_link_or_reparse(&metadata) {
+            return Err(PersistenceError::io(
+                "clean stale temporary",
+                path,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "temporary artifact path is a directory",
+                ),
+            ));
+        }
+        fs::remove_file(&path)
+            .map_err(|source| PersistenceError::io("clean stale temporary", &path, source))?;
+        removed = true;
+    }
+    if removed {
+        sync_parent(destination).map_err(|source| {
+            PersistenceError::io(
+                "synchronize parent after temporary cleanup for",
+                destination,
+                source,
+            )
+        })?;
+    }
+    Ok(())
 }
 
 impl Drop for TemporaryArtifact {
