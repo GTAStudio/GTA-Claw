@@ -135,7 +135,6 @@ impl IngressGate {
 pub struct LoopbackGateway {
     dispatch: Arc<dyn GatewayDispatch>,
     gate: IngressGate,
-    bound: std::sync::Mutex<Vec<SocketAddr>>,
 }
 
 impl LoopbackGateway {
@@ -145,7 +144,6 @@ impl LoopbackGateway {
         Self {
             dispatch,
             gate: IngressGate::new(),
-            bound: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -205,15 +203,22 @@ impl Subsystem for LoopbackGateway {
 
     fn start<'a>(
         &'a self,
-        context: &'a StartContext,
+        _context: &'a StartContext,
     ) -> BoxFuture<'a, Result<ServiceHandle, SubsystemError>> {
         Box::pin(async move {
-            let bound = context.settings().listen().to_vec();
-            *self.bound.lock().expect("uncontended") = bound.clone();
             self.gate.accepting.store(true, Ordering::SeqCst);
 
-            Ok(ServiceHandle::listening(well_known::gateway(), bound)
-                .with_detail(format!("{} methods", self.dispatch.methods().len())))
+            // Deliberately `inert`, not `listening`. This ingress binds no
+            // socket, and a handle that reported the *requested* addresses
+            // would advertise a service nothing is accepting on. Only a
+            // subsystem that owns a real listener may report `listening`, with
+            // addresses taken from the listener itself.
+            Ok(
+                ServiceHandle::inert(well_known::gateway()).with_detail(format!(
+                    "{} methods, in-process only",
+                    self.dispatch.methods().len()
+                )),
+            )
         })
     }
 
@@ -240,10 +245,7 @@ impl Subsystem for LoopbackGateway {
     }
 
     fn shutdown<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
-        Box::pin(async move {
-            self.bound.lock().expect("uncontended").clear();
-            Ok(())
-        })
+        Box::pin(async move { Ok(()) })
     }
 }
 
@@ -252,8 +254,9 @@ impl GatewayPort for LoopbackGateway {
         self.dispatch.methods().len()
     }
 
+    /// Always empty: this ingress binds no socket.
     fn bound(&self) -> Vec<SocketAddr> {
-        self.bound.lock().expect("uncontended").clone()
+        Vec::new()
     }
 }
 
@@ -272,7 +275,6 @@ pub struct LoopbackHttpApi {
     dispatch: Arc<dyn GatewayDispatch>,
     routes: Vec<HttpRoute>,
     gate: IngressGate,
-    bound: std::sync::Mutex<Vec<SocketAddr>>,
 }
 
 impl LoopbackHttpApi {
@@ -283,7 +285,6 @@ impl LoopbackHttpApi {
             dispatch,
             routes,
             gate: IngressGate::new(),
-            bound: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -355,15 +356,15 @@ impl Subsystem for LoopbackHttpApi {
 
     fn start<'a>(
         &'a self,
-        context: &'a StartContext,
+        _context: &'a StartContext,
     ) -> BoxFuture<'a, Result<ServiceHandle, SubsystemError>> {
         Box::pin(async move {
-            let bound = context.settings().listen().to_vec();
-            *self.bound.lock().expect("uncontended") = bound.clone();
             self.gate.accepting.store(true, Ordering::SeqCst);
 
-            Ok(ServiceHandle::listening(well_known::http_api(), bound)
-                .with_detail(format!("{} routes", self.routes.len())))
+            // `inert` for the same reason as the gateway above: nothing is
+            // bound here, so nothing may be advertised as bound.
+            Ok(ServiceHandle::inert(well_known::http_api())
+                .with_detail(format!("{} routes, in-process only", self.routes.len())))
         })
     }
 
@@ -384,10 +385,7 @@ impl Subsystem for LoopbackHttpApi {
     }
 
     fn shutdown<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
-        Box::pin(async move {
-            self.bound.lock().expect("uncontended").clear();
-            Ok(())
-        })
+        Box::pin(async move { Ok(()) })
     }
 }
 
@@ -396,8 +394,9 @@ impl HttpApiPort for LoopbackHttpApi {
         self.routes.clone()
     }
 
+    /// Always empty: this ingress binds no socket.
     fn bound(&self) -> Vec<SocketAddr> {
-        self.bound.lock().expect("uncontended").clone()
+        Vec::new()
     }
 }
 

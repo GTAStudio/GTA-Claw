@@ -390,6 +390,52 @@ async fn every_subsystem_is_initialized_started_and_stopped_exactly_once() {
     assert_eq!(daemon.http().bound().len(), 0);
 }
 
+/// No built-in subsystem may claim an address, because none of them binds one.
+///
+/// The in-process surfaces are doubles: they speak no wire protocol and open no
+/// socket. Reporting the *requested* `listen()` addresses as bound would
+/// advertise a service nothing is accepting on, which is worse than advertising
+/// nothing — a health check would see an address and believe it. Only a
+/// subsystem that owns a real listener may report `listening`, and the address
+/// must come from that listener.
+#[tokio::test]
+async fn no_subsystem_advertises_an_address_it_has_not_bound() {
+    let requested: Vec<std::net::SocketAddr> = vec![
+        "127.0.0.1:65000".parse().expect("a valid address"),
+        "127.0.0.1:65001".parse().expect("a valid address"),
+    ];
+    let mut daemon = Daemon::builder()
+        .clock(Arc::new(SteppedClock::new()))
+        .listen(requested.clone())
+        .build()
+        .expect("the composition builds");
+
+    let handles = daemon.start().await.expect("the daemon starts");
+
+    assert!(
+        !handles.is_empty(),
+        "no handles were returned, so the assertion below proves nothing"
+    );
+    for handle in &handles {
+        assert!(
+            handle.bound().is_empty(),
+            "{} advertised {:?} without binding it",
+            handle.subsystem().as_str(),
+            handle.bound()
+        );
+    }
+
+    // While running, not merely after shutdown: the fiction would be live here.
+    assert!(daemon.gateway().bound().is_empty());
+    assert!(daemon.http().bound().is_empty());
+
+    // And the requested addresses really were carried into the composition, so
+    // this is "nothing advertises them", not "they were silently dropped".
+    assert_eq!(daemon.settings().listen(), requested.as_slice());
+
+    daemon.stop().await.expect("the daemon stops");
+}
+
 #[tokio::test]
 async fn observability_records_the_start_and_each_completed_turn() {
     let clock = Arc::new(SteppedClock::new());

@@ -340,6 +340,16 @@ impl Daemon {
         Arc::clone(&self.http)
     }
 
+    /// Returns the settings the composition was built with.
+    ///
+    /// The addresses in [`RuntimeSettings::listen`] are *requested*, not bound.
+    /// Nothing in this composition opens a socket, so a subsystem that owns a
+    /// real listener is what turns them into something being accepted on.
+    #[must_use]
+    pub fn settings(&self) -> Arc<RuntimeSettings> {
+        Arc::clone(&self.settings)
+    }
+
     /// Returns the resolver, so a test can change an answer mid-run.
     #[must_use]
     pub fn dns(&self) -> Arc<TableDns> {
