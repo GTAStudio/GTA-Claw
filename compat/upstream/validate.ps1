@@ -41,9 +41,16 @@ $ExpectedSchemaDigest = "5fd454c7a1012e78410178bc44c02dc3201f46eed94d62c5dc811f4
 # contract artifact, NOT a regenerable one. -WriteLedgerDigests cannot reach this
 # constant, so weakening a case to let a forged citation through requires a
 # reviewed edit to this script.
-$ExpectedOracleCorpusDigest = "30d6163e8f84c29c60354a947c2ed6dd1974f91478c38d0f45830218e89239c0"
-$ExpectedOracleCorpusCases = 85
-$ExpectedOracleCorpusTrue = 35
+$ExpectedOracleCorpusDigest = "e8853b665f2d09e2d526dee5349b56223b249817df5872e408fc7a5d0b182c25"
+$ExpectedOracleCorpusCases = 120
+$ExpectedOracleCorpusTrue = 46
+# The shared reachability corpus is frozen on exactly the same terms. Its
+# expectations were produced by running cargo and rustc against each fixture, so
+# neither resolver is normative for reachability and neither may edit a case to
+# match itself. -WriteLedgerDigests cannot reach these constants.
+$ExpectedReachabilityCorpusDigest = "70aec3e02f3885970ec37d61421fdc34ea932e591842d6a1669adf0e1f4880dd"
+$ExpectedReachabilityCorpusCases = 32
+$ExpectedReachabilityCorpusAccepting = 15
 $LedgerDigestFileName = "ledger-digests.sha256"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
@@ -87,6 +94,7 @@ $ExpectedJsonPaths = @(
     "enabled-test-oracle.json",
     "feature-ledger.schema.json",
     "manifest.json",
+    "reachability-corpus.json",
     "inventories/channels.json",
     "inventories/clients.json",
     "inventories/config-domains.json",
@@ -237,7 +245,7 @@ $InventorySpecs = [ordered]@{
 }
 
 $ExpectedCanonicalCounts = [ordered]@{
-    artifact_json_files = 17
+    artifact_json_files = 18
     ledgers = 3
     feature_rows = 47
     inventory_files = 10
@@ -1126,15 +1134,24 @@ function Get-RustCharLiteralEnd {
 
 function Get-RustTokens {
     param([string]$Source, [switch]$WithStrings)
-    # Token encoding: identifiers become "i:<name>", punctuation is its own text
-    # and :: becomes "::". Rust identifiers are ASCII [A-Za-z0-9_] here, so no
-    # identifier can ever collide with a punctuation marker.
+    # Token encoding: identifiers become "i:<name>", punctuation is its own text,
+    # :: becomes "::", every string/char literal becomes "lit" and every other
+    # byte becomes "oth". Identifiers carry an "i:" prefix, so no identifier can
+    # collide with a punctuation marker even though identifiers may now contain
+    # non-ASCII characters.
+    #
+    # "lit" and "oth" are load bearing, not cosmetic. The normative tokenizer
+    # emits a token for every unrecognised byte, so a stray byte in front of an
+    # attribute makes the following item part of the item that stray byte opened
+    # and the test stops being visible. Dropping those bytes silently, as an
+    # earlier port did, accepted sources the normative rule rejects.
     #
     # -WithStrings is a LOCAL extension with no counterpart in the normative Rust
-    # tokenizer. It additionally emits "s:<value>" for quoted strings and "=", so
-    # the locally owned Cargo reachability rule below can read a #[path = "..."]
-    # attribute value. The oracle never passes it, so the token stream the oracle
-    # sees stays byte-identical to the Rust original; the 1269-case differential
+    # tokenizer. It emits "s:<value>" in place of "lit" for quoted strings and
+    # "=" in place of "oth" for an equals sign, so the locally owned Cargo
+    # reachability rule below can read a #[path = "..."] attribute value. It is
+    # otherwise the same stream. The oracle never passes it, so the token stream
+    # the oracle sees stays byte-identical to the Rust original; the differential
     # is run against the default path to keep that honest.
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Source)
     $length = $bytes.Length
@@ -1142,6 +1159,13 @@ function Get-RustTokens {
     $index = 0
     while ($index -lt $length) {
         $byte = $bytes[$index]
+        # A UTF-8 BOM is skipped outright. It has to be skipped before the
+        # identifier branch, because that branch now starts an identifier on any
+        # non-ASCII byte and would otherwise turn a leading BOM into one.
+        if (($index + 3) -le $length -and $byte -eq 239 -and $bytes[$index + 1] -eq 187 -and $bytes[$index + 2] -eq 191) {
+            $index += 3
+            continue
+        }
         # Rust is_ascii_whitespace: space, tab, newline, form feed, carriage
         # return. Carriage return being whitespace is what makes the oracle
         # produce identical tokens for CRLF and LF checkouts.
@@ -1162,6 +1186,30 @@ function Get-RustTokens {
         }
         $rawEnd = Get-RustRawStringEnd $bytes $index
         if ($rawEnd -ge 0) {
+            if ($WithStrings) {
+                # A raw string carries a value like any other string literal, and
+                # #[path = r"..."] is legal Rust. Tokenising it as an opaque
+                # literal made the attribute invisible, so the declaration was
+                # resolved by module name and a file cargo never compiles was
+                # blessed instead. Raw strings have no escapes, so the bytes
+                # between the quotes are the value.
+                $prefix = $index
+                if ($bytes[$prefix] -eq 98) { $prefix += 1 }
+                $prefix += 1
+                $hashCount = 0
+                while (($prefix + $hashCount) -lt $length -and $bytes[$prefix + $hashCount] -eq 35) {
+                    $hashCount += 1
+                }
+                $contentStart = $prefix + $hashCount + 1
+                $contentLength = $rawEnd - $hashCount - 1 - $contentStart
+                if ($contentLength -ge 0 -and ($contentStart + $contentLength) -le $length) {
+                    [void]$tokens.Add("s:" + [System.Text.Encoding]::UTF8.GetString($bytes, $contentStart, $contentLength))
+                } else {
+                    [void]$tokens.Add("lit")
+                }
+            } else {
+                [void]$tokens.Add("lit")
+            }
             $index = $rawEnd
             continue
         }
@@ -1172,12 +1220,17 @@ function Get-RustTokens {
                 $inner = $quotedEnd - $quote - 2
                 if ($inner -ge 0) {
                     [void]$tokens.Add("s:" + [System.Text.Encoding]::UTF8.GetString($bytes, $quote + 1, $inner))
+                } else {
+                    [void]$tokens.Add("lit")
                 }
+            } else {
+                [void]$tokens.Add("lit")
             }
             $index = $quotedEnd
             continue
         }
         if ($byte -eq 39) {
+            [void]$tokens.Add("lit")
             $charEnd = Get-RustCharLiteralEnd $bytes $index
             if ($charEnd -ge 0) {
                 $index = $charEnd
@@ -1186,19 +1239,23 @@ function Get-RustTokens {
             }
             continue
         }
-        if (($byte -ge 65 -and $byte -le 90) -or ($byte -ge 97 -and $byte -le 122) -or $byte -eq 95) {
+        # Identifier start: ASCII letter, underscore, or any non-ASCII byte.
+        # Walking non-ASCII a byte at a time is equivalent to the normative
+        # char::len_utf8 step, because every continuation byte of a multi-byte
+        # character is itself >= 0x80 and so is consumed by the same loop.
+        if (($byte -ge 65 -and $byte -le 90) -or ($byte -ge 97 -and $byte -le 122) -or $byte -eq 95 -or $byte -ge 128) {
             $start = $index
             $index += 1
             while ($index -lt $length) {
                 $next = $bytes[$index]
                 if (($next -ge 48 -and $next -le 57) -or ($next -ge 65 -and $next -le 90) -or
-                    ($next -ge 97 -and $next -le 122) -or $next -eq 95) {
+                    ($next -ge 97 -and $next -le 122) -or $next -eq 95 -or $next -ge 128) {
                     $index += 1
                 } else {
                     break
                 }
             }
-            [void]$tokens.Add("i:" + [System.Text.Encoding]::ASCII.GetString($bytes, $start, $index - $start))
+            [void]$tokens.Add("i:" + [System.Text.Encoding]::UTF8.GetString($bytes, $start, $index - $start))
             continue
         }
         if ($byte -eq 35) { [void]$tokens.Add("#") }
@@ -1210,11 +1267,12 @@ function Get-RustTokens {
         elseif ($byte -eq 40) { [void]$tokens.Add("(") }
         elseif ($byte -eq 41) { [void]$tokens.Add(")") }
         elseif ($byte -eq 59) { [void]$tokens.Add(";") }
-        elseif ($byte -eq 61 -and $WithStrings) { [void]$tokens.Add("=") }
         elseif ($byte -eq 58 -and ($index + 1) -lt $length -and $bytes[$index + 1] -eq 58) {
             [void]$tokens.Add("::")
             $index += 1
         }
+        elseif ($byte -eq 61 -and $WithStrings) { [void]$tokens.Add("=") }
+        else { [void]$tokens.Add("oth") }
         $index += 1
     }
     return ,$tokens.ToArray()
@@ -1222,28 +1280,104 @@ function Get-RustTokens {
 
 function Get-RustMatchingDelimiter {
     param([string[]]$Tokens, [int]$Open, [int]$End)
-    if ($Open -lt 0 -or $Open -ge $Tokens.Length) {
+    # A typed stack, not a depth counter. Mismatched delimiters return -1 so the
+    # caller fails closed. An earlier port counted only the opening delimiter's
+    # own kind and ignored the others, which accepted "{ ( }" as balanced; the
+    # normative rule rejects it, and macro scanning makes that reachable.
+    if ($Open -lt 0) {
         return -1
     }
-    $opening = $Tokens[$Open]
-    if (Test-OrdinalStringEqual $opening "[") { $closing = "]" }
-    elseif (Test-OrdinalStringEqual $opening "{") { $closing = "}" }
-    elseif (Test-OrdinalStringEqual $opening "(") { $closing = ")" }
-    else { return -1 }
+    $expected = New-Object System.Collections.Generic.List[string]
     $limit = [Math]::Min($End, $Tokens.Length)
-    $depth = 0
     for ($index = $Open; $index -lt $limit; $index += 1) {
         $token = $Tokens[$index]
-        if (Test-OrdinalStringEqual $token $opening) {
-            $depth += 1
-        } elseif (Test-OrdinalStringEqual $token $closing) {
-            $depth -= 1
-            if ($depth -eq 0) {
+        $closing = $null
+        if (Test-OrdinalStringEqual $token "[") { $closing = "]" }
+        elseif (Test-OrdinalStringEqual $token "{") { $closing = "}" }
+        elseif (Test-OrdinalStringEqual $token "(") { $closing = ")" }
+        if ($null -ne $closing) {
+            [void]$expected.Add($closing)
+            continue
+        }
+        if ((Test-OrdinalStringEqual $token "]") -or (Test-OrdinalStringEqual $token "}") -or
+            (Test-OrdinalStringEqual $token ")")) {
+            if ($expected.Count -eq 0) {
+                return -1
+            }
+            $top = $expected[$expected.Count - 1]
+            $expected.RemoveAt($expected.Count - 1)
+            if (-not (Test-OrdinalStringEqual $top $token)) {
+                return -1
+            }
+            if ($expected.Count -eq 0) {
                 return $index
             }
         }
     }
     return -1
+}
+
+function Get-RustMacroInvocationEnd {
+    param([string[]]$Tokens, [int]$Index, [int]$End)
+    # <name> ! <delimited token tree>, returning the index just past the closing
+    # delimiter, or -1 when this is not a macro invocation at all.
+    if ($Index -lt 0 -or $Index -ge $Tokens.Length) {
+        return -1
+    }
+    if (-not $Tokens[$Index].StartsWith("i:", [StringComparison]::Ordinal)) {
+        return -1
+    }
+    if (($Index + 1) -ge $Tokens.Length -or -not (Test-OrdinalStringEqual $Tokens[$Index + 1] "!")) {
+        return -1
+    }
+    $open = $Index + 2
+    # macro_rules! <name> { ... } carries the macro's own name before the body.
+    if ((Test-OrdinalStringEqual $Tokens[$Index] "i:macro_rules") -and
+        $open -lt $Tokens.Length -and $Tokens[$open].StartsWith("i:", [StringComparison]::Ordinal)) {
+        $open += 1
+    }
+    if ($open -ge $Tokens.Length) {
+        return -1
+    }
+    $delimiter = $Tokens[$open]
+    if (-not ((Test-OrdinalStringEqual $delimiter "[") -or (Test-OrdinalStringEqual $delimiter "{") -or
+            (Test-OrdinalStringEqual $delimiter "("))) {
+        return -1
+    }
+    $close = Get-RustMatchingDelimiter $Tokens $open $End
+    if ($close -lt 0) {
+        return -1
+    }
+    return $close + 1
+}
+
+function Test-RustMacroItemPrefix {
+    param([string[]]$Tokens, [int]$Start, [int]$MacroName)
+    # True when everything from the start of the item up to and including the
+    # macro name is a bare path, so the macro invocation IS the item rather than
+    # sitting inside one. A leading :: is allowed, which is what keeps a real
+    # test following ::std::thread_local! { ... } visible.
+    $start = $Start
+    if ($start -lt 0 -or $MacroName -ge $Tokens.Length -or $start -gt $MacroName) {
+        return $false
+    }
+    if (Test-OrdinalStringEqual $Tokens[$start] "::") {
+        $start += 1
+    }
+    if ($start -gt $MacroName) {
+        return $false
+    }
+    for ($offset = 0; ($start + $offset) -le $MacroName; $offset += 1) {
+        $token = $Tokens[$start + $offset]
+        if (($offset % 2) -eq 0) {
+            if (-not $token.StartsWith("i:", [StringComparison]::Ordinal)) {
+                return $false
+            }
+        } elseif (-not (Test-OrdinalStringEqual $token "::")) {
+            return $false
+        }
+    }
+    return $true
 }
 
 function Get-RustAttributes {
@@ -1290,57 +1424,62 @@ function Get-RustAttributes {
     return [ordered]@{ attributes = $attributes.ToArray(); next = $index }
 }
 
+function Test-RustAttributeEnablesTests {
+    param([object]$Attribute)
+    # One rule, shared by function attributes and by enclosing-scope attributes.
+    # An attribute with no path is inert. #[ignore] and #[cfg_attr(..)] always
+    # disqualify. A #[cfg(..)] disqualifies unless it is exactly cfg ( test ),
+    # so #[cfg(test)] is honoured but #[cfg(test = "disabled")], #[cfg(feature =
+    # "x")] and #[cfg(any())] are not.
+    [string[]]$path = $Attribute.path
+    if ($path.Length -eq 0) {
+        return $true
+    }
+    $first = $path[0]
+    if ((Test-OrdinalStringEqual $first "ignore") -or (Test-OrdinalStringEqual $first "cfg_attr")) {
+        return $false
+    }
+    if (-not (Test-OrdinalStringEqual $first "cfg")) {
+        return $true
+    }
+    [string[]]$body = $Attribute.tokens
+    if ($body.Length -ne 4) {
+        return $false
+    }
+    return ((Test-OrdinalStringEqual $body[0] "i:cfg") -and
+        (Test-OrdinalStringEqual $body[1] "(") -and
+        (Test-OrdinalStringEqual $body[2] "i:test") -and
+        (Test-OrdinalStringEqual $body[3] ")"))
+}
+
 function Test-RustAttributesDeclareEnabledTest {
     param([object[]]$Attributes)
-    # has_test && !ignored && !cfg_gated. Any cfg or cfg_attr on the function
-    # disqualifies it, and the trailing path segment is matched so that both
-    # #[test] and #[tokio::test] count.
+    # has_test && every attribute enables tests. The trailing path segment is
+    # matched for has_test so that both #[test] and #[tokio::test] count.
     $hasTest = $false
-    $ignored = $false
-    $cfgGated = $false
     foreach ($attribute in $Attributes) {
         [string[]]$path = $attribute.path
-        if ($path.Length -eq 0) {
-            continue
-        }
-        if (Test-OrdinalStringEqual $path[$path.Length - 1] "test") {
+        if ($path.Length -gt 0 -and (Test-OrdinalStringEqual $path[$path.Length - 1] "test")) {
             $hasTest = $true
         }
-        if (Test-OrdinalStringEqual $path[0] "ignore") {
-            $ignored = $true
-        }
-        if ((Test-OrdinalStringEqual $path[0] "cfg") -or (Test-OrdinalStringEqual $path[0] "cfg_attr")) {
-            $cfgGated = $true
+    }
+    if (-not $hasTest) {
+        return $false
+    }
+    foreach ($attribute in $Attributes) {
+        if (-not (Test-RustAttributeEnablesTests $attribute)) {
+            return $false
         }
     }
-    return ($hasTest -and -not $ignored -and -not $cfgGated)
+    return $true
 }
 
 function Test-RustModuleAttributesEnableTests {
     param([object[]]$Attributes)
-    # Enclosing modules and file/module inner attributes may carry no cfg at all,
-    # or exactly the token sequence cfg ( test ). Every other cfg predicate,
-    # every cfg_attr and every ignore disqualifies the whole subtree.
+    # Enclosing modules and file/module inner attributes are held to the same
+    # per-attribute rule, with no has_test requirement.
     foreach ($attribute in $Attributes) {
-        [string[]]$path = $attribute.path
-        if ($path.Length -eq 0) {
-            continue
-        }
-        $first = $path[0]
-        if ((Test-OrdinalStringEqual $first "ignore") -or (Test-OrdinalStringEqual $first "cfg_attr")) {
-            return $false
-        }
-        if (-not (Test-OrdinalStringEqual $first "cfg")) {
-            continue
-        }
-        [string[]]$body = $attribute.tokens
-        if ($body.Length -ne 4) {
-            return $false
-        }
-        if (-not ((Test-OrdinalStringEqual $body[0] "i:cfg") -and
-                (Test-OrdinalStringEqual $body[1] "(") -and
-                (Test-OrdinalStringEqual $body[2] "i:test") -and
-                (Test-OrdinalStringEqual $body[3] ")"))) {
+        if (-not (Test-RustAttributeEnablesTests $attribute)) {
             return $false
         }
     }
@@ -1381,8 +1520,31 @@ function Get-RustSkipVisibility {
 
 function Get-RustSkipItem {
     param([string[]]$Tokens, [int]$Index, [int]$End)
+    # Walks to the end of one item. Macro invocations are consumed whole, which
+    # is what stops a #[test] fn spelled inside stringify!(..), a discarding
+    # macro body or a macro_rules! definition from being read as a real test.
+    # A malformed macro invocation returns End, so scanning stops rather than
+    # resuming in the middle of a token tree.
+    $itemStart = $Index
     $index = $Index
-    while ($index -lt $End) {
+    $limit = [Math]::Min($End, $Tokens.Length)
+    while ($index -lt $limit) {
+        if ($Tokens[$index].StartsWith("i:", [StringComparison]::Ordinal) -and
+            ($index + 1) -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$index + 1] "!")) {
+            $afterMacro = Get-RustMacroInvocationEnd $Tokens $index $End
+            if ($afterMacro -lt 0) {
+                return $End
+            }
+            $macroIsItem = Test-RustMacroItemPrefix $Tokens $itemStart $index
+            $index = $afterMacro
+            if ($macroIsItem) {
+                if ($index -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$index] ";")) {
+                    $index += 1
+                }
+                return $index
+            }
+            continue
+        }
         $token = $Tokens[$index]
         if (Test-OrdinalStringEqual $token ";") {
             return $index + 1
@@ -1399,7 +1561,30 @@ function Get-RustSkipItem {
     return $End
 }
 
-$RustItemModifiers = @{ "i:async" = $true; "i:const" = $true; "i:default" = $true; "i:extern" = $true; "i:unsafe" = $true }
+$RustItemModifiers = @{ "i:async" = $true; "i:const" = $true; "i:default" = $true; "i:unsafe" = $true }
+
+function Get-RustSkipItemModifiers {
+    param([string[]]$Tokens, [int]$Index)
+    # async / const / default / unsafe advance one token; extern additionally
+    # consumes its ABI string literal, so extern "C" fn does not read as an item
+    # whose name is the literal.
+    $index = $Index
+    while ($index -lt $Tokens.Length) {
+        if (Test-OrdinalStringEqual $Tokens[$index] "i:extern") {
+            $index += 1
+            if ($index -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$index] "lit")) {
+                $index += 1
+            }
+            continue
+        }
+        if ($RustItemModifiers.ContainsKey($Tokens[$index])) {
+            $index += 1
+            continue
+        }
+        break
+    }
+    return $index
+}
 
 function Test-RustDeclaresInItems {
     param(
@@ -1428,9 +1613,7 @@ function Test-RustDeclaresInItems {
             break
         }
         $index = Get-RustSkipVisibility $Tokens $index $End
-        while ($index -lt $Tokens.Length -and $RustItemModifiers.ContainsKey($Tokens[$index])) {
-            $index += 1
-        }
+        $index = Get-RustSkipItemModifiers $Tokens $index
         $keyword = if ($index -lt $Tokens.Length) { $Tokens[$index] } else { $null }
         $nameToken = if (($index + 1) -lt $Tokens.Length) { $Tokens[$index + 1] } else { $null }
         $isIdentPair = ($null -ne $keyword -and $null -ne $nameToken -and
@@ -1530,8 +1713,8 @@ function Assert-EnabledTestOracle {
         }
         $actual = Test-DeclaresEnabledRustTest ([string]$case.source) ([string]$case.test)
         if ($actual -ne $case.expected) {
-            Fail ("enabled-test oracle drift on case '{0}': the shared corpus records {1} but this port returned {2}. " +
-                "crates/claw-conformance declares_enabled_test is normative; re-port Test-DeclaresEnabledRustTest before changing this corpus." -f
+            Fail (("enabled-test oracle drift on case '{0}': the shared corpus records {1} but this port returned {2}. " +
+                "crates/claw-conformance declares_enabled_test is normative; re-port Test-DeclaresEnabledRustTest before changing this corpus.") -f
                 $name, $case.expected, $actual)
         }
     }
@@ -1541,6 +1724,116 @@ function Assert-EnabledTestOracle {
     $digest = Get-ObjectDigest $Corpus
     if (-not (Test-OrdinalStringEqual $digest $ExpectedOracleCorpusDigest)) {
         Fail ("enabled-test-oracle digest mismatch; expected {0}, found {1}" -f $ExpectedOracleCorpusDigest, $digest)
+    }
+}
+
+function Assert-ReachabilityCorpusPath {
+    param(
+        [string]$Path,
+        [string]$Context
+    )
+    Assert-RelativeSourcePath $Path $Context
+    # Assert-RelativeSourcePath's character class admits "." and ".." as whole
+    # segments. A corpus key containing a dot segment would let any harness that
+    # materializes these fixtures write outside the fixture root, so reject them
+    # here rather than trusting every future replayer to notice.
+    foreach ($segment in $Path.Split("/")) {
+        if ((Test-OrdinalStringEqual $segment ".") -or (Test-OrdinalStringEqual $segment "..")) {
+            Fail "$Context '$Path' must not contain a dot segment"
+        }
+    }
+}
+
+function Assert-ReachabilityCorpus {
+    param([object]$Corpus)
+    # Structural and digest pin only. This function deliberately does NOT
+    # materialize the fixtures and replay them in-process: the resolver memoizes
+    # per-crate compiled-file sets in script-scoped caches, and seeding those
+    # caches from attacker-supplied fixture trees during a real validation run
+    # would be a forgery vector, not a convenience. Behavioural replay belongs in
+    # validate-self-test.ps1, where every case runs in an isolated child process
+    # against its own repository root.
+    Assert-ExactPropertySet $Corpus @(
+        "schema_version", "purpose", "rule", "arbiter", "implementations", "cases"
+    ) "reachability-corpus"
+    if ($Corpus.schema_version -ne 1) {
+        Fail "reachability-corpus schema_version must be 1"
+    }
+    $implementations = @($Corpus.implementations)
+    if ($implementations.Count -ne 2) {
+        Fail "reachability-corpus must record exactly the two resolvers it compares"
+    }
+    foreach ($implementation in $implementations) {
+        Assert-ExactPropertySet $implementation @("path", "entry_point") "reachability-corpus.implementations"
+    }
+    if (-not (Test-OrdinalStringEqual ([string]$implementations[0].path) "crates/claw-conformance/src/claims.rs") -or
+        -not (Test-OrdinalStringEqual ([string]$implementations[1].path) "compat/upstream/validate.ps1")) {
+        Fail "reachability-corpus must name claw-conformance and validate.ps1 as the two compared resolvers"
+    }
+    $cases = @($Corpus.cases)
+    if ($cases.Count -ne $ExpectedReachabilityCorpusCases) {
+        Fail ("reachability-corpus must contain exactly {0} cases; found {1}" -f $ExpectedReachabilityCorpusCases, $cases.Count)
+    }
+    $names = @{}
+    $accepting = 0
+    foreach ($case in $cases) {
+        Assert-ExactPropertySet $case @("name", "files", "cite", "expect", "why") "reachability-corpus case"
+        $name = [string]$case.name
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            Fail "reachability-corpus case name must not be empty"
+        }
+        if ($names.ContainsKey($name)) {
+            Fail "reachability-corpus case name '$name' is duplicated"
+        }
+        $names[$name] = $true
+        $expect = [string]$case.expect
+        if (-not (Test-OrdinalStringEqual $expect "accept") -and -not (Test-OrdinalStringEqual $expect "reject")) {
+            Fail "reachability-corpus case '$name' expect must be 'accept' or 'reject'"
+        }
+        if (Test-OrdinalStringEqual $expect "accept") {
+            $accepting += 1
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$case.why)) {
+            Fail "reachability-corpus case '$name' must record why the toolchain produces this verdict"
+        }
+        $fileNames = @($case.files.PSObject.Properties.Name)
+        if ($fileNames.Count -lt 2) {
+            Fail "reachability-corpus case '$name' must define a manifest and at least one source"
+        }
+        $hasManifest = $false
+        foreach ($fileName in $fileNames) {
+            Assert-ReachabilityCorpusPath $fileName ("reachability-corpus case '$name' file")
+            if ($fileName.EndsWith("Cargo.toml", [System.StringComparison]::Ordinal)) {
+                $hasManifest = $true
+            }
+        }
+        if (-not $hasManifest) {
+            Fail "reachability-corpus case '$name' must define at least one Cargo.toml"
+        }
+        # A case may only cite a file it actually defines. Without this a corpus
+        # case could cite a path that exists in the real repository and quietly
+        # assert a verdict about something the fixture never contained.
+        $cite = [string]$case.cite
+        Assert-ReachabilityCorpusPath $cite ("reachability-corpus case '$name' cite")
+        if (-not $cite.EndsWith(".rs", [System.StringComparison]::Ordinal)) {
+            Fail "reachability-corpus case '$name' must cite a .rs source"
+        }
+        $citeIsDefined = $false
+        foreach ($fileName in $fileNames) {
+            if (Test-OrdinalStringEqual $fileName $cite) {
+                $citeIsDefined = $true
+            }
+        }
+        if (-not $citeIsDefined) {
+            Fail "reachability-corpus case '$name' cites '$cite', which the case does not define"
+        }
+    }
+    if ($accepting -ne $ExpectedReachabilityCorpusAccepting) {
+        Fail ("reachability-corpus must record exactly {0} accepting cases; found {1}" -f $ExpectedReachabilityCorpusAccepting, $accepting)
+    }
+    $digest = Get-ObjectDigest $Corpus
+    if (-not (Test-OrdinalStringEqual $digest $ExpectedReachabilityCorpusDigest)) {
+        Fail ("reachability-corpus digest mismatch; expected {0}, found {1}" -f $ExpectedReachabilityCorpusDigest, $digest)
     }
 }
 
@@ -1602,7 +1895,7 @@ function Join-RepositoryRelativePath {
 }
 
 function Get-RustModReferencesInRange {
-    param([string[]]$Tokens, [int]$Start, [int]$End, [string[]]$Segments, [object]$Sink)
+    param([string[]]$Tokens, [int]$Start, [int]$End, [object[]]$Segments, [object]$Sink)
     $index = $Start
     while ($index -lt $End) {
         $attributeResult = Get-RustAttributes $Tokens $index $End
@@ -1610,34 +1903,43 @@ function Get-RustModReferencesInRange {
         $index = [int]$attributeResult.next
         if ($index -ge $End) { break }
         $itemStart = $index
-        $index = Get-RustSkipVisibility $Tokens $index
-        while ($index -lt $Tokens.Length -and $RustItemModifiers.ContainsKey($Tokens[$index])) {
-            $index += 1
-        }
+        $index = Get-RustSkipVisibility $Tokens $index $End
+        $index = Get-RustSkipItemModifiers $Tokens $index
         $matched = $false
         if ($index -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$index] "i:mod") -and
             ($index + 1) -lt $Tokens.Length -and $Tokens[$index + 1].StartsWith("i:", [StringComparison]::Ordinal)) {
             $name = $Tokens[$index + 1].Substring(2)
             $after = $index + 2
-            if ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] "{")) {
-                $close = Get-RustMatchingDelimiter $Tokens $after $End
-                if ($close -lt 0) { $close = $End }
-                Get-RustModReferencesInRange $Tokens ($after + 1) ([Math]::Min($close, $End)) ($Segments + @($name)) $Sink
-                $index = $close + 1
-                $matched = $true
-            } elseif ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] ";")) {
-                $pathAttribute = $null
-                foreach ($attribute in $outer) {
-                    if ($attribute.path.Length -eq 1 -and (Test-OrdinalStringEqual $attribute.path[0] "path")) {
-                        foreach ($token in $attribute.tokens) {
-                            if ($token.StartsWith("s:", [StringComparison]::Ordinal)) {
-                                $pathAttribute = $token.Substring(2)
-                                break
-                            }
+            # A path attribute governs an inline 'mod name { }' exactly as it
+            # governs 'mod name;', so it has to be read before the two forms are
+            # told apart rather than inside the semicolon branch only.
+            $pathAttribute = $null
+            $hasPathAttribute = $false
+            foreach ($attribute in $outer) {
+                if ($attribute.path.Length -eq 1 -and (Test-OrdinalStringEqual $attribute.path[0] "path")) {
+                    $hasPathAttribute = $true
+                    foreach ($token in $attribute.tokens) {
+                        if ($token.StartsWith("s:", [StringComparison]::Ordinal)) {
+                            $pathAttribute = $token.Substring(2)
+                            break
                         }
                     }
                 }
-                [void]$Sink.Add([ordered]@{ segments = $Segments; name = $name; path = $pathAttribute })
+            }
+            if ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] "{")) {
+                $close = Get-RustMatchingDelimiter $Tokens $after $End
+                if ($close -lt 0) { $close = $End }
+                $segment = [ordered]@{ name = $name; path = $pathAttribute; hasPath = $hasPathAttribute }
+                Get-RustModReferencesInRange $Tokens ($after + 1) ([Math]::Min($close, $End)) ($Segments + @($segment)) $Sink
+                $index = $close + 1
+                $matched = $true
+            } elseif ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] ";")) {
+                [void]$Sink.Add([ordered]@{
+                    segments = $Segments
+                    name = $name
+                    path = $pathAttribute
+                    hasPath = $hasPathAttribute
+                })
                 $index = $after + 1
                 $matched = $true
             }
@@ -1677,17 +1979,209 @@ function Get-CrateDirectoryForPath {
     return $null
 }
 
+function Convert-CargoGlobToRegex {
+    param([string]$Pattern)
+    # cargo accepts glob patterns in workspace member and exclude lists. `*` and
+    # `?` do not cross a directory separator; `**` does.
+    $placeholder = [string][char]1
+    $escaped = [regex]::Escape($Pattern)
+    $escaped = $escaped.Replace('\*\*', $placeholder)
+    $escaped = $escaped.Replace('\*', '[^/]*')
+    $escaped = $escaped.Replace('\?', '[^/]')
+    $escaped = $escaped.Replace($placeholder, '.*')
+    return ('\A' + $escaped + '\z')
+}
+
+function Get-CargoWorkspaceSpec {
+    param([string]$ManifestText)
+    # `members` and `exclude` read from the [workspace] table itself. The
+    # sub-tables [workspace.package], [workspace.dependencies] and
+    # [workspace.lints.*] are deliberately NOT the workspace table: reading an
+    # array of paths out of one of those would let an author claim membership in
+    # a place cargo never consults, which is the same mistake as honouring a
+    # bare `path =` under [dependencies.<name>] as a target.
+    $inWorkspace = $false
+    $hasWorkspace = $false
+    $collecting = $null
+    $members = New-Object System.Collections.Generic.List[string]
+    $exclude = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($ManifestText -split "`n")) {
+        $trimmed = $line.Trim()
+        $header = [regex]::Match($trimmed, '\A\[\[?([A-Za-z0-9_.-]+)\]?\]\z')
+        if ($header.Success) {
+            $inWorkspace = (Test-OrdinalStringEqual $header.Groups[1].Value "workspace")
+            if ($inWorkspace) { $hasWorkspace = $true }
+            $collecting = $null
+            continue
+        }
+        if (-not $inWorkspace) { continue }
+        if ($null -eq $collecting) {
+            $open = [regex]::Match($trimmed, '\A(members|exclude)\s*=\s*\[')
+            if (-not $open.Success) { continue }
+            $collecting = $open.Groups[1].Value
+            $trimmed = $trimmed.Substring($open.Length)
+        }
+        # A plain assignment, never $(if ...): a subexpression writes to the
+        # pipeline, and PowerShell enumerates a List there, so $sink would
+        # become a detached array copy and every Add would be lost.
+        $sink = $exclude
+        if (Test-OrdinalStringEqual $collecting "members") { $sink = $members }
+        foreach ($match in [regex]::Matches($trimmed, '"([^"]*)"')) {
+            $value = $match.Groups[1].Value.Trim().TrimEnd("/")
+            if (-not [string]::IsNullOrEmpty($value)) { [void]$sink.Add($value) }
+        }
+        if ($trimmed.Contains("]")) { $collecting = $null }
+    }
+    return [ordered]@{
+        workspace = $hasWorkspace
+        members = $members.ToArray()
+        exclude = $exclude.ToArray()
+    }
+}
+
+function Test-CargoPatternCoversPath {
+    param([string]$Pattern, [string]$RelativeDirectory)
+    # An exclude entry removes the named directory and everything beneath it, so
+    # the pattern is tested against the directory and each of its ancestors.
+    $expression = Convert-CargoGlobToRegex $Pattern
+    $segments = @($RelativeDirectory.Split("/") | Where-Object { -not [string]::IsNullOrEmpty($_) })
+    for ($i = 0; $i -lt $segments.Length; $i += 1) {
+        $prefix = ($segments[0..$i] -join "/")
+        if ([regex]::IsMatch($prefix, $expression)) { return $true }
+    }
+    return $false
+}
+
+function Test-CratePackageIsBuilt {
+    param([string]$CrateDirectory, [string]$ManifestText)
+    # Reachability from a target root proves cargo would compile a file WITHIN
+    # its package. It says nothing about whether anything builds that package.
+    # A package that no workspace lists is never built by `cargo test` at the
+    # repository root, so a #[test] inside it never runs, and citing it is a
+    # claim about code the repository does not execute. Adding one is a two-file
+    # change that needs no unusual Rust and no manifest trickery, which makes it
+    # the cheapest forgery available if membership is not checked.
+    if ((Get-CargoWorkspaceSpec $ManifestText).workspace) {
+        return [ordered]@{ built = $true; workspace = $CrateDirectory; reason = "root" }
+    }
+    $segments = @($CrateDirectory.Split("/") | Where-Object { -not [string]::IsNullOrEmpty($_) })
+    for ($i = $segments.Length - 1; $i -ge 0; $i -= 1) {
+        $directory = $(if ($i -eq 0) { "" } else { ($segments[0..($i - 1)] -join "/") })
+        $manifest = Join-RepositoryRelativePath $directory "Cargo.toml"
+        $absolute = Resolve-RepositoryFilePath $manifest
+        if ($null -eq $absolute) { continue }
+        $spec = Get-CargoWorkspaceSpec (Get-RepositoryFileText $absolute)
+        if (-not $spec.workspace) { continue }
+        # cargo stops at the FIRST [workspace] ancestor and that manifest alone
+        # decides membership, so neither does this.
+        $relative = $(if ([string]::IsNullOrEmpty($directory)) {
+            $CrateDirectory
+        } else {
+            $CrateDirectory.Substring($directory.Length + 1)
+        })
+        foreach ($pattern in $spec.exclude) {
+            if (Test-CargoPatternCoversPath $pattern $relative) {
+                return [ordered]@{ built = $false; workspace = $directory; reason = "excluded" }
+            }
+        }
+        foreach ($pattern in $spec.members) {
+            if ([regex]::IsMatch($relative, (Convert-CargoGlobToRegex $pattern))) {
+                return [ordered]@{ built = $true; workspace = $directory; reason = "member" }
+            }
+        }
+        return [ordered]@{ built = $false; workspace = $directory; reason = "unlisted" }
+    }
+    return [ordered]@{ built = $true; workspace = $null; reason = "standalone" }
+}
+
+function Get-CargoManifestTargetSections {
+    param([string]$ManifestText)
+    # Every [lib] / [[bin]] / [[test]] / [[bench]] / [[example]] block, with the
+    # only three keys that decide whether `cargo test` runs #[test] items in the
+    # named file. Keys are read per block: a bare `path = "..."` also appears
+    # under [dependencies.<name>], and honouring that would let an author bless
+    # an orphan file by adding one line to a manifest instead of wiring the file
+    # into the crate.
+    $sections = New-Object System.Collections.Generic.List[object]
+    $current = $null
+    $packageFlags = @{}
+    $inPackage = $false
+    foreach ($line in ($ManifestText -split "`n")) {
+        $trimmed = $line.Trim()
+        $header = [regex]::Match($trimmed, '\A\[\[?([A-Za-z0-9_.-]+)\]?\]\z')
+        if ($header.Success) {
+            $kind = $header.Groups[1].Value
+            $inPackage = (Test-OrdinalStringEqual $kind "package")
+            if (Test-OrdinalContains @("lib", "bin", "test", "bench", "example") $kind) {
+                $current = [ordered]@{ kind = $kind; path = $null; test = $null; harness = $null }
+                [void]$sections.Add($current)
+            } else {
+                $current = $null
+            }
+            continue
+        }
+        if ($inPackage) {
+            $auto = [regex]::Match($trimmed, '\A(autobins|autotests|autobenches|autoexamples)\s*=\s*(true|false)\z')
+            if ($auto.Success) { $packageFlags[$auto.Groups[1].Value] = (Test-OrdinalStringEqual $auto.Groups[2].Value "true") }
+            continue
+        }
+        if ($null -eq $current) { continue }
+        $declared = [regex]::Match($trimmed, '\Apath\s*=\s*"([^"]+)"\z')
+        if ($declared.Success) { $current.path = $declared.Groups[1].Value; continue }
+        $flag = [regex]::Match($trimmed, '\A(test|harness)\s*=\s*(true|false)\z')
+        if ($flag.Success) { $current[$flag.Groups[1].Value] = (Test-OrdinalStringEqual $flag.Groups[2].Value "true") }
+    }
+    return [ordered]@{ sections = $sections.ToArray(); package = $packageFlags }
+}
+
+function Test-CargoSectionRunsTests {
+    param([object]$Section)
+    # cargo's per-kind defaults, measured against `cargo metadata` rather than
+    # recalled: lib, bin and test targets are run by `cargo test`; bench and
+    # example targets are NOT (they report test = false), so a #[test] inside
+    # one never executes. An explicit `test = ...` overrides the default.
+    # `harness = false` replaces the libtest harness with the target's own
+    # main(), which makes every #[test] item in it inert, so it can never be
+    # acceptance evidence whatever `test` says.
+    if ($Section.harness -eq $false) { return $false }
+    if ($null -ne $Section.test) { return [bool]$Section.test }
+    return (Test-OrdinalContains @("lib", "bin", "test") ([string]$Section.kind))
+}
+
 function Get-CrateTargetRootFiles {
     param([string]$CrateDirectory, [string]$ManifestText)
     $roots = New-Object System.Collections.Generic.List[object]
+    $manifest = Get-CargoManifestTargetSections $ManifestText
+    # A file named by an explicit target section is governed by that section
+    # alone. cargo matches an explicit target to the auto-discovered file it
+    # replaces, so re-adding it through auto-discovery would resurrect exactly
+    # the target the manifest disabled -- an explicit `test = false` bin whose
+    # path sits under src/bin/ would otherwise still be treated as a root.
+    $explicitPaths = @{}
+    $explicitKinds = @{}
+    foreach ($section in $manifest.sections) {
+        if ($null -eq $section.path) { continue }
+        $explicitKinds[[string]$section.kind] = $true
+        $declared = Join-RepositoryRelativePath $CrateDirectory ([string]$section.path)
+        if ($null -ne $declared) { $explicitPaths[$declared] = $true }
+    }
+    # An explicit [lib] path replaces src/lib.rs rather than adding to it: cargo
+    # builds the named file and never looks at src/lib.rs.
     foreach ($entry in @("src/lib.rs", "src/main.rs")) {
+        if ($entry -eq "src/lib.rs" -and $explicitKinds.ContainsKey("lib")) { continue }
         $candidate = Join-RepositoryRelativePath $CrateDirectory $entry
+        if ($explicitPaths.ContainsKey($candidate)) { continue }
         if ($null -ne (Resolve-RepositoryFilePath $candidate)) {
             [void]$roots.Add([ordered]@{ file = $candidate; directory = (Join-RepositoryRelativePath $CrateDirectory "src") })
         }
     }
-    # Auto-discovered target directories. cargo test compiles and runs these.
-    foreach ($directory in @("tests", "benches", "examples", "src/bin")) {
+    # Auto-discovered target directories that `cargo test` actually runs.
+    # benches/ and examples/ are deliberately absent: their targets default to
+    # test = false, so a #[test] in one is compiled but never run, and treating
+    # them as roots would accept evidence that can never execute.
+    $autoDirectories = [ordered]@{ "tests" = "autotests"; "src/bin" = "autobins" }
+    foreach ($directory in $autoDirectories.Keys) {
+        if ($manifest.package[$autoDirectories[$directory]] -eq $false) { continue }
         $relative = Join-RepositoryRelativePath $CrateDirectory $directory
         $absolute = $script:RepositoryRootFull
         foreach ($segment in $relative.Split("/")) {
@@ -1696,40 +2190,37 @@ function Get-CrateTargetRootFiles {
         foreach ($name in (Get-DirectoryEntryNames $absolute)) {
             $child = Join-RepositoryRelativePath $relative $name
             if ($name.EndsWith(".rs", [StringComparison]::Ordinal)) {
+                if ($explicitPaths.ContainsKey($child)) { continue }
                 if ($null -ne (Resolve-RepositoryFilePath $child)) {
                     [void]$roots.Add([ordered]@{ file = $child; directory = $relative })
                 }
                 continue
             }
             $nested = Join-RepositoryRelativePath $child "main.rs"
+            if ($explicitPaths.ContainsKey($nested)) { continue }
             if ($null -ne (Resolve-RepositoryFilePath $nested)) {
                 [void]$roots.Add([ordered]@{ file = $nested; directory = $child })
             }
         }
     }
-    # Explicitly declared target paths. Only a target section may name one: a
-    # bare `path = "..."` also appears under [dependencies.<name>], and honouring
-    # that would let an author bless an orphan file by adding one line to a
-    # manifest instead of wiring the file into the crate.
-    $section = ""
-    foreach ($line in ($ManifestText -split "`n")) {
-        $trimmed = $line.Trim()
-        $header = [regex]::Match($trimmed, '\A\[\[?([A-Za-z0-9_.-]+)\]?\]\z')
-        if ($header.Success) {
-            $section = $header.Groups[1].Value
-            continue
-        }
-        if (-not (Test-OrdinalContains @("lib", "bin", "test", "bench", "example") $section)) {
-            continue
-        }
-        $declared = [regex]::Match($trimmed, '\Apath\s*=\s*"([^"]+)"\z')
-        if (-not $declared.Success) { continue }
-        $candidate = Join-RepositoryRelativePath $CrateDirectory $declared.Groups[1].Value
+    foreach ($section in $manifest.sections) {
+        if ($null -eq $section.path) { continue }
+        if (-not (Test-CargoSectionRunsTests $section)) { continue }
+        $candidate = Join-RepositoryRelativePath $CrateDirectory ([string]$section.path)
         if ($null -ne $candidate -and $null -ne (Resolve-RepositoryFilePath $candidate)) {
             [void]$roots.Add([ordered]@{ file = $candidate; directory = ($candidate -replace '/[^/]+\z', '') })
         }
     }
     return ,$roots.ToArray()
+}
+
+function Get-AmbiguousModuleKey {
+    # Ambiguity markers share the reachable-set hashtable, so they need a prefix
+    # no repository-relative path can ever produce. This is a function rather
+    # than a variable so that any harness which lifts the reachability rule out
+    # of this file fails loudly instead of silently keying on the bare path.
+    param([string]$Path)
+    return ("!ambiguous-module:" + $Path)
 }
 
 function Get-CrateCompiledFileSet {
@@ -1751,24 +2242,77 @@ function Get-CrateCompiledFileSet {
         if ($null -eq $absolute) { continue }
         foreach ($reference in (Get-RustModuleReferences (Get-RepositoryFileText $absolute))) {
             $scope = $current.directory
+            $fileDirectory = Join-RepositoryRelativePath $current.file ".."
+            # A path attribute on an INLINE module renames the directory its
+            # children live in, so the enclosing scopes cannot be a list of plain
+            # module names. Cargo compiles
+            #   #[path = "actual"] mod outer { #[path = "proof.rs"] mod proof; }
+            # as actual/proof.rs and never as outer/proof.rs, and it resolves a
+            # top-level inline path against the directory holding the source file
+            # exactly as it does for 'mod name;'.
+            $scopeFailed = $false
+            $depth = 0
             foreach ($segment in $reference.segments) {
-                $scope = Join-RepositoryRelativePath $scope $segment
-                if ($null -eq $scope) { break }
+                if ($segment.hasPath) {
+                    if ($null -eq $segment.path) { $scopeFailed = $true; break }
+                    if ($depth -eq 0) { $base = $fileDirectory } else { $base = $scope }
+                    if ($null -eq $base) { $scopeFailed = $true; break }
+                    $scope = Join-RepositoryRelativePath $base $segment.path
+                } else {
+                    $scope = Join-RepositoryRelativePath $scope $segment.name
+                }
+                if ($null -eq $scope) { $scopeFailed = $true; break }
+                $depth = $depth + 1
             }
+            if ($scopeFailed) { continue }
             if ($null -eq $scope) { continue }
             $candidates = @()
             $childDirectory = $null
-            if ($null -ne $reference.path) {
-                $target = Join-RepositoryRelativePath $scope $reference.path
+            if ($reference.hasPath) {
+                # A path attribute this reader cannot resolve to a string value
+                # resolves to nothing at all. Falling back to name-based lookup
+                # would bless '<scope>/<name>.rs' -- a file cargo never compiles
+                # -- on the strength of an attribute that points somewhere else.
+                if ($null -eq $reference.path) { continue }
+                # Outside an inline module block a path attribute is relative to
+                # the directory holding the source file, not to the module
+                # directory. The two coincide for mod-rs files (crate roots and
+                # mod.rs) and differ for every other file, so resolving against
+                # the module directory both missed the real target and blessed a
+                # same-named file one directory deeper.
+                $base = $scope
+                if (@($reference.segments).Count -eq 0) {
+                    $base = $fileDirectory
+                }
+                if ($null -eq $base) { continue }
+                $target = Join-RepositoryRelativePath $base $reference.path
                 if ($null -ne $target) {
                     $candidates = @($target)
-                    $childDirectory = ($target -replace '\.rs\z', '')
+                    # A path naming a mod.rs makes that module mod-rs, so its own
+                    # children live beside it rather than under a 'mod/' directory
+                    # named after the file.
+                    if ($target -cmatch '(?:\A|/)mod\.rs\z') {
+                        $childDirectory = Join-RepositoryRelativePath $target ".."
+                    } else {
+                        $childDirectory = ($target -replace '\.rs\z', '')
+                    }
                 }
             } else {
-                $candidates = @(
-                    (Join-RepositoryRelativePath $scope ($reference.name + ".rs")),
-                    (Join-RepositoryRelativePath $scope ($reference.name + "/mod.rs"))
-                )
+                $fileCandidate = Join-RepositoryRelativePath $scope ($reference.name + ".rs")
+                $directoryCandidate = Join-RepositoryRelativePath $scope ($reference.name + "/mod.rs")
+                $fileExists = ($null -ne $fileCandidate) -and ($null -ne (Resolve-RepositoryFilePath $fileCandidate))
+                $directoryExists = ($null -ne $directoryCandidate) -and ($null -ne (Resolve-RepositoryFilePath $directoryCandidate))
+                if ($fileExists -and $directoryExists) {
+                    # rustc refuses this outright (E0761: file for module found at
+                    # both paths) and compiles NEITHER file, so blessing either
+                    # one would cite a test out of a crate that does not build.
+                    # Fail closed and remember both sides so the citation gets the
+                    # specific reason instead of a misleading 'not wired in'.
+                    $reachable[(Get-AmbiguousModuleKey $fileCandidate)] = $directoryCandidate
+                    $reachable[(Get-AmbiguousModuleKey $directoryCandidate)] = $fileCandidate
+                    continue
+                }
+                $candidates = @($fileCandidate, $directoryCandidate)
                 $childDirectory = Join-RepositoryRelativePath $scope $reference.name
             }
             foreach ($candidate in $candidates) {
@@ -1790,13 +2334,39 @@ function Assert-EvidenceFileIsCompiled {
         Fail ("$Context acceptance evidence '$RelativePath' is not inside a Cargo package, " +
             "so no cargo test target compiles it and the cited test can never run")
     }
+    $membership = Test-CratePackageIsBuilt ([string]$crate.directory) ([string]$crate.text)
+    if (-not $membership.built) {
+        $workspaceLabel = $(if ([string]::IsNullOrEmpty([string]$membership.workspace)) {
+            "the repository root workspace"
+        } else {
+            "the workspace at " + [string]$membership.workspace
+        })
+        $why = $(if (Test-OrdinalStringEqual ([string]$membership.reason) "excluded") {
+            "its package is in that workspace's exclude list"
+        } else {
+            "its package is not in that workspace's members list"
+        })
+        Fail ("$Context acceptance evidence '$RelativePath' belongs to a Cargo package that nothing builds: " +
+            "$why, so cargo test never compiles or runs it and the cited test proves nothing about the " +
+            "shipped product. Reachability from a target root only establishes that cargo would compile the " +
+            "file WITHIN its package. Add the package to $workspaceLabel, or cite a test in a package that " +
+            "is already built.")
+    }
     $reachable = Get-CrateCompiledFileSet ([string]$crate.directory) ([string]$crate.text)
+    $ambiguityKey = Get-AmbiguousModuleKey $RelativePath
+    if ($reachable.ContainsKey($ambiguityKey)) {
+        Fail ("$Context acceptance evidence '$RelativePath' and '" + [string]$reachable[$ambiguityKey] + "' both " +
+            "answer the same 'mod' declaration. rustc rejects that ambiguity outright (E0761: file for module " +
+            "found at both paths) and compiles NEITHER file, so the crate does not build and the cited test can " +
+            "never run. Delete or rename one of the two files, then cite the survivor.")
+    }
     if (-not $reachable.ContainsKey($RelativePath)) {
         $crateLabel = $(if ([string]::IsNullOrEmpty([string]$crate.directory)) { "the repository root crate" } else { [string]$crate.directory })
         Fail ("$Context acceptance evidence '$RelativePath' is not reached by any cargo test target of $crateLabel. " +
-            "It is not an auto-discovered target under tests/, benches/, examples/ or src/bin/, and no mod chain from " +
-            "that crate's roots declares it, so the cited test is never compiled or run. Wire the file into the crate, " +
-            "or cite a test in a file that is.")
+            "It is not an auto-discovered target under tests/ or src/bin/, is not a manifest target that cargo test " +
+            "runs, and no mod chain from that crate's roots declares it, so the cited test is never compiled or run. " +
+            "Note that benches/ and examples/ targets default to test = false and never run #[test] items. " +
+            "Wire the file into the crate, or cite a test in a file that is.")
     }
 }
 
@@ -2351,10 +2921,11 @@ if ($actualFilePaths.Count -ne $expectedFilePaths.Count -or
 }
 $missingJsonFiles = @($ExpectedJsonPaths | Where-Object { -not (Test-OrdinalContains $actualJsonPaths $_) })
 $unexpectedJsonFiles = @($actualJsonPaths | Where-Object { -not (Test-OrdinalContains $ExpectedJsonPaths $_) })
-if ($actualJsonPaths.Count -ne 17 -or
+if ($actualJsonPaths.Count -ne 18 -or
     $missingJsonFiles.Count -gt 0 -or
     $unexpectedJsonFiles.Count -gt 0) {
-    Fail "fixed JSON topology mismatch; missing=[$($missingJsonFiles -join ',')], unexpected=[$($unexpectedJsonFiles -join ',')]"
+    Fail ("fixed JSON topology mismatch; expected 18 JSON artifacts, found {0}; missing=[{1}], unexpected=[{2}]" -f
+        $actualJsonPaths.Count, ($missingJsonFiles -join ','), ($unexpectedJsonFiles -join ','))
 }
 
 $documents = @{}
@@ -2366,6 +2937,7 @@ foreach ($relativePath in $ExpectedJsonPaths) {
 # any evidence is judged with it. A drifted oracle must never get the chance to
 # accept or reject a parity claim.
 Assert-EnabledTestOracle $documents["enabled-test-oracle.json"]
+Assert-ReachabilityCorpus $documents["reachability-corpus.json"]
 
 $baseline = $documents["baseline.json"]
 Assert-ExactPropertySet $baseline @("schema_version", "upstream", "stable_release", "gateway_protocol", "licensing") "baseline"

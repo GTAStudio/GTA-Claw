@@ -1,0 +1,1696 @@
+import { ListView, ScrollView } from "std-widgets.slint";
+import {
+    Card,
+    ComposerShell,
+    DangerButton,
+    Divider,
+    ModalSheetShell,
+    NavigationItem,
+    PrimaryButton,
+    SecondaryButton,
+    StatusBadge,
+    TextField,
+    ToolbarIconButton,
+} from "./primitives.slint";
+import { DesignTokens, Metrics, StatusKind, ThemeMode, VisualPreferences } from "./tokens.slint";
+
+export struct RunItem {
+    id: string,
+    title: string,
+    workspace: string,
+    state: string,
+    detail: string,
+    updated: string,
+    tone: int,
+}
+
+export struct WorkspaceItem {
+    name: string,
+    location: string,
+    kind: string,
+    branch: string,
+    active-runs: int,
+}
+
+export struct ScheduleItem {
+    name: string,
+    cadence: string,
+    next-run: string,
+    enabled: bool,
+    can-toggle: bool,
+    workspace: string,
+}
+
+export struct FileItem {
+    name: string,
+    status: string,
+}
+
+export struct DeliverableItem {
+    name: string,
+    kind: string,
+    source: string,
+    size: string,
+    pinned: bool,
+}
+
+export struct ExtensionItem {
+    name: string,
+    category: string,
+    detail: string,
+    permission: string,
+    enabled: bool,
+}
+
+export struct TranscriptItem {
+    role: string,
+    text: string,
+    detail: string,
+    timestamp: string,
+    tone: int,
+}
+
+export struct ActivityItem {
+    title: string,
+    detail: string,
+    state: string,
+    duration: string,
+    tone: int,
+}
+
+export struct DiffItem {
+    old-line: string,
+    new-line: string,
+    text: string,
+    old-text: string,
+    new-text: string,
+    kind: int,
+}
+
+component SemanticBadge inherits StatusBadge {
+    in property <int> tone: 0;
+    kind: root.tone == 4
+        ? StatusKind.success
+        : (root.tone == 3
+            ? StatusKind.danger
+            : (root.tone == 2
+                ? StatusKind.warning
+                : (root.tone == 1 ? StatusKind.info : StatusKind.neutral)));
+}
+
+component SectionTitle {
+    in property <string> eyebrow;
+    in property <string> title;
+    in property <string> detail;
+
+    VerticalLayout {
+        spacing: Metrics.space-1;
+
+        Text {
+            text: root.eyebrow;
+            color: DesignTokens.accent;
+            font-size: Metrics.type-caption;
+            font-weight: 800;
+            accessible-role: text;
+        }
+
+        Text {
+            text: root.title;
+            color: DesignTokens.text-primary;
+            font-size: Metrics.type-display;
+            font-weight: 850;
+            wrap: word-wrap;
+            accessible-role: text;
+        }
+
+        Text {
+            text: root.detail;
+            color: DesignTokens.text-secondary;
+            font-size: Metrics.type-small;
+            wrap: word-wrap;
+            accessible-role: text;
+        }
+    }
+}
+
+component MetricCard {
+    in property <string> value;
+    in property <string> label;
+    in property <string> detail;
+    in property <int> tone;
+
+    min-height: 112px;
+    accessible-role: region;
+    accessible-label: root.label + ": " + root.value + ". " + root.detail;
+
+    Rectangle {
+        background: DesignTokens.surface-raised;
+        border-width: 1px;
+        border-color: root.tone == 3
+            ? DesignTokens.danger
+            : (root.tone == 2 ? DesignTokens.warning : DesignTokens.border-default);
+        border-radius: Metrics.radius-large;
+
+        VerticalLayout {
+            padding: Metrics.space-3;
+            spacing: Metrics.space-1;
+
+            Text {
+                text: root.value;
+                color: root.tone == 3
+                    ? DesignTokens.danger
+                    : (root.tone == 2 ? DesignTokens.warning : DesignTokens.text-primary);
+                font-size: Metrics.type-display;
+                font-weight: 850;
+                accessible-role: none;
+            }
+            Text {
+                text: root.label;
+                color: DesignTokens.text-primary;
+                font-size: Metrics.type-small;
+                font-weight: 700;
+                accessible-role: none;
+            }
+            Text {
+                text: root.detail;
+                color: DesignTokens.text-muted;
+                font-size: Metrics.type-caption;
+                wrap: word-wrap;
+                accessible-role: none;
+            }
+        }
+    }
+}
+
+component LifecycleLegend {
+    accessible-role: region;
+    accessible-label: "All twelve supported run states";
+
+    GridLayout {
+        spacing: Metrics.space-2;
+
+        Row {
+            SemanticBadge { text: "Draft"; tone: 0; }
+            SemanticBadge { text: "Queued"; tone: 0; }
+            SemanticBadge { text: "Starting"; tone: 1; }
+            SemanticBadge { text: "Running"; tone: 1; }
+        }
+        Row {
+            SemanticBadge { text: "Waiting for approval"; tone: 2; }
+            SemanticBadge { text: "Waiting for answer"; tone: 1; }
+            SemanticBadge { text: "Paused"; tone: 0; }
+            SemanticBadge { text: "Blocked"; tone: 2; }
+        }
+        Row {
+            SemanticBadge { text: "Failed"; tone: 3; }
+            SemanticBadge { text: "Cancelled"; tone: 0; }
+            SemanticBadge { text: "Completed"; tone: 4; }
+            SemanticBadge { text: "Completed with changes"; tone: 4; }
+        }
+    }
+}
+
+component RunList {
+    in property <[RunItem]> runs;
+    callback open-requested(int);
+
+    accessible-role: region;
+    accessible-label: "Virtualized run list";
+
+    ListView {
+        for run[index] in root.runs : Rectangle {
+            height: max(76px, Metrics.control-large + 2 * Metrics.space-3);
+            background: Math.mod(index, 2) == 0
+                ? DesignTokens.surface-raised
+                : DesignTokens.surface-pane;
+            border-width: 1px;
+            border-color: DesignTokens.border-default;
+            border-radius: Metrics.radius-medium;
+
+            HorizontalLayout {
+                padding: Metrics.space-3;
+                spacing: Metrics.space-3;
+                alignment: center;
+
+                VerticalLayout {
+                    spacing: Metrics.space-1;
+
+                    HorizontalLayout {
+                        spacing: Metrics.space-2;
+                        alignment: center;
+
+                        Text {
+                            text: run.title;
+                            color: DesignTokens.text-primary;
+                            font-size: Metrics.type-small;
+                            font-weight: 750;
+                            overflow: elide;
+                            accessible-role: none;
+                        }
+                        SemanticBadge {
+                            text: run.state;
+                            tone: run.tone;
+                        }
+                    }
+
+                    Text {
+                        text: run.workspace + " · " + run.detail;
+                        color: DesignTokens.text-muted;
+                        font-size: Metrics.type-caption;
+                        overflow: elide;
+                        accessible-role: none;
+                    }
+                }
+
+                Text {
+                    text: run.updated;
+                    color: DesignTokens.text-muted;
+                    font-size: Metrics.type-caption;
+                    accessible-role: none;
+                }
+
+                SecondaryButton {
+                    text: "Open";
+                    accessible-name: "Open " + run.title;
+                    clicked => { root.open-requested(index); }
+                }
+            }
+        }
+    }
+}
+
+component FocusScreen {
+    in property <[RunItem]> runs;
+    callback open-session-requested(int);
+
+    accessible-role: main;
+    accessible-label: "Focus";
+
+    ScrollView {
+        viewport-width: self.width;
+        viewport-height: body.min-height;
+
+        body := VerticalLayout {
+            width: parent.width;
+            padding: Metrics.space-6;
+            spacing: Metrics.space-4;
+
+            SectionTitle {
+                eyebrow: "FOCUS";
+                title: "What needs your attention";
+                detail: "Pending decisions, running work, and review requests across every workspace.";
+            }
+
+            HorizontalLayout {
+                spacing: Metrics.space-3;
+                MetricCard { value: "3"; label: "Awaiting review"; detail: "Commands and diffs"; tone: 2; }
+                MetricCard { value: "7"; label: "Running"; detail: "Across 3 workspaces"; tone: 1; }
+                MetricCard { value: "2"; label: "Blocked"; detail: "Needs intervention"; tone: 3; }
+            }
+
+            Card {
+                accessible-name: "Run lifecycle coverage";
+                Text {
+                    text: "Lifecycle at a glance";
+                    color: DesignTokens.text-primary;
+                    font-size: Metrics.type-small;
+                    font-weight: 750;
+                    accessible-role: text;
+                }
+                LifecycleLegend { }
+            }
+
+            Text {
+                text: "Priority queue";
+                color: DesignTokens.text-primary;
+                font-size: Metrics.type-title;
+                font-weight: 800;
+                accessible-role: text;
+            }
+
+            RunList {
+                height: 320px;
+                runs: root.runs;
+                open-requested(index) => { root.open-session-requested(index); }
+            }
+        }
+    }
+}
+
+component WorkspacesScreen {
+    in property <[WorkspaceItem]> workspaces;
+    callback open-workspace-requested(int);
+
+    accessible-role: main;
+    accessible-label: "Workspaces";
+
+    ScrollView {
+        viewport-width: self.width;
+        viewport-height: body.min-height;
+
+        body := VerticalLayout {
+            width: parent.width;
+            padding: Metrics.space-6;
+            spacing: Metrics.space-4;
+
+            SectionTitle {
+                eyebrow: "WORKSPACES";
+                title: "Places your agents can work";
+                detail: "Local directories, Git repositories, and remote environments with explicit trust.";
+            }
+
+            for workspace[index] in root.workspaces : Card {
+                accessible-name: workspace.name + " workspace";
+
+                HorizontalLayout {
+                    spacing: Metrics.space-3;
+                    alignment: center;
+
+                    Rectangle {
+                        width: Metrics.control-large;
+                        height: Metrics.control-large;
+                        horizontal-stretch: 0;
+                        background: DesignTokens.accent-surface;
+                        border-radius: Metrics.radius-medium;
+
+                        Text {
+                            text: workspace.kind == "Remote workspace" ? "R" : "W";
+                            color: DesignTokens.accent;
+                            font-size: Metrics.type-small;
+                            font-weight: 850;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            accessible-role: none;
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: Metrics.space-1;
+                        Text {
+                            text: workspace.name;
+                            color: DesignTokens.text-primary;
+                            font-size: Metrics.type-title;
+                            font-weight: 800;
+                            accessible-role: none;
+                        }
+                        Text {
+                            text: workspace.kind + " · " + workspace.location;
+                            color: DesignTokens.text-muted;
+                            font-size: Metrics.type-caption;
+                            overflow: elide;
+                            accessible-role: none;
+                        }
+                        Text {
+                            text: workspace.branch + " · " + workspace.active-runs + " active runs";
+                            color: DesignTokens.text-secondary;
+                            font-size: Metrics.type-caption;
+                            accessible-role: none;
+                        }
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+                    SecondaryButton {
+                        text: "Open";
+                        accessible-name: "Open " + workspace.name;
+                        clicked => { root.open-workspace-requested(index); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component RunsScreen {
+    in property <[RunItem]> runs;
+    in property <string> page-label;
+    in property <bool> can-previous;
+    in property <bool> can-next;
+    callback open-session-requested(int);
+    callback previous-requested;
+    callback next-requested;
+
+    accessible-role: main;
+    accessible-label: "Run Monitor";
+
+    VerticalLayout {
+        padding: Metrics.space-6;
+        spacing: Metrics.space-4;
+
+        SectionTitle {
+            eyebrow: "RUN MONITOR";
+            title: "Every session and background task";
+            detail: "A paginated, virtualized view of live and historical work.";
+        }
+
+        Card {
+            accessible-name: "Supported run states";
+            LifecycleLegend { }
+        }
+
+        RunList {
+            vertical-stretch: 1;
+            runs: root.runs;
+            open-requested(index) => { root.open-session-requested(index); }
+        }
+
+        HorizontalLayout {
+            spacing: Metrics.space-3;
+            alignment: end;
+            Text {
+                text: root.page-label;
+                color: DesignTokens.text-muted;
+                font-size: Metrics.type-caption;
+                vertical-alignment: center;
+                accessible-role: text;
+            }
+            SecondaryButton {
+                text: "Previous";
+                enabled: root.can-previous;
+                clicked => { root.previous-requested(); }
+            }
+            SecondaryButton {
+                text: "Next";
+                enabled: root.can-next;
+                clicked => { root.next-requested(); }
+            }
+        }
+    }
+}
+
+component SchedulesScreen {
+    in property <[ScheduleItem]> schedules;
+    callback create-requested;
+    callback toggled(int);
+
+    accessible-role: main;
+    accessible-label: "Schedule Manager";
+
+    ScrollView {
+        viewport-width: self.width;
+        viewport-height: body.min-height;
+
+        body := VerticalLayout {
+            width: parent.width;
+            padding: Metrics.space-6;
+            spacing: Metrics.space-4;
+
+            SectionTitle {
+                eyebrow: "SCHEDULE MANAGER";
+                title: "Recurring work, on your terms";
+                detail: "Review cadence, destination, and next execution before enabling automation.";
+            }
+
+            HorizontalLayout {
+                alignment: end;
+                PrimaryButton {
+                    text: "New schedule";
+                    clicked => { root.create-requested(); }
+                }
+            }
+
+            for schedule[index] in root.schedules : Card {
+                accessible-name: schedule.name + " schedule";
+
+                HorizontalLayout {
+                    spacing: Metrics.space-3;
+                    alignment: center;
+
+                    VerticalLayout {
+                        spacing: Metrics.space-1;
+                        Text {
+                            text: schedule.name;
+                            color: DesignTokens.text-primary;
+                            font-size: Metrics.type-title;
+                            font-weight: 800;
+                            accessible-role: none;
+                        }
+                        Text {
+                            text: schedule.cadence + " · " + schedule.workspace;
+                            color: DesignTokens.text-secondary;
+                            font-size: Metrics.type-small;
+                            accessible-role: none;
+                        }
+                        Text {
+                            text: "Next: " + schedule.next-run;
+                            color: DesignTokens.text-muted;
+                            font-size: Metrics.type-caption;
+                            accessible-role: none;
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    SemanticBadge {
+                        text: schedule.enabled ? "Enabled" : (schedule.can-toggle ? "Paused" : "Draft");
+                        tone: schedule.enabled ? 4 : 0;
+                    }
+                    SecondaryButton {
+                        text: schedule.enabled ? "Pause" : "Enable";
+                        accessible-name: (schedule.enabled ? "Pause " : "Enable ") + schedule.name;
+                        enabled: schedule.can-toggle;
+                        clicked => { root.toggled(index); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component DeliverablesScreen {
+    in property <[DeliverableItem]> deliverables;
+    in property <int> selected-index;
+    in property <string> selected-name;
+    in property <string> selected-kind;
+    in property <string> selected-source;
+    in property <string> selected-size;
+    in property <string> selected-content;
+    in property <bool> selected-pinned;
+    callback selected(int);
+    callback pin-toggle-requested;
+
+    accessible-role: main;
+    accessible-label: "Deliverables and artifact viewer";
+
+    VerticalLayout {
+        padding: Metrics.space-6;
+        spacing: Metrics.space-4;
+
+        SectionTitle {
+            eyebrow: "DELIVERABLES";
+            title: "Files worth keeping";
+            detail: "Generated documents, previews, structured data, and pinned artifacts.";
+        }
+
+        HorizontalLayout {
+            spacing: Metrics.space-4;
+
+            Card {
+                width: 42%;
+                accessible-name: "Deliverable list";
+
+                Text {
+                    text: "Recent artifacts";
+                    color: DesignTokens.text-primary;
+                    font-size: Metrics.type-title;
+                    font-weight: 800;
+                    accessible-role: text;
+                }
+
+                for artifact[index] in root.deliverables : NavigationItem {
+                    glyph: artifact.pinned ? "P" : "F";
+                    text: artifact.name;
+                    detail: artifact.kind + " · " + artifact.size;
+                    selected: root.selected-index == index;
+                    clicked => { root.selected(index); }
+                }
+            }
+
+            Card {
+                horizontal-stretch: 1;
+                accessible-name: "Artifact viewer";
+
+                HorizontalLayout {
+                    Text {
+                        text: "Artifact viewer";
+                        color: DesignTokens.text-primary;
+                        font-size: Metrics.type-title;
+                        font-weight: 800;
+                        accessible-role: text;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    SemanticBadge {
+                        text: root.selected-pinned ? "Pinned" : "Not pinned";
+                        tone: root.selected-pinned ? 4 : 0;
+                    }
+                }
+                Divider { }
+                Text {
+                    text: root.selected-name;
+                    color: DesignTokens.accent;
+                    font-size: Metrics.type-small;
+                    font-weight: 750;
+                    accessible-role: text;
+                }
+                Text {
+                    text: root.selected-kind + " · " + root.selected-size + " · " + root.selected-source;
+                    color: DesignTokens.text-muted;
+                    font-size: Metrics.type-caption;
+                    accessible-role: text;
+                }
+                Text {
+                    text: root.selected-content;
+                    color: DesignTokens.text-secondary;
+                    font-size: Metrics.type-small;
+                    wrap: word-wrap;
+                    vertical-stretch: 1;
+                    accessible-role: text;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    SecondaryButton {
+                        text: root.selected-pinned ? "Unpin" : "Pin";
+                        clicked => { root.pin-toggle-requested(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component ExtensionsScreen {
+    in property <[ExtensionItem]> extensions;
+    callback toggled(int);
+
+    accessible-role: main;
+    accessible-label: "Extension Manager";
+
+    ScrollView {
+        viewport-width: self.width;
+        viewport-height: body.min-height;
+
+        body := VerticalLayout {
+            width: parent.width;
+            padding: Metrics.space-6;
+            spacing: Metrics.space-4;
+
+            SectionTitle {
+                eyebrow: "EXTENSION MANAGER";
+                title: "Roles, skills, connectors, and permissions";
+                detail: "Capabilities stay discoverable, scoped, and reversible.";
+            }
+
+            for extension[index] in root.extensions : Card {
+                accessible-name: extension.name + " " + extension.category;
+
+                HorizontalLayout {
+                    spacing: Metrics.space-3;
+                    alignment: center;
+
+                    Rectangle {
+                        width: Metrics.control-large;
+                        height: Metrics.control-large;
+                        horizontal-stretch: 0;
+                        background: DesignTokens.accent-surface;
+                        border-radius: Metrics.radius-medium;
+
+                        Text {
+                            text: extension.category == "Connector"
+                                ? "C"
+                                : (extension.category == "Skill" ? "S" : (extension.category == "Role" ? "R" : "P"));
+                            color: DesignTokens.accent;
+                            font-size: Metrics.type-small;
+                            font-weight: 850;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            accessible-role: none;
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: Metrics.space-1;
+                        Text {
+                            text: extension.name;
+                            color: DesignTokens.text-primary;
+                            font-size: Metrics.type-title;
+                            font-weight: 800;
+                            accessible-role: none;
+                        }
+                        Text {
+                            text: extension.category + " · " + extension.detail;
+                            color: DesignTokens.text-secondary;
+                            font-size: Metrics.type-small;
+                            wrap: word-wrap;
+                            accessible-role: none;
+                        }
+                        Text {
+                            text: "Permission: " + extension.permission;
+                            color: DesignTokens.text-muted;
+                            font-size: Metrics.type-caption;
+                            accessible-role: none;
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    SecondaryButton {
+                        text: extension.enabled ? "Disable" : "Enable";
+                        accessible-name: (extension.enabled ? "Disable " : "Enable ") + extension.name;
+                        clicked => { root.toggled(index); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component SettingsScreen {
+    in property <int> selected-section;
+    callback section-requested(int);
+    callback disconnect-requested;
+    callback update-requested;
+    callback diagnostics-requested;
+
+    accessible-role: main;
+    accessible-label: "Settings";
+
+    HorizontalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            width: 220px;
+            horizontal-stretch: 0;
+            background: DesignTokens.surface-pane;
+            border-width: 1px;
+            border-color: DesignTokens.border-default;
+
+            ScrollView {
+                viewport-width: self.width;
+                viewport-height: settings-navigation.min-height;
+
+                settings-navigation := VerticalLayout {
+                    width: parent.width;
+                    padding: Metrics.space-3;
+                    spacing: Metrics.space-1;
+
+                    Text {
+                        text: "Settings";
+                        color: DesignTokens.text-primary;
+                        font-size: Metrics.type-title;
+                        font-weight: 850;
+                        accessible-role: text;
+                    }
+                    NavigationItem { glyph: "A"; text: "Account"; selected: root.selected-section == 0; clicked => { root.section-requested(0); } }
+                    NavigationItem { glyph: "M"; text: "Models"; selected: root.selected-section == 1; clicked => { root.section-requested(1); } }
+                    NavigationItem { glyph: "E"; text: "Execution"; selected: root.selected-section == 2; clicked => { root.section-requested(2); } }
+                    NavigationItem { glyph: "V"; text: "Appearance"; selected: root.selected-section == 3; clicked => { root.section-requested(3); } }
+                    NavigationItem { glyph: "N"; text: "Notifications"; selected: root.selected-section == 4; clicked => { root.section-requested(4); } }
+                    NavigationItem { glyph: "K"; text: "Shortcuts"; selected: root.selected-section == 5; clicked => { root.section-requested(5); } }
+                    NavigationItem { glyph: "U"; text: "Updates"; selected: root.selected-section == 6; clicked => { root.section-requested(6); } }
+                    NavigationItem { glyph: "D"; text: "Diagnostics"; selected: root.selected-section == 7; clicked => { root.section-requested(7); } }
+                }
+            }
+        }
+
+        ScrollView {
+            horizontal-stretch: 1;
+            viewport-width: self.width;
+            viewport-height: body.min-height;
+
+            body := VerticalLayout {
+                width: parent.width;
+                padding: Metrics.space-6;
+                spacing: Metrics.space-4;
+
+                SectionTitle {
+                    eyebrow: "SETTINGS";
+                    title: root.selected-section == 0
+                        ? "Account"
+                        : (root.selected-section == 1
+                            ? "Models"
+                            : (root.selected-section == 2
+                                ? "Execution"
+                                : (root.selected-section == 3
+                                    ? "Appearance"
+                                    : (root.selected-section == 4
+                                        ? "Notifications"
+                                        : (root.selected-section == 5
+                                            ? "Shortcuts"
+                                            : (root.selected-section == 6 ? "Updates" : "Diagnostics"))))));
+                    detail: root.selected-section == 0
+                        ? "Identity and Gateway session."
+                        : (root.selected-section == 1
+                            ? "Default models, routing, and context budgets."
+                            : (root.selected-section == 2
+                                ? "Sandbox, approvals, and concurrency."
+                                : (root.selected-section == 3
+                                    ? "Theme, contrast, density, and motion."
+                                    : (root.selected-section == 4
+                                        ? "Attention and completion signals."
+                                        : (root.selected-section == 5
+                                            ? "Keyboard-first navigation."
+                                            : (root.selected-section == 6 ? "Native application releases." : "Runtime health and support data."))))));
+                }
+
+                Card {
+                    accessible-name: "Selected setting";
+
+                    if (root.selected-section == 0) : VerticalLayout {
+                        spacing: Metrics.space-3;
+                        Text { text: "Gateway account"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                        Text { text: "Connected as local desktop · read-only health scope"; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
+                        DangerButton {
+                            text: "Disconnect Gateway";
+                            clicked => { root.disconnect-requested(); }
+                        }
+                    }
+
+                    if (root.selected-section == 1) : VerticalLayout {
+                        spacing: Metrics.space-3;
+                        Text { text: "Default model"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                        TextField { label: "Model"; text: "Automatic"; read-only: true; }
+                        Text { text: "Routing prefers capability and policy compatibility over latency."; color: DesignTokens.text-muted; font-size: Metrics.type-caption; wrap: word-wrap; accessible-role: text; }
+                    }
+
+                    if (root.selected-section == 2) : VerticalLayout {
+                        spacing: Metrics.space-3;
+                        Text { text: "Execution policy"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                        Text { text: "Commands: ask before elevated or networked execution"; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
+                        Text { text: "Parallel runs: 4 · Background runtime: multi-threaded Tokio"; color: DesignTokens.text-muted; font-size: Metrics.type-caption; accessible-role: text; }
+                    }
+
+                    if (root.selected-section == 3) : VerticalLayout {
+                        spacing: Metrics.space-3;
+                        Text { text: "Appearance"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                        Text { text: "Light, dark, and high-contrast themes · scaling from 80% to 200% · reduced motion"; color: DesignTokens.text-secondary; font-size: Metrics.type-small; wrap: word-wrap; accessible-role: text; }
+                        VerticalLayout {
+                            spacing: Metrics.space-2;
+                            Text {
+                                text: "Theme: " + (VisualPreferences.theme-mode == ThemeMode.light ? "Light" : "Dark");
+                                color: DesignTokens.text-secondary;
+                                font-size: Metrics.type-small;
+                                accessible-role: text;
+                            }
+                            SecondaryButton {
+                                text: "Theme";
+                                accessible-name: VisualPreferences.theme-mode == ThemeMode.light ? "Use dark theme" : "Use light theme";
+                                clicked => {
+                                    VisualPreferences.theme-mode-requested(
+                                        VisualPreferences.theme-mode == ThemeMode.light ? ThemeMode.dark : ThemeMode.light
+                                    );
+                                }
+                            }
+                            Text {
+                                text: "High contrast: " + (VisualPreferences.high-contrast ? "On" : "Off");
+                                color: DesignTokens.text-secondary;
+                                font-size: Metrics.type-small;
+                                accessible-role: text;
+                            }
+                            SecondaryButton {
+                                text: "Contrast";
+                                accessible-name: VisualPreferences.high-contrast ? "Disable high contrast" : "Enable high contrast";
+                                clicked => { VisualPreferences.high-contrast-requested(!VisualPreferences.high-contrast); }
+                            }
+                            Text {
+                                text: "Scale " + round(VisualPreferences.density-scale * 100) + "%";
+                                color: DesignTokens.text-secondary;
+                                font-size: Metrics.type-small;
+                                accessible-role: text;
+                            }
+                            SecondaryButton {
+                                text: "Smaller";
+                                enabled: VisualPreferences.density-scale > 0.8;
+                                clicked => { VisualPreferences.density-scale-requested(VisualPreferences.density-scale - 0.1); }
+                            }
+                            SecondaryButton {
+                                text: "Larger";
+                                enabled: VisualPreferences.density-scale < 2.0;
+                                clicked => { VisualPreferences.density-scale-requested(VisualPreferences.density-scale + 0.1); }
+                            }
+                            Text {
+                                text: "Reduced motion: " + (VisualPreferences.reduced-motion ? "On" : "Off");
+                                color: DesignTokens.text-secondary;
+                                font-size: Metrics.type-small;
+                                accessible-role: text;
+                            }
+                            SecondaryButton {
+                                text: "Motion";
+                                accessible-name: VisualPreferences.reduced-motion ? "Enable motion" : "Reduce motion";
+                                clicked => { VisualPreferences.reduced-motion-requested(!VisualPreferences.reduced-motion); }
+                            }
+                        }
+                        Text { text: "The native Fluent or Cupertino style follows the operating system build."; color: DesignTokens.text-muted; font-size: Metrics.type-caption; wrap: word-wrap; accessible-role: text; }
+                    }
+
+                    if (root.selected-section == 4) : VerticalLayout {
+                        spacing: Metrics.space-3;
+                        Text { text: "Notifications"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                        Text { text: "Notify for approvals, questions, failures, and completed runs."; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
+                    }
+
+                    if (root.selected-section == 5) : VerticalLayout {
+                        spacing: Metrics.space-3;
+                        Text { text: "Keyboard shortcuts"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                        Text { text: "F1  Command palette\nCtrl+1…7  Primary destinations\nEscape  Close the active dialog\nEnter  Send message"; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
+                    }
+
+                    if (root.selected-section == 6) : VerticalLayout {
+                        spacing: Metrics.space-3;
+                        Text { text: "GTA Claw 0.1.0"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                        Text { text: "A signed native update is available for review."; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
+                        PrimaryButton { text: "Review update"; clicked => { root.update-requested(); } }
+                    }
+
+                    if (root.selected-section == 7) : VerticalLayout {
+                        spacing: Metrics.space-3;
+                        Text { text: "Diagnostics"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                        Text { text: "Gateway transport, renderer, accessibility, policy, and storage checks."; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
+                        PrimaryButton { text: "Open diagnostics"; clicked => { root.diagnostics-requested(); } }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component DiffViewer {
+    in property <[DiffItem]> lines;
+    in property <int> mode;
+    in property <string> file-name: "Selected file";
+    callback mode-requested(int);
+
+    accessible-role: region;
+    accessible-label: root.mode == 0 ? "Unified diff viewer" : "Side by side diff viewer";
+
+    VerticalLayout {
+        spacing: Metrics.space-2;
+
+        HorizontalLayout {
+            spacing: Metrics.space-2;
+            Text {
+                text: root.file-name;
+                color: DesignTokens.text-primary;
+                font-size: Metrics.type-small;
+                font-weight: 750;
+                vertical-alignment: center;
+                accessible-role: text;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            SecondaryButton { text: "Unified"; enabled: root.mode != 0; clicked => { root.mode-requested(0); } }
+            SecondaryButton { text: "Side by side"; enabled: root.mode != 1; clicked => { root.mode-requested(1); } }
+        }
+
+        ListView {
+            for line in root.lines : Rectangle {
+                height: max(28px, Metrics.line-caption + 2 * Metrics.space-1);
+                background: line.kind == 1
+                    ? DesignTokens.success-surface
+                    : (line.kind == 2 ? DesignTokens.danger-surface : DesignTokens.surface-raised);
+
+                if (root.mode == 0) : HorizontalLayout {
+                    spacing: Metrics.space-2;
+                    Text { width: 34px; text: line.old-line; color: DesignTokens.text-muted; font-size: Metrics.type-caption; horizontal-alignment: right; accessible-role: none; }
+                    Text { width: 34px; text: line.new-line; color: DesignTokens.text-muted; font-size: Metrics.type-caption; horizontal-alignment: right; accessible-role: none; }
+                    Text { text: line.text; color: DesignTokens.text-primary; font-size: Metrics.type-caption; overflow: elide; accessible-role: text; }
+                }
+
+                if (root.mode == 1) : HorizontalLayout {
+                    spacing: Metrics.space-2;
+                    Text { width: 30px; text: line.old-line; color: DesignTokens.text-muted; font-size: Metrics.type-caption; horizontal-alignment: right; accessible-role: none; }
+                    Text { horizontal-stretch: 1; text: line.old-text; color: DesignTokens.text-primary; font-size: Metrics.type-caption; overflow: elide; accessible-role: text; }
+                    Divider { vertical: true; }
+                    Text { width: 30px; text: line.new-line; color: DesignTokens.text-muted; font-size: Metrics.type-caption; horizontal-alignment: right; accessible-role: none; }
+                    Text { horizontal-stretch: 1; text: line.new-text; color: DesignTokens.text-primary; font-size: Metrics.type-caption; overflow: elide; accessible-role: text; }
+                }
+            }
+        }
+    }
+}
+
+component SessionScreen {
+    in property <[TranscriptItem]> transcript;
+    in property <[ActivityItem]> activity;
+    in property <[DiffItem]> diff-lines;
+    in property <[FileItem]> files;
+    in property <int> selected-file-index: 0;
+    in property <string> selected-file-name: "";
+    in property <string> session-title: "Session";
+    in property <string> session-state: "Draft";
+    in property <string> session-detail: "";
+    in property <int> session-tone: 0;
+    in property <bool> can-approve: false;
+    in property <bool> can-answer: false;
+    in property <string> approval-prompt: "";
+    in property <string> approval-scope: "";
+    in property <string> question: "";
+    in property <int> diff-mode;
+    in property <bool> narrow;
+
+    callback back-requested;
+    callback diff-mode-requested(int);
+    callback approval-requested(bool);
+    callback answer-requested(string);
+    callback message-submitted(string);
+    callback file-selected(int);
+
+    accessible-role: main;
+    accessible-label: "Session workspace";
+
+    VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            height: max(58px, Metrics.control-large + 2 * Metrics.space-2);
+            vertical-stretch: 0;
+            background: DesignTokens.surface-pane;
+            border-width: 1px;
+            border-color: DesignTokens.border-default;
+
+            HorizontalLayout {
+                padding-left: Metrics.space-3;
+                padding-right: Metrics.space-3;
+                spacing: Metrics.space-3;
+                alignment: center;
+
+                SecondaryButton { text: "Back"; clicked => { root.back-requested(); } }
+                VerticalLayout {
+                    spacing: 0px;
+                    Text { text: root.session-title; color: DesignTokens.text-primary; font-size: Metrics.type-small; font-weight: 800; accessible-role: text; }
+                    Text { text: root.session-detail; color: DesignTokens.text-muted; font-size: Metrics.type-caption; accessible-role: text; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                SemanticBadge { text: root.session-state; tone: root.session-tone; }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 0px;
+            vertical-stretch: 1;
+
+            if (!root.narrow) : Rectangle {
+                width: 190px;
+                horizontal-stretch: 0;
+                background: DesignTokens.surface-pane;
+                border-width: 1px;
+                border-color: DesignTokens.border-default;
+
+                VerticalLayout {
+                    padding: Metrics.space-3;
+                    spacing: Metrics.space-2;
+                    Text { text: "Files"; color: DesignTokens.text-primary; font-size: Metrics.type-small; font-weight: 800; accessible-role: text; }
+                    for file[index] in root.files : NavigationItem {
+                        glyph: "F";
+                        text: file.name;
+                        detail: file.status;
+                        selected: root.selected-file-index == index;
+                        clicked => { root.file-selected(index); }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                    Card {
+                        accessible-name: "Pinned artifact preview";
+                        Text { text: "Artifact"; color: DesignTokens.text-muted; font-size: Metrics.type-caption; font-weight: 700; accessible-role: none; }
+                        Text { text: "UI walkthrough"; color: DesignTokens.text-primary; font-size: Metrics.type-small; font-weight: 750; accessible-role: text; }
+                        Text { text: "Markdown · pinned"; color: DesignTokens.text-muted; font-size: Metrics.type-caption; accessible-role: text; }
+                    }
+                }
+            }
+
+            ScrollView {
+                horizontal-stretch: 1;
+                viewport-width: self.width;
+                viewport-height: center-body.min-height;
+
+                center-body := VerticalLayout {
+                    width: parent.width;
+                    spacing: Metrics.space-2;
+                    padding: Metrics.space-3;
+
+                    if (root.narrow) : Card {
+                        accessible-name: "Session files";
+                        Text { text: "Files"; color: DesignTokens.text-primary; font-size: Metrics.type-small; font-weight: 800; accessible-role: text; }
+                        for file[index] in root.files : NavigationItem {
+                            glyph: "F";
+                            text: file.name;
+                            detail: file.status;
+                            selected: root.selected-file-index == index;
+                            clicked => { root.file-selected(index); }
+                        }
+                    }
+
+                    ListView {
+                    height: 300px;
+                    vertical-stretch: 0;
+                    accessible-role: region;
+                    accessible-label: "Streaming transcript";
+
+                    for entry in root.transcript : Rectangle {
+                        height: max(86px, 3 * Metrics.line-body + 2 * Metrics.space-2);
+                        background: entry.tone == 2
+                            ? DesignTokens.warning-surface
+                            : (entry.tone == 1 ? DesignTokens.info-surface : DesignTokens.surface-raised);
+                        border-width: 1px;
+                        border-color: DesignTokens.border-default;
+                        border-radius: Metrics.radius-medium;
+
+                        VerticalLayout {
+                            padding: Metrics.space-2;
+                            spacing: Metrics.space-1;
+                            HorizontalLayout {
+                                Text { text: entry.role; color: DesignTokens.text-primary; font-size: Metrics.type-caption; font-weight: 800; accessible-role: none; }
+                                Rectangle { horizontal-stretch: 1; }
+                                Text { text: entry.timestamp; color: DesignTokens.text-muted; font-size: Metrics.type-caption; accessible-role: none; }
+                            }
+                            Text { text: entry.text; color: DesignTokens.text-primary; font-size: Metrics.type-small; wrap: word-wrap; accessible-role: text; }
+                            Text { text: entry.detail; color: DesignTokens.text-muted; font-size: Metrics.type-caption; overflow: elide; accessible-role: text; }
+                        }
+                    }
+                }
+
+                if (root.can-approve) : Card {
+                    min-height: max(134px, Metrics.control-large + 4 * Metrics.line-body);
+                    vertical-stretch: 0;
+                    accessible-name: "Approval prompt";
+
+                    HorizontalLayout {
+                        spacing: Metrics.space-3;
+                        VerticalLayout {
+                            spacing: Metrics.space-1;
+                            Text { text: "Approval required"; color: DesignTokens.warning; font-size: Metrics.type-small; font-weight: 850; accessible-role: text; }
+                            Text { text: root.approval-prompt; color: DesignTokens.text-primary; font-size: Metrics.type-small; wrap: word-wrap; accessible-role: text; }
+                            Text { text: root.approval-scope; color: DesignTokens.text-muted; font-size: Metrics.type-caption; accessible-role: text; }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        DangerButton { text: "Deny"; clicked => { root.approval-requested(false); } }
+                        PrimaryButton { text: "Approve"; clicked => { root.approval-requested(true); } }
+                    }
+                }
+
+                if (root.can-answer) : Card {
+                    min-height: max(116px, Metrics.control-large + 3 * Metrics.line-body);
+                    vertical-stretch: 0;
+                    accessible-name: "Agent question";
+                    Text { text: "Agent question"; color: DesignTokens.info; font-size: Metrics.type-caption; font-weight: 850; accessible-role: text; }
+                    Text { text: root.question; color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; }
+                    HorizontalLayout {
+                        spacing: Metrics.space-2;
+                        PrimaryButton { text: "Continue"; clicked => { root.answer-requested("Continue"); } }
+                        SecondaryButton { text: "Pause run"; clicked => { root.answer-requested("Pause run"); } }
+                    }
+                }
+
+                ComposerShell {
+                    placeholder: "Message the agent";
+                    submit-label: "Send";
+                    submitted(message) => { root.message-submitted(message); }
+                }
+
+                Rectangle {
+                    height: 260px;
+                    vertical-stretch: 0;
+                    background: DesignTokens.surface-pane;
+                    border-width: 1px;
+                    border-color: DesignTokens.border-default;
+                    border-radius: Metrics.radius-large;
+
+                    DiffViewer {
+                        x: Metrics.space-3;
+                        y: Metrics.space-3;
+                        width: parent.width - 2 * Metrics.space-3;
+                        height: parent.height - 2 * Metrics.space-3;
+                        lines: root.diff-lines;
+                        mode: root.diff-mode;
+                        file-name: root.selected-file-name;
+                        mode-requested(mode) => { root.diff-mode-requested(mode); }
+                    }
+                }
+                }
+            }
+
+            if (!root.narrow) : Rectangle {
+                width: 260px;
+                horizontal-stretch: 0;
+                background: DesignTokens.surface-pane;
+                border-width: 1px;
+                border-color: DesignTokens.border-default;
+
+                VerticalLayout {
+                    padding: Metrics.space-3;
+                    spacing: Metrics.space-3;
+
+                    Text { text: "Activity"; color: DesignTokens.text-primary; font-size: Metrics.type-small; font-weight: 850; accessible-role: text; }
+
+                    ListView {
+                        vertical-stretch: 1;
+                        accessible-role: region;
+                        accessible-label: "Tool activity timeline";
+
+                        for item in root.activity : Rectangle {
+                            height: max(92px, 3 * Metrics.line-caption + Metrics.control-small + 2 * Metrics.space-2);
+                            background: DesignTokens.surface-raised;
+                            border-width: 1px;
+                            border-color: DesignTokens.border-default;
+                            border-radius: Metrics.radius-medium;
+
+                            VerticalLayout {
+                                padding: Metrics.space-2;
+                                spacing: Metrics.space-1;
+                                Text { text: item.title; color: DesignTokens.text-primary; font-size: Metrics.type-caption; font-weight: 800; accessible-role: text; }
+                                Text { text: item.detail; color: DesignTokens.text-muted; font-size: Metrics.type-caption; wrap: word-wrap; accessible-role: text; }
+                                HorizontalLayout {
+                                    SemanticBadge { text: item.state; tone: item.tone; }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    Text { text: item.duration; color: DesignTokens.text-muted; font-size: Metrics.type-caption; accessible-role: none; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component UpdateScreen {
+    callback back-requested;
+
+    accessible-role: main;
+    accessible-label: "Application update";
+
+    ScrollView {
+        viewport-width: self.width;
+        viewport-height: body.min-height;
+
+        body := VerticalLayout {
+            width: parent.width;
+            padding: Metrics.space-8;
+            spacing: Metrics.space-4;
+
+            SectionTitle {
+                eyebrow: "UPDATE";
+                title: "GTA Claw 0.2.0 is ready";
+                detail: "Review the signed native release before installing.";
+            }
+            Card {
+                accessible-name: "Update details";
+                SemanticBadge { text: "Signature verified"; tone: 4; }
+                Text { text: "What’s new"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                Text { text: "• Faster workspace indexing\n• Improved screen-reader announcements\n• Safer connector permission review\n• Gateway protocol compatibility fixes"; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
+                Divider { }
+                Text { text: "The application will restart after installation. Running sessions remain paused until reconnection."; color: DesignTokens.text-muted; font-size: Metrics.type-caption; wrap: word-wrap; accessible-role: text; }
+                HorizontalLayout {
+                    alignment: end;
+                    SecondaryButton { text: "Back"; clicked => { root.back-requested(); } }
+                    PrimaryButton {
+                        text: "Installer unavailable";
+                        accessible-name: "Installer unavailable in this development build";
+                        enabled: false;
+                    }
+                }
+            }
+        }
+    }
+}
+
+component DiagnosticsScreen {
+    callback back-requested;
+
+    accessible-role: main;
+    accessible-label: "Diagnostics";
+
+    ScrollView {
+        viewport-width: self.width;
+        viewport-height: body.min-height;
+
+        body := VerticalLayout {
+            width: parent.width;
+            padding: Metrics.space-8;
+            spacing: Metrics.space-4;
+
+            SectionTitle {
+                eyebrow: "DIAGNOSTICS";
+                title: "Desktop health";
+                detail: "Safe summaries only; secrets and raw Gateway payloads are excluded.";
+            }
+
+            Card {
+                accessible-name: "Diagnostic checks";
+                HorizontalLayout { Text { text: "Gateway v4 transport"; color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; } Rectangle { horizontal-stretch: 1; } SemanticBadge { text: "Healthy"; tone: 4; } }
+                HorizontalLayout { Text { text: "Slint renderer"; color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; } Rectangle { horizontal-stretch: 1; } SemanticBadge { text: "FemtoVG · software fallback"; tone: 4; } }
+                HorizontalLayout { Text { text: "Accessibility bridge"; color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; } Rectangle { horizontal-stretch: 1; } SemanticBadge { text: "Active"; tone: 4; } }
+                HorizontalLayout { Text { text: "Policy database"; color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; } Rectangle { horizontal-stretch: 1; } SemanticBadge { text: "Current"; tone: 4; } }
+                HorizontalLayout { Text { text: "Background runtime"; color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; } Rectangle { horizontal-stretch: 1; } SemanticBadge { text: "4 worker threads"; tone: 1; } }
+                Divider { }
+                HorizontalLayout {
+                    alignment: end;
+                    SecondaryButton { text: "Back"; clicked => { root.back-requested(); } }
+                }
+            }
+        }
+    }
+}
+
+component CommandPalette {
+    callback dismiss-requested;
+    callback navigate-requested(int);
+
+    Rectangle {
+        background: #00000066;
+        TouchArea { clicked => { root.dismiss-requested(); } }
+
+        ModalSheetShell {
+            x: max(Metrics.space-3, (parent.width - self.width) / 2);
+            y: Metrics.space-8;
+            width: min(620px, parent.width - 2 * Metrics.space-3);
+            height: min(520px, parent.height - 2 * Metrics.space-8);
+            title: "Command palette";
+            dismiss-label: "Close palette";
+            dismiss-requested => { root.dismiss-requested(); }
+
+            ScrollView {
+                vertical-stretch: 1;
+                viewport-width: self.width;
+                viewport-height: commands.min-height;
+
+                commands := VerticalLayout {
+                    width: parent.width;
+                    spacing: Metrics.space-1;
+
+                    NavigationItem { glyph: "F"; text: "Go to Focus"; detail: "Ctrl+1"; clicked => { root.navigate-requested(0); } }
+                    NavigationItem { glyph: "W"; text: "Go to Workspaces"; detail: "Ctrl+2"; clicked => { root.navigate-requested(1); } }
+                    NavigationItem { glyph: "R"; text: "Open Run Monitor"; detail: "Ctrl+3"; clicked => { root.navigate-requested(2); } }
+                    NavigationItem { glyph: "S"; text: "Open Schedule Manager"; detail: "Ctrl+4"; clicked => { root.navigate-requested(3); } }
+                    NavigationItem { glyph: "D"; text: "Open Deliverables"; detail: "Ctrl+5"; clicked => { root.navigate-requested(4); } }
+                    NavigationItem { glyph: "E"; text: "Open Extension Manager"; detail: "Ctrl+6"; clicked => { root.navigate-requested(5); } }
+                    NavigationItem { glyph: "G"; text: "Open Settings"; detail: "Ctrl+7"; clicked => { root.navigate-requested(6); } }
+                }
+            }
+        }
+    }
+}
+
+component PrimaryNavigation {
+    in property <int> selected-screen;
+    in property <bool> compact;
+    callback navigate-requested(int);
+
+    min-width: 0px;
+    preferred-width: 0px;
+    max-width: 100000px;
+    min-height: 0px;
+    preferred-height: 0px;
+    max-height: 100000px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    accessible-role: navigation;
+    accessible-label: "Primary navigation";
+
+    Rectangle {
+        background: DesignTokens.surface-pane;
+        border-width: 1px;
+        border-color: DesignTokens.border-default;
+
+        ScrollView {
+            viewport-width: self.width;
+            viewport-height: navigation-content.min-height;
+
+            navigation-content := VerticalLayout {
+                width: parent.width;
+                padding: Metrics.space-3;
+                spacing: Metrics.space-1;
+
+                HorizontalLayout {
+                    spacing: Metrics.space-2;
+                    alignment: center;
+
+                    Rectangle {
+                        width: Metrics.control-large;
+                        height: Metrics.control-large;
+                        horizontal-stretch: 0;
+                        background: DesignTokens.accent;
+                        border-radius: Metrics.radius-large;
+                        Text { text: "GC"; color: DesignTokens.accent-on; font-size: Metrics.type-small; font-weight: 850; horizontal-alignment: center; vertical-alignment: center; accessible-role: none; }
+                    }
+                    if (!root.compact) : VerticalLayout {
+                        spacing: 0px;
+                        Text { text: "GTA Claw"; color: DesignTokens.text-primary; font-size: Metrics.type-small; font-weight: 850; accessible-role: none; }
+                        Text { text: "Native workspace"; color: DesignTokens.text-muted; font-size: Metrics.type-caption; accessible-role: none; }
+                    }
+                }
+
+                Divider { }
+                NavigationItem { glyph: "F"; text: root.compact ? "" : "Focus"; detail: root.compact ? "" : "Needs attention"; accessible-name: "Focus, needs attention"; selected: root.selected-screen == 0; clicked => { root.navigate-requested(0); } }
+                NavigationItem { glyph: "W"; text: root.compact ? "" : "Workspaces"; detail: root.compact ? "" : "Local and remote"; accessible-name: "Workspaces, local and remote"; selected: root.selected-screen == 1; clicked => { root.navigate-requested(1); } }
+                NavigationItem { glyph: "R"; text: root.compact ? "" : "Runs"; detail: root.compact ? "" : "Sessions and tasks"; accessible-name: "Runs, sessions and tasks"; selected: root.selected-screen == 2 || root.selected-screen == 7; clicked => { root.navigate-requested(2); } }
+                NavigationItem { glyph: "S"; text: root.compact ? "" : "Schedules"; detail: root.compact ? "" : "Recurring work"; accessible-name: "Schedules, recurring work"; selected: root.selected-screen == 3; clicked => { root.navigate-requested(3); } }
+                NavigationItem { glyph: "D"; text: root.compact ? "" : "Deliverables"; detail: root.compact ? "" : "Files and artifacts"; accessible-name: "Deliverables, files and artifacts"; selected: root.selected-screen == 4; clicked => { root.navigate-requested(4); } }
+                NavigationItem { glyph: "E"; text: root.compact ? "" : "Extensions"; detail: root.compact ? "" : "Roles and tools"; accessible-name: "Extensions, roles and tools"; selected: root.selected-screen == 5; clicked => { root.navigate-requested(5); } }
+                Divider { }
+                NavigationItem { glyph: "G"; text: root.compact ? "" : "Settings"; detail: root.compact ? "" : "Preferences"; accessible-name: "Settings, preferences"; selected: root.selected-screen == 6 || root.selected-screen == 8 || root.selected-screen == 9; clicked => { root.navigate-requested(6); } }
+                SemanticBadge { text: root.compact ? "OK" : "Gateway healthy"; tone: 4; }
+            }
+        }
+    }
+}
+
+export component ProductShell inherits FocusScope {
+    in property <length> available-width;
+    in property <int> selected-screen: 0;
+    in property <int> selected-settings-section: 0;
+    in property <bool> palette-open: false;
+    in property <int> diff-mode: 0;
+    in property <[RunItem]> runs;
+    in property <[WorkspaceItem]> workspaces;
+    in property <[ScheduleItem]> schedules;
+    in property <[DeliverableItem]> deliverables;
+    in property <[ExtensionItem]> extensions;
+    in property <[TranscriptItem]> transcript;
+    in property <[ActivityItem]> activity;
+    in property <[DiffItem]> diff-lines;
+    in property <[FileItem]> session-files;
+    in property <int> selected-file-index: 0;
+    in property <string> selected-file-name: "";
+    in property <string> session-title: "Session";
+    in property <string> session-state: "Draft";
+    in property <string> session-detail: "";
+    in property <int> session-tone: 0;
+    in property <bool> can-approve: false;
+    in property <bool> can-answer: false;
+    in property <string> approval-prompt: "";
+    in property <string> approval-scope: "";
+    in property <string> question: "";
+    in property <int> selected-deliverable-index: 0;
+    in property <string> selected-deliverable-name: "";
+    in property <string> selected-deliverable-kind: "";
+    in property <string> selected-deliverable-source: "";
+    in property <string> selected-deliverable-size: "";
+    in property <string> selected-deliverable-content: "";
+    in property <bool> selected-deliverable-pinned: false;
+    in property <string> run-page-label: "Page 1 of 1";
+    in property <bool> can-previous-run-page: false;
+    in property <bool> can-next-run-page: false;
+    out property <bool> compact-navigation: root.available-width < 900px;
+
+    callback navigate-requested(int);
+    callback palette-toggle-requested;
+    callback palette-dismiss-requested;
+    callback open-session-requested(int);
+    callback open-workspace-requested(int);
+    callback settings-section-requested(int);
+    callback disconnect-requested;
+    callback update-requested;
+    callback diagnostics-requested;
+    callback back-requested;
+    callback diff-mode-requested(int);
+    callback previous-run-page-requested;
+    callback next-run-page-requested;
+    callback approval-requested(bool);
+    callback answer-requested(string);
+    callback message-submitted(string);
+    callback file-selected(int);
+    callback schedule-create-requested;
+    callback schedule-toggled(int);
+    callback extension-toggled(int);
+    callback deliverable-selected(int);
+    callback deliverable-pin-toggle-requested;
+
+    min-width: 0px;
+    preferred-width: 0px;
+    max-width: 100000px;
+    min-height: 0px;
+    preferred-height: 0px;
+    max-height: 100000px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+
+    key-pressed(event) => {
+        if (event.text == Key.F1) {
+            root.palette-toggle-requested();
+            return accept;
+        }
+        if (event.modifiers.control && event.text == "1") {
+            root.navigate-requested(0);
+            return accept;
+        }
+        if (event.modifiers.control && event.text == "2") {
+            root.navigate-requested(1);
+            return accept;
+        }
+        if (event.modifiers.control && event.text == "3") {
+            root.navigate-requested(2);
+            return accept;
+        }
+        if (event.modifiers.control && event.text == "4") {
+            root.navigate-requested(3);
+            return accept;
+        }
+        if (event.modifiers.control && event.text == "5") {
+            root.navigate-requested(4);
+            return accept;
+        }
+        if (event.modifiers.control && event.text == "6") {
+            root.navigate-requested(5);
+            return accept;
+        }
+        if (event.modifiers.control && event.text == "7") {
+            root.navigate-requested(6);
+            return accept;
+        }
+        if (event.text == Key.Escape && root.palette-open) {
+            root.palette-dismiss-requested();
+            return accept;
+        }
+        return reject;
+    }
+
+    accessible-role: region;
+    accessible-label: "GTA Claw desktop application";
+
+    Rectangle { background: DesignTokens.surface-app; }
+
+    HorizontalLayout {
+        spacing: 0px;
+
+        PrimaryNavigation {
+            width: root.compact-navigation
+                ? max(82px, Metrics.control-large + 2 * Metrics.space-3)
+                : max(224px, 112px + Metrics.control-large + 4 * Metrics.space-3);
+            horizontal-stretch: 0;
+            selected-screen: root.selected-screen;
+            compact: root.compact-navigation;
+            navigate-requested(index) => { root.navigate-requested(index); }
+        }
+
+        VerticalLayout {
+            spacing: 0px;
+            horizontal-stretch: 1;
+
+            Rectangle {
+                height: max(58px, Metrics.control-large + 2 * Metrics.space-2);
+                vertical-stretch: 0;
+                background: DesignTokens.surface-pane;
+                border-width: 1px;
+                border-color: DesignTokens.border-default;
+
+                HorizontalLayout {
+                    padding-left: Metrics.space-4;
+                    padding-right: Metrics.space-4;
+                    spacing: Metrics.space-3;
+                    alignment: center;
+
+                    Text {
+                        text: root.selected-screen == 0
+                            ? "Focus"
+                            : (root.selected-screen == 1
+                                ? "Workspaces"
+                                : (root.selected-screen == 2
+                                    ? "Runs"
+                                    : (root.selected-screen == 3
+                                        ? "Schedules"
+                                        : (root.selected-screen == 4
+                                            ? "Deliverables"
+                                            : (root.selected-screen == 5
+                                                ? "Extensions"
+                                                : (root.selected-screen == 6
+                                                    ? "Settings"
+                                                    : (root.selected-screen == 7
+                                                        ? "Session workspace"
+                                                        : (root.selected-screen == 8 ? "Update" : "Diagnostics"))))))));
+                        color: DesignTokens.text-primary;
+                        font-size: Metrics.type-title;
+                        font-weight: 800;
+                        accessible-role: text;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    ToolbarIconButton {
+                        glyph: "P";
+                        accessible-name: "Open command palette, F1";
+                        checked: root.palette-open;
+                        checkable: true;
+                        clicked => { root.palette-toggle-requested(); }
+                    }
+                    ToolbarIconButton {
+                        glyph: "?";
+                        accessible-name: "Help and keyboard shortcuts";
+                        clicked => {
+                            root.settings-section-requested(5);
+                            root.navigate-requested(6);
+                        }
+                    }
+                }
+            }
+
+            if (root.selected-screen == 0) : FocusScreen {
+                runs: root.runs;
+                open-session-requested(index) => { root.open-session-requested(index); }
+            }
+            if (root.selected-screen == 1) : WorkspacesScreen {
+                workspaces: root.workspaces;
+                open-workspace-requested(index) => { root.open-workspace-requested(index); }
+            }
+            if (root.selected-screen == 2) : RunsScreen {
+                runs: root.runs;
+                page-label: root.run-page-label;
+                can-previous: root.can-previous-run-page;
+                can-next: root.can-next-run-page;
+                open-session-requested(index) => { root.open-session-requested(index); }
+                previous-requested => { root.previous-run-page-requested(); }
+                next-requested => { root.next-run-page-requested(); }
+            }
+            if (root.selected-screen == 3) : SchedulesScreen {
+                schedules: root.schedules;
+                create-requested => { root.schedule-create-requested(); }
+                toggled(index) => { root.schedule-toggled(index); }
+            }
+            if (root.selected-screen == 4) : DeliverablesScreen {
+                deliverables: root.deliverables;
+                selected-index: root.selected-deliverable-index;
+                selected-name: root.selected-deliverable-name;
+                selected-kind: root.selected-deliverable-kind;
+                selected-source: root.selected-deliverable-source;
+                selected-size: root.selected-deliverable-size;
+                selected-content: root.selected-deliverable-content;
+                selected-pinned: root.selected-deliverable-pinned;
+                selected(index) => { root.deliverable-selected(index); }
+                pin-toggle-requested => { root.deliverable-pin-toggle-requested(); }
+            }
+            if (root.selected-screen == 5) : ExtensionsScreen {
+                extensions: root.extensions;
+                toggled(index) => { root.extension-toggled(index); }
+            }
+            if (root.selected-screen == 6) : SettingsScreen {
+                selected-section: root.selected-settings-section;
+                section-requested(index) => { root.settings-section-requested(index); }
+                disconnect-requested => { root.disconnect-requested(); }
+                update-requested => { root.update-requested(); }
+                diagnostics-requested => { root.diagnostics-requested(); }
+            }
+            if (root.selected-screen == 7) : SessionScreen {
+                transcript: root.transcript;
+                activity: root.activity;
+                diff-lines: root.diff-lines;
+                files: root.session-files;
+                selected-file-index: root.selected-file-index;
+                selected-file-name: root.selected-file-name;
+                diff-mode: root.diff-mode;
+                narrow: root.available-width < 1040px;
+                session-title: root.session-title;
+                session-state: root.session-state;
+                session-detail: root.session-detail;
+                session-tone: root.session-tone;
+                can-approve: root.can-approve;
+                can-answer: root.can-answer;
+                approval-prompt: root.approval-prompt;
+                approval-scope: root.approval-scope;
+                question: root.question;
+                back-requested => { root.back-requested(); }
+                diff-mode-requested(mode) => { root.diff-mode-requested(mode); }
+                approval-requested(approved) => { root.approval-requested(approved); }
+                answer-requested(answer) => { root.answer-requested(answer); }
+                message-submitted(message) => { root.message-submitted(message); }
+                file-selected(index) => { root.file-selected(index); }
+            }
+            if (root.selected-screen == 8) : UpdateScreen { back-requested => { root.back-requested(); } }
+            if (root.selected-screen == 9) : DiagnosticsScreen { back-requested => { root.back-requested(); } }
+        }
+    }
+
+    if (root.palette-open) : CommandPalette {
+        dismiss-requested => { root.palette-dismiss-requested(); }
+        navigate-requested(index) => { root.navigate-requested(index); }
+    }
+}

@@ -2,14 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+use crate::ConfigSnapshot;
 use crate::error::ConfigError;
 use crate::model::SecretRef;
-use crate::wire::{
-    AdminWire, AuthWire, ChannelsWire, CopilotWire, CoreWire, DeviceAuthWire, EnvelopeWire,
-    GithubAuthWire, LegacyWire, LogLevelWire, LoggingWire, NetworkWire, RoleWire, ServerWire,
-    SessionsWire, UpdatesWire,
-};
-use crate::{CONFIG_SCHEMA_VERSION, ConfigSnapshot};
+use crate::wire::{EnvelopeWire, LogLevelWire};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LegacyMappingContract {
@@ -126,12 +122,31 @@ pub fn migrate_legacy_environment<'a>(
     variables: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<MigrationResult, MigrationError> {
     let variables = collect_variables(variables)?;
-    let mut wire = default_envelope();
+    migrate_collected(&variables)
+}
+
+fn migrate_collected(
+    variables: &BTreeMap<String, String>,
+) -> Result<MigrationResult, MigrationError> {
+    let (wire, diagnostics) = apply_mappings(variables, default_envelope(), true)?;
+    let config = wire.validate().map_err(MigrationError::Config)?;
+    Ok(MigrationResult {
+        config,
+        diagnostics,
+    })
+}
+
+fn apply_mappings(
+    variables: &BTreeMap<String, String>,
+    mut wire: EnvelopeWire,
+    infer_device_from_existing_client: bool,
+) -> Result<(EnvelopeWire, Vec<MigrationDiagnostic>), MigrationError> {
     let mut diagnostics = Vec::new();
     let mut explicit_device_flow = false;
+    let mut explicit_device_client_id = false;
 
     for mapping in LEGACY_MAPPINGS {
-        let selected = select_value(mapping, &variables)?;
+        let selected = select_value(mapping, variables)?;
         let Some((name, value)) = selected else {
             continue;
         };
@@ -143,6 +158,7 @@ pub fn migrate_legacy_environment<'a>(
                     reason: manual_reason(mapping),
                 }));
             }
+
             continue;
         }
 
@@ -155,6 +171,7 @@ pub fn migrate_legacy_environment<'a>(
                 wire.core.auth.github.device.enabled = parse_bool(mapping, value)?;
             }
             MappingId::GithubClientId => {
+                explicit_device_client_id = true;
                 wire.core.auth.github.device.client_id = trimmed_optional(value);
             }
             MappingId::Microsoftappid => {
@@ -282,15 +299,19 @@ pub fn migrate_legacy_environment<'a>(
         }
     }
 
-    if !explicit_device_flow {
+    if !explicit_device_flow && (infer_device_from_existing_client || explicit_device_client_id) {
         wire.core.auth.github.device.enabled = wire.core.auth.github.device.client_id.is_some();
     }
 
-    let config = wire.validate().map_err(MigrationError::Config)?;
-    Ok(MigrationResult {
-        config,
-        diagnostics,
-    })
+    Ok((wire, diagnostics))
+}
+
+pub(crate) fn apply_legacy_environment_layer<'a>(
+    base: EnvelopeWire,
+    variables: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<EnvelopeWire, MigrationError> {
+    let variables = collect_variables(variables)?;
+    apply_mappings(&variables, base, false).map(|(wire, _)| wire)
 }
 
 fn collect_variables<'a>(
@@ -374,24 +395,7 @@ fn parse_u64(
     minimum: u64,
     maximum: Option<u64>,
 ) -> Result<u64, MigrationError> {
-    let parsed = match parse_integer_prefix(value) {
-        IntegerPrefix::Parsed(value) => value,
-        IntegerPrefix::Missing => {
-            return Err(invalid(mapping, "must start with a base-10 integer"));
-        }
-        IntegerPrefix::Overflow => {
-            return Err(invalid(mapping, "integer prefix is too large to represent"));
-        }
-    };
-    let parsed = u64::try_from(parsed).map_err(|_| invalid(mapping, "must not be negative"))?;
-    if parsed < minimum || maximum.is_some_and(|maximum| parsed > maximum) {
-        let requirement = maximum.map_or_else(
-            || format!("must be at least {minimum}"),
-            |maximum| format!("must be from {minimum} through {maximum}"),
-        );
-        return Err(invalid(mapping, requirement));
-    }
-    Ok(parsed)
+    parse_legacy_integer(value, minimum, maximum).map_err(|message| invalid(mapping, message))
 }
 
 enum IntegerPrefix {
@@ -415,6 +419,28 @@ fn parse_integer_prefix(value: &str) -> IntegerPrefix {
         Ok(value) => IntegerPrefix::Parsed(value),
         Err(_) => IntegerPrefix::Overflow,
     }
+}
+
+pub(crate) fn parse_legacy_integer(
+    value: &str,
+    minimum: u64,
+    maximum: Option<u64>,
+) -> Result<u64, String> {
+    let parsed = match parse_integer_prefix(value) {
+        IntegerPrefix::Parsed(value) => value,
+        IntegerPrefix::Missing => return Err("must start with a base-10 integer".to_owned()),
+        IntegerPrefix::Overflow => {
+            return Err("integer prefix is too large to represent".to_owned());
+        }
+    };
+    let parsed = u64::try_from(parsed).map_err(|_| "must not be negative".to_owned())?;
+    if parsed < minimum || maximum.is_some_and(|maximum| parsed > maximum) {
+        return Err(maximum.map_or_else(
+            || format!("must be at least {minimum}"),
+            |maximum| format!("must be from {minimum} through {maximum}"),
+        ));
+    }
+    Ok(parsed)
 }
 
 fn parse_log_level(
@@ -497,25 +523,5 @@ fn invalid(mapping: &LegacyMappingContract, message: impl Into<String>) -> Migra
 }
 
 fn default_envelope() -> EnvelopeWire {
-    EnvelopeWire {
-        schema_version: CONFIG_SCHEMA_VERSION,
-        core: CoreWire {
-            auth: AuthWire {
-                github: GithubAuthWire {
-                    pat: None,
-                    device: DeviceAuthWire::default(),
-                },
-            },
-            role: RoleWire::default(),
-            channels: ChannelsWire::default(),
-            server: ServerWire::default(),
-            logging: LoggingWire::default(),
-            sessions: SessionsWire::default(),
-            copilot: CopilotWire::default(),
-            legacy: LegacyWire::default(),
-            updates: UpdatesWire::default(),
-            admin: AdminWire::default(),
-            network: NetworkWire::default(),
-        },
-    }
+    EnvelopeWire::default()
 }

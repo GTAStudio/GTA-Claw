@@ -11,6 +11,7 @@ use claw_gateway_client::{
     ConfigurationError, ConnectionInfo, ConnectionState, GatewayClientError, ProtocolFailure,
     TransportFailure,
 };
+use claw_protocol::gateway::ConnectErrorDetailCode;
 use secrecy::SecretString;
 use url::{Host, Url};
 
@@ -354,14 +355,9 @@ impl UserError {
                 Self::from_configuration(*configuration)
             }
             GatewayClientError::Transport(transport) => Self::from_transport(*transport),
-            GatewayClientError::Authentication(failure) => Self::new(
-                "The Gateway rejected this device.",
-                if failure.device_retry_recommended() {
-                    "The server asked for a fresh device token. Reconnect to request one."
-                } else {
-                    "Check the token, then try again."
-                },
-            ),
+            GatewayClientError::Authentication(failure) => {
+                Self::from_authentication(failure.detail_code(), failure.device_retry_recommended())
+            }
             GatewayClientError::Protocol(protocol) => Self::from_protocol(protocol),
             GatewayClientError::Backpressure(_) => Self::new(
                 "The app is sending faster than this connection allows.",
@@ -390,6 +386,136 @@ impl UserError {
             GatewayClientError::ReconnectExhausted => Self::new(
                 "Reconnect attempts ran out.",
                 "Check the network and the Gateway address, then connect again.",
+            ),
+        }
+    }
+
+    /// Translates a rejected handshake into a remedy the operator can act on.
+    ///
+    /// Taken as the two accessors of `AuthenticationFailure` rather than the
+    /// failure itself: that type has no public constructor, so this is the only
+    /// shape in which the mapping can be tested at all.
+    ///
+    /// The structured detail code wins over `device_retry_recommended` whenever
+    /// the server supplied one. A server may recommend a device-token retry
+    /// alongside, say, a Tailscale rejection, and following that advice would
+    /// loop forever — the specific reason is always the more useful one.
+    ///
+    /// The match is deliberately exhaustive. `ConnectErrorDetailCode` mirrors a
+    /// frozen upstream registry; if it ever grows a variant this crate stops
+    /// compiling instead of quietly giving an operator advice invented for a
+    /// different failure.
+    #[must_use]
+    pub fn from_authentication(
+        detail: Option<ConnectErrorDetailCode>,
+        device_retry_recommended: bool,
+    ) -> Self {
+        let Some(detail) = detail else {
+            return if device_retry_recommended {
+                Self::new(
+                    "The Gateway rejected this device.",
+                    "The server asked for a fresh device token. Reconnect to request one.",
+                )
+            } else {
+                Self::new(
+                    "The Gateway rejected this device.",
+                    "Check the token, then try again.",
+                )
+            };
+        };
+
+        match detail {
+            // Tailscale identity cannot be produced by this client on Android.
+            // Telling the operator to check the token would send them around a
+            // loop that cannot terminate, so the platform limit is stated.
+            ConnectErrorDetailCode::AuthTailscaleIdentityMissing
+            | ConnectErrorDetailCode::AuthTailscaleProxyMissing
+            | ConnectErrorDetailCode::AuthTailscaleWhoisFailed
+            | ConnectErrorDetailCode::AuthTailscaleIdentityMismatch => Self::new(
+                "This Gateway authenticates callers through Tailscale.",
+                "This Android build cannot present a Tailscale identity, so it cannot connect to \
+                 this server. Use a Gateway that accepts token or device authentication.",
+            ),
+            ConnectErrorDetailCode::PairingRequired => Self::new(
+                "This Gateway requires the device to be paired first.",
+                "This build has no pairing screen, so the pairing has to be completed from \
+                 another client before this device can connect.",
+            ),
+            ConnectErrorDetailCode::AuthRateLimited => Self::new(
+                "The Gateway is rate limiting authentication attempts.",
+                "Wait before trying again. Repeated attempts usually extend the limit.",
+            ),
+            ConnectErrorDetailCode::AuthRequired | ConnectErrorDetailCode::AuthTokenMissing => {
+                Self::new(
+                    "This Gateway requires a token and none was sent.",
+                    "Enter the Gateway token, then connect again.",
+                )
+            }
+            ConnectErrorDetailCode::AuthTokenMismatch
+            | ConnectErrorDetailCode::AuthBootstrapTokenInvalid => Self::new(
+                "The Gateway did not accept this token.",
+                "Check the token for a typo or an expiry, then connect again.",
+            ),
+            ConnectErrorDetailCode::AuthTokenNotConfigured => Self::new(
+                "This Gateway is not configured to accept tokens.",
+                "Ask whoever runs the Gateway which authentication it expects.",
+            ),
+            ConnectErrorDetailCode::AuthPasswordMissing
+            | ConnectErrorDetailCode::AuthPasswordMismatch
+            | ConnectErrorDetailCode::AuthPasswordNotConfigured => Self::new(
+                "This Gateway expects password authentication.",
+                "This build only sends a token, so it cannot authenticate here. Use a Gateway \
+                 that accepts token or device authentication.",
+            ),
+            ConnectErrorDetailCode::AuthScopeMismatch => Self::new(
+                "The Gateway would not grant the permissions this app asked for.",
+                "This app requests read-only operator access. Ask for that grant on the Gateway, \
+                 then connect again.",
+            ),
+            ConnectErrorDetailCode::AuthDeviceTokenMismatch => Self::new(
+                "The Gateway did not recognise this device's token.",
+                if device_retry_recommended {
+                    "The server asked for a fresh device token. Reconnect to request one."
+                } else {
+                    "The device registration may have been revoked. Re-register it on the \
+                     Gateway, then connect again."
+                },
+            ),
+            // This client creates a new identity every launch, so a rejected or
+            // unknown identity is expected rather than a corruption to repair.
+            ConnectErrorDetailCode::DeviceIdentityRequired
+            | ConnectErrorDetailCode::ControlUiDeviceIdentityRequired
+            | ConnectErrorDetailCode::DeviceAuthInvalid
+            | ConnectErrorDetailCode::DeviceAuthDeviceIdMismatch
+            | ConnectErrorDetailCode::DeviceAuthPublicKeyInvalid
+            | ConnectErrorDetailCode::DeviceAuthSignatureInvalid => Self::new(
+                "The Gateway rejected this device's identity.",
+                "This app generates a new identity each time it starts, so a Gateway that only \
+                 admits known devices will refuse it until this one is registered.",
+            ),
+            ConnectErrorDetailCode::DeviceAuthSignatureExpired => Self::new(
+                "The Gateway judged this device's signature to be out of date.",
+                "Check that the phone's clock and time zone are correct, then connect again.",
+            ),
+            ConnectErrorDetailCode::DeviceAuthNonceRequired
+            | ConnectErrorDetailCode::DeviceAuthNonceMismatch => Self::new(
+                "The Gateway's authentication challenge did not match the reply.",
+                "Connect again to start a fresh challenge.",
+            ),
+            ConnectErrorDetailCode::ProtocolMismatch
+            | ConnectErrorDetailCode::ClientVersionMismatch => Self::new(
+                "This app and the Gateway do not speak a common protocol version.",
+                "Update whichever of the app and the Gateway is older.",
+            ),
+            // Emitted for browser Control UI callers. This client is not one, so
+            // seeing it means the Gateway took us for something we are not.
+            ConnectErrorDetailCode::ControlUiOriginNotAllowed => Self::new(
+                "The Gateway answered as though this app were a web page.",
+                "Check that the address points at a Gateway endpoint and not at a Control UI one.",
+            ),
+            ConnectErrorDetailCode::AuthUnauthorized => Self::new(
+                "The Gateway refused this connection.",
+                "Check the token and that this device is allowed to connect, then try again.",
             ),
         }
     }
@@ -854,12 +980,60 @@ mod tests {
     use std::sync::Arc;
 
     use claw_gateway_client::{ConnectionInfo, ConnectionState};
-    use claw_protocol::gateway::ProtocolVersion;
+    use claw_protocol::gateway::{ConnectErrorDetailCode, ProtocolVersion};
 
     use super::{
         AttemptUpdate, ConnectRequest, ReadySummary, StatusKind, SubmissionRejection,
         TransportPosture, UserError, ViewModel,
     };
+
+    /// Every detail code the frozen registry can carry.
+    ///
+    /// Listed by hand so that adding a variant upstream fails the exhaustive
+    /// match in `from_authentication` *and* leaves this list visibly short.
+    const ALL_DETAIL_CODES: &[ConnectErrorDetailCode] = &[
+        ConnectErrorDetailCode::AuthRequired,
+        ConnectErrorDetailCode::AuthUnauthorized,
+        ConnectErrorDetailCode::AuthTokenMissing,
+        ConnectErrorDetailCode::AuthTokenMismatch,
+        ConnectErrorDetailCode::AuthTokenNotConfigured,
+        ConnectErrorDetailCode::AuthPasswordMissing,
+        ConnectErrorDetailCode::AuthPasswordMismatch,
+        ConnectErrorDetailCode::AuthPasswordNotConfigured,
+        ConnectErrorDetailCode::AuthBootstrapTokenInvalid,
+        ConnectErrorDetailCode::AuthDeviceTokenMismatch,
+        ConnectErrorDetailCode::AuthScopeMismatch,
+        ConnectErrorDetailCode::AuthRateLimited,
+        ConnectErrorDetailCode::AuthTailscaleIdentityMissing,
+        ConnectErrorDetailCode::AuthTailscaleProxyMissing,
+        ConnectErrorDetailCode::AuthTailscaleWhoisFailed,
+        ConnectErrorDetailCode::AuthTailscaleIdentityMismatch,
+        ConnectErrorDetailCode::ControlUiOriginNotAllowed,
+        ConnectErrorDetailCode::ProtocolMismatch,
+        ConnectErrorDetailCode::ControlUiDeviceIdentityRequired,
+        ConnectErrorDetailCode::DeviceIdentityRequired,
+        ConnectErrorDetailCode::DeviceAuthInvalid,
+        ConnectErrorDetailCode::DeviceAuthDeviceIdMismatch,
+        ConnectErrorDetailCode::DeviceAuthSignatureExpired,
+        ConnectErrorDetailCode::DeviceAuthNonceRequired,
+        ConnectErrorDetailCode::DeviceAuthNonceMismatch,
+        ConnectErrorDetailCode::DeviceAuthSignatureInvalid,
+        ConnectErrorDetailCode::DeviceAuthPublicKeyInvalid,
+        ConnectErrorDetailCode::PairingRequired,
+        ConnectErrorDetailCode::ClientVersionMismatch,
+    ];
+
+    /// Codes describing something this Android build structurally cannot do.
+    const UNSUPPORTABLE_ON_ANDROID: &[ConnectErrorDetailCode] = &[
+        ConnectErrorDetailCode::AuthTailscaleIdentityMissing,
+        ConnectErrorDetailCode::AuthTailscaleProxyMissing,
+        ConnectErrorDetailCode::AuthTailscaleWhoisFailed,
+        ConnectErrorDetailCode::AuthTailscaleIdentityMismatch,
+        ConnectErrorDetailCode::PairingRequired,
+        ConnectErrorDetailCode::AuthPasswordMissing,
+        ConnectErrorDetailCode::AuthPasswordMismatch,
+        ConnectErrorDetailCode::AuthPasswordNotConfigured,
+    ];
 
     fn ready_info(role: &str, scopes: &[&str]) -> ConnectionInfo {
         ConnectionInfo {
@@ -1326,5 +1500,101 @@ mod tests {
             64 * 1024,
             "the summary must copy the payload cap, got {summary:?}"
         );
+    }
+    #[test]
+    fn a_tailscale_rejection_states_the_platform_limit_instead_of_blaming_the_token() {
+        for code in UNSUPPORTABLE_ON_ANDROID {
+            let error = UserError::from_authentication(Some(*code), false);
+            let action = error.action().to_lowercase();
+
+            assert!(
+                !action.contains("check the token"),
+                "{code:?} cannot be fixed by checking the token, but the advice was {:?}",
+                error.action()
+            );
+            assert!(
+                !action.contains("try again") && !action.contains("connect again"),
+                "{code:?} is not fixable on this platform, so retrying is not advice; got {:?}",
+                error.action()
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_recommended_device_retry_cannot_override_an_unfixable_reason() {
+        // A Gateway may set the device-retry hint alongside a Tailscale
+        // rejection. Following it would loop forever.
+        let error = UserError::from_authentication(
+            Some(ConnectErrorDetailCode::AuthTailscaleProxyMissing),
+            true,
+        );
+
+        assert!(
+            !error.action().contains("fresh device token"),
+            "a device-token retry cannot satisfy Tailscale, but the advice was {:?}",
+            error.action()
+        );
+    }
+
+    #[test]
+    fn rate_limiting_is_not_answered_with_retry_now() {
+        let error =
+            UserError::from_authentication(Some(ConnectErrorDetailCode::AuthRateLimited), false);
+        let action = error.action().to_lowercase();
+
+        assert!(
+            action.contains("wait"),
+            "rate limiting must advise waiting, got {:?}",
+            error.action()
+        );
+    }
+
+    #[test]
+    fn every_detail_code_produces_a_non_empty_remedy() {
+        for code in ALL_DETAIL_CODES {
+            let error = UserError::from_authentication(Some(*code), false);
+
+            assert!(
+                !error.message().trim().is_empty(),
+                "{code:?} produced an empty message"
+            );
+            assert!(
+                !error.action().trim().is_empty(),
+                "{code:?} produced an empty action"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_detail_code_still_honours_the_device_retry_hint() {
+        let hinted = UserError::from_authentication(None, true);
+        let plain = UserError::from_authentication(None, false);
+
+        assert!(
+            hinted.action().contains("fresh device token"),
+            "the server hint must reach the operator, got {:?}",
+            hinted.action()
+        );
+        assert_ne!(
+            hinted.action(),
+            plain.action(),
+            "the hint must change the advice, but both said {:?}",
+            plain.action()
+        );
+    }
+
+    #[test]
+    fn no_remedy_reproduces_a_credential() {
+        for code in ALL_DETAIL_CODES {
+            let error = UserError::from_authentication(Some(*code), true);
+            let rendered = format!("{} {} {error:?}", error.message(), error.action());
+
+            for secret in ["hunter2", "wss://", "Bearer "] {
+                assert!(
+                    !rendered.contains(secret),
+                    "{code:?} rendered {secret:?} into operator-facing text: {rendered}"
+                );
+            }
+        }
     }
 }
