@@ -63,7 +63,7 @@ $ExpectedReachabilityCorpusAccepting = 15
 # Frozen exactly like the schema and corpus digests: -WriteLedgerDigests cannot
 # reach this constant, so re-blessing a hollowed-out self-test takes a reviewed
 # edit to this line.
-$ExpectedSelfTestDigest = "bd96e4bc02328b0641587a9cccf4d4228cd715454a78041bbc681f99fd818b58"
+$ExpectedSelfTestDigest = "0da69d4ad9266c7a5cb4516dbf7fd95a4f0c7f0f82f6844bea44116a06956d96"
 $LedgerDigestFileName = "ledger-digests.sha256"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
