@@ -485,10 +485,22 @@ impl ServerConfig {
         self.port
     }
 
+    /// Returns the validated per-minute request budget.
+    #[must_use]
+    pub const fn teams_rate_limit_per_minute(&self) -> u32 {
+        self.teams_rate_limit_per_minute
+    }
+
     /// Returns the externally advertised domain.
     #[must_use]
     pub fn public_domain(&self) -> &str {
         &self.public_domain
+    }
+
+    /// Reports whether forwarding headers from a fronting proxy are trusted.
+    #[must_use]
+    pub const fn trust_proxy(&self) -> bool {
+        self.trust_proxy
     }
 }
 
