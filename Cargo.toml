@@ -1,33 +1,61 @@
 [workspace]
 members = [
+  "apps/gta-claw-android",
   "apps/gta-claw-cli",
   "apps/gta-claw-daemon",
+  "apps/gta-claw-ios",
   "crates/claw-application",
+  "crates/claw-channel-sdk",
+  "crates/claw-channels",
+  "crates/claw-clients",
   "crates/claw-config",
   "crates/claw-conformance",
+  "crates/claw-crestodian",
   "crates/claw-domain",
   "crates/claw-gateway",
   "crates/claw-gateway-client",
+  "crates/claw-http-api",
+  "crates/claw-memory",
   "crates/claw-observability",
   "crates/claw-platform",
+  "crates/claw-plugin-api",
+  "crates/claw-plugin-host",
   "crates/claw-protocol",
+  "crates/claw-provider-sdk",
+  "crates/claw-providers",
+  "crates/claw-relay",
   "crates/claw-repo-policy",
   "crates/claw-security",
+  "crates/claw-skills",
+  "crates/claw-tools",
 ]
-exclude = ["desktop"]
+exclude = ["android", "desktop", "ios"]
 resolver = "3"
 
 [workspace.dependencies]
 claw-application = { path = "crates/claw-application", version = "0.1.0" }
-claw-conformance = { path = "crates/claw-conformance", version = "0.1.0" }
+claw-channel-sdk = { path = "crates/claw-channel-sdk", version = "0.1.0" }
+claw-channels = { path = "crates/claw-channels", version = "0.1.0" }
+claw-clients = { path = "crates/claw-clients", version = "0.1.0" }
 claw-config = { path = "crates/claw-config", version = "0.1.0" }
+claw-conformance = { path = "crates/claw-conformance", version = "0.1.0" }
+claw-crestodian = { path = "crates/claw-crestodian", version = "0.1.0" }
 claw-domain = { path = "crates/claw-domain", version = "0.1.0" }
 claw-gateway = { path = "crates/claw-gateway", version = "0.1.0" }
 claw-gateway-client = { path = "crates/claw-gateway-client", version = "0.1.0" }
+claw-http-api = { path = "crates/claw-http-api", version = "0.1.0" }
+claw-memory = { path = "crates/claw-memory", version = "0.1.0" }
 claw-observability = { path = "crates/claw-observability", version = "0.1.0" }
 claw-platform = { path = "crates/claw-platform", version = "0.1.0" }
+claw-plugin-api = { path = "crates/claw-plugin-api", version = "0.1.0" }
+claw-plugin-host = { path = "crates/claw-plugin-host", version = "0.1.0" }
 claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
+claw-provider-sdk = { path = "crates/claw-provider-sdk", version = "0.1.0" }
+claw-providers = { path = "crates/claw-providers", version = "0.1.0" }
+claw-relay = { path = "crates/claw-relay", version = "0.1.0" }
 claw-security = { path = "crates/claw-security", version = "0.1.0" }
+claw-skills = { path = "crates/claw-skills", version = "0.1.0" }
+claw-tools = { path = "crates/claw-tools", version = "0.1.0" }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.150", features = ["raw_value"] }
 serde_path_to_error = "=0.1.20"

@@ -33,11 +33,16 @@ pub struct TreeFile {
     pub size: u64,
 }
 
+#[cfg(windows)]
+fn has_reparse_attribute(attributes: u32) -> bool {
+    attributes & 0x400 != 0
+}
+
 fn is_reparse(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
-        metadata.file_attributes() & 0x400 != 0
+        has_reparse_attribute(metadata.file_attributes())
     }
     #[cfg(not(windows))]
     {
@@ -46,7 +51,7 @@ fn is_reparse(metadata: &fs::Metadata) -> bool {
     }
 }
 
-fn require_plain(metadata: &fs::Metadata, path: &Path) -> PolicyResult<()> {
+pub(crate) fn require_plain(metadata: &fs::Metadata, path: &Path) -> PolicyResult<()> {
     if metadata.file_type().is_symlink() || is_reparse(metadata) {
         return Err(PolicyError::new(format!(
             "candidate path is a symlink or reparse point: {}",
@@ -54,6 +59,22 @@ fn require_plain(metadata: &fs::Metadata, path: &Path) -> PolicyResult<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::has_reparse_attribute;
+
+    #[test]
+    fn windows_reparse_attribute_is_rejected_even_for_regular_files() {
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+        assert!(!has_reparse_attribute(FILE_ATTRIBUTE_NORMAL));
+        assert!(has_reparse_attribute(
+            FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_REPARSE_POINT
+        ));
+    }
 }
 
 fn validate_relative(relative: &Path) -> PolicyResult<()> {

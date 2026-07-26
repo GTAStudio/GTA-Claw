@@ -219,6 +219,7 @@ export component NavigationItem {
     in property <string> glyph: "G";
     in property <string> text: "Destination";
     in property <string> detail: "";
+    in property <string> accessible-name: root.detail == "" ? root.text : root.text + ", " + root.detail;
     in property <bool> selected: false;
     in property <bool> enabled: true;
     callback clicked;
@@ -227,7 +228,7 @@ export component NavigationItem {
     forward-focus: interaction;
 
     accessible-role: button;
-    accessible-label: root.detail == "" ? root.text : root.text + ", " + root.detail;
+    accessible-label: root.accessible-name;
     accessible-enabled: root.enabled;
     accessible-checkable: true;
     accessible-checked: root.selected;
@@ -622,6 +623,7 @@ export component ComposerShell {
                 accepted => {
                     if (root.enabled && root.text != "") {
                         root.submitted(root.text);
+                        root.text = "";
                     }
                 }
             }
@@ -630,7 +632,10 @@ export component ComposerShell {
                 text: root.submit-label;
                 accessible-name: root.submit-label + " message";
                 enabled: root.enabled && root.text != "";
-                clicked => { root.submitted(root.text); }
+                clicked => {
+                    root.submitted(root.text);
+                    root.text = "";
+                }
             }
         }
     }
