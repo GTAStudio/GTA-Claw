@@ -15,6 +15,7 @@ mod mcp;
 mod openai;
 mod ports;
 mod probes;
+mod rate_limit;
 mod state;
 mod tools;
 mod watch;
@@ -46,6 +47,7 @@ pub use ports::{
 pub use watch::WatchNodeHandle;
 
 use crate::auth::{AuthMiddlewareState, require_bearer};
+use crate::rate_limit::RateLimiter;
 use crate::state::ApiState;
 
 macro_rules! method_router {
@@ -141,6 +143,7 @@ impl HttpApi {
             limits: config.limits.clone(),
         };
         let cors_origins = config.cors_origins.clone();
+        let rate_limiter = config.rate_limit_per_minute.map(RateLimiter::new);
         let state = ApiState::new(config, services);
         let (router, protected, mcp_router) = http_api_endpoints!(build_route_groups);
         let protected = protected.layer(middleware::from_fn_with_state(auth_state, require_bearer));
@@ -163,8 +166,19 @@ impl HttpApi {
         } else {
             cors
         };
+        let mut router = router.merge(protected);
+        let mut mcp_router = mcp_router;
+        if let Some(rate_limiter) = rate_limiter {
+            router = router.layer(middleware::from_fn_with_state(
+                rate_limiter.clone(),
+                rate_limit::enforce,
+            ));
+            mcp_router = mcp_router.layer(middleware::from_fn_with_state(
+                rate_limiter,
+                rate_limit::enforce,
+            ));
+        }
         let router = router
-            .merge(protected)
             .layer(SetResponseHeaderLayer::if_not_present(
                 HeaderName::from_static("x-content-type-options"),
                 HeaderValue::from_static("nosniff"),

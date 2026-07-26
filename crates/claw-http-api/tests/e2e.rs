@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr};
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +19,7 @@ use http::HeaderValue;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
@@ -239,9 +241,35 @@ async fn request_at(
     extra_headers: &[(&str, &str)],
     body: &[u8],
 ) -> HttpResponse {
-    let mut stream = TcpStream::connect(address)
-        .await
-        .expect("connect test server");
+    request_at_from(address, None, method, path, token, extra_headers, body).await
+}
+
+async fn request_at_from(
+    address: SocketAddr,
+    source_ip: Option<IpAddr>,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    extra_headers: &[(&str, &str)],
+    body: &[u8],
+) -> HttpResponse {
+    let mut stream = if let Some(source_ip) = source_ip {
+        let socket = match source_ip {
+            IpAddr::V4(_) => TcpSocket::new_v4().expect("create IPv4 client socket"),
+            IpAddr::V6(_) => TcpSocket::new_v6().expect("create IPv6 client socket"),
+        };
+        socket
+            .bind(SocketAddr::new(source_ip, 0))
+            .expect("bind client source address");
+        socket
+            .connect(address)
+            .await
+            .expect("connect bound client socket")
+    } else {
+        TcpStream::connect(address)
+            .await
+            .expect("connect test server")
+    };
     let mut head = format!(
         "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n",
         address,
@@ -498,6 +526,110 @@ async fn probes_reflect_real_dependency_state_and_hide_details_without_auth() {
         "readiness details have exactly three fields"
     );
     assert!(detailed_json["uptimeMs"].as_u64().is_some());
+}
+
+#[tokio::test]
+async fn rate_limit_enforces_exact_contract_by_socket_peer_and_ignores_forwarding_headers() {
+    let runtime = DeterministicRuntime::new();
+    let mut rate_config = config();
+    rate_config.rate_limit_per_minute = NonZeroU32::new(2);
+    let server = spawn_with(rate_config, runtime).await;
+
+    let first = request(
+        &server,
+        "GET",
+        "/v1/models",
+        Some("operator-token"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(first.status, 200);
+    let second = request(
+        &server,
+        "GET",
+        "/v1/models",
+        Some("operator-token"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(second.status, 200);
+
+    let limited = request(
+        &server,
+        "GET",
+        "/v1/models",
+        Some("operator-token"),
+        &[("X-Forwarded-For", "203.0.113.40")],
+        b"",
+    )
+    .await;
+    assert_eq!(limited.status, 429);
+    assert_eq!(limited.body, br#"{"error":"Too many requests"}"#);
+    assert_eq!(
+        limited.headers.get("content-type").map(String::as_str),
+        Some("application/json; charset=utf-8")
+    );
+    assert_eq!(
+        limited.headers.get("content-length").map(String::as_str),
+        Some("29")
+    );
+    assert_eq!(
+        limited
+            .headers
+            .get("x-content-type-options")
+            .map(String::as_str),
+        Some("nosniff")
+    );
+    assert_eq!(
+        limited.headers.get("referrer-policy").map(String::as_str),
+        Some("no-referrer")
+    );
+    assert_eq!(
+        limited
+            .headers
+            .get("permissions-policy")
+            .map(String::as_str),
+        Some("camera=(), microphone=(self), geolocation=()")
+    );
+    assert!(!limited.headers.contains_key("retry-after"));
+
+    let isolated = request_at_from(
+        server.address,
+        Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
+        "GET",
+        "/v1/models",
+        Some("operator-token"),
+        &[("X-Forwarded-For", "203.0.113.40")],
+        b"",
+    )
+    .await;
+    assert_eq!(isolated.status, 200);
+
+    for path in ["/health", "/healthz", "/ready", "/readyz"] {
+        let probe = request(&server, "GET", path, None, &[], b"").await;
+        assert_eq!(probe.status, 200, "{path} must not consume the API budget");
+    }
+}
+
+#[tokio::test]
+async fn absent_rate_limit_is_explicitly_unlimited() {
+    let runtime = DeterministicRuntime::new();
+    let server = spawn_with(config(), runtime).await;
+
+    for _ in 0..4 {
+        let response = request(
+            &server,
+            "GET",
+            "/v1/models",
+            Some("operator-token"),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(response.status, 200);
+    }
 }
 
 #[tokio::test]
