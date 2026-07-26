@@ -4,9 +4,9 @@
 # row is accepted. Regenerate ONLY through the reviewed command, never by hand:
 #   powershell -NoProfile -File compat/upstream/validate.ps1 -ReplayEvidenceSweep
 # generated-by: validate.ps1 -ReplayEvidenceSweep
-# base-commit: 9e622280c2878dc3410db0ef966e70b23f691ef6
+# base-commit: 0c9c84b3baa33b7ee1bc6acec2407e57b1c52bb2
 # swept-at: 2026-07-26
-# totals: files=307 accept=302 reject=5
+# totals: files=332 accept=327 reject=5
 reject	.github/trusted/desktop-supply-chain-policy/policy/final/desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs
 accept	.github/trusted/desktop-supply-chain-policy/src/bootstrap_decisions.rs
 accept	.github/trusted/desktop-supply-chain-policy/src/changes.rs
@@ -60,6 +60,15 @@ accept	apps/gta-claw-tui/tests/rendering.rs
 accept	apps/gta-claw-updater/src/lib.rs
 accept	apps/gta-claw-updater/src/main.rs
 accept	apps/gta-claw-updater/tests/signed_update.rs
+accept	crates/claw-acp/src/acpx.rs
+accept	crates/claw-acp/src/bridge.rs
+accept	crates/claw-acp/src/debug_client.rs
+accept	crates/claw-acp/src/error.rs
+accept	crates/claw-acp/src/lib.rs
+accept	crates/claw-acp/src/protocol.rs
+accept	crates/claw-acp/tests/acpx_interop.rs
+accept	crates/claw-acp/tests/fixtures/acp_fixture.rs
+accept	crates/claw-acp/tests/subprocess_interop.rs
 accept	crates/claw-application/src/lib.rs
 accept	crates/claw-channel-sdk/src/lib.rs
 accept	crates/claw-channels/src/lib.rs
@@ -157,6 +166,22 @@ accept	crates/claw-http-api/src/tools.rs
 accept	crates/claw-http-api/src/watch.rs
 accept	crates/claw-http-api/src/webhooks.rs
 accept	crates/claw-http-api/tests/e2e.rs
+accept	crates/claw-mcp/src/client.rs
+accept	crates/claw-mcp/src/error.rs
+accept	crates/claw-mcp/src/framing.rs
+accept	crates/claw-mcp/src/http_client.rs
+accept	crates/claw-mcp/src/lib.rs
+accept	crates/claw-mcp/src/oauth.rs
+accept	crates/claw-mcp/src/projection.rs
+accept	crates/claw-mcp/src/registry.rs
+accept	crates/claw-mcp/src/secure_random.rs
+accept	crates/claw-mcp/src/server.rs
+accept	crates/claw-mcp/src/sse.rs
+accept	crates/claw-mcp/tests/fixtures/mcp_fixture.rs
+accept	crates/claw-mcp/tests/http_interop.rs
+accept	crates/claw-mcp/tests/registry_interop.rs
+accept	crates/claw-mcp/tests/sse_interop.rs
+accept	crates/claw-mcp/tests/stdio_interop.rs
 accept	crates/claw-memory/src/budget.rs
 accept	crates/claw-memory/src/context.rs
 accept	crates/claw-memory/src/lib.rs

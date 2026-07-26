@@ -73,7 +73,7 @@ $ExpectedReachabilityCorpusAccepting = 15
 # Frozen exactly like the schema and corpus digests: -WriteLedgerDigests cannot
 # reach this constant, so re-blessing a hollowed-out self-test takes a reviewed
 # edit to this line.
-$ExpectedSelfTestDigest = "fb0360904a1070588d08f95d7f41857014c7e96d5139440ce34817cd7f3aa660"
+$ExpectedSelfTestDigest = "ece2e6f87d4788f18cf2676db50dee75bb7ece5dc83ef4ac2083bc14df825e10"
 $LedgerDigestFileName = "ledger-digests.sha256"
 $EvidenceSweepFileName = "evidence-reachability-sweep.tsv"
 $EvidenceSweepHeaderKeys = @("generated-by", "base-commit", "swept-at", "totals")
@@ -82,7 +82,7 @@ $EvidenceSweepHeaderKeys = @("generated-by", "base-commit", "swept-at", "totals"
 # and fail under pwsh on Linux CI. -WriteLedgerDigests cannot reach this
 # constant; only -ReplayEvidenceSweep regenerates the record, and landing a new
 # record is a reviewed edit to this line.
-$ExpectedEvidenceSweepDigest = "bf954498a9fe5b48182c97800657bd6397d44bdae58404b57b7730e66d8558ca"
+$ExpectedEvidenceSweepDigest = "b4f5868ebc0070fdee57409bcb7497193c978d078bd4afaa70a6dd9cd7f493c6"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
     "# Only the three mutable ledgers are covered here; inventory digests, the feature",
