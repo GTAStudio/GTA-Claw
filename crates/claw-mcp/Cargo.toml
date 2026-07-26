@@ -1,0 +1,60 @@
+[package]
+name = "claw-mcp"
+description = "Pure-Rust Model Context Protocol interoperability for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+async-trait = "=0.1.91"
+base64 = "=0.22.1"
+bytes = "=1.12.1"
+claw-domain.workspace = true
+futures-util = { version = "=0.3.33", default-features = false, features = ["alloc", "std"] }
+http = "=1.4.0"
+http-body-util = "=0.1.4"
+hyper = { version = "=1.11.0", features = ["client", "http1"] }
+hyper-util = { version = "=0.1.20", features = ["client-legacy", "client-proxy", "http1", "tokio"] }
+httparse = "=1.10.1"
+rmcp = { version = "=2.2.0", default-features = false, features = [
+  "base64",
+  "client",
+  "server",
+  "transport-child-process",
+  "transport-io",
+  "transport-streamable-http-client",
+] }
+ring = "=0.17.14"
+rustls = { version = "=0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "=0.8.4"
+process-wrap = { version = "=9.1.0", default-features = false, features = [
+  "job-object",
+  "kill-on-drop",
+  "process-group",
+  "tokio1",
+] }
+secrecy = "=0.10.3"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sse-stream = "=0.2.5"
+thiserror = "=2.0.19"
+tokio = { version = "=1.52.3", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "=0.7.18", features = ["rt"] }
+tower-service = "=0.3.3"
+url = "=2.5.8"
+zeroize = "=1.9.0"
+
+[dev-dependencies]
+axum = "=0.8.9"
+
+[[bin]]
+name = "claw-mcp-fixture"
+path = "tests/fixtures/mcp_fixture.rs"
+
+[lints]
+workspace = true
