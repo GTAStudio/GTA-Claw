@@ -48,9 +48,9 @@ $ExpectedOracleCorpusTrue = 46
 # expectations were produced by running cargo and rustc against each fixture, so
 # neither resolver is normative for reachability and neither may edit a case to
 # match itself. -WriteLedgerDigests cannot reach these constants.
-$ExpectedReachabilityCorpusDigest = "08dd0269372fb8ef4d9e5fdfbcf5c58eca92ec4b8cce0b79536a4a06b25cbe5f"
-$ExpectedReachabilityCorpusCases = 27
-$ExpectedReachabilityCorpusAccepting = 13
+$ExpectedReachabilityCorpusDigest = "70aec3e02f3885970ec37d61421fdc34ea932e591842d6a1669adf0e1f4880dd"
+$ExpectedReachabilityCorpusCases = 32
+$ExpectedReachabilityCorpusAccepting = 15
 $LedgerDigestFileName = "ledger-digests.sha256"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
