@@ -2200,6 +2200,10 @@ struct ProcessIdentityGuard {
     lock_file: Option<File>,
 }
 
+const OPEN_FINISHED_PENDING: u8 = 0;
+const OPEN_FINISHED_BEFORE_DEADLINE: u8 = 1;
+const OPEN_FINISHED_AFTER_DEADLINE: u8 = 2;
+
 struct OpenDeadlineState {
     work_cutoff: std::time::Instant,
     deadline: std::time::Instant,
@@ -2208,7 +2212,8 @@ struct OpenDeadlineState {
     busy_timeout: Duration,
     expired: Arc<std::sync::atomic::AtomicBool>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
-    finished: std::sync::atomic::AtomicBool,
+    finished: std::sync::atomic::AtomicU8,
+    open_cleanup_retirement: std::sync::OnceLock<Arc<std::sync::atomic::AtomicU8>>,
     final_commit_state: std::sync::atomic::AtomicU8,
     open_cleanup_state: std::sync::atomic::AtomicU8,
 }
@@ -2288,7 +2293,7 @@ impl OpenDeadlineState {
                 .store(true, std::sync::atomic::Ordering::Release);
         }
 
-        self.finished.load(std::sync::atomic::Ordering::Acquire)
+        self.finished.load(std::sync::atomic::Ordering::Acquire) != OPEN_FINISHED_PENDING
             || (!self.cancelled.load(std::sync::atomic::Ordering::Acquire)
                 && !self.expired.load(std::sync::atomic::Ordering::Acquire))
     }
@@ -2297,6 +2302,47 @@ impl OpenDeadlineState {
         StateError::OperationTimedOut {
             operation: self.operation,
             timeout_ms: self.timeout_ms,
+        }
+    }
+
+    fn retained_open_cleanup_timeout_error(&self) -> StateError {
+        let _ = self.retain_open_cleanup();
+        StateError::OperationCleanupFailed {
+            operation: self.operation,
+            primary: Box::new(self.timeout_error()),
+            cleanup: "open cleanup lifecycle retained ownership beyond the absolute open deadline"
+                .to_owned(),
+        }
+    }
+
+    fn mark_finished(&self) {
+        let state = if std::time::Instant::now() < self.deadline {
+            OPEN_FINISHED_BEFORE_DEADLINE
+        } else {
+            OPEN_FINISHED_AFTER_DEADLINE
+        };
+        let _ = self.finished.compare_exchange(
+            OPEN_FINISHED_PENDING,
+            state,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+
+    fn completion_state(&self) -> u8 {
+        let state = self.finished.load(std::sync::atomic::Ordering::Acquire);
+        if state != OPEN_FINISHED_PENDING {
+            return state;
+        }
+        if self
+            .open_cleanup_retirement
+            .get()
+            .is_some_and(|signal| signal.load(std::sync::atomic::Ordering::Acquire) == 2)
+        {
+            self.mark_finished();
+            self.finished.load(std::sync::atomic::Ordering::Acquire)
+        } else {
+            OPEN_FINISHED_PENDING
         }
     }
 
@@ -2360,7 +2406,6 @@ struct UndeliveredStoreCleanup {
     store: Option<StateStore>,
     open_admission: Option<tokio::sync::SemaphorePermit<'static>>,
     deadline: tokio::time::Instant,
-    deadline_state: Arc<OpenDeadlineState>,
 }
 
 async fn release_undelivered_store_without_sql(mut store: StateStore) -> Result<(), StateError> {
@@ -2383,14 +2428,29 @@ fn handoff_undelivered_store(
     deadline: tokio::time::Instant,
     deadline_state: Arc<OpenDeadlineState>,
 ) -> Result<(), StateError> {
-    handoff_state_payload_decide(
+    let retirement = StateOwnerRetirementReceipt::new();
+    let retirement_signal = retirement.signal();
+    if deadline_state
+        .open_cleanup_retirement
+        .set(Arc::clone(&retirement_signal))
+        .is_err()
+    {
+        return Err(database(
+            "register undelivered state store cleanup",
+            sqlx::Error::Protocol(
+                "open cleanup retirement signal is already registered".to_owned(),
+            ),
+        ));
+    }
+    let handoff = handoff_state_payload_decide_with_signal(
         owner,
         std::sync::Mutex::new(UndeliveredStoreCleanup {
             store: Some(store),
             open_admission: Some(open_admission),
             deadline,
-            deadline_state,
         }),
+        NO_STATE_CLEANUP_RETENTION_SIGNAL,
+        Some(retirement_signal),
         |runtime, _, payload| {
             let mut payload = payload
                 .lock()
@@ -2407,7 +2467,6 @@ fn handoff_undelivered_store(
                 .store
                 .take()
                 .expect("undelivered store is consumed once");
-            let deadline_state = Arc::clone(&payload.deadline_state);
             let open_admission = payload
                 .open_admission
                 .take()
@@ -2415,15 +2474,13 @@ fn handoff_undelivered_store(
             drop(payload);
             let _open_admission = open_admission;
             let terminal = runtime.block_on(release_undelivered_store_without_sql(store));
-            deadline_state
-                .finished
-                .store(true, std::sync::atomic::Ordering::Release);
             let _cleanup_receipt = cleanup;
             let _terminal_receipt = terminal;
             true
         },
-    )
-    .map_err(|error| {
+    );
+    drop(retirement);
+    handoff.map_err(|error| {
         database(
             "handoff undelivered state store cleanup",
             sqlx::Error::Protocol(error),
@@ -2574,25 +2631,12 @@ async fn open_timeout_error(
     let terminal_result = match terminal_result {
         Ok(result) => result,
         Err(_) => {
-            if !deadline_state.retain_open_cleanup() {
-                return StateError::OperationCleanupFailed {
-                    operation: "state store open",
-                    primary: Box::new(primary),
-                    cleanup:
-                        "open cleanup lifecycle retained ownership beyond the absolute open deadline"
-                            .to_owned(),
-                };
-            }
             drop(terminal);
-            return primary;
+            return deadline_state.retained_open_cleanup_timeout_error();
         }
     };
     match terminal_result {
-        Ok(Ok(OpenLifecycleTerminal::Delivery(delivery))) => {
-            drop(delivery);
-            primary
-        }
-        Ok(Ok(OpenLifecycleTerminal::Cleaned)) => primary,
+        Ok(Ok(terminal)) => open_terminal_timeout_error(terminal, deadline, deadline_state).await,
         Ok(Err(cleanup)) => StateError::OperationCleanupFailed {
             operation: "state store open",
             primary: Box::new(primary),
@@ -2603,6 +2647,28 @@ async fn open_timeout_error(
             primary: Box::new(primary),
             cleanup: "open lifecycle actor stopped without a terminal receipt".to_owned(),
         },
+    }
+}
+
+async fn open_terminal_timeout_error(
+    terminal: OpenLifecycleTerminal,
+    deadline: tokio::time::Instant,
+    deadline_state: &OpenDeadlineState,
+) -> StateError {
+    drop(terminal);
+    loop {
+        match deadline_state.completion_state() {
+            OPEN_FINISHED_BEFORE_DEADLINE => return deadline_state.timeout_error(),
+            OPEN_FINISHED_AFTER_DEADLINE => {
+                return deadline_state.retained_open_cleanup_timeout_error();
+            }
+            OPEN_FINISHED_PENDING => {}
+            _ => return deadline_state.retained_open_cleanup_timeout_error(),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return deadline_state.retained_open_cleanup_timeout_error();
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -2875,7 +2941,8 @@ impl StateStore {
             busy_timeout: config.busy_timeout,
             expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            finished: std::sync::atomic::AtomicBool::new(false),
+            finished: std::sync::atomic::AtomicU8::new(OPEN_FINISHED_PENDING),
+            open_cleanup_retirement: std::sync::OnceLock::new(),
             final_commit_state: std::sync::atomic::AtomicU8::new(0),
             open_cleanup_state: std::sync::atomic::AtomicU8::new(0),
         });
@@ -2939,6 +3006,17 @@ impl StateStore {
         let mut cancellation_guard = OperationCancellationGuard::new(Arc::clone(&deadline_state));
         tokio::select! {
             ready = &mut ready_rx => {
+                if tokio::time::Instant::now() >= cancel_at {
+                    deadline_state
+                        .expired
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    deadline_state.cancel();
+                    drop(delivery_ack_tx.take());
+                    let error =
+                        open_timeout_error(terminal_rx, deadline, &deadline_state, timeout_ms).await;
+                    cancellation_guard.disarm();
+                    return Err(error);
+                }
                 match ready {
                     Ok(Err(error)) => Err(error),
                     Ok(Ok(())) => {
@@ -3024,13 +3102,15 @@ impl StateStore {
                                 .load(std::sync::atomic::Ordering::Acquire)
                             || tokio::time::Instant::now() >= deadline
                         {
-                            drop(delivery);
                             deadline_state
                                 .expired
                                 .store(true, std::sync::atomic::Ordering::Release);
                             deadline_state.cancel();
+                            let error =
+                                open_terminal_timeout_error(delivery, deadline, &deadline_state)
+                                    .await;
                             cancellation_guard.disarm();
-                            return Err(deadline_state.timeout_error());
+                            return Err(error);
                         }
                         let store = match delivery {
                             OpenLifecycleTerminal::Delivery(delivery) => delivery.accept(),
@@ -3043,9 +3123,7 @@ impl StateStore {
                                 ));
                             }
                         };
-                        deadline_state
-                            .finished
-                            .store(true, std::sync::atomic::Ordering::Release);
+                        deadline_state.mark_finished();
                         cancellation_guard.disarm();
                         Ok(store)
                     }
@@ -3394,6 +3472,7 @@ impl StateStore {
                         let admission_deadline = if deadline_state
                             .finished
                             .load(std::sync::atomic::Ordering::Acquire)
+                            != OPEN_FINISHED_PENDING
                         {
                             std::time::Instant::now()
                                 .checked_add(live_acquire_timeout)
@@ -4165,7 +4244,8 @@ impl StateStore {
             busy_timeout: self.busy_timeout,
             expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            finished: std::sync::atomic::AtomicBool::new(false),
+            finished: std::sync::atomic::AtomicU8::new(OPEN_FINISHED_PENDING),
+            open_cleanup_retirement: std::sync::OnceLock::new(),
             final_commit_state: std::sync::atomic::AtomicU8::new(0),
             open_cleanup_state: std::sync::atomic::AtomicU8::new(0),
         });
@@ -4676,9 +4756,7 @@ impl StateStore {
         match selector_result {
             Ok(receipt) => {
                 cancellation_guard.disarm();
-                deadline_state
-                    .finished
-                    .store(true, std::sync::atomic::Ordering::Release);
+                deadline_state.mark_finished();
                 Ok(receipt)
             }
             Err(error)
@@ -4901,7 +4979,8 @@ impl StateStore {
             busy_timeout: MAX_CONFIGURED_TIMEOUT,
             expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            finished: std::sync::atomic::AtomicBool::new(false),
+            finished: std::sync::atomic::AtomicU8::new(OPEN_FINISHED_PENDING),
+            open_cleanup_retirement: std::sync::OnceLock::new(),
             final_commit_state: std::sync::atomic::AtomicU8::new(0),
             open_cleanup_state: std::sync::atomic::AtomicU8::new(0),
         });
@@ -8566,7 +8645,8 @@ mod open_deadline_tests {
             busy_timeout: Duration::from_secs(1),
             expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            finished: std::sync::atomic::AtomicBool::new(false),
+            finished: std::sync::atomic::AtomicU8::new(OPEN_FINISHED_PENDING),
+            open_cleanup_retirement: std::sync::OnceLock::new(),
             final_commit_state: std::sync::atomic::AtomicU8::new(0),
             open_cleanup_state: std::sync::atomic::AtomicU8::new(0),
         });
@@ -8617,7 +8697,8 @@ mod open_deadline_tests {
             busy_timeout: Duration::from_secs(1),
             expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            finished: std::sync::atomic::AtomicBool::new(false),
+            finished: std::sync::atomic::AtomicU8::new(OPEN_FINISHED_PENDING),
+            open_cleanup_retirement: std::sync::OnceLock::new(),
             final_commit_state: std::sync::atomic::AtomicU8::new(0),
             open_cleanup_state: std::sync::atomic::AtomicU8::new(0),
         });
@@ -8679,7 +8760,8 @@ mod open_deadline_tests {
             busy_timeout: Duration::from_secs(1),
             expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            finished: std::sync::atomic::AtomicBool::new(false),
+            finished: std::sync::atomic::AtomicU8::new(OPEN_FINISHED_PENDING),
+            open_cleanup_retirement: std::sync::OnceLock::new(),
             final_commit_state: std::sync::atomic::AtomicU8::new(0),
             open_cleanup_state: std::sync::atomic::AtomicU8::new(0),
         });
@@ -9816,7 +9898,8 @@ impl<'store> StoreOperationConnection<'store> {
             busy_timeout: identity.busy_timeout,
             expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            finished: std::sync::atomic::AtomicBool::new(false),
+            finished: std::sync::atomic::AtomicU8::new(OPEN_FINISHED_PENDING),
+            open_cleanup_retirement: std::sync::OnceLock::new(),
             final_commit_state: std::sync::atomic::AtomicU8::new(0),
             open_cleanup_state: std::sync::atomic::AtomicU8::new(0),
         });
@@ -10112,9 +10195,7 @@ impl<'store> StoreOperationConnection<'store> {
                 close,
             ));
         }
-        self.deadline_state
-            .finished
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.deadline_state.mark_finished();
         connection.release_reusable()
     }
 
@@ -15746,7 +15827,8 @@ async fn backup_pool(
         busy_timeout: MAX_CONFIGURED_TIMEOUT,
         expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        finished: std::sync::atomic::AtomicBool::new(false),
+        finished: std::sync::atomic::AtomicU8::new(OPEN_FINISHED_PENDING),
+        open_cleanup_retirement: std::sync::OnceLock::new(),
         final_commit_state: std::sync::atomic::AtomicU8::new(0),
         open_cleanup_state: std::sync::atomic::AtomicU8::new(0),
     });
@@ -17341,7 +17423,8 @@ pub(crate) mod test_support {
             busy_timeout: std::time::Duration::from_secs(1),
             expired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            finished: std::sync::atomic::AtomicBool::new(false),
+            finished: std::sync::atomic::AtomicU8::new(super::OPEN_FINISHED_PENDING),
+            open_cleanup_retirement: std::sync::OnceLock::new(),
             final_commit_state: std::sync::atomic::AtomicU8::new(1),
             open_cleanup_state: std::sync::atomic::AtomicU8::new(1),
         });
@@ -17354,10 +17437,7 @@ pub(crate) mod test_support {
         )
         .expect("handoff expired undelivered store");
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while !deadline_state
-                .finished
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            while deadline_state.completion_state() == super::OPEN_FINISHED_PENDING {
                 tokio::task::yield_now().await;
             }
         })
@@ -17411,7 +17491,8 @@ pub(crate) mod test_support {
             busy_timeout: std::time::Duration::from_secs(1),
             expired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            finished: std::sync::atomic::AtomicBool::new(false),
+            finished: std::sync::atomic::AtomicU8::new(super::OPEN_FINISHED_PENDING),
+            open_cleanup_retirement: std::sync::OnceLock::new(),
             final_commit_state: std::sync::atomic::AtomicU8::new(0),
             open_cleanup_state: std::sync::atomic::AtomicU8::new(1),
         });
@@ -17428,11 +17509,7 @@ pub(crate) mod test_support {
 
     pub(crate) async fn wait_for_undelivered_completion(completion: &UndeliveredCompletion) {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while !completion
-                .0
-                .finished
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            while completion.0.completion_state() == super::OPEN_FINISHED_PENDING {
                 tokio::task::yield_now().await;
             }
         })
@@ -18193,6 +18270,29 @@ pub(crate) mod test_support {
             .lock()
             .expect("migration test barrier lock poisoned")
             .remove(&path);
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn wait_for_process_identity_release(path: &Path) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let path = super::resolve_database_path(path).expect("resolve released database path");
+        let metadata = std::fs::metadata(&path).expect("inspect released database identity");
+        let identity = (metadata.dev(), metadata.ino());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !super::PROCESS_IDENTITIES
+                    .lock()
+                    .expect("process identity registry lock poisoned")
+                    .contains(&identity)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retained process identity releases");
     }
 
     pub(crate) fn set_snapshot_barrier(
