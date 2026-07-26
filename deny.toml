@@ -63,7 +63,8 @@ version = "=0.10.9"
 
 # russh 0.62 requires generic-array 1.x, and the 1.x line depends on 0.14 through
 # its non-optional compat-0_14 bridge. The duplicate is therefore structural: no
-# version selection elsewhere in the graph can eliminate it.
+# version selection elsewhere in the graph can eliminate it. Remove this skip
+# when russh no longer requires that bridge.
 [[bans.skip]]
 name = "generic-array"
 version = "=0.14.7"
