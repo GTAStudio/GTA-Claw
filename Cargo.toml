@@ -20,6 +20,7 @@ members = [
   "crates/claw-http-api",
   "crates/claw-mcp",
   "crates/claw-memory",
+  "crates/claw-migrate",
   "crates/claw-observability",
   "crates/claw-platform",
   "crates/claw-plugin-api",
@@ -29,6 +30,7 @@ members = [
   "crates/claw-providers",
   "crates/claw-relay",
   "crates/claw-repo-policy",
+  "crates/claw-runtime",
   "crates/claw-security",
   "crates/claw-skills",
   "crates/claw-tools",
@@ -51,6 +53,7 @@ claw-gateway-client = { path = "crates/claw-gateway-client", version = "0.1.0" }
 claw-http-api = { path = "crates/claw-http-api", version = "0.1.0" }
 claw-mcp = { path = "crates/claw-mcp", version = "0.1.0" }
 claw-memory = { path = "crates/claw-memory", version = "0.1.0" }
+claw-migrate = { path = "crates/claw-migrate", version = "0.1.0" }
 claw-observability = { path = "crates/claw-observability", version = "0.1.0" }
 claw-platform = { path = "crates/claw-platform", version = "0.1.0" }
 claw-plugin-api = { path = "crates/claw-plugin-api", version = "0.1.0" }
@@ -59,6 +62,7 @@ claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
 claw-provider-sdk = { path = "crates/claw-provider-sdk", version = "0.1.0" }
 claw-providers = { path = "crates/claw-providers", version = "0.1.0" }
 claw-relay = { path = "crates/claw-relay", version = "0.1.0" }
+claw-runtime = { path = "crates/claw-runtime", version = "0.1.0" }
 claw-security = { path = "crates/claw-security", version = "0.1.0" }
 claw-skills = { path = "crates/claw-skills", version = "0.1.0" }
 claw-tools = { path = "crates/claw-tools", version = "0.1.0" }
