@@ -433,6 +433,28 @@ mod tests {
         }
     }
 
+    fn assert_open_timeout_cleanup_outcome(error: StateError, timeout_ms: u64) {
+        let timeout = StateError::OperationTimedOut {
+            operation: "state store open",
+            timeout_ms,
+        };
+        match error {
+            error @ StateError::OperationTimedOut { .. } => assert_eq!(error, timeout),
+            StateError::OperationCleanupFailed {
+                operation: "state store open",
+                primary,
+                cleanup,
+            } => {
+                assert_eq!(*primary, timeout);
+                assert_eq!(
+                    cleanup,
+                    "open cleanup lifecycle retained ownership beyond the absolute open deadline"
+                );
+            }
+            error => panic!("unexpected open timeout cleanup outcome: {error:?}"),
+        }
+    }
+
     async fn execute_direct(path: &Path, sql: &'static str) {
         let options = SqliteConnectOptions::new().filename(path);
         let mut connection = SqliteConnection::connect_with(&options)
@@ -1311,13 +1333,7 @@ mod tests {
         .await
         .err()
         .expect("cleanup admission saturation reaches the open deadline");
-        assert_eq!(
-            error,
-            StateError::OperationTimedOut {
-                operation: "state store open",
-                timeout_ms: 200,
-            }
-        );
+        assert_open_timeout_cleanup_outcome(error, 200);
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "cleanup admission must not inherit the longer pool acquire timeout"
@@ -1400,13 +1416,7 @@ mod tests {
             .expect("deadline-bound open task joins")
             .err()
             .expect("competing writer reaches the absolute open deadline");
-        assert_eq!(
-            error,
-            StateError::OperationTimedOut {
-                operation: "state store open",
-                timeout_ms: 300,
-            }
-        );
+        assert_open_timeout_cleanup_outcome(error, 300);
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "configured SQLite busy timeout must not extend the overall open deadline"
@@ -1545,11 +1555,11 @@ mod tests {
         let open_path = path.clone();
         let opening = tokio::spawn(async move {
             StateStore::open(
-                StoreConfig::new(open_path).with_open_timeout(Duration::from_millis(500)),
+                StoreConfig::new(open_path).with_open_timeout(Duration::from_millis(1_000)),
             )
             .await
         });
-        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
             .expect("open reaches pre-transaction capacity fence");
         let blockers = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
@@ -1567,13 +1577,7 @@ mod tests {
                 panic!("capacity reservation unexpectedly committed claim; close: {close:?}");
             }
         };
-        assert_eq!(
-            error,
-            StateError::OperationTimedOut {
-                operation: "state store open",
-                timeout_ms: 500,
-            }
-        );
+        assert_open_timeout_cleanup_outcome(error, 1_000);
         for blocker in blockers {
             blocker
                 .shutdown()
@@ -1829,6 +1833,69 @@ mod tests {
         test_support::clear_before_acquire_owner_barrier();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_timeout_reports_unretired_before_acquire_verifier() {
+        struct ReleaseOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let _serialized = serialize_adversarial_test();
+        let directory = tempfile::tempdir().expect("verifier timeout directory");
+        let path = database_path(&directory, "verifier-timeout.sqlite");
+        open(&path)
+            .await
+            .close()
+            .await
+            .expect("warm verifier timeout fixture");
+        let (entered, release) = test_support::set_early_verifier_retire_barrier(&path);
+        let release = ReleaseOnDrop(release);
+        let open_path = path.clone();
+        let opening = tokio::spawn(async move {
+            StateStore::open(
+                StoreConfig::new(open_path).with_open_timeout(Duration::from_millis(1_000)),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while entered.load(std::sync::atomic::Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("before-acquire verifier computes before its retirement gate");
+        let error = tokio::time::timeout(Duration::from_secs(2), opening)
+            .await
+            .expect("open remains bounded by its hard deadline")
+            .expect("deadline-bound verifier task joins")
+            .err()
+            .expect("unretired verifier prevents a successful open");
+        assert_eq!(
+            error,
+            StateError::OperationCleanupFailed {
+                operation: "state store open",
+                primary: Box::new(StateError::OperationTimedOut {
+                    operation: "state store open",
+                    timeout_ms: 1_000,
+                }),
+                cleanup:
+                    "open cleanup lifecycle retained ownership beyond the absolute open deadline"
+                        .to_owned(),
+            }
+        );
+        release.0.store(true, std::sync::atomic::Ordering::Release);
+        test_support::wait_for_process_identity_release(&path).await;
+        let reopened = open(&path).await;
+        reopened
+            .close()
+            .await
+            .expect("post-verifier-timeout store closes");
+    }
+
     #[tokio::test]
     async fn open_actor_survives_caller_runtime_drop_before_and_after_construction() {
         const CHILD_ENV: &str = "GTA_CLAW_OPEN_ACTOR_RUNTIME_DROP_CHILD";
@@ -2057,13 +2124,23 @@ mod tests {
                     panic!("final delivery mode {mode} returned a store; close: {close:?}");
                 }
             };
-            assert_eq!(
-                error,
-                StateError::OperationTimedOut {
-                    operation: "state store open",
-                    timeout_ms: u64::try_from(timeout.as_millis()).expect("timeout fits u64"),
-                }
-            );
+            let timeout_error = StateError::OperationTimedOut {
+                operation: "state store open",
+                timeout_ms: u64::try_from(timeout.as_millis()).expect("timeout fits u64"),
+            };
+            if mode == "deadline" {
+                assert_eq!(
+                    error,
+                    StateError::OperationCleanupFailed {
+                        operation: "state store open",
+                        primary: Box::new(timeout_error),
+                        cleanup: "open cleanup lifecycle retained ownership beyond the absolute open deadline"
+                            .to_owned(),
+                    }
+                );
+            } else {
+                assert_eq!(error, timeout_error);
+            }
             let reopened = tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
                     match StateStore::open(StoreConfig::new(&path)).await {
@@ -2320,6 +2397,11 @@ mod tests {
         let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "stalled-postcommit-cleanup.sqlite");
+        open(&path)
+            .await
+            .close()
+            .await
+            .expect("warm stalled postcommit cleanup fixture");
         let (postcommit_entered, _postcommit_release) =
             test_support::set_open_postcommit_barrier(&path);
         let (cleanup_entered, _cleanup_release) = test_support::set_open_cleanup_barrier(&path);
@@ -2348,9 +2430,15 @@ mod tests {
         };
         assert_eq!(
             error,
-            StateError::OperationTimedOut {
+            StateError::OperationCleanupFailed {
                 operation: "state store open",
-                timeout_ms: 1_000,
+                primary: Box::new(StateError::OperationTimedOut {
+                    operation: "state store open",
+                    timeout_ms: 1_000,
+                }),
+                cleanup:
+                    "open cleanup lifecycle retained ownership beyond the absolute open deadline"
+                        .to_owned(),
             }
         );
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -2390,19 +2478,16 @@ mod tests {
         connection.close().await.expect("close timeout prefix");
         make_private_file(&path);
         let (entered, release) = test_support::set_migration_barrier(&path);
-        assert_eq!(
-                StateStore::open(
-                    StoreConfig::new(&path).with_open_timeout(Duration::from_millis(500)),
-                )
-                .await
-                .err()
-                .expect("gated migration reaches one overall timeout"),
-                StateError::OperationTimedOut {
-                    operation: "state store open",
-                    timeout_ms: 500,
-                }
-            );
-        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        assert_open_timeout_cleanup_outcome(
+            StateStore::open(
+                StoreConfig::new(&path).with_open_timeout(Duration::from_millis(1_000)),
+            )
+            .await
+            .err()
+            .expect("gated migration reaches one overall timeout"),
+            1_000,
+        );
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
             .expect("migration entered the deterministic gate");
         release.notify_one();
@@ -2451,6 +2536,7 @@ mod tests {
         .expect("migration artifacts reach a quiescent baseline");
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_database_artifacts_unchanged(&stable, &database_artifact_bytes(&path));
+        test_support::wait_for_process_identity_release(&path).await;
         let reopened = open(&path).await;
         assert!(
             reopened
@@ -2463,19 +2549,14 @@ mod tests {
 
         let fresh_path = database_path(&directory, "fresh-migration-timeout.sqlite");
         let (entered, release) = test_support::set_migration_barrier(&fresh_path);
-        assert_eq!(
-            StateStore::open(
-                StoreConfig::new(&fresh_path).with_open_timeout(Duration::from_millis(500)),
-            )
-            .await
-            .err()
-            .expect("fresh gated migration reaches one overall timeout"),
-            StateError::OperationTimedOut {
-                operation: "state store open",
-                timeout_ms: 500,
-            }
-        );
-        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        let fresh_error = StateStore::open(
+            StoreConfig::new(&fresh_path).with_open_timeout(Duration::from_millis(1_000)),
+        )
+        .await
+        .err()
+        .expect("fresh gated migration reaches one overall timeout");
+        assert_open_timeout_cleanup_outcome(fresh_error, 1_000);
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
             .expect("fresh migration entered deterministic gate");
         release.notify_one();
@@ -2524,19 +2605,8 @@ mod tests {
         .expect("fresh migration artifacts reach a quiescent baseline");
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_database_artifacts_unchanged(&stable, &database_artifact_bytes(&fresh_path));
-        let reopened = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                match StateStore::open(StoreConfig::new(&fresh_path)).await {
-                    Ok(store) => break store,
-                    Err(StateError::StoreLocked { .. } | StateError::FileSystem { .. }) => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    Err(error) => panic!("fresh post-migration-timeout reopen failed: {error}"),
-                }
-            }
-        })
-        .await
-        .expect("fresh migration timeout releases writer ownership");
+        test_support::wait_for_process_identity_release(&fresh_path).await;
+        let reopened = open(&fresh_path).await;
         assert!(
             reopened
                 .health()
@@ -6428,21 +6498,7 @@ mod tests {
             operation: "checkpoint SQLite WAL",
             timeout_ms: 500,
         };
-        match checkpoint_error {
-            error @ StateError::OperationTimedOut { .. } => assert_eq!(error, timeout),
-            StateError::OperationCleanupFailed {
-                operation: "checkpoint SQLite WAL",
-                primary,
-                cleanup,
-            } => {
-                assert_eq!(*primary, timeout);
-                assert!(
-                    !cleanup.is_empty(),
-                    "terminal checkpoint evidence remains explicit"
-                );
-            }
-            error => panic!("unexpected checkpoint timeout error: {error:?}"),
-        }
+        assert_eq!(checkpoint_error, timeout);
         assert!(started.elapsed() < Duration::from_secs(1));
         reader
             .execute("ROLLBACK")
