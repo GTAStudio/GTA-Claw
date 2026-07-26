@@ -361,8 +361,6 @@ struct VerifiedWriteTransaction {
     timeout_ms: u64,
     #[cfg(test)]
     rollback_cleanup_test: Option<Arc<RollbackCleanupTestState>>,
-    #[cfg(all(test, unix))]
-    test_owner: String,
 }
 
 macro_rules! rollback_on_error {
@@ -448,12 +446,7 @@ impl VerifiedWriteTransaction {
     async fn main_database_has_moved(
         &mut self,
     ) -> Result<bool, claw_sqlite_file_control::FileControlError> {
-        let moved = self.executor().main_database_has_moved().await?;
-        #[cfg(test)]
-        if moved {
-            wait_at_identity_invalidation_test_barrier(&self.test_owner).await;
-        }
-        Ok(moved)
+        self.executor().main_database_has_moved().await
     }
 
     async fn commit(
@@ -630,10 +623,6 @@ static PROTECTED_COMMIT_DISPATCH_TEST_BARRIERS: LazyLock<
 #[cfg(test)]
 static PROTECTED_READ_POST_TEST_BARRIER: LazyLock<Mutex<Option<WriteTestBarrier>>> =
     LazyLock::new(|| Mutex::new(None));
-#[cfg(all(test, unix))]
-static IDENTITY_INVALIDATION_TEST_BARRIERS: LazyLock<
-    Mutex<std::collections::HashMap<String, WriteTestBarrier>>,
-> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
 static ROLLBACK_CLEANUP_TEST_STATES: LazyLock<
     Mutex<std::collections::HashMap<String, Arc<RollbackCleanupTestState>>>,
@@ -1776,8 +1765,6 @@ async fn begin_verified_write_with_deadline(
         timeout_ms,
         #[cfg(test)]
         rollback_cleanup_test: claim_rollback_cleanup_test(owner),
-        #[cfg(all(test, unix))]
-        test_owner: owner.to_owned(),
     };
     #[cfg(test)]
     if let Some(state) = transaction.rollback_cleanup_test.as_ref() {
@@ -1912,28 +1899,6 @@ async fn wait_at_commit_test_barrier(owner: &str) {
         COMMIT_TEST_BARRIERS
             .lock()
             .expect("commit test barriers lock poisoned")
-            .remove(owner);
-    }
-}
-
-#[cfg(all(test, unix))]
-async fn wait_at_identity_invalidation_test_barrier(owner: &str) {
-    let barrier = IDENTITY_INVALIDATION_TEST_BARRIERS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(owner)
-        .map(|configured| {
-            (
-                Arc::clone(&configured.entered),
-                Arc::clone(&configured.release),
-            )
-        });
-    if let Some((entered, release)) = barrier {
-        entered.notify_one();
-        release.notified().await;
-        IDENTITY_INVALIDATION_TEST_BARRIERS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(owner);
     }
 }
@@ -2169,16 +2134,18 @@ async fn apply_commit_test_tamper(
         .expect("commit test tampers lock poisoned")
         .remove(owner);
     if tamper {
-        sqlx::raw_sql(
+        for statement in [
             "UPDATE claw_writer_lock
              SET owner = 'commit-boundary-attacker'
-             WHERE singleton = 1;
-             PRAGMA application_id = 0;
-             CREATE TABLE commit_boundary_rogue(value TEXT) STRICT;",
-        )
-        .execute(transaction.executor())
-        .await
-        .map_err(|error| database("apply commit-boundary test tamper", error))?;
+             WHERE singleton = 1",
+            "PRAGMA application_id = 0",
+            "CREATE TABLE commit_boundary_rogue(value TEXT) STRICT",
+        ] {
+            sqlx::query(statement)
+                .execute(transaction.executor())
+                .await
+                .map_err(|error| database("apply commit-boundary test tamper", error))?;
+        }
     }
     Ok(())
 }
@@ -2643,6 +2610,7 @@ mod deadline_tests {
 
     #[tokio::test]
     async fn expired_write_deadline_never_polls_statement_future() {
+        let _serialized = crate::serialize_adversarial_test();
         let cancelled = Arc::new(AtomicBool::new(false));
         let deadline = WriteDeadline {
             deadline: std::time::Instant::now(),
@@ -2671,12 +2639,12 @@ mod deadline_tests {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    #[cfg(unix)]
+    use super::COMMIT_TEST_TAMPERS;
     use super::{
         Arc, COMMIT_TEST_BARRIERS, READ_TEST_BARRIERS, ROLLBACK_CLEANUP_TEST_STATES,
         RollbackCleanupTestState, WRITE_TEST_BARRIERS, WriteTestBarrier,
     };
-    #[cfg(unix)]
-    use super::{COMMIT_TEST_TAMPERS, IDENTITY_INVALIDATION_TEST_BARRIERS};
     #[cfg(target_os = "linux")]
     use super::{
         POST_COMMIT_TEST_BARRIERS, PROTECTED_COMMIT_DISPATCH_TEST_BARRIERS,
@@ -2924,25 +2892,6 @@ pub(crate) mod test_support {
         COMMIT_TEST_BARRIERS
             .lock()
             .expect("commit test barriers lock poisoned")
-            .insert(
-                owner.to_owned(),
-                WriteTestBarrier {
-                    entered: Arc::clone(&entered),
-                    release: Arc::clone(&release),
-                },
-            );
-        (entered, release)
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn set_identity_invalidation_barrier(
-        owner: &str,
-    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        IDENTITY_INVALIDATION_TEST_BARRIERS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
                 owner.to_owned(),
                 WriteTestBarrier {

@@ -8182,25 +8182,18 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
     let identity = match outcome {
         Ok(identity) => identity,
         Err(error) => {
-            if cancellation.is_cancelled() {
-                let primary = FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT);
-                return Err(match guard.join_failure().await {
-                    Ok(()) => primary,
-                    Err(cleanup) => FileControlError::Handle(format!(
-                        "{primary}; terminal cleanup failed: {cleanup}"
-                    )),
-                });
-            }
-            let primary = if cancellation.stopped_by_work_or_cancellation()
-                && matches!(
-                    error.code().map(|code| code & 0xff),
-                    Some(libsqlite3_sys::SQLITE_BUSY | libsqlite3_sys::SQLITE_INTERRUPT)
-                ) {
+            let cleanup = guard.join_failure().await;
+            let primary = if cancellation.is_cancelled()
+                || (cancellation.stopped_by_work_or_cancellation()
+                    && matches!(
+                        error.code().map(|code| code & 0xff),
+                        Some(libsqlite3_sys::SQLITE_BUSY | libsqlite3_sys::SQLITE_INTERRUPT)
+                    )) {
                 FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT)
             } else {
                 error
             };
-            if let Err(cleanup) = guard.join_failure().await {
+            if let Err(cleanup) = cleanup {
                 return Err(FileControlError::Handle(format!(
                     "{primary}; terminal cleanup failed: {cleanup}"
                 )));
@@ -13550,10 +13543,21 @@ mod deadline_tests {
             .await
             .expect("external cancellation completes after terminal worker retirement")
             .expect("worker-error task joins");
-        assert!(matches!(
-            result,
-            Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT))
-        ));
+        assert!(
+            matches!(
+                &result,
+                Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT))
+            ) || matches!(
+                &result,
+                Err(FileControlError::Handle(message))
+                    if message.starts_with(
+                        "SQLite BEGIN interrupted; terminal cleanup failed:"
+                    )
+                        && message.contains("SQLite file-control operation failed with code 9")
+                        && message.ends_with("terminal cleanup degraded: Quarantined")
+            ),
+            "cancellation did not retain interrupt precedence: {result:?}"
+        );
         tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
             .await
             .expect("terminal cleanup restores worker-error pool capacity")

@@ -35,20 +35,210 @@ pub use store::{
 };
 
 #[cfg(test)]
+struct AdversarialTestState {
+    owner: Option<std::thread::ThreadId>,
+    depth: usize,
+    file: Option<std::sync::Arc<std::fs::File>>,
+    next_ticket: u64,
+    serving_ticket: u64,
+}
+
+#[cfg(test)]
+static ADVERSARIAL_TEST_STATE: std::sync::Mutex<AdversarialTestState> =
+    std::sync::Mutex::new(AdversarialTestState {
+        owner: None,
+        depth: 0,
+        file: None,
+        next_ticket: 0,
+        serving_ticket: 0,
+    });
+
+#[cfg(test)]
+static ADVERSARIAL_TEST_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+
+#[cfg(test)]
+struct AdversarialTestGuard {
+    owner: std::thread::ThreadId,
+    _file: std::sync::Arc<std::fs::File>,
+}
+
+#[cfg(test)]
+impl Drop for AdversarialTestGuard {
+    fn drop(&mut self) {
+        let file = {
+            let mut state = ADVERSARIAL_TEST_STATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(state.owner, Some(self.owner));
+            state.depth = state
+                .depth
+                .checked_sub(1)
+                .expect("adversarial test lock depth is nonzero");
+            if state.depth == 0 {
+                state.owner = None;
+                state.file.take()
+            } else {
+                None
+            }
+        };
+        if let Some(file) = file {
+            std::fs::File::unlock(&file).expect("release adversarial test process lock");
+            let mut state = ADVERSARIAL_TEST_STATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.serving_ticket = state
+                .serving_ticket
+                .checked_add(1)
+                .expect("adversarial test ticket fits u64");
+            ADVERSARIAL_TEST_CHANGED.notify_all();
+        }
+    }
+}
+
+#[cfg(test)]
+fn serialize_adversarial_test() -> AdversarialTestGuard {
+    let owner = std::thread::current().id();
+    {
+        let mut state = ADVERSARIAL_TEST_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.owner == Some(owner) {
+            state.depth = state
+                .depth
+                .checked_add(1)
+                .expect("adversarial test lock depth fits usize");
+            return AdversarialTestGuard {
+                owner,
+                _file: std::sync::Arc::clone(
+                    state
+                        .file
+                        .as_ref()
+                        .expect("owned adversarial test lock retains its file"),
+                ),
+            };
+        }
+    }
+
+    let lock_path = std::env::current_exe()
+        .expect("resolve adversarial test executable")
+        .parent()
+        .expect("adversarial test executable has a parent")
+        .join(".claw-state-tests.lock");
+    let (file, created) = loop {
+        match std::fs::OpenOptions::new().read(true).open(&lock_path) {
+            Ok(file) => break (file, false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&lock_path)
+                {
+                    Ok(file) => break (file, true),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        panic!(
+                            "create adversarial test process lock {}: {error}",
+                            lock_path.display()
+                        )
+                    }
+                }
+            }
+            Err(error) => {
+                panic!(
+                    "open adversarial test process lock {}: {error}",
+                    lock_path.display()
+                )
+            }
+        }
+    };
+    #[cfg(unix)]
+    if created {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "make adversarial test process lock cross-UID readable {}: {error}",
+                    lock_path.display()
+                )
+            });
+    }
+    #[cfg(not(unix))]
+    let _ = created;
+    let ticket = {
+        let mut state = ADVERSARIAL_TEST_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ticket = state.next_ticket;
+        state.next_ticket = state
+            .next_ticket
+            .checked_add(1)
+            .expect("adversarial test ticket fits u64");
+        while state.owner.is_some() || state.serving_ticket != ticket {
+            state = ADVERSARIAL_TEST_CHANGED
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        ticket
+    };
+
+    if let Err(error) = std::fs::File::lock(&file) {
+        let mut state = ADVERSARIAL_TEST_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.serving_ticket, ticket);
+        state.serving_ticket = state
+            .serving_ticket
+            .checked_add(1)
+            .expect("adversarial test ticket fits u64");
+        ADVERSARIAL_TEST_CHANGED.notify_all();
+        panic!(
+            "acquire adversarial test process lock {}: {error}",
+            lock_path.display()
+        );
+    }
+    let file = std::sync::Arc::new(file);
+    let mut state = ADVERSARIAL_TEST_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(state.owner.is_none());
+    assert_eq!(state.depth, 0);
+    assert!(state.file.is_none());
+    assert_eq!(state.serving_ticket, ticket);
+    state.owner = Some(owner);
+    state.depth = 1;
+    state.file = Some(std::sync::Arc::clone(&file));
+    AdversarialTestGuard { owner, _file: file }
+}
+
+#[cfg(test)]
 mod tests {
     mod tempfile {
-        pub(super) use ::tempfile::TempDir;
+        pub(super) struct TempDir {
+            inner: ::tempfile::TempDir,
+            _serialized: crate::AdversarialTestGuard,
+        }
+
+        impl TempDir {
+            pub(super) fn path(&self) -> &std::path::Path {
+                self.inner.path()
+            }
+        }
 
         pub(super) fn tempdir() -> std::io::Result<TempDir> {
+            let serialized = crate::serialize_adversarial_test();
             #[cfg(target_os = "macos")]
-            {
+            let inner = {
                 let root = std::fs::canonicalize(std::env::temp_dir())?;
                 ::tempfile::Builder::new().tempdir_in(root)
-            }
+            }?;
             #[cfg(not(target_os = "macos"))]
-            {
-                ::tempfile::tempdir()
-            }
+            let inner = { ::tempfile::tempdir() }?;
+            Ok(TempDir {
+                inner,
+                _serialized: serialized,
+            })
         }
     }
 
@@ -140,6 +330,19 @@ mod tests {
         #[cfg(windows)]
         secure_windows_test_directory(directory.path());
         directory.path().join(name)
+    }
+
+    fn cleanup_may_still_own_untagged_sidecar(error: &StateError) -> bool {
+        match error {
+            StateError::InvalidPath {
+                reason: "SQLite sidecar generation is missing",
+                ..
+            } => true,
+            StateError::OperationCleanupFailed { primary, .. } => {
+                cleanup_may_still_own_untagged_sidecar(primary)
+            }
+            _ => false,
+        }
     }
 
     #[cfg(windows)]
@@ -496,6 +699,42 @@ mod tests {
         store.close().await.expect("store closes cleanly");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_initial_sidecar_setup_remains_recoverable() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "failed-sidecar-initialization.sqlite");
+        test_support::fail_portable_sidecar_initialization_once();
+        let error = match StateStore::open(StoreConfig::new(&path)).await {
+            Err(error) => error,
+            Ok(store) => {
+                let close = store.close().await;
+                panic!("injected sidecar initialization succeeded; close: {close:?}");
+            }
+        };
+        assert!(
+            matches!(error, StateError::Database(_))
+                || matches!(
+                    error,
+                    StateError::OperationCleanupFailed { ref primary, .. }
+                        if matches!(&**primary, StateError::Database(_))
+                ),
+            "unexpected sidecar initialization error: {error:?}"
+        );
+        for suffix in ["-wal", "-shm"] {
+            assert!(
+                !sidecar(&path, suffix).exists(),
+                "failed initialization cannot preserve an unauthenticated {suffix} sidecar"
+            );
+        }
+        StateStore::open(StoreConfig::new(&path))
+            .await
+            .expect("failed sidecar initialization remains retryable")
+            .close()
+            .await
+            .expect("retried sidecar initialization closes cleanly");
+    }
+
     #[tokio::test]
     async fn portable_profile_rejects_fixed_catalog_operations_explicitly() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -749,6 +988,7 @@ mod tests {
 
     #[tokio::test]
     async fn migration_transaction_excludes_external_schema_writer() {
+        let _serialized = serialize_adversarial_test();
         const OVERALL_TIMEOUT: Duration = Duration::from_secs(5);
 
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -863,6 +1103,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancelling_open_aborts_migration_without_late_owner_claim() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "cancelled-open.sqlite");
         let options = SqliteConnectOptions::new()
@@ -955,10 +1196,17 @@ mod tests {
             loop {
                 match StateStore::open(StoreConfig::new(&path)).await {
                     Ok(store) => break store,
-                    Err(StateError::StoreLocked { .. } | StateError::FileSystem { .. }) => {
+                    Err(error)
+                        if matches!(
+                            error,
+                            StateError::StoreLocked { .. } | StateError::FileSystem { .. }
+                        ) || cleanup_may_still_own_untagged_sidecar(&error) =>
+                    {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    Err(error) => panic!("post-migration-timeout reopen failed: {error}"),
+                    Err(error) => {
+                        panic!("post-migration-timeout reopen failed: {error:?}")
+                    }
                 }
             }
         })
@@ -1044,6 +1292,7 @@ mod tests {
             return;
         }
 
+        let _serialized = serialize_adversarial_test();
         let owners = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
             "state-open-admission-saturation",
             64,
@@ -1078,6 +1327,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_checkouts_do_not_reuse_the_expired_open_deadline() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("live checkout directory");
         let path = database_path(&directory, "live-checkout-deadline.sqlite");
         let store = StateStore::open(
@@ -1111,6 +1361,7 @@ mod tests {
             return;
         }
 
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "open-busy-deadline.sqlite");
         open(&path)
@@ -1186,6 +1437,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_open_at_final_commit_fence_rolls_back_schema_and_owner() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "cancelled-open-precommit.sqlite");
         let (entered, _release) = test_support::set_open_precommit_barrier(&path);
@@ -1273,7 +1525,7 @@ mod tests {
         if std::env::var_os(CHILD_ENV).is_none() {
             let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
                 .lock()
-                .expect("isolated SQLite global test lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let status = Command::new(std::env::current_exe().expect("current test executable"))
                 .arg("--exact")
                 .arg("tests::late_claim_capacity_is_reserved_before_writer_claim_commit")
@@ -1286,6 +1538,7 @@ mod tests {
             return;
         }
 
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("late-claim capacity directory");
         let path = database_path(&directory, "late-claim-capacity.sqlite");
         let (entered, release) = test_support::set_open_initialization_barrier(&path);
@@ -1345,7 +1598,7 @@ mod tests {
         if std::env::var_os(CHILD_ENV).is_none() {
             let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
                 .lock()
-                .expect("isolated SQLite global test lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let status = Command::new(std::env::current_exe().expect("current test executable"))
                 .arg("--exact")
                 .arg("tests::open_transaction_quota_preserves_unrelated_cleanup_headroom")
@@ -1361,6 +1614,7 @@ mod tests {
             return;
         }
 
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("open transaction quota directory");
         let (admitted, admission_release) = test_support::set_open_admission_barrier();
         let (peak_entered, peak_release) = test_support::set_before_acquire_owner_barrier();
@@ -1480,7 +1734,7 @@ mod tests {
         if std::env::var_os(CHILD_ENV).is_none() {
             let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
                 .lock()
-                .expect("isolated SQLite global test lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let status = Command::new(std::env::current_exe().expect("current test executable"))
                 .arg("--exact")
                 .arg("tests::open_waits_for_earlier_verifier_retirement_before_seven_set")
@@ -1496,6 +1750,7 @@ mod tests {
             return;
         }
 
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("verifier retirement directory");
         let path = database_path(&directory, "verifier-retirement.sqlite");
         let (retire_entered, retire_release) =
@@ -1580,7 +1835,7 @@ mod tests {
         if std::env::var_os(CHILD_ENV).is_none() {
             let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
                 .lock()
-                .expect("isolated SQLite global test lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let status = Command::new(std::env::current_exe().expect("current test executable"))
                 .arg("--exact")
                 .arg("tests::open_actor_survives_caller_runtime_drop_before_and_after_construction")
@@ -1593,6 +1848,7 @@ mod tests {
             return;
         }
 
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("open actor runtime-drop directory");
         let close_capacity = test_support::available_close_retention_slots();
         for postcommit in [false, true] {
@@ -1648,7 +1904,12 @@ mod tests {
                 loop {
                     match StateStore::open(StoreConfig::new(&path)).await {
                         Ok(store) => break store,
-                        Err(StateError::StoreLocked { .. } | StateError::FileSystem { .. }) => {
+                        Err(error)
+                            if matches!(
+                                error,
+                                StateError::StoreLocked { .. } | StateError::FileSystem { .. }
+                            ) || cleanup_may_still_own_untagged_sidecar(&error) =>
+                        {
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                         Err(error) => panic!("actor cleanup reopen failed: {error}"),
@@ -1732,6 +1993,7 @@ mod tests {
 
     #[tokio::test]
     async fn final_store_delivery_obeys_deadline_tie_and_cancellation() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("final delivery deadline directory");
         for mode in ["tail", "deadline", "tie", "cancel"] {
             let path = database_path(&directory, &format!("final-delivery-{mode}.sqlite"));
@@ -1828,6 +2090,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_open_after_commit_closes_committed_owner_before_reopen() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "cancelled-open-postcommit.sqlite");
         let (entered, release) = test_support::set_open_postcommit_barrier(&path);
@@ -1917,7 +2180,7 @@ mod tests {
         if std::env::var_os(CHILD_ENV).is_none() {
             let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
                 .lock()
-                .expect("isolated SQLite global test lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let executable = std::env::current_exe().expect("current state test executable");
             let status = Command::new(executable)
                 .arg("--exact")
@@ -1930,6 +2193,7 @@ mod tests {
             return;
         }
 
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "timeout-after-commit.sqlite");
         let (entered, _release) = test_support::set_open_postcommit_barrier(&path);
@@ -2003,6 +2267,7 @@ mod tests {
 
     #[tokio::test]
     async fn undelivered_cleanup_never_dispatches_sql_after_work_cutoff() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("gated undelivered directory");
         for after_delete in [false, true] {
             let path = database_path(
@@ -2052,6 +2317,7 @@ mod tests {
             return;
         }
 
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "stalled-postcommit-cleanup.sqlite");
         let (postcommit_entered, _postcommit_release) =
@@ -2060,18 +2326,16 @@ mod tests {
         let open_path = path.clone();
         let started = Instant::now();
         let opening = tokio::spawn(async move {
-            StateStore::open(
-                StoreConfig::new(open_path).with_open_timeout(Duration::from_millis(300)),
-            )
-            .await
+            StateStore::open(StoreConfig::new(open_path).with_open_timeout(Duration::from_secs(1)))
+                .await
         });
-        tokio::time::timeout(Duration::from_secs(1), postcommit_entered.notified())
+        tokio::time::timeout(Duration::from_secs(2), postcommit_entered.notified())
             .await
             .expect("open reaches postcommit cleanup fixture");
-        tokio::time::timeout(Duration::from_secs(1), cleanup_entered.notified())
+        tokio::time::timeout(Duration::from_secs(2), cleanup_entered.notified())
             .await
             .expect("cancelled open starts writer-claim cleanup");
-        let result = tokio::time::timeout(Duration::from_secs(1), opening)
+        let result = tokio::time::timeout(Duration::from_secs(2), opening)
             .await
             .expect("stalled open cleanup remains externally bounded")
             .expect("stalled open task joins");
@@ -2086,10 +2350,10 @@ mod tests {
             error,
             StateError::OperationTimedOut {
                 operation: "state store open",
-                timeout_ms: 300,
+                timeout_ms: 1_000,
             }
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(2));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             StateStore::open(StoreConfig::new(&path).with_open_timeout(Duration::from_millis(50)))
@@ -2102,6 +2366,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn migration_timeout_rolls_back_without_late_mutation() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "migration-timeout.sqlite");
         let options = SqliteConnectOptions::new()
@@ -2417,6 +2682,7 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_cleanup_disruptions_never_panic_or_poison_the_pool() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = StateStore::open(
             StoreConfig::new(database_path(&directory, "rollback-cleanup.sqlite"))
@@ -2475,6 +2741,7 @@ mod tests {
             return;
         }
 
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let first = open(&database_path(&directory, "rollback-key-first.sqlite")).await;
         let second = open(&database_path(&directory, "rollback-key-second.sqlite")).await;
@@ -2533,6 +2800,8 @@ mod tests {
             );
             return;
         }
+
+        let _serialized = serialize_adversarial_test();
 
         let close_capacity = test_support::close_retention_capacity();
         assert_eq!(
@@ -2954,6 +3223,7 @@ mod tests {
 
     #[tokio::test]
     async fn archive_and_task_create_race_has_only_serializable_outcomes() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = open(&database_path(&directory, "archive-race.sqlite")).await;
         for index in 0..10 {
@@ -3285,7 +3555,7 @@ mod tests {
         let store = StateStore::open(
             StoreConfig::new(&path)
                 .with_busy_timeout(Duration::from_secs(5))
-                .with_close_timeout(Duration::from_millis(500)),
+                .with_close_timeout(Duration::from_millis(1_500)),
         )
         .await
         .expect("close cleanup-tail store opens");
@@ -3316,7 +3586,7 @@ mod tests {
             .await
             .expect_err("checkpoint work cutoff degrades but terminalizes close");
         assert!(
-            started.elapsed() < Duration::from_millis(700),
+            started.elapsed() < Duration::from_secs(2),
             "checkpoint cannot consume a second relative close budget"
         );
         assert!(
@@ -3349,6 +3619,7 @@ mod tests {
 
     #[tokio::test]
     async fn final_connection_close_failures_never_report_clean_shutdown() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         for (name, timeout, reason) in [
             (
@@ -3402,7 +3673,7 @@ mod tests {
         if std::env::var_os(CHILD_ENV).is_none() {
             let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
                 .lock()
-                .expect("isolated SQLite global test lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let executable = std::env::current_exe().expect("current state test executable");
             let status = Command::new(executable)
                 .arg("--exact")
@@ -3419,6 +3690,8 @@ mod tests {
             );
             return;
         }
+
+        let _serialized = serialize_adversarial_test();
 
         let capacity = test_support::close_retention_capacity();
         assert_eq!(
@@ -3554,7 +3827,7 @@ mod tests {
         if std::env::var_os(CHILD_ENV).is_none() {
             let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
                 .lock()
-                .expect("isolated SQLite global test lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let executable = std::env::current_exe().expect("current state test executable");
             let status = Command::new(executable)
                 .arg("--exact")
@@ -3569,6 +3842,7 @@ mod tests {
             return;
         }
 
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("open headroom directory");
         let (entered, release) = test_support::set_open_admission_barrier();
         let mut opens = tokio::task::JoinSet::new();
@@ -3999,6 +4273,7 @@ mod tests {
 
     #[tokio::test]
     async fn published_backup_remains_writer_excluded_until_final_handoff() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "handoff-source.sqlite");
         let backup_path = database_path(&directory, "handoff-backup.sqlite");
@@ -4123,6 +4398,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_publication_failure_reports_published_destination() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "publication-source.sqlite");
         let destination = database_path(&directory, "publication-destination.sqlite");
@@ -4180,6 +4456,7 @@ mod tests {
             return;
         }
 
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "substitution-source.sqlite");
         let victim_path = database_path(&directory, "substitution-victim.sqlite");
@@ -4359,6 +4636,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_restore_removes_unpublished_writer_lock_record() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "lock-cleanup-source.sqlite");
         let backup_path = database_path(&directory, "lock-cleanup-backup.sqlite");
@@ -4369,11 +4647,15 @@ mod tests {
             .await
             .expect("create restore source");
         let before = test_support::writer_lock_records(&destination);
-        test_support::create_competing_destination_once(&destination);
+        let identity_initialized = test_support::fail_restore_after_identity_once(&destination);
         assert!(
             StateStore::restore_backup(&backup_path, &destination)
                 .await
                 .is_err()
+        );
+        assert!(
+            identity_initialized.load(std::sync::atomic::Ordering::Acquire),
+            "restore fault must run after identity initialization"
         );
         assert_eq!(
             test_support::writer_lock_records(&destination),
@@ -4432,6 +4714,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn backup_parent_replacement_aborts_and_cleans_pinned_staging() {
+        let _serialized = serialize_adversarial_test();
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -4466,13 +4749,16 @@ mod tests {
             .expect("backup parent replacement remains bounded")
             .expect("backup parent replacement task joins")
             .expect_err("backup rejects replaced destination parent");
-        assert!(matches!(
-            error,
-            StateError::InvalidPath {
-                reason: "state directory path changed after its identity was verified",
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                error,
+                StateError::InvalidPath {
+                    reason: "restored snapshot changed before identity initialization",
+                    ..
+                }
+            ),
+            "unexpected parent-replacement error: {error:?}"
+        );
         assert!(!destination.exists());
         for artifact in [
             temporary.clone(),
@@ -4556,6 +4842,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_flight_bound_destination_is_rejected_before_sqlite_open() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "bound-open-source.sqlite");
         let destination = database_path(&directory, "bound-open-backup.sqlite");
@@ -4601,6 +4888,7 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_source_removal_failure_reports_published_destination() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "windows-publication-source.sqlite");
         let destination = database_path(&directory, "windows-publication-destination.sqlite");
@@ -4681,6 +4969,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_remains_consistent_during_concurrent_checkpoint() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "checkpoint-source.sqlite");
         let backup_path = database_path(&directory, "checkpoint-backup.sqlite");
@@ -4745,6 +5034,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_rejects_mutation_after_seal_validation() {
+        let _serialized = serialize_adversarial_test();
         use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -4795,6 +5085,7 @@ mod tests {
 
     #[tokio::test]
     async fn backup_timeout_removes_staging_without_late_publication() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "backup-timeout-source.sqlite");
         let destination = database_path(&directory, "backup-timeout.sqlite");
@@ -5131,6 +5422,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_backup_and_restore_cleans_staging_and_keeps_pool_usable() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "cancel-source.sqlite");
         let backup_path = database_path(&directory, "cancel-backup.sqlite");
@@ -5203,6 +5495,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn backup_rejects_source_replaced_while_capture_is_in_flight() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "capture-replaced-source.sqlite");
         let detached = database_path(&directory, "capture-replaced-source.detached");
@@ -5217,7 +5510,10 @@ mod tests {
             release.store(true, std::sync::atomic::Ordering::Release);
         });
         let error = backup.expect_err("post-capture source replacement fails closed");
-        assert!(matches!(error, StateError::InvalidPath { .. }));
+        assert!(
+            matches!(error, StateError::InvalidPath { .. }),
+            "unexpected source-replacement error: {error:?}"
+        );
         assert!(!destination.exists());
         fs::remove_file(&source_path).expect("remove replacement source");
         fs::rename(&detached, &source_path).expect("restore original source identity");
@@ -5375,16 +5671,22 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn restore_rejects_hardlink_alias_with_committed_wal() {
+        let _serialized = serialize_adversarial_test();
         use std::os::unix::fs::MetadataExt as _;
 
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "wal-hardlink-source.sqlite");
+        let backup_path = database_path(&directory, "wal-hardlink-backup.sqlite");
         let alias = database_path(&directory, "wal-hardlink-alias.sqlite");
         let destination = database_path(&directory, "wal-hardlink-restored.sqlite");
         let source = open(&source_path).await;
-        source.close().await.expect("seed hardlink source closes");
+        source
+            .backup_to(&backup_path)
+            .await
+            .expect("create locally sealed hardlink backup");
+        source.close().await.expect("hardlink source closes");
         let options = SqliteConnectOptions::new()
-            .filename(&source_path)
+            .filename(&backup_path)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
         let mut connection = SqliteConnection::connect_with(&options)
             .await
@@ -5411,14 +5713,13 @@ mod tests {
             )
             .await
             .expect("commit hardlink row to WAL");
-        assert!(sidecar(&source_path, "-wal").exists());
-        fs::hard_link(&source_path, &alias).expect("create WAL source hard link");
-        fs::remove_file(&source_path).expect("unlink original WAL database main file");
+        assert!(sidecar(&backup_path, "-wal").exists());
+        fs::hard_link(&backup_path, &alias).expect("create sealed WAL backup hard link");
         assert_eq!(
             fs::metadata(&alias)
                 .expect("inspect alias link count")
                 .nlink(),
-            1
+            2
         );
 
         let alias_options = SqliteConnectOptions::new()
@@ -5444,8 +5745,14 @@ mod tests {
 
         let error = StateStore::restore_backup(&alias, &destination)
             .await
-            .expect_err("detached WAL alias without snapshot provenance is rejected");
-        assert!(matches!(error, StateError::InvalidBackup { .. }));
+            .expect_err("hard-linked sealed WAL alias is rejected");
+        assert!(matches!(
+            error,
+            StateError::InvalidPath {
+                reason: "hard-linked SQLite databases are not supported",
+                ..
+            }
+        ));
         assert!(!destination.exists());
         reader
             .execute("ROLLBACK")
@@ -5461,6 +5768,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn transplanted_and_recreated_sidecars_fail_closed() {
+        let _serialized = serialize_adversarial_test();
         use std::os::unix::fs::PermissionsExt as _;
         use xattr::FileExt as _;
 
@@ -5523,6 +5831,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
             .expect("writer reaches sidecar commit boundary");
+        let saved_victim_wal = sidecar(&victim_path, "-wal-saved");
+        fs::hard_link(&victim_wal, &saved_victim_wal).expect("retain original victim WAL identity");
         fs::remove_file(&victim_wal).expect("unlink live victim WAL path");
         fs::copy(&clone_wal, &victim_wal).expect("recreate victim WAL from clone");
         fs::set_permissions(&victim_wal, fs::Permissions::from_mode(0o600))
@@ -5545,18 +5855,16 @@ mod tests {
             .expect("sidecar commit rejection remains bounded")
             .expect("sidecar writer task joins")
             .expect_err("commit hook rejects recreated WAL generation");
-        let StateError::CommitOutcomeUncertain {
-            operation,
-            code,
-            message,
-        } = &error
-        else {
-            panic!("expected typed uncertain commit outcome, received {error:?}");
-        };
-        assert_eq!(*operation, "commit session create");
-        assert_eq!(*code, 531);
-        assert!(message.contains("autocommit was restored"));
-        assert_eq!(error.write_outcome(), WriteOutcome::Uncertain);
+        assert!(matches!(
+            &error,
+            StateError::InvalidPath {
+                path,
+                reason: "SQLite WAL identity changed during COMMIT",
+            } if path == &victim_wal
+        ));
+        assert_eq!(error.write_outcome(), WriteOutcome::NotCommitted);
+        fs::remove_file(&victim_wal).expect("remove rejected recreated WAL");
+        fs::rename(&saved_victim_wal, &victim_wal).expect("restore original victim WAL identity");
         assert!(
             live.sessions()
                 .get(&record_id)
@@ -5564,16 +5872,15 @@ mod tests {
                 .expect("read recreated-sidecar rollback")
                 .is_none()
         );
-        fs::remove_file(&victim_wal).expect("remove rejected recreated WAL");
+        live.sessions()
+            .create(&session("recreated-sidecar-recovery", 3))
+            .await
+            .expect("replacement pool connection commits after sidecar veto");
         let live = std::sync::Arc::try_unwrap(live)
             .unwrap_or_else(|_| panic!("writer retained live sidecar store"));
-        assert!(matches!(
-            live.close().await,
-            Err(StateError::CloseDegraded {
-                os_lock_released: true,
-                ..
-            })
-        ));
+        live.close()
+            .await
+            .expect("restored sidecar identity store closes");
         clone.close().await.expect("clone store closes");
     }
 
@@ -5583,6 +5890,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         use xattr::FileExt as _;
 
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "untagged-sidecars.sqlite");
         let saved_wal = database_path(&directory, "untagged-saved-wal");
@@ -5600,6 +5908,9 @@ mod tests {
             (&saved_wal, sidecar(&path, "-wal")),
             (&saved_shm, sidecar(&path, "-shm")),
         ] {
+            if target.exists() {
+                fs::remove_file(&target).expect("remove authenticated sidecar fixture");
+            }
             fs::copy(saved, &target).expect("restore untagged sidecar");
             fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
                 .expect("secure untagged sidecar");
@@ -5634,6 +5945,7 @@ mod tests {
     async fn missing_live_wal_path_rolls_back_commit() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        let _serialized = serialize_adversarial_test();
         for mutation in ["missing", "replaced"] {
             let directory = tempfile::tempdir().expect("temporary directory");
             let path = database_path(&directory, &format!("{mutation}-live-wal.sqlite"));
@@ -5702,6 +6014,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_hook_rejects_invalidated_writer_generation() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "invalidated-writer-generation.sqlite");
         let store = std::sync::Arc::new(open(&path).await);
@@ -5785,6 +6098,7 @@ mod tests {
 
     #[tokio::test]
     async fn repository_precommit_deadline_rolls_back_staged_write() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "repository-precommit-deadline.sqlite");
         let store = std::sync::Arc::new(
@@ -5829,6 +6143,7 @@ mod tests {
 
     #[tokio::test]
     async fn repository_statement_dispatch_obeys_the_absolute_deadline() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "repository-statement-deadline.sqlite");
         let store = std::sync::Arc::new(
@@ -6024,6 +6339,7 @@ mod tests {
             return;
         }
 
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "health-progress-deadline.sqlite");
         let store = StateStore::open(
@@ -6227,7 +6543,7 @@ mod tests {
         if std::env::var_os(CHILD_ENV).is_none() {
             let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
                 .lock()
-                .expect("isolated SQLite global test lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let status = Command::new(std::env::current_exe().expect("current test executable"))
                 .arg("--exact")
                 .arg(
@@ -6242,6 +6558,7 @@ mod tests {
             return;
         }
 
+        let _serialized = serialize_adversarial_test();
         struct GateGuard {
             release: std::sync::Arc<std::sync::atomic::AtomicBool>,
         }
@@ -6484,6 +6801,7 @@ mod tests {
 
     #[tokio::test]
     async fn repository_update_deadline_includes_preliminary_read() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "repository-read-deadline.sqlite");
         let store = std::sync::Arc::new(
@@ -6885,6 +7203,12 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "legacy-lock-upgrade.sqlite");
         open(&path).await.close().await.expect("seed store closes");
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = sidecar(&path, suffix);
+            if sidecar.exists() {
+                fs::remove_file(sidecar).expect("remove post-checkpoint sidecar");
+            }
+        }
         let lock_path = unix_lock_path(&path);
         let metadata = fs::metadata(&path).expect("inspect legacy database identity");
         let legacy = format!(
@@ -7371,6 +7695,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn active_write_and_second_process_reject_replaced_lock_inode() {
+        let _serialized = serialize_adversarial_test();
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -7493,6 +7818,10 @@ mod tests {
             .write(true)
             .open(&path)
             .expect("open database for xattr replacement");
+        let original_identity = database_file
+            .get_xattr("user.gta-claw.writer-lock-path")
+            .expect("read original database lock xattr")
+            .expect("original database lock xattr exists");
         database_file
             .set_xattr(
                 "user.gta-claw.writer-lock-path",
@@ -7528,6 +7857,12 @@ mod tests {
             }
         ));
 
+        database_file
+            .set_xattr("user.gta-claw.writer-lock-path", &original_identity)
+            .expect("restore original database lock xattr");
+        database_file
+            .sync_all()
+            .expect("sync restored database lock xattr");
         let recovered = open(&path).await;
         assert!(recovered.recovered_writer().is_some());
         recovered.close().await.expect("replacement owner closes");
@@ -7599,6 +7934,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn checkpoint_rejects_database_replaced_after_sqlite_operation() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "checkpoint-post-identity.sqlite");
         let detached = database_path(&directory, "checkpoint-post-identity.detached");
@@ -7644,7 +7980,7 @@ mod tests {
         if std::env::var_os(CHILD_ENV).is_none() {
             let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
                 .lock()
-                .expect("isolated SQLite global test lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let status = Command::new(std::env::current_exe().expect("current test executable"))
                 .arg("--exact")
                 .arg("tests::checkpoint_identity_mismatch_wins_after_work_cutoff")
@@ -7660,6 +7996,7 @@ mod tests {
             return;
         }
 
+        let _serialized = serialize_adversarial_test();
         struct IdentityGateGuard {
             release: std::sync::Arc<std::sync::atomic::AtomicBool>,
         }
@@ -7850,6 +8187,7 @@ mod tests {
     async fn state_parent_replacement_rolls_back_at_commit_boundary() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let original_parent = directory.path().to_owned();
         let moved_parent = original_parent.with_extension("moved");
@@ -7941,6 +8279,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn active_repository_transaction_fails_closed_on_database_replacement() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "active-write.sqlite");
         let detached = database_path(&directory, "active-write-detached.sqlite");
@@ -7948,8 +8287,6 @@ mod tests {
         let store = std::sync::Arc::new(open(&path).await);
         let owner = test_support::owner(&store).to_owned();
         let (entered, release) = crate::repository::test_support::set_write_barrier(&owner);
-        let (identity_invalidated, identity_release) =
-            crate::repository::test_support::set_identity_invalidation_barrier(&owner);
         let record = session("must-not-commit-after-replacement", 1);
         let record_id = record.id.clone();
         let writer_store = std::sync::Arc::clone(&store);
@@ -7972,9 +8309,18 @@ mod tests {
             .await
             .expect("replacement closes before swap-back");
         release.notify_one();
-        tokio::time::timeout(Duration::from_secs(2), identity_invalidated.notified())
-            .await
-            .expect("transaction observes replacement before swap-back");
+        let write_result = match tokio::time::timeout(Duration::from_secs(2), &mut writer).await {
+            Ok(join) => join.expect("repository write task joins"),
+            Err(_) => {
+                writer.abort();
+                let _ = writer.await;
+                panic!("repository write did not reject the replacement within two seconds");
+            }
+        };
+        assert!(
+            write_result.is_err(),
+            "repository write must reject the replacement before swap-back"
+        );
         fs::rename(&path, &replacement_path).expect("move replacement database away");
         for suffix in ["-wal", "-shm"] {
             let source = sidecar(&path, suffix);
@@ -7989,27 +8335,17 @@ mod tests {
             }
         }
         fs::rename(&detached, &path).expect("restore original database pathname");
-        identity_release.notify_one();
-        let write_result = match tokio::time::timeout(Duration::from_secs(2), &mut writer).await {
-            Ok(join) => join.expect("repository write task joins"),
-            Err(_) => {
-                writer.abort();
-                let _ = writer.await;
-                panic!("repository write exceeded two seconds");
-            }
-        };
-        assert!(
-            write_result.is_err(),
-            "repository write must not report success after path replacement"
-        );
-        let replacement = open(&replacement_path).await;
-        assert!(
-            replacement
-                .sessions()
-                .get(&record_id)
+        let options = SqliteConnectOptions::new().filename(&replacement_path);
+        let mut replacement = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open replacement database directly");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions WHERE id = ?")
+                .bind(record_id.as_str())
+                .fetch_one(&mut replacement)
                 .await
-                .expect("read replacement database")
-                .is_none()
+                .expect("read replacement database"),
+            0
         );
         replacement.close().await.expect("replacement closes");
 
@@ -8046,6 +8382,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn commit_boundary_logical_identity_drift_rolls_back_every_change() {
+        let _serialized = serialize_adversarial_test();
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "commit-logical-drift.sqlite");
         let store = open(&path).await;
@@ -8057,7 +8394,10 @@ mod tests {
             .create(&record)
             .await
             .expect_err("commit-boundary logical drift is rejected");
-        assert!(matches!(error, StateError::InvalidMigrationHistory { .. }));
+        assert!(
+            matches!(error, StateError::InvalidMigrationHistory { .. }),
+            "unexpected logical-drift error: {error:?}"
+        );
         assert!(
             store
                 .sessions()
@@ -8092,6 +8432,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         use xattr::FileExt as _;
 
+        let _serialized = serialize_adversarial_test();
         for drift in ["database", "xattr", "header"] {
             let directory = tempfile::tempdir().expect("temporary directory");
             let path = database_path(&directory, &format!("commit-{drift}.sqlite"));

@@ -7870,7 +7870,13 @@ mod tests {
             .await
             .expect_err("deadline-bound publication must fail before selector commit");
         assert!(
-            error.to_string().contains("timed out"),
+            matches!(
+                &error,
+                StateError::OperationTimedOut {
+                    operation: "LinuxProtected snapshot publication",
+                    timeout_ms: 500,
+                }
+            ),
             "deadline failure must remain timeout-shaped: {error:?}"
         );
         assert!(!matches!(error, StateError::PublicationUncertain { .. }));
@@ -8815,6 +8821,7 @@ mod tests {
 
     #[tokio::test]
     async fn committed_wal_discards_spilled_pages_above_final_size() {
+        let _serialized = crate::serialize_adversarial_test();
         let temporary = tempfile::tempdir().expect("create WAL shrink fixture");
         let database_path = temporary.path().join(DATABASE_NAME);
         let wal_path = temporary.path().join(WAL_NAME);
@@ -8889,6 +8896,7 @@ mod tests {
 
     #[tokio::test]
     async fn committed_wal_shrink_then_regrow_retains_high_page() {
+        let _serialized = crate::serialize_adversarial_test();
         let temporary = tempfile::tempdir().expect("create WAL regrow fixture");
         let database_path = temporary.path().join(DATABASE_NAME);
         let wal_path = temporary.path().join(WAL_NAME);
@@ -9188,6 +9196,7 @@ mod tests {
         if run_root_driver() {
             return;
         }
+        let _serialized = crate::serialize_adversarial_test();
         assert!(
             rustix::process::getuid().is_root() && rustix::process::geteuid().is_root(),
             "LinuxProtected acceptance requires a real/effective root driver"

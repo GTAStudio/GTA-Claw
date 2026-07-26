@@ -199,6 +199,21 @@ impl ActiveStoreProfile {
         Ok(())
     }
 
+    async fn enable_portable_persistent_wal(
+        &self,
+        connection: &mut SqliteConnection,
+    ) -> Result<(), sqlx::Error> {
+        #[cfg(unix)]
+        if matches!(self, Self::PortablePrivate) {
+            claw_sqlite_file_control::enable_persistent_wal(connection)
+                .await
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        }
+        #[cfg(not(unix))]
+        let _ = (self, connection);
+        Ok(())
+    }
+
     async fn install_commit_guard(
         &self,
         connection: &mut SqliteConnection,
@@ -1190,10 +1205,17 @@ where
     ensure_state_cleanup_executor(deadline)
         .await
         .map_err(|error| {
-            database(
-                "prepare bounded filesystem executor",
-                sqlx::Error::Protocol(error),
-            )
+            if error == "state cleanup executor readiness timed out" {
+                StateError::OperationTimedOut {
+                    operation,
+                    timeout_ms,
+                }
+            } else {
+                database(
+                    "prepare bounded filesystem executor",
+                    sqlx::Error::Protocol(error),
+                )
+            }
         })?;
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let decision = Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
@@ -1357,6 +1379,10 @@ static CREATE_DESTINATION_BEFORE_PUBLICATION: std::sync::LazyLock<
     Mutex<std::collections::HashSet<PathBuf>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 #[cfg(test)]
+static FAIL_RESTORE_AFTER_IDENTITY: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, Arc<std::sync::atomic::AtomicBool>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
 static STALL_HEALTH_PROGRESS: std::sync::LazyLock<Mutex<std::collections::HashSet<PathBuf>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 #[cfg(test)]
@@ -1460,6 +1486,9 @@ static FINAL_CONNECTION_CLOSE_FAILURES: std::sync::LazyLock<
 static PANIC_CLOSE_AFTER_OWNERSHIP_GUARD: std::sync::LazyLock<
     Mutex<std::collections::HashSet<PathBuf>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+#[cfg(test)]
+static FAIL_PORTABLE_SIDECAR_INITIALIZATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 #[cfg(all(test, unix))]
 static FAIL_SNAPSHOT_CLEANUP_AFTER_RENAME: std::sync::LazyLock<
     Mutex<std::collections::HashMap<PathBuf, CountedFailure>>,
@@ -3322,6 +3351,7 @@ impl StateStore {
                             profile
                                 .secure_sidecars(&path, lock_identity.as_deref())
                                 .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
+                            profile.enable_portable_persistent_wal(connection).await?;
                             profile
                                 .install_commit_guard(
                                     connection,
@@ -3450,7 +3480,7 @@ impl StateStore {
                                 lock_file,
                                 lock_identity,
                                 profile: profile.clone(),
-                                ready,
+                                ready: Arc::clone(&ready),
                                 result: Arc::clone(&verified),
                             },
                             verifier_retired.signal(),
@@ -3530,6 +3560,9 @@ impl StateStore {
                             })?;
                         verified.map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
                         profile.verify_connection(connection).await?;
+                        if ready.load(std::sync::atomic::Ordering::Acquire) {
+                            profile.enable_portable_persistent_wal(connection).await?;
+                        }
                         Ok(true)
                     })
                 })
@@ -3665,11 +3698,30 @@ impl StateStore {
                     );
                 }
             };
-        if let Err(error) = initialize_connection_sidecars(&mut initial).await {
+        let sidecar_initialization = initialize_connection_sidecars(&mut initial).await;
+        #[cfg(test)]
+        let sidecar_initialization = sidecar_initialization.and_then(|()| {
+            if FAIL_PORTABLE_SIDECAR_INITIALIZATION.swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                Err(sqlx::Error::Protocol(
+                    "injected portable sidecar initialization failure".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = sidecar_initialization {
             let primary = database("initialize SQLite sidecars", error);
             let rollback = initial.rollback().await;
             let primary = match rollback {
-                Ok(_) => primary,
+                Ok(connection) => match connection.close().await {
+                    Ok(()) => primary,
+                    Err(cleanup) => StateError::OperationCleanupFailed {
+                        operation: "initialize SQLite sidecars",
+                        primary: Box::new(primary),
+                        cleanup: format!("close rolled-back initialization connection: {cleanup}"),
+                    },
+                },
                 Err(cleanup) => StateError::OperationCleanupFailed {
                     operation: "initialize SQLite sidecars",
                     primary: Box::new(primary),
@@ -3692,6 +3744,10 @@ impl StateStore {
                     file_control_database("commit SQLite sidecar initialization", error)
                 })?;
             active_profile.secure_sidecars(&path, lock_identity.as_deref())?;
+            active_profile
+                .enable_portable_persistent_wal(&mut initial)
+                .await
+                .map_err(|error| database("enable initial persistent WAL", error))?;
             active_profile
                 .install_commit_guard(
                     &mut initial,
@@ -3738,6 +3794,10 @@ impl StateStore {
                 )
             })?;
             active_profile.secure_sidecars(&path, lock_identity.as_deref())?;
+            active_profile
+                .enable_portable_persistent_wal(&mut configured_connection)
+                .await
+                .map_err(|error| database("enable configured persistent WAL", error))?;
             active_profile
                 .install_commit_guard(
                     &mut configured_connection,
@@ -5013,6 +5073,27 @@ impl StateStore {
                 return Err(cleanup_snapshot_guard_or_error(&mut guard, error).await);
             }
         };
+        #[cfg(test)]
+        let restore_identity_failure = FAIL_RESTORE_AFTER_IDENTITY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&destination);
+        #[cfg(test)]
+        if let Some(observed) = restore_identity_failure {
+            observed.store(true, std::sync::atomic::Ordering::Release);
+            let mut identity_guard = identity_guard;
+            let primary = cleanup_identity_or_error(
+                "SQLite restore",
+                &mut identity_guard,
+                StateError::InvalidPath {
+                    path: destination.clone(),
+                    reason: "injected failure after restored identity initialization",
+                },
+            );
+            drop(pinned);
+            let mut temporary_guard = temporary_guard;
+            return Err(cleanup_snapshot_guard_or_error(&mut temporary_guard, primary).await);
+        }
         let publication_destination = destination.clone();
         let publication_deadline_state = Arc::clone(&deadline_state);
         let mut pinned = Some(pinned);
@@ -6173,7 +6254,13 @@ fn initialize_restored_store_identity(
     expected_file: &File,
     _published_path: &Path,
 ) -> Result<RestoredIdentityGuard, StateError> {
-    let file = open_database_file(path)?;
+    if !path_entry_exists(path)? {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "restored snapshot changed before identity initialization",
+        });
+    }
+    let file = open_existing_file_no_follow(path)?;
     if !files_share_identity_from_handles_portable(expected_file, &file)? {
         return Err(StateError::InvalidPath {
             path: path.to_owned(),
@@ -8450,6 +8537,7 @@ mod open_deadline_tests {
 
     #[test]
     fn dropped_open_runtime_readiness_receiver_stops_all_workers() {
+        let _serialized = crate::serialize_adversarial_test();
         let (ready, receiver) = std::sync::mpsc::sync_channel(1);
         drop(receiver);
         std::thread::Builder::new()
@@ -8462,6 +8550,7 @@ mod open_deadline_tests {
 
     #[tokio::test]
     async fn bootstrap_pool_acquire_uses_the_immutable_work_cutoff() {
+        let _serialized = crate::serialize_adversarial_test();
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -8508,6 +8597,7 @@ mod open_deadline_tests {
 
     #[tokio::test]
     async fn migration_application_id_acquire_uses_the_immutable_work_cutoff() {
+        let _serialized = crate::serialize_adversarial_test();
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -8557,6 +8647,7 @@ mod open_deadline_tests {
 
     #[tokio::test]
     async fn application_id_read_crossing_cutoff_never_starts_migration() {
+        let _serialized = crate::serialize_adversarial_test();
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -8636,6 +8727,7 @@ mod open_deadline_tests {
             return;
         }
 
+        let _serialized = crate::serialize_adversarial_test();
         struct GateGuard {
             result_release: Arc<std::sync::atomic::AtomicBool>,
             retirement_release: Arc<std::sync::atomic::AtomicBool>,
@@ -8732,6 +8824,7 @@ mod open_deadline_tests {
             return;
         }
 
+        let _serialized = crate::serialize_adversarial_test();
         for failure in ["row-count", "statement"] {
             let pool = sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
@@ -8921,6 +9014,7 @@ mod snapshot_quarantine_tests {
 
     #[test]
     fn concurrent_reservations_cannot_exceed_residual_quota() {
+        let _serialized = crate::serialize_adversarial_test();
         let directory = private_tempdir();
         let database = directory.path().join("state.sqlite");
         let parent = pin_private_directory(&database).expect("pin quarantine quota directory");
@@ -8967,6 +9061,7 @@ mod snapshot_quarantine_tests {
             return;
         }
 
+        let _serialized = crate::serialize_adversarial_test();
         let directory = private_tempdir();
         let mut cleanups = tokio::task::JoinSet::new();
         for index in 0..16 {
@@ -9034,6 +9129,7 @@ mod snapshot_quarantine_tests {
             return;
         }
 
+        let _serialized = crate::serialize_adversarial_test();
         let directory = private_tempdir();
         let path = directory.path().join("persistent-cleanup.sqlite");
         let mut guard = staging_cleanup_guard(&path).await;
@@ -9168,6 +9264,7 @@ mod trusted_backup_seal_cleanup_tests {
 
     #[test]
     fn transient_post_unlink_failure_resumes_at_parent_sync() {
+        let _serialized = crate::serialize_adversarial_test();
         let directory = super::snapshot_quarantine_tests::private_tempdir();
         let path = directory.path().join("transient-seal.record");
         let (mut seal, attempts) = trusted_seal_fixture(&path, 1);
@@ -9202,6 +9299,7 @@ mod trusted_backup_seal_cleanup_tests {
 
     #[test]
     fn persistent_post_unlink_failure_returns_without_reunlinking() {
+        let _serialized = crate::serialize_adversarial_test();
         let directory = super::snapshot_quarantine_tests::private_tempdir();
         let path = directory.path().join("persistent-seal.record");
         let (mut seal, attempts) = trusted_seal_fixture(&path, usize::MAX);
@@ -16021,16 +16119,17 @@ async fn backup_pool(
             );
         }
     };
-    let sqlite_identity = match operational_identity {
-        Some(identity) => identity.profile.verify_connection(&mut connection).await,
-        None => verify_sqlite_connection_identity(&mut connection).await,
-    }
-    .map_err(|error| database("reverify backup source SQLite identity", error));
-    let source_identity = sqlite_identity.and_then(|()| {
-        operational_identity
-            .map(OperationalIdentity::verify)
-            .unwrap_or(Ok(()))
-    });
+    let source_identity = operational_identity
+        .map(OperationalIdentity::verify)
+        .unwrap_or(Ok(()));
+    let source_identity = match source_identity {
+        Ok(()) => match operational_identity {
+            Some(identity) => identity.profile.verify_connection(&mut connection).await,
+            None => verify_sqlite_connection_identity(&mut connection).await,
+        }
+        .map_err(|error| database("reverify backup source SQLite identity", error)),
+        Err(error) => Err(error),
+    };
     if let Err(error) = source_identity {
         let close = connection.discard().await;
         let error = if close == claw_sqlite_file_control::TerminalCloseOutcome::Closed {
@@ -17103,6 +17202,12 @@ pub(crate) mod test_support {
         migration_checksum(sql)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn fail_portable_sidecar_initialization_once() {
+        super::FAIL_PORTABLE_SIDECAR_INITIALIZATION
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     pub(crate) fn initialize_store_identity_fixture(path: &Path) {
         let path = super::resolve_database_path(path).expect("resolve store identity fixture path");
         let database_file =
@@ -17499,6 +17604,24 @@ pub(crate) mod test_support {
             .lock()
             .expect("publication race lock poisoned")
             .insert(destination);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn fail_restore_after_identity_once(
+        destination: &Path,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let destination =
+            super::resolve_database_path(destination).expect("resolve restore identity fault path");
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let previous = super::FAIL_RESTORE_AFTER_IDENTITY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(destination, std::sync::Arc::clone(&observed));
+        assert!(
+            previous.is_none(),
+            "restore identity fault is registered once"
+        );
+        observed
     }
 
     pub(crate) async fn assert_snapshot_memory_saturation() {
