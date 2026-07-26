@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "crate_name": "claw-acp",
+  "features": [
+    {
+      "feature_id": "interop.acp.server",
+      "level": "implemented",
+      "evidence": [
+        {
+          "path": "crates/claw-acp/tests/subprocess_interop.rs",
+          "test": "debug_client_exercises_bridge_lifecycle_and_streaming"
+        },
+        {
+          "path": "crates/claw-acp/tests/subprocess_interop.rs",
+          "test": "debug_client_resumes_and_configures_a_session"
+        }
+      ],
+      "implementation_pointers": [
+        {
+          "path": "crates/claw-acp/src/bridge.rs",
+          "note": "Implements the ACP stdio server bridge, request dispatch, lifecycle methods, streaming, cancellation, modes, and permissions."
+        },
+        {
+          "path": "crates/claw-acp/src/protocol.rs",
+          "note": "Implements bounded newline-delimited bidirectional JSON-RPC framing and connection-wide failure propagation."
+        }
+      ]
+    },
+    {
+      "feature_id": "interop.acp.client",
+      "level": "implemented",
+      "evidence": [
+        {
+          "path": "crates/claw-acp/tests/subprocess_interop.rs",
+          "test": "debug_client_exercises_bridge_lifecycle_and_streaming"
+        },
+        {
+          "path": "crates/claw-acp/tests/subprocess_interop.rs",
+          "test": "debug_client_resumes_and_configures_a_session"
+        },
+        {
+          "path": "crates/claw-acp/tests/subprocess_interop.rs",
+          "test": "debug_client_rejects_unsupported_protocol_version"
+        }
+      ],
+      "implementation_pointers": [
+        {
+          "path": "crates/claw-acp/src/debug_client.rs",
+          "note": "Implements protocol negotiation, session lifecycle, prompt streaming, cancellation, permission handling, and subprocess-tree supervision."
+        }
+      ]
+    },
+    {
+      "feature_id": "interop.acpx",
+      "level": "implemented",
+      "evidence": [
+        {
+          "path": "crates/claw-acp/tests/acpx_interop.rs",
+          "test": "runtime_resolves_aliases_persists_sessions_and_completes_leases"
+        },
+        {
+          "path": "crates/claw-acp/tests/acpx_interop.rs",
+          "test": "registry_stdio_configuration_maps_to_exact_acp_mcp_shape"
+        },
+        {
+          "path": "crates/claw-acp/src/acpx.rs",
+          "test": "tests::permission_policy_is_fail_closed_and_allowlisted"
+        },
+        {
+          "path": "crates/claw-acp/src/acpx.rs",
+          "test": "tests::process_leases_enforce_exclusivity_and_completion"
+        }
+      ],
+      "implementation_pointers": [
+        {
+          "path": "crates/claw-acp/src/acpx.rs",
+          "note": "Implements harness aliases, fail-closed permissions, process leases, persistent and one-shot turns, and optional MCP bridge conversion."
+        }
+      ]
+    }
+  ],
+  "inventories": []
+}
