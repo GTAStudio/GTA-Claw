@@ -31,7 +31,9 @@ clear_native_configuration_fence() {
     'configuration active:21' | 'configuration inactive:23')
       rm -f "$persistent_failure_marker" || return 1
       /usr/bin/sync -f "$persistent_runtime_directory" || return 1
-      rmdir "$persistent_runtime_directory" >/dev/null 2>&1 || true
+      if rmdir "$persistent_runtime_directory" >/dev/null 2>&1; then
+        :
+      fi
       ;;
   esac
 }

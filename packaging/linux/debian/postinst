@@ -138,7 +138,11 @@ prepare_abort_deconfigure_configuration() {
   [ "$(stat -c '%u:%g:%a' "$persistent_runtime_directory")" = "0:0:700" ] ||
     return 1
   intent=inactive
-  active_state="$(systemctl show -P ActiveState gta-claw-daemon.service 2>/dev/null || true)"
+  if ! active_state="$(
+    systemctl show -P ActiveState gta-claw-daemon.service 2>/dev/null
+  )"; then
+    return 1
+  fi
   case "$active_state" in
     active | activating | reloading | deactivating) intent=active ;;
   esac
