@@ -61,6 +61,12 @@ version = "=0.16.1"
 name = "sha2"
 version = "=0.10.9"
 
+# Wasmtime/Cranelift's SHA-2 0.10 line requires generic-array 0.14, while
+# russh 0.62 mandates the 1.x line and enables its non-optional compat-0_14 bridge.
+[[bans.skip]]
+name = "generic-array"
+version = "=0.14.7"
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
