@@ -1,0 +1,98 @@
+// Reusable presentation pieces for the GTA Claw Android shell.
+
+import { Palette } from "std-widgets.slint";
+import { Tokens } from "tokens.slint";
+
+export enum StatusKind {
+    neutral,
+    info,
+    success,
+    warning,
+    danger,
+}
+
+export component StatusPill inherits Rectangle {
+    in property <string> label;
+    in property <StatusKind> kind: StatusKind.neutral;
+
+    property <color> tint: root.kind == StatusKind.success ? Tokens.success
+        : root.kind == StatusKind.warning ? Tokens.warning
+        : root.kind == StatusKind.danger ? Tokens.danger
+        : root.kind == StatusKind.info ? Tokens.info
+        : Tokens.neutral;
+
+    background: root.tint.with-alpha(0.14);
+    border-radius: Tokens.pill-radius;
+    horizontal-stretch: 0;
+    min-width: pill-text.preferred-width + 24px;
+    height: 28px;
+
+    pill-text := Text {
+        x: 12px;
+        text: root.label;
+        color: root.tint;
+        font-size: Tokens.label-size;
+        font-weight: 600;
+        vertical-alignment: center;
+        accessible-role: text;
+        accessible-label: root.label;
+    }
+}
+
+export component SummaryRow inherits VerticalLayout {
+    in property <string> label;
+    in property <string> value;
+
+    spacing: Tokens.tight-gap;
+
+    Text {
+        text: root.label;
+        font-size: Tokens.label-size;
+        color: Palette.foreground.with-alpha(0.6);
+    }
+
+    Text {
+        text: root.value;
+        font-size: Tokens.value-size;
+        color: Palette.foreground;
+        wrap: word-wrap;
+        accessible-role: text;
+        accessible-label: root.label + ": " + root.value;
+    }
+}
+
+export component NoticeBanner inherits Rectangle {
+    in property <string> message;
+    in property <string> action;
+    in property <StatusKind> kind: StatusKind.info;
+
+    property <color> tint: root.kind == StatusKind.danger ? Tokens.danger
+        : root.kind == StatusKind.warning ? Tokens.warning
+        : Tokens.info;
+
+    background: root.tint.with-alpha(0.10);
+    border-radius: Tokens.radius;
+    border-width: 1px;
+    border-color: root.tint.with-alpha(0.35);
+    height: banner-layout.preferred-height;
+
+    banner-layout := VerticalLayout {
+        padding: Tokens.gap;
+        spacing: Tokens.tight-gap;
+
+        Text {
+            text: root.message;
+            font-size: Tokens.value-size;
+            font-weight: 600;
+            color: root.tint;
+            wrap: word-wrap;
+        }
+
+        if root.action != "": Text {
+            text: root.action;
+            font-size: Tokens.label-size;
+            color: Palette.foreground.with-alpha(0.75);
+            wrap: word-wrap;
+        }
+    }
+}

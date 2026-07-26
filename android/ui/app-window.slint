@@ -1,0 +1,237 @@
+// GTA Claw Android shell.
+//
+// The window is drawn edge to edge, so every inset is taken from the platform
+// rather than assumed: `safe-area-insets` covers the status bar, the gesture
+// bar and any display cutout, and `virtual-keyboard-position` lifts the content
+// above the IME instead of letting it cover the field being edited.
+
+import { Button, CheckBox, LineEdit, Palette, ScrollView } from "std-widgets.slint";
+import { Tokens } from "@gta-ui/tokens.slint";
+import { NoticeBanner, StatusKind, StatusPill, SummaryRow } from "@gta-ui/shell.slint";
+
+export { StatusKind }
+
+export component AppWindow inherits Window {
+    title: "GTA Claw";
+    background: Palette.background;
+
+    in property <string> title-text: "Not connected";
+    in property <string> detail-text;
+    in property <string> status-label: "Idle";
+    in property <StatusKind> status-kind: StatusKind.neutral;
+
+    in property <string> endpoint-summary;
+    in property <string> server-summary: "—";
+    in property <string> protocol-summary: "—";
+    in property <string> role-summary: "—";
+    in property <string> scopes-summary: "—";
+    in property <string> identity-summary: "not generated";
+    in property <string> credential-notice;
+    in property <string> transport-notice;
+    in property <string> runtime-summary: "—";
+    in property <string> core-protocol-summary: "—";
+
+    in property <bool> busy: false;
+    in property <bool> can-connect: true;
+    in property <bool> can-disconnect: false;
+
+    in property <string> error-message;
+    in property <string> error-action;
+
+    callback connect-requested(endpoint: string, token: string, allow-plaintext: bool);
+    callback disconnect-requested();
+
+    // Clears the token editor's visible content. The IME keeps its own preedit
+    // buffer, which only the platform can drop, so this is not a claim that the
+    // token is gone from the device's input method.
+    public function clear-token-input() {
+        token-input.text = "";
+    }
+
+    // Android docks the IME to the bottom of the window, so the height it
+    // reports is exactly the strip of window it covers.
+    //
+    // Deliberately *not* `root.height - virtual-keyboard-position.y`: reading
+    // `root.height` here closes a binding loop (height -> layout -> padding ->
+    // this inset -> height) that Slint 1.17 reports as deprecated and warns may
+    // panic at runtime. The docked-keyboard height carries the same information
+    // without depending on the layout it feeds.
+    property <length> keyboard-inset: root.virtual-keyboard-size.height;
+    property <length> bottom-inset: max(root.safe-area-insets.bottom, root.keyboard-inset);
+
+    VerticalLayout {
+        padding-left: root.safe-area-insets.left + Tokens.page-padding;
+        padding-right: root.safe-area-insets.right + Tokens.page-padding;
+        padding-top: root.safe-area-insets.top + Tokens.page-padding;
+        padding-bottom: root.bottom-inset + Tokens.page-padding;
+
+        ScrollView {
+            VerticalLayout {
+                spacing: Tokens.gap;
+
+                HorizontalLayout {
+                    spacing: Tokens.gap;
+                    alignment: space-between;
+
+                    Text {
+                        text: root.title-text;
+                        font-size: Tokens.title-size;
+                        font-weight: 700;
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                        wrap: word-wrap;
+                        horizontal-stretch: 1;
+                        accessible-role: text;
+                        accessible-label: root.title-text;
+                    }
+
+                    StatusPill {
+                        label: root.status-label;
+                        kind: root.status-kind;
+                    }
+                }
+
+                Text {
+                    text: root.detail-text;
+                    font-size: Tokens.value-size;
+                    color: Palette.foreground.with-alpha(0.75);
+                    wrap: word-wrap;
+                }
+
+                if root.error-message != "": NoticeBanner {
+                    message: root.error-message;
+                    action: root.error-action;
+                    kind: StatusKind.danger;
+                }
+
+                Rectangle {
+                    background: Palette.alternate-background;
+                    border-radius: Tokens.radius;
+                    height: form-layout.preferred-height;
+
+                    form-layout := VerticalLayout {
+                        padding: Tokens.gap;
+                        spacing: Tokens.gap;
+
+                        Text {
+                            text: "Gateway";
+                            font-size: Tokens.label-size;
+                            font-weight: 600;
+                            color: Palette.foreground.with-alpha(0.6);
+                        }
+
+                        endpoint-input := LineEdit {
+                            placeholder-text: "wss://gateway.example.com:8443";
+                            enabled: !root.busy;
+                            input-type: text;
+                            accessible-label: "Gateway address";
+                        }
+
+                        token-input := LineEdit {
+                            placeholder-text: "Gateway token (optional)";
+                            enabled: !root.busy;
+                            input-type: password;
+                            accessible-label: "Gateway token";
+                        }
+
+                        plaintext-consent := CheckBox {
+                            text: "Allow plaintext ws:// to this host";
+                            enabled: !root.busy;
+                        }
+
+                        Text {
+                            text: root.transport-notice;
+                            font-size: Tokens.label-size;
+                            color: Palette.foreground.with-alpha(0.6);
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: Tokens.gap;
+
+                            Button {
+                                text: root.busy ? "Connecting…" : "Connect";
+                                primary: true;
+                                enabled: root.can-connect;
+                                horizontal-stretch: 1;
+                                clicked => {
+                                    root.connect-requested(
+                                        endpoint-input.text,
+                                        token-input.text,
+                                        plaintext-consent.checked,
+                                    );
+                                }
+                            }
+
+                            Button {
+                                text: "Disconnect";
+                                enabled: root.can-disconnect;
+                                horizontal-stretch: 1;
+                                clicked => {
+                                    root.disconnect-requested();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    background: Palette.alternate-background;
+                    border-radius: Tokens.radius;
+                    height: detail-layout.preferred-height;
+
+                    detail-layout := VerticalLayout {
+                        padding: Tokens.gap;
+                        spacing: Tokens.gap;
+
+                        SummaryRow {
+                            label: "Endpoint";
+                            value: root.endpoint-summary;
+                        }
+
+                        SummaryRow {
+                            label: "Server";
+                            value: root.server-summary;
+                        }
+
+                        SummaryRow {
+                            label: "Gateway protocol";
+                            value: root.protocol-summary;
+                        }
+
+                        SummaryRow {
+                            label: "Granted role";
+                            value: root.role-summary;
+                        }
+
+                        SummaryRow {
+                            label: "Granted scopes";
+                            value: root.scopes-summary;
+                        }
+
+                        SummaryRow {
+                            label: "Device identity";
+                            value: root.identity-summary;
+                        }
+
+                        SummaryRow {
+                            label: "Runtime";
+                            value: root.runtime-summary;
+                        }
+
+                        SummaryRow {
+                            label: "Core protocol";
+                            value: root.core-protocol-summary;
+                        }
+                    }
+                }
+
+                NoticeBanner {
+                    message: "Credential storage";
+                    action: root.credential-notice;
+                    kind: StatusKind.warning;
+                }
+            }
+        }
+    }
+}

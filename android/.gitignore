@@ -1,0 +1,5 @@
+# This crate is its own Cargo workspace (see the `[workspace]` table in
+# `Cargo.toml`), so its build directory is not covered by the repository root's
+# anchored `/target/` rule. Keeping the ignore local avoids editing a shared
+# root file that every other session in this fleet also touches.
+/target/

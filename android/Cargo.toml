@@ -1,0 +1,58 @@
+[workspace]
+resolver = "3"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+# The android-activity entry point is an unmangled `android_main` symbol that the
+# Android runtime resolves by name, so exactly one exported function opts out.
+# Every crate under `crates/` and `apps/gta-claw-{cli,daemon}` keeps `forbid`.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[package]
+name = "gta-claw-android"
+description = "Native Slint Android client for GTA Claw"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+license = "MIT"
+repository = "https://github.com/GTAStudio/GTA-Claw"
+publish = false
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+claw-application = { path = "../crates/claw-application", version = "0.1.0" }
+claw-gateway-client = { path = "../crates/claw-gateway-client", version = "0.1.0" }
+claw-platform = { path = "../crates/claw-platform", version = "0.1.0" }
+claw-protocol = { path = "../crates/claw-protocol", version = "0.1.0" }
+claw-security = { path = "../crates/claw-security", version = "0.1.0" }
+getrandom = { version = "=0.4.3", features = ["sys_rng"] }
+secrecy = "=0.10.3"
+tokio = { version = "=1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "=0.7.18", features = ["rt"] }
+url = "=2.5.8"
+
+[target.'cfg(target_os = "android")'.dependencies]
+slint = { version = "=1.17.1", default-features = false, features = [
+  "backend-android-activity-06",
+  "compat-1-2",
+  "renderer-femtovg",
+  "renderer-software",
+  "std",
+] }
+
+# Cargo resolves build-dependencies against the *host*, so this table cannot be
+# gated on `cfg(target_os = "android")` without disappearing during every
+# cross-compile. `build.rs` skips UI compilation for non-Android targets instead.
+[build-dependencies]
+slint-build = "=1.17.1"
+
+[lints]
+workspace = true
