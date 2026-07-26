@@ -22,22 +22,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use claw_application::composition::{
-    BoxFuture, Capability, CapabilitySet, Clock, CompositionError, DrainReport, GatewayPort,
-    GatewayRequest, LifecyclePhase, Principal, ServiceHandle, StartContext, Subsystem,
-    SubsystemDescriptor, SubsystemError, SubsystemErrorKind, SubsystemId, SubsystemKind,
-    well_known,
+    BoxFuture, Capability, CapabilitySet, Clock, CompositionError, DrainReport, GatewayDispatch,
+    GatewayPort, GatewayRequest, GatewayResponse, LifecyclePhase, ModelName, Principal,
+    ProviderName, RuntimeSettings, ServiceHandle, StartContext, Subsystem, SubsystemDescriptor,
+    SubsystemError, SubsystemErrorKind, SubsystemId, SubsystemKind, well_known,
 };
 use claw_domain::SessionId;
-use claw_gateway::{Grant, RequestGuard, RequestMeter};
+use claw_gateway::store::StoreFuture;
+use claw_gateway::{
+    AuthorizationSource, CredentialPolicy, GatewayServer, GatewayServerConfig, GatewayStore, Grant,
+    HeartbeatRecord, InMemoryGatewayStore, PendingInvocation, RequestGuard, RequestMeter,
+    SessionDraft, SessionPatch, SessionRecord, StaticAuthenticator,
+};
 use claw_gateway_client::{GatewayClient, GatewayClientConfig, ReconnectPolicy};
 use claw_protocol::gateway::{
-    GatewayMethodName, OperatorScope, PREAUTH_MAX_FRAME_BYTES, ProtocolVersion, RequestId, Role,
-    resolve_core_method,
+    AuthenticationPort, GatewayMethodName, OperatorScope, PREAUTH_MAX_FRAME_BYTES, ProtocolVersion,
+    RequestId, Role, resolve_core_method,
 };
 use claw_security::authorization::{Role as SecurityRole, Scope, ScopeSet};
 use claw_security::identity::DeviceIdentity;
+use gta_claw_daemon::adapters::gateway::GatewayIngress;
 use gta_claw_daemon::adapters::support::SteppedClock;
 use gta_claw_daemon::compose::Daemon;
+use gta_claw_daemon::runtime::RuntimeHost;
 use rand_chacha::ChaCha20Rng;
 use rand_chacha::rand_core::SeedableRng;
 use serde_json::{Value, json};
@@ -143,12 +150,13 @@ impl Subsystem for QuiesceWitness {
 fn client_config(
     address: std::net::SocketAddr,
     identity: Arc<DeviceIdentity>,
+    scopes: &[Scope],
 ) -> GatewayClientConfig {
     let endpoint = Url::parse(&format!("ws://127.0.0.1:{}/", address.port()))
         .expect("the loopback endpoint parses");
     let mut config = GatewayClientConfig::new(endpoint, identity);
     config.role = SecurityRole::Operator;
-    config.scopes = ScopeSet::from_scopes([Scope::OperatorRead]);
+    config.scopes = ScopeSet::from_scopes(scopes.iter().copied());
     config.reconnect = ReconnectPolicy::Never;
     config.timeouts.request = Duration::from_secs(5);
     config
@@ -195,8 +203,12 @@ async fn a_real_client_is_served_by_the_daemon_and_the_stop_closes_every_ingress
         .expect("the gateway accepts connections while the daemon runs");
 
     // ---- The real client, against the real server, inside the real daemon.
-    let (client, _events) = GatewayClient::start(client_config(address, Arc::clone(&identity)))
-        .expect("the client configuration is valid");
+    let (client, _events) = GatewayClient::start(client_config(
+        address,
+        Arc::clone(&identity),
+        &[Scope::OperatorRead],
+    ))
+    .expect("the client configuration is valid");
     let ready = client
         .wait_ready()
         .await
@@ -361,8 +373,12 @@ async fn a_device_the_daemon_never_paired_is_refused_by_its_gateway() {
     daemon.start().await.expect("every subsystem comes up");
 
     let address = daemon.gateway().bound()[0];
-    let (client, _events) = GatewayClient::start(client_config(address, Arc::clone(&stranger)))
-        .expect("the client configuration is valid");
+    let (client, _events) = GatewayClient::start(client_config(
+        address,
+        Arc::clone(&stranger),
+        &[Scope::OperatorRead],
+    ))
+    .expect("the client configuration is valid");
 
     client
         .wait_ready()
@@ -506,4 +522,261 @@ fn the_test_principal_is_not_itself_the_reason_a_request_is_refused() {
     ] {
         assert!(operator().capabilities().contains(capability));
     }
+}
+
+/// A store that parks `create_session` until the test releases it.
+///
+/// Every other method delegates, so the only thing this changes about the
+/// server is *when* one catalogued method returns. That is what puts a genuine
+/// request in flight across a drain deadline; nothing else in this crate can,
+/// because every shipped handler answers immediately.
+#[derive(Debug)]
+struct ParkedStore {
+    inner: InMemoryGatewayStore,
+    /// Zero permits until the test grants one, so the handler parks.
+    gate: tokio::sync::Semaphore,
+}
+
+impl ParkedStore {
+    fn new() -> Self {
+        Self {
+            inner: InMemoryGatewayStore::new(16, 16),
+            gate: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    /// Lets one parked handler through.
+    fn release(&self) {
+        self.gate.add_permits(1);
+    }
+}
+
+impl GatewayStore for ParkedStore {
+    fn create_session<'a>(&'a self, draft: SessionDraft) -> StoreFuture<'a, SessionRecord> {
+        Box::pin(async move {
+            let permit = self.gate.acquire().await.expect("the gate stays open");
+            permit.forget();
+            self.inner.create_session(draft).await
+        })
+    }
+
+    fn get_session<'a>(&'a self, id: &'a str) -> StoreFuture<'a, Option<SessionRecord>> {
+        self.inner.get_session(id)
+    }
+
+    fn list_sessions(&self) -> StoreFuture<'_, Vec<SessionRecord>> {
+        self.inner.list_sessions()
+    }
+
+    fn patch_session<'a>(
+        &'a self,
+        id: &'a str,
+        patch: SessionPatch,
+    ) -> StoreFuture<'a, Option<SessionRecord>> {
+        self.inner.patch_session(id, patch)
+    }
+
+    fn delete_session<'a>(&'a self, id: &'a str) -> StoreFuture<'a, bool> {
+        self.inner.delete_session(id)
+    }
+
+    fn record_heartbeat(&self, record: HeartbeatRecord) -> StoreFuture<'_, ()> {
+        self.inner.record_heartbeat(record)
+    }
+
+    fn last_heartbeat(&self) -> StoreFuture<'_, Option<HeartbeatRecord>> {
+        self.inner.last_heartbeat()
+    }
+
+    fn set_heartbeats_enabled(&self, enabled: bool) -> StoreFuture<'_, bool> {
+        self.inner.set_heartbeats_enabled(enabled)
+    }
+
+    fn heartbeats_enabled(&self) -> StoreFuture<'_, bool> {
+        self.inner.heartbeats_enabled()
+    }
+
+    fn enqueue_pending<'a>(
+        &'a self,
+        node_id: &'a str,
+        invocation: PendingInvocation,
+    ) -> StoreFuture<'a, usize> {
+        self.inner.enqueue_pending(node_id, invocation)
+    }
+
+    fn pull_pending<'a>(
+        &'a self,
+        node_id: &'a str,
+        max: usize,
+    ) -> StoreFuture<'a, Vec<PendingInvocation>> {
+        self.inner.pull_pending(node_id, max)
+    }
+
+    fn ack_pending<'a>(
+        &'a self,
+        node_id: &'a str,
+        invocation_id: &'a str,
+    ) -> StoreFuture<'a, bool> {
+        self.inner.ack_pending(node_id, invocation_id)
+    }
+
+    fn drain_pending<'a>(&'a self, node_id: &'a str) -> StoreFuture<'a, Vec<PendingInvocation>> {
+        self.inner.drain_pending(node_id)
+    }
+}
+
+/// The in-process dispatcher is not what this test is about, so it answers
+/// nothing and its drain contributes zero.
+#[derive(Debug)]
+struct SilentDispatch;
+
+impl GatewayDispatch for SilentDispatch {
+    fn dispatch(
+        &self,
+        _request: GatewayRequest,
+    ) -> BoxFuture<'_, Result<GatewayResponse, SubsystemError>> {
+        Box::pin(async { Ok(GatewayResponse::new(String::new(), 0)) })
+    }
+
+    fn methods(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// Waits until `ingress` reports `want` wire requests in flight.
+async fn wait_for_in_flight(ingress: &GatewayIngress, want: u64) {
+    for _ in 0..400 {
+        if ingress.wire_requests_in_flight().await == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "the gateway never reached {want} in-flight wire requests; it is at {}",
+        ingress.wire_requests_in_flight().await
+    );
+}
+
+/// A drain that gives up on wire work must report it, not call the stop clean.
+///
+/// The subsystem's `drain` folds two counts together: the in-process path's, and
+/// the wire's. Every other test in this crate leaves the wire idle at drain time
+/// — the shipped handlers answer immediately — so the wire's contribution is
+/// always zero and a `drain` that reported the wire as *always* zero would pass
+/// all of them. That is not a hypothetical: replacing the wire's abandoned count
+/// with a literal `0` leaves this crate green, which means a daemon that
+/// silently discarded in-flight wire requests would still report `is_clean()`.
+///
+/// So here one real request from the real client is parked inside a real
+/// catalogued handler, the ingress is quiesced, and the drain is given less
+/// grace than the request needs. The report has to name the work it cut off.
+#[tokio::test]
+async fn a_drain_that_gives_up_on_a_wire_request_reports_it_as_abandoned() {
+    let identity = device(41);
+    let authenticator =
+        StaticAuthenticator::new(CredentialPolicy::None, Arc::new(claw_gateway::SystemClock))
+            .with_paired_device(
+                identity.device_id().gateway_wire_id(),
+                Grant::new(Role::Operator, [OperatorScope::Write]),
+            );
+    let devices = authenticator.devices();
+    let store = Arc::new(ParkedStore::new());
+
+    let server = GatewayServer::new(
+        GatewayServerConfig::default(),
+        Arc::new(authenticator) as Arc<dyn AuthenticationPort + Send + Sync>,
+        Arc::new(devices) as Arc<dyn AuthorizationSource>,
+    )
+    .expect("the configuration and registry are valid")
+    .with_store(Arc::clone(&store) as Arc<dyn GatewayStore>);
+
+    // Shorter than the request will take, so the drain is forced to give up
+    // rather than merely being slow.
+    let ingress = GatewayIngress::new(
+        server,
+        Arc::new(SilentDispatch) as Arc<dyn GatewayDispatch>,
+        Duration::from_millis(150),
+    );
+
+    let runtime = RuntimeHost::new();
+    let context = StartContext::new(
+        well_known::gateway(),
+        Arc::new(RuntimeSettings::new(
+            vec!["127.0.0.1:0".parse().expect("loopback address parses")],
+            ProviderName::new("primary").expect("the literal satisfies the grammar"),
+            ModelName::new("standard").expect("the literal satisfies the grammar"),
+            4,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        )),
+        runtime.spawner(),
+        runtime.shutdown_signal(),
+        Arc::new(SteppedClock::new()) as Arc<dyn Clock>,
+    );
+
+    ingress
+        .initialize(&context)
+        .await
+        .expect("the gateway binds an ephemeral loopback port");
+    let handle = ingress.start(&context).await.expect("the gateway starts");
+    let address = *handle
+        .bound()
+        .first()
+        .expect("a started gateway advertises the port it opened");
+
+    let (client, _events) = GatewayClient::start(client_config(
+        address,
+        Arc::clone(&identity),
+        &[Scope::OperatorWrite],
+    ))
+    .expect("the client configuration is valid");
+    client
+        .wait_ready()
+        .await
+        .expect("the v4 handshake completes");
+
+    // Fired but not awaited: the handler parks in the store, so this request is
+    // still being served when the drain runs.
+    let calling = tokio::spawn(async move {
+        client
+            .request(
+                request_id("parked-create"),
+                method("sessions.create"),
+                &json!({ "id": "parked", "agentId": "agent" }),
+            )
+            .await
+    });
+    wait_for_in_flight(&ingress, 1).await;
+
+    ingress.quiesce().await.expect("the gateway quiesces");
+    let report = ingress.drain().await.expect("the gateway reports a drain");
+
+    assert_eq!(
+        report.subsystem(),
+        &well_known::gateway(),
+        "the report must be attributed to the gateway"
+    );
+    assert_eq!(
+        report.abandoned(),
+        1,
+        "the drain gave up on a request it did not report"
+    );
+    assert_eq!(
+        report.completed(),
+        0,
+        "nothing was answered, so nothing may be counted as answered"
+    );
+
+    // And the request really was still alive rather than having failed earlier:
+    // released, it completes against the same store.
+    store.release();
+    let response = tokio::time::timeout(Duration::from_secs(5), calling)
+        .await
+        .expect("the released request finishes")
+        .expect("the calling task did not panic")
+        .expect("the server answers the released request");
+    assert!(response.ok());
+    assert_eq!(payload(&response)["id"], json!("parked"));
+
+    ingress.shutdown().await.expect("the gateway shuts down");
 }

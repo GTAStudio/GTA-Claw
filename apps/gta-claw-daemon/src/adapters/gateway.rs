@@ -164,6 +164,18 @@ impl GatewayIngress {
         }
     }
 
+    /// Returns how many wire requests are being served at this instant.
+    ///
+    /// Zero unless the server is running, for the same reason
+    /// [`wire_requests_completed`](Self::wire_requests_completed) is: the depth
+    /// lives in the server rather than in this wrapper.
+    pub async fn wire_requests_in_flight(&self) -> u64 {
+        match &*self.stage.lock().await {
+            Stage::Running(handle) => handle.in_flight_requests(),
+            Stage::Unbound(_) | Stage::Offline | Stage::Bound(_) | Stage::Stopped => 0,
+        }
+    }
+
     /// Returns how many peers are connected over the wire right now.
     pub async fn wire_connections(&self) -> usize {
         match &*self.stage.lock().await {
