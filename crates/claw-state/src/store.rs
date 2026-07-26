@@ -2699,6 +2699,14 @@ impl StateStore {
                 let destination = resolve_database_path(&requested_destination)?;
                 ensure_database_artifacts_absent(&destination)?;
                 let destination_directory = pin_private_directory(&destination)?;
+                #[cfg(test)]
+                if take_publication_failpoint(&CREATE_DESTINATION_BEFORE_PUBLICATION, &destination)
+                {
+                    std::fs::write(&destination, b"other publisher").map_err(|error| {
+                        file_error("inject competing publication", &destination, error)
+                    })?;
+                }
+                ensure_database_artifacts_absent(&destination)?;
                 let guard = SnapshotCleanupGuard::new_pinned(
                     &destination,
                     &destination_directory,
