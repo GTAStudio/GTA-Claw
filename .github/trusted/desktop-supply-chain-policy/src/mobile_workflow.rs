@@ -23,6 +23,27 @@
 //! `FORCE_SKIA_BINARIES_DOWNLOAD` set and the resulting build log checked for the exact evidence
 //! that the forced download-and-unpack path actually ran, not merely declared.
 //!
+//! ## Logs are corroboration, not the primary proof
+//!
+//! The primary proof this chain is safe is the sequence above: a trusted-table resolve, a
+//! fail-closed prefetch, a local SHA-256 verification, a `file://` injection of that exact
+//! verified path, `FORCE_SKIA_BINARIES_DOWNLOAD` forcing the download-only code path, and the
+//! step's own process exit status. The captured build log is secondary corroboration layered on
+//! top of that chain, and is only trustworthy once three further conditions hold, because a real
+//! GitHub Actions log retains ANSI color escape codes interleaved with cargo's own text (for
+//! example, a "Compiling" token immediately followed by a color-reset escape code and only then
+//! `skia-bindings`). A raw, colorized log can split one of this module's literal markers across an
+//! escape code, so a naive substring grep for it can silently find nothing even though the marker
+//! text is fully present in the log — turning an absence-check meant to catch a real failure into
+//! a vacuous pass instead. An admitted workflow must therefore also: disable color at the source
+//! (`CARGO_TERM_COLOR=never` or `--color never`, [`requests_color_never`]); strip any ANSI escape
+//! codes from the captured log before grepping it ([`ANSI_CSI_STRIP_PATTERN`]); and prove that
+//! capture-and-strip pipeline can find *something* with a verified-nonzero positive control — a
+//! `grep -c` count actually compared against zero, not merely computed and discarded
+//! ([`has_verified_positive_control`]) — before its absence-check on the failure line means
+//! anything at all. A zero or unchecked count invalidates the whole measurement and must be
+//! treated as failure, never silently passed.
+//!
 //! ## What this check proves, and what it does not
 //!
 //! This is a **static content check** over the workflow YAML text and structure. It proves the
@@ -55,6 +76,9 @@
 //!   `exact_flag_token` mirrors. The build-log evidence check is the same kind of bounded textual
 //!   proxy: it confirms the workflow's own script *contains* the exact `skia-bindings` log lines
 //!   and a check for the failure line, not that a shell interpreter's negation logic is correct.
+//!   The color-never, ANSI-strip, and positive-control evidence above are the same kind of
+//!   bounded literal/token presence check, not shell execution or real log inspection either —
+//!   they raise the bar on what the workflow's own script must visibly do, they do not run it.
 //!
 //! Digest mismatches, 404s, and "wrong local archive" substitutions are **not** static content
 //! properties of the YAML; they are runtime facts about what a `curl` and a local file actually
@@ -105,6 +129,23 @@ const SKIA_UNPACK_LOG: &str = "UNPACKING ARCHIVE INTO";
 /// proves nothing, since a stale build directory or a silent fallback source build can print that
 /// line too.
 const SKIA_DOWNLOAD_FAILED_LOG: &str = "DOWNLOAD AND INSTALL FAILED";
+/// The cargo/env knob controlling ANSI color output in build logs.
+const CARGO_TERM_COLOR_VAR: &str = "CARGO_TERM_COLOR";
+/// The only value of [`CARGO_TERM_COLOR_VAR`] (or a `--color` flag) this policy accepts as
+/// disabling color output.
+const COLOR_NEVER_VALUE: &str = "never";
+/// The literal ANSI CSI (Control Sequence Introducer) escape prefix, spelled the way an author
+/// types it inside a `sed`/`perl` pattern: `\x1b\[`. A raw GitHub Actions log retains real escape
+/// sequences interleaved with cargo's own output, which can split one of this module's required
+/// literal markers across the escape code so a naive substring grep on the unstripped log finds
+/// nothing even when the marker text is fully present. Bounded textual detection of this exact
+/// pattern in some forward-scanned step's `run` text is evidence the workflow strips escape codes
+/// from its captured log before grepping it, rather than grepping the raw log directly.
+const ANSI_CSI_STRIP_PATTERN: &str = r"\x1b\[";
+/// Literal shell idioms proving a count was compared against zero: `-gt 0`/`-ne 0` (POSIX
+/// `test`/`[`) or `!= 0` (arithmetic `(( ))`/`[[ ]]`) — any one of the ways an author might spell
+/// "and it is not zero".
+const NONZERO_COMPARISONS: [&str; 3] = ["-gt 0", "-ne 0", "!= 0"];
 
 /// Immutable per-job context threaded through the step-level checks below.
 struct StepContext<'a> {
@@ -652,30 +693,86 @@ fn captures_verbose_build_log(run: &str) -> bool {
     requests_double_verbose(run) && contains_word_token(run, "tee")
 }
 
+/// Returns whether `env` (already merged workflow+job+step, see [`ParsedStep`]) or `run` disables
+/// cargo's ANSI color output: [`CARGO_TERM_COLOR_VAR`] set to [`COLOR_NEVER_VALUE`]
+/// (case-insensitive), or an exact `--color never`/`--color=never` flag on the invocation itself
+/// ([`exact_flag_token`]).
+///
+/// This is the first and strongest defense against the ANSI-escape concern
+/// [`ANSI_CSI_STRIP_PATTERN`]'s doc comment describes: a color code cargo never emits in the first
+/// place can never split a literal log marker, regardless of whether a later stripping step is
+/// also present, or is itself correct.
+fn requests_color_never(run: &str, env: &BTreeMap<String, String>) -> bool {
+    env.get(CARGO_TERM_COLOR_VAR)
+        .is_some_and(|value| value.eq_ignore_ascii_case(COLOR_NEVER_VALUE))
+        || exact_flag_token(run, "--color", COLOR_NEVER_VALUE)
+}
+
+/// Returns whether `token` is a grep count-mode short-option cluster: a single dash followed only
+/// by letters, at least one of which is `c` — covering `-c` as well as combined clusters such as
+/// `-Ec`, consistent with [`is_curl_fail_flag`]'s own documented scope of recognizing but not
+/// decomposing combined short-option clusters.
+fn is_grep_count_flag(token: &str) -> bool {
+    match token.strip_prefix('-') {
+        Some(rest) if !rest.is_empty() && !rest.starts_with('-') => {
+            rest.chars().all(|ch| ch.is_ascii_alphabetic()) && rest.contains('c')
+        }
+        _ => false,
+    }
+}
+
+/// Returns whether `run` proves a "positive control": a `grep` count-mode invocation
+/// ([`is_grep_count_flag`]) together with evidence that count was actually compared against zero
+/// ([`NONZERO_COMPARISONS`]), not merely computed and ignored.
+///
+/// `grep`'s own exit code and a printed count look identical whether a pattern matched many
+/// times, once, or the capture pipeline is entirely broken (wrong file, truncated log, stripping
+/// that ate everything) unless something then checks the count is nonzero. Requiring a
+/// verified-nonzero count on some known-present marker is the closest bounded textual proxy for
+/// "this workflow's own capture-and-check pipeline can find something on this exact log", so a
+/// zero or unchecked count cannot be silently treated as a passing measurement.
+fn has_verified_positive_control(run: &str) -> bool {
+    let has_grep_count = contains_word_token(run, "grep") && tokens(run).any(is_grep_count_flag);
+    has_grep_count
+        && NONZERO_COMPARISONS
+            .iter()
+            .any(|pattern| run.contains(pattern))
+}
+
 /// Returns whether, scanning forward from `steps[from_index..]` inclusive, some step's `run` text
 /// contains all three literal `skia-bindings` build-script log lines this policy requires as
-/// evidence the forced download-and-unpack path actually ran:
+/// evidence the forced download-and-unpack path actually ran —
 /// [`SKIA_DOWNLOAD_ATTEMPTED_LOG`], [`SKIA_UNPACK_LOG`], and [`SKIA_DOWNLOAD_FAILED_LOG`] (the
 /// last one so the workflow's own script demonstrably checks for, rather than ignores, that
-/// failure line). Scanning forward from the Skia-resolving cargo step itself, rather than
-/// requiring all three in one exact line, allows the same `run: |` block or a later step in the
-/// job to perform the actual grep/assert.
+/// failure line) — **and** the two conditions that make trusting those three checks sound in the
+/// first place: literal evidence the log was stripped of ANSI escape codes before any of them ran
+/// ([`ANSI_CSI_STRIP_PATTERN`]), and a verified-nonzero positive control proving the
+/// capture-and-strip pipeline can find something at all ([`has_verified_positive_control`]).
+/// Scanning forward from the Skia-resolving cargo step itself, rather than requiring everything in
+/// one exact line, allows the same `run: |` block or a later step in the job to perform the actual
+/// grep/assert.
 ///
 /// A successful `Compiling skia-bindings` line proves nothing on its own — a stale build cache or
 /// a silent fallback source build (see this module's own doc comment on
 /// `FORCE_SKIA_BINARIES_DOWNLOAD`) can print that line too — so this check requires the specific
-/// download/unpack evidence instead.
+/// download/unpack evidence instead. Nor does a raw, unstripped grep against a colorized log:
+/// escape codes between tokens can make it silently find nothing even when the marker text is
+/// fully present, so a naive absence-check on [`SKIA_DOWNLOAD_FAILED_LOG`] could vacuously pass.
 fn skia_download_path_is_verified_in_log(steps: &[ParsedStep<'_>], from_index: usize) -> bool {
     let mut saw_attempted = false;
     let mut saw_unpacked = false;
     let mut saw_failure_check = false;
+    let mut saw_ansi_stripped = false;
+    let mut saw_positive_control = false;
     for step in &steps[from_index..] {
         let Some(run) = step.run else { continue };
         saw_attempted |= run.contains(SKIA_DOWNLOAD_ATTEMPTED_LOG);
         saw_unpacked |= run.contains(SKIA_UNPACK_LOG);
         saw_failure_check |= run.contains(SKIA_DOWNLOAD_FAILED_LOG);
+        saw_ansi_stripped |= run.contains(ANSI_CSI_STRIP_PATTERN);
+        saw_positive_control |= has_verified_positive_control(run);
     }
-    saw_attempted && saw_unpacked && saw_failure_check
+    saw_attempted && saw_unpacked && saw_failure_check && saw_ansi_stripped && saw_positive_control
 }
 
 fn parse_steps<'a>(job: &'a YamlValue, job_env: &BTreeMap<String, String>) -> Vec<ParsedStep<'a>> {
@@ -752,13 +849,28 @@ fn validate_job_skia_injection(
                  needed to ever prove the forced Skia download actually ran"
             )));
         }
+        if !requests_color_never(run, &step.env) {
+            return Err(PolicyError::new(format!(
+                "{path}: job {job_id} step {index} runs a Skia-resolving cargo command without \
+                 disabling ANSI color output ({CARGO_TERM_COLOR_VAR}={COLOR_NEVER_VALUE:?} or \
+                 --color {COLOR_NEVER_VALUE}); a colorized log can interleave escape codes with \
+                 the literal build-script markers this policy requires, letting a later absence \
+                 check on {SKIA_DOWNLOAD_FAILED_LOG:?} silently pass even when that text is \
+                 fully present in the raw log"
+            )));
+        }
         if !skia_download_path_is_verified_in_log(&steps, index) {
             return Err(PolicyError::new(format!(
                 "{path}: job {job_id} step {index} never checks a captured build log for \
                  evidence the forced Skia download actually ran ({SKIA_DOWNLOAD_ATTEMPTED_LOG:?} \
-                 and {SKIA_UNPACK_LOG:?}) and did not fail ({SKIA_DOWNLOAD_FAILED_LOG:?}); a \
-                 successful `Compiling skia-bindings` line alone does not prove this, since a \
-                 stale cache or a silent fallback source build can print that too"
+                 and {SKIA_UNPACK_LOG:?}), did not fail ({SKIA_DOWNLOAD_FAILED_LOG:?}), that the \
+                 log was stripped of ANSI escape codes before grepping it (a literal \
+                 {ANSI_CSI_STRIP_PATTERN:?} pattern), and a verified-nonzero positive control \
+                 proving that capture-and-strip pipeline can find something at all (a `grep -c` \
+                 count actually compared against zero); a successful `Compiling skia-bindings` \
+                 line alone does not prove this, since a stale cache or a silent fallback source \
+                 build can print that too, and a raw grep against an unstripped colorized log can \
+                 silently find nothing even when the marker text is fully present"
             )));
         }
     }

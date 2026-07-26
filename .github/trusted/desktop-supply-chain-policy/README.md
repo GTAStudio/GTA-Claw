@@ -309,6 +309,52 @@ per line, quote-trimming only, not a shell parser or a GitHub Actions expression
 the workflow *says* the right things in the right order; it cannot prove a 404, a digest mismatch, or
 a wrong local archive at runtime, which remain the resolver/verifier's own job and its own tests.
 
+### Colorized build logs cannot defeat the download-evidence check
+
+The build-log evidence check above is corroboration layered on top of the trust chain's actual proof
+(a trusted-table resolve, a fail-closed prefetch, a local SHA-256 verification, a `file://` injection
+of that exact verified path, `FORCE_SKIA_BINARIES_DOWNLOAD`, and the step's own process exit status),
+not the proof itself. Corroboration from a real GitHub Actions log is only meaningful once three
+further conditions hold, because such a log retains ANSI color escape codes interleaved with cargo's
+own text — for example, a `Compiling` token immediately followed by a color-reset escape code and only
+then `skia-bindings`. A raw, colorized log can split one of this policy's literal markers across an
+escape code, so a naive substring grep for it can silently find nothing even though the marker text is
+fully present, turning an absence-check meant to catch a real failure into a vacuous pass instead. An
+admitted workflow must therefore also: disable color at the source (`CARGO_TERM_COLOR=never` or
+`--color never`); show literal evidence it strips ANSI escape codes (a literal `\x1b\[` pattern) from
+the captured log before grepping it; and prove that capture-and-strip pipeline can find *something*
+with a verified-nonzero positive control — a `grep -c` count actually compared against zero (`-gt 0`,
+`-ne 0`, or `!= 0`), not merely computed and discarded. A zero or unchecked count invalidates the whole
+measurement and is treated as a failure, never silently passed. Like the rest of this section, this is
+a bounded textual-presence check, not a shell interpreter or a real log inspection: it raises the bar
+on what the workflow's own script must visibly do, it does not execute it.
+
+### Current desktop clippy is Skia-free by construction, and untouched by this trust chain
+
+`desktop/apps/gta-claw-desktop/Cargo.toml` depends on `slint` with `default-features = false` and an
+exact, byte-pinned feature list — `renderer-femtovg` and `renderer-software`, never `renderer-skia` —
+so `cargo clippy --manifest-path desktop/Cargo.toml --workspace --all-targets --locked -- -D warnings`
+in `.github/workflows/rust.yml` never resolves, builds, or lints `skia-bindings`/`skia-safe` today. A
+clean run of that clippy job is not a gap this trust chain leaves open; it is the expected, currently
+correct state of a workspace that does not consume Skia yet. Nothing in this module or
+`validate_final`/`require_desktop_dependencies` scopes, weakens, or otherwise touches `rust.yml`: the
+Skia-specific checks above (`validate_ios_packaging_workflow_skia_injection`) apply only to
+`.github/workflows/ios-packaging.yml`, and only once a step within it targets the iOS Skia workspace —
+never to the real desktop clippy job, and never contingent on live PR #138 (which itself resolves no
+Skia and ships no packaged artifact; see above).
+
+That non-Skia feature list is itself already under exact, redundant enforcement, so a future flip to
+`renderer-skia` or `default-features = true` cannot silently bypass the pinned Skia trust chain through
+the desktop app: `validate_final_static` byte-compares `desktop/apps/gta-claw-desktop/Cargo.toml`
+against `policy/final/desktop/apps/gta-claw-desktop/Cargo.toml.fixture`, and, independently,
+`require_desktop_dependencies` re-derives `cargo metadata` for the live tree and rejects any deviation
+from `DESKTOP_DEPENDENCIES`'s exact expected `slint` spec — including its full feature set and
+`default-features` — with `desktop metadata dependency controls changed: {name}`. Both run
+unconditionally as part of `validate_final`.
+`exact_desktop_binding_rejects_member_package_build_and_target_mutations` carries two dedicated
+regressions proving the byte-exact path alone already rejects both a `renderer-skia` feature addition
+and a `default-features = true` flip on this exact dependency entry.
+
 ## Legacy Node shrink-only ratchet
 
 

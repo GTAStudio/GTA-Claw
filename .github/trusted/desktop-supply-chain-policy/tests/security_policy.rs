@@ -1916,28 +1916,39 @@ fn ios_resolve_and_verify_step(step_name: &str, target: &str, archive_var: &str)
 /// One `cargo build` step for a single admitted iOS Skia target, injecting the verified local
 /// archive named by `archive_var` through the supported `SKIA_BINARIES_URL=file://...` override,
 /// requesting cargo's `-vv` build-script output (plain `-v` suppresses it on a successful build),
-/// capturing it through `tee`, and asserting on that captured log that the forced Skia download
-/// actually ran rather than silently falling back to a source build.
+/// disabling ANSI color at the source, capturing it through `tee`, stripping any residual ANSI
+/// escape codes before grepping, proving that capture-and-strip pipeline finds something with a
+/// verified-nonzero positive control, and asserting on that captured log that the forced Skia
+/// download actually ran rather than silently falling back to a source build.
 fn ios_build_step(step_name: &str, target: &str, archive_var: &str) -> String {
     let log_file = format!("build-{target}.log");
+    let plain_log_file = format!("build-{target}.plain.log");
     let mut step = String::new();
     step.push_str(&format!("      - name: {step_name}\n"));
     step.push_str("        env:\n");
     step.push_str(&format!(
         "          SKIA_BINARIES_URL: \"file://${{{{ env.{archive_var} }}}}\"\n"
     ));
+    step.push_str("          CARGO_TERM_COLOR: \"never\"\n");
     step.push_str("        run: |\n");
     step.push_str(&format!(
-        "          cargo build --manifest-path ios/Cargo.toml --target {target} -vv 2>&1 | tee {log_file}\n"
+        "          cargo build --manifest-path ios/Cargo.toml --target {target} -vv --color never 2>&1 | tee {log_file}\n"
     ));
     step.push_str(&format!(
-        "          grep -q \"TRYING TO DOWNLOAD AND INSTALL SKIA BINARIES\" {log_file}\n"
+        "          perl -pe 's/\\x1b\\[[0-9;]*[A-Za-z]//g' {log_file} > {plain_log_file}\n"
     ));
     step.push_str(&format!(
-        "          grep -q \"UNPACKING ARCHIVE INTO\" {log_file}\n"
+        "          grep -c \"TRYING TO DOWNLOAD AND INSTALL SKIA BINARIES\" {plain_log_file} > control.count\n"
+    ));
+    step.push_str("          [ \"$(cat control.count)\" -gt 0 ]\n");
+    step.push_str(&format!(
+        "          grep -q \"TRYING TO DOWNLOAD AND INSTALL SKIA BINARIES\" {plain_log_file}\n"
     ));
     step.push_str(&format!(
-        "          ! grep -q \"DOWNLOAD AND INSTALL FAILED\" {log_file}\n"
+        "          grep -q \"UNPACKING ARCHIVE INTO\" {plain_log_file}\n"
+    ));
+    step.push_str(&format!(
+        "          ! grep -q \"DOWNLOAD AND INSTALL FAILED\" {plain_log_file}\n"
     ));
     step
 }
@@ -3926,6 +3937,18 @@ fn exact_desktop_binding_rejects_member_package_build_and_target_mutations() {
             "[lints]",
             "[target.'cfg(target_os = \"linux\")'.dependencies]\nslint = \"*\"\n\n[lints]",
         ),
+        (
+            "slint-renderer-skia-feature-add",
+            "desktop/apps/gta-claw-desktop/Cargo.toml",
+            "  \"renderer-software\",\r\n  \"std\",\r\n",
+            "  \"renderer-software\",\r\n  \"renderer-skia\",\r\n  \"std\",\r\n",
+        ),
+        (
+            "slint-default-features-enabled",
+            "desktop/apps/gta-claw-desktop/Cargo.toml",
+            "default-features = false",
+            "default-features = true",
+        ),
     ];
     for (label, file, from, to) in cases {
         let tree = final_tree(label);
@@ -5444,7 +5467,7 @@ fn ios_packaging_workflow_rejects_missing_force_flag_and_missing_local_override(
     );
 
     let without_local_override = workflow.replace(
-        "        env:\n          SKIA_BINARIES_URL: \"file://${{ env.SKIA_ARCHIVE_IOS_DEVICE }}\"\n",
+        "        env:\n          SKIA_BINARIES_URL: \"file://${{ env.SKIA_ARCHIVE_IOS_DEVICE }}\"\n          CARGO_TERM_COLOR: \"never\"\n",
         "",
     );
     assert_ne!(
@@ -5702,11 +5725,12 @@ fn ios_packaging_workflow_rejects_missing_verbose_build_log_capture() {
     let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
 
     // A space immediately follows "ios" in this exact substring, so it cannot match a prefix of
-    // the simulator step's "...--target aarch64-apple-ios-sim -vv 2>&1" line (which has "-sim"
-    // immediately after "ios", not a space) — only the device build step's line is affected.
+    // the simulator step's "...--target aarch64-apple-ios-sim -vv --color never 2>&1" line (which
+    // has "-sim" immediately after "ios", not a space) — only the device build step's line is
+    // affected.
     let missing_verbose = workflow.replace(
-        "cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios -vv 2>&1",
-        "cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios -v 2>&1",
+        "cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios -vv --color never 2>&1",
+        "cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios -v --color never 2>&1",
     );
     assert_ne!(
         missing_verbose, workflow,
@@ -5730,7 +5754,7 @@ fn ios_packaging_workflow_rejects_missing_download_log_evidence() {
     // nothing after it can satisfy [`skia_download_path_is_verified_in_log`]'s forward scan the way
     // a later step's own complete log-marker set otherwise could for an earlier step.
     let missing_log_evidence = workflow.replace(
-        "          grep -q \"UNPACKING ARCHIVE INTO\" build-aarch64-apple-ios-sim.log\n",
+        "          grep -q \"UNPACKING ARCHIVE INTO\" build-aarch64-apple-ios-sim.plain.log\n",
         "",
     );
     assert_ne!(
@@ -5740,6 +5764,90 @@ fn ios_packaging_workflow_rejects_missing_download_log_evidence() {
     let error = validate_ios_skia_injection_text(&missing_log_evidence).expect_err(
         "a build step that captures -vv output through tee but never checks it for the forced \
          download's log evidence must be rejected",
+    );
+    assert!(
+        error.contains("never checks a captured build log for evidence"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_missing_color_never() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // `requests_color_never` accepts either signal alone (CARGO_TERM_COLOR=never or a --color
+    // never flag), so a true negative case must remove both from the same step. Strip
+    // CARGO_TERM_COLOR from every step's env (both build steps carry the identical line) and the
+    // --color never flag from the *device* step's cargo invocation specifically, so that one step
+    // loses every color-disabling signal while the simulator step (checked afterward) keeps its
+    // own flag — irrelevant here, since the device step is encountered, and therefore rejected,
+    // first.
+    let without_color_env = workflow.replace("          CARGO_TERM_COLOR: \"never\"\n", "");
+    assert_ne!(
+        without_color_env, workflow,
+        "color-env-removal fixture did not change anything"
+    );
+    let missing_color_never = without_color_env.replace(
+        "cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios -vv --color never 2>&1",
+        "cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios -vv 2>&1",
+    );
+    assert_ne!(
+        missing_color_never, without_color_env,
+        "color-flag-removal fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&missing_color_never).expect_err(
+        "a Skia-resolving cargo step that never disables ANSI color output must be rejected",
+    );
+    assert!(
+        error.contains("disabling ANSI color output"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_missing_ansi_strip_evidence() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // Removed from the *simulator* build step specifically: it is the last step in the fixture, so
+    // nothing after it can satisfy skia_download_path_is_verified_in_log's forward scan the way an
+    // earlier step's own strip evidence otherwise could (the device step, checked first, still
+    // carries its own untouched strip line and would pass on its own forward scan, which also
+    // covers this later step).
+    let missing_ansi_strip = workflow.replace(
+        "          perl -pe 's/\\x1b\\[[0-9;]*[A-Za-z]//g' build-aarch64-apple-ios-sim.log > build-aarch64-apple-ios-sim.plain.log\n",
+        "",
+    );
+    assert_ne!(
+        missing_ansi_strip, workflow,
+        "ansi-strip-removal fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&missing_ansi_strip).expect_err(
+        "a Skia-resolving cargo step whose script never strips ANSI escape codes before \
+         grepping its captured log must be rejected",
+    );
+    assert!(
+        error.contains("never checks a captured build log for evidence"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_an_unverified_positive_control() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // The grep -c count is still computed into control.count by every step (untouched), but the
+    // check that it is actually nonzero is removed everywhere: exactly the "computed but ignored"
+    // gap a positive control exists to close, per this policy's own rule that a zero or unchecked
+    // count invalidates the whole measurement and must never be silently passed.
+    let missing_positive_control =
+        workflow.replace("          [ \"$(cat control.count)\" -gt 0 ]\n", "");
+    assert_ne!(
+        missing_positive_control, workflow,
+        "positive-control-removal fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&missing_positive_control).expect_err(
+        "a Skia-resolving cargo step that computes a grep count but never verifies it is nonzero \
+         must be rejected",
     );
     assert!(
         error.contains("never checks a captured build log for evidence"),
