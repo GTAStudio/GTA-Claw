@@ -6,7 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use claw_conformance::{Contract, Registry, discover_claim_files, generate_report};
+use claw_conformance::{
+    Contract, Registry, ReportOptions, discover_claim_files, generate_report_with_options,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OutputFormat {
@@ -20,6 +22,7 @@ struct Arguments {
     contract_root: PathBuf,
     claim_files: Vec<PathBuf>,
     format: OutputFormat,
+    verify_libtest_membership: bool,
 }
 
 fn main() -> ExitCode {
@@ -61,8 +64,13 @@ fn run() -> Result<(), String> {
             .load_claims_file(path)
             .map_err(|error| error.to_string())?;
     }
-    let report = generate_report(&contract, &registry, &repository_root)
-        .map_err(|error| error.to_string())?;
+    let mut report_options = ReportOptions::default();
+    if arguments.verify_libtest_membership {
+        report_options = report_options.with_libtest_membership_verification();
+    }
+    let report =
+        generate_report_with_options(&contract, &registry, &repository_root, report_options)
+            .map_err(|error| error.to_string())?;
     match arguments.format {
         OutputFormat::Human => print!("{}", report.to_human_table()),
         OutputFormat::Json => println!(
@@ -90,6 +98,7 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
     let mut contract_root = PathBuf::from("compat/upstream");
     let mut claim_files = Vec::new();
     let mut format = OutputFormat::Human;
+    let mut verify_libtest_membership = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--root" => {
@@ -117,6 +126,7 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
                     _ => return Err(format!("unsupported output format '{value}'")),
                 };
             }
+            "--verify-libtest-membership" => verify_libtest_membership = true,
             _ => return Err(format!("unknown argument '{argument}'")),
         }
     }
@@ -124,12 +134,14 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
         contract_root,
         claim_files,
         format,
+        verify_libtest_membership,
     })
 }
 
 fn print_usage() {
     println!(
-        "Usage: claw-conformance [--root compat/upstream] [--claims FILE]... [--format human|json|both]"
+        "Usage: claw-conformance [--root compat/upstream] [--claims FILE]... \
+         [--format human|json|both] [--verify-libtest-membership]"
     );
 }
 
@@ -158,7 +170,15 @@ mod tests {
     fn arguments_accept_multiple_claim_files() {
         let parsed = parse_arguments(
             [
-                "--root", "fixture", "--claims", "a.json", "--claims", "b.json", "--format", "both",
+                "--root",
+                "fixture",
+                "--claims",
+                "a.json",
+                "--claims",
+                "b.json",
+                "--format",
+                "both",
+                "--verify-libtest-membership",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -174,5 +194,6 @@ mod tests {
             vec!["a.json".to_owned(), "b.json".to_owned()]
         );
         assert_eq!(parsed.format, OutputFormat::Both);
+        assert!(parsed.verify_libtest_membership);
     }
 }

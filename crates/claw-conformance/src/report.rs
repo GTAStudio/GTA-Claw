@@ -7,7 +7,8 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::claims::{
-    CargoTestTargets, ClaimLevel, Registry, validate_evidence, validate_implementation_pointers,
+    CargoTestTargets, ClaimLevel, LibtestMembershipVerifier, Registry, validate_evidence,
+    validate_evidence_with_membership, validate_implementation_pointers,
 };
 use crate::error::{ConformanceError, ViolationCode};
 use crate::loader::Contract;
@@ -107,6 +108,24 @@ pub struct ParityReport {
     pub totals: ParityTotals,
 }
 
+/// Explicit controls for parity-report evidence verification.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReportOptions {
+    verify_libtest_membership: bool,
+}
+
+impl ReportOptions {
+    /// Enables real Cargo/libtest registration checks for every cited test.
+    ///
+    /// This proves registration in a standard libtest target, not execution or
+    /// success of the cited test.
+    #[must_use]
+    pub const fn with_libtest_membership_verification(mut self) -> Self {
+        self.verify_libtest_membership = true;
+        self
+    }
+}
+
 impl ParityReport {
     /// Renders the deterministic human-readable table used by the CLI.
     #[must_use]
@@ -181,6 +200,21 @@ pub fn generate_report(
     registry: &Registry,
     repository_root: impl AsRef<Path>,
 ) -> Result<ParityReport, ConformanceError> {
+    generate_report_with_options(
+        contract,
+        registry,
+        repository_root,
+        ReportOptions::default(),
+    )
+}
+
+/// Validates every claim with explicit verification options and generates the report.
+pub fn generate_report_with_options(
+    contract: &Contract,
+    registry: &Registry,
+    repository_root: impl AsRef<Path>,
+    options: ReportOptions,
+) -> Result<ParityReport, ConformanceError> {
     let repository_root = repository_root.as_ref();
     let known_features = contract
         .ledgers()
@@ -190,6 +224,9 @@ pub fn generate_report(
         .collect::<BTreeSet<_>>();
     let mut cargo_test_targets: Option<CargoTestTargets> =
         contract.cargo_test_targets(repository_root);
+    let mut membership_verifier = options
+        .verify_libtest_membership
+        .then(LibtestMembershipVerifier::new);
     for (feature_id, claim) in &registry.features {
         if !known_features.contains(feature_id.as_str()) {
             return Err(ConformanceError::new(
@@ -199,11 +236,12 @@ pub fn generate_report(
             ));
         }
         if claim.level != ClaimLevel::Registered || !claim.evidence.is_empty() {
-            validate_evidence(
+            validate_report_evidence(
                 repository_root,
                 feature_id,
                 &claim.evidence,
                 &mut cargo_test_targets,
+                &mut membership_verifier,
             )?;
         }
         validate_implementation_pointers(
@@ -232,11 +270,12 @@ pub fn generate_report(
             ));
         }
         if claim.level != ClaimLevel::Registered || !claim.evidence.is_empty() {
-            validate_evidence(
+            validate_report_evidence(
                 repository_root,
                 &format!("{inventory_id}:{record_id}"),
                 &claim.evidence,
                 &mut cargo_test_targets,
+                &mut membership_verifier,
             )?;
         }
         validate_implementation_pointers(
@@ -322,6 +361,26 @@ pub fn generate_report(
         inventories,
         totals,
     })
+}
+
+fn validate_report_evidence(
+    repository_root: &Path,
+    subject: &str,
+    evidence: &[crate::claims::Evidence],
+    cargo_test_targets: &mut Option<CargoTestTargets>,
+    membership_verifier: &mut Option<LibtestMembershipVerifier>,
+) -> Result<(), ConformanceError> {
+    if let Some(verifier) = membership_verifier {
+        validate_evidence_with_membership(
+            repository_root,
+            subject,
+            evidence,
+            cargo_test_targets,
+            verifier,
+        )
+    } else {
+        validate_evidence(repository_root, subject, evidence, cargo_test_targets)
+    }
 }
 
 fn count_status(features: &[FeatureReport], expected: ParityStatus) -> usize {

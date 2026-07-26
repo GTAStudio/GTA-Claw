@@ -11,6 +11,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ConformanceError, ViolationCode};
 
+const COMPILER_ORACLE_ENV: [&str; 4] = [
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_BUILD_RUSTFLAGS",
+    "CARGO_BUILD_WARNINGS",
+];
+
 /// Claimed implementation level.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -220,10 +227,13 @@ pub struct Registry {
 #[derive(Debug, Deserialize)]
 struct CargoMetadata {
     packages: Vec<CargoPackage>,
+    workspace_root: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
 struct CargoPackage {
+    id: String,
+    name: String,
     manifest_path: PathBuf,
     targets: Vec<CargoTarget>,
 }
@@ -234,6 +244,8 @@ struct CargoTarget {
     name: String,
     src_path: PathBuf,
     test: bool,
+    #[serde(default, rename = "required-features")]
+    required_features: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -329,6 +341,68 @@ fn matching_manifest_target<'a>(
 pub(crate) struct CargoTestTargets {
     repository_root: PathBuf,
     source_paths: BTreeSet<PathBuf>,
+    candidates_by_source: BTreeMap<PathBuf, BTreeSet<CargoSourceCandidate>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CargoTestTargetKind {
+    Library,
+    Test,
+    Binary,
+    Example,
+    Bench,
+}
+
+impl CargoTestTargetKind {
+    fn selector(self) -> &'static str {
+        match self {
+            Self::Library => "--lib",
+            Self::Test => "--test",
+            Self::Binary => "--bin",
+            Self::Example => "--example",
+            Self::Bench => "--bench",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CargoTestTarget {
+    workspace_root: PathBuf,
+    manifest_path: PathBuf,
+    package_id: String,
+    package_name: String,
+    package_directory: PathBuf,
+    kind: CargoTestTargetKind,
+    name: String,
+    src_path: PathBuf,
+    required_features: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CargoSourceCandidate {
+    target: CargoTestTarget,
+    module_path: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CargoTargetExecutionKey {
+    manifest_path: PathBuf,
+    package_id: String,
+    kind: CargoTestTargetKind,
+    name: String,
+    required_features: Vec<String>,
+}
+
+impl From<&CargoTestTarget> for CargoTargetExecutionKey {
+    fn from(target: &CargoTestTarget) -> Self {
+        Self {
+            manifest_path: target.manifest_path.clone(),
+            package_id: target.package_id.clone(),
+            kind: target.kind,
+            name: target.name.clone(),
+            required_features: target.required_features.clone(),
+        }
+    }
 }
 
 impl CargoTestTargets {
@@ -371,7 +445,7 @@ impl CargoTestTargets {
                     .map(|workspace| workspace.directory.clone())
             })
             .collect::<BTreeSet<_>>();
-        let mut target_roots = BTreeSet::new();
+        let mut candidates = BTreeSet::new();
         for (canonical_manifest, scope) in scoped_manifests {
             let package_directory = canonical_manifest
                 .parent()
@@ -392,6 +466,16 @@ impl CargoTestTargets {
                 continue;
             };
             let metadata = load_cargo_metadata(&canonical_root, &canonical_manifest, code)?;
+            let workspace_root = metadata.workspace_root.canonicalize().map_err(|error| {
+                ConformanceError::new(
+                    code,
+                    Some("Cargo.toml".to_owned()),
+                    format!(
+                        "cannot resolve Cargo workspace root '{}': {error}",
+                        metadata.workspace_root.display()
+                    ),
+                )
+            })?;
             for package in metadata.packages {
                 let package_manifest = package.manifest_path.canonicalize().map_err(|error| {
                     ConformanceError::new(
@@ -422,6 +506,13 @@ impl CargoTestTargets {
                     target.test
                         && manifest_targets.uses_standard_test_harness(package_directory, target)
                 }) {
+                    let kind = cargo_test_target_kind(&target).map_err(|message| {
+                        ConformanceError::new(
+                            code,
+                            Some("Cargo.toml".to_owned()),
+                            format!("test-enabled Cargo target '{}': {message}", target.name),
+                        )
+                    })?;
                     let source_path = target.src_path.canonicalize().map_err(|error| {
                         ConformanceError::new(
                             code,
@@ -433,15 +524,52 @@ impl CargoTestTargets {
                         )
                     })?;
                     if source_path.starts_with(package_directory) {
-                        target_roots.insert((source_path, package_directory.to_path_buf()));
+                        let mut required_features = target.required_features;
+                        required_features.sort();
+                        required_features.dedup();
+                        candidates.insert(CargoTestTarget {
+                            workspace_root: workspace_root.clone(),
+                            manifest_path: canonical_manifest.clone(),
+                            package_id: package.id.clone(),
+                            package_name: package.name.clone(),
+                            package_directory: package_directory.to_path_buf(),
+                            kind,
+                            name: target.name,
+                            src_path: source_path,
+                            required_features,
+                        });
                     }
                 }
             }
         }
-        let source_paths = reachable_rust_sources(&canonical_root, target_roots, code)?;
+        let mut source_paths = BTreeSet::new();
+        let mut candidates_by_source = BTreeMap::<_, BTreeSet<_>>::new();
+        for candidate in candidates {
+            let reachable = reachable_rust_sources(
+                &canonical_root,
+                BTreeSet::from([(
+                    candidate.src_path.clone(),
+                    candidate.package_directory.clone(),
+                )]),
+                code,
+            )?;
+            for (path, module_paths) in reachable {
+                source_paths.insert(path.clone());
+                for module_path in module_paths {
+                    candidates_by_source
+                        .entry(path.clone())
+                        .or_default()
+                        .insert(CargoSourceCandidate {
+                            target: candidate.clone(),
+                            module_path,
+                        });
+                }
+            }
+        }
         Ok(Self {
             repository_root: canonical_root,
             source_paths,
+            candidates_by_source,
         })
     }
 
@@ -449,10 +577,50 @@ impl CargoTestTargets {
         self.source_paths.contains(path)
     }
 
+    fn candidates_for_source(&self, path: &Path) -> Option<&BTreeSet<CargoSourceCandidate>> {
+        self.candidates_by_source.get(path)
+    }
+
     pub(crate) fn is_for_repository(&self, repository_root: &Path) -> bool {
         repository_root
             .canonicalize()
             .is_ok_and(|root| root == self.repository_root)
+    }
+}
+
+fn cargo_test_target_kind(target: &CargoTarget) -> Result<CargoTestTargetKind, String> {
+    let kinds = [
+        (
+            target
+                .kind
+                .iter()
+                .any(|kind| matches!(kind.as_str(), "lib" | "proc-macro")),
+            CargoTestTargetKind::Library,
+        ),
+        (
+            target.kind.iter().any(|kind| kind == "test"),
+            CargoTestTargetKind::Test,
+        ),
+        (
+            target.kind.iter().any(|kind| kind == "bin"),
+            CargoTestTargetKind::Binary,
+        ),
+        (
+            target.kind.iter().any(|kind| kind == "example"),
+            CargoTestTargetKind::Example,
+        ),
+        (
+            target.kind.iter().any(|kind| kind == "bench"),
+            CargoTestTargetKind::Bench,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(matches, kind)| matches.then_some(kind))
+    .collect::<Vec<_>>();
+    match kinds.as_slice() {
+        [kind] => Ok(*kind),
+        [] => Err(format!("has unsupported target kind {:?}", target.kind)),
+        _ => Err(format!("has ambiguous target kinds {:?}", target.kind)),
     }
 }
 
@@ -780,26 +948,40 @@ struct ReachableRustSource {
     path: PathBuf,
     module_directory: PathBuf,
     package_directory: PathBuf,
+    module_path: Vec<String>,
+    ancestors: BTreeSet<PathBuf>,
 }
 
 fn reachable_rust_sources(
     repository_root: &Path,
     target_roots: BTreeSet<(PathBuf, PathBuf)>,
     code: ViolationCode,
-) -> Result<BTreeSet<PathBuf>, ConformanceError> {
+) -> Result<BTreeMap<PathBuf, BTreeSet<Vec<String>>>, ConformanceError> {
     let mut reachable = target_roots
         .iter()
-        .map(|(path, _)| path.clone())
+        .map(|(path, _)| (path.clone(), BTreeSet::from([Vec::new()])))
+        .collect::<BTreeMap<_, _>>();
+    let mut visited = target_roots
+        .iter()
+        .map(|(path, package_directory)| {
+            (
+                path.clone(),
+                package_directory.clone(),
+                Vec::<String>::new(),
+            )
+        })
         .collect::<BTreeSet<_>>();
-    let mut visited = target_roots.clone();
     let mut queue = target_roots
         .into_iter()
         .filter_map(|(path, package_directory)| {
             let module_directory = path.parent()?.to_path_buf();
+            let ancestors = BTreeSet::from([path.clone()]);
             Some(ReachableRustSource {
                 path,
                 module_directory,
                 package_directory,
+                module_path: Vec::new(),
+                ancestors,
             })
         })
         .collect::<VecDeque<_>>();
@@ -823,15 +1005,24 @@ fn reachable_rust_sources(
         })?;
         for reference in rust_module_references(&source) {
             let mut scope = current.module_directory.clone();
+            let mut module_path = current.module_path.clone();
             for (index, directory) in reference.inline_modules.iter().enumerate() {
                 match directory {
-                    InlineModuleDirectory::Default(name) => scope.push(name),
-                    InlineModuleDirectory::Path(path) if index == 0 => {
-                        scope = current.path.parent().unwrap_or(&scope).join(path);
+                    InlineModuleDirectory::Default { name } => {
+                        scope.push(name);
+                        module_path.push(name.clone());
                     }
-                    InlineModuleDirectory::Path(path) => scope.push(path),
+                    InlineModuleDirectory::Path { name, path } if index == 0 => {
+                        scope = current.path.parent().unwrap_or(&scope).join(path);
+                        module_path.push(name.clone());
+                    }
+                    InlineModuleDirectory::Path { name, path } => {
+                        scope.push(path);
+                        module_path.push(name.clone());
+                    }
                 }
             }
+            module_path.push(reference.name.clone());
             let candidates = if let Some(path) = &reference.path {
                 let base = if reference.inline_modules.is_empty() {
                     current.path.parent().unwrap_or(&scope)
@@ -881,13 +1072,26 @@ fn reachable_rust_sources(
                 ));
             }
             for path in resolved {
-                if visited.insert((path.clone(), current.package_directory.clone())) {
-                    reachable.insert(path.clone());
+                reachable
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(module_path.clone());
+                if !current.ancestors.contains(&path)
+                    && visited.insert((
+                        path.clone(),
+                        current.package_directory.clone(),
+                        module_path.clone(),
+                    ))
+                {
                     let module_directory = module_directory_for_source(&path);
+                    let mut ancestors = current.ancestors.clone();
+                    ancestors.insert(path.clone());
                     queue.push_back(ReachableRustSource {
                         path,
                         module_directory,
                         package_directory: current.package_directory.clone(),
+                        module_path: module_path.clone(),
+                        ancestors,
                     });
                 }
             }
@@ -1073,12 +1277,47 @@ pub(crate) fn validate_evidence(
     )
 }
 
+pub(crate) fn validate_evidence_with_membership(
+    repository_root: &Path,
+    subject: &str,
+    evidence: &[Evidence],
+    cargo_test_targets: &mut Option<CargoTestTargets>,
+    membership_verifier: &mut LibtestMembershipVerifier,
+) -> Result<(), ConformanceError> {
+    validate_evidence_internal(
+        repository_root,
+        subject,
+        evidence,
+        cargo_test_targets,
+        ViolationCode::ClaimEvidence,
+        Some(membership_verifier),
+    )
+}
+
 pub(crate) fn validate_evidence_as(
     repository_root: &Path,
     subject: &str,
     evidence: &[Evidence],
     cargo_test_targets: &mut Option<CargoTestTargets>,
     code: ViolationCode,
+) -> Result<(), ConformanceError> {
+    validate_evidence_internal(
+        repository_root,
+        subject,
+        evidence,
+        cargo_test_targets,
+        code,
+        None,
+    )
+}
+
+fn validate_evidence_internal(
+    repository_root: &Path,
+    subject: &str,
+    evidence: &[Evidence],
+    cargo_test_targets: &mut Option<CargoTestTargets>,
+    code: ViolationCode,
+    mut membership_verifier: Option<&mut LibtestMembershipVerifier>,
 ) -> Result<(), ConformanceError> {
     if evidence.is_empty() {
         return Err(ConformanceError::new(
@@ -1215,8 +1454,187 @@ pub(crate) fn validate_evidence_as(
                 ),
             ));
         }
+        if let (Some(targets), Some(verifier)) = (
+            cargo_test_targets.as_ref(),
+            membership_verifier.as_deref_mut(),
+        ) {
+            verifier.verify(targets, subject, item, &canonical_path, code)?;
+        }
     }
     Ok(())
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct LibtestMembershipVerifier {
+    listings: BTreeMap<CargoTargetExecutionKey, Result<BTreeSet<String>, String>>,
+    #[cfg(test)]
+    listing_runs: usize,
+}
+
+impl LibtestMembershipVerifier {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn verify(
+        &mut self,
+        targets: &CargoTestTargets,
+        subject: &str,
+        evidence: &Evidence,
+        canonical_path: &Path,
+        code: ViolationCode,
+    ) -> Result<(), ConformanceError> {
+        let candidates = targets
+            .candidates_for_source(canonical_path)
+            .expect("compiled evidence source has at least one target candidate");
+        let mut registered = false;
+        let mut descriptions = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let target = &candidate.target;
+            let description = target_description(target, &targets.repository_root);
+            descriptions.push(description.clone());
+            let key = CargoTargetExecutionKey::from(target);
+            if !self.listings.contains_key(&key) {
+                let listing = run_libtest_listing(&targets.repository_root, target);
+                self.listings.insert(key.clone(), listing);
+                #[cfg(test)]
+                {
+                    self.listing_runs += 1;
+                }
+            }
+            match self
+                .listings
+                .get(&key)
+                .expect("listing cache contains the requested target")
+            {
+                Ok(listing) => {
+                    let listed_identity = if candidate.module_path.is_empty() {
+                        evidence.test.clone()
+                    } else {
+                        format!("{}::{}", candidate.module_path.join("::"), evidence.test)
+                    };
+                    registered |= listing.contains(&listed_identity);
+                }
+                Err(message) => {
+                    return Err(ConformanceError::new(
+                        code,
+                        Some(subject.to_owned()),
+                        format!(
+                            "cannot verify libtest membership for evidence test '{}' in '{}': \
+                             {description}: {message}",
+                            evidence.test, evidence.path
+                        ),
+                    ));
+                }
+            }
+        }
+        if !registered {
+            return Err(ConformanceError::new(
+                code,
+                Some(subject.to_owned()),
+                format!(
+                    "evidence test '{}' in '{}' is not registered by standard libtest in any \
+                     reachable Cargo target: {}",
+                    evidence.test,
+                    evidence.path,
+                    descriptions.join(", ")
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn listing_runs(&self) -> usize {
+        self.listing_runs
+    }
+}
+
+fn run_libtest_listing(
+    repository_root: &Path,
+    target: &CargoTestTarget,
+) -> Result<BTreeSet<String>, String> {
+    let cargo = cargo_executable(repository_root, ViolationCode::ClaimEvidence)
+        .map_err(|error| error.to_string())?;
+    let output = libtest_listing_command(&cargo, target)
+        .output()
+        .map_err(|error| format!("cannot start Cargo: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Cargo exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_libtest_listing(&output.stdout)
+}
+
+fn libtest_listing_command(cargo: &Path, target: &CargoTestTarget) -> Command {
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(&target.workspace_root)
+        .arg("test")
+        .arg("--manifest-path")
+        .arg(&target.manifest_path)
+        .arg("--locked")
+        .arg("--package")
+        .arg(&target.package_name)
+        .arg(target.kind.selector());
+    if target.kind != CargoTestTargetKind::Library {
+        command.arg(&target.name);
+    }
+    if !target.required_features.is_empty() {
+        command
+            .arg("--features")
+            .arg(target.required_features.join(","));
+    }
+    command.args(["--", "--list", "--format", "terse"]);
+    // Preserve repository Cargo configuration while preventing inherited process
+    // flags from changing or suppressing the compiler-oracle result.
+    for variable in COMPILER_ORACLE_ENV {
+        command.env_remove(variable);
+    }
+    command
+}
+
+fn parse_libtest_listing(stdout: &[u8]) -> Result<BTreeSet<String>, String> {
+    let stdout =
+        std::str::from_utf8(stdout).map_err(|error| format!("listing is not UTF-8: {error}"))?;
+    let mut identities = BTreeSet::new();
+    for line in stdout.lines().filter(|line| !line.is_empty()) {
+        let identity = line
+            .strip_suffix(": test")
+            .or_else(|| line.strip_suffix(": benchmark"))
+            .ok_or_else(|| format!("malformed libtest listing line {line:?}"))?;
+        if !valid_rust_test_path(identity) {
+            return Err(format!(
+                "malformed libtest identity {identity:?} in listing line {line:?}"
+            ));
+        }
+        if !identities.insert(identity.to_owned()) {
+            return Err(format!("duplicate libtest listing identity {identity:?}"));
+        }
+    }
+    Ok(identities)
+}
+
+fn target_description(target: &CargoTestTarget, repository_root: &Path) -> String {
+    let manifest = target
+        .manifest_path
+        .strip_prefix(repository_root)
+        .unwrap_or(&target.manifest_path);
+    let selector = if target.kind == CargoTestTargetKind::Library {
+        target.kind.selector().to_owned()
+    } else {
+        format!("{} {}", target.kind.selector(), target.name)
+    };
+    format!(
+        "package '{}' ({}) target '{}' from manifest '{}'",
+        target.package_name,
+        target.package_id,
+        selector,
+        normalized_api_path(manifest.to_path_buf())
+    )
 }
 
 pub(crate) fn validate_implementation_pointers(
@@ -1450,8 +1868,8 @@ enum PathAttribute {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum InlineModuleDirectory {
-    Default(String),
-    Path(String),
+    Default { name: String },
+    Path { name: String, path: String },
 }
 
 // This is the normative enabled-test decision. The transition validator ports
@@ -1594,7 +2012,7 @@ fn collect_rust_module_references(
                     let mut nested = inline_modules.to_vec();
                     match path_attribute(&outer_attributes) {
                         PathAttribute::Absent => {
-                            nested.push(InlineModuleDirectory::Default(name.clone()));
+                            nested.push(InlineModuleDirectory::Default { name: name.clone() });
                             collect_rust_module_references(
                                 tokens,
                                 open + 1,
@@ -1604,7 +2022,10 @@ fn collect_rust_module_references(
                             );
                         }
                         PathAttribute::Value(path) => {
-                            nested.push(InlineModuleDirectory::Path(path));
+                            nested.push(InlineModuleDirectory::Path {
+                                name: name.clone(),
+                                path,
+                            });
                             collect_rust_module_references(
                                 tokens,
                                 open + 1,
@@ -2029,19 +2450,15 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        CargoTestTargets, cargo_executable, cargo_pattern_matches, declares_enabled_test,
-        load_manifest_scope, normalized_api_path, resolve_cargo_executable,
-        resolve_external_executable,
+        COMPILER_ORACLE_ENV, CargoTestTarget, CargoTestTargetKind, CargoTestTargets,
+        LibtestMembershipVerifier, cargo_executable, cargo_pattern_matches, declares_enabled_test,
+        libtest_listing_command, load_manifest_scope, normalized_api_path, parse_libtest_listing,
+        resolve_cargo_executable, resolve_external_executable, validate_evidence_as,
+        validate_evidence_with_membership,
     };
-    use crate::ViolationCode;
+    use crate::{Evidence, ViolationCode};
 
     static NEXT_COMPILER_ORACLE: AtomicU64 = AtomicU64::new(0);
-    const COMPILER_ORACLE_WARNING_ENV: [&str; 4] = [
-        "RUSTFLAGS",
-        "CARGO_ENCODED_RUSTFLAGS",
-        "CARGO_BUILD_RUSTFLAGS",
-        "CARGO_BUILD_WARNINGS",
-    ];
 
     #[derive(Deserialize)]
     struct SharedOracleCorpus {
@@ -2078,7 +2495,7 @@ mod tests {
         command
             .current_dir(root)
             .env("CARGO_TARGET_DIR", root.join("target"));
-        for variable in COMPILER_ORACLE_WARNING_ENV {
+        for variable in COMPILER_ORACLE_ENV {
             command.env_remove(variable);
         }
         command
@@ -2146,6 +2563,198 @@ mod tests {
         }
     }
 
+    struct ProcMacroMembershipFixture {
+        root: PathBuf,
+    }
+
+    impl ProcMacroMembershipFixture {
+        fn new() -> Self {
+            let root = env::temp_dir().join(format!(
+                "claw-conformance-libtest-membership-{}-{}",
+                std::process::id(),
+                NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+            ));
+            for directory in ["evil/src", "consumer/src", "consumer/tests"] {
+                fs::create_dir_all(root.join(directory))
+                    .expect("create proc-macro membership fixture");
+            }
+            fs::write(
+                root.join("Cargo.toml"),
+                "[workspace]\nmembers = [\"evil\", \"consumer\"]\nresolver = \"3\"\n",
+            )
+            .expect("write proc-macro workspace");
+            fs::write(
+                root.join("Cargo.lock"),
+                "# This file is automatically @generated by Cargo.\n\
+                 # It is not intended for manual editing.\n\
+                 version = 4\n\n\
+                 [[package]]\n\
+                 name = \"consumer\"\n\
+                 version = \"0.0.0\"\n\
+                 dependencies = [\n\
+                  \"evil\",\n\
+                 ]\n\n\
+                 [[package]]\n\
+                 name = \"evil\"\n\
+                 version = \"0.0.0\"\n",
+            )
+            .expect("write proc-macro lockfile");
+            fs::write(
+                root.join("evil").join("Cargo.toml"),
+                "[package]\n\
+                 name = \"evil\"\n\
+                 version = \"0.0.0\"\n\
+                 edition = \"2024\"\n\n\
+                 [lib]\n\
+                 proc-macro = true\n",
+            )
+            .expect("write proc-macro manifest");
+            fs::write(
+                root.join("evil").join("src").join("lib.rs"),
+                "extern crate proc_macro;\n\
+                 use proc_macro::TokenStream;\n\n\
+                 #[proc_macro_attribute]\n\
+                 pub fn test(_attribute: TokenStream, item: TokenStream) -> TokenStream {\n\
+                     item\n\
+                 }\n",
+            )
+            .expect("write proc-macro source");
+            fs::write(
+                root.join("consumer").join("Cargo.toml"),
+                "[package]\n\
+                 name = \"consumer\"\n\
+                 version = \"0.0.0\"\n\
+                 edition = \"2024\"\n\n\
+                 [features]\n\
+                 alpha = []\n\
+                 zeta = []\n\n\
+                 [dev-dependencies]\n\
+                 evil = { path = \"../evil\" }\n\n\
+                 [[test]]\n\
+                 name = \"qualified\"\n\
+                 path = \"tests/qualified.rs\"\n\
+                 required-features = [\"zeta\", \"alpha\"]\n\n\
+                 [[test]]\n\
+                 name = \"imported\"\n\
+                 path = \"tests/imported.rs\"\n\n\
+                 [[test]]\n\
+                 name = \"harnessless\"\n\
+                 path = \"tests/harnessless.rs\"\n\
+                 harness = false\n",
+            )
+            .expect("write consumer manifest");
+            fs::write(root.join("consumer").join("src").join("lib.rs"), "")
+                .expect("write consumer library");
+            fs::write(
+                root.join("consumer").join("build.rs"),
+                "fn main() {\n\
+                     std::fs::write(\n\
+                         std::path::Path::new(&std::env::var(\"CARGO_MANIFEST_DIR\").unwrap())\n\
+                             .join(\"build-script-ran\"),\n\
+                         \"ran\",\n\
+                     )\n\
+                     .unwrap();\n\
+                 }\n",
+            )
+            .expect("write consumer build script");
+            fs::write(
+                root.join("consumer").join("tests").join("qualified.rs"),
+                "#[evil::test]\n\
+                 fn forged_qualified() {}\n\n\
+                 #[test]\n\
+                 fn real_builtin() {}\n\n\
+                 #[test]\n\
+                 fn second_builtin() {}\n",
+            )
+            .expect("write qualified proc-macro fixture");
+            fs::write(
+                root.join("consumer").join("tests").join("imported.rs"),
+                "use evil::test;\n\n\
+                 #[test]\n\
+                 fn imported_test_name() {}\n",
+            )
+            .expect("write imported proc-macro fixture");
+            fs::write(
+                root.join("consumer").join("tests").join("harnessless.rs"),
+                "#[test]\n\
+                 fn forged_harnessless() {}\n\n\
+                 fn main() {\n\
+                     println!(\"forged_harnessless: test\");\n\
+                 }\n",
+            )
+            .expect("write harness-free fixture");
+            Self { root }
+        }
+
+        fn list_target(&self, target: &str, features: Option<&str>) -> Output {
+            let cargo = cargo_executable(&self.root, ViolationCode::ClaimEvidence)
+                .expect("resolve trusted Cargo");
+            let mut command = compiler_oracle_command(&cargo, &self.root);
+            command.args([
+                "test",
+                "--offline",
+                "--quiet",
+                "--manifest-path",
+                "Cargo.toml",
+                "--locked",
+                "--package",
+                "consumer",
+                "--test",
+                target,
+            ]);
+            if let Some(features) = features {
+                command.args(["--features", features]);
+            }
+            command.args(["--", "--list", "--format", "terse"]);
+            command.output().expect("run proc-macro compiler oracle")
+        }
+
+        fn canonical_source(&self, relative: &str) -> PathBuf {
+            self.root
+                .join(relative)
+                .canonicalize()
+                .expect("canonical fixture source")
+        }
+    }
+
+    impl Drop for ProcMacroMembershipFixture {
+        fn drop(&mut self) {
+            if self.root.exists() {
+                fs::remove_dir_all(&self.root).expect("remove proc-macro membership fixture");
+            }
+        }
+    }
+
+    fn fixture_target<'a>(
+        targets: &'a CargoTestTargets,
+        canonical_source: &Path,
+    ) -> &'a CargoTestTarget {
+        let candidates = targets
+            .candidates_for_source(canonical_source)
+            .expect("fixture source has target candidates");
+        assert_eq!(candidates.len(), 1);
+        &candidates.first().expect("one fixture candidate").target
+    }
+
+    fn fixture_target_description(target: &CargoTestTarget, repository_root: &Path) -> String {
+        let manifest = target
+            .manifest_path
+            .strip_prefix(repository_root)
+            .expect("fixture manifest is repository-relative");
+        let selector = if target.kind == CargoTestTargetKind::Library {
+            target.kind.selector().to_owned()
+        } else {
+            format!("{} {}", target.kind.selector(), target.name)
+        };
+        format!(
+            "package '{}' ({}) target '{}' from manifest '{}'",
+            target.package_name,
+            target.package_id,
+            selector,
+            normalized_api_path(manifest.to_path_buf())
+        )
+    }
+
     fn assert_command_succeeded(output: &Output) {
         assert!(
             output.status.success(),
@@ -2158,7 +2767,7 @@ mod tests {
     #[test]
     fn compiler_oracle_command_removes_warning_escalation() {
         let command = compiler_oracle_command(Path::new("cargo"), Path::new("."));
-        for variable in COMPILER_ORACLE_WARNING_ENV {
+        for variable in COMPILER_ORACLE_ENV {
             assert_eq!(
                 command
                     .get_envs()
@@ -2168,6 +2777,367 @@ mod tests {
                 "{variable} must be absent from compiler oracle subprocesses"
             );
         }
+    }
+
+    #[test]
+    fn proc_macro_test_shapes_follow_real_libtest_membership() {
+        let fixture = ProcMacroMembershipFixture::new();
+        let qualified = fixture.list_target("qualified", Some("alpha,zeta"));
+        assert_command_succeeded(&qualified);
+        assert_eq!(
+            parse_libtest_listing(&qualified.stdout),
+            Ok(BTreeSet::from([
+                "real_builtin".to_owned(),
+                "second_builtin".to_owned(),
+            ]))
+        );
+        let imported = fixture.list_target("imported", None);
+        assert_command_succeeded(&imported);
+        assert_eq!(parse_libtest_listing(&imported.stdout), Ok(BTreeSet::new()));
+
+        for (path, identity) in [
+            ("consumer/tests/qualified.rs", "forged_qualified"),
+            ("consumer/tests/imported.rs", "imported_test_name"),
+        ] {
+            let evidence = [Evidence::test(path, identity)];
+            let mut targets = None;
+            assert_eq!(
+                validate_evidence_as(
+                    &fixture.root,
+                    "forged-claim",
+                    &evidence,
+                    &mut targets,
+                    ViolationCode::ClaimEvidence,
+                ),
+                Ok(())
+            );
+            let targets_ref = targets.as_ref().expect("static validation loads targets");
+            let canonical_source = fixture.canonical_source(path);
+            let description = fixture_target_description(
+                fixture_target(targets_ref, &canonical_source),
+                &targets_ref.repository_root,
+            );
+            let mut verifier = LibtestMembershipVerifier::new();
+            let error = validate_evidence_with_membership(
+                &fixture.root,
+                "forged-claim",
+                &evidence,
+                &mut targets,
+                &mut verifier,
+            )
+            .expect_err("forged proc-macro identity must not be registered");
+            assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+            assert_eq!(error.subject(), Some("forged-claim"));
+            assert_eq!(
+                error.message(),
+                format!(
+                    "evidence test '{identity}' in '{path}' is not registered by standard \
+                     libtest in any reachable Cargo target: {description}"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn built_in_membership_is_accepted_and_target_listing_is_cached() {
+        let fixture = ProcMacroMembershipFixture::new();
+        let evidence = [
+            Evidence::test("consumer/tests/qualified.rs", "real_builtin"),
+            Evidence::test("consumer/tests/qualified.rs", "second_builtin"),
+        ];
+        let mut targets = None;
+        let mut verifier = LibtestMembershipVerifier::new();
+        assert_eq!(
+            validate_evidence_with_membership(
+                &fixture.root,
+                "built-in-claim",
+                &evidence,
+                &mut targets,
+                &mut verifier,
+            ),
+            Ok(())
+        );
+        assert_eq!(verifier.listing_runs(), 1);
+    }
+
+    #[test]
+    fn static_validation_does_not_execute_candidate_builds() {
+        let fixture = ProcMacroMembershipFixture::new();
+        let marker = fixture.root.join("consumer").join("build-script-ran");
+        let evidence = [Evidence::test(
+            "consumer/tests/qualified.rs",
+            "real_builtin",
+        )];
+        let mut targets = None;
+        assert_eq!(
+            validate_evidence_as(
+                &fixture.root,
+                "static-claim",
+                &evidence,
+                &mut targets,
+                ViolationCode::ClaimEvidence,
+            ),
+            Ok(())
+        );
+        assert!(!marker.exists());
+
+        let mut verifier = LibtestMembershipVerifier::new();
+        assert_eq!(
+            validate_evidence_with_membership(
+                &fixture.root,
+                "verified-claim",
+                &evidence,
+                &mut targets,
+                &mut verifier,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            fs::read_to_string(marker).expect("read build-script marker"),
+            "ran"
+        );
+    }
+
+    #[test]
+    fn alternate_module_aliases_preserve_each_exact_libtest_identity() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-module-alias-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let package = root.join("package");
+        fs::create_dir_all(package.join("src")).expect("create module alias fixture");
+        fs::write(
+            package.join("Cargo.toml"),
+            "[package]\n\
+             name = \"module-alias\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2024\"\n\n\
+             [workspace]\n\
+             resolver = \"3\"\n",
+        )
+        .expect("write module alias manifest");
+        fs::write(
+            package.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\n\
+             name = \"module-alias\"\n\
+             version = \"0.0.0\"\n",
+        )
+        .expect("write module alias lockfile");
+        fs::write(
+            package.join("src").join("lib.rs"),
+            "#[cfg(target_os = \"none\")]\n\
+             #[path = \"shared.rs\"]\n\
+             mod disabled_alias;\n\n\
+             #[path = \"shared.rs\"]\n\
+             mod enabled_alias;\n",
+        )
+        .expect("write module aliases");
+        fs::write(
+            package.join("src").join("shared.rs"),
+            "#[test]\nfn alias_test() {}\n",
+        )
+        .expect("write aliased test source");
+
+        let evidence = [Evidence::test("package/src/shared.rs", "alias_test")];
+        let mut targets = None;
+        let mut verifier = LibtestMembershipVerifier::new();
+        assert_eq!(
+            validate_evidence_with_membership(
+                &root,
+                "module-alias-claim",
+                &evidence,
+                &mut targets,
+                &mut verifier,
+            ),
+            Ok(())
+        );
+        let canonical = package
+            .join("src")
+            .join("shared.rs")
+            .canonicalize()
+            .expect("canonical aliased source");
+        let module_paths = targets
+            .as_ref()
+            .and_then(|targets| targets.candidates_for_source(&canonical))
+            .expect("alias candidates")
+            .iter()
+            .map(|candidate| candidate.module_path.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            module_paths,
+            BTreeSet::from([
+                vec!["disabled_alias".to_owned()],
+                vec!["enabled_alias".to_owned()],
+            ])
+        );
+        assert_eq!(verifier.listing_runs(), 1);
+        fs::remove_dir_all(root).expect("remove module alias fixture");
+    }
+
+    #[test]
+    fn harness_free_target_output_cannot_satisfy_membership() {
+        let fixture = ProcMacroMembershipFixture::new();
+        let output = fixture.list_target("harnessless", None);
+        assert_command_succeeded(&output);
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("harness-free output is UTF-8"),
+            "forged_harnessless: test\n"
+        );
+
+        let evidence = [Evidence::test(
+            "consumer/tests/harnessless.rs",
+            "forged_harnessless",
+        )];
+        let mut targets = None;
+        let mut verifier = LibtestMembershipVerifier::new();
+        let error = validate_evidence_with_membership(
+            &fixture.root,
+            "harness-free-claim",
+            &evidence,
+            &mut targets,
+            &mut verifier,
+        )
+        .expect_err("harness-free target must not be a candidate");
+        assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+        assert_eq!(error.subject(), Some("harness-free-claim"));
+        assert_eq!(
+            error.message(),
+            "evidence path 'consumer/tests/harnessless.rs' is not reachable from a test-enabled \
+             Cargo target"
+        );
+        assert_eq!(verifier.listing_runs(), 0);
+    }
+
+    #[test]
+    fn libtest_listing_command_is_exact_and_environment_hardened() {
+        let fixture = ProcMacroMembershipFixture::new();
+        let targets = CargoTestTargets::load(&fixture.root, ViolationCode::ClaimEvidence)
+            .expect("load fixture target graph");
+        let source = fixture.canonical_source("consumer/tests/qualified.rs");
+        let target = fixture_target(&targets, &source);
+        let command = libtest_listing_command(Path::new("cargo"), target);
+        assert_eq!(
+            command.get_current_dir(),
+            Some(target.workspace_root.as_path())
+        );
+        assert_eq!(
+            command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec![
+                "test".to_owned(),
+                "--manifest-path".to_owned(),
+                target.manifest_path.to_string_lossy().into_owned(),
+                "--locked".to_owned(),
+                "--package".to_owned(),
+                "consumer".to_owned(),
+                "--test".to_owned(),
+                "qualified".to_owned(),
+                "--features".to_owned(),
+                "alpha,zeta".to_owned(),
+                "--".to_owned(),
+                "--list".to_owned(),
+                "--format".to_owned(),
+                "terse".to_owned(),
+            ]
+        );
+        for variable in COMPILER_ORACLE_ENV {
+            assert_eq!(
+                command
+                    .get_envs()
+                    .find(|(key, _)| *key == variable)
+                    .map(|(_, value)| value),
+                Some(None),
+                "{variable} must be absent from libtest listing subprocesses"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_libtest_listing_fails_closed() {
+        assert_eq!(
+            parse_libtest_listing(b"forged output\n"),
+            Err("malformed libtest listing line \"forged output\"".to_owned())
+        );
+        assert_eq!(
+            parse_libtest_listing(b"valid_name: test\nvalid_name: test\n"),
+            Err("duplicate libtest listing identity \"valid_name\"".to_owned())
+        );
+        assert_eq!(
+            parse_libtest_listing(b"not valid!: test\n"),
+            Err(
+                "malformed libtest identity \"not valid!\" in listing line \"not valid!: test\""
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn cached_target_command_failure_is_a_precise_conformance_error() {
+        let fixture = ProcMacroMembershipFixture::new();
+        let source = fixture.canonical_source("consumer/tests/qualified.rs");
+        let loaded = CargoTestTargets::load(&fixture.root, ViolationCode::ClaimEvidence)
+            .expect("load fixture target graph");
+        let target = fixture_target(&loaded, &source);
+        let description = fixture_target_description(target, &loaded.repository_root);
+        let mut verifier = LibtestMembershipVerifier::new();
+        verifier.listings.insert(
+            super::CargoTargetExecutionKey::from(target),
+            Err("fixture command failure".to_owned()),
+        );
+        let evidence = [Evidence::test(
+            "consumer/tests/qualified.rs",
+            "real_builtin",
+        )];
+        let mut targets = Some(loaded);
+        let error = validate_evidence_with_membership(
+            &fixture.root,
+            "failed-command-claim",
+            &evidence,
+            &mut targets,
+            &mut verifier,
+        )
+        .expect_err("target command failure must fail closed");
+        assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+        assert_eq!(error.subject(), Some("failed-command-claim"));
+        assert_eq!(
+            error.message(),
+            format!(
+                "cannot verify libtest membership for evidence test 'real_builtin' in \
+                 'consumer/tests/qualified.rs': {description}: fixture command failure"
+            )
+        );
+    }
+
+    #[test]
+    fn qualified_tokio_test_is_registered_by_real_workspace_target() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("canonical repository root");
+        let evidence = [Evidence::test(
+            "crates/claw-acp/src/protocol.rs",
+            "tests::split_and_coalesced_frames_are_decoded_independently",
+        )];
+        let mut targets = None;
+        let mut verifier = LibtestMembershipVerifier::new();
+        assert_eq!(
+            validate_evidence_with_membership(
+                &root,
+                "normative-tokio-test",
+                &evidence,
+                &mut targets,
+                &mut verifier,
+            ),
+            Ok(())
+        );
+        assert_eq!(verifier.listing_runs(), 1);
     }
 
     #[test]
