@@ -250,6 +250,23 @@ fn real_frozen_contract_loads_every_row() {
 }
 
 #[test]
+fn canonical_count_drift_names_the_key_and_values() {
+    let fixture = Fixture::copy_upstream();
+    mutate_json(&fixture.root.join("manifest.json"), |manifest| {
+        manifest["canonical_counts"]["artifact_json_files"] = serde_json::json!(17);
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::ManifestDrift);
+    assert_eq!(error.subject(), Some("manifest.json"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "canonical count 'artifact_json_files' must be 18, got 17"
+    );
+}
+
+#[test]
 fn workspace_claim_manifests_pass_conformance() {
     let repository = repository_root();
     let contract =

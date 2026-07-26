@@ -1,14 +1,17 @@
 //! Static final-state policy and extensible root workspace validation.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write as _};
 use std::path::{Component, Path};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest as _, Sha256};
 use toml::Value as TomlValue;
 
 use crate::identity::canonical_caseless;
-use crate::input::{DEFAULT_FILE_LIMIT, SafeRoot};
+use crate::input::{DEFAULT_FILE_LIMIT, SafeRoot, require_plain_path};
 use crate::ownership::{CODEOWNERS_PATH, is_codeowners_path_or_alias, validate_codeowners};
 use crate::{PolicyError, PolicyResult, error};
 
@@ -82,6 +85,8 @@ const BOOTSTRAP_FINGERPRINT: &str =
     "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3";
 
 const BOOTSTRAP_SNAPSHOT_MAGIC: &[u8; 8] = b"GTABOOT1";
+const MAX_BOOTSTRAP_SNAPSHOT_PATH_BYTES: usize = 4096;
+static NEXT_BOOTSTRAP_SNAPSHOT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 const BOOTSTRAP_FILES: [&str; 28] = [
     ".cargo/audit.toml",
@@ -113,6 +118,206 @@ const BOOTSTRAP_FILES: [&str; 28] = [
     "rust-toolchain.toml",
     "rustfmt.toml",
 ];
+
+/// One deterministic change between an existing and generated Bootstrap snapshot.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BootstrapSnapshotChange {
+    path: String,
+    status: BootstrapSnapshotChangeStatus,
+}
+
+impl BootstrapSnapshotChange {
+    /// Returns the changed archive path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns how the archive path changed.
+    #[must_use]
+    pub const fn status(&self) -> BootstrapSnapshotChangeStatus {
+        self.status
+    }
+}
+
+/// Classification for one changed Bootstrap snapshot path.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BootstrapSnapshotChangeStatus {
+    /// The path is present only in the generated snapshot.
+    Added,
+    /// The path is present in both snapshots with different payload bytes.
+    Modified,
+    /// The path is present only in the existing snapshot.
+    Removed,
+}
+
+impl fmt::Display for BootstrapSnapshotChangeStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Added => "added",
+            Self::Modified => "modified",
+            Self::Removed => "removed",
+        })
+    }
+}
+
+/// Deterministic delta emitted by every successful Bootstrap snapshot write.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BootstrapSnapshotDelta {
+    preserved_count: usize,
+    changes: Vec<BootstrapSnapshotChange>,
+}
+
+impl BootstrapSnapshotDelta {
+    /// Returns the number of added, modified, or removed paths.
+    #[must_use]
+    pub fn changed_count(&self) -> usize {
+        self.changes.len()
+    }
+
+    /// Returns the number of paths whose payload bytes were preserved.
+    #[must_use]
+    pub const fn preserved_count(&self) -> usize {
+        self.preserved_count
+    }
+
+    /// Returns changed paths in ascending path order.
+    #[must_use]
+    pub fn changes(&self) -> &[BootstrapSnapshotChange] {
+        &self.changes
+    }
+}
+
+impl fmt::Display for BootstrapSnapshotDelta {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "bootstrap_snapshot_delta changed_count={} preserved_count={}",
+            self.changed_count(),
+            self.preserved_count
+        )?;
+        for change in &self.changes {
+            write!(
+                formatter,
+                "\nchanged_path={:?} status={}",
+                change.path, change.status
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Strictly parsed canonical Bootstrap snapshot archive.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BootstrapSnapshotArchive {
+    entries: BTreeMap<String, Vec<u8>>,
+}
+
+impl BootstrapSnapshotArchive {
+    /// Parses one canonical Bootstrap snapshot without accepting trailing or ambiguous data.
+    pub fn parse(bytes: &[u8]) -> PolicyResult<Self> {
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_REPOSITORY_BYTES {
+            return Err(PolicyError::new(format!(
+                "Bootstrap snapshot exceeds {MAX_REPOSITORY_BYTES} bytes"
+            )));
+        }
+
+        let mut offset = 0;
+        let magic = snapshot_bytes(bytes, &mut offset, BOOTSTRAP_SNAPSHOT_MAGIC.len(), "magic")?;
+        if magic != BOOTSTRAP_SNAPSHOT_MAGIC {
+            return Err(PolicyError::new("Bootstrap snapshot magic is not GTABOOT1"));
+        }
+        let count = usize::try_from(snapshot_u32(bytes, &mut offset, "entry count")?)
+            .map_err(|_| PolicyError::new("Bootstrap snapshot entry count exceeds usize"))?;
+        if count > MAX_REPOSITORY_FILES {
+            return Err(PolicyError::new(format!(
+                "Bootstrap snapshot entry count exceeds {MAX_REPOSITORY_FILES}"
+            )));
+        }
+
+        let mut entries = BTreeMap::new();
+        let mut previous_path: Option<String> = None;
+        for index in 0..count {
+            let path_length = usize::try_from(snapshot_u32(bytes, &mut offset, "path length")?)
+                .map_err(|_| PolicyError::new("Bootstrap snapshot path length exceeds usize"))?;
+            if path_length == 0 || path_length > MAX_BOOTSTRAP_SNAPSHOT_PATH_BYTES {
+                return Err(PolicyError::new(format!(
+                    "Bootstrap snapshot entry {index} has invalid path length {path_length}"
+                )));
+            }
+            let data_length = usize::try_from(snapshot_u64(bytes, &mut offset, "payload length")?)
+                .map_err(|_| PolicyError::new("Bootstrap snapshot payload length exceeds usize"))?;
+            if u64::try_from(data_length).unwrap_or(u64::MAX) > MAX_LOCK_BYTES {
+                return Err(PolicyError::new(format!(
+                    "Bootstrap snapshot entry {index} payload exceeds {MAX_LOCK_BYTES} bytes"
+                )));
+            }
+            let path_bytes = snapshot_bytes(bytes, &mut offset, path_length, "entry path bytes")?;
+            let path = std::str::from_utf8(path_bytes).map_err(|cause| {
+                error(
+                    &format!("Bootstrap snapshot entry {index} path is not UTF-8"),
+                    cause,
+                )
+            })?;
+            validate_bootstrap_snapshot_path(path, index)?;
+            if previous_path
+                .as_deref()
+                .is_some_and(|previous| previous >= path)
+            {
+                return Err(PolicyError::new(format!(
+                    "Bootstrap snapshot paths are not strictly sorted at entry {index}: {path}"
+                )));
+            }
+            let payload = snapshot_bytes(bytes, &mut offset, data_length, "entry payload")?;
+            entries.insert(path.to_owned(), payload.to_vec());
+            previous_path = Some(path.to_owned());
+        }
+        if offset != bytes.len() {
+            return Err(PolicyError::new(format!(
+                "Bootstrap snapshot has {} trailing bytes",
+                bytes.len() - offset
+            )));
+        }
+        Ok(Self { entries })
+    }
+
+    /// Returns the canonical entries in ascending path order.
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = (&str, &[u8])> {
+        self.entries
+            .iter()
+            .map(|(path, payload)| (path.as_str(), payload.as_slice()))
+    }
+
+    fn from_root(root: &SafeRoot) -> PolicyResult<Self> {
+        let mut entries = BTreeMap::new();
+        for path in BOOTSTRAP_FILES {
+            entries.insert(
+                path.to_owned(),
+                normalize_text(&root.read_bytes(path, MAX_LOCK_BYTES)?),
+            );
+        }
+        Ok(Self { entries })
+    }
+
+    fn serialize(&self) -> PolicyResult<Vec<u8>> {
+        let file_count = u32::try_from(self.entries.len())
+            .map_err(|_| PolicyError::new("Bootstrap snapshot file count exceeds u32"))?;
+        let mut snapshot = Vec::new();
+        snapshot.extend_from_slice(BOOTSTRAP_SNAPSHOT_MAGIC);
+        snapshot.extend_from_slice(&file_count.to_le_bytes());
+        for (path, bytes) in &self.entries {
+            let path_length = u32::try_from(path.len())
+                .map_err(|_| PolicyError::new("Bootstrap snapshot path length exceeds u32"))?;
+            let data_length = u64::try_from(bytes.len())
+                .map_err(|_| PolicyError::new("Bootstrap snapshot file length exceeds u64"))?;
+            snapshot.extend_from_slice(&path_length.to_le_bytes());
+            snapshot.extend_from_slice(&data_length.to_le_bytes());
+            snapshot.extend_from_slice(path.as_bytes());
+            snapshot.extend_from_slice(bytes);
+        }
+        Ok(snapshot)
+    }
+}
 
 const BOOTSTRAP_MEMBER_MANIFESTS: [&str; 9] = [
     "apps/gta-claw-cli/Cargo.toml",
@@ -1352,29 +1557,207 @@ pub fn bootstrap_fingerprint(root: &SafeRoot) -> PolicyResult<String> {
 
 /// Serializes the exact pre-P04f policy inputs into the canonical Bootstrap snapshot format.
 pub fn bootstrap_snapshot(root: &SafeRoot) -> PolicyResult<Vec<u8>> {
-    let file_count = u32::try_from(BOOTSTRAP_FILES.len())
-        .map_err(|_| PolicyError::new("Bootstrap snapshot file count exceeds u32"))?;
-    let mut snapshot = Vec::new();
-    snapshot.extend_from_slice(BOOTSTRAP_SNAPSHOT_MAGIC);
-    snapshot.extend_from_slice(&file_count.to_le_bytes());
-    for path in BOOTSTRAP_FILES {
-        let path_length = u32::try_from(path.len())
-            .map_err(|_| PolicyError::new("Bootstrap snapshot path length exceeds u32"))?;
-        let bytes = normalize_text(&root.read_bytes(path, MAX_LOCK_BYTES)?);
-        let data_length = u64::try_from(bytes.len())
-            .map_err(|_| PolicyError::new("Bootstrap snapshot file length exceeds u64"))?;
-        snapshot.extend_from_slice(&path_length.to_le_bytes());
-        snapshot.extend_from_slice(&data_length.to_le_bytes());
-        snapshot.extend_from_slice(path.as_bytes());
-        snapshot.extend_from_slice(&bytes);
-    }
-    Ok(snapshot)
+    BootstrapSnapshotArchive::from_root(root)?.serialize()
 }
 
-/// Writes a canonical Bootstrap snapshot generated from trusted policy inputs.
-pub fn write_bootstrap_snapshot(root: &SafeRoot, output: &Path) -> PolicyResult<()> {
-    fs::write(output, bootstrap_snapshot(root)?)
-        .map_err(|cause| error("write Bootstrap snapshot", cause))
+fn snapshot_bytes<'a>(
+    bytes: &'a [u8],
+    offset: &mut usize,
+    length: usize,
+    label: &str,
+) -> PolicyResult<&'a [u8]> {
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| PolicyError::new(format!("Bootstrap snapshot {label} offset overflowed")))?;
+    let value = bytes.get(*offset..end).ok_or_else(|| {
+        PolicyError::new(format!(
+            "Bootstrap snapshot ended inside {label} at byte {offset}"
+        ))
+    })?;
+    *offset = end;
+    Ok(value)
+}
+
+fn snapshot_u32(bytes: &[u8], offset: &mut usize, label: &str) -> PolicyResult<u32> {
+    Ok(u32::from_le_bytes(
+        snapshot_bytes(bytes, offset, 4, label)?
+            .try_into()
+            .map_err(|_| PolicyError::new("Bootstrap snapshot u32 width changed"))?,
+    ))
+}
+
+fn snapshot_u64(bytes: &[u8], offset: &mut usize, label: &str) -> PolicyResult<u64> {
+    Ok(u64::from_le_bytes(
+        snapshot_bytes(bytes, offset, 8, label)?
+            .try_into()
+            .map_err(|_| PolicyError::new("Bootstrap snapshot u64 width changed"))?,
+    ))
+}
+
+fn validate_bootstrap_snapshot_path(path: &str, index: usize) -> PolicyResult<()> {
+    if path.contains('\\')
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(PolicyError::new(format!(
+            "Bootstrap snapshot entry {index} path is not canonical: {path:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn bootstrap_snapshot_delta(
+    existing: Option<&BootstrapSnapshotArchive>,
+    generated: &BootstrapSnapshotArchive,
+) -> BootstrapSnapshotDelta {
+    let mut preserved_count = 0;
+    let mut changes = BTreeMap::new();
+    for (path, payload) in &generated.entries {
+        match existing.and_then(|archive| archive.entries.get(path)) {
+            Some(previous) if previous == payload => preserved_count += 1,
+            Some(_) => {
+                changes.insert(path.clone(), BootstrapSnapshotChangeStatus::Modified);
+            }
+            None => {
+                changes.insert(path.clone(), BootstrapSnapshotChangeStatus::Added);
+            }
+        }
+    }
+    if let Some(existing) = existing {
+        for path in existing.entries.keys() {
+            if !generated.entries.contains_key(path) {
+                changes.insert(path.clone(), BootstrapSnapshotChangeStatus::Removed);
+            }
+        }
+    }
+    BootstrapSnapshotDelta {
+        preserved_count,
+        changes: changes
+            .into_iter()
+            .map(|(path, status)| BootstrapSnapshotChange { path, status })
+            .collect(),
+    }
+}
+
+fn read_existing_bootstrap_snapshot(output: &Path) -> PolicyResult<Option<Vec<u8>>> {
+    let metadata = match fs::symlink_metadata(output) {
+        Ok(metadata) => metadata,
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(cause) => return Err(error("inspect existing Bootstrap snapshot", cause)),
+    };
+    require_plain_path(output)?;
+    if !metadata.is_file() {
+        return Err(PolicyError::new(format!(
+            "existing Bootstrap snapshot is not a regular file: {}",
+            output.display()
+        )));
+    }
+    if metadata.len() > MAX_REPOSITORY_BYTES {
+        return Err(PolicyError::new(format!(
+            "existing Bootstrap snapshot exceeds {MAX_REPOSITORY_BYTES} bytes"
+        )));
+    }
+    let mut file =
+        File::open(output).map_err(|cause| error("open existing Bootstrap snapshot", cause))?;
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    Read::by_ref(&mut file)
+        .take(MAX_REPOSITORY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|cause| error("read existing Bootstrap snapshot", cause))?;
+    let after = file
+        .metadata()
+        .map_err(|cause| error("inspect existing Bootstrap snapshot after read", cause))?;
+    if after.len() != metadata.len() || after.len() != bytes.len() as u64 {
+        return Err(PolicyError::new(
+            "existing Bootstrap snapshot changed while it was read",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn stage_bootstrap_snapshot(output: &Path, bytes: &[u8]) -> PolicyResult<std::path::PathBuf> {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    require_plain_path(parent)?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .map_err(|cause| error("inspect Bootstrap snapshot output directory", cause))?;
+    if !parent_metadata.is_dir() {
+        return Err(PolicyError::new(format!(
+            "Bootstrap snapshot output parent is not a directory: {}",
+            parent.display()
+        )));
+    }
+    for _ in 0..32 {
+        let unique = NEXT_BOOTSTRAP_SNAPSHOT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let staged = parent.join(format!(
+            ".bootstrap-snapshot-{}-{unique}.tmp",
+            std::process::id()
+        ));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged);
+        match file {
+            Ok(mut file) => {
+                let result = file
+                    .write_all(bytes)
+                    .and_then(|()| file.sync_all())
+                    .map_err(|cause| error("stage Bootstrap snapshot", cause));
+                drop(file);
+                if let Err(cause) = result {
+                    return Err(cleanup_staged_snapshot(&staged, cause));
+                }
+                return Ok(staged);
+            }
+            Err(cause) if cause.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(cause) => return Err(error("create staged Bootstrap snapshot", cause)),
+        }
+    }
+    Err(PolicyError::new(
+        "could not allocate a unique staged Bootstrap snapshot",
+    ))
+}
+
+fn cleanup_staged_snapshot(staged: &Path, cause: PolicyError) -> PolicyError {
+    match fs::remove_file(staged) {
+        Ok(()) => cause,
+        Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => cause,
+        Err(cleanup) => PolicyError::new(format!(
+            "{cause}; remove staged Bootstrap snapshot: {cleanup}"
+        )),
+    }
+}
+
+fn replace_bootstrap_snapshot(staged: &Path, output: &Path) -> PolicyResult<()> {
+    if let Err(cause) = fs::rename(staged, output) {
+        return Err(cleanup_staged_snapshot(
+            staged,
+            error("replace Bootstrap snapshot", cause),
+        ));
+    }
+    Ok(())
+}
+
+/// Writes a canonical Bootstrap snapshot and returns its deterministic archive delta.
+pub fn write_bootstrap_snapshot(
+    root: &SafeRoot,
+    output: &Path,
+) -> PolicyResult<BootstrapSnapshotDelta> {
+    let generated = BootstrapSnapshotArchive::from_root(root)?;
+    let generated_bytes = generated.serialize()?;
+    let existing_bytes = read_existing_bootstrap_snapshot(output)?;
+    let existing = existing_bytes
+        .as_deref()
+        .map(BootstrapSnapshotArchive::parse)
+        .transpose()
+        .map_err(|cause| error("parse existing Bootstrap snapshot", cause))?;
+    let delta = bootstrap_snapshot_delta(existing.as_ref(), &generated);
+    if existing_bytes.as_deref() == Some(generated_bytes.as_slice()) {
+        return Ok(delta);
+    }
+    let staged = stage_bootstrap_snapshot(output, &generated_bytes)?;
+    replace_bootstrap_snapshot(&staged, output)?;
+    Ok(delta)
 }
 
 /// Copies live dependency artifacts and policy into their canonical Final audit fixtures.

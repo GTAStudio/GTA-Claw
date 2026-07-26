@@ -23,8 +23,10 @@ use desktop_supply_chain_policy::ownership::{
     validate_codeowners_text,
 };
 use desktop_supply_chain_policy::policy::{
-    bootstrap_fingerprint, bootstrap_snapshot, expected_bootstrap_fingerprint, is_bootstrap_state,
-    validate_casefold_paths, validate_final_static, write_final_dependency_fixtures,
+    BootstrapSnapshotArchive, BootstrapSnapshotChangeStatus, bootstrap_fingerprint,
+    bootstrap_snapshot, expected_bootstrap_fingerprint, is_bootstrap_state,
+    validate_casefold_paths, validate_final_static, write_bootstrap_snapshot,
+    write_final_dependency_fixtures,
 };
 use desktop_supply_chain_policy::process::{CommandSpec, run, run_checked};
 use desktop_supply_chain_policy::repository_policy::validate_repository_policy_transition;
@@ -558,55 +560,21 @@ fn copy_repo(label: &str) -> TempTree {
     tree
 }
 
-fn read_u32(bytes: &[u8], offset: &mut usize) -> u32 {
-    let end = offset.checked_add(4).expect("snapshot u32 offset");
-    let value = u32::from_le_bytes(
-        bytes[*offset..end]
-            .try_into()
-            .expect("snapshot contains complete u32"),
-    );
-    *offset = end;
-    value
-}
-
-fn read_u64(bytes: &[u8], offset: &mut usize) -> u64 {
-    let end = offset.checked_add(8).expect("snapshot u64 offset");
-    let value = u64::from_le_bytes(
-        bytes[*offset..end]
-            .try_into()
-            .expect("snapshot contains complete u64"),
-    );
-    *offset = end;
-    value
-}
-
 fn bootstrap_tree(label: &str) -> TempTree {
     let tree = TempTree::new(label);
     let snapshot = fs::read(
         repo_root().join(".github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"),
     )
     .expect("read immutable bootstrap snapshot");
-    assert!(snapshot.starts_with(b"GTABOOT1"));
-    let mut offset = 8;
-    let count = read_u32(&snapshot, &mut offset);
-    assert_eq!(count, 28);
-    for _ in 0..count {
-        let path_length = read_u32(&snapshot, &mut offset) as usize;
-        let data_length =
-            usize::try_from(read_u64(&snapshot, &mut offset)).expect("snapshot data length");
-        let path_end = offset.checked_add(path_length).expect("snapshot path end");
-        let path = std::str::from_utf8(&snapshot[offset..path_end])
-            .expect("snapshot path is UTF-8")
-            .to_owned();
-        offset = path_end;
-        let data_end = offset.checked_add(data_length).expect("snapshot data end");
-        let destination = tree.join(&path);
+    let archive =
+        BootstrapSnapshotArchive::parse(&snapshot).expect("parse immutable bootstrap snapshot");
+    assert_eq!(archive.entries().len(), 28);
+    for (path, payload) in archive.entries() {
+        let destination = tree.join(path);
         fs::create_dir_all(destination.parent().expect("snapshot path parent"))
             .expect("create snapshot parent");
-        fs::write(destination, &snapshot[offset..data_end]).expect("write snapshot file");
-        offset = data_end;
+        fs::write(destination, payload).expect("write snapshot file");
     }
-    assert_eq!(offset, snapshot.len());
     copy_directory(
         &repo_root().join(".github/trusted/desktop-supply-chain-policy"),
         &tree.join(".github/trusted/desktop-supply-chain-policy"),
@@ -1149,6 +1117,199 @@ fn immutable_bootstrap_snapshot_is_canonical_validator_output() {
     )
     .expect("read committed Bootstrap snapshot");
     assert_eq!(actual, expected);
+}
+
+fn committed_bootstrap_snapshot() -> Vec<u8> {
+    fs::read(
+        repo_root().join(".github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"),
+    )
+    .expect("read committed Bootstrap snapshot")
+}
+
+#[test]
+fn bootstrap_snapshot_writer_reports_an_exact_no_op() {
+    let tree = bootstrap_tree("snapshot-writer-no-op");
+    let output = tree.join("output.snapshot");
+    fs::write(&output, committed_bootstrap_snapshot()).expect("seed existing snapshot");
+
+    let delta = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect("write no-op snapshot");
+
+    assert_eq!(delta.changed_count(), 0);
+    assert_eq!(delta.preserved_count(), 28);
+    assert!(delta.changes().is_empty());
+    assert_eq!(
+        delta.to_string(),
+        "bootstrap_snapshot_delta changed_count=0 preserved_count=28"
+    );
+}
+
+#[test]
+fn bootstrap_snapshot_writer_reports_one_reviewed_workflow_change() {
+    let tree = bootstrap_tree("snapshot-writer-one-entry");
+    let output = tree.join("output.snapshot");
+    fs::write(&output, committed_bootstrap_snapshot()).expect("seed existing snapshot");
+    let changed_path = ".github/workflows/upstream-gateway-reference.yml";
+    let mut payload = fs::read(tree.join(changed_path)).expect("read reviewed workflow");
+    payload.extend_from_slice(b"\n# reviewed replacement\n");
+    fs::write(tree.join(changed_path), payload).expect("plant reviewed workflow replacement");
+
+    let delta = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect("write surgical snapshot");
+
+    assert_eq!(delta.changed_count(), 1);
+    assert_eq!(delta.preserved_count(), 27);
+    assert_eq!(delta.changes()[0].path(), changed_path);
+    assert_eq!(
+        delta.changes()[0].status(),
+        BootstrapSnapshotChangeStatus::Modified
+    );
+    assert_eq!(
+        delta.to_string(),
+        "bootstrap_snapshot_delta changed_count=1 preserved_count=27\nchanged_path=\".github/workflows/upstream-gateway-reference.yml\" status=modified"
+    );
+}
+
+#[test]
+fn bootstrap_snapshot_writer_cannot_hide_a_wholesale_rebaseline() {
+    let tree = bootstrap_tree("snapshot-writer-rebaseline");
+    let output = tree.join("output.snapshot");
+    let committed = committed_bootstrap_snapshot();
+    fs::write(&output, &committed).expect("seed existing snapshot");
+    let archive =
+        BootstrapSnapshotArchive::parse(&committed).expect("parse committed Bootstrap snapshot");
+    for (path, _) in archive.entries() {
+        let mut payload = fs::read(tree.join(path)).expect("read Bootstrap input");
+        payload.extend_from_slice(b"\n# planted rebaseline\n");
+        fs::write(tree.join(path), payload).expect("plant rebaseline input");
+    }
+
+    let delta = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect("write rebaseline snapshot");
+
+    assert_eq!(delta.changed_count(), 28);
+    assert_eq!(delta.preserved_count(), 0);
+    assert_eq!(delta.changes().len(), 28);
+    assert!(
+        delta
+            .changes()
+            .iter()
+            .all(|change| change.status() == BootstrapSnapshotChangeStatus::Modified)
+    );
+}
+
+#[test]
+fn bootstrap_snapshot_writer_rejects_malformed_existing_archive_without_overwrite() {
+    let tree = bootstrap_tree("snapshot-writer-malformed");
+    let output = tree.join("output.snapshot");
+    let malformed = b"GTABOOT1\x01\x00";
+    fs::write(&output, malformed).expect("seed malformed snapshot");
+
+    let error = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect_err("malformed snapshot must fail closed");
+
+    assert!(
+        error
+            .to_string()
+            .contains("parse existing Bootstrap snapshot")
+    );
+    assert_eq!(
+        fs::read(output).expect("read rejected malformed snapshot"),
+        malformed
+    );
+}
+
+#[test]
+fn bootstrap_snapshot_writer_reports_inventory_additions_and_removals() {
+    let tree = bootstrap_tree("snapshot-writer-inventory");
+    let output = tree.join("output.snapshot");
+    let mut existing = committed_bootstrap_snapshot();
+    let expected = b".cargo/audit.toml";
+    let planted = b".cargo/zudit.toml";
+    let offset = existing
+        .windows(expected.len())
+        .position(|window| window == expected)
+        .expect("find first Bootstrap path");
+    existing[offset..offset + expected.len()].copy_from_slice(planted);
+    BootstrapSnapshotArchive::parse(&existing).expect("planted inventory remains canonical");
+    fs::write(&output, existing).expect("seed changed inventory");
+
+    let delta = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect("write changed inventory snapshot");
+
+    assert_eq!(delta.changed_count(), 2);
+    assert_eq!(delta.preserved_count(), 27);
+    assert_eq!(delta.changes()[0].path(), ".cargo/audit.toml");
+    assert_eq!(
+        delta.changes()[0].status(),
+        BootstrapSnapshotChangeStatus::Added
+    );
+    assert_eq!(delta.changes()[1].path(), ".cargo/zudit.toml");
+    assert_eq!(
+        delta.changes()[1].status(),
+        BootstrapSnapshotChangeStatus::Removed
+    );
+}
+
+#[test]
+fn bootstrap_snapshot_writer_preserves_existing_archive_when_generation_fails() {
+    let tree = bootstrap_tree("snapshot-writer-generation-failure");
+    let output = tree.join("output.snapshot");
+    let existing = committed_bootstrap_snapshot();
+    fs::write(&output, &existing).expect("seed existing snapshot");
+    fs::remove_file(tree.join("rustfmt.toml")).expect("remove one required input");
+
+    write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open incomplete Bootstrap materialization"),
+        &output,
+    )
+    .expect_err("missing input must fail generation");
+
+    assert_eq!(
+        fs::read(output).expect("read preserved existing snapshot"),
+        existing
+    );
+}
+
+#[test]
+fn bootstrap_snapshot_writer_pins_first_write_semantics() {
+    let tree = bootstrap_tree("snapshot-writer-first-write");
+    let output = tree.join("first.snapshot");
+
+    let delta = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect("write first snapshot");
+
+    assert_eq!(delta.changed_count(), 28);
+    assert_eq!(delta.preserved_count(), 0);
+    assert_eq!(delta.changes().len(), 28);
+    assert!(
+        delta
+            .changes()
+            .iter()
+            .all(|change| change.status() == BootstrapSnapshotChangeStatus::Added)
+    );
+    assert_eq!(
+        fs::read(output).expect("read first snapshot"),
+        committed_bootstrap_snapshot()
+    );
 }
 
 #[test]

@@ -3231,10 +3231,11 @@ mod nested {
 
     #[test]
     fn shared_reachability_corpus_matches_cargo() {
-        let corpus: ReachabilityCorpus =
-            serde_json::from_str(include_str!("../tests/fixtures/reachability-corpus.json"))
-                .expect("parse shared reachability corpus");
-        assert_eq!(corpus.cases.len(), 14);
+        let corpus: ReachabilityCorpus = serde_json::from_str(include_str!(
+            "../../../compat/upstream/reachability-corpus.json"
+        ))
+        .expect("parse shared reachability corpus");
+        assert_eq!(corpus.cases.len(), 27);
         let fixture_root = env::temp_dir().join(format!(
             "claw-conformance-reachability-corpus-{}-{}",
             std::process::id(),
@@ -3246,24 +3247,40 @@ mod nested {
 
         for case in corpus.cases {
             let root = fixture_root.join(&case.name);
+            let manifests = case
+                .files
+                .keys()
+                .filter(|path| path.ends_with("Cargo.toml"))
+                .cloned()
+                .collect::<Vec<_>>();
             for (path, source) in case.files {
                 let destination = root.join(path);
                 fs::create_dir_all(destination.parent().expect("corpus file parent"))
                     .expect("create corpus directory");
                 fs::write(destination, source).expect("write corpus file");
             }
-            let lock_output = compiler_oracle_command(&cargo, &root)
-                .args(["generate-lockfile", "--offline", "--quiet"])
-                .output()
-                .expect("generate reachability corpus lockfile");
-            assert_command_succeeded(&lock_output);
+            for manifest in manifests {
+                let _ = compiler_oracle_command(&cargo, &root)
+                    .args([
+                        "generate-lockfile",
+                        "--offline",
+                        "--quiet",
+                        "--manifest-path",
+                    ])
+                    .arg(manifest)
+                    .output()
+                    .expect("generate reachability corpus lockfile");
+            }
             let output = compiler_oracle_command(&cargo, &root)
                 .args(["build", "--offline", "--quiet", "--locked"])
                 .output()
                 .expect("run reachability corpus compiler oracle");
             let ambiguous = matches!(
                 case.name.as_str(),
-                "ambiguity-file-side" | "ambiguity-directory-side"
+                "ambiguity-file-side"
+                    | "ambiguity-directory-side"
+                    | "peer6-ambiguity-file-side"
+                    | "peer6-ambiguity-directory-side"
             );
             assert_eq!(
                 output.status.success(),
@@ -3287,11 +3304,18 @@ mod nested {
                     assert!(ambiguous, "unexpected target discovery error: {error}");
                     assert_eq!(error.code(), ViolationCode::ClaimEvidence);
                     assert_eq!(error.subject(), Some("crates/p/src/lib.rs"));
-                    assert_eq!(
-                        error.message(),
-                        "Rust module 'ambig' is ambiguous because both 'ambig.rs' and \
-                         'ambig/mod.rs' exist"
-                    );
+                    let expected_message = match case.name.as_str() {
+                        "ambiguity-file-side" | "ambiguity-directory-side" => {
+                            "Rust module 'ambig' is ambiguous because both 'ambig.rs' and \
+                             'ambig/mod.rs' exist"
+                        }
+                        "peer6-ambiguity-file-side" | "peer6-ambiguity-directory-side" => {
+                            "Rust module 'foo' is ambiguous because both 'foo.rs' and \
+                             'foo/mod.rs' exist"
+                        }
+                        value => panic!("unexpected ambiguous corpus case '{value}'"),
+                    };
+                    assert_eq!(error.message(), expected_message);
                     false
                 }
             };
