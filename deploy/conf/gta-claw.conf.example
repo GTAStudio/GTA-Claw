@@ -46,22 +46,17 @@ MAX_SESSIONS=100
 # 会话过期时间 (毫秒)
 SESSION_TTL_MS=3600000
 
-# Skill 执行超时 (毫秒)
-SKILL_EXEC_TIMEOUT_MS=30000
-
 # SDK 请求超时 (毫秒)
 SDK_REQUEST_TIMEOUT_MS=120000
 
 # 速率限制 (每 IP 每分钟请求数, 仅 /api/messages)
 RATE_LIMIT_PER_MIN=30
 
-# Skill HTTP 请求域名白名单 (逗号分隔, 留空=不限制)
-ALLOWED_SKILL_DOMAINS=
-
 # 信任上游代理的 x-forwarded-for 头 (仅在受信代理后面设 true)
 TRUST_PROXY=false
 
-# 自动更新 SDK/CLI
+# 启动时报告 @github/copilot-sdk / CLI 是否有新版本 (仅上报, 从不在运行中的
+# 容器内执行 npm update 或自更新安装脚本; 如需更新请重新构建镜像)
 AUTO_UPDATE=false
 
 # Admin API 令牌 (留空则禁用 /admin/reload 端点)

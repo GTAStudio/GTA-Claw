@@ -1,6 +1,7 @@
 import { CopilotClient, CopilotSession, defineTool, approveAll } from "@github/copilot-sdk";
 import type { Tool } from "@github/copilot-sdk";
 import { logger } from "../utils/logger.js";
+import { resolveBundledCliPath } from "../updater/sdkUpdater.js";
 import { SessionManager } from "./sessionManager.js";
 import type { ToolExecutor } from "./toolExecutor.js";
 import type { Skill } from "../loader/skillLoader.js";
@@ -35,6 +36,13 @@ export class CopilotEngine {
     this.client = new CopilotClient({
       githubToken,
       autoRestart: true,
+      // Resolve the CLI path ourselves instead of relying on the SDK's own
+      // default: this legacy image runs Node 20, but @github/copilot-sdk's
+      // bundled default resolves to a *.js entrypoint that requires Node 22+
+      // (Promise.withResolvers) and would crash on start. Resolving to the
+      // platform package's native binary instead sidesteps that mismatch —
+      // see resolveBundledCliPath() for the full empirical trail.
+      cliPath: resolveBundledCliPath(),
     });
 
     this.sessionManager = new SessionManager(

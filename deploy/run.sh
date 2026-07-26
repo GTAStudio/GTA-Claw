@@ -205,8 +205,18 @@ select_model() {
 validate_url() {
   local url="$1"
   local label="$2"
-  if [[ ! "$url" =~ ^https?:// ]]; then
-    log_error "无效的 URL ($label): $url"
+  if [[ ! "$url" =~ ^https:// ]]; then
+    log_error "无效的 URL ($label), 必须使用 https://: $url"
+    return 1
+  fi
+  return 0
+}
+
+validate_wss_url() {
+  local url="$1"
+  local label="$2"
+  if [[ ! "$url" =~ ^wss:// ]]; then
+    log_error "无效的 URL ($label), 必须使用 wss://: $url"
     return 1
   fi
   return 0
@@ -376,6 +386,7 @@ do_config() {
   validate_boolean "$(grep '^DEVICE_FLOW_ENABLED=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "DEVICE_FLOW_ENABLED"
   validate_url "$(grep '^AGENT_ROLE_URL=' "$ENV_FILE" | cut -d'=' -f2-)" "AGENT_ROLE_URL"
   validate_skills_urls "$(grep '^ENABLED_SKILLS=' "$ENV_FILE" | cut -d'=' -f2-)"
+  validate_wss_url "$(grep '^DISCORD_GATEWAY_URL=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2- || echo 'wss://gateway.discord.gg/?v=10&encoding=json')" "DISCORD_GATEWAY_URL"
   validate_auth_mode \
     "$(grep '^GITHUB_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
     "$(grep '^DEVICE_FLOW_ENABLED=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" \
@@ -486,6 +497,7 @@ do_interactive() {
   if [ "$enable_discord" = "true" ]; then
     discord_bot_token=$(prompt_secret "DISCORD_BOT_TOKEN" "Discord Bot Token")
     discord_gateway_url=$(prompt_optional "$(msg ask_discord_gateway_url)" "$discord_gateway_url")
+    validate_wss_url "$discord_gateway_url" "DISCORD_GATEWAY_URL"
     discord_gateway_intents=$(prompt_optional "$(msg ask_discord_intents)" "$discord_gateway_intents")
     validate_positive_integer "$discord_gateway_intents" "DISCORD_GATEWAY_INTENTS"
   fi
@@ -551,7 +563,6 @@ DOMAIN=${domain}
 LOG_LEVEL=info
 MAX_SESSIONS=100
 SESSION_TTL_MS=3600000
-SKILL_EXEC_TIMEOUT_MS=30000
 SDK_REQUEST_TIMEOUT_MS=120000
 RATE_LIMIT_PER_MIN=${rate_limit}
 TRUST_PROXY=${trust_proxy}

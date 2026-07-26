@@ -2,6 +2,13 @@
 
 > Self-Governing AI Agent Engine: A pure empty-shell engine that dynamically loads roles and skills from remote URLs.
 
+> **Historical snapshot.** This document records the original implementation plan and does not track
+> later changes. For current architecture and security posture see `README.md` and
+> `docs/legacy-node-port-obligations.md`. Notably, the `isolated-vm` skill sandbox and the `curl | bash`
+> Copilot CLI installer described below have since been removed for security reasons (remote skill code
+> is never executed, and the CLI is resolved from the npm-installed `@github/copilot` package); do not
+> treat those mentions as current behavior.
+
 ## Architecture Overview
 
 ```
@@ -82,7 +89,7 @@ d:\GTA-Claw/
 ## Implementation Phases
 
 ### Phase 1: Project Scaffolding
-- `package.json` — dependencies, scripts (`--no-node-snapshot` required)
+- `package.json` — dependencies, scripts (previously required `--no-node-snapshot` as an `isolated-vm` V8-snapshot workaround; removed with `isolated-vm` during the 2026-07 emergency hardening pass — see `docs/PROGRESS.md`)
 - `tsconfig.json` — ES2022, NodeNext, strict
 - `.dockerignore` — exclusion rules
 

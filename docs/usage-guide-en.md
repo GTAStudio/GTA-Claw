@@ -206,6 +206,12 @@ Requires a Meta Business developer account and a public callback URL.
 
 ## 4. Daily Usage
 
+> **Remote skill execution is currently disabled.** The examples and built-in skills below describe
+> the tool metadata (name/description/parameters) that the AI can see, but invoking any of them
+> returns a clear "remote skill execution is disabled" error rather than running code — the engine
+> ships with no `node:vm`/`isolated-vm`/other script engine. This is a deliberate security posture,
+> not a bug; see [Security](../README.md#security).
+
 ### 4.1 Conversation Examples
 
 Once connected to a chat channel, just talk naturally:
@@ -242,7 +248,7 @@ Once connected to a chat channel, just talk naturally:
 | `server_admin` | Server management (disk/memory/Docker) | "Server status" |
 | `marp_slides` | Generate Marp-format slide decks | "Make a PPT / slides" |
 
-> All skills run in an isolated V8 sandbox, interacting with the outside world through `httpGet`/`httpPost`/`log` APIs.
+> All skills are registered as tool metadata only; execution is disabled (see notice above).
 
 ---
 
@@ -288,10 +294,9 @@ Skills are also JSON files. You can write your own:
 }
 ```
 
-**Sandbox API**:
-- `api.httpGet(url)` — HTTP GET request
-- `api.httpPost(url, body, headers)` — HTTP POST request
-- `api.log(message)` — Output log message
+**`executeCode` is never executed** — the field is still required by the loader for schema
+compatibility, but its text is retained only as inert metadata. Invoking the resulting tool always
+fails closed with a "remote skill execution is disabled" error.
 
 Concatenate multiple skill URLs with commas and set them as `ENABLED_SKILLS`.
 
@@ -346,8 +351,8 @@ docker rm -f gta-claw
 | `/chat` | POST | HTTP chat interface (no channel needed) |
 | `/api/messages` | POST | Bot Framework messages (Teams) |
 | `/admin/reload` | POST | Hot-reload role and skills (requires `ADMIN_TOKEN`) |
-| `/admin/system` | GET | System info (Node.js process + OS) |
-| `/admin/exec` | POST | Execute whitelisted system commands |
+| `/admin/system` | GET | System info (Node.js process + OS) (requires `ADMIN_TOKEN`) |
+| `/admin/exec` | POST | Execute whitelisted system commands (requires `ADMIN_TOKEN`) |
 
 ### Recommended First-Use Flow
 
