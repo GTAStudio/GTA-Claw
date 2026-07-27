@@ -335,6 +335,30 @@ pub fn probe_component_registering_tools(count: u32) -> Vec<u8> {
     wat::parse_str(&text).expect("the tool-quota fixture must assemble")
 }
 
+/// Assembles a probe that registers one tool and then spins during activation.
+#[must_use]
+pub fn probe_component_registering_tool_then_spinning_on_activate() -> Vec<u8> {
+    let source = probe_wat_lf();
+    let original = concat!(
+        "    (func (export \"activate\") (result i32)\n",
+        "      (i32.store8 (i32.const 192) (i32.const 0))\n",
+        "      (i32.const 192))\n",
+    );
+    let replacement = concat!(
+        "    (func (export \"activate\") (result i32)\n",
+        "      (call $h-tools\n",
+        "        (i32.const 1052) (i32.const 5)\n",
+        "        (i32.const 1108) (i32.const 10)\n",
+        "        (i32.const 1120) (i32.const 2)\n",
+        "        (i32.const 288))\n",
+        "      (loop $activate-spin (br $activate-spin))\n",
+        "      (i32.const 192))\n",
+    );
+    let text = source.replacen(original, replacement, 1);
+    assert_ne!(text, source, "the activation loop must be inserted");
+    wat::parse_str(&text).expect("the activation-loop fixture must assemble")
+}
+
 /// A manifest describing `component` with no capabilities and default limits.
 #[must_use]
 pub fn manifest_for(component: &[u8]) -> PluginManifest {

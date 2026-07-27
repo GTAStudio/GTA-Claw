@@ -2,18 +2,65 @@
 
 mod support;
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
+use claw_plugin_api::capability::{CapabilityGrant, ToolsGrant};
 use claw_plugin_api::registry::DeliveryClass;
 use claw_plugin_api::trust::{Ed25519Verifier, TrustPolicy, VerificationError};
+use claw_plugin_host::services::{HostServices, RecordingSink, ToolRegistration, ToolSink};
 use claw_plugin_host::{
-    ActivationOutcome, ActivationStage, DiscoveryRecord, DiscoveryStage, HostError, LifecycleState,
+    ActivationControl, ActivationOutcome, ActivationStage, CancellationToken,
+    ControlledActivationOutcome, DiscoveryRecord, DiscoveryStage, HostError, LifecycleState,
     PluginHost,
 };
 use ed25519_dalek::SigningKey;
 use support::{
-    PROBE_ID, install, manifest_for, probe_component, probe_component_named, sign_manifest,
+    PROBE_ID, install, install_probe_named, install_variant, manifest_for, probe_component,
+    probe_component_named, probe_component_registering_tool_then_spinning_on_activate,
+    sign_manifest,
 };
+
+#[derive(Clone)]
+struct CancellingTools {
+    recorder: RecordingSink,
+    cancellation: Option<CancellationToken>,
+    registrations: Arc<AtomicUsize>,
+}
+
+impl CancellingTools {
+    fn new(cancellation: Option<CancellationToken>) -> Self {
+        Self {
+            recorder: RecordingSink::new(),
+            cancellation,
+            registrations: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn registrations(&self) -> usize {
+        self.registrations.load(Ordering::Acquire)
+    }
+
+    fn tools(&self) -> Vec<ToolRegistration> {
+        self.recorder.tools()
+    }
+}
+
+impl ToolSink for CancellingTools {
+    fn register(&self, registration: ToolRegistration) {
+        self.registrations.fetch_add(1, Ordering::AcqRel);
+        self.recorder.register(registration);
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
+    }
+
+    fn unregister(&self, plugin_id: &str, name: &str) -> bool {
+        self.recorder.unregister(plugin_id, name)
+    }
+}
 
 #[test]
 fn signed_activation_reports_failures_in_order_and_keeps_later_successes() {
@@ -161,4 +208,167 @@ fn detailed_discovery_surfaces_a_dangling_manifest_symlink() {
     };
     assert_eq!(path, &plugin);
     assert_eq!(*stage, DiscoveryStage::Manifest);
+}
+
+#[test]
+fn controlled_activation_reports_preexisting_cancellation_and_deadline() {
+    let root = support::tempdir();
+    support::install_probe(root.path(), "probe", Vec::new());
+    let mut host = PluginHost::builder()
+        .trust_policy(support::unsigned_core_policy(root.path()))
+        .build()
+        .expect("host");
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let cancelled = ActivationControl::new(
+        NonZeroUsize::new(1).expect("one is non-zero"),
+        Instant::now() + Duration::from_secs(1),
+        cancellation,
+    )
+    .expect("bounded control");
+    let report = host.activate_discovered_with_control(&cancelled);
+    assert!(matches!(
+        report.outcomes(),
+        [ControlledActivationOutcome::Cancelled]
+    ));
+    assert!(host.loaded_ids().is_empty());
+
+    let expired = ActivationControl::new(
+        NonZeroUsize::new(1).expect("one is non-zero"),
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("the process has run for at least a millisecond"),
+        CancellationToken::new(),
+    )
+    .expect("bounded control");
+    let report = host.activate_discovered_with_control(&expired);
+    assert!(matches!(
+        report.outcomes(),
+        [ControlledActivationOutcome::DeadlineExceeded]
+    ));
+    assert!(host.loaded_ids().is_empty());
+}
+
+#[test]
+fn controlled_activation_rejects_an_unbounded_candidate_capacity() {
+    let error = ActivationControl::new(
+        NonZeroUsize::new(usize::MAX).expect("usize::MAX is non-zero"),
+        Instant::now() + Duration::from_secs(1),
+        CancellationToken::new(),
+    )
+    .expect_err("the candidate heap has a hard ceiling");
+    assert_eq!(error.requested(), usize::MAX);
+}
+
+#[test]
+fn controlled_activation_stops_at_the_hard_candidate_limit_in_lexical_order() {
+    let root = support::tempdir();
+    let first_id = "gta-claw-fixture-alpha";
+    let second_id = "gta-claw-fixture-bravo";
+    let first = install_probe_named(root.path(), "aaa-first", first_id, Vec::new());
+    let second = install_probe_named(root.path(), "bbb-second", second_id, Vec::new());
+    let mut host = PluginHost::builder()
+        .trust_policy(support::unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from_all(&[&first, &second]))
+        .build()
+        .expect("host");
+    let control = ActivationControl::new(
+        NonZeroUsize::new(1).expect("one is non-zero"),
+        Instant::now() + Duration::from_secs(5),
+        CancellationToken::new(),
+    )
+    .expect("bounded control");
+
+    let report = host.activate_discovered_with_control(&control);
+    assert_eq!(report.activated_count(), 1);
+    assert_eq!(report.outcomes().len(), 2);
+    assert!(matches!(
+        report.outcomes()[0].candidate(),
+        Some(ActivationOutcome::Activated(plugin)) if plugin.id == first_id
+    ));
+    assert!(matches!(
+        report.outcomes()[1],
+        ControlledActivationOutcome::CandidateLimitReached { limit }
+            if limit.get() == 1
+    ));
+    assert_eq!(host.loaded_ids(), [first_id]);
+    assert_eq!(host.state(second_id), None);
+}
+
+#[test]
+fn cancellation_during_guest_activation_removes_the_instance_and_its_tools() {
+    let root = support::tempdir();
+    let component = probe_component_registering_tool_then_spinning_on_activate();
+    let grants = vec![CapabilityGrant::Tools(ToolsGrant {
+        max_tools: 1,
+        max_schema_bytes: 1024,
+    })];
+    let directory = install_variant(root.path(), "probe", &component, grants.clone());
+    let cancellation = CancellationToken::new();
+    let tools = CancellingTools::new(Some(cancellation.clone()));
+    let mut host = PluginHost::builder()
+        .trust_policy(support::unsigned_core_policy(root.path()))
+        .operator_policy(support::probe_ceiling(grants))
+        .services(HostServices::deny_all().with_tools(Arc::new(tools.clone())))
+        .build()
+        .expect("host");
+    let control = ActivationControl::new(
+        NonZeroUsize::new(1).expect("one is non-zero"),
+        Instant::now() + Duration::from_secs(5),
+        cancellation,
+    )
+    .expect("bounded control");
+
+    let report = host.activate_discovered_with_control(&control);
+    assert!(matches!(
+        report.outcomes(),
+        [ControlledActivationOutcome::Cancelled]
+    ));
+    assert_eq!(
+        tools.registrations(),
+        1,
+        "the guest registered before cancel"
+    );
+    assert!(
+        tools.tools().is_empty(),
+        "cancellation must purge stale tools"
+    );
+    assert!(host.loaded_ids().is_empty());
+    assert_eq!(host.state(PROBE_ID), None);
+    assert_eq!(
+        directory.file_name().and_then(|name| name.to_str()),
+        Some("probe")
+    );
+}
+
+#[test]
+fn short_deadline_stops_discovered_activation_without_stale_tools() {
+    let root = support::tempdir();
+    let component = probe_component_registering_tool_then_spinning_on_activate();
+    let grants = vec![CapabilityGrant::Tools(ToolsGrant {
+        max_tools: 1,
+        max_schema_bytes: 1024,
+    })];
+    install_variant(root.path(), "probe", &component, grants.clone());
+    let tools = CancellingTools::new(None);
+    let mut host = PluginHost::builder()
+        .trust_policy(support::unsigned_core_policy(root.path()))
+        .operator_policy(support::probe_ceiling(grants))
+        .services(HostServices::deny_all().with_tools(Arc::new(tools.clone())))
+        .build()
+        .expect("host");
+    let control = ActivationControl::new(
+        NonZeroUsize::new(1).expect("one is non-zero"),
+        Instant::now() + Duration::from_millis(30),
+        CancellationToken::new(),
+    )
+    .expect("bounded control");
+
+    let report = host.activate_discovered_with_control(&control);
+    assert!(matches!(
+        report.outcomes(),
+        [ControlledActivationOutcome::DeadlineExceeded]
+    ));
+    assert!(tools.tools().is_empty(), "deadline must purge stale tools");
+    assert!(host.loaded_ids().is_empty());
 }

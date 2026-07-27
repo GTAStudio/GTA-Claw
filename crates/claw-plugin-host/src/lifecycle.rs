@@ -1,6 +1,8 @@
 //! Discovery, loading, validation and the full plugin lifecycle.
 
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,7 +26,7 @@ use crate::engine::{CANCELLATION_POLL_MS, PluginEngine, epoch_ticks_for};
 use crate::error::{GuestFailure, HostError, TerminationCause};
 use crate::host_impl::wit_event;
 use crate::limiter::HostCallGate;
-use crate::services::{HostEvent, HostServices};
+use crate::services::{HostCallControl, HostCallStop, HostEvent, HostServices};
 use crate::state::{LifecyclePhase, PluginState, PluginStateConfig, ViolationPolicy};
 
 /// Whether a lifecycle transition withdraws the plugin's tools.
@@ -224,6 +226,156 @@ pub struct ActivationReport {
     outcomes: Vec<ActivationOutcome>,
 }
 
+/// Hard bounds and interruption state for one discovered activation pass.
+#[derive(Clone, Debug)]
+pub struct ActivationControl {
+    max_candidates: NonZeroUsize,
+    deadline: Instant,
+    cancellation: CancellationToken,
+}
+
+/// Largest candidate cap accepted by [`ActivationControl`].
+pub const MAX_ACTIVATION_CANDIDATES: usize = 4096;
+
+/// A controlled activation bound was unusable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActivationControlError {
+    requested: usize,
+}
+
+impl ActivationControlError {
+    /// Rejected candidate cap.
+    #[must_use]
+    pub const fn requested(&self) -> usize {
+        self.requested
+    }
+}
+
+impl core::fmt::Display for ActivationControlError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            formatter,
+            "activation candidate limit {} exceeds the hard maximum {MAX_ACTIVATION_CANDIDATES}",
+            self.requested
+        )
+    }
+}
+
+impl core::error::Error for ActivationControlError {}
+
+impl ActivationControl {
+    /// Creates a bounded activation control.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ActivationControlError`] when `max_candidates` exceeds
+    /// [`MAX_ACTIVATION_CANDIDATES`].
+    pub fn new(
+        max_candidates: NonZeroUsize,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<Self, ActivationControlError> {
+        if max_candidates.get() > MAX_ACTIVATION_CANDIDATES {
+            return Err(ActivationControlError {
+                requested: max_candidates.get(),
+            });
+        }
+        Ok(Self {
+            max_candidates,
+            deadline,
+            cancellation,
+        })
+    }
+
+    /// Maximum manifest-bearing or unreadable plugin entries to attempt.
+    #[must_use]
+    pub const fn max_candidates(&self) -> NonZeroUsize {
+        self.max_candidates
+    }
+
+    /// Overall absolute deadline for discovery, loading, and activation.
+    #[must_use]
+    pub const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Cancellation signal shared with the caller.
+    #[must_use]
+    pub const fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    fn check(&self) -> Result<(), HostCallStop> {
+        self.host_call_control().check()
+    }
+
+    fn host_call_control(&self) -> HostCallControl {
+        HostCallControl::new(self.deadline, Some(self.cancellation.clone()))
+    }
+}
+
+/// One ordered event from a controlled discovered activation pass.
+#[derive(Debug)]
+pub enum ControlledActivationOutcome {
+    /// Result for one candidate in discovery order.
+    Candidate(Box<ActivationOutcome>),
+    /// The caller cancelled before the next stage began or while guest code ran.
+    Cancelled,
+    /// The overall activation deadline was reached.
+    DeadlineExceeded,
+    /// Another candidate existed after the hard candidate cap was consumed.
+    CandidateLimitReached {
+        /// Configured hard cap.
+        limit: NonZeroUsize,
+    },
+}
+
+impl ControlledActivationOutcome {
+    /// Candidate result, when this is not a terminal event.
+    #[must_use]
+    pub fn candidate(&self) -> Option<&ActivationOutcome> {
+        match self {
+            Self::Candidate(outcome) => Some(outcome),
+            Self::Cancelled | Self::DeadlineExceeded | Self::CandidateLimitReached { .. } => None,
+        }
+    }
+
+    /// Whether this event stops the pass.
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Candidate(_))
+    }
+}
+
+/// Bounded, ordered result of controlled discovery and activation.
+#[derive(Debug, Default)]
+pub struct ControlledActivationReport {
+    outcomes: Vec<ControlledActivationOutcome>,
+}
+
+impl ControlledActivationReport {
+    /// Candidate and terminal events in deterministic discovery order.
+    #[must_use]
+    pub fn outcomes(&self) -> &[ControlledActivationOutcome] {
+        &self.outcomes
+    }
+
+    /// Number of plugins that reached the active state.
+    #[must_use]
+    pub fn activated_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome.candidate(), Some(ActivationOutcome::Activated(_))))
+            .count()
+    }
+
+    /// Final terminal event, absent when every discovered entry was attempted.
+    #[must_use]
+    pub fn terminal(&self) -> Option<&ControlledActivationOutcome> {
+        self.outcomes.last().filter(|outcome| outcome.is_terminal())
+    }
+}
+
 impl ActivationReport {
     /// Every outcome in trusted-root order, then lexical directory order.
     #[must_use]
@@ -351,6 +503,32 @@ struct Loaded {
     instance: Option<Instance>,
     last_denials: Vec<CapabilityDenial>,
     last_usage: ResourceUsage,
+}
+
+#[derive(Debug)]
+struct CandidatePath {
+    path: PathBuf,
+    metadata_error: Option<HostError>,
+}
+
+impl PartialEq for CandidatePath {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+impl Eq for CandidatePath {}
+
+impl PartialOrd for CandidatePath {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CandidatePath {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.path.cmp(&other.path)
+    }
 }
 
 /// Builds a [`PluginHost`].
@@ -691,26 +869,8 @@ impl PluginHost {
                 match entry {
                     Ok(entry) => {
                         let path = entry.path();
-                        match std::fs::metadata(&path) {
-                            Ok(metadata) if metadata.is_dir() => {
-                                let manifest_path = path.join(MANIFEST_FILE_NAME);
-                                match std::fs::symlink_metadata(&manifest_path) {
-                                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                                    Err(error) => directories
-                                        .push((path, Some(HostError::io(&manifest_path, &error)))),
-                                    Ok(_) => match std::fs::metadata(&manifest_path) {
-                                        Ok(_) => directories.push((path, None)),
-                                        Err(error) => directories.push((
-                                            path,
-                                            Some(HostError::io(&manifest_path, &error)),
-                                        )),
-                                    },
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(error) => {
-                                directories.push((path.clone(), Some(HostError::io(path, &error))));
-                            }
+                        if let Some(candidate) = inspect_candidate_path(path) {
+                            directories.push((candidate.path, candidate.metadata_error));
                         }
                     }
                     Err(error) => entry_failures.push(DiscoveryRecord::Failed {
@@ -821,6 +981,203 @@ impl PluginHost {
         ActivationReport { outcomes }
     }
 
+    /// Discovers and activates plugins under hard count, deadline, and
+    /// cancellation bounds.
+    ///
+    /// Candidate paths are retained in a bounded heap and then processed in
+    /// lexical order, so the report is deterministic without first allocating
+    /// an unbounded discovery catalog. A terminal event is appended exactly
+    /// where processing stopped. Any plugin loaded but not reported active is
+    /// synchronously forgotten and its registered tools are withdrawn.
+    #[must_use]
+    pub fn activate_discovered_with_control(
+        &mut self,
+        control: &ActivationControl,
+    ) -> ControlledActivationReport {
+        let mut outcomes = Vec::new();
+        let mut candidates_seen = 0_usize;
+        let roots = self.trust.roots().to_vec();
+
+        for root in roots {
+            if let Err(stop) = control.check() {
+                outcomes.push(controlled_terminal(stop));
+                return ControlledActivationReport { outcomes };
+            }
+
+            let entries = match std::fs::read_dir(&root) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    let error = HostError::io(&root, &error);
+                    outcomes.push(controlled_candidate(ActivationOutcome::Failed(
+                        ActivationFailure {
+                            path: root,
+                            plugin_id: None,
+                            stage: ActivationStage::Discovery,
+                            error,
+                            cleanup_error: None,
+                        },
+                    )));
+                    continue;
+                }
+            };
+
+            let remaining = control
+                .max_candidates()
+                .get()
+                .saturating_sub(candidates_seen);
+            let selection_cap = remaining.saturating_add(1).max(1);
+            let mut selected = BinaryHeap::with_capacity(selection_cap);
+            let mut root_error = None;
+
+            for entry in entries {
+                if let Err(stop) = control.check() {
+                    outcomes.push(controlled_terminal(stop));
+                    return ControlledActivationReport { outcomes };
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        root_error = Some(HostError::io(&root, &error));
+                        break;
+                    }
+                };
+                if let Some(candidate) = inspect_candidate_path(entry.path()) {
+                    retain_smallest_candidate(&mut selected, selection_cap, candidate);
+                }
+            }
+
+            if let Some(error) = root_error {
+                outcomes.push(controlled_candidate(ActivationOutcome::Failed(
+                    ActivationFailure {
+                        path: root,
+                        plugin_id: None,
+                        stage: ActivationStage::Discovery,
+                        error,
+                        cleanup_error: None,
+                    },
+                )));
+            }
+
+            for candidate in selected.into_sorted_vec() {
+                if let Err(stop) = control.check() {
+                    outcomes.push(controlled_terminal(stop));
+                    return ControlledActivationReport { outcomes };
+                }
+                if candidates_seen == control.max_candidates().get() {
+                    outcomes.push(ControlledActivationOutcome::CandidateLimitReached {
+                        limit: control.max_candidates(),
+                    });
+                    return ControlledActivationReport { outcomes };
+                }
+                candidates_seen = candidates_seen.saturating_add(1);
+
+                let directory = candidate.path;
+                let record = candidate
+                    .metadata_error
+                    .map_or_else(|| read_manifest(&directory).map(Box::new), Err);
+
+                if let Err(stop) = control.check() {
+                    outcomes.push(controlled_terminal(stop));
+                    return ControlledActivationReport { outcomes };
+                }
+
+                let manifest = match record {
+                    Ok(manifest) => manifest,
+                    Err(error) => {
+                        outcomes.push(controlled_candidate(ActivationOutcome::Failed(
+                            ActivationFailure {
+                                path: directory,
+                                plugin_id: None,
+                                stage: ActivationStage::Manifest,
+                                error,
+                                cleanup_error: None,
+                            },
+                        )));
+                        continue;
+                    }
+                };
+
+                match self.activate_candidate_with_control(directory, *manifest, control) {
+                    Ok(outcome) => outcomes.push(controlled_candidate(outcome)),
+                    Err(stop) => {
+                        outcomes.push(controlled_terminal(stop));
+                        return ControlledActivationReport { outcomes };
+                    }
+                }
+            }
+        }
+
+        if let Err(stop) = control.check() {
+            outcomes.push(controlled_terminal(stop));
+        }
+        ControlledActivationReport { outcomes }
+    }
+
+    fn activate_candidate_with_control(
+        &mut self,
+        directory: PathBuf,
+        manifest: PluginManifest,
+        control: &ActivationControl,
+    ) -> Result<ActivationOutcome, HostCallStop> {
+        control.check()?;
+        let plugin_id = manifest.id.clone();
+        let host_control = control.host_call_control();
+        let id = match self.load_manifest_with_control(&directory, manifest, Some(&host_control)) {
+            Ok(id) => id,
+            Err(error) => {
+                control.check()?;
+                return Ok(ActivationOutcome::Failed(ActivationFailure {
+                    path: directory,
+                    plugin_id: Some(plugin_id),
+                    stage: ActivationStage::Load,
+                    error,
+                    cleanup_error: None,
+                }));
+            }
+        };
+
+        if let Err(stop) = control.check() {
+            self.discard_plugin(&id);
+            return Err(stop);
+        }
+
+        if let Err(error) = self.activate_with_control(&id, &host_control) {
+            if let Err(stop) = control.check() {
+                self.discard_plugin(&id);
+                return Err(stop);
+            }
+            let cleanup_error = self.unload(&id).err();
+            return Ok(ActivationOutcome::Failed(ActivationFailure {
+                path: directory,
+                plugin_id: Some(id),
+                stage: ActivationStage::Activate,
+                error,
+                cleanup_error,
+            }));
+        }
+
+        if let Err(stop) = control.check() {
+            self.discard_plugin(&id);
+            return Err(stop);
+        }
+
+        let Some(plugin) = self.plugins.get(&id) else {
+            return Ok(ActivationOutcome::Failed(ActivationFailure {
+                path: directory,
+                plugin_id: Some(id.clone()),
+                stage: ActivationStage::Activate,
+                error: HostError::UnknownPlugin(id),
+                cleanup_error: None,
+            }));
+        };
+        Ok(ActivationOutcome::Activated(ActivatedPlugin {
+            directory,
+            component_sha256: plugin.digest.clone(),
+            signing_key_id: plugin.signing_key_id.clone(),
+            id,
+        }))
+    }
+
     /// Loads, validates and instantiates the plugin in `directory`.
     ///
     /// The order is deliberate: schema, limits, capabilities and ABI are
@@ -873,6 +1230,16 @@ impl PluginHost {
         directory: &Path,
         manifest: PluginManifest,
     ) -> Result<String, HostError> {
+        self.load_manifest_with_control(directory, manifest, None)
+    }
+
+    fn load_manifest_with_control(
+        &mut self,
+        directory: &Path,
+        manifest: PluginManifest,
+        control: Option<&HostCallControl>,
+    ) -> Result<String, HostError> {
+        ensure_host_control(control, "plugin load")?;
         if self.plugins.contains_key(&manifest.id) {
             return Err(HostError::DuplicatePlugin(manifest.id));
         }
@@ -895,6 +1262,7 @@ impl PluginHost {
         let decision: TrustDecision = self.trust.authorize(directory, &manifest)?;
         let signing_key_id = decision.signing_key_id().map(str::to_owned);
 
+        ensure_host_control(control, "plugin load")?;
         let metadata = std::fs::metadata(decision.component_path())
             .map_err(|error| HostError::io(decision.component_path(), &error))?;
         if metadata.len() > manifest.limits.max_component_bytes {
@@ -910,6 +1278,7 @@ impl PluginHost {
             });
         }
 
+        ensure_host_control(control, "plugin load")?;
         let bytes = std::fs::read(decision.component_path())
             .map_err(|error| HostError::io(decision.component_path(), &error))?;
         let digest = component_sha256(&bytes);
@@ -926,8 +1295,10 @@ impl PluginHost {
 
         let (read_roots, write_roots) = canonical_roots(&capabilities)?;
 
+        ensure_host_control(control, "plugin compilation")?;
         let component = Component::new(self.engine.engine(), &bytes)
             .map_err(|error| HostError::Instantiate(format!("{error:#}")))?;
+        ensure_host_control(control, "plugin compilation")?;
         reject_foreign_imports(self.engine.engine(), &component)?;
 
         let state = PluginState::new(PluginStateConfig {
@@ -941,7 +1312,7 @@ impl PluginHost {
             write_roots,
         });
         let mut store = self.engine.new_store(state)?;
-        arm_call(&mut store, &manifest.limits, None);
+        arm_call(&mut store, &manifest.limits, control);
         let raw = Plugin::instantiate(&mut store, &component, self.engine.linker());
         let raw = observe_interruption(&mut store, raw);
         let bindings = raw.map_err(|error| classify_instantiation(&error, store.data()));
@@ -953,13 +1324,14 @@ impl PluginHost {
         // is the plugin the manifest names. The store is still in
         // `LifecyclePhase::Starting`, so neither can reach a host effect.
         debug_assert_eq!(store.data().phase(), LifecyclePhase::Starting);
-        arm_call(&mut store, &manifest.limits, None);
+        arm_call(&mut store, &manifest.limits, control);
         let info = bindings.gta_claw_plugin_guest().call_describe(&mut store);
         let info =
             observe_interruption(&mut store, info).map_err(|error| classify(&error, store.data()));
         disarm_call(&mut store);
         let info = info?;
 
+        ensure_host_control(control, "plugin description")?;
         check_payload("component identity", info.id.as_bytes(), &manifest.limits)?;
         if info.id != manifest.id {
             return Err(HostError::IdentityMismatch {
@@ -1031,7 +1403,17 @@ impl PluginHost {
     ///   [`ViolationPolicy::Trap`]. The instance is destroyed and the plugin is
     ///   left faulted.
     pub fn activate(&mut self, id: &str) -> Result<(), HostError> {
-        self.transition(id, &ACTIVATE, |bindings, store| {
+        self.transition(id, &ACTIVATE, None, |bindings, store| {
+            bindings.gta_claw_plugin_guest().call_activate(store)
+        })
+    }
+
+    fn activate_with_control(
+        &mut self,
+        id: &str,
+        control: &HostCallControl,
+    ) -> Result<(), HostError> {
+        self.transition(id, &ACTIVATE, Some(control), |bindings, store| {
             bindings.gta_claw_plugin_guest().call_activate(store)
         })
     }
@@ -1056,7 +1438,7 @@ impl PluginHost {
     ///   under [`ViolationPolicy::Trap`]. The instance is destroyed and the
     ///   plugin is left faulted; its tools are withdrawn either way.
     pub fn deactivate(&mut self, id: &str) -> Result<(), HostError> {
-        self.transition(id, &DEACTIVATE, |bindings, store| {
+        self.transition(id, &DEACTIVATE, None, |bindings, store| {
             bindings.gta_claw_plugin_guest().call_deactivate(store)
         })
     }
@@ -1065,6 +1447,7 @@ impl PluginHost {
         &mut self,
         id: &str,
         transition: &Transition,
+        control: Option<&HostCallControl>,
         call: impl FnOnce(
             &Plugin,
             &mut Store<PluginState>,
@@ -1072,6 +1455,7 @@ impl PluginHost {
             Result<(), crate::bindings::gta_claw::plugin::types::Error>,
         >,
     ) -> Result<(), HostError> {
+        ensure_host_control(control, transition.operation)?;
         let limits = {
             let plugin = self
                 .plugins
@@ -1108,7 +1492,7 @@ impl PluginHost {
                 })?;
             let previous_phase = instance.store.data().phase();
             instance.store.data_mut().set_phase(transition.during);
-            arm_call(&mut instance.store, &limits, None);
+            arm_call(&mut instance.store, &limits, control);
             let raw = call(&instance.bindings, &mut instance.store);
             let raw = observe_interruption(&mut instance.store, raw);
             disarm_call(&mut instance.store);
@@ -1307,6 +1691,9 @@ impl PluginHost {
         let limits = self.require_active(id, "invoke-tool")?;
         check_payload("tool name", name.as_bytes(), &limits)?;
         check_payload("tool input", input.as_bytes(), &limits)?;
+        let call_control = cancellation.map(|token| {
+            HostCallControl::new(Instant::now() + limits.timeout(), Some(token.clone()))
+        });
         let outcome = {
             let plugin = self
                 .plugins
@@ -1320,7 +1707,7 @@ impl PluginHost {
                     actual: "unloaded",
                     expected: "invoke-tool",
                 })?;
-            arm_call(&mut instance.store, &limits, cancellation);
+            arm_call(&mut instance.store, &limits, call_control.as_ref());
             let raw = instance.bindings.gta_claw_plugin_guest().call_invoke_tool(
                 &mut instance.store,
                 name,
@@ -1401,6 +1788,12 @@ impl PluginHost {
         for name in names {
             self.services.tools.unregister(id, &name);
         }
+    }
+
+    fn discard_plugin(&mut self, id: &str) {
+        self.purge_tools(id);
+        self.plugins.remove(id);
+        self.activation_order.retain(|active| active != id);
     }
 
     /// Drops a plugin's instance and forgets it.
@@ -1493,6 +1886,63 @@ impl Drop for PluginHost {
     }
 }
 
+fn controlled_candidate(outcome: ActivationOutcome) -> ControlledActivationOutcome {
+    ControlledActivationOutcome::Candidate(Box::new(outcome))
+}
+
+const fn controlled_terminal(stop: HostCallStop) -> ControlledActivationOutcome {
+    match stop {
+        HostCallStop::Cancelled => ControlledActivationOutcome::Cancelled,
+        HostCallStop::DeadlineExceeded => ControlledActivationOutcome::DeadlineExceeded,
+    }
+}
+
+fn retain_smallest_candidate(
+    selected: &mut BinaryHeap<CandidatePath>,
+    capacity: usize,
+    candidate: CandidatePath,
+) {
+    if selected.len() < capacity {
+        selected.push(candidate);
+    } else if selected
+        .peek()
+        .is_some_and(|largest| candidate.path < largest.path)
+    {
+        selected.pop();
+        selected.push(candidate);
+    }
+}
+
+fn inspect_candidate_path(path: PathBuf) -> Option<CandidatePath> {
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => {
+            let manifest_path = path.join(MANIFEST_FILE_NAME);
+            match std::fs::symlink_metadata(&manifest_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => Some(CandidatePath {
+                    path,
+                    metadata_error: Some(HostError::io(&manifest_path, &error)),
+                }),
+                Ok(_) => match std::fs::metadata(&manifest_path) {
+                    Ok(_) => Some(CandidatePath {
+                        path,
+                        metadata_error: None,
+                    }),
+                    Err(error) => Some(CandidatePath {
+                        path,
+                        metadata_error: Some(HostError::io(&manifest_path, &error)),
+                    }),
+                },
+            }
+        }
+        Ok(_) => None,
+        Err(error) => Some(CandidatePath {
+            path: path.clone(),
+            metadata_error: Some(HostError::io(path, &error)),
+        }),
+    }
+}
+
 fn read_manifest(directory: &Path) -> Result<PluginManifest, HostError> {
     let path = directory.join(MANIFEST_FILE_NAME);
     let bytes = std::fs::read(&path).map_err(|error| HostError::io(&path, &error))?;
@@ -1542,7 +1992,7 @@ fn reject_foreign_imports(
 fn arm_call(
     store: &mut Store<PluginState>,
     limits: &ResourceLimits,
-    cancellation: Option<&CancellationToken>,
+    control: Option<&HostCallControl>,
 ) {
     // Every store this host runs came from `PluginEngine::new_store`, whose
     // engine always has fuel metering enabled, so this cannot fail. Even if it
@@ -1556,9 +2006,12 @@ fn arm_call(
     // `ResourceLimits::validate` caps `wall_clock_timeout_ms` at ten minutes
     // and `load` runs it before any instance exists, so this addition cannot
     // overflow even for a manifest written by a hostile author.
-    store
-        .data_mut()
-        .arm_call(Instant::now() + limits.timeout(), cancellation.cloned());
+    let plugin_deadline = Instant::now() + limits.timeout();
+    let deadline = control.map_or(plugin_deadline, |control| {
+        plugin_deadline.min(control.deadline())
+    });
+    let cancellation = control.and_then(HostCallControl::cancellation).cloned();
+    store.data_mut().arm_call(deadline, cancellation);
     let first_check = store.data().next_interrupt_check_ms(CANCELLATION_POLL_MS);
     store.set_epoch_deadline(epoch_ticks_for(first_check));
 }
@@ -1579,6 +2032,28 @@ fn observe_interruption<T>(
         )));
     }
     outcome
+}
+
+fn ensure_host_control(
+    control: Option<&HostCallControl>,
+    operation: &'static str,
+) -> Result<(), HostError> {
+    let Some(control) = control else {
+        return Ok(());
+    };
+    control
+        .check()
+        .map_err(|stop| host_control_error(stop, operation))
+}
+
+fn host_control_error(stop: HostCallStop, operation: &'static str) -> HostError {
+    match stop {
+        HostCallStop::Cancelled => HostError::Cancelled { operation },
+        HostCallStop::DeadlineExceeded => HostError::Terminated {
+            cause: TerminationCause::Timeout,
+            detail: format!("{operation} exceeded the overall activation deadline"),
+        },
+    }
 }
 
 fn check_payload(

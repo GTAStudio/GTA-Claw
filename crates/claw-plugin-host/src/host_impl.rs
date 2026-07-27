@@ -669,10 +669,17 @@ impl PluginState {
         // hostile authoritative server can therefore not answer a second,
         // unchecked lookup inside the transport with a loopback or metadata
         // address.
+        let control = self.host_call_control().ok_or_else(|| {
+            CapabilityDenial::quota_exceeded(
+                Capability::Http,
+                "send",
+                "the host-call deadline is unavailable",
+            )
+        })?;
         let addresses = self
             .services()
             .dns
-            .resolve(&host, target.port())
+            .resolve_with_control(&host, target.port(), &control)
             .map_err(|error| {
                 CapabilityDenial::out_of_scope(
                     Capability::Http,
@@ -697,7 +704,15 @@ impl PluginState {
             headers: headers.to_vec(),
             body,
         };
-        let response = match self.services().http.send(self.plugin_id(), outbound) {
+        let response = self.host_call_control().map_or_else(
+            || Err("HTTP request call control is unavailable".to_owned()),
+            |control| {
+                self.services()
+                    .http
+                    .send_with_control(self.plugin_id(), outbound, &control)
+            },
+        );
+        let response = match response {
             Ok(response) => response,
             Err(message) => return Ok(Err(wit_error(ErrorCode::Internal, message))),
         };

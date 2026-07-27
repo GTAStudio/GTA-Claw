@@ -14,6 +14,11 @@ claw-security = { workspace = true }
 # getrandom would add a second version of the crate and `deny.toml` - which is
 # a frozen trust-root file - forbids duplicates.
 getrandom = "=0.2.17"
+http = "=1.4.2"
+httparse = "=1.10.1"
+rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "=0.8.4"
+rustls-pki-types = "=1.15.1"
 serde_json.workspace = true
 wasmtime = { version = "=47.0.2", default-features = false, features = [
   "component-model",

@@ -11,7 +11,7 @@ use claw_plugin_api::limits::ResourceLimits;
 use crate::bindings::gta_claw::plugin::types::{Error as WitError, ErrorCode};
 use crate::error::TerminationCause;
 use crate::limiter::{HostCallGate, HostCallPermits, InstanceLimiter};
-use crate::services::HostServices;
+use crate::services::{HostCallControl, HostServices};
 
 /// How the host reacts when a plugin calls something it was not granted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -340,6 +340,11 @@ impl PluginState {
         self.cancellation
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
+    }
+
+    pub(crate) fn host_call_control(&self) -> Option<HostCallControl> {
+        self.deadline
+            .map(|deadline| HostCallControl::new(deadline, self.cancellation.clone()))
     }
 
     pub(crate) const fn next_sequence(&mut self) -> u64 {
