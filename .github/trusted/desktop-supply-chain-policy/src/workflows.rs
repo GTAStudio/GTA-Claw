@@ -79,10 +79,28 @@ const REQUIRED_WORKFLOWS: [&str; 8] = [
 /// Additional exact workflow paths admitted for the newly shipped mobile
 /// platforms. Each may be absent or present; nothing else may be present, and
 /// a present file is validated exactly like a required one.
-const ADMITTED_WORKFLOWS: [&str; 2] = [
+const ADMITTED_WORKFLOWS: [&str; 3] = [
     ".github/workflows/android-packaging.yml",
     ".github/workflows/ios-packaging.yml",
+    ".github/workflows/trusted-policy-windows.yml",
 ];
+
+/// Workflow paths that must exist in every valid inventory.
+///
+/// Exposed so tests can assert the inventory *property* rather than restate its size. A count
+/// literal has to be edited every time an admitted workflow lands, which turns a real invariant
+/// into a number someone maintains, and makes an unexpected workflow indistinguishable from an
+/// expected one that nobody updated the count for.
+#[must_use]
+pub fn required_workflows() -> BTreeSet<&'static str> {
+    REQUIRED_WORKFLOWS.into_iter().collect()
+}
+
+/// Workflow paths that may exist without being required.
+#[must_use]
+pub fn admitted_workflows() -> BTreeSet<&'static str> {
+    ADMITTED_WORKFLOWS.into_iter().collect()
+}
 
 /// Parsed workflow identity used to prevent required-check spoofing.
 #[derive(Debug, Clone, Eq, PartialEq)]

@@ -1,0 +1,70 @@
+name: "GTA Claw supplementary trusted policy tests on Windows"
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/trusted/desktop-supply-chain-policy/**"
+      - ".github/workflows/trusted-policy-windows.yml"
+
+permissions:
+  contents: read
+
+# This workflow is supplementary host coverage and is NOT a supply-chain authority.
+#
+# It deliberately does not reuse scripts/bootstrap-tools.sh. That script runs under
+# `env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc`, a hardened environment-stripped shell
+# that the repository proves resistant to PATH and environment poisoning with dedicated fixtures.
+# No PowerShell equivalent exists, and inventing one would be new security surface that looks
+# equivalent while being weaker. This job therefore runs plain cargo directly and claims nothing
+# about the protected tree: it does not read the trusted base, does not compare trees, and cannot
+# pass or fail the authoritative gate.
+#
+# What it does cover is host-dependent behaviour the Ubuntu-only jobs cannot reach. The validator
+# reasons about Windows semantics — reserved device names, trailing dots and spaces, case-folded
+# path collisions — and a case-alias test that built its fixture on disk once passed on Linux while
+# proving nothing, because Windows collapses `Android/` onto `android/`.
+#
+# Known gap, stated rather than left to be discovered: the `#[cfg(unix)]` shadow-tool permission
+# assertions do not execute here. Windows coverage is additional, not equivalent.
+jobs:
+  supplementary-trusted-policy-windows:
+    name: "[SUPPLEMENTARY] Trusted policy tests on Windows"
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Install the exact validator toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.0 --profile minimal --component clippy,rustfmt
+          rustc +1.94.0 --version
+          cargo +1.94.0 --version
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          cargo +1.94.0 fmt \
+            --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml \
+            --all -- --check
+
+      - name: Run Clippy
+        shell: bash
+        run: |
+          cargo +1.94.0 clippy \
+            --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml \
+            --locked --all-targets -- -D warnings
+
+      - name: Run the validator test suite on Windows
+        shell: bash
+        run: |
+          cargo +1.94.0 test \
+            --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml \
+            --locked --all-targets
