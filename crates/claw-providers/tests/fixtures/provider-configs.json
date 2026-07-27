@@ -1,0 +1,246 @@
+{
+  "schema_version": 1,
+  "description": "Provider configuration corpus for `integration.providers`. Each case is raw configuration text plus the verdict GTA-Claw must reach. `expect` is either `accepted`, `rejected_by_parser` when strict deserialisation must refuse the text before any registry lookup happens, or the stable `ConfigError::code`/`AuthError::code` the resolver must return. Codes are compared rather than rendered messages, so wording may be improved without editing this corpus.",
+  "cases": [
+    {
+      "name": "implemented-provider-takes-the-registry-endpoint",
+      "json": "{\"id\":\"openai\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"sk-test\"}}",
+      "expect": "accepted",
+      "resolves_to": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "auth_mode": "bearer_token",
+      "via_alias": null
+    },
+    {
+      "name": "anthropic-takes-an-api-key",
+      "json": "{\"id\":\"anthropic\",\"auth\":{\"mode\":\"api_key\",\"key\":\"sk-ant-test\"}}",
+      "expect": "accepted",
+      "resolves_to": "anthropic",
+      "base_url": "https://api.anthropic.com/",
+      "auth_mode": "api_key",
+      "via_alias": null
+    },
+    {
+      "name": "anthropic-also-takes-an-authorization-code-token",
+      "json": "{\"id\":\"anthropic\",\"auth\":{\"mode\":\"oauth_authorization_code\",\"access_token\":\"at-test\"}}",
+      "expect": "accepted",
+      "resolves_to": "anthropic",
+      "base_url": "https://api.anthropic.com/",
+      "auth_mode": "oauth_authorization_code",
+      "via_alias": null
+    },
+    {
+      "name": "copilot-takes-a-device-code-token",
+      "json": "{\"id\":\"github-copilot\",\"auth\":{\"mode\":\"oauth_device_code\",\"access_token\":\"gho_test\"}}",
+      "expect": "accepted",
+      "resolves_to": "github-copilot",
+      "base_url": "https://api.githubcopilot.com/",
+      "auth_mode": "oauth_device_code",
+      "via_alias": null
+    },
+    {
+      "name": "an-alias-resolves-to-its-frozen-identifier",
+      "json": "{\"id\":\"claude\",\"auth\":{\"mode\":\"api_key\",\"key\":\"sk-ant-test\"}}",
+      "expect": "accepted",
+      "resolves_to": "anthropic",
+      "base_url": "https://api.anthropic.com/",
+      "auth_mode": "api_key",
+      "via_alias": "claude"
+    },
+    {
+      "name": "an-alias-is-normalised-before-it-is-resolved",
+      "json": "{\"id\":\"  LM-Studio \",\"auth\":{\"mode\":\"none\"}}",
+      "expect": "accepted",
+      "resolves_to": "lmstudio",
+      "base_url": "http://127.0.0.1:1234/v1",
+      "auth_mode": "none",
+      "via_alias": "lm-studio"
+    },
+    {
+      "name": "a-local-runtime-needs-no-credential",
+      "json": "{\"id\":\"ollama\",\"auth\":{\"mode\":\"none\"}}",
+      "expect": "accepted",
+      "resolves_to": "ollama",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "auth_mode": "none",
+      "via_alias": null
+    },
+    {
+      "name": "an-endpoint-required-provider-is-configured-with-an-endpoint",
+      "json": "{\"id\":\"byteplus\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"t\"},\"base-url\":\"https://ark.ap-southeast.bytepluses.com/api/v3\"}",
+      "expect": "accepted",
+      "resolves_to": "byteplus",
+      "base_url": "https://ark.ap-southeast.bytepluses.com/api/v3",
+      "auth_mode": "bearer_token",
+      "via_alias": null
+    },
+    {
+      "name": "a-self-hosted-endpoint-may-override-a-shipped-default",
+      "json": "{\"id\":\"openai\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"t\"},\"base-url\":\"https://openai.internal.example/v1\"}",
+      "expect": "accepted",
+      "resolves_to": "openai",
+      "base_url": "https://openai.internal.example/v1",
+      "auth_mode": "bearer_token",
+      "via_alias": null
+    },
+    {
+      "name": "a-loopback-endpoint-may-be-plaintext",
+      "json": "{\"id\":\"litellm\",\"auth\":{\"mode\":\"none\"},\"base-url\":\"http://localhost:4000/v1\"}",
+      "expect": "accepted",
+      "resolves_to": "litellm",
+      "base_url": "http://localhost:4000/v1",
+      "auth_mode": "none",
+      "via_alias": null
+    },
+    {
+      "name": "an-ordinary-header-is-carried-through",
+      "json": "{\"id\":\"openrouter\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"t\"},\"headers\":{\"X-Title\":\"gta-claw\"}}",
+      "expect": "accepted",
+      "resolves_to": "openrouter",
+      "base_url": "https://openrouter.ai/api/v1",
+      "auth_mode": "bearer_token",
+      "via_alias": null
+    },
+    {
+      "name": "a-disabled-provider-is-still-validated",
+      "json": "{\"id\":\"groq\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"t\"},\"enabled\":false}",
+      "expect": "accepted",
+      "resolves_to": "groq",
+      "base_url": "https://api.groq.com/openai/v1",
+      "auth_mode": "bearer_token",
+      "via_alias": null
+    },
+    {
+      "name": "a-misspelt-key-is-refused-rather-than-defaulted",
+      "json": "{\"id\":\"openai\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"t\"},\"base_url\":\"https://api.openai.com/v1\"}",
+      "expect": "rejected_by_parser",
+      "why": "the field is spelt base-url; an ignored base_url would silently call the default endpoint"
+    },
+    {
+      "name": "an-invented-key-is-refused",
+      "json": "{\"id\":\"openai\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"t\"},\"proxy\":\"http://attacker.example\"}",
+      "expect": "rejected_by_parser",
+      "why": "a key the schema does not have must not be accepted and dropped"
+    },
+    {
+      "name": "a-missing-identifier-is-refused",
+      "json": "{\"auth\":{\"mode\":\"none\"}}",
+      "expect": "rejected_by_parser",
+      "why": "there is no default provider"
+    },
+    {
+      "name": "a-missing-credential-block-is-refused",
+      "json": "{\"id\":\"ollama\"}",
+      "expect": "rejected_by_parser",
+      "why": "even a credential-free provider states mode=none explicitly, so a forgotten credential is never mistaken for a deliberate one"
+    },
+    {
+      "name": "a-wrongly-typed-value-is-refused",
+      "json": "{\"id\":\"openai\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"t\"},\"enabled\":\"yes\"}",
+      "expect": "rejected_by_parser",
+      "why": "a truthy string is not a boolean"
+    },
+    {
+      "name": "an-unknown-credential-mode-is-refused",
+      "json": "{\"id\":\"openai\",\"auth\":{\"mode\":\"password\",\"token\":\"t\"}}",
+      "expect": "rejected_by_parser",
+      "why": "the credential tag is closed over the eight known auth modes"
+    },
+    {
+      "name": "a-credential-field-from-another-mode-is-refused",
+      "json": "{\"id\":\"openai\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"t\",\"key\":\"k\"}}",
+      "expect": "rejected_by_parser",
+      "why": "mixing shapes hides which field is actually used"
+    },
+    {
+      "name": "a-credential-attached-to-mode-none-is-refused",
+      "json": "{\"id\":\"ollama\",\"auth\":{\"mode\":\"none\",\"token\":\"t\"}}",
+      "expect": "rejected_by_parser",
+      "why": "an operator who wrote a token must not be left believing it is in force"
+    },
+    {
+      "name": "an-unregistered-identifier-is-refused",
+      "json": "{\"id\":\"gpt-9\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"t\"}}",
+      "expect": "unknown_provider",
+      "why": "the frozen inventory is the whole set of providers"
+    },
+    {
+      "name": "a-frozen-identifier-with-a-fold-applied-is-not-a-provider",
+      "json": "{\"id\":\"githubcopilot\",\"auth\":{\"mode\":\"oauth_device_code\",\"access_token\":\"t\"}}",
+      "expect": "unknown_provider",
+      "why": "separator folding is not performed, because it would merge novita-ai with novitaai and gmi-cloud with gmicloud"
+    },
+    {
+      "name": "a-registration-only-provider-cannot-be-configured",
+      "json": "{\"id\":\"amazon-bedrock\",\"auth\":{\"mode\":\"aws_sigv4\",\"access_key_id\":\"AKIA\",\"secret_access_key\":\"s\",\"region\":\"us-east-1\"}}",
+      "expect": "no_client",
+      "why": "no Bedrock client ships, and a configuration that appears to work would be a lie"
+    },
+    {
+      "name": "a-registration-only-media-provider-cannot-be-configured",
+      "json": "{\"id\":\"fal\",\"auth\":{\"mode\":\"api_key\",\"key\":\"k\"}}",
+      "expect": "no_client",
+      "why": "fal.ai is media generation, not a chat dialect this crate implements"
+    },
+    {
+      "name": "an-endpoint-required-provider-without-an-endpoint-is-refused",
+      "json": "{\"id\":\"byteplus\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"t\"}}",
+      "expect": "missing_base_url",
+      "why": "GTA-Claw ships no verified endpoint for this identifier and must not invent one"
+    },
+    {
+      "name": "an-unparsable-endpoint-is-refused",
+      "json": "{\"id\":\"byteplus\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"t\"},\"base-url\":\"api.byteplus.com/v3\"}",
+      "expect": "invalid_base_url",
+      "why": "a relative URL has no origin to bind a credential to"
+    },
+    {
+      "name": "a-plaintext-remote-endpoint-is-refused",
+      "json": "{\"id\":\"byteplus\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"t\"},\"base-url\":\"http://ark.example.com/api/v3\"}",
+      "expect": "insecure_base_url",
+      "why": "a bearer token must not cross a plaintext link to a remote host"
+    },
+    {
+      "name": "a-non-http-endpoint-is-refused",
+      "json": "{\"id\":\"byteplus\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"t\"},\"base-url\":\"file:///etc/shadow\"}",
+      "expect": "insecure_base_url",
+      "why": "only https, or http on loopback, is an endpoint"
+    },
+    {
+      "name": "a-configured-authorization-header-is-refused",
+      "json": "{\"id\":\"openai\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"t\"},\"headers\":{\"Authorization\":\"Bearer attacker\"}}",
+      "expect": "reserved_header",
+      "why": "a configured credential header would race the one the client attaches"
+    },
+    {
+      "name": "a-configured-api-key-header-is-refused-whatever-its-case",
+      "json": "{\"id\":\"anthropic\",\"auth\":{\"mode\":\"api_key\",\"key\":\"k\"},\"headers\":{\"X-API-KEY\":\"attacker\"}}",
+      "expect": "reserved_header",
+      "why": "HTTP field names are case-insensitive, so the check must be too"
+    },
+    {
+      "name": "a-credential-mode-the-provider-does-not-accept-is-refused",
+      "json": "{\"id\":\"openai\",\"auth\":{\"mode\":\"api_key\",\"key\":\"k\"}}",
+      "expect": "unsupported_auth_mode",
+      "why": "openai authenticates with a bearer token, and a key sent the wrong way is a leak with no benefit"
+    },
+    {
+      "name": "a-credential-handed-to-a-credential-free-runtime-is-refused",
+      "json": "{\"id\":\"ollama\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"t\"}}",
+      "expect": "unsupported_auth_mode",
+      "why": "a local runtime accepts only mode=none, so a token here was meant for something else"
+    },
+    {
+      "name": "an-empty-credential-is-refused",
+      "json": "{\"id\":\"openai\",\"auth\":{\"mode\":\"bearer_token\",\"token\":\"\"}}",
+      "expect": "missing_credential",
+      "why": "an unset environment variable expands to an empty string"
+    },
+    {
+      "name": "a-whitespace-credential-is-refused",
+      "json": "{\"id\":\"anthropic\",\"auth\":{\"mode\":\"api_key\",\"key\":\"   \"}}",
+      "expect": "missing_credential",
+      "why": "a whitespace-only secret is no secret, and failing locally beats failing at the vendor"
+    }
+  ]
+}

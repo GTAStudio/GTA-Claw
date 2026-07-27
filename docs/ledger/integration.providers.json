@@ -23,14 +23,110 @@
                    "registration_only":  12
                },
     "tests":  {
-                  "total":  248,
-                  "claw-provider-sdk::lib":  123,
-                  "claw-provider-sdk::tests/transport.rs":  8,
-                  "claw-providers::lib":  88,
+                  "total":  376,
+                  "ignored":  1,
+                  "ignored_reason":  "claw-provider-sdk::tests/secret_transactions.rs carries one pre-existing #[ignore] that predates this row and is not part of its evidence.",
+                  "claw-provider-sdk::lib":  140,
+                  "claw-provider-sdk::tests/secret_transactions.rs":  27,
+                  "claw-provider-sdk::tests/transport.rs":  20,
+                  "claw-providers::lib":  134,
                   "claw-providers::tests/frozen_inventory.rs":  6,
+                  "claw-providers::tests/registry_contract.rs":  12,
+                  "claw-providers::tests/security.rs":  14,
                   "claw-providers::tests/wire.rs":  23,
                   "third_party_network_calls":  0
               },
+    "dimensions":  [
+                       {
+                           "dimension":  "ids",
+                           "status":  "implemented",
+                           "module":  "crates/claw-providers/src/registry.rs",
+                           "evidence":  [
+                                            {
+                                                "path":  "crates/claw-providers/tests/frozen_inventory.rs",
+                                                "test":  "the_registry_and_the_frozen_inventory_hold_the_same_identifiers"
+                                            },
+                                            {
+                                                "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                "test":  "every_frozen_identifier_resolves_canonically_and_near_misses_do_not"
+                                            }
+                                        ]
+                       },
+                       {
+                           "dimension":  "aliases",
+                           "status":  "implemented",
+                           "module":  "crates/claw-providers/src/alias.rs",
+                           "evidence":  [
+                                            {
+                                                "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                "test":  "no_frozen_identifier_may_be_registered_as_an_alias"
+                                            },
+                                            {
+                                                "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                "test":  "the_builtin_alias_table_only_names_frozen_identifiers"
+                                            },
+                                            {
+                                                "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                "test":  "separator_folding_would_merge_distinct_frozen_rows"
+                                            }
+                                        ]
+                       },
+                       {
+                           "dimension":  "configuration",
+                           "status":  "implemented",
+                           "module":  "crates/claw-providers/src/config.rs",
+                           "fixtures":  "crates/claw-providers/tests/fixtures/provider-configs.json",
+                           "evidence":  [
+                                            {
+                                                "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                "test":  "every_frozen_provider_is_configurable_exactly_as_its_status_allows"
+                                            },
+                                            {
+                                                "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                "test":  "every_frozen_provider_configuration_rejects_an_unknown_field"
+                                            },
+                                            {
+                                                "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                "test":  "the_configuration_fixture_corpus_is_classified_exactly"
+                                            }
+                                        ]
+                       },
+                       {
+                           "dimension":  "auth",
+                           "status":  "implemented_partial",
+                           "status_reason":  "Credential shape, mode admissibility and blank-credential refusal are enforced for all 78 rows. Live token acquisition (OAuth device/authorization-code flows, AWS SigV4 signing, Google service-account exchange, Azure identity) is not performed here.",
+                           "module":  "crates/claw-providers/src/auth.rs",
+                           "evidence":  [
+                                            {
+                                                "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                "test":  "every_frozen_provider_accepts_exactly_its_declared_auth_modes"
+                                            },
+                                            {
+                                                "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                "test":  "every_frozen_provider_rejects_a_blank_credential_in_every_secret_bearing_mode"
+                                            }
+                                        ]
+                       },
+                       {
+                           "dimension":  "capability_routing",
+                           "status":  "implemented",
+                           "module":  "crates/claw-providers/src/routing.rs",
+                           "evidence":  [
+                                            {
+                                                "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                "test":  "capability_routing_serves_every_client_bearing_frozen_provider"
+                                            },
+                                            {
+                                                "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                "test":  "capability_routing_finds_nothing_when_no_configured_provider_qualifies"
+                                            },
+                                            {
+                                                "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                "test":  "the_capability_catalogue_covers_the_frozen_inventory_exactly"
+                                            }
+                                        ]
+                       }
+                   ],
     "providers":  [
                       {
                           "id":  "amazon-bedrock",
