@@ -3,7 +3,10 @@
 //! Nothing here touches the operating system: time is a counter, the provider replays a script,
 //! and every store is a map behind a mutex. That keeps the concurrency tests reproducible.
 
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "this module is compiled separately into each integration-test binary, so a helper only one suite needs is genuinely unused in the others"
+)]
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};

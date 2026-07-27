@@ -1,6 +1,6 @@
 //! Main-thread smoke test for the native macOS Slint winit backend.
 
-#![allow(
+#![expect(
     missing_docs,
     reason = "Slint generates public bindings for this dedicated smoke executable"
 )]
