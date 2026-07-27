@@ -1,0 +1,434 @@
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
+use std::path::PathBuf;
+
+/// A deterministic database failure with no SQLx type in the public API.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DatabaseFailure {
+    operation: &'static str,
+    code: Option<String>,
+    message: String,
+}
+
+impl DatabaseFailure {
+    pub(crate) fn from_sqlx(operation: &'static str, error: sqlx::Error) -> Self {
+        let (code, message) = match error {
+            sqlx::Error::Database(database) => (
+                database.code().map(|code| code.into_owned()),
+                database.message().to_owned(),
+            ),
+            other => (None, other.to_string()),
+        };
+        Self {
+            operation,
+            code,
+            message,
+        }
+    }
+
+    pub(crate) fn from_code(operation: &'static str, code: i32, message: String) -> Self {
+        Self {
+            operation,
+            code: Some(code.to_string()),
+            message,
+        }
+    }
+
+    /// Returns the operation that failed.
+    #[must_use]
+    pub const fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    /// Returns SQLite's stable result code when one was available.
+    #[must_use]
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
+    /// Returns the database-provided diagnostic.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl Display for DatabaseFailure {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        if let Some(code) = &self.code {
+            write!(
+                formatter,
+                "{} failed (SQLite code {code}): {}",
+                self.operation, self.message
+            )
+        } else {
+            write!(formatter, "{} failed: {}", self.operation, self.message)
+        }
+    }
+}
+
+impl Error for DatabaseFailure {}
+
+/// The durability semantics of a failed repository write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteOutcome {
+    /// The write did not commit and may be retried according to normal error policy.
+    NotCommitted,
+    /// The write is known to be durable and must not be retried automatically.
+    Committed,
+    /// The write may be durable and must be reconciled before any retry.
+    Uncertain,
+}
+
+/// Failures surfaced by the durable state boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StateError {
+    /// A configured path cannot represent an on-disk SQLite store.
+    InvalidPath {
+        /// Rejected path.
+        path: PathBuf,
+        /// Stable rejection reason.
+        reason: &'static str,
+    },
+    /// A filesystem operation failed.
+    FileSystem {
+        /// Operation that failed.
+        operation: &'static str,
+        /// Relevant path.
+        path: PathBuf,
+        /// Platform diagnostic.
+        message: String,
+    },
+    /// Another writer currently owns this store.
+    StoreLocked {
+        /// Advisory lock path.
+        path: PathBuf,
+    },
+    /// SQLite rejected an operation.
+    Database(DatabaseFailure),
+    /// An already-applied migration no longer matches the embedded SQL.
+    MigrationChecksumDrift {
+        /// Migration version.
+        version: i64,
+        /// Stored checksum.
+        applied: String,
+        /// Current embedded checksum.
+        embedded: String,
+    },
+    /// The database schema was produced by a newer binary.
+    NewerSchema {
+        /// Highest applied schema version.
+        found: i64,
+        /// Highest version this binary supports.
+        supported: i64,
+    },
+    /// Applied migration history is incomplete or otherwise invalid.
+    InvalidMigrationHistory {
+        /// Stable diagnostic.
+        reason: String,
+    },
+    /// A backup destination must not be overwritten.
+    BackupDestinationExists {
+        /// Existing destination.
+        path: PathBuf,
+    },
+    /// Snapshot publication completed but rollback could not restore a clean destination.
+    PublicationUncertain {
+        /// Destination that may contain a published snapshot.
+        path: PathBuf,
+        /// Publication and rollback diagnostic.
+        reason: String,
+    },
+    /// Store shutdown completed with one or more durability or cleanup degradations.
+    CloseDegraded {
+        /// Whether the final WAL checkpoint completed.
+        checkpoint_completed: bool,
+        /// Whether the persisted application writer row was released.
+        application_lock_released: bool,
+        /// Whether shutdown observed the final maintenance connection close.
+        final_connection_closed: bool,
+        /// Whether final-connection closure and complete pool drain were both observed.
+        pool_closed: bool,
+        /// Whether the OS identity lock was explicitly released.
+        os_lock_released: bool,
+        /// Combined deterministic diagnostic.
+        reason: String,
+    },
+    /// A stored backup failed validation.
+    InvalidBackup {
+        /// Backup path.
+        path: PathBuf,
+        /// Stable diagnostic.
+        reason: String,
+    },
+    /// The backup is not sealed for this machine and service identity.
+    BackupNotPortable {
+        /// Backup path.
+        path: PathBuf,
+        /// Stable fail-closed diagnostic.
+        reason: &'static str,
+    },
+    /// A durable record already exists.
+    AlreadyExists {
+        /// Record kind.
+        entity: &'static str,
+        /// Record identifier.
+        id: String,
+    },
+    /// A durable record was not found.
+    NotFound {
+        /// Record kind.
+        entity: &'static str,
+        /// Record identifier.
+        id: String,
+    },
+    /// A referenced parent record does not exist.
+    ForeignKeyViolation {
+        /// Referenced record kind.
+        entity: &'static str,
+        /// Referenced identifier.
+        id: String,
+    },
+    /// A parent record exists but cannot accept the requested child.
+    InactiveParent {
+        /// Parent record kind.
+        entity: &'static str,
+        /// Parent identifier.
+        id: String,
+        /// Current parent state.
+        state: &'static str,
+    },
+    /// A caller attempted a forbidden state-machine transition.
+    InvalidTransition {
+        /// Record kind.
+        entity: &'static str,
+        /// Source state.
+        from: &'static str,
+        /// Requested state.
+        to: &'static str,
+    },
+    /// An optimistic version changed before the update committed.
+    OptimisticConflict {
+        /// Record kind.
+        entity: &'static str,
+        /// Record identifier.
+        id: String,
+        /// Version supplied by the caller.
+        expected_version: i64,
+    },
+    /// A caller or persisted row violated a state invariant.
+    InvalidValue {
+        /// Value category.
+        field: &'static str,
+        /// Stable rejection reason.
+        reason: &'static str,
+    },
+    /// A write committed after its delivery deadline.
+    CommittedAfterDeadline {
+        /// Write operation whose result arrived late.
+        operation: &'static str,
+        /// Optional late cleanup degradation.
+        cleanup: Option<String>,
+    },
+    /// A write committed, but terminal connection cleanup degraded.
+    CommittedWithCleanupFailure {
+        /// Write operation that became durable.
+        operation: &'static str,
+        /// Terminal cleanup diagnostic.
+        cleanup: String,
+    },
+    /// SQLite reported an error after durability became uncertain.
+    CommitOutcomeUncertain {
+        /// Write operation with an uncertain outcome.
+        operation: &'static str,
+        /// SQLite result code.
+        code: i32,
+        /// Stable diagnostic.
+        message: String,
+    },
+    /// A bounded store lifecycle operation exceeded its configured deadline.
+    OperationTimedOut {
+        /// Bounded operation name.
+        operation: &'static str,
+        /// Configured deadline in milliseconds.
+        timeout_ms: u64,
+    },
+    /// An operation failed and cleanup also degraded.
+    OperationCleanupFailed {
+        /// Operation whose cleanup degraded.
+        operation: &'static str,
+        /// Original operation failure.
+        primary: Box<StateError>,
+        /// Cleanup/close diagnostic.
+        cleanup: String,
+    },
+}
+
+impl StateError {
+    /// Returns whether a failed write is known not to have committed, committed, or uncertain.
+    #[must_use]
+    pub fn write_outcome(&self) -> WriteOutcome {
+        match self {
+            Self::CommittedAfterDeadline { .. } | Self::CommittedWithCleanupFailure { .. } => {
+                WriteOutcome::Committed
+            }
+            Self::CommitOutcomeUncertain { .. } => WriteOutcome::Uncertain,
+            Self::OperationCleanupFailed { primary, .. } => primary.write_outcome(),
+            _ => WriteOutcome::NotCommitted,
+        }
+    }
+}
+
+impl Display for StateError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPath { path, reason } => {
+                write!(formatter, "invalid state path {}: {reason}", path.display())
+            }
+            Self::FileSystem {
+                operation,
+                path,
+                message,
+            } => write!(
+                formatter,
+                "{operation} {} failed: {message}",
+                path.display()
+            ),
+            Self::StoreLocked { path } => {
+                write!(
+                    formatter,
+                    "state store is locked by another writer: {}",
+                    path.display()
+                )
+            }
+            Self::Database(error) => Display::fmt(error, formatter),
+            Self::MigrationChecksumDrift {
+                version,
+                applied,
+                embedded,
+            } => write!(
+                formatter,
+                "migration {version} checksum drift: applied {applied}, embedded {embedded}"
+            ),
+            Self::NewerSchema { found, supported } => write!(
+                formatter,
+                "database schema version {found} is newer than supported version {supported}"
+            ),
+            Self::InvalidMigrationHistory { reason } => {
+                write!(formatter, "invalid migration history: {reason}")
+            }
+            Self::BackupDestinationExists { path } => {
+                write!(
+                    formatter,
+                    "backup destination already exists: {}",
+                    path.display()
+                )
+            }
+            Self::PublicationUncertain { path, reason } => {
+                write!(
+                    formatter,
+                    "snapshot publication state is uncertain at {}: {reason}",
+                    path.display()
+                )
+            }
+            Self::CloseDegraded {
+                checkpoint_completed,
+                application_lock_released,
+                final_connection_closed,
+                pool_closed,
+                os_lock_released,
+                reason,
+            } => write!(
+                formatter,
+                "state store closed with degradation (checkpoint={checkpoint_completed}, application_lock={application_lock_released}, final_connection={final_connection_closed}, pool={pool_closed}, os_lock={os_lock_released}): {reason}"
+            ),
+            Self::InvalidBackup { path, reason } => {
+                write!(formatter, "invalid backup {}: {reason}", path.display())
+            }
+            Self::BackupNotPortable { path, reason } => write!(
+                formatter,
+                "backup {} is not portable to this machine identity: {reason}",
+                path.display()
+            ),
+            Self::AlreadyExists { entity, id } => write!(formatter, "{entity} {id} already exists"),
+            Self::NotFound { entity, id } => write!(formatter, "{entity} {id} was not found"),
+            Self::ForeignKeyViolation { entity, id } => {
+                write!(formatter, "referenced {entity} {id} was not found")
+            }
+            Self::InactiveParent { entity, id, state } => {
+                write!(
+                    formatter,
+                    "{entity} {id} is {state} and cannot accept children"
+                )
+            }
+            Self::InvalidTransition { entity, from, to } => {
+                write!(formatter, "invalid {entity} transition from {from} to {to}")
+            }
+            Self::OptimisticConflict {
+                entity,
+                id,
+                expected_version,
+            } => write!(
+                formatter,
+                "{entity} {id} changed from expected version {expected_version}"
+            ),
+            Self::InvalidValue { field, reason } => {
+                write!(formatter, "invalid {field}: {reason}")
+            }
+            Self::CommittedAfterDeadline { operation, cleanup } => {
+                write!(formatter, "{operation} committed after its deadline")?;
+                if let Some(cleanup) = cleanup {
+                    write!(formatter, "; late cleanup failed: {cleanup}")?;
+                }
+                Ok(())
+            }
+            Self::CommittedWithCleanupFailure { operation, cleanup } => {
+                write!(
+                    formatter,
+                    "{operation} committed; terminal cleanup failed: {cleanup}"
+                )
+            }
+            Self::CommitOutcomeUncertain {
+                operation,
+                code,
+                message,
+            } => write!(
+                formatter,
+                "{operation} may have committed (SQLite code {code}): {message}"
+            ),
+            Self::OperationTimedOut {
+                operation,
+                timeout_ms,
+            } => write!(
+                formatter,
+                "{operation} exceeded its {timeout_ms} ms deadline"
+            ),
+            Self::OperationCleanupFailed {
+                operation,
+                primary,
+                cleanup,
+            } => write!(
+                formatter,
+                "{primary}; {operation} cleanup failed: {cleanup}"
+            ),
+        }
+    }
+}
+
+impl Error for StateError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Database(error) => Some(error),
+            Self::OperationCleanupFailed { primary, .. } => Some(primary),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn database(operation: &'static str, error: sqlx::Error) -> StateError {
+    StateError::Database(DatabaseFailure::from_sqlx(operation, error))
+}
+
+pub(crate) fn database_code(operation: &'static str, code: i32, message: String) -> StateError {
+    StateError::Database(DatabaseFailure::from_code(operation, code, message))
+}
