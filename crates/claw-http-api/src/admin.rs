@@ -154,7 +154,7 @@ pub(crate) async fn rpc(
     // cannot be boxed without changing the public API.
     #[expect(
         clippy::result_large_err,
-        reason = "`AdminFailure` is a frozen public port type; boxing it here would change `AdminPort::dispatch`'s signature and the wire contract it feeds"
+        reason = "`AdminSuccess` and `AdminFailure` are both 144 bytes of `serde_json::Value`, so boxing the error shrinks this `Result` from 152 to 144 bytes — and would still change `AdminPort::dispatch`'s published signature and every implementor of it"
     )]
     let result = timeout(
         limits.operation_timeout,
