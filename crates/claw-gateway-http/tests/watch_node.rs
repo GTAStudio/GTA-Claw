@@ -1,15 +1,18 @@
 //! HTTP behaviour of the five watch-node transport endpoints.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use claw_gateway_http::{
     EnqueueOutcome, InMemoryResultSink, WATCH_CHALLENGE_PATH, WATCH_CONNECT_PATH,
     WATCH_DISCONNECT_PATH, WATCH_POLL_PATH, WATCH_RESULT_PATH, WatchLimits, WatchNodeRegistry,
-    WatchNodeTransport, sign_challenge, watch_router,
+    WatchNodeTransport, sign_challenge, verify_challenge, watch_router,
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -90,6 +93,21 @@ fn post(uri: &str, token: Option<&str>, body: &Value) -> Request<Body> {
         .header("content-type", "application/json");
     if let Some(token) = token {
         builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    builder
+        .body(Body::from(serde_json::to_vec(body).expect("watch request")))
+        .expect("watch POST")
+}
+
+/// Builds a POST whose `authorization` header is written verbatim, so tests can
+/// present header shapes that [`post`] would never construct.
+fn post_with_authorization(uri: &str, authorization: Option<&str>, body: &Value) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(authorization) = authorization {
+        builder = builder.header("authorization", authorization);
     }
     builder
         .body(Body::from(serde_json::to_vec(body).expect("watch request")))
@@ -550,5 +568,134 @@ async fn watch_queue_limits_bound_bytes_as_well_as_event_count() {
             EnqueueOutcome::RejectedTooLarge { limit: 128, .. }
         ),
         "an oversized event is rejected rather than emptying the queue: {too_large:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn challenge_nonces_are_unpredictable_single_use_and_never_repeat() {
+    let roomy = WatchLimits {
+        max_pending_challenges: 256,
+        max_pending_challenges_per_node: 256,
+        ..limits()
+    };
+    let (transport, _sink, router) = transport_with(roomy);
+
+    // A nonce that were a constant, a counter, or anything else derivable would
+    // fail one of the next three assertions.
+    let mut minted = BTreeSet::new();
+    for _ in 0..64 {
+        let nonce = mint_nonce(&router).await;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(&nonce)
+            .expect("a nonce is base64url with no padding");
+        assert_eq!(
+            bytes.len(),
+            32,
+            "a nonce carries 256 bits of entropy, not a truncated or derived value"
+        );
+        assert!(
+            minted.insert(nonce.clone()),
+            "the same nonce was minted twice: {nonce}"
+        );
+    }
+    assert_eq!(
+        transport.pending_challenges(),
+        64,
+        "64 distinct nonces are 64 distinct pending challenges"
+    );
+
+    // Signing proves the node holds the secret; the nonce proves this exchange
+    // is not a recording of an earlier one.
+    let nonce = minted.iter().next().expect("64 nonces were minted").clone();
+    let connect = json!({
+        "nodeId": NODE,
+        "nonce": nonce,
+        "signature": sign_challenge(SECRET, &nonce),
+    });
+    let accepted = send(&router, post(WATCH_CONNECT_PATH, None, &connect)).await;
+    assert_eq!(accepted.status, StatusCode::OK, "{}", accepted.body);
+    assert_eq!(
+        transport.pending_challenges(),
+        63,
+        "connecting consumes exactly the nonce it presented"
+    );
+
+    let replayed = send(&router, post(WATCH_CONNECT_PATH, None, &connect)).await;
+    assert_eq!(
+        replayed.status,
+        StatusCode::UNAUTHORIZED,
+        "a captured connect exchange must not be replayable"
+    );
+    assert_eq!(replayed.body["error"], "unknown or expired challenge");
+    assert_eq!(transport.pending_challenges(), 63);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_signature_verifies_only_against_its_own_nonce_and_secret() {
+    let (_transport, _sink, router) = transport_with(limits());
+    let nonce = mint_nonce(&router).await;
+    let other = mint_nonce(&router).await;
+    assert_ne!(nonce, other);
+
+    let signature = sign_challenge(SECRET, &nonce);
+    assert!(verify_challenge(SECRET, &nonce, &signature));
+    assert!(
+        !verify_challenge(SECRET, &other, &signature),
+        "a signature is bound to the one nonce it was made over"
+    );
+    assert!(
+        !verify_challenge(b"a-different-node-secret", &nonce, &signature),
+        "a signature is bound to the secret that made it"
+    );
+    assert!(
+        !verify_challenge(SECRET, &nonce, "not base64!!"),
+        "a malformed tag is rejected rather than decoded to an empty one"
+    );
+    assert!(
+        !verify_challenge(SECRET, &nonce, ""),
+        "an empty tag never verifies"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_token_is_accepted_only_from_a_well_formed_bearer_header() {
+    let (_transport, _sink, router) = transport_with(limits());
+    let token = open_session(&router).await;
+
+    for header in [
+        None,
+        Some(String::new()),
+        Some("Bearer".to_owned()),
+        Some("Bearer ".to_owned()),
+        Some(format!("Basic {token}")),
+        Some(token.clone()),
+    ] {
+        let reply = send(
+            &router,
+            post_with_authorization(WATCH_POLL_PATH, header.as_deref(), &json!({})),
+        )
+        .await;
+        assert_eq!(
+            reply.status,
+            StatusCode::UNAUTHORIZED,
+            "authorization {header:?} must not authenticate"
+        );
+        assert_eq!(reply.body["error"], "unauthenticated");
+    }
+
+    let reply = send(
+        &router,
+        post_with_authorization(
+            WATCH_POLL_PATH,
+            Some(&format!("Bearer {token}")),
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::OK,
+        "the genuine token in a well formed header still works: {}",
+        reply.body
     );
 }

@@ -26,7 +26,9 @@
 //! let probes = ProbeSurface::new(lifecycle.clone()).with_check(store);
 //!
 //! let registry = WatchNodeRegistry::new();
-//! registry.register("watch-1", b"shared-secret".to_vec());
+//! // Node secrets are provisioned, never compiled in.
+//! let secret = std::env::var("WATCH_NODE_SECRET").expect("provisioned node secret");
+//! registry.register("watch-1", secret.into_bytes());
 //! let transport =
 //!     WatchNodeTransport::new(WatchLimits::default(), registry, InMemoryResultSink::new());
 //!
@@ -56,7 +58,7 @@ pub use crate::watch::{
     EnqueueOutcome, InMemoryResultSink, WATCH_CHALLENGE_PATH, WATCH_CONNECT_PATH,
     WATCH_DISCONNECT_PATH, WATCH_NODE_ENDPOINTS, WATCH_POLL_PATH, WATCH_RESULT_PATH,
     WatchCommandResult, WatchLimits, WatchNodeRegistry, WatchNodeTransport, WatchResultSink,
-    sign_challenge, watch_router,
+    sign_challenge, verify_challenge, watch_router,
 };
 
 /// Method and path of every route this crate registers, in inventory order.

@@ -60,6 +60,10 @@ pub const WATCH_NODE_ENDPOINTS: [(&str, &str); 5] = [
     ("POST", WATCH_RESULT_PATH),
 ];
 
+/// Width of every minted nonce and session token, in bytes drawn from the
+/// operating system CSPRNG.
+const RANDOM_TOKEN_BYTES: usize = 32;
+
 /// Bounds every watch-node session and every unauthenticated allocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WatchLimits {
@@ -149,7 +153,12 @@ pub fn sign_challenge(secret: &[u8], nonce: &str) -> String {
     URL_SAFE_NO_PAD.encode(hmac::sign(&key, nonce.as_bytes()).as_ref())
 }
 
-fn verify_challenge(secret: &[u8], nonce: &str, signature: &str) -> bool {
+/// Verifies a challenge signature against the nonce and secret it claims.
+///
+/// Comparison is constant time, and a signature that is not valid base64url is
+/// rejected rather than treated as an empty tag.
+#[must_use]
+pub fn verify_challenge(secret: &[u8], nonce: &str, signature: &str) -> bool {
     let Ok(presented) = URL_SAFE_NO_PAD.decode(signature) else {
         return false;
     };
@@ -407,8 +416,15 @@ impl WatchNodeTransport {
         state.sessions.get(token).cloned()
     }
 
+    /// Draws 256 bits from the operating system CSPRNG and encodes them as
+    /// base64url.
+    ///
+    /// This is the only source of nonces and session tokens in this transport:
+    /// there is no seeded, counter-based or caller-supplied alternative, so a
+    /// nonce can never be a constant. If the CSPRNG fails the caller fails
+    /// closed rather than falling back to anything weaker.
     fn random_token(&self) -> Option<String> {
-        let mut bytes = [0_u8; 32];
+        let mut bytes = [0_u8; RANDOM_TOKEN_BYTES];
         self.inner.rng.fill(&mut bytes).ok()?;
         Some(URL_SAFE_NO_PAD.encode(bytes))
     }
@@ -808,27 +824,6 @@ async fn result(State(transport): State<WatchNodeTransport>, request: Request) -
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_signature_verifies_only_against_its_own_nonce_and_secret() {
-        let signature = sign_challenge(b"secret", "nonce-a");
-        assert!(verify_challenge(b"secret", "nonce-a", &signature));
-        assert!(!verify_challenge(b"secret", "nonce-b", &signature));
-        assert!(!verify_challenge(b"other", "nonce-a", &signature));
-        assert!(!verify_challenge(b"secret", "nonce-a", "not base64!!"));
-    }
-
-    #[test]
-    fn a_bearer_token_is_read_only_from_a_well_formed_authorization_header() {
-        let mut headers = HeaderMap::new();
-        assert_eq!(bearer_token(&headers), None);
-        headers.insert(header::AUTHORIZATION, "Bearer  token-1 ".parse().unwrap());
-        assert_eq!(bearer_token(&headers), Some("token-1"));
-        headers.insert(header::AUTHORIZATION, "Basic token-1".parse().unwrap());
-        assert_eq!(bearer_token(&headers), None);
-        headers.insert(header::AUTHORIZATION, "Bearer ".parse().unwrap());
-        assert_eq!(bearer_token(&headers), None);
-    }
 
     #[test]
     fn a_result_payload_must_match_its_ok_flag() {
