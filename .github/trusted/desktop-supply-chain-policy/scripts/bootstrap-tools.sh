@@ -148,12 +148,12 @@ import sys
 metadata = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 allowed = {
     ("libc", "0.2.186", "custom-build"),
-    ("proc-macro2", "1.0.106", "custom-build"),
-    ("quote", "1.0.46", "custom-build"),
-    ("serde", "1.0.228", "custom-build"),
-    ("serde_core", "1.0.228", "custom-build"),
-    ("serde_derive", "1.0.228", "proc-macro"),
-    ("serde_json", "1.0.149", "custom-build"),
+    ("proc-macro2", "1.0.107", "custom-build"),
+    ("quote", "1.0.47", "custom-build"),
+    ("serde", "1.0.229", "custom-build"),
+    ("serde_core", "1.0.229", "custom-build"),
+    ("serde_derive", "1.0.229", "proc-macro"),
+    ("serde_json", "1.0.151", "custom-build"),
     ("zmij", "1.0.23", "custom-build"),
 }
 actual = {

@@ -31,7 +31,7 @@ For `x86_64` (`x86_64-unknown-linux-gnu`, Debian `amd64`, RPM `x86_64`, OCI
   The second layer assigns the writable directories to uid/gid 65532.
 - `provenance-ARCH.json` and `SHA256SUMS` for the final artifacts.
 
-Builds run in the digest-pinned Rust 1.97.0 Bookworm image using the immutable
+Builds run in the digest-pinned Rust 1.97.1 Bookworm image using the immutable
 Debian `20260701T000000Z` snapshot and glibc ceiling 2.36. Each sealed build
 manifest binds the clean Git commit/tree, Dockerfile digest, toolchain, target,
 profile, flags, exact dpkg runtime packages, license providers, and binary

@@ -389,34 +389,34 @@ const P04F_MUTATION_ORACLE: [ExpectedMutation; 48] = [
 ];
 
 const P04F_MUTATED_ARTIFACT_SHA256: [&str; 48] = [
-    "90e24e0c9fc0d53b0f916c78c5a68412cf26d03a9c1e247dc4d63a75b57fa970",
-    "61c7ff94f9f7030e9ddab3e43dd81a5af90d1676ecba5ac2109a26870f6e59d7",
-    "748b4fe8c75731d4af37df67feb12440538cbfb6f00c2d37f743033b54cd67c0",
-    "c16d255135044fc70e6804c0beda1653fa4c51a913d3fa27bc30580c9ddf4771",
-    "ada5d293265b7f62be3e813c901bc32a67562ce83c3da329f8efa46e33535b7f",
-    "d3aa806687c3f70ad56e79aaf3e03f447b0eaacd2be960a5b0f95522fd52a34f",
-    "93bc016b4eff2f2856d63c63ff1a7884fba5142d702c689aa1b65fafd114a3e7",
-    "11bf6afdb402b75010f93578d1b23eefc809f724789805cecf905004dda02a82",
-    "69d4dd13274184df81e40850af72b43a61616d39053756e4b9af048c6258d300",
-    "9753cc1eadca7a09df356d08dafec088e646c94c0ce2868f84710df1943a2441",
-    "3467fde87a6a406cc94335bd2bd63f0b8e3522c134e063976328a630de1dcaa7",
-    "1da40175a7d23d22a337c66d4142ff085d3ab600132af3a9b542e3c84db2ca9d",
-    "a6203dbf4d210e5e11ba68275ed600aac157a4d45adc3bea2a45027deebe6884",
-    "167036eb447029f002f216247434daa4bb2e4134c0d5bc93267aaed0cc069327",
-    "a8bbfc6d471d39ed81ad4676e57f477b5b50afd82129068eb6bc6d6f57733342",
-    "a20a835fd001a0eca4eb665cf735848ff18c5fa311de33e905d6306f31bc3140",
-    "26b9dfaacb1ebafbc10112322f708fc9b8e65f2c136e1a2c1e1d0e1c4e4515ca",
-    "ec82eef948d01d5cab301b32086204cb966db73dd01644070f6c6777a4b45924",
-    "0bdd763bd89d491d9b8b35421b4ad3654a4679c86f1822bbf1c909c87374e00e",
-    "5aee908db7a976b943b26425e848cfa90931ee626f804e39cb252486cf047383",
-    "ccb878d811465ad1005d7bf4792506cde121e17cbeee566b244eeb05265800cc",
-    "4ae7bed67b0afe8d76e1fb6503497b1563d4b256b715e78d71029c875409a032",
-    "1b7b2da40c6655a218b0c7e20d844280df99d2cb9b09f7c20d689d5ff1183d08",
-    "14275c8e0e44b039a72082688afc2a6411eba71a96390d28247bf5802509c8ef",
-    "20a72617566a38befd9e48ae5ef899e8e41de2e15b4ad2b9b4a4c22549c8ee92",
-    "9492af801047bb872e00cbf2f458da57103af236b9f1e18ea2e3ef52284eb942",
-    "24e97bd0ff76612445f7ed60adefa4d5f22154c77c1c54602e8caeec8302f957",
-    "6323a7af697145771d2c7347e8d58b7473a03aebdd9f4f454373265cd878b109",
+    "b478429aea39df8f52056d4db5bca2c0b2ae5a87b2d42bd1abb9d8b020d05ec6",
+    "548e935e8e767560468a6b30a3f21065f42b62cc4fdfe19b71038dbbe0568a75",
+    "f6fd74eda4466f80b9d252f8870c8e6099e36676a19da30fd50cdd499c4f7c66",
+    "c14f6dfe6a2edca9c1e719ebc969e67daf5f35286488a7a935c56d36fe90435f",
+    "1b920e71a1c59add7a4943a35891780963937c193deaff3e60471889438c0607",
+    "7abf6fa2af540f0f09e4019ab70914e933eee5c7fc83ca045bf6d6d7ece04385",
+    "45aae46cc59c67ae5787da614d5dc29c000438da1d6418f2931ecd6822938fdd",
+    "90e127b0ea867fea1f913460f8d4300808c162c1bcdcb66e605f0cb66debdbae",
+    "172feb0b07d2be665b40676afe20f6d77a8c7dcbc6cebd76a9ec8ca9997d087e",
+    "474fdd8578f294d45712632f91ccf74edac9846a67d3e00155aba6ff11cdcb2f",
+    "889d64c3ff68eb5bfcf959b97f887e5cbcc91f1006e518620501833fa7aed7f8",
+    "a076ad2b48de28c8a58160dccd3dec04dbbe37d6d139c7306de34587d407c713",
+    "7d682f522d4951dc7683952bafedfa3c5e02780802319ed79aba2d407999ace8",
+    "41db5183fcd7dec24da5c3d1cd4d4d1f35a26f8b3baf20f8c3d77b1715b9ea83",
+    "0ea6e9edb3dd390f4250842323ddc0c295b003e0db424d6a68c4f75f9ac99ea8",
+    "6927b94872622ef6c0dc78447ada6571c99add1cc50bb84052431af5378bc980",
+    "b484420d2d10dc5723cac9caf2c89ab2ed629cfa32ead60b080f34e39c06fa03",
+    "2f709caee6c1ac1f98e573feff60729c164fbc143013b8480640006438d95482",
+    "371a31bf888593d8cb68df66fc900a0f4cb504fb2c114c5ce520856058a3e642",
+    "1b1f4d9bf0475e77d0e95e110417fe9f890086b94d53bec2185fc6c2d716237c",
+    "ab667749bcba2009c3b08a731b575c2552c0916f4e8e8bd43ac3e14123d0c2eb",
+    "2ca242c86a81276c49191d289509c50aa0b42733dc9abd81f035fe1c565ea5bd",
+    "078a84959517ad83e434bd103727cf4a81ee9af64b6c84369c6402d1bccb556d",
+    "a8d14608d022164d7eeecca6db4b66f4083089252d68300fd959464ce01760fc",
+    "33b5c07863d77dcb023d86a41fdadec3df80f8a1955cfea36557d731afc25040",
+    "ef42642328b326e7640027fa724938fa1c7e4028182efd4062fbbcf43bea7e9f",
+    "a6e93baf183716d0b0e299756c9e9319361362418f3c3aed1a6af0880a0288dd",
+    "100ccfcffd6a2259b09ffa081475677e0e71438258987c4abf05a0183bf8e3d9",
     "6f9e9832a4b82fb713d312da5003f65c5c95324fc10a1ec64f5f59cc28bafcb0",
     "d25d49c53c9c183dd0686e25d714c17a8658992615b1c51b5154af2d5795eec7",
     "1419ffd6b5eba450fe1971895ee7f8ce390706bd01b57d4e8bfbf57987fd41c7",
@@ -429,18 +429,18 @@ const P04F_MUTATED_ARTIFACT_SHA256: [&str; 48] = [
     "b9452f32eec46f9400af6dd0a8c6160d83580bce1f163a6587cc88ff2de56213",
     "226007c6e9d0dcf1e48f5b2a4b083f1b5669dfb91f235e999b97e1f7fc1a00f2",
     "4c663a6cebb27c4cb285c5587e019ae503b2ec352ba83c95dc94f48cf8fa5b18",
-    "dbbf5e53488e8977958a95ab58e03ba89ee9da7503ffe0e58dd946946afb8179",
-    "bb2febc949e862a6e5c0904f4041b19853e7bde3f06f17627f4c828519b856d7",
-    "781a04de8ae53429a22b602b303fe9f870def0c545f7a056c7ea322677984409",
-    "8fcfb80aae55f86784ae9beb5156adbc0fc39d1fd94e4c38168eb98d2b2eb673",
-    "9c80415e5ee8df92ffd430eccb522092c976a664e465a2ff0b1f1b005bee9b98",
-    "615596b62a471f0770006a9c0cc42b2c0693550f2fbdee876478b060f176b4f9",
-    "3491150028a9366726ce7d277138d1e28603a1d6f94fa1f2c22db61297659d07",
-    "a2575b5c38377babd9418a0d7741c1e3bebf551b5dcac449c306e3fcc3352567",
+    "55c8a09e4ce78280a7ee54ce4aae940c09bbb89ed7077ae5e714aa93b53c3784",
+    "3c1b7333023393552ac7abc7c3e20a4cc673a93eac26dc152b80d1a5ce79cf32",
+    "e9ed05dc4017ec1354c22307e17436c4562dc198d11460562c53e7a4e32d1cb9",
+    "707db8a9be8572c77f184bcd54091015bd6aa4206f96032e8193fc3baa33f6f1",
+    "768ed12847b2d67b2508930ae7f4ad7877134ab4d469263662ed550de01f8a0a",
+    "eb8201043125e996013d526563dc6d4a10d3ac77a3b9229310e13bd8224d697e",
+    "d4f98189ac36c7d4fab8ffbebbc0131afef121e1322a49f312a6ff61791ddabb",
+    "2440459afaea5d01b71273bdf7d14d4f96e8ed0e3924c9ef87610843b45cb762",
 ];
 
 const SUPERSEDED_FINAL_DEPENDENCY_SHA256: [&str; 3] = [
-    "597bfbaf79ac07fa1cbddb25acba7ac1446a8e1d02296149e5a3fe715ce85f06",
+    "3870b99cd986fe0e364c740a4959fc08f4105ada77ae297c0014972724a96b7e",
     "d1cc4a296b767bcb4082506c572d30d91369ec99db4ce5182ea24e93526d8a79",
     "c0bf44bbc8a93fbe08f33fcc990354cc36dac8da1a556e9a4b05e8686d3b50ae",
 ];
@@ -2188,32 +2188,32 @@ fn validator_dependency_graph_has_only_reviewed_build_and_proc_targets() {
         ),
         (
             "proc-macro2".to_owned(),
-            "1.0.106".to_owned(),
+            "1.0.107".to_owned(),
             "custom-build".to_owned(),
         ),
         (
             "quote".to_owned(),
-            "1.0.46".to_owned(),
+            "1.0.47".to_owned(),
             "custom-build".to_owned(),
         ),
         (
             "serde".to_owned(),
-            "1.0.228".to_owned(),
+            "1.0.229".to_owned(),
             "custom-build".to_owned(),
         ),
         (
             "serde_core".to_owned(),
-            "1.0.228".to_owned(),
+            "1.0.229".to_owned(),
             "custom-build".to_owned(),
         ),
         (
             "serde_derive".to_owned(),
-            "1.0.228".to_owned(),
+            "1.0.229".to_owned(),
             "proc-macro".to_owned(),
         ),
         (
             "serde_json".to_owned(),
-            "1.0.149".to_owned(),
+            "1.0.151".to_owned(),
             "custom-build".to_owned(),
         ),
         (
@@ -2401,7 +2401,7 @@ fn codeowners_deletion_widening_owner_and_surface_removal_fail() {
 #[test]
 fn alternate_codeowners_locations_fail_final_inventory() {
     let alternates = vec!["CODEOWNERS", "docs/CODEOWNERS"];
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     let alternates = {
         let mut values = alternates;
         values.push(".github/codeowners");
@@ -3030,9 +3030,9 @@ fn superseded_final_and_dependency_surface_mutations_are_rejected() {
         "claw-security.workspace = true\n",
         "getrandom = { version = \"=0.4.3\", features = [\"sys_rng\"] }\n",
         "secrecy = \"=0.10.3\"\n",
-        "serde_json = { version = \"=1.0.150\", features = [\"raw_value\"] }\n",
-        "tokio = { version = \"=1.52.3\", features = [\"io-util\", \"macros\", \"net\", \"rt-multi-thread\", \"sync\", \"time\"] }\n",
-        "tokio-util = { version = \"=0.7.18\", features = [\"rt\"] }\n",
+        "serde_json = { version = \"=1.0.151\", features = [\"preserve_order\", \"raw_value\"] }\n",
+        "tokio = { version = \"=1.53.1\", features = [\"io-util\", \"macros\", \"net\", \"rt-multi-thread\", \"sync\", \"time\"] }\n",
+        "tokio-util = { version = \"=0.7.19\", features = [\"rt\"] }\n",
         "url = \"=2.5.8\"\n",
         "\n[target.'cfg(any(target_os = \"windows\", target_os = \"macos\"))'.dev-dependencies]\nbase64 = \"=0.22.1\"\nfastwebsockets = { version = \"=0.10.0\", default-features = false }\nhttparse = \"=1.10.1\"\nsha1 = \"=0.11.0\"\n",
     ] {
@@ -3146,8 +3146,8 @@ fn root_gui_family_aliases_and_lock_packages_fail_closed() {
         let tree = final_tree(&format!("root-gui-{label}"));
         replace(
             &tree.join("Cargo.toml"),
-            "serde = { version = \"=1.0.228\", features = [\"derive\"] }\n",
-            &format!("serde = {{ version = \"=1.0.228\", features = [\"derive\"] }}\n{dependency}"),
+            "serde = { version = \"=1.0.229\", features = [\"derive\"] }\n",
+            &format!("serde = {{ version = \"=1.0.229\", features = [\"derive\"] }}\n{dependency}"),
         );
         assert!(
             validate_final_static(&SafeRoot::new(&tree.path).expect("open GUI mutation")).is_err(),
@@ -3169,8 +3169,8 @@ fn root_gui_family_aliases_and_lock_packages_fail_closed() {
     let positive = final_tree("root-gui-positive");
     replace(
         &positive.join("Cargo.toml"),
-        "serde = { version = \"=1.0.228\", features = [\"derive\"] }\n",
-        "serde = { version = \"=1.0.228\", features = [\"derive\"] }\ntoolkit-helper = { package = \"serde\", version = \"=1.0.228\" }\n",
+        "serde = { version = \"=1.0.229\", features = [\"derive\"] }\n",
+        "serde = { version = \"=1.0.229\", features = [\"derive\"] }\ntoolkit-helper = { package = \"serde\", version = \"=1.0.229\" }\n",
     );
     validate_final_static(&SafeRoot::new(&positive.path).expect("open GUI positive"))
         .expect("unrelated dependency name remains accepted");
@@ -4490,8 +4490,18 @@ unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 unreachable_pub = "warn"
 
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+invalid_html_tags = "warn"
+private_intra_doc_links = "warn"
+unescaped_backticks = "warn"
+
 [workspace.lints.clippy]
-all = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+redundant_pub_crate = "allow"
+too_many_lines = "allow"
 
 [profile.release]
 codegen-units = 1

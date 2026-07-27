@@ -78,6 +78,15 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
 
+      # The workspace denies broken intra-doc links, but nothing ran rustdoc, so
+      # eighteen of them accumulated unnoticed in one crate alone. One platform
+      # is enough: rustdoc resolution does not vary by host.
+      - name: Check documentation
+        if: runner.os == 'Linux'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+
       - name: Assert root metadata excludes Slint
         if: runner.os == 'Linux'
         shell: bash
@@ -158,6 +167,12 @@ jobs:
 
       - name: Run tests
         run: cargo test --manifest-path desktop/Cargo.toml --workspace --all-targets --locked
+
+      - name: Check documentation
+        if: runner.os == 'Windows'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --manifest-path desktop/Cargo.toml --workspace --no-deps --locked
 
       - name: Build desktop application
         run: cargo build --manifest-path desktop/Cargo.toml --workspace --locked

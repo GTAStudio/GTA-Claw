@@ -47,7 +47,7 @@ Teams / Telegram / Discord / WhatsApp 的流量。这些仍由 `src/` 下的遗�
 
 | 项目 | 说明 |
 |---|---|
-| Rust 工具链 | 由 `rust-toolchain.toml` 固定为 `1.97.0`，在仓库目录内 `rustup` 会自动选用。最低支持版本为 `1.94.0`。 |
+| Rust 工具链 | 由 `rust-toolchain.toml` 固定为 `1.97.1`，在仓库目录内 `rustup` 会自动选用。最低支持版本为 `1.94.0`。 |
 | 平台 | 根工作空间可在 Linux、macOS 和 Windows 上构建。桌面客户端**仅支持 Windows 和 macOS**——在 Linux 上构建会被有意拒绝。 |
 | 一个 Gateway | CLI、TUI 和桌面客户端都是客户端程序。要做实际的事情，需要一个可达的 OpenClaw Gateway v4 端点（`ws://` 或 `wss://`）。 |
 

@@ -198,7 +198,7 @@ independently testable units that a composition root adapts to a port.
 
 | Item | Value |
 |---|---|
-| Pinned toolchain | `1.97.0` (`rust-toolchain.toml`, with `clippy` and `rustfmt`) |
+| Pinned toolchain | `1.97.1` (`rust-toolchain.toml`, with `clippy` and `rustfmt`) |
 | MSRV | `1.94.0` (`rust-version`, verified by a dedicated CI job) |
 | Edition | 2024 |
 | Resolver | `3` |

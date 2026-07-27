@@ -50,7 +50,7 @@ and is being deleted module by module — see
 
 | Requirement | Detail |
 |---|---|
-| Rust toolchain | Pinned to `1.97.0` by `rust-toolchain.toml`; `rustup` picks it up automatically inside the repository. The minimum supported version is `1.94.0`. |
+| Rust toolchain | Pinned to `1.97.1` by `rust-toolchain.toml`; `rustup` picks it up automatically inside the repository. The minimum supported version is `1.94.0`. |
 | Platforms | The root workspace builds on Linux, macOS and Windows. The desktop shell builds on **Windows and macOS only** — a Linux desktop build is rejected on purpose. |
 | A Gateway | The CLI, TUI and desktop shell are clients. You need a reachable OpenClaw Gateway v4 endpoint (`ws://` or `wss://`) for them to do anything interesting. |
 

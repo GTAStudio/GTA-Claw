@@ -33,8 +33,7 @@ export class CopilotEngine {
     }
 
     this.client = new CopilotClient({
-      githubToken,
-      autoRestart: true,
+      gitHubToken: githubToken,
     });
 
     this.sessionManager = new SessionManager(

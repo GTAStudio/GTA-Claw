@@ -83,7 +83,7 @@ const FINAL_DEPENDENCY_FILES: [(&str, &str, u64); 5] = [
 ];
 
 const ROOT_AUDIT: &[u8] = b"[advisories]\nignore = []\n";
-const ROOT_TOOLCHAIN: &[u8] = b"[toolchain]\nchannel = \"1.97.0\"\ncomponents = [\"clippy\", \"rustfmt\"]\nprofile = \"minimal\"\n";
+const ROOT_TOOLCHAIN: &[u8] = b"[toolchain]\nchannel = \"1.97.1\"\ncomponents = [\"clippy\", \"rustfmt\"]\nprofile = \"minimal\"\n";
 const ROOT_RUSTFMT: &[u8] = b"edition = \"2024\"\nmax_width = 100\nnewline_style = \"Unix\"\nuse_field_init_shorthand = true\nuse_try_shorthand = true\n";
 const ROOT_GITATTRIBUTES: &[u8] = b"# Keep Rust workspace inputs deterministic on Windows checkouts.\n/.gitattributes text eol=lf\n*.rs text eol=lf\n*.slint text eol=lf\n*.toml text eol=lf\n*.yml text eol=lf\n*.yaml text eol=lf\n*.sh text eol=lf\nCargo.lock text eol=lf\nrust-toolchain text eol=lf\n.github/fixtures/security-tools/shadow-bin/* text eol=lf\n.github/trusted/desktop-supply-chain-policy/policy/final/.github/fixtures/security-tools/shadow-bin/* text eol=lf\n";
 
@@ -629,6 +629,9 @@ fn validate_workspace_lints(workspace: &toml::map::Map<String, TomlValue>) -> Po
         .get("lints")
         .and_then(TomlValue::as_table)
         .ok_or_else(|| PolicyError::new("root workspace.lints table is missing"))?;
+    if keys(lints) != expected_keys(&["clippy", "rust", "rustdoc"]) {
+        return Err(PolicyError::new("root workspace lint schema changed"));
+    }
     let rust = lints
         .get("rust")
         .and_then(TomlValue::as_table)
@@ -659,31 +662,113 @@ fn validate_workspace_lints(workspace: &toml::map::Map<String, TomlValue>) -> Po
         .get("clippy")
         .and_then(TomlValue::as_table)
         .ok_or_else(|| PolicyError::new("root workspace.lints.clippy table is missing"))?;
-    if clippy
-        != &toml::map::Map::from_iter([("all".to_owned(), TomlValue::String("warn".to_owned()))])
-    {
+    if clippy != &expected_clippy_lints() {
         return Err(PolicyError::new("root workspace Clippy policy changed"));
+    }
+    let rustdoc = lints
+        .get("rustdoc")
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| PolicyError::new("root workspace.lints.rustdoc table is missing"))?;
+    if rustdoc != &expected_rustdoc_lints() {
+        return Err(PolicyError::new("root workspace rustdoc policy changed"));
     }
     Ok(())
 }
 
+fn lint_with_priority(level: &str) -> TomlValue {
+    TomlValue::Table(toml::map::Map::from_iter([
+        ("level".to_owned(), TomlValue::String(level.to_owned())),
+        ("priority".to_owned(), TomlValue::Integer(-1)),
+    ]))
+}
+
+fn expected_clippy_lints() -> toml::map::Map<String, TomlValue> {
+    toml::map::Map::from_iter([
+        ("all".to_owned(), lint_with_priority("warn")),
+        ("nursery".to_owned(), lint_with_priority("warn")),
+        ("pedantic".to_owned(), lint_with_priority("warn")),
+        (
+            "redundant_pub_crate".to_owned(),
+            TomlValue::String("allow".to_owned()),
+        ),
+        (
+            "too_many_lines".to_owned(),
+            TomlValue::String("allow".to_owned()),
+        ),
+    ])
+}
+
+fn expected_rustdoc_lints() -> toml::map::Map<String, TomlValue> {
+    toml::map::Map::from_iter([
+        (
+            "broken_intra_doc_links".to_owned(),
+            TomlValue::String("deny".to_owned()),
+        ),
+        (
+            "invalid_html_tags".to_owned(),
+            TomlValue::String("warn".to_owned()),
+        ),
+        (
+            "private_intra_doc_links".to_owned(),
+            TomlValue::String("warn".to_owned()),
+        ),
+        (
+            "unescaped_backticks".to_owned(),
+            TomlValue::String("warn".to_owned()),
+        ),
+    ])
+}
+
 fn validate_profile(root_manifest: &TomlValue) -> PolicyResult<()> {
     let profile = table(root_manifest, "profile")?;
-    if keys(profile) != expected_keys(&["release"]) {
-        return Err(PolicyError::new("root profile schema changed"));
-    }
-    let release = profile
-        .get("release")
-        .and_then(TomlValue::as_table)
-        .ok_or_else(|| PolicyError::new("root release profile is missing"))?;
-    if release
-        != &toml::map::Map::from_iter([
-            ("codegen-units".to_owned(), TomlValue::Integer(1)),
-            ("lto".to_owned(), TomlValue::String("thin".to_owned())),
-            ("strip".to_owned(), TomlValue::String("symbols".to_owned())),
-        ])
-    {
-        return Err(PolicyError::new("root release profile changed"));
+    let dependency_profile = TomlValue::Table(toml::map::Map::from_iter([
+        ("debug".to_owned(), TomlValue::Boolean(false)),
+        ("opt-level".to_owned(), TomlValue::Integer(2)),
+    ]));
+    let development_profile = |dependency_profile: TomlValue| {
+        TomlValue::Table(toml::map::Map::from_iter([
+            (
+                "debug".to_owned(),
+                TomlValue::String("line-tables-only".to_owned()),
+            ),
+            (
+                "package".to_owned(),
+                TomlValue::Table(toml::map::Map::from_iter([(
+                    "*".to_owned(),
+                    dependency_profile,
+                )])),
+            ),
+        ]))
+    };
+    let expected = toml::map::Map::from_iter([
+        (
+            "bench".to_owned(),
+            TomlValue::Table(toml::map::Map::from_iter([
+                ("codegen-units".to_owned(), TomlValue::Integer(1)),
+                (
+                    "debug".to_owned(),
+                    TomlValue::String("line-tables-only".to_owned()),
+                ),
+                ("lto".to_owned(), TomlValue::String("thin".to_owned())),
+            ])),
+        ),
+        (
+            "dev".to_owned(),
+            development_profile(dependency_profile.clone()),
+        ),
+        (
+            "release".to_owned(),
+            TomlValue::Table(toml::map::Map::from_iter([
+                ("codegen-units".to_owned(), TomlValue::Integer(1)),
+                ("lto".to_owned(), TomlValue::String("thin".to_owned())),
+                ("panic".to_owned(), TomlValue::String("unwind".to_owned())),
+                ("strip".to_owned(), TomlValue::String("symbols".to_owned())),
+            ])),
+        ),
+        ("test".to_owned(), development_profile(dependency_profile)),
+    ]);
+    if profile != &expected {
+        return Err(PolicyError::new("root build profile policy changed"));
     }
     Ok(())
 }
@@ -987,7 +1072,11 @@ fn validate_member_manifest(
             .get("clippy")
             .and_then(TomlValue::as_table)
             .ok_or_else(|| PolicyError::new("claw-config Clippy lints are missing"))?;
-        if keys(lints) != expected_keys(&["clippy", "rust"])
+        let rustdoc = lints
+            .get("rustdoc")
+            .and_then(TomlValue::as_table)
+            .ok_or_else(|| PolicyError::new("claw-config rustdoc lints are missing"))?;
+        if keys(lints) != expected_keys(&["clippy", "rust", "rustdoc"])
             || rust
                 != &toml::map::Map::from_iter([
                     (
@@ -1007,11 +1096,8 @@ fn validate_member_manifest(
                         TomlValue::String("warn".to_owned()),
                     ),
                 ])
-            || clippy
-                != &toml::map::Map::from_iter([(
-                    "all".to_owned(),
-                    TomlValue::String("warn".to_owned()),
-                )])
+            || clippy != &expected_clippy_lints()
+            || rustdoc != &expected_rustdoc_lints()
         {
             return Err(PolicyError::new(
                 "claw-config's generated-code lint exception changed",
@@ -1593,8 +1679,17 @@ fn validate_mobile_workspace_lints(
                 platform.manifest
             ))
         })?;
+    let rustdoc = lints
+        .get("rustdoc")
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| {
+            PolicyError::new(format!(
+                "{} workspace.lints.rustdoc is missing",
+                platform.manifest
+            ))
+        })?;
     let unsafe_code = rust.get("unsafe_code").and_then(TomlValue::as_str);
-    if keys(lints) != expected_keys(&["clippy", "rust"])
+    if keys(lints) != expected_keys(&["clippy", "rust", "rustdoc"])
         || keys(rust)
             != expected_keys(&[
                 "missing_docs",
@@ -1609,11 +1704,8 @@ fn validate_mobile_workspace_lints(
             .and_then(TomlValue::as_str)
             != Some("deny")
         || rust.get("unreachable_pub").and_then(TomlValue::as_str) != Some("warn")
-        || clippy
-            != &toml::map::Map::from_iter([(
-                "all".to_owned(),
-                TomlValue::String("warn".to_owned()),
-            )])
+        || clippy != &expected_clippy_lints()
+        || rustdoc != &expected_rustdoc_lints()
     {
         return Err(PolicyError::new(format!(
             "{} workspace lint policy is weaker than the desktop policy",

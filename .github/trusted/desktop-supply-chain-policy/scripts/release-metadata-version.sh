@@ -22,7 +22,7 @@ readonly jq_bin="/usr/bin/jq"
 [[ "$tag_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 [[ -z "$requested_version" || "$requested_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 
-/usr/bin/mkdir -p \
+/bin/mkdir -p \
   "$isolation/home" \
   "$isolation/cargo-home" \
   "$isolation/rustup-home" \
@@ -52,7 +52,7 @@ run_metadata() {
       --no-deps \
       --format-version 1 \
       --manifest-path "$manifest" >"$output"
-  [[ "$(/usr/bin/stat --format='%s' "$output")" -le 8388608 ]]
+  [[ "$(/usr/bin/wc -c < "$output")" -le 8388608 ]]
 }
 
 workspace_version() {
