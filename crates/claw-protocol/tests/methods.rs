@@ -306,7 +306,7 @@ fn catalog_drift_is_detected_for_every_mutated_pinned_field() {
         Err(MethodCatalogDrift::Name { position: 0, .. })
     ));
 
-    let mut unknown_scope = rows.clone();
+    let mut unknown_scope = rows;
     unknown_scope[0].1 = "operator.Read".to_owned();
     assert!(matches!(
         verify_pinned_methods(borrow(&unknown_scope)),

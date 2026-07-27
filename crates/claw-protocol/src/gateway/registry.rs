@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -207,6 +208,15 @@ impl DynamicPluginMethod {
     ///
     /// Missing legacy metadata defaults to admin. Reserved upstream namespaces
     /// are always coerced to admin and can never be weakened by a plugin.
+    ///
+    /// # Errors
+    ///
+    /// - [`RegistryError::EmptyPluginMethod`] — `raw_name` is empty after
+    ///   trimming surrounding whitespace.
+    /// - [`RegistryError::PluginMethodTooLong`] — the trimmed name exceeds
+    ///   `policy.max_name_bytes`.
+    /// - [`RegistryError::CoreMethodShadow`] — the trimmed name is byte-for-byte
+    ///   one of the frozen core methods, which a plugin must never take over.
     pub fn new(
         raw_name: impl Into<String>,
         scope: Option<OperatorScope>,
@@ -272,6 +282,13 @@ impl DynamicPluginRegistry {
     }
 
     /// Validates and registers one method, rejecting duplicates and core shadows.
+    ///
+    /// # Errors
+    ///
+    /// Returns every rejection listed for [`DynamicPluginMethod::new`], plus
+    /// [`RegistryError::DuplicatePluginMethod`] when a method with this exact
+    /// normalized identity is already registered. Registration is all-or-
+    /// nothing: a rejected method leaves the registry unchanged.
     pub fn register(
         &mut self,
         raw_name: impl Into<String>,
@@ -279,23 +296,22 @@ impl DynamicPluginRegistry {
         policy: &ValidationPolicy,
     ) -> Result<&DynamicPluginMethod, RegistryError> {
         let method = DynamicPluginMethod::new(raw_name, scope, policy)?;
-        if self.methods.contains_key(method.name()) {
-            return Err(RegistryError::DuplicatePluginMethod(
-                method.name().to_owned(),
-            ));
+        match self.methods.entry(method.name.clone()) {
+            Entry::Occupied(_) => Err(RegistryError::DuplicatePluginMethod(method.name)),
+            Entry::Vacant(slot) => Ok(slot.insert(method)),
         }
-        let name = method.name.clone();
-        self.methods.insert(name.clone(), method);
-        Ok(self
-            .methods
-            .get(&name)
-            .expect("method was inserted under the same exact key"))
     }
 
     /// Parses untrusted plugin scope metadata through the closed operator set.
     ///
     /// Omitted legacy metadata defaults to admin. Empty, node, dynamic, unknown,
     /// or incorrectly cased scope strings are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::InvalidPluginScope`] when `declared_scope` is
+    /// `Some` but is not one of the six closed operator scope identities, and
+    /// otherwise every rejection listed for [`DynamicPluginRegistry::register`].
     pub fn register_declared(
         &mut self,
         raw_name: impl Into<String>,
@@ -374,6 +390,13 @@ pub enum PluginLookup<'a> {
 }
 
 /// Resolves a method without ever collapsing a dynamic plugin into the core variant.
+///
+/// # Errors
+///
+/// Returns [`RegistryError::UnknownMethod`] when `name` is not byte-for-byte a
+/// frozen core method and either `plugin_lookup` is [`PluginLookup::Deny`] or
+/// the supplied registry holds no method with that exact identity. Lookup is
+/// ordinal and case-sensitive, so a differently cased spelling fails closed.
 pub fn resolve_gateway_method<'a>(
     name: &str,
     plugin_lookup: PluginLookup<'a>,

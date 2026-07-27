@@ -17,6 +17,24 @@ pub enum AuthorizationDecision {
 ///
 /// `resolved_dynamic_scopes` must be supplied for methods classified as
 /// [`MethodScope::Dynamic`]; it is never defaulted.
+///
+/// # Errors
+///
+/// - [`AuthorizationError::WorkerNotAdmitted`] — `role` is [`Role::Worker`],
+///   which belongs to the closed worker protocol and never reaches ordinary
+///   Gateway RPC.
+/// - [`AuthorizationError::RoleMismatch`] — the method is node-scoped and the
+///   caller is not a node, or the method is operator- or dynamically scoped and
+///   the caller is not an operator.
+/// - [`AuthorizationError::UnresolvedDynamicScope`] — the method is
+///   [`MethodScope::Dynamic`] and `resolved_dynamic_scopes` is `None`, so no
+///   runtime resolver answered for it.
+/// - [`AuthorizationError::EmptyDynamicScope`] — a resolver answered with an
+///   empty scope set, which would otherwise authorize the method for free.
+/// - [`AuthorizationError::MissingScope`] — `granted_scopes` lacks a required
+///   scope. [`OperatorScope::Admin`] satisfies everything and
+///   [`OperatorScope::Write`] satisfies [`OperatorScope::Read`]; no other
+///   implication exists.
 pub fn authorize(
     role: Role,
     method: GatewayMethod<'_>,
@@ -79,9 +97,9 @@ pub fn authorize(
         return Ok(AuthorizationDecision::Allowed);
     }
     for required in required {
-        if !granted_scopes.contains(required)
-            && !(*required == OperatorScope::Read && granted_scopes.contains(&OperatorScope::Write))
-        {
+        let satisfied = granted_scopes.contains(required)
+            || (*required == OperatorScope::Read && granted_scopes.contains(&OperatorScope::Write));
+        if !satisfied {
             return Err(AuthorizationError::MissingScope {
                 method: method.identity().to_owned(),
                 required: *required,
@@ -95,6 +113,13 @@ pub fn authorize(
 ///
 /// Unknown methods and plugin methods without explicit [`PluginLookup::Allow`]
 /// fail closed before dispatch.
+///
+/// # Errors
+///
+/// Returns [`AuthorizationError::Registry`] wrapping
+/// [`RegistryError::UnknownMethod`] when `method_name` is neither a frozen core
+/// method nor a method in an explicitly permitted plugin registry, and
+/// otherwise every rejection listed for [`authorize`].
 pub fn authorize_named(
     role: Role,
     method_name: &str,

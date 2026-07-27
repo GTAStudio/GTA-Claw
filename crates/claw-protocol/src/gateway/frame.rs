@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -26,6 +26,13 @@ macro_rules! string_newtype {
 
         impl $name {
             /// Creates a non-empty value under an explicit UTF-8 byte limit.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`StringValidationError::Empty`] when `value` is the
+            /// empty string, which the wire schema never permits for this
+            /// field, and [`StringValidationError::TooLong`] when its UTF-8
+            /// byte length exceeds `max_bytes`.
             pub fn new(
                 value: impl Into<String>,
                 max_bytes: usize,
@@ -228,7 +235,17 @@ macro_rules! integer_newtype {
 
         impl $name {
             /// Creates a validated integer.
-            pub fn new(value: u64) -> Result<Self, IntegerValidationError> {
+            ///
+            /// # Errors
+            ///
+            #[doc = concat!(
+                "Returns [`IntegerValidationError`] when `value` is less than ",
+                stringify!($minimum),
+                ", because ",
+                $message,
+                "."
+            )]
+            pub const fn new(value: u64) -> Result<Self, IntegerValidationError> {
                 if value < $minimum {
                     return Err(IntegerValidationError($message));
                 }
@@ -287,6 +304,16 @@ where
                 && (0.0..U64_UPPER_EXCLUSIVE).contains(&value)
                 && value.fract() == 0.0
             {
+                // The three guards above prove the cast is exact: the value is
+                // finite, is in `[0, 2^64)`, and has no fractional part, so it
+                // is an integer that `u64` represents without truncation and
+                // without a sign to lose. Rejecting the cast here would reject
+                // JSON integers that upstream encodes in exponent form.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "guarded above to be a non-negative integral f64 below 2^64, so the cast is lossless"
+                )]
                 Ok(value as u64)
             } else {
                 Err(E::custom("number is not a finite non-negative u64 integer"))
@@ -369,7 +396,13 @@ pub struct FiniteNumber(f64);
 
 impl FiniteNumber {
     /// Creates a finite number.
-    pub fn new(value: f64) -> Result<Self, IntegerValidationError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IntegerValidationError`] when `value` is `NaN` or an infinity.
+    /// Neither has a JSON representation, so accepting one here would produce a
+    /// value that cannot be re-encoded.
+    pub const fn new(value: f64) -> Result<Self, IntegerValidationError> {
         if value.is_finite() {
             Ok(Self(value))
         } else {
@@ -516,10 +549,10 @@ pub enum ClientId {
     /// Browser chat UI.
     #[serde(rename = "webchat-ui")]
     WebchatUi,
-    /// OpenClaw control UI.
+    /// `OpenClaw` control UI.
     #[serde(rename = "openclaw-control-ui")]
     ControlUi,
-    /// OpenClaw terminal UI.
+    /// `OpenClaw` terminal UI.
     #[serde(rename = "openclaw-tui")]
     Tui,
     /// Legacy webchat client.
@@ -977,7 +1010,7 @@ pub struct UpdateAvailable {
     pub latest_version: Name,
     /// Update channel.
     pub channel: Name,
-    /// Additive fields allowed by the pinned nested TypeBox object.
+    /// Additive fields allowed by the pinned nested `TypeBox` object.
     #[serde(flatten)]
     pub extensions: BTreeMap<String, OpaqueJson>,
 }
@@ -1386,10 +1419,7 @@ impl<'de> Deserialize<'de> for EventName {
         D: Deserializer<'de>,
     {
         let name = Name::deserialize(deserializer)?;
-        Ok(match resolve_core_event(name.as_str()) {
-            Some(event) => Self::Core(event),
-            None => Self::Extension(name),
-        })
+        Ok(resolve_core_event(name.as_str()).map_or(Self::Extension(name), Self::Core))
     }
 }
 
@@ -1792,6 +1822,10 @@ pub struct ShutdownEvent {
 pub(crate) struct KindProbe {
     #[serde(rename = "type")]
     pub(crate) kind: String,
+    #[expect(
+        clippy::zero_sized_map_values,
+        reason = "`serde(flatten)` requires a map; the probe only needs the sibling key set, and `IgnoredAny` is what keeps it from retaining the values"
+    )]
     #[serde(flatten)]
     remaining: BTreeMap<String, serde::de::IgnoredAny>,
 }
@@ -2151,15 +2185,15 @@ impl Validate for ShutdownEvent {
 
 pub(crate) fn classify_method(
     method: Name,
-    dynamic_methods: &BTreeMap<String, ()>,
+    dynamic_methods: &BTreeSet<String>,
 ) -> Result<GatewayMethodName, Name> {
     if let Some(core) = resolve_core_method(method.as_str()) {
-        Ok(GatewayMethodName::Core(core))
-    } else if dynamic_methods.contains_key(method.as_str()) {
-        Ok(GatewayMethodName::DynamicPlugin(DynamicGatewayMethodName(
-            method,
-        )))
-    } else {
-        Err(method)
+        return Ok(GatewayMethodName::Core(core));
     }
+    if dynamic_methods.contains(method.as_str()) {
+        return Ok(GatewayMethodName::DynamicPlugin(DynamicGatewayMethodName(
+            method,
+        )));
+    }
+    Err(method)
 }

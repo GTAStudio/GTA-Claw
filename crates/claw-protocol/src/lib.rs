@@ -92,6 +92,18 @@ impl Display for ServerEvent {
 }
 
 /// Parses the deliberately small command-line representation of the protocol.
+///
+/// # Errors
+///
+/// - [`ProtocolError::MissingCommand`] — `arguments` is empty.
+/// - [`ProtocolError::UnknownCommand`] — the first argument is neither `health`
+///   nor `send`.
+/// - [`ProtocolError::UnexpectedArgument`] — `health` was followed by an
+///   argument, which it never accepts.
+/// - [`ProtocolError::MissingArgument`] — `send` was given no session id, or no
+///   message text after the session id.
+/// - [`ProtocolError::Domain`] — the session id violates a
+///   [`SessionId`] invariant.
 pub fn parse_command<I, S>(arguments: I) -> Result<ClientCommand, ProtocolError>
 where
     I: IntoIterator<Item = S>,

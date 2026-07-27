@@ -161,6 +161,6 @@ fn target_triple() -> String {
     format!("{architecture}-{os}")
 }
 
-fn help_text() -> &'static str {
+const fn help_text() -> &'static str {
     "Usage: gta-claw-updater --manifest URL --current VERSION --target PATH"
 }

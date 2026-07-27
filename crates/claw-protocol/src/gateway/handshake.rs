@@ -469,7 +469,7 @@ pub struct Negotiation {
 impl Negotiation {
     /// Starts immediately after the typed challenge has been sent.
     #[must_use]
-    pub fn challenge_sent(challenge: ConnectChallenge) -> Self {
+    pub const fn challenge_sent(challenge: ConnectChallenge) -> Self {
         Self {
             state: NegotiationState::ChallengeSent,
             challenge,
@@ -509,6 +509,20 @@ impl Negotiation {
     }
 
     /// Receives the first frame and requires it to be a strict `req/connect`.
+    ///
+    /// # Errors
+    ///
+    /// - [`NegotiationError::IllegalTransition`] — the reducer is not in
+    ///   [`NegotiationState::ChallengeSent`], so this is not the first frame.
+    /// - [`NegotiationError::PreAuthenticationCodecRequired`] — `codec` is an
+    ///   authenticated codec, which would admit a 25 MiB first frame instead of
+    ///   the 64 KiB pre-authentication cap.
+    /// - [`NegotiationError::Codec`] — the frame does not survive a
+    ///   pre-authentication re-encode (it exceeds the 64 KiB cap or violates
+    ///   the pre-authentication policy), or its parameters are not strict
+    ///   connect parameters, or its method is not `connect`.
+    /// - [`NegotiationError::FirstFrameMustBeConnect`] — the first frame is a
+    ///   response or an event rather than a request.
     pub fn receive_first(&mut self, frame: Frame, codec: &Codec) -> Result<(), NegotiationError> {
         self.require_state(NegotiationState::ChallengeSent, "receive first frame")?;
         if codec.phase() != TransportPhase::PreAuthentication {
@@ -526,6 +540,24 @@ impl Negotiation {
     }
 
     /// Applies the exact v4/general and conditional v3 node/probe predicates.
+    ///
+    /// # Errors
+    ///
+    /// - [`NegotiationError::IllegalTransition`] — the reducer is not in
+    ///   [`NegotiationState::ConnectReceived`].
+    /// - [`NegotiationError::MissingReducerData`] — connect parameters were not
+    ///   retained, which only happens if a caller drives the reducer out of
+    ///   order.
+    /// - [`NegotiationError::Rejected`] with
+    ///   [`ConnectErrorDetailCode::AuthUnauthorized`] — the client claims the
+    ///   `worker` role, id or mode, which belongs to the closed worker
+    ///   protocol, or it names a gateway role outside `operator` and `node`.
+    /// - [`NegotiationError::Rejected`] with
+    ///   [`ConnectErrorDetailCode::ProtocolMismatch`] — `minProtocol` is above
+    ///   `maxProtocol`, or the requested window contains neither protocol 4 nor
+    ///   a qualifying N-1 exception. The N-1 exceptions are narrow: an operator
+    ///   whose client id and mode are both `probe`, or a node whose client mode
+    ///   is `node`, may be admitted at protocol 3.
     pub fn check_protocol(&mut self) -> Result<CompatibilityMode, NegotiationError> {
         self.require_state(NegotiationState::ConnectReceived, "check protocol")?;
         let params = self
@@ -595,6 +627,15 @@ impl Negotiation {
     }
 
     /// Runs a caller-provided authentication/device verifier port.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NegotiationError::IllegalTransition`] when the reducer is not
+    /// in [`NegotiationState::AwaitingAuthentication`],
+    /// [`NegotiationError::MissingReducerData`] when connect parameters, the
+    /// compatibility mode or the requested role were not retained, and every
+    /// rejection listed for [`Negotiation::apply_authentication`], which
+    /// consumes whatever `port` returns.
     pub fn authenticate_with<P: AuthenticationPort>(
         &mut self,
         port: &P,
@@ -620,6 +661,27 @@ impl Negotiation {
     }
 
     /// Applies an explicit external authentication/device-proof decision.
+    ///
+    /// # Errors
+    ///
+    /// - [`NegotiationError::IllegalTransition`] — the reducer is not in
+    ///   [`NegotiationState::AwaitingAuthentication`].
+    /// - [`NegotiationError::MissingReducerData`] — the requested role, connect
+    ///   parameters or compatibility mode were not retained.
+    /// - [`NegotiationError::Rejected`] carrying the port's own rejection when
+    ///   `decision` is [`AuthenticationDecision::Rejected`].
+    /// - [`NegotiationError::Rejected`] with
+    ///   [`ConnectErrorDetailCode::AuthUnauthorized`] — the authenticated role
+    ///   differs from the requested role, the port authenticated a `worker`, or
+    ///   an N-1 legacy window authenticated the wrong role (the probe window
+    ///   requires an operator and the node window requires a node).
+    /// - [`NegotiationError::Rejected`] with
+    ///   [`ConnectErrorDetailCode::DeviceIdentityRequired`] — a node
+    ///   authenticated without supplying device identity.
+    /// - [`NegotiationError::Rejected`] with
+    ///   [`ConnectErrorDetailCode::DeviceAuthInvalid`] — device identity was
+    ///   supplied but not verified, or a proof was reported verified when no
+    ///   device identity was supplied.
     pub fn apply_authentication(
         &mut self,
         decision: AuthenticationDecision,
@@ -696,6 +758,20 @@ impl Negotiation {
     }
 
     /// Validates and stores the successful hello payload.
+    ///
+    /// # Errors
+    ///
+    /// - [`NegotiationError::IllegalTransition`] — the reducer is not in
+    ///   [`NegotiationState::Authenticated`].
+    /// - [`NegotiationError::HelloProtocolMustBeCurrent`] — `hello.protocol` is
+    ///   not 4. A connection admitted through an N-1 window is still told the
+    ///   current protocol, so a legacy version here would be a downgrade.
+    /// - [`NegotiationError::MissingReducerData`] — the authenticated role was
+    ///   not retained.
+    /// - [`NegotiationError::HelloAuthenticationMismatch`] — `hello.auth.role`
+    ///   is not the authenticated role, `hello.auth.scopes` contains an
+    ///   identity outside the closed operator scope set, or those scopes differ
+    ///   from the authenticated scopes in value or order.
     pub fn prepare_hello(&mut self, hello: HelloOk) -> Result<(), NegotiationError> {
         self.require_state(NegotiationState::Authenticated, "prepare hello")?;
         if hello.protocol != GATEWAY_PROTOCOL_VERSION {
@@ -725,6 +801,12 @@ impl Negotiation {
     }
 
     /// Marks the prepared hello response as sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NegotiationError::IllegalTransition`] unless the reducer is in
+    /// [`NegotiationState::HelloPrepared`], so a hello cannot be reported sent
+    /// twice or before it was validated.
     pub fn mark_hello_sent(&mut self) -> Result<(), NegotiationError> {
         self.require_state(NegotiationState::HelloPrepared, "mark hello sent")?;
         self.state = NegotiationState::HelloSent;
@@ -732,6 +814,12 @@ impl Negotiation {
     }
 
     /// Completes negotiation after hello transmission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NegotiationError::IllegalTransition`] unless the reducer is in
+    /// [`NegotiationState::HelloSent`], so ordinary frames cannot be admitted
+    /// before the hello reached the client.
     pub fn mark_ready(&mut self) -> Result<(), NegotiationError> {
         self.require_state(NegotiationState::HelloSent, "mark ready")?;
         self.state = NegotiationState::Ready;

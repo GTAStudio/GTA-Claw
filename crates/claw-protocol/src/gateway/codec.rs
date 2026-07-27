@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Write};
@@ -32,41 +32,60 @@ struct SerializableRequest<'a, T: ?Sized> {
 pub struct Codec {
     phase: TransportPhase,
     policy: ValidationPolicy,
-    dynamic_methods: BTreeMap<String, ()>,
+    dynamic_methods: BTreeSet<String>,
 }
 
 impl Codec {
     /// Creates a codec for a phase and explicit validation policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::InvalidPolicy`] when any limit in `policy` is
+    /// zero, because a zero limit would reject every frame instead of bounding
+    /// one dimension of it.
     pub fn new(phase: TransportPhase, policy: ValidationPolicy) -> Result<Self, CodecError> {
         policy.validate().map_err(CodecError::InvalidPolicy)?;
         Ok(Self {
             phase,
             policy,
-            dynamic_methods: BTreeMap::new(),
+            dynamic_methods: BTreeSet::new(),
         })
     }
 
     /// Creates a pre-authentication codec using mechanically derived defaults.
     #[must_use]
-    pub fn preauthentication() -> Self {
-        Self::new(
-            TransportPhase::PreAuthentication,
-            ValidationPolicy::for_phase(TransportPhase::PreAuthentication),
-        )
-        .expect("mechanically derived policy is valid")
+    pub const fn preauthentication() -> Self {
+        Self::derived(TransportPhase::PreAuthentication)
     }
 
     /// Creates an authenticated codec using mechanically derived defaults.
     #[must_use]
-    pub fn authenticated() -> Self {
-        Self::new(
-            TransportPhase::Authenticated,
-            ValidationPolicy::for_phase(TransportPhase::Authenticated),
-        )
-        .expect("mechanically derived policy is valid")
+    pub const fn authenticated() -> Self {
+        Self::derived(TransportPhase::Authenticated)
+    }
+
+    /// Builds a codec from a mechanically derived policy.
+    ///
+    /// This deliberately bypasses [`ValidationPolicy::validate`] instead of
+    /// asserting it: every limit produced by [`ValidationPolicy::for_phase`] is
+    /// either the phase's non-zero transport cap or the non-zero default
+    /// nesting depth, so there is no zero limit for validation to reject and no
+    /// panic path to document.
+    const fn derived(phase: TransportPhase) -> Self {
+        Self {
+            phase,
+            policy: ValidationPolicy::for_phase(phase),
+            dynamic_methods: BTreeSet::new(),
+        }
     }
 
     /// Explicitly opts this codec into the supplied, already-validated plugin registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::PolicyLimit`] at `$dynamicMethods` when the
+    /// registry holds more methods than `max_collection_items` allows, so an
+    /// oversized plugin surface cannot be smuggled past the active policy.
     pub fn allow_dynamic_plugins(
         mut self,
         registry: &DynamicPluginRegistry,
@@ -80,7 +99,7 @@ impl Codec {
             });
         }
         self.dynamic_methods
-            .extend(registry.names().map(|name| (name.to_owned(), ())));
+            .extend(registry.names().map(str::to_owned));
         Ok(self)
     }
 
@@ -97,6 +116,34 @@ impl Codec {
     }
 
     /// Strictly decodes one complete frame.
+    ///
+    /// # Errors
+    ///
+    /// The checks run in this order, and the first failure is returned:
+    ///
+    /// - [`CodecError::FrameTooLarge`] — `bytes` is longer than the phase cap
+    ///   (64 KiB pre-authentication, 25 MiB authenticated). The length is
+    ///   rejected before any parsing, so an oversized frame is never buffered.
+    /// - [`CodecError::MalformedJson`] — the bytes are not one syntactically
+    ///   valid JSON document, or bytes trail the top-level value.
+    /// - [`CodecError::DuplicateKey`], [`CodecError::CollectionLimit`],
+    ///   [`CodecError::NestingLimit`], [`CodecError::NonFiniteNumber`] — a
+    ///   preflight policy rejection anywhere in the JSON tree, reported with
+    ///   the offending path.
+    /// - [`CodecError::TypedDecode`] — the envelope did not match the strict
+    ///   schema: a missing or misspelled field, an unknown field under
+    ///   `deny_unknown_fields`, a wrong JSON type, an empty string where the
+    ///   schema requires a non-empty one, or a non-positive `seq`.
+    /// - [`CodecError::UnknownFrameKind`] — `type` is not `req`, `res` or
+    ///   `event`.
+    /// - [`CodecError::ContradictoryEnvelopeField`] — a field belonging to a
+    ///   different envelope kind appeared alongside the declared `type`, such
+    ///   as `payload` on a `req`.
+    /// - [`CodecError::UnknownMethod`] — a request named a method that is
+    ///   neither in the frozen core registry nor in a registry this codec was
+    ///   explicitly opted into through [`Codec::allow_dynamic_plugins`].
+    /// - [`CodecError::PolicyLimit`] — a decoded field exceeded a typed policy
+    ///   bound, such as `$.id` or `$.error.message`.
     pub fn decode(&self, bytes: &[u8]) -> Result<Frame, CodecError> {
         self.check_size(bytes.len())?;
         preflight_json(bytes, &self.policy)?;
@@ -132,6 +179,13 @@ impl Codec {
     }
 
     /// Decodes a response and verifies its exact correlation identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns every rejection listed for [`Codec::decode`], plus
+    /// [`CodecError::UnexpectedFrame`] when the frame decoded to a request or
+    /// an event, and [`CodecError::ResponseIdMismatch`] when it is a response
+    /// whose `id` is not byte-for-byte `expected_id`.
     pub fn decode_response(
         &self,
         bytes: &[u8],
@@ -151,6 +205,20 @@ impl Codec {
     }
 
     /// Encodes one frame and enforces the active phase cap before returning bytes.
+    ///
+    /// # Errors
+    ///
+    /// - [`CodecError::PolicyLimit`] — a field of `frame` exceeds a typed
+    ///   policy bound, named by its JSON path.
+    /// - [`CodecError::FrameTooLarge`] — serialization reached the phase cap.
+    ///   The writer stops at the cap, so an oversized frame is never fully
+    ///   materialized.
+    /// - [`CodecError::Encode`] — `serde_json` refused the value.
+    /// - [`CodecError::CollectionLimit`], [`CodecError::NestingLimit`],
+    ///   [`CodecError::NonFiniteNumber`], [`CodecError::DuplicateKey`] — the
+    ///   post-encode preflight rejected the produced bytes, which is how an
+    ///   opaque payload that was accepted under a wider policy is stopped from
+    ///   leaving under a narrower one.
     pub fn encode(&self, frame: &Frame) -> Result<Vec<u8>, CodecError> {
         frame
             .validate(&self.policy)
@@ -163,6 +231,19 @@ impl Codec {
     /// Serialization writes directly into the phase-bounded writer, so a
     /// parameter source that would exceed the transport cap cannot force a full
     /// oversized intermediate allocation.
+    ///
+    /// # Errors
+    ///
+    /// - [`CodecError::PolicyLimit`] — `id` is longer than
+    ///   `max_request_id_bytes`, or a dynamic plugin `method` is longer than
+    ///   `max_name_bytes`.
+    /// - [`CodecError::FrameTooLarge`] — `params` pushed the serialized request
+    ///   past the phase cap; encoding stops at the cap rather than completing.
+    /// - [`CodecError::Encode`] — the caller's `Serialize` implementation
+    ///   failed, for example on a non-string map key or a non-finite float.
+    /// - [`CodecError::CollectionLimit`], [`CodecError::NestingLimit`],
+    ///   [`CodecError::NonFiniteNumber`], [`CodecError::DuplicateKey`] — the
+    ///   post-encode preflight rejected the serialized parameters.
     pub fn encode_request<T>(
         &self,
         id: &RequestId,
@@ -204,6 +285,24 @@ impl Codec {
     }
 
     /// Decodes connect parameters from a strict `connect` request.
+    ///
+    /// # Errors
+    ///
+    /// - [`CodecError::ExpectedConnectMethod`] — `request` names a method other
+    ///   than `connect`.
+    /// - [`CodecError::MissingOpaqueField`] or [`CodecError::NullOpaqueField`]
+    ///   at `$.params` — `connect` requires parameters, so neither an omitted
+    ///   nor an explicitly null `params` is accepted.
+    /// - [`CodecError::TypedDecode`] — the parameters did not match the strict
+    ///   connect schema: an unknown field, a missing `minProtocol`,
+    ///   `maxProtocol`, `client.id`, `client.version`, `client.platform` or
+    ///   `client.mode`, a client id or mode outside the closed sets, or a
+    ///   protocol version that is not a positive integer.
+    /// - [`CodecError::DuplicateKey`], [`CodecError::CollectionLimit`],
+    ///   [`CodecError::NestingLimit`], [`CodecError::NonFiniteNumber`] — a
+    ///   preflight policy rejection inside the parameters.
+    /// - [`CodecError::PolicyLimit`] — a name, capability list, command list,
+    ///   scope list, permission map or device proof field exceeded its bound.
     pub fn decode_connect(&self, request: &RequestFrame) -> Result<ConnectParams, CodecError> {
         if request.method().as_str() != "connect" {
             return Err(CodecError::ExpectedConnectMethod(
@@ -218,6 +317,24 @@ impl Codec {
     }
 
     /// Decodes a successful hello payload from a response.
+    ///
+    /// # Errors
+    ///
+    /// - [`CodecError::UnsuccessfulResponse`] — `response.ok()` is false, so
+    ///   there is no success payload to read; inspect `response.error()`
+    ///   instead.
+    /// - [`CodecError::MissingOpaqueField`] or [`CodecError::NullOpaqueField`]
+    ///   at `$.payload` — a successful response carried no hello payload.
+    /// - [`CodecError::TypedDecode`] — the payload did not match the strict
+    ///   `hello-ok` schema: a `type` other than `hello-ok`, an unknown field, or
+    ///   a missing `protocol`, `server`, `features`, `snapshot`, `auth` or
+    ///   `policy`.
+    /// - [`CodecError::DuplicateKey`], [`CodecError::CollectionLimit`],
+    ///   [`CodecError::NestingLimit`], [`CodecError::NonFiniteNumber`] — a
+    ///   preflight policy rejection inside the payload.
+    /// - [`CodecError::PolicyLimit`] — a hello name, feature list, presence
+    ///   entry, Control UI tab, plugin surface URL or device token exceeded its
+    ///   bound.
     pub fn decode_hello(&self, response: &ResponseFrame) -> Result<HelloOk, CodecError> {
         if !response.ok() {
             return Err(CodecError::UnsuccessfulResponse {
@@ -232,6 +349,18 @@ impl Codec {
     }
 
     /// Decodes a `connect.challenge` event payload.
+    ///
+    /// # Errors
+    ///
+    /// - [`CodecError::ExpectedChallengeEvent`] — `event` names an event other
+    ///   than `connect.challenge`.
+    /// - [`CodecError::MissingOpaqueField`] or [`CodecError::NullOpaqueField`]
+    ///   at `$.payload` — the challenge event carried no payload.
+    /// - [`CodecError::TypedDecode`] — the payload is not exactly
+    ///   `{"nonce": <non-empty string>, "ts": <non-negative integer>}`; unknown
+    ///   fields are rejected.
+    /// - [`CodecError::PolicyLimit`] at `$.payload.nonce` — the nonce exceeds
+    ///   `max_name_bytes`.
     pub fn decode_challenge(&self, event: &EventFrame) -> Result<ConnectChallenge, CodecError> {
         if event.event().as_str() != "connect.challenge" {
             return Err(CodecError::ExpectedChallengeEvent(
@@ -247,6 +376,15 @@ impl Codec {
     }
 
     /// Decodes a strict `tick` control event payload.
+    ///
+    /// # Errors
+    ///
+    /// - [`CodecError::ExpectedControlEvent`] — `event` names an event other
+    ///   than `tick`.
+    /// - [`CodecError::MissingOpaqueField`] or [`CodecError::NullOpaqueField`]
+    ///   at `$.payload` — the tick carried no payload.
+    /// - [`CodecError::TypedDecode`] — the payload is not exactly
+    ///   `{"ts": <non-negative integer>}`; unknown fields are rejected.
     pub fn decode_tick(&self, event: &EventFrame) -> Result<TickEvent, CodecError> {
         if event.event().as_str() != "tick" {
             return Err(CodecError::ExpectedControlEvent {
@@ -258,6 +396,17 @@ impl Codec {
     }
 
     /// Decodes and validates a strict `shutdown` control event payload.
+    ///
+    /// # Errors
+    ///
+    /// - [`CodecError::ExpectedControlEvent`] — `event` names an event other
+    ///   than `shutdown`.
+    /// - [`CodecError::MissingOpaqueField`] or [`CodecError::NullOpaqueField`]
+    ///   at `$.payload` — the shutdown notice carried no payload.
+    /// - [`CodecError::TypedDecode`] — `reason` is absent or empty, or an
+    ///   unknown field was present.
+    /// - [`CodecError::PolicyLimit`] at `$.payload.reason` — the reason exceeds
+    ///   `max_name_bytes`.
     pub fn decode_shutdown(&self, event: &EventFrame) -> Result<ShutdownEvent, CodecError> {
         if event.event().as_str() != "shutdown" {
             return Err(CodecError::ExpectedControlEvent {
@@ -273,6 +422,16 @@ impl Codec {
     }
 
     /// Decodes a deliberately opaque value through duplicate and path-aware checks.
+    ///
+    /// # Errors
+    ///
+    /// - [`CodecError::FrameTooLarge`] — the retained JSON text is longer than
+    ///   the phase cap.
+    /// - [`CodecError::DuplicateKey`], [`CodecError::CollectionLimit`],
+    ///   [`CodecError::NestingLimit`], [`CodecError::NonFiniteNumber`] — a
+    ///   preflight policy rejection, reported with the offending path.
+    /// - [`CodecError::TypedDecode`] — the value did not match `T`.
+    /// - [`CodecError::MalformedJson`] — bytes trail the top-level value.
     pub fn decode_opaque<T: DeserializeOwned>(
         &self,
         value: &super::OpaqueJson,
@@ -295,7 +454,7 @@ impl Codec {
         }
     }
 
-    fn check_size(&self, actual: usize) -> Result<(), CodecError> {
+    const fn check_size(&self, actual: usize) -> Result<(), CodecError> {
         let limit = self.phase.max_frame_bytes();
         if actual > limit {
             Err(CodecError::FrameTooLarge {
@@ -358,7 +517,9 @@ fn decode_typed<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
             column: error.column(),
         }
     })?;
-    deserializer.end().map_err(CodecError::from_json)?;
+    deserializer
+        .end()
+        .map_err(|error| CodecError::from_json(&error))?;
     Ok(value)
 }
 
@@ -568,10 +729,12 @@ fn preflight_json(bytes: &[u8], policy: &ValidationPolicy) -> Result<(), CodecEr
                 CodecError::NestingLimit { path, depth, limit }
             }
             Some(PreflightFailure::NonFinite { path }) => CodecError::NonFiniteNumber { path },
-            None => CodecError::from_json(error),
+            None => CodecError::from_json(&error),
         });
     }
-    deserializer.end().map_err(CodecError::from_json)
+    deserializer
+        .end()
+        .map_err(|error| CodecError::from_json(&error))
 }
 
 /// Stateful checker for per-connection broadcast event sequences.
@@ -591,6 +754,18 @@ impl EventSequenceTracker {
     ///
     /// Targeted events with no sequence do not alter state. Forward gaps update
     /// the tracker to the received value before returning the typed gap.
+    ///
+    /// # Errors
+    ///
+    /// - [`EventSequenceError::Gap`] — the sequence is ahead of the next
+    ///   expected value, so at least one broadcast was missed. The tracker
+    ///   adopts the received value so the caller resynchronizes after
+    ///   refetching state.
+    /// - [`EventSequenceError::NonMonotonic`] — the sequence repeats or moves
+    ///   backwards, which means a replayed or reordered broadcast. The tracker
+    ///   keeps its previous value.
+    /// - [`EventSequenceError::Overflow`] — the last accepted sequence is
+    ///   `u64::MAX`, so no successor exists.
     pub fn observe(&mut self, sequence: Option<EventSequence>) -> Result<(), EventSequenceError> {
         let Some(received) = sequence else {
             return Ok(());
@@ -600,7 +775,7 @@ impl EventSequenceTracker {
             Some(last) => last
                 .get()
                 .checked_add(1)
-                .ok_or(EventSequenceError::Overflow { last: last.get() })?,
+                .ok_or_else(|| EventSequenceError::Overflow { last: last.get() })?,
         };
         if received.get() > expected {
             self.last = Some(received);
@@ -793,7 +968,7 @@ pub enum CodecError {
 }
 
 impl CodecError {
-    fn from_json(error: serde_json::Error) -> Self {
+    fn from_json(error: &serde_json::Error) -> Self {
         Self::MalformedJson {
             message: error.to_string(),
             line: error.line(),

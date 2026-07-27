@@ -89,7 +89,7 @@ pub fn descriptors() -> impl Iterator<Item = MethodDescriptor> {
 
 /// Returns the number of generated core methods.
 #[must_use]
-pub fn method_count() -> usize {
+pub const fn method_count() -> usize {
     core_methods().len()
 }
 

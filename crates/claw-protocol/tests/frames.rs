@@ -14,11 +14,11 @@
 use claw_protocol::gateway::{
     AUTHENTICATED_MAX_FRAME_BYTES, ClientId, ClientMode, Codec, CodecError, CoreErrorCode,
     DEFAULT_JSON_NESTING_DEPTH, ErrorCode, EventName, EventSequence, EventSequenceError,
-    EventSequenceTracker, Frame, FrameKind, GatewayMethodName, OpaqueField,
+    EventSequenceTracker, Frame, FrameKind, GatewayMethodName, NonNegativeInteger, OpaqueField,
     PREAUTH_MAX_FRAME_BYTES, RequestId, TransportPhase, ValidationPolicy, resolve_core_method,
 };
 
-fn preauth() -> Codec {
+const fn preauth() -> Codec {
     Codec::preauthentication()
 }
 
@@ -430,7 +430,7 @@ fn golden_event_frames_round_trip_with_sequence_and_state_version() {
         .expect("the golden shutdown payload decodes");
     assert_eq!(shutdown.reason.as_str(), "restart");
     assert_eq!(
-        shutdown.restart_expected_ms.map(|value| value.get()),
+        shutdown.restart_expected_ms.map(NonNegativeInteger::get),
         Some(5000)
     );
 
@@ -617,7 +617,10 @@ fn golden_error_envelopes_carry_every_pinned_field() {
         r#"{"hint":"pair the device first"}"#
     );
     assert_eq!(error.retryable, Some(true));
-    assert_eq!(error.retry_after_ms.map(|value| value.get()), Some(1500));
+    assert_eq!(
+        error.retry_after_ms.map(NonNegativeInteger::get),
+        Some(1500)
+    );
 
     // The code is extensible: every pinned built-in classifies, anything else
     // stays an opaque wire code rather than being rejected.
