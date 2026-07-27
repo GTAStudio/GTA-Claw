@@ -73,39 +73,49 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // for the whole run, so any other thread that printed would block
             // until the daemon exited. Each `writeln!` takes the lock for the
             // length of one line instead, and this daemon has one writer.
-            let summary =
-                serve_production(io::stdout(), tokio::io::stdin(), &command.options, loaded)
-                    .await?;
+            let service =
+                serve_production(io::stdout(), tokio::io::stdin(), &command.options, loaded).await;
+            let telemetry_shutdown = telemetry.shutdown();
+            let late_telemetry = telemetry.take_writer_error();
+            let mut failures = Vec::new();
 
-            if !summary.is_clean() {
-                let error = summary.fault().map_or_else(
-                    || {
-                        if summary.deadline_expired() {
-                            io::Error::other(format!(
-                                "shutdown did not finish within its deadline: {} of {} service tasks joined",
-                                summary.terminated(),
-                                summary.spawned(),
-                            ))
-                        } else {
-                            io::Error::other(format!(
-                                "shutdown left work behind: {} abandoned, {} of {} tasks joined",
-                                summary.abandoned(),
-                                summary.terminated(),
-                                summary.spawned(),
-                            ))
-                        }
-                    },
-                    |fault| {
-                        io::Error::other(format!("runtime supervision failed: {fault}"))
-                    },
-                );
-
-                return Err(Box::<dyn std::error::Error>::from(error));
+            match service {
+                Ok(summary) if !summary.is_clean() => {
+                    failures.push(summary.fault().map_or_else(
+                        || {
+                            if summary.deadline_expired() {
+                                format!(
+                                    "shutdown did not finish within its deadline: {} of {} service tasks joined",
+                                    summary.terminated(),
+                                    summary.spawned(),
+                                )
+                            } else {
+                                format!(
+                                    "shutdown left work behind: {} abandoned, {} of {} tasks joined",
+                                    summary.abandoned(),
+                                    summary.terminated(),
+                                    summary.spawned(),
+                                )
+                            }
+                        },
+                        |fault| format!("runtime supervision failed: {fault}"),
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => failures.push(format!("service failed: {error}")),
             }
-            if let Some(error) = telemetry.take_writer_error()? {
-                return Err(Box::new(io::Error::other(format!(
-                    "telemetry writer failed: {error}"
-                ))));
+            if let Err(error) = telemetry_shutdown {
+                failures.push(format!("telemetry shutdown failed: {error}"));
+            }
+            match late_telemetry {
+                Ok(Some(error)) => failures.push(format!("late telemetry writer failure: {error}")),
+                Ok(None) => {}
+                Err(error) => failures.push(format!("telemetry health check failed: {error}")),
+            }
+            failures.sort_unstable();
+            failures.dedup();
+            if !failures.is_empty() {
+                return Err(Box::new(io::Error::other(failures.join("; "))));
             }
         }
     }
