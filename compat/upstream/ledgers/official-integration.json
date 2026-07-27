@@ -116,10 +116,14 @@
                                                                "skills"
                                                            ]
                                              },
-                         "status":  "partial",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "partial",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
+                                                                       {
+                                                                           "path":  "crates/claw-skills/tests/bundled_manifests.rs",
+                                                                           "test":  "exactly_fifty_one_bundled_manifests_load_from_the_shipped_assets"
+                                                                       },
                                                                        {
                                                                            "path":  "crates/claw-skills/tests/frozen_inventory.rs",
                                                                            "test":  "registry_matches_every_frozen_skill_field"
@@ -129,8 +133,7 @@
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "Every bundled skill manifest in the frozen inventory is discoverable from the Rust registry and every frozen field is compared row by row.",
-                                                   "Rust-native loading of those manifests is not proven: the same test asserts every bundled entry is RequiresNativePort, so the loading tests in crates/claw-skills/tests/runtime.rs exercise the native and bridge machinery on synthetic skills instead."
+                                                   "Every bundled manifest is discovered and loaded natively from the shipped assets and compared against the frozen inventory in both directions; the manifests are shipped as assets rather than compiled in, so a stripped install would discover none of them."
                                                ]
                      },
                      {
@@ -147,29 +150,40 @@
                                                                "scripts/lib/official-external-provider-catalog.json"
                                                            ]
                                              },
-                         "status":  "partial",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "partial",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
+                                                                       {
+                                                                           "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                                           "test":  "every_frozen_identifier_resolves_canonically_and_near_misses_do_not"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                                           "test":  "the_builtin_alias_table_only_names_frozen_identifiers"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                                           "test":  "every_frozen_provider_is_configurable_exactly_as_its_status_allows"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                                           "test":  "every_frozen_provider_accepts_exactly_its_declared_auth_modes"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                                           "test":  "capability_routing_serves_every_client_bearing_frozen_provider"
+                                                                       },
                                                                        {
                                                                            "path":  "crates/claw-providers/tests/frozen_inventory.rs",
                                                                            "test":  "every_registered_row_reproduces_the_frozen_fields_exactly"
-                                                                       },
-                                                                       {
-                                                                           "path":  "crates/claw-providers/tests/frozen_inventory.rs",
-                                                                           "test":  "the_registry_and_the_frozen_inventory_hold_the_same_identifiers"
-                                                                       },
-                                                                       {
-                                                                           "path":  "crates/claw-providers/tests/wire.rs",
-                                                                           "test":  "embeddings_and_model_listing_round_trip_over_the_wire"
                                                                        }
                                                                    ],
                                                      "required":  "Provider inventory IDs, aliases, configuration, auth, and capability routing pass fixtures."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "Every provider identity, its frozen fields, inventory order and capability routing for the implemented transports are proven, as are credential and auth handling in crates/claw-providers/tests/security.rs.",
-                                                   "Aliases are not proven in either direction: the frozen providers inventory carries no alias column and no Rust test asserts a provider alias table."
+                                                   "Identifiers, aliases, configuration, auth modes and capability routing are proven against the frozen inventory, but the alias table is a Rust-side convenience list checked only for internal consistency: the frozen inventory carries no alias column, so parity with upstream aliases cannot be asserted."
                                                ]
                      },
                      {
@@ -186,13 +200,37 @@
                                                                "scripts/lib/official-external-channel-catalog.json"
                                                            ]
                                              },
-                         "status":  "partial",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "partial",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
                                                                        {
                                                                            "path":  "crates/claw-channels/tests/frozen_inventory.rs",
-                                                                           "test":  "registry_matches_every_frozen_identity_and_provenance_field"
+                                                                           "test":  "frozen_channel_identifiers_are_unique_and_individually_resolvable"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-channels/tests/account_routing.rs",
+                                                                           "test":  "every_frozen_channel_identifier_routes_to_its_own_accounts"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-channels/tests/account_routing.rs",
+                                                                           "test":  "inbound_is_delivered_only_to_the_account_that_owns_it"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-channels/tests/channel_commands.rs",
+                                                                           "test":  "every_frozen_channel_declares_a_command_surface_matching_its_inbound_support"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-channels/tests/channel_commands.rs",
+                                                                           "test":  "help_output_lists_exactly_the_commands_a_channel_offers"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-channels/tests/channel_lifecycle.rs",
+                                                                           "test":  "connection_state_machine_accepts_exactly_the_contract_transitions"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-channels/tests/channel_lifecycle.rs",
+                                                                           "test":  "every_frozen_channel_is_gated_by_the_same_session_lifecycle"
                                                                        },
                                                                        {
                                                                            "path":  "crates/claw-channels/tests/channel_behavior.rs",
@@ -203,8 +241,7 @@
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "Every channel identity and provenance field, the declared auth policy and inbound and outbound round-tripping with account and conversation routing are proven for the adapters that carry an executable implementation.",
-                                                   "Channel commands and the lifecycle contract are not proven: no test drives channel command registration or a start and stop lifecycle, and the remaining inventoried channels are registration-only."
+                                                   "Identity, account routing, command surfaces and the session lifecycle are proven for every frozen channel, but only the channels with an executable adapter carry real inbound and outbound transport: the rest are proven to refuse inbound rather than to carry it."
                                                ]
                      },
                      {
