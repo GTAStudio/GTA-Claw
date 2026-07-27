@@ -325,6 +325,7 @@ pub struct FileGoalStore {
     accepted_writes: AtomicU64,
     synced_publications: AtomicU64,
     unsynced_publications: AtomicU64,
+    unlock_failures: AtomicU64,
 }
 
 impl FileGoalStore {
@@ -373,6 +374,7 @@ impl FileGoalStore {
             accepted_writes: AtomicU64::new(0),
             synced_publications: AtomicU64::new(0),
             unsynced_publications: AtomicU64::new(0),
+            unlock_failures: AtomicU64::new(0),
         };
         store.recovery = store.with_store_lock(|| store.recover())?;
         Ok(store)
@@ -440,6 +442,17 @@ impl FileGoalStore {
     #[must_use]
     pub fn unsynced_publications(&self) -> u64 {
         self.unsynced_publications.load(Ordering::SeqCst)
+    }
+
+    /// Returns how many explicit store-lock releases failed.
+    ///
+    /// A failed release never changes the result of work that already
+    /// committed. The lock guard retries during drop, while this counter lets
+    /// operators distinguish a healthy release path from degraded filesystem
+    /// lock behavior.
+    #[must_use]
+    pub fn unlock_failures(&self) -> u64 {
+        self.unlock_failures.load(Ordering::SeqCst)
     }
 
     /// Returns what one session currently occupies.
@@ -677,7 +690,18 @@ impl FileGoalStore {
             released: false,
         };
         let outcome = operation();
-        lock.release()?;
+        let release_failed = lock.release().is_err();
+        self.finish_locked_operation(outcome, release_failed)
+    }
+
+    fn finish_locked_operation<T>(
+        &self,
+        outcome: Result<T, StoreError>,
+        release_failed: bool,
+    ) -> Result<T, StoreError> {
+        if release_failed {
+            self.unlock_failures.fetch_add(1, Ordering::SeqCst);
+        }
         outcome
     }
 
@@ -1028,6 +1052,21 @@ mod tests {
             .expect("load succeeds")
             .expect("the synchronous save committed before its future was returned");
         assert_eq!(loaded.objective, "objective");
+    }
+
+    #[test]
+    fn an_unlock_failure_never_overwrites_a_committed_outcome() {
+        let root = TempRoot::new("unlock-outcome");
+        let store = FileGoalStore::open(root.path()).expect("store opens");
+        let committed = store
+            .finish_locked_operation(Ok("committed"), true)
+            .expect("the committed outcome wins");
+        assert_eq!(committed, "committed");
+        assert!(matches!(
+            store.finish_locked_operation::<()>(Err(StoreError::Busy { attempts: 7 }), true),
+            Err(StoreError::Busy { attempts: 7 })
+        ));
+        assert_eq!(store.unlock_failures(), 2);
     }
 
     #[test]
