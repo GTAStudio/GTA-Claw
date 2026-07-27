@@ -1,6 +1,7 @@
 //! HTTP adapter configuration and bounded defaults.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use http::HeaderValue;
@@ -103,6 +104,14 @@ pub struct ApiConfig {
     pub webhooks: BTreeMap<String, WebhookRoute>,
     /// Exact allowed browser origins. Empty denies cross-origin requests.
     pub cors_origins: Vec<HeaderValue>,
+    /// Per-peer request budget per minute. `None` disables rate limiting.
+    pub rate_limit_per_minute: Option<NonZeroU32>,
+    /// Trust the first valid `X-Forwarded-For` IP from the direct proxy path.
+    ///
+    /// Enabling this asserts that an operator-controlled proxy overwrites the
+    /// header before requests reach this listener. The secure default uses only
+    /// the accepted socket peer.
+    pub trust_proxy: bool,
     /// Bounded request and stream limits.
     pub limits: HttpLimits,
 }
@@ -118,6 +127,8 @@ impl ApiConfig {
             agents: vec!["main".to_owned()],
             webhooks: BTreeMap::new(),
             cors_origins: Vec::new(),
+            rate_limit_per_minute: None,
+            trust_proxy: false,
             limits: HttpLimits::default(),
         }
     }

@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -498,6 +499,332 @@ async fn probes_reflect_real_dependency_state_and_hide_details_without_auth() {
         "readiness details have exactly three fields"
     );
     assert!(detailed_json["uptimeMs"].as_u64().is_some());
+}
+
+#[tokio::test]
+async fn rate_limit_enforces_exact_contract_by_socket_peer_and_ignores_forwarding_headers() {
+    let runtime = DeterministicRuntime::new();
+    let mut rate_config = config();
+    rate_config.rate_limit_per_minute = NonZeroU32::new(2);
+    let server = spawn_with(rate_config, runtime).await;
+
+    let first = request(
+        &server,
+        "GET",
+        "/v1/models",
+        Some("operator-token"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(first.status, 200);
+    let second = request(
+        &server,
+        "GET",
+        "/v1/models",
+        Some("operator-token"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(second.status, 200);
+
+    let limited = request(
+        &server,
+        "GET",
+        "/v1/models",
+        Some("operator-token"),
+        &[("X-Forwarded-For", "203.0.113.40")],
+        b"",
+    )
+    .await;
+    assert_eq!(limited.status, 429);
+    assert_eq!(limited.body, br#"{"error":"Too many requests"}"#);
+    assert_eq!(
+        limited.headers.get("content-type").map(String::as_str),
+        Some("application/json; charset=utf-8")
+    );
+    assert_eq!(
+        limited.headers.get("content-length").map(String::as_str),
+        Some("29")
+    );
+    assert_eq!(
+        limited
+            .headers
+            .get("x-content-type-options")
+            .map(String::as_str),
+        Some("nosniff")
+    );
+    assert_eq!(
+        limited.headers.get("referrer-policy").map(String::as_str),
+        Some("no-referrer")
+    );
+    assert_eq!(
+        limited
+            .headers
+            .get("permissions-policy")
+            .map(String::as_str),
+        Some("camera=(), microphone=(self), geolocation=()")
+    );
+    assert!(!limited.headers.contains_key("retry-after"));
+
+    // A second socket peer must carry its own budget. `::1` is the only
+    // additional loopback address every supported platform assigns without
+    // administrative setup: macOS leaves 127.0.0.2 unassigned on lo0, so
+    // binding a client there fails with `AddrNotAvailable`. This extra
+    // listener shares the very same `HttpApi` (and therefore the very same
+    // limiter state) as `server`, so a 200 here can only come from the peer
+    // key, never from the listener.
+    let isolated_listener = TcpListener::bind("[::1]:0")
+        .await
+        .expect("bind IPv6 loopback test listener");
+    let isolated_address = isolated_listener
+        .local_addr()
+        .expect("IPv6 loopback listener address");
+    let isolated_api = server.api.clone();
+    let isolated_task = tokio::spawn(async move {
+        isolated_api
+            .serve(isolated_listener)
+            .await
+            .expect("serve IPv6 loopback test API");
+    });
+    for attempt in 0..2 {
+        let isolated = request_at(
+            isolated_address,
+            "GET",
+            "/v1/models",
+            Some("operator-token"),
+            &[("X-Forwarded-For", "203.0.113.40")],
+            b"",
+        )
+        .await;
+        assert_eq!(
+            isolated.status, 200,
+            "request {attempt} from a distinct socket peer spends its own budget"
+        );
+    }
+    let isolated_limited = request_at(
+        isolated_address,
+        "GET",
+        "/v1/models",
+        Some("operator-token"),
+        &[("X-Forwarded-For", "198.51.100.77")],
+        b"",
+    )
+    .await;
+    assert_eq!(
+        isolated_limited.status, 429,
+        "the second peer shares the one limiter and exhausts the same budget size"
+    );
+    assert_eq!(isolated_limited.body, br#"{"error":"Too many requests"}"#);
+    isolated_task.abort();
+
+    for path in ["/health", "/healthz", "/ready", "/readyz"] {
+        let probe = request(&server, "GET", path, None, &[], b"").await;
+        assert_eq!(probe.status, 200, "{path} must not consume the API budget");
+    }
+}
+
+#[tokio::test]
+async fn trusted_proxy_rate_limit_accepts_only_valid_first_forwarded_ips() {
+    let mut rate_config = config();
+    rate_config.rate_limit_per_minute = NonZeroU32::new(2);
+    rate_config.trust_proxy = true;
+    let server = spawn_with(rate_config, DeterministicRuntime::new()).await;
+
+    for _ in 0..2 {
+        let forwarded = request(
+            &server,
+            "GET",
+            "/v1/models/openclaw",
+            Some("operator-token"),
+            &[("X-Forwarded-For", "198.51.100.10, not-an-ip")],
+            b"",
+        )
+        .await;
+        assert_eq!(forwarded.status, 200);
+    }
+    let forwarded_limited = request(
+        &server,
+        "GET",
+        "/v1/models/openclaw",
+        Some("operator-token"),
+        &[("X-Forwarded-For", "198.51.100.10, 203.0.113.2")],
+        b"",
+    )
+    .await;
+    assert_eq!(forwarded_limited.status, 429);
+    assert_eq!(forwarded_limited.body, br#"{"error":"Too many requests"}"#);
+
+    let isolated_forwarded = request(
+        &server,
+        "GET",
+        "/v1/models/openclaw",
+        Some("operator-token"),
+        &[("X-Forwarded-For", "198.51.100.11")],
+        b"",
+    )
+    .await;
+    assert_eq!(isolated_forwarded.status, 200);
+    assert_eq!(
+        isolated_forwarded.json(),
+        json!({"id":"openclaw","object":"model","created":0,"owned_by":"openclaw","permission":[]})
+    );
+
+    for malformed in ["", "not-an-ip"] {
+        let fallback = request(
+            &server,
+            "GET",
+            "/v1/models/openclaw",
+            Some("operator-token"),
+            &[("X-Forwarded-For", malformed)],
+            b"",
+        )
+        .await;
+        assert_eq!(fallback.status, 200);
+    }
+    let malformed_limited = request(
+        &server,
+        "GET",
+        "/v1/models/openclaw",
+        Some("operator-token"),
+        &[("X-Forwarded-For", "[invalid-ip]")],
+        b"",
+    )
+    .await;
+    assert_eq!(malformed_limited.status, 429);
+    assert_eq!(malformed_limited.body, br#"{"error":"Too many requests"}"#);
+}
+
+#[tokio::test]
+async fn absent_rate_limit_is_explicitly_unlimited() {
+    let runtime = DeterministicRuntime::new();
+    let server = spawn_with(config(), runtime).await;
+
+    for _ in 0..4 {
+        let response = request(
+            &server,
+            "GET",
+            "/v1/models",
+            Some("operator-token"),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(response.status, 200);
+    }
+}
+
+#[tokio::test]
+async fn main_and_mcp_listeners_have_independent_peer_budgets() {
+    let mut rate_config = config();
+    rate_config.rate_limit_per_minute = NonZeroU32::new(2);
+    let server = spawn_with(rate_config, DeterministicRuntime::new()).await;
+    let model_body =
+        json!({"id":"openclaw","object":"model","created":0,"owned_by":"openclaw","permission":[]});
+
+    for _ in 0..2 {
+        let model = request(
+            &server,
+            "GET",
+            "/v1/models/openclaw",
+            Some("operator-token"),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(model.status, 200);
+        assert_eq!(model.json(), model_body);
+    }
+    let main_limited = request(
+        &server,
+        "GET",
+        "/v1/models/openclaw",
+        Some("operator-token"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(main_limited.status, 429);
+    assert_eq!(main_limited.body, br#"{"error":"Too many requests"}"#);
+
+    let mcp_after_main_exhaustion = mcp_request(
+        &server,
+        "POST",
+        Some("mcp-owner"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({
+            "jsonrpc":"2.0","id":"mcp-after-main","method":"initialize",
+            "params":{"protocolVersion":"2024-11-05"}
+        })),
+    )
+    .await;
+    assert_eq!(mcp_after_main_exhaustion.status, 200);
+    assert_eq!(
+        mcp_after_main_exhaustion.json(),
+        json!({
+            "jsonrpc":"2.0","id":"mcp-after-main",
+            "result":{
+                "protocolVersion":"2024-11-05",
+                "capabilities":{"tools":{}},
+                "serverInfo":{"name":"openclaw","version":"0.1.0"}
+            }
+        })
+    );
+
+    let mut second_rate_config = config();
+    second_rate_config.rate_limit_per_minute = NonZeroU32::new(2);
+    let second_server = spawn_with(second_rate_config, DeterministicRuntime::new()).await;
+    for id in ["first", "second"] {
+        let mcp = mcp_request(
+            &second_server,
+            "POST",
+            Some("mcp-owner"),
+            &[("Content-Type", "application/json")],
+            &json_body(json!({
+                "jsonrpc":"2.0","id":id,"method":"initialize",
+                "params":{"protocolVersion":"2024-11-05"}
+            })),
+        )
+        .await;
+        assert_eq!(mcp.status, 200);
+        assert_eq!(
+            mcp.json(),
+            json!({
+                "jsonrpc":"2.0","id":id,
+                "result":{
+                    "protocolVersion":"2024-11-05",
+                    "capabilities":{"tools":{}},
+                    "serverInfo":{"name":"openclaw","version":"0.1.0"}
+                }
+            })
+        );
+    }
+    let mcp_limited = mcp_request(
+        &second_server,
+        "POST",
+        Some("mcp-owner"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({
+            "jsonrpc":"2.0","id":"third","method":"initialize",
+            "params":{"protocolVersion":"2024-11-05"}
+        })),
+    )
+    .await;
+    assert_eq!(mcp_limited.status, 429);
+    assert_eq!(mcp_limited.body, br#"{"error":"Too many requests"}"#);
+
+    let main_after_mcp_exhaustion = request(
+        &second_server,
+        "GET",
+        "/v1/models/openclaw",
+        Some("operator-token"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(main_after_mcp_exhaustion.status, 200);
+    assert_eq!(main_after_mcp_exhaustion.json(), model_body);
 }
 
 #[tokio::test]
