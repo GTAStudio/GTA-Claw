@@ -23,8 +23,12 @@
 //! # Design rules
 //!
 //! * **A write is durable before it is acknowledged.** Records are written to a temporary file,
-//!   flushed with [`std::fs::File::sync_all`], and renamed over the target. A reader therefore
-//!   never observes a half-written record, and an acknowledged write survives the process.
+//!   flushed with [`std::fs::File::sync_all`], renamed over the target, and the directory holding
+//!   them is flushed in turn. A reader therefore never observes a half-written record, and an
+//!   acknowledged write survives both the process and a power cut. Directory flushing exists only
+//!   on Unix, and a Unix flush that fails leaves the bytes published but the rename unguaranteed;
+//!   [`FileGoalStore::synced_publications`] and [`FileGoalStore::unsynced_publications`] report
+//!   which of the three happened instead of leaving the promise to the prose.
 //! * **Refusals leave nothing behind.** Revision conflicts and budget refusals are decided before
 //!   any byte is written, so a rejected save cannot change what a restart would recover.
 //! * **Recovery is explicit, never silent.** [`FileGoalStore::open`] reports what it repaired in a

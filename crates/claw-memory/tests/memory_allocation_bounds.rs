@@ -219,15 +219,23 @@ fn a_bounded_keyword_working_set_still_returns_the_globally_best_matches() {
     // would clone all sixty. Records are inserted worst-first so a naive
     // truncation would keep the wrong ones.
     for ordinal in 0..60_u64 {
-        retriever.insert(record(
-            &format!("weak-{ordinal:03}"),
-            "alpha filler text",
-            2_000 + ordinal,
-        ));
+        retriever
+            .insert(record(
+                &format!("weak-{ordinal:03}"),
+                "alpha filler text",
+                2_000 + ordinal,
+            ))
+            .expect("indexed");
     }
-    retriever.insert(record("strong-a", "alpha beta gamma", 3_000));
-    retriever.insert(record("strong-b", "alpha beta gamma", 3_001));
-    retriever.insert(record("middle", "alpha beta", 3_002));
+    retriever
+        .insert(record("strong-a", "alpha beta gamma", 3_000))
+        .expect("indexed");
+    retriever
+        .insert(record("strong-b", "alpha beta gamma", 3_001))
+        .expect("indexed");
+    retriever
+        .insert(record("middle", "alpha beta", 3_002))
+        .expect("indexed");
 
     let query = RetrievalQuery::new("alpha beta gamma", 3).expect("valid query");
     let hits = retriever.retrieve(&query).expect("retrieval succeeds");
@@ -380,4 +388,61 @@ fn a_window_of_only_tool_results_is_dropped_entirely_and_costs_nothing() {
     // System body of 16 characters is 4 tokens, plus 2 for the six-character
     // role name, and nothing else was admitted.
     assert_eq!(plan.used_tokens(), 6);
+}
+
+/// The keyword corpus is the same attacker-influenced record set the vector
+/// index holds, so it carries the same bound rather than relying on whoever
+/// owns it to stop inserting.
+#[test]
+fn a_full_keyword_corpus_refuses_new_records_but_still_accepts_replacements() {
+    let mut retriever = KeywordRetriever::with_capacity(2).expect("valid retriever");
+    assert_eq!(retriever.capacity(), 2);
+
+    retriever
+        .insert(record("first", "alpha", 1))
+        .expect("the first record fits");
+    retriever
+        .insert(record("second", "beta", 2))
+        .expect("the second record fits");
+
+    assert_eq!(
+        retriever.insert(record("third", "gamma", 3)).err(),
+        Some(RetrievalError::RetrieverFull)
+    );
+    assert_eq!(retriever.len(), 2, "the refused record was never indexed");
+    assert!(
+        retriever
+            .retrieve(&RetrievalQuery::new("gamma", 5).expect("valid query"))
+            .expect("retrieval succeeds")
+            .is_empty(),
+        "a record the retriever refused must not be searchable"
+    );
+
+    retriever
+        .insert(record("first", "delta", 4))
+        .expect("replacing an indexed record does not grow the corpus");
+    assert_eq!(retriever.len(), 2);
+
+    assert!(retriever.remove(&RecordId::new("second").expect("valid identifier")));
+    retriever
+        .insert(record("third", "gamma", 5))
+        .expect("removal is the eviction path, and it frees a slot");
+    assert_eq!(retriever.len(), 2);
+}
+
+#[test]
+fn a_retriever_with_no_capacity_is_refused_at_construction() {
+    assert_eq!(
+        KeywordRetriever::with_capacity(0).err(),
+        Some(RetrievalError::EmptyCapacity)
+    );
+}
+
+#[test]
+fn the_default_keyword_and_vector_bounds_are_the_same_number() {
+    assert_eq!(
+        KeywordRetriever::new().capacity(),
+        ExactVectorIndex::new(2).expect("valid index").capacity(),
+        "the two holders of the same records must not disagree about how many is too many"
+    );
 }

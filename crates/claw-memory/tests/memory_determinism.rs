@@ -555,9 +555,15 @@ fn the_hashing_model_is_stable_across_instances_and_orderings() {
 #[test]
 fn keyword_retrieval_is_ordered_and_bounded() {
     let mut retriever = KeywordRetriever::new();
-    retriever.insert(record("r1", "s", "the gateway protocol is frozen", 10));
-    retriever.insert(record("r2", "s", "the gateway is open", 20));
-    retriever.insert(record("r3", "s", "unrelated content", 30));
+    retriever
+        .insert(record("r1", "s", "the gateway protocol is frozen", 10))
+        .expect("indexed");
+    retriever
+        .insert(record("r2", "s", "the gateway is open", 20))
+        .expect("indexed");
+    retriever
+        .insert(record("r3", "s", "unrelated content", 30))
+        .expect("indexed");
     let query = RetrievalQuery::new("gateway protocol", 10).expect("valid query");
     let hits = retriever.retrieve(&query).expect("retrieved");
     let identities: Vec<&str> = hits.iter().map(|hit| hit.record.id.as_str()).collect();

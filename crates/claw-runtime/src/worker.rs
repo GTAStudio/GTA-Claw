@@ -211,6 +211,9 @@ impl Error for WorkerError {}
 
 #[derive(Debug, Default)]
 struct RegistryState {
+    /// Bounded by [`WorkerRegistry::reclaim_stale_tickets`]: an entry lives for its
+    /// `ticket_ttl` plus one more `ticket_ttl` of diagnostic grace, so the table holds only
+    /// what was issued in that window rather than everything ever issued.
     tickets: HashMap<String, WorkerTicket>,
     sessions: HashMap<WorkerId, WorkerSession>,
     next_fence: u64,
@@ -258,6 +261,11 @@ impl WorkerRegistry {
 
     /// Issues a single-use admission ticket.
     ///
+    /// Issuing is also when the table is swept: a ticket that expired more than one `ticket_ttl`
+    /// ago is reclaimed here, so the registry holds only the tickets issued inside that window
+    /// instead of every ticket it ever minted. See [`WorkerRegistry::retained_tickets`] for why
+    /// the sweep waits rather than reclaiming at expiry.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkerError::DeadlineOverflow`] when the ticket deadline cannot be represented.
@@ -276,9 +284,10 @@ impl WorkerRegistry {
             issued_at,
             expires_at,
         };
-        self.lock()
-            .tickets
-            .insert(ticket.secret.clone(), ticket.clone());
+        let mut state = self.lock();
+        Self::reclaim_stale_tickets(&mut state, issued_at, self.config.ticket_ttl);
+        state.tickets.insert(ticket.secret.clone(), ticket.clone());
+        drop(state);
         Ok(ticket)
     }
 
@@ -445,12 +454,47 @@ impl WorkerRegistry {
     }
 
     /// Returns the number of tickets that have been issued but not redeemed or expired.
+    ///
+    /// Counting is destructive: every ticket found expired is dropped here rather than kept for
+    /// the grace window [`WorkerRegistry::retained_tickets`] describes, so a redemption after this
+    /// call is refused with [`WorkerError::UnknownTicket`] instead of
+    /// [`WorkerError::TicketExpired`]. Use `retained_tickets` to observe without sweeping.
     #[must_use]
     pub fn outstanding_tickets(&self) -> usize {
         let now = self.clock.now();
         let mut state = self.lock();
         state.tickets.retain(|_, ticket| now < ticket.expires_at);
         state.tickets.len()
+    }
+
+    /// Returns how many tickets the registry is holding, expired ones included.
+    ///
+    /// This is deliberately larger than [`WorkerRegistry::outstanding_tickets`] for a while. An
+    /// expired ticket is kept past its deadline so that a worker presenting it is refused with
+    /// [`WorkerError::TicketExpired`], which tells it to ask for a new ticket, rather than with
+    /// [`WorkerError::UnknownTicket`], which is the answer to a forged secret. Dropping the entry
+    /// at `expires_at` would erase that distinction; keeping it forever would grow this table for
+    /// as long as the process lives. One further `ticket_ttl` of grace is long enough that no
+    /// worker can still be mid-handshake with the ticket, and short enough that the table's size
+    /// is a function of the recent issue rate rather than of uptime.
+    ///
+    /// Unlike `outstanding_tickets`, this observes without sweeping.
+    #[must_use]
+    pub fn retained_tickets(&self) -> usize {
+        self.lock().tickets.len()
+    }
+
+    /// Drops tickets that expired more than `grace` ago.
+    ///
+    /// A deadline that cannot be represented is kept: an unrepresentable reclamation point is not
+    /// a reason to forget a ticket a worker may still hold.
+    fn reclaim_stale_tickets(state: &mut RegistryState, now: Timestamp, grace: Duration) {
+        state.tickets.retain(|_, ticket| {
+            ticket
+                .expires_at
+                .checked_add(grace)
+                .is_none_or(|reclaim_at| now < reclaim_at)
+        });
     }
 
     fn live_session_mut<'state>(

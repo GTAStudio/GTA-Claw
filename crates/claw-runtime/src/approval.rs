@@ -289,8 +289,10 @@ impl ApprovalBroker {
     ///
     /// # Errors
     ///
-    /// Returns [`ApprovalError::Port`] when the presentation adapter fails, and
-    /// [`ApprovalError::DeadlineOverflow`] when the deadline cannot be represented.
+    /// Returns [`ApprovalError::Port`] when the presentation adapter fails,
+    /// [`ApprovalError::DeadlineOverflow`] when the deadline cannot be represented, and
+    /// [`ApprovalError::Identifier`] when the broker's identifier counter cannot advance — the
+    /// request is refused rather than issued an identifier that is already in use.
     pub async fn request(
         &self,
         ticket: ApprovalTicket,
@@ -310,10 +312,23 @@ impl ApprovalBroker {
 
         // Only the counter bump needs the lock; minting the identifier, building the request and
         // allocating the channel all happen outside it.
+        //
+        // `checked_add`, not `saturating_add`: a saturated counter re-mints an identifier that is
+        // already in `pending`, and the insert below would then evict a live waiter. That waiter's
+        // responder would drop, so its call would report a withdrawal that no operator and no
+        // timeout ever caused, and the guard it holds would retract the *new* request instead.
+        // Exhausting a u64 is unreachable in practice, which is exactly why the failure has to be
+        // loud: an unreachable branch that silently corrupts is worse than one that refuses.
         let ordinal = {
             let mut state = self.lock();
-            state.next_id = state.next_id.saturating_add(1);
-            state.next_id
+            let ordinal = state
+                .next_id
+                .checked_add(1)
+                .ok_or(ApprovalError::Identifier(
+                    "the broker has exhausted its identifier space",
+                ))?;
+            state.next_id = ordinal;
+            ordinal
         };
         let approval_id = ApprovalId::new(format!("approval-{ordinal}"))
             .map_err(|error| ApprovalError::Identifier(error.reason()))?;
@@ -416,4 +431,95 @@ impl ApprovalPort for SilentApprovalPort {
     }
 
     fn abandon(&self, _approval_id: &ApprovalId) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use claw_application::model::ids::{ToolCallId, TurnId};
+    use claw_application::model::time::Timestamp;
+    use claw_application::ports::PortFuture;
+    use claw_application::ports::clock::ClockPort;
+    use claw_domain::SessionId;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{ApprovalBroker, ApprovalError, ApprovalTicket, SilentApprovalPort, lock_state};
+
+    /// A clock that never moves, so a request that reaches its deadline never resolves.
+    struct FrozenClock;
+
+    impl ClockPort for FrozenClock {
+        fn now(&self) -> Timestamp {
+            Timestamp::EPOCH
+        }
+
+        fn sleep(&self, _duration: Duration) -> PortFuture<'_, ()> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn broker() -> ApprovalBroker {
+        ApprovalBroker::new(
+            Arc::new(SilentApprovalPort),
+            Arc::new(FrozenClock),
+            Duration::from_secs(30),
+        )
+    }
+
+    fn ticket() -> ApprovalTicket {
+        ApprovalTicket {
+            session_id: SessionId::new("exhaustion").expect("the test session id is valid"),
+            turn: TurnId::FIRST,
+            call_id: ToolCallId::new("call-1").expect("the test call id is valid"),
+            tool_name: "shell".to_owned(),
+            arguments: "{}".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_identifier_space_is_refused_instead_of_reusing_an_identifier() {
+        let broker = broker();
+        // Reaching this by making requests would take 2^64 of them; the counter is set directly
+        // so the branch is actually executed rather than merely reasoned about.
+        lock_state(&broker.state).next_id = u64::MAX;
+
+        let refused = broker
+            .request(ticket(), &CancellationToken::new())
+            .await
+            .expect_err("a counter that cannot advance must refuse the request");
+
+        assert!(
+            matches!(refused, ApprovalError::Identifier(_)),
+            "expected an identifier refusal, got {refused}"
+        );
+        assert!(
+            broker.outstanding().is_empty(),
+            "a refused request must not leave a waiter that a later request could evict"
+        );
+    }
+
+    #[tokio::test]
+    async fn identifiers_advance_by_one_per_request() {
+        use std::future::Future as _;
+
+        let broker = broker();
+        lock_state(&broker.state).next_id = 41;
+
+        let cancel = CancellationToken::new();
+        let mut waiting = Box::pin(broker.request(ticket(), &cancel));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            waiting.as_mut().poll(&mut context).is_pending(),
+            "a presented request waits for an answer"
+        );
+
+        assert_eq!(
+            broker.outstanding()[0].approval_id.as_str(),
+            "approval-42",
+            "the minted ordinal must be the incremented counter, not the one before it"
+        );
+        assert_eq!(lock_state(&broker.state).next_id, 42);
+    }
 }

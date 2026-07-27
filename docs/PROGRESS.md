@@ -76,7 +76,7 @@ Everything below should be read against that fact.
 | `claw-plugin-api` | Implemented (contract) / Registration-only (inventory) | ABI, capability model, limits, manifest schema and trust policy are implemented. All 137 upstream plugin descriptors are present and every one reports `RegistrationOnly`. |
 | `claw-plugin-host` | Implemented (host) | The wasmtime Component Model host, sandbox, limits and lifecycle are real. It contains **no ports of the 137 upstream plugins**. |
 | `claw-memory` | Implemented | Deterministic context assembly with anchor preservation. |
-| `claw-goals` | Implemented | The durable on-disk adapter behind `GoalStorePort`; earlier adapters in the tree were in-memory fakes. |
+| `claw-goals` | Implemented | The on-disk adapter behind `GoalStorePort`; earlier adapters in the tree were in-memory fakes. Publication is a rename whose parent directory is fsynced on Unix, so it survives power loss there; Windows has no equivalent step and durability after sudden power loss is not claimed. Recovery's temp-file unlinks are not directory-synced. |
 
 ### Transports and interop
 
