@@ -12,6 +12,13 @@ component StepMarker {
     in property <int> number;
     in property <string> label;
     in property <int> current-step;
+    in property <int> total-steps: 3;
+
+    accessible-role: text;
+    accessible-label: "Step " + root.number + " of " + root.total-steps + ", " + root.label + ", "
+        + (root.number < root.current-step
+            ? "completed"
+            : (root.number == root.current-step ? "current step" : "not started"));
 
     HorizontalLayout {
         spacing: Metrics.space-2;
@@ -66,7 +73,7 @@ component PermissionRow {
 
     content := HorizontalLayout {
         spacing: Metrics.space-3;
-        alignment: center;
+        cross-axis-alignment: center;
 
         VerticalLayout {
             spacing: Metrics.space-1;
@@ -114,6 +121,9 @@ export component FirstRunSurface inherits FocusScope {
             ? "Device authorization"
             : "Workspace trust");
 
+    // Created on demand, so take focus to keep the Escape shortcut live.
+    init => { root.focus(); }
+
     key-pressed(event) => {
         if (event.text == Key.Escape && root.stage > 0) {
             root.stage-requested(root.stage - 1);
@@ -133,12 +143,14 @@ export component FirstRunSurface inherits FocusScope {
             background: DesignTokens.surface-pane;
             border-width: 1px;
             border-color: DesignTokens.border-default;
+            accessible-role: banner;
+            accessible-label: "GTA Claw setup, step " + (root.stage + 1) + " of 3";
 
             HorizontalLayout {
                 padding-left: Metrics.space-6;
                 padding-right: Metrics.space-6;
                 spacing: Metrics.space-3;
-                alignment: center;
+                cross-axis-alignment: center;
 
                 Rectangle {
                     width: Metrics.control-large;
@@ -203,6 +215,10 @@ export component FirstRunSurface inherits FocusScope {
                     width: min(900px, parent.width);
                     horizontal-stretch: 0;
                     min-height: step-row.min-height;
+
+                    accessible-role: list;
+                    accessible-label: "Setup steps";
+                    accessible-item-count: 3;
 
                     step-row := HorizontalLayout {
                         spacing: root.narrow-layout ? Metrics.space-3 : Metrics.space-8;
@@ -315,6 +331,7 @@ export component FirstRunSurface inherits FocusScope {
 
                         SecondaryButton {
                             text: "Back";
+                            accessible-name: "Back to welcome";
                             clicked => { root.stage-requested(0); }
                         }
                         PrimaryButton {
@@ -408,6 +425,7 @@ export component FirstRunSurface inherits FocusScope {
 
                         SecondaryButton {
                             text: "Back";
+                            accessible-name: "Back to device authorization";
                             clicked => { root.stage-requested(1); }
                         }
                         PrimaryButton {

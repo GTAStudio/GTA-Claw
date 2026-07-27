@@ -12,6 +12,8 @@ mod software_renderer_smoke;
 mod test_gateway;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod ui_adapter;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+mod ui_models;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::cell::RefCell;
@@ -38,9 +40,14 @@ use product_state::{
 use slint::{CloseRequestResponse, ComponentHandle};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use ui_adapter::{UiTheme, VisualPreferencesState};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use ui_models::{ProductModels, reconcile};
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-#[allow(missing_docs, unreachable_pub)]
+#[expect(
+    unreachable_pub,
+    reason = "slint::include_modules! emits `pub` items that stay crate-private behind this module"
+)]
 mod generated_ui {
     slint::include_modules!();
 }
@@ -80,11 +87,6 @@ fn apply_snapshot(window: &AppWindow, snapshot: &ViewSnapshot) {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn model<T: Clone + 'static>(rows: Vec<T>) -> slint::ModelRc<T> {
-    Rc::new(slint::VecModel::from(rows)).into()
-}
-
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 const fn tone_index(tone: SemanticTone) -> i32 {
     match tone {
         SemanticTone::Neutral => 0,
@@ -112,9 +114,9 @@ fn line_number(number: Option<u32>) -> slint::SharedString {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn apply_product_state(window: &AppWindow, state: &ProductState) {
-    debug_assert_eq!(state.keyboard_order().len(), 10);
-    debug_assert_eq!(state.accessibility_nodes().len(), 4);
+fn apply_product_state(window: &AppWindow, models: &ProductModels, state: &ProductState) {
+    debug_assert_eq!(ProductState::keyboard_order().len(), 10);
+    debug_assert_eq!(ProductState::accessibility_nodes().len(), 4);
     window.set_onboarding_stage(state.onboarding_stage().index());
     window.set_selected_screen(state.surface().screen_index());
     window.set_selected_settings_section(
@@ -126,7 +128,7 @@ fn apply_product_state(window: &AppWindow, state: &ProductState) {
         DiffMode::SideBySide => 1,
     });
     let selected_run = state.selected_run();
-    window.set_session_title(selected_run.title.clone().into());
+    window.set_session_title(selected_run.title.as_str().into());
     window.set_session_state(selected_run.state.label().into());
     window
         .set_session_detail(format!("{} · {}", selected_run.workspace, selected_run.detail).into());
@@ -137,154 +139,146 @@ fn apply_product_state(window: &AppWindow, state: &ProductState) {
     window.set_approval_scope(state.approval_scope().into());
     window.set_question(state.question().into());
 
-    let runs = state
-        .runs()
-        .visible()
-        .iter()
-        .map(|run| RunItem {
-            id: run.id.clone().into(),
-            title: run.title.clone().into(),
-            workspace: run.workspace.clone().into(),
+    reconcile(
+        models.runs(),
+        state.runs().visible().iter().map(|run| RunItem {
+            id: run.id.as_str().into(),
+            title: run.title.as_str().into(),
+            workspace: run.workspace.as_str().into(),
             state: run.state.label().into(),
-            detail: run.detail.clone().into(),
-            updated: run.updated.clone().into(),
+            detail: run.detail.as_str().into(),
+            updated: run.updated.as_str().into(),
             tone: tone_index(run.state.tone()),
-        })
-        .collect();
-    window.set_runs(model(runs));
+        }),
+    );
 
-    let workspaces = state
-        .workspaces()
-        .iter()
-        .map(|workspace| WorkspaceItem {
-            name: workspace.name.clone().into(),
-            location: workspace.location.clone().into(),
-            kind: workspace.kind.clone().into(),
-            branch: workspace.branch.clone().into(),
+    reconcile(
+        models.workspaces(),
+        state.workspaces().iter().map(|workspace| WorkspaceItem {
+            name: workspace.name.as_str().into(),
+            location: workspace.location.as_str().into(),
+            kind: workspace.kind.as_str().into(),
+            branch: workspace.branch.as_str().into(),
             active_runs: i32::try_from(workspace.active_runs).unwrap_or(i32::MAX),
-        })
-        .collect();
-    window.set_workspaces(model(workspaces));
+        }),
+    );
 
-    let schedules = state
-        .schedules()
-        .iter()
-        .map(|schedule| ScheduleItem {
-            name: schedule.name.clone().into(),
-            cadence: schedule.cadence.clone().into(),
-            next_run: schedule.next_run.clone().into(),
+    reconcile(
+        models.schedules(),
+        state.schedules().iter().map(|schedule| ScheduleItem {
+            name: schedule.name.as_str().into(),
+            cadence: schedule.cadence.as_str().into(),
+            next_run: schedule.next_run.as_str().into(),
             enabled: schedule.enabled,
             can_toggle: schedule.enabled || schedule.next_run != "Not scheduled",
-            workspace: schedule.workspace.clone().into(),
-        })
-        .collect();
-    window.set_schedules(model(schedules));
+            workspace: schedule.workspace.as_str().into(),
+        }),
+    );
 
-    let deliverables = state
-        .deliverables()
-        .iter()
-        .map(|deliverable| DeliverableItem {
-            name: deliverable.name.clone().into(),
-            kind: deliverable.kind.clone().into(),
-            source: deliverable.source.clone().into(),
-            size: deliverable.size.clone().into(),
-            pinned: deliverable.pinned,
-        })
-        .collect();
-    window.set_deliverables(model(deliverables));
+    reconcile(
+        models.deliverables(),
+        state
+            .deliverables()
+            .iter()
+            .map(|deliverable| DeliverableItem {
+                name: deliverable.name.as_str().into(),
+                kind: deliverable.kind.as_str().into(),
+                source: deliverable.source.as_str().into(),
+                size: deliverable.size.as_str().into(),
+                pinned: deliverable.pinned,
+            }),
+    );
     let selected_deliverable = state.selected_deliverable();
     window.set_selected_deliverable_index(
         i32::try_from(state.selected_deliverable_index()).unwrap_or(i32::MAX),
     );
-    window.set_selected_deliverable_name(selected_deliverable.name.clone().into());
-    window.set_selected_deliverable_kind(selected_deliverable.kind.clone().into());
-    window.set_selected_deliverable_source(selected_deliverable.source.clone().into());
-    window.set_selected_deliverable_size(selected_deliverable.size.clone().into());
+    window.set_selected_deliverable_name(selected_deliverable.name.as_str().into());
+    window.set_selected_deliverable_kind(selected_deliverable.kind.as_str().into());
+    window.set_selected_deliverable_source(selected_deliverable.source.as_str().into());
+    window.set_selected_deliverable_size(selected_deliverable.size.as_str().into());
     window.set_selected_deliverable_content(state.selected_deliverable_content().into());
     window.set_selected_deliverable_pinned(selected_deliverable.pinned);
 
-    let extensions = state
-        .extensions()
-        .iter()
-        .map(|extension| ExtensionItem {
-            name: extension.name.clone().into(),
-            category: extension.category.clone().into(),
-            detail: extension.detail.clone().into(),
-            permission: extension.permission.clone().into(),
+    reconcile(
+        models.extensions(),
+        state.extensions().iter().map(|extension| ExtensionItem {
+            name: extension.name.as_str().into(),
+            category: extension.category.as_str().into(),
+            detail: extension.detail.as_str().into(),
+            permission: extension.permission.as_str().into(),
             enabled: extension.enabled,
-        })
-        .collect();
-    window.set_extensions(model(extensions));
+        }),
+    );
 
-    let transcript = state
-        .transcript()
-        .iter()
-        .map(|entry| TranscriptItem {
+    reconcile(
+        models.transcript(),
+        state.transcript().iter().map(|entry| TranscriptItem {
             role: entry.role.label().into(),
-            text: entry.text.clone().into(),
-            detail: entry.detail.clone().into(),
-            timestamp: entry.timestamp.clone().into(),
+            text: entry.text.as_str().into(),
+            detail: entry.detail.as_str().into(),
+            timestamp: entry.timestamp.as_str().into(),
             tone: match entry.role {
                 TranscriptRole::User | TranscriptRole::Activity => 0,
                 TranscriptRole::Assistant => 1,
                 TranscriptRole::System => 2,
             },
-        })
-        .collect();
-    window.set_transcript(model(transcript));
+        }),
+    );
 
-    let activity = state
-        .activity()
-        .iter()
-        .map(|entry| ActivityItem {
-            title: entry.title.clone().into(),
-            detail: entry.detail.clone().into(),
+    reconcile(
+        models.activity(),
+        state.activity().iter().map(|entry| ActivityItem {
+            title: entry.title.as_str().into(),
+            detail: entry.detail.as_str().into(),
             state: entry.state.label().into(),
-            duration: entry.duration.clone().into(),
+            duration: entry.duration.as_str().into(),
             tone: tone_index(entry.state.tone()),
-        })
-        .collect();
-    window.set_activity(model(activity));
+        }),
+    );
 
-    let session_files = state
-        .session_files()
-        .iter()
-        .map(|file| FileItem {
-            name: file.name.clone().into(),
-            status: file.status.clone().into(),
-        })
-        .collect();
-    window.set_session_files(model(session_files));
+    reconcile(
+        models.session_files(),
+        state.session_files().iter().map(|file| FileItem {
+            name: file.name.as_str().into(),
+            status: file.status.as_str().into(),
+        }),
+    );
     window.set_selected_file_index(i32::try_from(state.selected_file_index()).unwrap_or(i32::MAX));
     window.set_selected_file_name(state.selected_file_name().into());
 
-    let diff = match state.diff_mode() {
-        DiffMode::Unified => state
-            .diff()
-            .iter()
-            .zip(render_unified(state.diff()))
-            .map(|(line, text)| DiffItem {
-                old_line: line_number(line.old_line),
-                new_line: line_number(line.new_line),
-                text: text.into(),
-                old_text: line.text.clone().into(),
-                new_text: line.text.clone().into(),
-                kind: change_kind_index(line.kind),
-            })
-            .collect(),
-        DiffMode::SideBySide => render_side_by_side(state.diff())
-            .into_iter()
-            .map(|line| DiffItem {
-                old_line: line_number(line.old_line),
-                new_line: line_number(line.new_line),
-                text: slint::SharedString::default(),
-                old_text: line.old_text.into(),
-                new_text: line.new_text.into(),
-                kind: change_kind_index(line.kind),
-            })
-            .collect(),
-    };
-    window.set_diff_lines(model(diff));
+    match state.diff_mode() {
+        DiffMode::Unified => reconcile(
+            models.diff_lines(),
+            state
+                .diff()
+                .iter()
+                .zip(render_unified(state.diff()))
+                .map(|(line, text)| {
+                    let text_column: slint::SharedString = line.text.as_str().into();
+                    DiffItem {
+                        old_line: line_number(line.old_line),
+                        new_line: line_number(line.new_line),
+                        text: text.into(),
+                        old_text: text_column.clone(),
+                        new_text: text_column,
+                        kind: change_kind_index(line.kind),
+                    }
+                }),
+        ),
+        DiffMode::SideBySide => reconcile(
+            models.diff_lines(),
+            render_side_by_side(state.diff())
+                .into_iter()
+                .map(|line| DiffItem {
+                    old_line: line_number(line.old_line),
+                    new_line: line_number(line.new_line),
+                    text: slint::SharedString::default(),
+                    old_text: line.old_text.into(),
+                    new_text: line.new_text.into(),
+                    kind: change_kind_index(line.kind),
+                }),
+        ),
+    }
 
     let page_count = state.runs().page_count();
     window.set_run_page_label(
@@ -300,15 +294,37 @@ fn apply_product_state(window: &AppWindow, state: &ProductState) {
     window.set_can_next_run_page(state.runs().page() + 1 < page_count);
 }
 
+/// The product screens and the Rust state they render, bound together so a
+/// callback only has to carry one handle.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+struct ProductView {
+    models: ProductModels,
+    state: RefCell<ProductState>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl ProductView {
+    fn attach(window: &AppWindow, state: ProductState) -> Self {
+        Self {
+            models: ProductModels::attach(window),
+            state: RefCell::new(state),
+        }
+    }
+
+    fn apply(&self, window: &AppWindow) {
+        apply_product_state(window, &self.models, &self.state.borrow());
+    }
+}
+
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn mutate_product(
     weak_window: &slint::Weak<AppWindow>,
-    state: &Rc<RefCell<ProductState>>,
+    view: &ProductView,
     update: impl FnOnce(&mut ProductState),
 ) {
-    update(&mut state.borrow_mut());
+    update(&mut view.state.borrow_mut());
     if let Some(window) = weak_window.upgrade() {
-        apply_product_state(&window, &state.borrow());
+        view.apply(&window);
     }
 }
 
@@ -350,11 +366,11 @@ fn apply_preferences(window: &AppWindow, preferences: VisualPreferencesState) {
 fn enqueue_submission(
     weak_window: &slint::Weak<AppWindow>,
     sender: &ControllerSender,
-    endpoint: slint::SharedString,
-    token: slint::SharedString,
+    endpoint: &slint::SharedString,
+    token: &slint::SharedString,
     consent: bool,
 ) {
-    let submission = ConnectRequest::prepare(endpoint.to_string(), token.to_string(), consent);
+    let submission = ConnectRequest::prepare(endpoint, token.to_string(), consent);
     let Some(window) = weak_window.upgrade() else {
         return;
     };
@@ -401,18 +417,18 @@ fn wire_callbacks(
     window: &AppWindow,
     sender: ControllerSender,
     preferences: Rc<RefCell<VisualPreferencesState>>,
-    product_state: Rc<RefCell<ProductState>>,
+    product_view: &Rc<ProductView>,
 ) {
     let weak_window = window.as_weak();
     let callback_sender = sender.clone();
     window.on_connect_requested(move |endpoint, token, consent| {
-        enqueue_submission(&weak_window, &callback_sender, endpoint, token, consent);
+        enqueue_submission(&weak_window, &callback_sender, &endpoint, &token, consent);
     });
 
     let weak_window = window.as_weak();
     let callback_sender = sender.clone();
     window.on_retry_requested(move |endpoint, token, consent| {
-        enqueue_submission(&weak_window, &callback_sender, endpoint, token, consent);
+        enqueue_submission(&weak_window, &callback_sender, &endpoint, &token, consent);
     });
 
     let weak_window = window.as_weak();
@@ -476,52 +492,52 @@ fn wire_callbacks(
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_onboarding_stage_requested(move |index| {
         let stage = OnboardingStage::from_index(index)
             .expect("Slint onboarding stages must use a known index");
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             product.select_onboarding_stage(stage);
         });
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_navigate_requested(move |index| {
         let destination = PrimaryDestination::from_index(index)
             .expect("Slint navigation must use a known destination index");
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             product.select_destination(destination);
             product.close_palette();
         });
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_palette_toggle_requested(move || {
-        mutate_product(&weak_window, &state, ProductState::toggle_palette);
+        mutate_product(&weak_window, &view, ProductState::toggle_palette);
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_palette_dismiss_requested(move || {
-        mutate_product(&weak_window, &state, ProductState::close_palette);
+        mutate_product(&weak_window, &view, ProductState::close_palette);
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_open_session_requested(move |index| {
         let index = usize::try_from(index).expect("Slint run indexes must be non-negative");
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             product.open_session(index);
         });
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_open_workspace_requested(move |index| {
         let index = usize::try_from(index).expect("Slint workspace indexes must be non-negative");
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             if !product.open_workspace(index) {
                 product.record_message(
                     TranscriptRole::System,
@@ -533,65 +549,65 @@ fn wire_callbacks(
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_settings_section_requested(move |index| {
         let index = usize::try_from(index).expect("Slint settings indexes must be non-negative");
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             product.select_settings_section(index);
         });
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_update_requested(move || {
-        mutate_product(&weak_window, &state, ProductState::open_update);
+        mutate_product(&weak_window, &view, ProductState::open_update);
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_diagnostics_requested(move || {
-        mutate_product(&weak_window, &state, ProductState::open_diagnostics);
+        mutate_product(&weak_window, &view, ProductState::open_diagnostics);
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_back_requested(move || {
-        mutate_product(&weak_window, &state, ProductState::return_from_auxiliary);
+        mutate_product(&weak_window, &view, ProductState::return_from_auxiliary);
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_diff_mode_requested(move |mode| {
         let mode = match mode {
             0 => DiffMode::Unified,
             1 => DiffMode::SideBySide,
             _ => panic!("Slint diff modes must use a known index"),
         };
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             product.set_diff_mode(mode);
         });
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_previous_run_page_requested(move || {
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             product.previous_run_page();
         });
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_next_run_page_requested(move || {
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             product.next_run_page();
         });
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_approval_requested(move |approved| {
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             match product.resolve_approval(approved) {
                 Ok(run_state) => product.record_message(
                     TranscriptRole::System,
@@ -612,9 +628,9 @@ fn wire_callbacks(
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_answer_requested(move |answer| {
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             match product.answer_question(answer.as_str()) {
                 Ok(run_state) => {
                     product.record_message(
@@ -638,9 +654,9 @@ fn wire_callbacks(
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_message_submitted(move |message| {
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             product.record_message(
                 TranscriptRole::User,
                 message.to_string(),
@@ -650,51 +666,51 @@ fn wire_callbacks(
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_file_selected(move |index| {
         let index = usize::try_from(index).expect("Slint file indexes must be non-negative");
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             product.select_session_file(index);
         });
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_schedule_create_requested(move || {
-        mutate_product(&weak_window, &state, ProductState::create_schedule);
+        mutate_product(&weak_window, &view, ProductState::create_schedule);
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_schedule_toggled(move |index| {
         let index = usize::try_from(index).expect("Slint schedule indexes must be non-negative");
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             product.toggle_schedule(index);
         });
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_extension_toggled(move |index| {
         let index = usize::try_from(index).expect("Slint extension indexes must be non-negative");
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             product.toggle_extension(index);
         });
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_deliverable_selected(move |index| {
         let index = usize::try_from(index).expect("Slint deliverable indexes must be non-negative");
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             product.select_deliverable(index);
         });
     });
 
     let weak_window = window.as_weak();
-    let state = Rc::clone(&product_state);
+    let view = Rc::clone(product_view);
     window.on_deliverable_pin_toggle_requested(move || {
-        mutate_product(&weak_window, &state, |product| {
+        mutate_product(&weak_window, &view, |product| {
             product.toggle_selected_deliverable_pin();
         });
     });
@@ -720,10 +736,10 @@ fn main() -> Result<(), DesktopError> {
     })
     .map_err(DesktopError::ControllerStart)?;
     let preferences = Rc::new(RefCell::new(VisualPreferencesState::default()));
-    let product_state = Rc::new(RefCell::new(ProductState::default()));
+    let product_view = Rc::new(ProductView::attach(&window, ProductState::default()));
     apply_preferences(&window, *preferences.borrow());
-    apply_product_state(&window, &product_state.borrow());
-    wire_callbacks(&window, controller.sender(), preferences, product_state);
+    product_view.apply(&window);
+    wire_callbacks(&window, controller.sender(), preferences, &product_view);
     window.run().map_err(DesktopError::Platform)?;
     controller
         .shutdown()
@@ -788,9 +804,9 @@ mod tests {
         apply_snapshot(window, &OnboardingModel::default().snapshot());
         let mut initial_product = ProductState::default();
         initial_product.select_onboarding_stage(OnboardingStage::GatewayConnection);
-        let product_state = Rc::new(RefCell::new(initial_product));
-        apply_product_state(window, &product_state.borrow());
-        wire_callbacks(window, sender, preferences, product_state);
+        let product_view = Rc::new(ProductView::attach(window, initial_product));
+        product_view.apply(window);
+        wire_callbacks(window, sender, preferences, &product_view);
 
         window.set_layout_width(1080.0);
         assert!(!window.get_narrow_layout());

@@ -45,7 +45,10 @@ component FocusRing inherits Rectangle {
 export component ActionButton {
     in property <string> text: "Action";
     in property <string> accessible-name: root.text;
+    in property <string> description: "";
     in property <bool> enabled: true;
+    in property <bool> checkable: false;
+    in property <bool> checked: false;
     in property <ButtonTone> tone: ButtonTone.secondary;
     callback clicked;
 
@@ -64,7 +67,10 @@ export component ActionButton {
 
     accessible-role: button;
     accessible-label: root.accessible-name;
+    accessible-description: root.description;
     accessible-enabled: root.enabled;
+    accessible-checkable: root.checkable;
+    accessible-checked: root.checkable && root.checked;
     accessible-action-default => {
         if (root.enabled) {
             interaction.clicked();
@@ -87,7 +93,10 @@ export component ActionButton {
         border-color: root.enabled ? DesignTokens.border-strong : DesignTokens.border-default;
         border-radius: Metrics.radius-medium;
 
-        animate background, border-color { duration: Metrics.motion-fast; }
+        animate background, border-color {
+            duration: Metrics.motion-fast;
+            enabled: Metrics.motion-enabled;
+        }
     }
 
     content := HorizontalLayout {
@@ -180,6 +189,12 @@ export component ToolbarIconButton {
         if (root.enabled) {
             interaction.clicked();
         }
+    }
+
+    // Icon-only controls carry no visible label; the tooltip surfaces the same
+    // string that assistive technology reads out.
+    Tooltip {
+        text: @markdown("\{root.accessible-name}");
     }
 
     Rectangle {
@@ -408,6 +423,9 @@ export component ResettableTextField {
     in property <bool> preserve-focus-on-reset: false;
     out property <bool> has-focus: false;
     callback accepted;
+    // Fired synchronously so an enclosing (possibly conditional) component can
+    // mirror the focus state without reaching into this instance by id.
+    callback focus-changed(bool);
 
     min-width: 180px;
     min-height: Metrics.control-medium + (root.label == "" ? 0px : Metrics.line-caption + Metrics.space-1);
@@ -428,7 +446,10 @@ export component ResettableTextField {
         focus-requested: focus-proxy.has-focus;
         focus-on-init: root.preserve-focus-on-reset;
         accepted => { root.accepted(); }
-        focus-state-changed(focused) => { root.has-focus = focused; }
+        focus-state-changed(focused) => {
+            root.has-focus = focused;
+            root.focus-changed(focused);
+        }
     }
 
     if (root.reset-selector) : ResettableTextFieldInstance {
@@ -440,7 +461,10 @@ export component ResettableTextField {
         focus-requested: focus-proxy.has-focus;
         focus-on-init: root.preserve-focus-on-reset;
         accepted => { root.accepted(); }
-        focus-state-changed(focused) => { root.has-focus = focused; }
+        focus-state-changed(focused) => {
+            root.has-focus = focused;
+            root.focus-changed(focused);
+        }
     }
 }
 
@@ -546,6 +570,9 @@ export component SecureTextField {
     in property <bool> preserve-focus-on-reset: false;
     out property <bool> has-focus: false;
     callback accepted;
+    // Fired synchronously so an enclosing (possibly conditional) component can
+    // mirror the focus state without reaching into this instance by id.
+    callback focus-changed(bool);
 
     min-width: 180px;
     min-height: Metrics.control-medium + (root.label == "" ? 0px : Metrics.line-caption + Metrics.space-1);
@@ -576,7 +603,10 @@ export component SecureTextField {
             focus-requested: focus-proxy.has-focus;
             focus-on-init: root.preserve-focus-on-reset;
             accepted => { root.accepted(); }
-            focus-state-changed(focused) => { root.has-focus = focused; }
+            focus-state-changed(focused) => {
+                root.has-focus = focused;
+                root.focus-changed(focused);
+            }
         }
 
         if (root.reset-selector) : odd-instance := SecureEditorInstance {
@@ -587,7 +617,10 @@ export component SecureTextField {
             focus-requested: focus-proxy.has-focus;
             focus-on-init: root.preserve-focus-on-reset;
             accepted => { root.accepted(); }
-            focus-state-changed(focused) => { root.has-focus = focused; }
+            focus-state-changed(focused) => {
+                root.has-focus = focused;
+                root.focus-changed(focused);
+            }
         }
     }
 }
@@ -867,7 +900,7 @@ export component ModalSheetShell {
             spacing: Metrics.space-4;
 
             HorizontalLayout {
-                alignment: center;
+                cross-axis-alignment: center;
 
                 Text {
                     text: root.title;
@@ -997,6 +1030,7 @@ export component LoadingIndicator {
     min-height: Metrics.control-small;
     accessible-role: progress-indicator;
     accessible-label: root.accessible-name;
+    accessible-live-region: AccessibleLiveness.polite;
     accessible-value: root.indeterminate ? "" : clamp(root.progress, 0.0, 1.0);
     accessible-value-minimum: 0.0;
     accessible-value-maximum: 1.0;

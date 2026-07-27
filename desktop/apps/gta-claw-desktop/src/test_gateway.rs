@@ -212,9 +212,8 @@ pub(crate) async fn send_challenge(socket: &mut TestSocket) {
 pub(crate) async fn receive_connect(socket: &mut TestSocket) -> (RequestFrame, ConnectParams) {
     let bytes = receive_text(socket).await;
     let codec = Codec::preauthentication();
-    let request = match codec.decode(&bytes).expect("connect frame") {
-        GatewayFrame::Request(request) => request,
-        _ => panic!("expected connect request"),
+    let GatewayFrame::Request(request) = codec.decode(&bytes).expect("connect frame") else {
+        panic!("expected connect request")
     };
     let params = codec.decode_connect(&request).expect("connect params");
     (request, params)
@@ -231,7 +230,7 @@ pub(crate) async fn send_hello(
     let scopes = params.scopes.as_ref().map_or_else(Vec::new, |scopes| {
         scopes
             .iter()
-            .map(|scope| scope.as_str())
+            .map(claw_protocol::gateway::Name::as_str)
             .collect::<Vec<_>>()
     });
     send_hello_with_scopes(

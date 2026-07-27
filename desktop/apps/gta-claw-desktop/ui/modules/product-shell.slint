@@ -185,6 +185,8 @@ component MetricCard {
 component LifecycleLegend {
     accessible-role: region;
     accessible-label: "All twelve supported run states";
+    // Twelve static badges that never change once laid out.
+    cache-rendering-hint: true;
 
     GridLayout {
         spacing: Metrics.space-2;
@@ -214,12 +216,18 @@ component RunList {
     in property <[RunItem]> runs;
     callback open-requested(int);
 
-    accessible-role: region;
-    accessible-label: "Virtualized run list";
+    accessible-role: none;
 
     ListView {
+        accessible-label: "Runs";
+        accessible-item-count: root.runs.length;
+
         for run[index] in root.runs : Rectangle {
             height: max(76px, Metrics.control-large + 2 * Metrics.space-3);
+            accessible-role: list-item;
+            accessible-label: run.title + ", " + run.state + ", " + run.workspace + ", " + run.detail + ", updated " + run.updated;
+            accessible-item-index: index;
+            accessible-item-count: root.runs.length;
             background: Math.mod(index, 2) == 0
                 ? DesignTokens.surface-raised
                 : DesignTokens.surface-pane;
@@ -364,7 +372,7 @@ component WorkspacesScreen {
 
                 HorizontalLayout {
                     spacing: Metrics.space-3;
-                    alignment: center;
+                    cross-axis-alignment: center;
 
                     Rectangle {
                         width: Metrics.control-large;
@@ -513,7 +521,7 @@ component SchedulesScreen {
 
                 HorizontalLayout {
                     spacing: Metrics.space-3;
-                    alignment: center;
+                    cross-axis-alignment: center;
 
                     VerticalLayout {
                         spacing: Metrics.space-1;
@@ -682,7 +690,7 @@ component ExtensionsScreen {
 
                 HorizontalLayout {
                     spacing: Metrics.space-3;
-                    alignment: center;
+                    cross-axis-alignment: center;
 
                     Rectangle {
                         width: Metrics.control-large;
@@ -861,18 +869,32 @@ component SettingsScreen {
                         VerticalLayout {
                             spacing: Metrics.space-2;
                             Text {
-                                text: "Theme: " + (VisualPreferences.theme-mode == ThemeMode.light ? "Light" : "Dark");
+                                text: "Theme: "
+                                    + (VisualPreferences.effective-theme-mode == ThemeMode.light ? "Light" : "Dark")
+                                    + (VisualPreferences.theme-override-active ? "" : " (following the system)");
                                 color: DesignTokens.text-secondary;
                                 font-size: Metrics.type-small;
                                 accessible-role: text;
                             }
                             SecondaryButton {
                                 text: "Theme";
-                                accessible-name: VisualPreferences.theme-mode == ThemeMode.light ? "Use dark theme" : "Use light theme";
+                                accessible-name: VisualPreferences.effective-theme-mode == ThemeMode.light
+                                    ? "Use dark theme"
+                                    : "Use light theme";
+                                description: "Overrides the system light and dark setting";
                                 clicked => {
-                                    VisualPreferences.theme-mode-requested(
-                                        VisualPreferences.theme-mode == ThemeMode.light ? ThemeMode.dark : ThemeMode.light
+                                    VisualPreferences.request-theme-mode(
+                                        VisualPreferences.effective-theme-mode == ThemeMode.light ? ThemeMode.dark : ThemeMode.light
                                     );
+                                }
+                            }
+                            SecondaryButton {
+                                text: "Match system";
+                                accessible-name: "Follow the system light and dark setting";
+                                enabled: VisualPreferences.theme-override-active;
+                                clicked => {
+                                    VisualPreferences.theme-override-active = false;
+                                    VisualPreferences.theme-mode-requested(VisualPreferences.system-theme-mode);
                                 }
                             }
                             Text {
@@ -884,6 +906,8 @@ component SettingsScreen {
                             SecondaryButton {
                                 text: "Contrast";
                                 accessible-name: VisualPreferences.high-contrast ? "Disable high contrast" : "Enable high contrast";
+                                checkable: true;
+                                checked: VisualPreferences.high-contrast;
                                 clicked => { VisualPreferences.high-contrast-requested(!VisualPreferences.high-contrast); }
                             }
                             Text {
@@ -891,14 +915,17 @@ component SettingsScreen {
                                 color: DesignTokens.text-secondary;
                                 font-size: Metrics.type-small;
                                 accessible-role: text;
+                                accessible-live-region: AccessibleLiveness.polite;
                             }
                             SecondaryButton {
                                 text: "Smaller";
+                                accessible-name: "Decrease interface scale";
                                 enabled: VisualPreferences.density-scale > 0.8;
                                 clicked => { VisualPreferences.density-scale-requested(VisualPreferences.density-scale - 0.1); }
                             }
                             SecondaryButton {
                                 text: "Larger";
+                                accessible-name: "Increase interface scale";
                                 enabled: VisualPreferences.density-scale < 2.0;
                                 clicked => { VisualPreferences.density-scale-requested(VisualPreferences.density-scale + 0.1); }
                             }
@@ -911,6 +938,8 @@ component SettingsScreen {
                             SecondaryButton {
                                 text: "Motion";
                                 accessible-name: VisualPreferences.reduced-motion ? "Enable motion" : "Reduce motion";
+                                checkable: true;
+                                checked: VisualPreferences.reduced-motion;
                                 clicked => { VisualPreferences.reduced-motion-requested(!VisualPreferences.reduced-motion); }
                             }
                         }
@@ -971,31 +1000,54 @@ component DiffViewer {
                 accessible-role: text;
             }
             Rectangle { horizontal-stretch: 1; }
-            SecondaryButton { text: "Unified"; enabled: root.mode != 0; clicked => { root.mode-requested(0); } }
-            SecondaryButton { text: "Side by side"; enabled: root.mode != 1; clicked => { root.mode-requested(1); } }
+            SecondaryButton {
+                text: "Unified";
+                accessible-name: "Unified diff view";
+                checkable: true;
+                checked: root.mode == 0;
+                clicked => { root.mode-requested(0); }
+            }
+            SecondaryButton {
+                text: "Side by side";
+                accessible-name: "Side by side diff view";
+                checkable: true;
+                checked: root.mode == 1;
+                clicked => { root.mode-requested(1); }
+            }
         }
 
         ListView {
-            for line in root.lines : Rectangle {
+            accessible-label: root.file-name + " diff";
+            accessible-item-count: root.lines.length;
+
+            for line[index] in root.lines : Rectangle {
                 height: max(28px, Metrics.line-caption + 2 * Metrics.space-1);
                 background: line.kind == 1
                     ? DesignTokens.success-surface
                     : (line.kind == 2 ? DesignTokens.danger-surface : DesignTokens.surface-raised);
+                accessible-role: list-item;
+                accessible-item-index: index;
+                accessible-item-count: root.lines.length;
+                accessible-label: (line.kind == 1 ? "added" : (line.kind == 2 ? "removed" : "unchanged"))
+                    + ", " + (root.mode == 0
+                        ? "line " + line.new-line + ", " + line.text
+                        : "old line " + line.old-line + ", " + line.old-text
+                            + ", new line " + line.new-line + ", " + line.new-text);
 
                 if (root.mode == 0) : HorizontalLayout {
                     spacing: Metrics.space-2;
                     Text { width: 34px; text: line.old-line; color: DesignTokens.text-muted; font-size: Metrics.type-caption; horizontal-alignment: right; accessible-role: none; }
                     Text { width: 34px; text: line.new-line; color: DesignTokens.text-muted; font-size: Metrics.type-caption; horizontal-alignment: right; accessible-role: none; }
-                    Text { text: line.text; color: DesignTokens.text-primary; font-size: Metrics.type-caption; overflow: elide; accessible-role: text; }
+                    Text { text: line.text; color: DesignTokens.text-primary; font-size: Metrics.type-caption; overflow: elide; accessible-role: none; }
                 }
 
                 if (root.mode == 1) : HorizontalLayout {
                     spacing: Metrics.space-2;
                     Text { width: 30px; text: line.old-line; color: DesignTokens.text-muted; font-size: Metrics.type-caption; horizontal-alignment: right; accessible-role: none; }
-                    Text { horizontal-stretch: 1; text: line.old-text; color: DesignTokens.text-primary; font-size: Metrics.type-caption; overflow: elide; accessible-role: text; }
+                    Text { horizontal-stretch: 1; text: line.old-text; color: DesignTokens.text-primary; font-size: Metrics.type-caption; overflow: elide; accessible-role: none; }
                     Divider { vertical: true; }
                     Text { width: 30px; text: line.new-line; color: DesignTokens.text-muted; font-size: Metrics.type-caption; horizontal-alignment: right; accessible-role: none; }
-                    Text { horizontal-stretch: 1; text: line.new-text; color: DesignTokens.text-primary; font-size: Metrics.type-caption; overflow: elide; accessible-role: text; }
+                    Text { horizontal-stretch: 1; text: line.new-text; color: DesignTokens.text-primary; font-size: Metrics.type-caption; overflow: elide; accessible-role: none; }
                 }
             }
         }
@@ -1031,6 +1083,10 @@ component SessionScreen {
     accessible-role: main;
     accessible-label: "Session workspace";
 
+    // Fixed row height so the virtualized file lists can size themselves.
+    private property <length> file-row-height: max(Metrics.control-large,
+        2 * Metrics.space-2 + Metrics.line-body + 1px + Metrics.line-caption);
+
     VerticalLayout {
         spacing: 0px;
 
@@ -1045,7 +1101,7 @@ component SessionScreen {
                 padding-left: Metrics.space-3;
                 padding-right: Metrics.space-3;
                 spacing: Metrics.space-3;
-                alignment: center;
+                cross-axis-alignment: center;
 
                 SecondaryButton { text: "Back"; clicked => { root.back-requested(); } }
                 VerticalLayout {
@@ -1073,14 +1129,20 @@ component SessionScreen {
                     padding: Metrics.space-3;
                     spacing: Metrics.space-2;
                     Text { text: "Files"; color: DesignTokens.text-primary; font-size: Metrics.type-small; font-weight: 800; accessible-role: text; }
-                    for file[index] in root.files : NavigationItem {
-                        glyph: "F";
-                        text: file.name;
-                        detail: file.status;
-                        selected: root.selected-file-index == index;
-                        clicked => { root.file-selected(index); }
+                    ListView {
+                        vertical-stretch: 1;
+                        accessible-label: "Session files";
+                        accessible-item-count: root.files.length;
+
+                        for file[index] in root.files : NavigationItem {
+                            height: root.file-row-height;
+                            glyph: "F";
+                            text: file.name;
+                            detail: file.status;
+                            selected: root.selected-file-index == index;
+                            clicked => { root.file-selected(index); }
+                        }
                     }
-                    Rectangle { vertical-stretch: 1; }
                     Card {
                         accessible-name: "Pinned artifact preview";
                         Text { text: "Artifact"; color: DesignTokens.text-muted; font-size: Metrics.type-caption; font-weight: 700; accessible-role: none; }
@@ -1103,23 +1165,35 @@ component SessionScreen {
                     if (root.narrow) : Card {
                         accessible-name: "Session files";
                         Text { text: "Files"; color: DesignTokens.text-primary; font-size: Metrics.type-small; font-weight: 800; accessible-role: text; }
-                        for file[index] in root.files : NavigationItem {
-                            glyph: "F";
-                            text: file.name;
-                            detail: file.status;
-                            selected: root.selected-file-index == index;
-                            clicked => { root.file-selected(index); }
+                        ListView {
+                            height: min(5 * root.file-row-height, max(root.file-row-height, root.files.length * root.file-row-height));
+                            vertical-stretch: 0;
+                            accessible-label: "Session files";
+                            accessible-item-count: root.files.length;
+
+                            for file[index] in root.files : NavigationItem {
+                                height: root.file-row-height;
+                                glyph: "F";
+                                text: file.name;
+                                detail: file.status;
+                                selected: root.selected-file-index == index;
+                                clicked => { root.file-selected(index); }
+                            }
                         }
                     }
 
                     ListView {
                     height: 300px;
                     vertical-stretch: 0;
-                    accessible-role: region;
                     accessible-label: "Streaming transcript";
+                    accessible-item-count: root.transcript.length;
 
-                    for entry in root.transcript : Rectangle {
+                    for entry[index] in root.transcript : Rectangle {
                         height: max(86px, 3 * Metrics.line-body + 2 * Metrics.space-2);
+                        accessible-role: list-item;
+                        accessible-item-index: index;
+                        accessible-item-count: root.transcript.length;
+                        accessible-label: entry.role + " at " + entry.timestamp + ". " + entry.text + " " + entry.detail;
                         background: entry.tone == 2
                             ? DesignTokens.warning-surface
                             : (entry.tone == 1 ? DesignTokens.info-surface : DesignTokens.surface-raised);
@@ -1216,11 +1290,15 @@ component SessionScreen {
 
                     ListView {
                         vertical-stretch: 1;
-                        accessible-role: region;
                         accessible-label: "Tool activity timeline";
+                        accessible-item-count: root.activity.length;
 
-                        for item in root.activity : Rectangle {
+                        for item[index] in root.activity : Rectangle {
                             height: max(92px, 3 * Metrics.line-caption + Metrics.control-small + 2 * Metrics.space-2);
+                            accessible-role: list-item;
+                            accessible-item-index: index;
+                            accessible-item-count: root.activity.length;
+                            accessible-label: item.title + ", " + item.state + ", " + item.detail + ", " + item.duration;
                             background: DesignTokens.surface-raised;
                             border-width: 1px;
                             border-color: DesignTokens.border-default;
@@ -1229,8 +1307,8 @@ component SessionScreen {
                             VerticalLayout {
                                 padding: Metrics.space-2;
                                 spacing: Metrics.space-1;
-                                Text { text: item.title; color: DesignTokens.text-primary; font-size: Metrics.type-caption; font-weight: 800; accessible-role: text; }
-                                Text { text: item.detail; color: DesignTokens.text-muted; font-size: Metrics.type-caption; wrap: word-wrap; accessible-role: text; }
+                                Text { text: item.title; color: DesignTokens.text-primary; font-size: Metrics.type-caption; font-weight: 800; accessible-role: none; }
+                                Text { text: item.detail; color: DesignTokens.text-muted; font-size: Metrics.type-caption; wrap: word-wrap; accessible-role: none; }
                                 HorizontalLayout {
                                     SemanticBadge { text: item.state; tone: item.tone; }
                                     Rectangle { horizontal-stretch: 1; }
@@ -1349,6 +1427,9 @@ component CommandPalette {
                 commands := VerticalLayout {
                     width: parent.width;
                     spacing: Metrics.space-1;
+                    accessible-role: list;
+                    accessible-label: "Commands";
+                    accessible-item-count: 7;
 
                     NavigationItem { glyph: "F"; text: "Go to Focus"; detail: "Ctrl+1"; clicked => { root.navigate-requested(0); } }
                     NavigationItem { glyph: "W"; text: "Go to Workspaces"; detail: "Ctrl+2"; clicked => { root.navigate-requested(1); } }
@@ -1540,6 +1621,9 @@ export component ProductShell inherits FocusScope {
     accessible-role: region;
     accessible-label: "GTA Claw desktop application";
 
+    // The shell is created on demand, so claim focus for F1 and Ctrl+1..7.
+    init => { root.focus(); }
+
     Rectangle { background: DesignTokens.surface-app; }
 
     HorizontalLayout {
@@ -1565,12 +1649,14 @@ export component ProductShell inherits FocusScope {
                 background: DesignTokens.surface-pane;
                 border-width: 1px;
                 border-color: DesignTokens.border-default;
+                accessible-role: banner;
+                accessible-label: "Application header";
 
                 HorizontalLayout {
                     padding-left: Metrics.space-4;
                     padding-right: Metrics.space-4;
                     spacing: Metrics.space-3;
-                    alignment: center;
+                    cross-axis-alignment: center;
 
                     Text {
                         text: root.selected-screen == 0

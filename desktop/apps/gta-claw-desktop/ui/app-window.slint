@@ -135,33 +135,37 @@ export component AppWindow inherits Window {
         return root.close();
     }
 
+    // Mirrored from the onboarding surface because it is conditional: an element
+    // inside an `if` cannot be reached by id from here.
+    private property <bool> onboarding-endpoint-has-focus: false;
+    private property <bool> onboarding-token-has-focus: false;
+
     public function purge-token-input() {
-        root.token-preserve-focus = onboarding.token-has-focus;
+        root.token-preserve-focus = root.onboarding-token-has-focus;
         root.token-input = "";
         root.token-reset-selector = !root.token-reset-selector;
     }
 
     public function replace-endpoint-input(value: string) {
-        root.endpoint-preserve-focus = onboarding.endpoint-has-focus;
+        root.endpoint-preserve-focus = root.onboarding-endpoint-has-focus;
         root.endpoint-input = value;
         root.endpoint-reset-selector = !root.endpoint-reset-selector;
     }
 
-    first-run := FirstRunSurface {
+    // `if` instead of `visible`: a hidden element still exists, is laid out and
+    // keeps its whole subtree alive, so all three surfaces used to be built at
+    // startup. `if` builds exactly the surface that is on screen.
+    if (!root.workspace-ready && root.onboarding-stage < 3) : FirstRunSurface {
         width: 100%;
         height: 100%;
-        visible: !root.workspace-ready && root.onboarding-stage < 3;
-        enabled: self.visible;
         stage: root.onboarding-stage;
         available-width: root.layout-width;
         stage-requested(stage) => { root.onboarding-stage-requested(stage); }
     }
 
-    onboarding := GatewayOnboardingSurface {
+    if (!root.workspace-ready && root.onboarding-stage == 3) : GatewayOnboardingSurface {
         width: 100%;
         height: 100%;
-        visible: !root.workspace-ready && root.onboarding-stage == 3;
-        enabled: self.visible;
         available-width: root.layout-width;
         state-title: root.state-title;
         state-detail: root.state-detail;
@@ -199,13 +203,15 @@ export component AppWindow inherits Window {
         cancel-requested => { root.cancel-requested(); }
         disconnect-requested => { root.disconnect-requested(); }
         error-dismiss-requested => { root.error-dismiss-requested(); }
+        focus-changed(endpoint-focused, token-focused) => {
+            root.onboarding-endpoint-has-focus = endpoint-focused;
+            root.onboarding-token-has-focus = token-focused;
+        }
     }
 
-    product := ProductShell {
+    if (root.workspace-ready) : ProductShell {
         width: 100%;
         height: 100%;
-        visible: root.workspace-ready;
-        enabled: self.visible;
         available-width: root.layout-width;
         selected-screen: root.selected-screen;
         selected-settings-section: root.selected-settings-section;

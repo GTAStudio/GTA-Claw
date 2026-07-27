@@ -267,7 +267,7 @@ pub(crate) struct GatewayEndpoint {
 }
 
 impl GatewayEndpoint {
-    fn parse(input: String) -> Result<Self, EndpointRejection> {
+    fn parse(input: &str) -> Result<Self, EndpointRejection> {
         if input.is_empty()
             || input.len() > MAX_ENDPOINT_INPUT_BYTES
             || input.trim() != input
@@ -276,7 +276,7 @@ impl GatewayEndpoint {
             return Err(EndpointRejection::invalid(None, None));
         }
 
-        let url = Url::parse(&input).map_err(|_| EndpointRejection::invalid(None, None))?;
+        let url = Url::parse(input).map_err(|_| EndpointRejection::invalid(None, None))?;
         if !matches!(url.scheme(), "ws" | "wss") || url.host().is_none() {
             return Err(EndpointRejection::invalid(None, None));
         }
@@ -297,7 +297,7 @@ impl GatewayEndpoint {
                 ),
             });
         }
-        if url.scheme() == "ws" && !is_loopback(url.host()) {
+        if url.scheme() == "ws" && !is_loopback(url.host().as_ref()) {
             return Err(EndpointRejection {
                 input: Some(input),
                 display: Some(display),
@@ -346,7 +346,7 @@ fn sanitize_url(url: &Url) -> String {
     sanitized.to_string()
 }
 
-fn is_loopback(host: Option<Host<&str>>) -> bool {
+fn is_loopback(host: Option<&Host<&str>>) -> bool {
     match host {
         Some(Host::Domain("localhost")) => true,
         Some(Host::Ipv4(address)) => address.is_loopback(),
@@ -382,7 +382,7 @@ pub(crate) struct ConnectRequest {
 
 impl ConnectRequest {
     pub(crate) fn prepare(
-        endpoint: String,
+        endpoint: &str,
         token: String,
         consent: bool,
     ) -> Result<Self, SubmissionRejection> {
@@ -511,7 +511,7 @@ pub(crate) enum AttemptUpdate {
 }
 
 impl OnboardingModel {
-    pub(crate) fn can_start_connection(&self) -> bool {
+    pub(crate) const fn can_start_connection(&self) -> bool {
         matches!(
             self.phase,
             OnboardingPhase::Disconnected
@@ -556,7 +556,7 @@ impl OnboardingModel {
             AttemptUpdate::Reconnecting { attempt } => {
                 self.phase = OnboardingPhase::Reconnecting;
                 self.reconnect_attempt = Some(attempt);
-                self.summary.health = "Waiting for a fresh connection".to_owned();
+                "Waiting for a fresh connection".clone_into(&mut self.summary.health);
             }
             AttemptUpdate::IdentityCreated(identity) => {
                 self.summary.identity = bounded_text(identity, 96);
@@ -571,13 +571,13 @@ impl OnboardingModel {
                 } else {
                     bounded_safe_field(info.scopes.join(", "), 160)
                 };
-                self.summary.health = "Checking with safe health RPC".to_owned();
+                "Checking with safe health RPC".clone_into(&mut self.summary.health);
                 self.error = None;
                 self.reconnect_attempt = None;
             }
             AttemptUpdate::Healthy => {
                 self.phase = OnboardingPhase::Ready;
-                self.summary.health = "Healthy - safe RPC completed".to_owned();
+                "Healthy - safe RPC completed".clone_into(&mut self.summary.health);
                 self.error = None;
             }
             AttemptUpdate::Failed(error) => {
@@ -586,11 +586,11 @@ impl OnboardingModel {
                 } else {
                     OnboardingPhase::Failed
                 };
-                self.summary.server = "Not connected".to_owned();
-                self.summary.protocol = "Not negotiated".to_owned();
-                self.summary.role = "Not authenticated".to_owned();
-                self.summary.scopes = "No effective scopes".to_owned();
-                self.summary.health = "Not healthy - connection failed".to_owned();
+                "Not connected".clone_into(&mut self.summary.server);
+                "Not negotiated".clone_into(&mut self.summary.protocol);
+                "Not authenticated".clone_into(&mut self.summary.role);
+                "No effective scopes".clone_into(&mut self.summary.scopes);
+                "Not healthy - connection failed".clone_into(&mut self.summary.health);
                 self.error = Some(error);
                 self.reconnect_attempt = None;
             }
@@ -611,12 +611,12 @@ impl OnboardingModel {
             return false;
         }
         self.phase = OnboardingPhase::Disconnected;
-        self.summary.server = "Not connected".to_owned();
-        self.summary.protocol = "Not negotiated".to_owned();
-        self.summary.role = "Not authenticated".to_owned();
-        self.summary.scopes = "No effective scopes".to_owned();
-        self.summary.health = "Disconnected".to_owned();
-        self.summary.identity = "Discarded on disconnect".to_owned();
+        "Not connected".clone_into(&mut self.summary.server);
+        "Not negotiated".clone_into(&mut self.summary.protocol);
+        "Not authenticated".clone_into(&mut self.summary.role);
+        "No effective scopes".clone_into(&mut self.summary.scopes);
+        "Disconnected".clone_into(&mut self.summary.health);
+        "Discarded on disconnect".clone_into(&mut self.summary.identity);
         true
     }
 
@@ -712,7 +712,7 @@ impl OnboardingModel {
     }
 
     #[cfg(test)]
-    fn generation(&self) -> u64 {
+    const fn generation(&self) -> u64 {
         self.generation
     }
 }
@@ -794,11 +794,11 @@ impl ViewSnapshot {
         &self.identity
     }
 
-    pub(crate) fn error(&self) -> Option<&UserError> {
+    pub(crate) const fn error(&self) -> Option<&UserError> {
         self.error.as_ref()
     }
 
-    pub(crate) fn busy(&self) -> bool {
+    pub(crate) const fn busy(&self) -> bool {
         matches!(
             self.phase,
             OnboardingPhase::Connecting
@@ -809,7 +809,7 @@ impl ViewSnapshot {
         )
     }
 
-    pub(crate) fn can_connect(&self) -> bool {
+    pub(crate) const fn can_connect(&self) -> bool {
         matches!(
             self.phase,
             OnboardingPhase::Disconnected
@@ -818,7 +818,7 @@ impl ViewSnapshot {
         )
     }
 
-    pub(crate) fn can_cancel(&self) -> bool {
+    pub(crate) const fn can_cancel(&self) -> bool {
         matches!(
             self.phase,
             OnboardingPhase::Connecting
@@ -832,7 +832,7 @@ impl ViewSnapshot {
         self.phase == OnboardingPhase::Ready
     }
 
-    pub(crate) fn can_retry(&self) -> bool {
+    pub(crate) const fn can_retry(&self) -> bool {
         matches!(
             self.phase,
             OnboardingPhase::Failed | OnboardingPhase::PairingRequired
@@ -841,16 +841,20 @@ impl ViewSnapshot {
 }
 
 fn bounded_safe_field(value: String, maximum: usize) -> String {
-    let filtered = value
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                '\u{fffd}'
-            } else {
-                character
-            }
-        })
-        .collect();
+    let filtered = if value.chars().any(char::is_control) {
+        value
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    '\u{fffd}'
+                } else {
+                    character
+                }
+            })
+            .collect()
+    } else {
+        value
+    };
     bounded_text(filtered, maximum)
 }
 
@@ -962,7 +966,7 @@ mod tests {
     #[test]
     fn endpoint_display_strips_credentials_query_and_fragment_before_rejection() {
         let rejection = ConnectRequest::prepare(
-            "wss://alice:secret@gateway.example/path?token=hidden#private".to_owned(),
+            "wss://alice:secret@gateway.example/path?token=hidden#private",
             "session-secret".to_owned(),
             true,
         )
@@ -980,12 +984,9 @@ mod tests {
         assert!(!rendered.contains("hidden"));
         assert!(!rendered.contains("private"));
 
-        let rejection = ConnectRequest::prepare(
-            "data:text/plain,SESSION_TOKEN".to_owned(),
-            String::new(),
-            true,
-        )
-        .expect_err("unsupported opaque scheme rejected");
+        let rejection =
+            ConnectRequest::prepare("data:text/plain,SESSION_TOKEN", String::new(), true)
+                .expect_err("unsupported opaque scheme rejected");
         assert_eq!(rejection.endpoint_input, None);
         assert_eq!(rejection.endpoint_display, None);
         assert!(!format!("{rejection:?}").contains("SESSION_TOKEN"));
@@ -996,7 +997,7 @@ mod tests {
         let path = "a".repeat(400);
         let endpoint = format!("wss://gateway.example/{path}");
         let request =
-            ConnectRequest::prepare(endpoint.clone(), String::new(), true).expect("valid endpoint");
+            ConnectRequest::prepare(&endpoint, String::new(), true).expect("valid endpoint");
         assert_eq!(request.endpoint_input(), endpoint);
         assert!(request.endpoint_display().chars().count() <= MAX_ENDPOINT_DISPLAY_CHARS);
         assert!(request.endpoint_display().ends_with("..."));
@@ -1004,12 +1005,9 @@ mod tests {
 
     #[test]
     fn session_token_is_bounded_and_debug_redacted() {
-        let request = ConnectRequest::prepare(
-            "ws://localhost:18789".to_owned(),
-            "never-print-this".to_owned(),
-            true,
-        )
-        .expect("valid request");
+        let request =
+            ConnectRequest::prepare("ws://localhost:18789", "never-print-this".to_owned(), true)
+                .expect("valid request");
         let rendered = format!("{request:?}");
         assert!(rendered.contains("REDACTED"));
         assert!(!rendered.contains("never-print-this"));
@@ -1017,7 +1015,7 @@ mod tests {
         assert_eq!(token.expect("token").expose_secret(), "never-print-this");
 
         let rejection = ConnectRequest::prepare(
-            "ws://localhost:18789".to_owned(),
+            "ws://localhost:18789",
             "x".repeat(MAX_TOKEN_BYTES + 1),
             true,
         )
@@ -1031,9 +1029,8 @@ mod tests {
 
     #[test]
     fn consent_is_fail_closed_before_identity_creation() {
-        let rejection =
-            ConnectRequest::prepare("ws://localhost:18789".to_owned(), String::new(), false)
-                .expect_err("consent required");
+        let rejection = ConnectRequest::prepare("ws://localhost:18789", String::new(), false)
+            .expect_err("consent required");
         assert_eq!(rejection.error.code(), "identity.consent-required");
         assert_eq!(
             rejection.endpoint_input.as_deref(),
@@ -1041,7 +1038,7 @@ mod tests {
         );
 
         let rejection = ConnectRequest::prepare(
-            "not-a-gateway token=must-not-survive ".to_owned(),
+            "not-a-gateway token=must-not-survive ",
             String::new(),
             false,
         )

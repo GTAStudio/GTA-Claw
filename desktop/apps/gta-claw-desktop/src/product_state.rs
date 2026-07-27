@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 
+/// Upper bound on the per-run history a session keeps in memory and renders.
+const MAX_SESSION_HISTORY: usize = 200;
+
 pub(crate) const PRIMARY_DESTINATIONS: [PrimaryDestination; 7] = [
     PrimaryDestination::Focus,
     PrimaryDestination::Workspaces,
@@ -205,7 +208,7 @@ impl RunLifecycle {
         self.state
     }
 
-    pub(crate) fn transition(&mut self, next: RunState) -> Result<(), InvalidRunTransition> {
+    pub(crate) const fn transition(&mut self, next: RunState) -> Result<(), InvalidRunTransition> {
         if is_valid_transition(self.state, next) {
             self.state = next;
             Ok(())
@@ -490,7 +493,7 @@ impl<T> PagedModel<T> {
         self.page_size
     }
 
-    pub(crate) fn page_count(&self) -> usize {
+    pub(crate) const fn page_count(&self) -> usize {
         self.rows.len().div_ceil(self.page_size)
     }
 
@@ -500,7 +503,7 @@ impl<T> PagedModel<T> {
         &self.rows[start..end]
     }
 
-    pub(crate) fn next_page(&mut self) -> bool {
+    pub(crate) const fn next_page(&mut self) -> bool {
         if self.page + 1 < self.page_count() {
             self.page += 1;
             true
@@ -509,7 +512,7 @@ impl<T> PagedModel<T> {
         }
     }
 
-    pub(crate) fn previous_page(&mut self) -> bool {
+    pub(crate) const fn previous_page(&mut self) -> bool {
         if self.page > 0 {
             self.page -= 1;
             true
@@ -684,11 +687,11 @@ impl ProductState {
         &self.selected_session().question
     }
 
-    pub(crate) fn select_destination(&mut self, destination: PrimaryDestination) {
+    pub(crate) const fn select_destination(&mut self, destination: PrimaryDestination) {
         self.surface = ProductSurface::Primary(destination);
     }
 
-    pub(crate) fn select_onboarding_stage(&mut self, stage: OnboardingStage) {
+    pub(crate) const fn select_onboarding_stage(&mut self, stage: OnboardingStage) {
         self.onboarding_stage = stage;
     }
 
@@ -719,15 +722,15 @@ impl ProductState {
         true
     }
 
-    pub(crate) fn open_update(&mut self) {
+    pub(crate) const fn open_update(&mut self) {
         self.surface = ProductSurface::Update;
     }
 
-    pub(crate) fn open_diagnostics(&mut self) {
+    pub(crate) const fn open_diagnostics(&mut self) {
         self.surface = ProductSurface::Diagnostics;
     }
 
-    pub(crate) fn return_from_auxiliary(&mut self) {
+    pub(crate) const fn return_from_auxiliary(&mut self) {
         self.surface = match self.surface {
             ProductSurface::Session => ProductSurface::Primary(PrimaryDestination::Runs),
             ProductSurface::Update | ProductSurface::Diagnostics => {
@@ -737,15 +740,15 @@ impl ProductState {
         };
     }
 
-    pub(crate) fn toggle_palette(&mut self) {
+    pub(crate) const fn toggle_palette(&mut self) {
         self.palette_open = !self.palette_open;
     }
 
-    pub(crate) fn close_palette(&mut self) {
+    pub(crate) const fn close_palette(&mut self) {
         self.palette_open = false;
     }
 
-    pub(crate) fn set_diff_mode(&mut self, mode: DiffMode) {
+    pub(crate) const fn set_diff_mode(&mut self, mode: DiffMode) {
         self.diff_mode = mode;
     }
 
@@ -779,7 +782,7 @@ impl ProductState {
         }
     }
 
-    pub(crate) fn select_deliverable(&mut self, index: usize) {
+    pub(crate) const fn select_deliverable(&mut self, index: usize) {
         if index < self.deliverables.len() {
             self.selected_deliverable = index;
         }
@@ -810,7 +813,7 @@ impl ProductState {
             detail: detail.into(),
             timestamp: "Now".to_owned(),
         });
-        if transcript.len() > 200 {
+        if transcript.len() > MAX_SESSION_HISTORY {
             transcript.remove(0);
         }
     }
@@ -841,7 +844,7 @@ impl ProductState {
         } else {
             "Approval denied; execution cancelled".to_owned()
         };
-        self.selected_run.updated = "Now".to_owned();
+        "Now".clone_into(&mut self.selected_run.updated);
         self.persist_selected_run();
         self.record_transition_activity(if approved {
             "Approval granted"
@@ -867,7 +870,7 @@ impl ProductState {
         } else {
             "Answer recorded; execution resumed".to_owned()
         };
-        self.selected_run.updated = "Now".to_owned();
+        "Now".clone_into(&mut self.selected_run.updated);
         self.persist_selected_run();
         self.record_transition_activity(if next == RunState::Paused {
             "Run paused by answer"
@@ -903,23 +906,27 @@ impl ProductState {
     fn record_transition_activity(&mut self, title: &str) {
         let state = self.selected_run.state;
         let detail = self.selected_run.detail.clone();
-        self.selected_session_mut().activity.push(ActivityEntry {
+        let activity = &mut self.selected_session_mut().activity;
+        activity.push(ActivityEntry {
             title: title.to_owned(),
             detail,
             state,
             duration: "Now".to_owned(),
         });
+        if activity.len() > MAX_SESSION_HISTORY {
+            activity.remove(0);
+        }
     }
 
-    pub(crate) fn next_run_page(&mut self) -> bool {
+    pub(crate) const fn next_run_page(&mut self) -> bool {
         self.runs.next_page()
     }
 
-    pub(crate) fn previous_run_page(&mut self) -> bool {
+    pub(crate) const fn previous_run_page(&mut self) -> bool {
         self.runs.previous_page()
     }
 
-    pub(crate) fn keyboard_order(&self) -> Vec<String> {
+    pub(crate) fn keyboard_order() -> Vec<String> {
         let mut order = PRIMARY_DESTINATIONS
             .iter()
             .map(|destination| destination.label().to_owned())
@@ -932,7 +939,7 @@ impl ProductState {
         order
     }
 
-    pub(crate) fn accessibility_nodes(&self) -> Vec<AccessibilityNode> {
+    pub(crate) fn accessibility_nodes() -> Vec<AccessibilityNode> {
         vec![
             AccessibilityNode {
                 role: "navigation".to_owned(),
@@ -1376,9 +1383,26 @@ mod tests {
     }
 
     #[test]
+    fn run_activity_history_is_bounded_like_the_transcript() {
+        let mut state = ProductState::default();
+        assert!(!state.activity().is_empty());
+        for index in 0..MAX_SESSION_HISTORY + 5 {
+            let answer = if index % 2 == 0 { "" } else { "Pause run" };
+            state
+                .answer_question(answer)
+                .expect("alternating answers stay inside the run lifecycle");
+        }
+        assert_eq!(state.activity().len(), MAX_SESSION_HISTORY);
+        assert_eq!(
+            state.activity()[MAX_SESSION_HISTORY - 1].title,
+            "Answer received"
+        );
+    }
+
+    #[test]
     fn keyboard_navigation_order_is_stable_and_complete() {
         assert_eq!(
-            ProductState::default().keyboard_order(),
+            ProductState::keyboard_order(),
             vec![
                 "Focus",
                 "Workspaces",
@@ -1397,7 +1421,7 @@ mod tests {
     #[test]
     fn accessibility_metadata_identifies_landmarks_and_live_regions() {
         assert_eq!(
-            ProductState::default().accessibility_nodes(),
+            ProductState::accessibility_nodes(),
             vec![
                 AccessibilityNode {
                     role: "navigation".to_owned(),

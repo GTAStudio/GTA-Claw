@@ -83,7 +83,7 @@ impl ControllerSender {
                 request,
                 completion,
             })
-            .map_err(CommandRejection::from_send)
+            .map_err(|error| CommandRejection::from_send(&error))
     }
 
     #[cfg(test)]
@@ -99,7 +99,7 @@ impl ControllerSender {
     pub(crate) fn cancel(&self) -> Result<(), CommandRejection> {
         self.commands
             .try_send(ControllerCommand::Cancel)
-            .map_err(CommandRejection::from_send)
+            .map_err(|error| CommandRejection::from_send(&error))
     }
 
     pub(crate) fn reject_submission(
@@ -108,13 +108,13 @@ impl ControllerSender {
     ) -> Result<(), CommandRejection> {
         self.commands
             .try_send(ControllerCommand::RejectSubmission(rejection))
-            .map_err(CommandRejection::from_send)
+            .map_err(|error| CommandRejection::from_send(&error))
     }
 
     pub(crate) fn disconnect(&self) -> Result<(), CommandRejection> {
         self.commands
             .try_send(ControllerCommand::Disconnect)
-            .map_err(CommandRejection::from_send)
+            .map_err(|error| CommandRejection::from_send(&error))
     }
 
     pub(crate) fn close(&self) {
@@ -129,7 +129,7 @@ pub(crate) enum CommandRejection {
 }
 
 impl CommandRejection {
-    fn from_send(error: mpsc::error::TrySendError<ControllerCommand>) -> Self {
+    const fn from_send(error: &mpsc::error::TrySendError<ControllerCommand>) -> Self {
         match error {
             mpsc::error::TrySendError::Full(_) => Self::Busy,
             mpsc::error::TrySendError::Closed(_) => Self::Closed,
@@ -348,7 +348,7 @@ async fn controller_loop(
             () = close.cancelled() => {
                 let generation = model.start_disconnect();
                 publish(&sink, &model);
-                stop_attempt(active.take(), &attempt_stop_observer).await;
+                stop_attempt(active.take(), attempt_stop_observer.as_ref()).await;
                 drop(session_identity.take());
                 model.finish_disconnect(generation);
                 publish(&sink, &model);
@@ -358,7 +358,7 @@ async fn controller_loop(
                 let Some(command) = command else {
                     let generation = model.start_disconnect();
                     publish(&sink, &model);
-                    stop_attempt(active.take(), &attempt_stop_observer).await;
+                    stop_attempt(active.take(), attempt_stop_observer.as_ref()).await;
                     drop(session_identity.take());
                     model.finish_disconnect(generation);
                     publish(&sink, &model);
@@ -376,7 +376,7 @@ async fn controller_loop(
                         let endpoint = request.endpoint_display().to_owned();
                         let generation = model.begin(endpoint);
                         publish(&sink, &model);
-                        stop_attempt(active.take(), &attempt_stop_observer).await;
+                        stop_attempt(active.take(), attempt_stop_observer.as_ref()).await;
                         if close.is_cancelled() {
                             complete_connect(completion, ConnectDisposition::Closed);
                             continue;
@@ -410,14 +410,14 @@ async fn controller_loop(
                         if !model.can_start_connection() {
                             continue;
                         }
-                        stop_attempt(active.take(), &attempt_stop_observer).await;
+                        stop_attempt(active.take(), attempt_stop_observer.as_ref()).await;
                         model.reject_submission(rejection.endpoint_display, rejection.error);
                         publish(&sink, &model);
                     }
                     ControllerCommand::Cancel | ControllerCommand::Disconnect => {
                         let generation = model.start_disconnect();
                         publish(&sink, &model);
-                        stop_attempt(active.take(), &attempt_stop_observer).await;
+                        stop_attempt(active.take(), attempt_stop_observer.as_ref()).await;
                         session_identity = None;
                         model.finish_disconnect(generation);
                         publish(&sink, &model);
@@ -450,7 +450,7 @@ fn publish(sink: &ViewSink, model: &OnboardingModel) {
 
 async fn stop_attempt(
     active: Option<ActiveAttempt>,
-    attempt_stop_observer: &Option<AttemptStopObserver>,
+    attempt_stop_observer: Option<&AttemptStopObserver>,
 ) {
     let Some(mut active) = active else {
         return;
@@ -912,7 +912,7 @@ mod tests {
 
     fn request(url: &Url) -> ConnectRequest {
         ConnectRequest::prepare(
-            url.as_str().trim_end_matches('/').to_owned(),
+            url.as_str().trim_end_matches('/'),
             "desktop-session-token".to_owned(),
             true,
         )
@@ -921,18 +921,18 @@ mod tests {
 
     async fn wait_snapshot(
         snapshots: &Snapshots,
-        predicate: impl Fn(&ViewSnapshot) -> bool,
+        predicate: impl Fn(&ViewSnapshot) -> bool + Send + Sync,
     ) -> ViewSnapshot {
         tokio::time::timeout(Duration::from_secs(6), async {
             loop {
-                if let Some(snapshot) = snapshots
+                let matched = snapshots
                     .lock()
                     .expect("snapshots")
                     .iter()
                     .rev()
                     .find(|snapshot| predicate(snapshot))
-                    .cloned()
-                {
+                    .cloned();
+                if let Some(snapshot) = matched {
                     return snapshot;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1062,7 +1062,7 @@ mod tests {
                 .as_ref()
                 .expect("requested scopes")
                 .iter()
-                .map(|scope| scope.as_str())
+                .map(claw_protocol::gateway::Name::as_str)
                 .collect::<Vec<_>>();
             assert_eq!(requested_scopes, ["operator.read"]);
             assert!(
@@ -1205,7 +1205,7 @@ mod tests {
         let first_observed = sender
             .connect_observed(
                 ConnectRequest::prepare(
-                    gateway.url.as_str().trim_end_matches('/').to_owned(),
+                    gateway.url.as_str().trim_end_matches('/'),
                     "first-token".to_owned(),
                     true,
                 )
@@ -1215,7 +1215,7 @@ mod tests {
         let duplicate_observed = sender
             .connect_observed(
                 ConnectRequest::prepare(
-                    gateway.url.as_str().trim_end_matches('/').to_owned(),
+                    gateway.url.as_str().trim_end_matches('/'),
                     String::new(),
                     true,
                 )
@@ -1464,25 +1464,25 @@ mod tests {
             "gateway.protocol-scope"
         );
         assert_authenticated_summary_cleared(&failed);
-        {
+        let (ready_index, failed_index, ready_count) = {
             let snapshots = snapshots.lock().expect("snapshots");
-            let ready_index = snapshots
-                .iter()
-                .position(|snapshot| snapshot.phase() == OnboardingPhase::Ready)
-                .expect("response A must produce Ready");
-            let failed_index = snapshots
-                .iter()
-                .position(|snapshot| snapshot.phase() == OnboardingPhase::Failed)
-                .expect("epoch B must fail closed");
-            assert!(ready_index < failed_index);
-            assert_eq!(
+            (
+                snapshots
+                    .iter()
+                    .position(|snapshot| snapshot.phase() == OnboardingPhase::Ready),
+                snapshots
+                    .iter()
+                    .position(|snapshot| snapshot.phase() == OnboardingPhase::Failed),
                 snapshots
                     .iter()
                     .filter(|snapshot| snapshot.phase() == OnboardingPhase::Ready)
                     .count(),
-                1
-            );
-        }
+            )
+        };
+        let ready_index = ready_index.expect("response A must produce Ready");
+        let failed_index = failed_index.expect("epoch B must fail closed");
+        assert!(ready_index < failed_index);
+        assert_eq!(ready_count, 1);
         assert_eq!(
             health_ids.lock().expect("health ids").as_slice(),
             &["desktop-health-1-epoch-1"]
@@ -1661,7 +1661,8 @@ mod tests {
                 sink.lock().expect("snapshots").push(snapshot);
             },
             move |_| {
-                if let Some(observed) = event_observer.lock().expect("event observer").take() {
+                let observed = event_observer.lock().expect("event observer").take();
+                if let Some(observed) = observed {
                     let _ = observed.send(());
                 }
             },
@@ -1777,21 +1778,20 @@ mod tests {
             health_ids.lock().expect("health ids").as_slice(),
             &["desktop-health-1-epoch-1"]
         );
-        {
+        let (ready_count, any_failed) = {
             let snapshots = snapshots.lock().expect("snapshots");
-            assert_eq!(
+            (
                 snapshots
                     .iter()
                     .filter(|snapshot| snapshot.phase() == OnboardingPhase::Ready)
                     .count(),
-                1
-            );
-            assert!(
                 snapshots
                     .iter()
-                    .all(|snapshot| snapshot.phase() != OnboardingPhase::Failed)
-            );
-        }
+                    .any(|snapshot| snapshot.phase() == OnboardingPhase::Failed),
+            )
+        };
+        assert_eq!(ready_count, 1);
+        assert!(!any_failed);
         controller.shutdown().expect("shutdown");
         gateway.shutdown().await;
     }
@@ -2011,14 +2011,13 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
         let count_after_cancel = snapshots.lock().expect("snapshots").len();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        {
+        let settled_after_cancel = {
             let all = snapshots.lock().expect("snapshots");
-            assert!(
-                all[count_after_cancel..]
-                    .iter()
-                    .all(|snapshot| snapshot.phase() == OnboardingPhase::Disconnected)
-            );
-        }
+            all[count_after_cancel..]
+                .iter()
+                .all(|snapshot| snapshot.phase() == OnboardingPhase::Disconnected)
+        };
+        assert!(settled_after_cancel);
         controller.shutdown().expect("shutdown");
         gateway.shutdown().await;
     }
