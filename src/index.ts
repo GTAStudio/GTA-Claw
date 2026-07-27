@@ -46,11 +46,8 @@ async function main(): Promise<void> {
     );
   }
 
-  // 3. Set up isolated-vm sandbox and register skills
-  let toolExecutor = new ToolExecutor(
-    config.SKILL_EXEC_TIMEOUT_MS,
-    config.ALLOWED_SKILL_DOMAINS,
-  );
+  // 3. Register skills (execution is disabled; see ToolExecutor)
+  let toolExecutor = new ToolExecutor();
   let reloadInProgress = false;
   for (const skill of skills) {
     toolExecutor.registerSkill(skill.name, skill.executeCode);
@@ -191,10 +188,7 @@ async function main(): Promise<void> {
           );
         }
 
-        const nextExecutor = new ToolExecutor(
-          config.SKILL_EXEC_TIMEOUT_MS,
-          config.ALLOWED_SKILL_DOMAINS,
-        );
+        const nextExecutor = new ToolExecutor();
         try {
           for (const skill of nextSkills) {
             nextExecutor.registerSkill(skill.name, skill.executeCode);

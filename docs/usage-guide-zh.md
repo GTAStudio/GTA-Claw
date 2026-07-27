@@ -206,6 +206,11 @@ GTA-Claw 支持四个聊天频道，可同时启用多个。
 
 ## 四、日常使用
 
+> **远程技能执行目前已禁用。** 下面的示例和内置技能列表描述的是 AI 可见的工具元数据（名称/描述/参数），
+> 但调用其中任何一个都会返回明确的"远程技能执行已禁用"错误，而不会真正运行代码——引擎不包含
+> `node:vm`/`isolated-vm` 或任何其他脚本引擎。这是刻意的安全策略，不是缺陷；详见
+> [Security](../README.md#security)。
+
 ### 4.1 对话示例
 
 连接好聊天频道后，直接用自然语言和机器人对话即可：
@@ -242,7 +247,7 @@ GTA-Claw 支持四个聊天频道，可同时启用多个。
 | `server_admin` | 服务器管理（磁盘/内存/Docker等） | "服务器状态" |
 | `marp_slides` | 生成 Marp 格式幻灯片 | "做 PPT / 幻灯片" |
 
-> 所有技能在 V8 沙箱中隔离运行，通过 `httpGet`/`httpPost`/`log` API 与外部交互。
+> 所有技能仅作为工具元数据注册；执行已被禁用（见上方提示）。
 
 ---
 
@@ -288,10 +293,8 @@ GTA-Claw 支持四个聊天频道，可同时启用多个。
 }
 ```
 
-**沙箱 API**：
-- `api.httpGet(url)` — HTTP GET 请求
-- `api.httpPost(url, body, headers)` — HTTP POST 请求
-- `api.log(message)` — 输出日志
+**`executeCode` 永远不会被执行**——该字段仍然是加载器为兼容既有技能格式而要求的必填项，但其内容仅作为
+惰性元数据保留。调用生成的工具始终会返回"远程技能执行已禁用"错误而失败。
 
 将多个技能 URL 用逗号拼接，设置到 `ENABLED_SKILLS` 即可。
 
@@ -346,8 +349,8 @@ docker rm -f gta-claw
 | `/chat` | POST | HTTP 直聊接口（无需聊天频道） |
 | `/api/messages` | POST | Bot Framework 消息（Teams） |
 | `/admin/reload` | POST | 热重载角色和技能（需 `ADMIN_TOKEN`） |
-| `/admin/system` | GET | 系统信息（Node.js 进程 + OS） |
-| `/admin/exec` | POST | 执行白名单系统命令 |
+| `/admin/system` | GET | 系统信息（Node.js 进程 + OS）（需 `ADMIN_TOKEN`） |
+| `/admin/exec` | POST | 执行白名单系统命令（需 `ADMIN_TOKEN`） |
 
 ### 首次使用推荐路径
 

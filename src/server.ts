@@ -350,12 +350,12 @@ export function createServer(deps: ServerDeps): restify.Server {
       date: { cmd: "date", args: [] },
     };
 
-    // Admin auth: require ADMIN_TOKEN via Bearer, or trust loopback (for in-process skills)
+    // Admin auth: require ADMIN_TOKEN via Bearer. Loopback/localhost is no
+    // longer trusted implicitly — a request originating from 127.0.0.1 (e.g.
+    // from a container-local process) must still present the token.
     const isAdminAuthorized = (req: Request): boolean => {
       const token = parseBearerToken(req.headers["authorization"]);
-      if (token === config.ADMIN_TOKEN) return true;
-      const remote = req.socket.remoteAddress ?? "";
-      return remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
+      return token === config.ADMIN_TOKEN;
     };
 
     // GET /admin/system — Node.js process + OS info (no shell needed)

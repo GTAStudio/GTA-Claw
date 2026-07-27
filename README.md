@@ -52,13 +52,13 @@ Internet → Reverse Proxy (:443 HTTPS) → GTA-Claw Engine (:3978)
                                        └───────────┬─────────────┘
                                        ┌───────────┴─────────────┐
                                        │ ToolExecutor              │
-                                       │ isolated-vm sandbox       │
+                                       │ (remote exec disabled)    │
                                        └─────────────────────────┘
 ```
 
 **Core Principle**: The engine is an empty shell. All intelligence comes from:
 - **Role** (`AGENT_ROLE_URL`): System prompt + model selection loaded from a remote URL
-- **Skills** (`ENABLED_SKILLS`): Tool definitions + sandboxed code loaded from remote URLs
+- **Skills** (`ENABLED_SKILLS`): Tool definitions loaded from remote URLs. Remote skill code is registered as inert metadata only — the engine never executes it (see [Security](#security))
 
 ## Configuration
 
@@ -93,12 +93,10 @@ Authentication now supports two modes:
 | `LOG_LEVEL` | `info` | Logging level |
 | `MAX_SESSIONS` | `100` | Max concurrent sessions |
 | `SESSION_TTL_MS` | `3600000` | Session idle timeout (1 hour) |
-| `SKILL_EXEC_TIMEOUT_MS` | `30000` | Skill execution timeout |
 | `SDK_REQUEST_TIMEOUT_MS` | `120000` | SDK request timeout |
 | `RATE_LIMIT_PER_MIN` | `30` | Per-IP rate limit for `/api/messages` |
-| `ALLOWED_SKILL_DOMAINS` | *(empty)* | Domain whitelist for skill HTTP calls |
 | `TRUST_PROXY` | `false` | Trust `x-forwarded-for` from upstream proxy |
-| `AUTO_UPDATE` | `false` | Auto-update SDK/CLI on startup |
+| `AUTO_UPDATE` | `false` | Report (log-only) whether a newer SDK/CLI version is available on startup; never mutates the running container |
 | `ADMIN_TOKEN` | *(empty)* | Token for admin endpoints |
 
 ## Role Configuration
@@ -146,12 +144,13 @@ Skills are hosted as JSON files at any accessible URL:
 }
 ```
 
-### Sandbox API
-
-Skills execute in an isolated V8 sandbox with these bridges:
-- `api.httpGet(url)` — HTTP GET (domain whitelisted)
-- `api.httpPost(url, body, headers)` — HTTP POST (domain whitelisted)
-- `api.log(message)` — Log to host
+> **`executeCode` is never executed.** The field is still required by the
+> loader for schema/format compatibility with existing skill documents, and
+> its text is retained only as inert metadata. The engine ships with no
+> script engine (no `node:vm`, no `isolated-vm`, no fallback sandbox): if a
+> registered skill's tool is invoked, the call is rejected with a clear
+> "remote skill execution is disabled" error instead of running any
+> remote-sourced code. See [Security](#security).
 
 ## Deployment
 
@@ -241,10 +240,10 @@ Recommended auth strategy:
 
 ## Security
 
-- Skills run in V8 isolate sandbox (`isolated-vm`) with memory limits when available
-- If `isolated-vm` is unavailable, engine falls back to Node `vm` sandbox mode (reduced isolation)
-- Domain whitelist for skill HTTP calls
-- Rate limiting on bot endpoint (30 req/min per IP)
+- Remote skill code execution is disabled: skills load as tool metadata only, and any invocation attempt is rejected with a clear error (no `node:vm`, no `isolated-vm`, no fallback script engine)
+- `AGENT_ROLE_URL`, `ENABLED_SKILLS`, and `DISCORD_GATEWAY_URL` require `https://`/`wss://` respectively
+- Admin endpoints (`/admin/*`) require `ADMIN_TOKEN`; the loopback-bypass authorization path has been removed
+- Rate limiting on bot endpoint (30 req/min per IP, configurable via `RATE_LIMIT_PER_MIN`)
 - Non-root Docker user
 - HTTPS via reverse proxy (Caddy/Nginx/Traefik)
 

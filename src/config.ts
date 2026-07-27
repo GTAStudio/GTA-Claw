@@ -39,10 +39,8 @@ export interface AppConfig {
   SESSION_TTL_MS: number;
   MAX_SESSIONS: number;
   COPILOT_MODEL: string;
-  SKILL_EXEC_TIMEOUT_MS: number;
   SDK_REQUEST_TIMEOUT_MS: number;
   RATE_LIMIT_PER_MIN: number;
-  ALLOWED_SKILL_DOMAINS: string[];
   DOMAIN: string;
   AUTO_UPDATE: boolean;
   ADMIN_TOKEN: string | undefined;
@@ -66,15 +64,31 @@ function requireEnv(name: string): string {
   return value;
 }
 
+// All retained remote URLs (agent role, enabled skills) must be HTTPS.
+// Plaintext http: is rejected outright — there is no legitimate reason to
+// fetch role/skill definitions over an unencrypted, tamperable channel.
 function validateUrl(raw: string, label: string): string {
   try {
     const parsed = new URL(raw);
-    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    if (parsed.protocol !== "https:") {
       throw new Error(`Invalid protocol`);
     }
     return raw;
   } catch {
-    throw new Error(`Invalid URL for ${label}: ${raw}`);
+    throw new Error(`Invalid URL for ${label}: ${raw} (must be https://)`);
+  }
+}
+
+// The Discord gateway is a WebSocket endpoint; only wss: (TLS) is accepted.
+function validateWssUrl(raw: string, label: string): string {
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "wss:") {
+      throw new Error(`Invalid protocol`);
+    }
+    return raw;
+  } catch {
+    throw new Error(`Invalid URL for ${label}: ${raw} (must be wss://)`);
   }
 }
 
@@ -122,19 +136,6 @@ function parseOptionalNonEmptyEnv(name: string): string | undefined {
   return raw ? raw : undefined;
 }
 
-function parseDomainList(name: string): string[] {
-  const raw = process.env[name];
-  if (!raw) return [];
-
-  const unique = new Set(
-    raw
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean),
-  );
-  return [...unique];
-}
-
 export function loadConfig(): AppConfig {
   logger.info("Loading configuration...");
 
@@ -154,9 +155,11 @@ export function loadConfig(): AppConfig {
   );
 
   const DISCORD_BOT_TOKEN = parseOptionalNonEmptyEnv("DISCORD_BOT_TOKEN");
-  const DISCORD_GATEWAY_URL =
+  const DISCORD_GATEWAY_URL = validateWssUrl(
     process.env["DISCORD_GATEWAY_URL"]?.trim() ||
-    "wss://gateway.discord.gg/?v=10&encoding=json";
+      "wss://gateway.discord.gg/?v=10&encoding=json",
+    "DISCORD_GATEWAY_URL",
+  );
   const DISCORD_GATEWAY_INTENTS = parseIntegerEnv(
     "DISCORD_GATEWAY_INTENTS",
     33281,
@@ -265,14 +268,10 @@ export function loadConfig(): AppConfig {
     SESSION_TTL_MS: parseIntegerEnv("SESSION_TTL_MS", 3_600_000, { min: 1_000 }),
     MAX_SESSIONS: parseIntegerEnv("MAX_SESSIONS", 100, { min: 1 }),
     COPILOT_MODEL: process.env["COPILOT_MODEL"] ?? "gpt-4o",
-    SKILL_EXEC_TIMEOUT_MS: parseIntegerEnv("SKILL_EXEC_TIMEOUT_MS", 30_000, {
-      min: 100,
-    }),
     SDK_REQUEST_TIMEOUT_MS: parseIntegerEnv("SDK_REQUEST_TIMEOUT_MS", 120_000, {
       min: 1_000,
     }),
     RATE_LIMIT_PER_MIN: parseIntegerEnv("RATE_LIMIT_PER_MIN", 30, { min: 1 }),
-    ALLOWED_SKILL_DOMAINS: parseDomainList("ALLOWED_SKILL_DOMAINS"),
     DOMAIN: process.env["DOMAIN"] ?? "localhost",
     AUTO_UPDATE: parseBooleanEnv("AUTO_UPDATE", false),
     ADMIN_TOKEN: process.env["ADMIN_TOKEN"],

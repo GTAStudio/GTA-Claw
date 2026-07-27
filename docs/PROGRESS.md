@@ -21,7 +21,7 @@
 
 | # | File | Status | Notes |
 |---|------|--------|-------|
-| 1 | `package.json` | ✅ Done | deps + `--no-node-snapshot` script |
+| 1 | `package.json` | ✅ Done | deps + script (`--no-node-snapshot` later removed with `isolated-vm`, see changelog) |
 | 2 | `tsconfig.json` | ✅ Done | ES2022, NodeNext, strict |
 | 3 | `.dockerignore` | ✅ Done | node_modules, dist, .env, .git |
 
@@ -38,7 +38,7 @@
 |---|------|--------|-------|
 | 6 | `src/loader/roleLoader.ts` | ✅ Done | Fetch role JSON (content + model) |
 | 7 | `src/loader/skillLoader.ts` | ✅ Done | Fetch & validate skill modules |
-| 8 | `src/engine/toolExecutor.ts` | ✅ Done | isolated-vm sandbox + API bridges |
+| 8 | `src/engine/toolExecutor.ts` | ✅ Done | Remote skill execution disabled (no `node:vm`/`isolated-vm`); metadata-only registry |
 
 ## Phase 4: AI Engine
 
@@ -124,3 +124,11 @@
 | 2026-03-05 | Patched transitive vulnerabilities with npm `overrides` (`find-my-way`, `send`) | package.json, package-lock.json |
 | 2026-03-05 | Security audit clean (`npm audit`: 0 vulnerabilities) | package-lock.json |
 | 2026-03-05 | Updated TypeScript include pattern to include local `.d.ts` files | tsconfig.json |
+| 2026-07-26 | Emergency hardening: refreshed lockfile to close 20/21 open high Dependabot alerts (axios, form-data, undici, ws, lodash, @github/copilot-sdk/@github/copilot); find-my-way/restify (`GHSA-c96f-x56v-gq3h`, alert #55) deliberately left gated rather than blind-bumped across unsupported majors | package.json, package-lock.json |
+| 2026-07-26 | Removed the CRITICAL arbitrary-JS-execution path: deleted `isolated-vm`/`node:vm` entirely from `ToolExecutor`; remote skill invocation now always fails closed with a clear error instead of executing code. Also dropped the now-vestigial `--no-node-snapshot` flag (`package.json` scripts, Dockerfile `NODE_OPTIONS`) since it existed solely as an `isolated-vm` V8-snapshot compatibility workaround | src/engine/toolExecutor.ts, src/index.ts, package.json, package-lock.json, Dockerfile |
+| 2026-07-26 | Hardened network/control paths: `AGENT_ROLE_URL`/`ENABLED_SKILLS` now require `https://`, `DISCORD_GATEWAY_URL` now requires `wss://`; removed `ALLOWED_SKILL_DOMAINS`/`SKILL_EXEC_TIMEOUT_MS` (skill network/exec bridge no longer exists) | src/config.ts |
+| 2026-07-26 | Removed the `/admin` loopback-bypass authorization path; admin endpoints now require `ADMIN_TOKEN` unconditionally | src/server.ts |
+| 2026-07-26 | Removed live-container self-mutation (`npm update`, `curl \| bash` CLI reinstall); updater is now report-only and resolves the CLI the same way `@github/copilot-sdk` does | src/updater/sdkUpdater.ts |
+| 2026-07-26 | Dockerfile: frozen `npm ci --ignore-scripts` install with sha256 lockfile-immutability + `npm ls` evidence, embedded build-time regression gate (7 planted-regression checks), removed unpinned `curl \| bash` Copilot CLI installer and `isolated-vm`-only envs | Dockerfile |
+| 2026-07-26 | Docs/config samples updated so removed keys/behaviors are not silently accepted (`.env.example`, deploy conf, `deploy/run.sh` URL validators, README, usage guides, legacy port-obligations) | .env.example, deploy/conf/gta-claw.conf.example, deploy/run.sh, README.md, docs/usage-guide-en.md, docs/usage-guide-zh.md, docs/legacy-node-port-obligations.md, docs/PROJECT_PLAN.md |
+| 2026-07-26 | Found (via live execution, not just static checks) that the mandated `@github/copilot-sdk@0.1.32` + `@github/copilot@1.0.75` pairing breaks `CopilotClient`'s CLI bootstrap outright: the SDK's default path resolver targets a `sdk/index.js` layout that no longer exists in `@github/copilot@1.0.75` (CLI moved into per-platform packages), and even a corrected path fails on this image's Node 20 runtime because the CLI's JS bundle needs Node ≥22 (`Promise.withResolvers`). Fixed by resolving each platform package's native Single-Executable-Application binary instead (a first-class, SDK-supported spawn path); `resolveBundledCliPath()` lives in `src/updater/sdkUpdater.ts` (exported for reuse by the engine) rather than a new module, so the frozen legacy TypeScript ceiling (`crates/claw-repo-policy`) is not raised. Added a 7th regression check so this can never silently regress | src/updater/sdkUpdater.ts, src/engine/copilotEngine.ts, Dockerfile |
