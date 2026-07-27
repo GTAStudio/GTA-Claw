@@ -5,6 +5,24 @@
 //! [`GatewayStore`]; the shipped [`InMemoryGatewayStore`] is the only adapter in
 //! this crate. A durable adapter can be supplied by a composition root without
 //! changing any Gateway code.
+//!
+//! # What a durable adapter must provide that this one does not
+//!
+//! The port is what a restart reads state back through, so every operation here
+//! is a read or a *single* record mutation, and none of them are batched into a
+//! transaction. Two consequences an adapter author has to plan for:
+//!
+//! * **A failed write may still have landed.** [`crate::error::StoreError`] can
+//!   report [`crate::error::StoreError::Backend`], but nothing distinguishes
+//!   "refused before writing" from "committed and then failed to answer". The
+//!   only handler that issues two writes for one request is `set-heartbeats`,
+//!   and it is documented in [`crate::methods`] as non-atomic for that reason.
+//! * **Idempotency is per operation, not per request.**
+//!   [`GatewayStore::enqueue_pending`] and [`GatewayStore::create_session`]
+//!   reject a duplicate identity, so a retry after an unacknowledged write is
+//!   *detectable* by the caller — but it is reported as a conflict, not as a
+//!   confirmation, and [`GatewayStore::patch_session`] bumps the revision on
+//!   every call, so a retried patch is not the same as one patch.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -157,6 +175,29 @@ pub trait GatewayStore: Debug + Send + Sync {
     /// Acknowledges one pulled invocation and reports whether it was awaited.
     fn ack_pending<'a>(&'a self, node_id: &'a str, invocation_id: &'a str)
     -> StoreFuture<'a, bool>;
+
+    /// Returns every claimed-but-unacknowledged invocation to the pending set.
+    ///
+    /// Returns how many invocations were reclaimed, which is zero when the node
+    /// holds no outstanding claim.
+    ///
+    /// [`Self::pull_pending`] moves work into an awaiting-acknowledgement set
+    /// that only [`Self::ack_pending`] and [`Self::drain_pending`] can leave.
+    /// A claimant that dies between the pull and the acknowledgement — a node
+    /// that crashes, or a Gateway process that restarts on top of a durable
+    /// adapter — therefore strands that work permanently: no later
+    /// [`Self::pull_pending`] can see it, and the entries keep occupying the
+    /// per-node bound until something discards the whole queue. This is the one
+    /// operation a durable adapter needs that reading state back cannot
+    /// substitute for, because the claim it must undo was made by a process
+    /// that no longer exists.
+    ///
+    /// Reclaimed invocations are placed **before** entries still pending, in
+    /// their original pull order, so redelivery preserves the order the
+    /// enqueuing operator chose. Delivery is therefore at-least-once: a node
+    /// that executed an invocation and died before acknowledging it will be
+    /// handed that invocation again.
+    fn reclaim_pending<'a>(&'a self, node_id: &'a str) -> StoreFuture<'a, usize>;
 
     /// Removes and returns every pending and awaiting-acknowledgement invocation.
     fn drain_pending<'a>(&'a self, node_id: &'a str) -> StoreFuture<'a, Vec<PendingInvocation>>;
@@ -375,6 +416,22 @@ impl InMemoryGatewayStore {
         drained
     }
 
+    fn requeue_awaiting(&self, node_id: &str) -> usize {
+        let mut state = self.lock();
+        let Some(queue) = state.nodes.get_mut(node_id) else {
+            return 0;
+        };
+        let mut reclaimed = std::mem::take(&mut queue.awaiting_ack);
+        let count = reclaimed.len();
+        // The reclaimed entries were pulled before anything still pending was,
+        // so they go back at the head to keep the enqueue order intact.
+        reclaimed.append(&mut queue.pending);
+        queue.pending = reclaimed;
+        Self::forget_empty(&mut state, node_id);
+        drop(state);
+        count
+    }
+
     /// Drops a node's queue once it holds nothing.
     ///
     /// Node identities are verified device identities, so they are attacker
@@ -464,6 +521,10 @@ impl GatewayStore for InMemoryGatewayStore {
 
     fn drain_pending<'a>(&'a self, node_id: &'a str) -> StoreFuture<'a, Vec<PendingInvocation>> {
         ready(Ok(self.take_all_pending(node_id)))
+    }
+
+    fn reclaim_pending<'a>(&'a self, node_id: &'a str) -> StoreFuture<'a, usize> {
+        ready(Ok(self.requeue_awaiting(node_id)))
     }
 }
 
@@ -739,5 +800,76 @@ mod tests {
             store.pull_pending("node-a", 8).await.expect("pull"),
             vec![invocation("i1")]
         );
+    }
+
+    #[tokio::test]
+    async fn reclaim_returns_unacknowledged_claims_to_the_front_of_the_queue() {
+        let store = InMemoryGatewayStore::new(2, 8);
+        for id in ["i1", "i2", "i3"] {
+            store
+                .enqueue_pending("node-a", invocation(id))
+                .await
+                .expect("enqueue");
+        }
+        assert_eq!(
+            store.pull_pending("node-a", 2).await.expect("pull"),
+            vec![invocation("i1"), invocation("i2")]
+        );
+        assert_eq!(store.reclaim_pending("node-a").await.expect("reclaim"), 2);
+        assert_eq!(
+            store.pull_pending("node-a", 8).await.expect("pull"),
+            vec![invocation("i1"), invocation("i2"), invocation("i3")]
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_leaves_acknowledged_work_alone_and_is_idempotent() {
+        let store = store();
+        store
+            .enqueue_pending("node-a", invocation("i1"))
+            .await
+            .expect("enqueue");
+        store.pull_pending("node-a", 1).await.expect("pull");
+        assert!(store.ack_pending("node-a", "i1").await.expect("ack"));
+        assert_eq!(store.reclaim_pending("node-a").await.expect("reclaim"), 0);
+        assert_eq!(store.reclaim_pending("node-a").await.expect("reclaim"), 0);
+        assert_eq!(store.pull_pending("node-a", 8).await.expect("pull"), vec![]);
+    }
+
+    #[tokio::test]
+    async fn reclaim_frees_the_bound_a_dead_claimant_was_holding() {
+        let store = store();
+        for id in ["i1", "i2"] {
+            store
+                .enqueue_pending("node-a", invocation(id))
+                .await
+                .expect("enqueue");
+        }
+        store.pull_pending("node-a", 2).await.expect("pull");
+        // Without a reclaim the queue is full of claims nobody will ever ack.
+        assert_eq!(
+            store
+                .enqueue_pending("node-a", invocation("i3"))
+                .await
+                .unwrap_err(),
+            StoreError::CapacityExceeded {
+                collection: "node.pending",
+                limit: 2,
+            }
+        );
+        assert_eq!(store.reclaim_pending("node-a").await.expect("reclaim"), 2);
+        // Reclaiming redelivers rather than discarding, so the bound is still
+        // occupied — by work that can now actually be pulled again.
+        assert_eq!(
+            store.pull_pending("node-a", 8).await.expect("pull"),
+            vec![invocation("i1"), invocation("i2")]
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaiming_an_unknown_node_creates_no_queue_entry() {
+        let store = store();
+        assert_eq!(store.reclaim_pending("ghost").await.expect("reclaim"), 0);
+        assert_eq!(store.drain_pending("ghost").await.expect("drain"), vec![]);
     }
 }

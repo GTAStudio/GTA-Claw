@@ -411,14 +411,16 @@ async fn serve_request(
         ));
     };
     let request_id = request.id().clone();
-    let requested = request.method().as_str().to_owned();
 
-    let Some(method) = services.registry.canonical_name(&requested) else {
+    // Keyed by borrowed text: the registry is a `BTreeMap<&'static str, _>`, so
+    // only the identity that turns out *not* to be catalogued needs an owned
+    // copy, and that is the path that is about to end the request anyway.
+    let Some(method) = services.registry.canonical_name(request.method().as_str()) else {
         return respond_error(
             write,
             codec,
             &request_id,
-            &DispatchError::UnknownMethod(requested),
+            &DispatchError::UnknownMethod(request.method().as_str().to_owned()),
         )
         .await;
     };
@@ -703,6 +705,8 @@ async fn negotiate(
         .and_then(|()| negotiation.mark_ready())
         .map_err(|error| ConnectionClose::HandshakeRejected(error.to_string()))?;
 
+    reclaim_stale_claims(services, role, &device_id).await;
+
     let registration = services.directory.register(ConnectionInfo {
         id,
         role,
@@ -732,6 +736,39 @@ async fn negotiate(
 
 fn handshake_failure(error: &EncodeError) -> ConnectionClose {
     ConnectionClose::HandshakeRejected(error.to_string())
+}
+
+/// Returns invocations a previous incarnation of this node claimed but never
+/// acknowledged to the pending set, so its new connection can pull them.
+///
+/// [`crate::store::GatewayStore::pull_pending`] hands work to a claimant that
+/// is expected to acknowledge it. Nothing acknowledges on the claimant's
+/// behalf when it dies, so without this the work is invisible to every later
+/// pull. Against a durable adapter that outlives the process it is invisible
+/// *forever*, and it keeps occupying the per-node bound, so a node that
+/// crashes often enough eventually cannot be sent anything at all.
+///
+/// Three deliberate restrictions:
+///
+/// * **Nodes only.** Operators have no pending queue.
+/// * **Only when no other connection for this device is live.** The same device
+///   may hold two connections; the reclaim runs before this one is registered,
+///   so an already-connected incarnation still owns its outstanding claims and
+///   is not undercut by a second connection arriving.
+/// * **A reclaim failure is not fatal.** The adapter is being asked to undo a
+///   claim, not to admit the connection. When it refuses, the connection is
+///   still served and the stale claims simply stay stranded, exactly as they
+///   were before this call existed; refusing the handshake instead would let a
+///   flaky adapter deny every node. The call happens inside the handshake, so
+///   a slow adapter is bounded by the configured handshake timeout.
+async fn reclaim_stale_claims(services: &ConnectionServices, role: Role, device_id: &str) {
+    if role != Role::Node || device_id.is_empty() {
+        return;
+    }
+    if services.directory.node(device_id).is_some() {
+        return;
+    }
+    let _ = services.store.reclaim_pending(device_id).await;
 }
 
 fn command_claims(params: &ConnectParams, role: Role) -> Vec<String> {

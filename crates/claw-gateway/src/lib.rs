@@ -29,7 +29,11 @@
 //!
 //! [`store::GatewayStore`] is a narrow persistence port owned by this crate.
 //! [`store::InMemoryGatewayStore`] is the shipped adapter. Durable adapters live
-//! outside this crate.
+//! outside this crate; what one has to cope with that the in-memory adapter
+//! never exercises is written down on [`store`] itself, and
+//! `tests/store_port.rs` holds a second, deliberately hostile in-crate adapter
+//! that fails after committing, answers from stale snapshots, and loses
+//! everything between calls.
 
 pub mod auth;
 pub mod authority;

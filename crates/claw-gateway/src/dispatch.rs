@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use claw_protocol::gateway::{
-    GatewayMethod, MethodScope, OperatorScope, Role, authorize, core_methods, resolve_core_method,
+    GatewayMethod, MethodScope, OperatorScope, Role, authorize, core_methods,
 };
 use serde_json::Value;
 
@@ -114,7 +114,14 @@ pub const fn scope_identity(scope: MethodScope) -> &'static str {
 
 #[derive(Debug)]
 struct Entry {
-    scope: MethodScope,
+    /// The frozen descriptor this entry was built from, in the exact shape
+    /// [`claw_protocol::gateway::authorize`] takes.
+    ///
+    /// Keeping it here rather than re-deriving it per request is what lets
+    /// [`MethodRegistry::authorize_call`] avoid
+    /// [`claw_protocol::gateway::resolve_core_method`], which is a linear scan
+    /// of all 278 frozen descriptors on every single request.
+    descriptor: GatewayMethod<'static>,
     advertised: bool,
     handler: Option<Arc<dyn MethodHandler>>,
 }
@@ -142,7 +149,7 @@ impl MethodRegistry {
                 (
                     method.name(),
                     Entry {
-                        scope: method.scope(),
+                        descriptor: GatewayMethod::Core(method),
                         advertised: method.advertised(),
                         handler: None,
                     },
@@ -200,7 +207,7 @@ impl MethodRegistry {
     /// Returns the frozen classification of one catalogued method.
     #[must_use]
     pub fn scope_of(&self, name: &str) -> Option<MethodScope> {
-        self.entries.get(name).map(|entry| entry.scope)
+        self.entries.get(name).map(|entry| entry.descriptor.scope())
     }
 
     /// Returns the number of catalogued methods.
@@ -215,7 +222,39 @@ impl MethodRegistry {
         self.entries.is_empty()
     }
 
+    /// Resolves one catalogued identity to its entry.
+    fn entry(&self, method: &str) -> Result<&Entry, DispatchError> {
+        self.entries
+            .get(method)
+            .ok_or_else(|| DispatchError::UnknownMethod(method.to_owned()))
+    }
+
+    /// Authorizes one already-resolved entry.
+    fn authorize_entry(
+        &self,
+        role: Role,
+        scopes: &[OperatorScope],
+        entry: &Entry,
+        params: &Value,
+    ) -> Result<(), DispatchError> {
+        let resolved = if entry.descriptor.scope() == MethodScope::Dynamic {
+            self.dynamic.resolve(entry.descriptor.identity(), params)
+        } else {
+            None
+        };
+        authorize(role, entry.descriptor, scopes, resolved.as_deref())?;
+        Ok(())
+    }
+
     /// Authorizes one call without running its handler.
+    ///
+    /// The entry is resolved through this registry's own map rather than
+    /// through [`claw_protocol::gateway::resolve_core_method`]. The two agree
+    /// by construction — the map is built from
+    /// [`claw_protocol::gateway::core_methods`] and
+    /// `registry_key_set_equals_its_own_descriptor_table` pins that it neither
+    /// drops nor duplicates an entry — and the map lookup does not scan all 278
+    /// descriptors.
     ///
     /// # Errors
     ///
@@ -229,18 +268,13 @@ impl MethodRegistry {
         method: &str,
         params: &Value,
     ) -> Result<(), DispatchError> {
-        let core = resolve_core_method(method)
-            .ok_or_else(|| DispatchError::UnknownMethod(method.to_owned()))?;
-        let resolved = if core.scope() == MethodScope::Dynamic {
-            self.dynamic.resolve(method, params)
-        } else {
-            None
-        };
-        authorize(role, GatewayMethod::Core(core), scopes, resolved.as_deref())?;
-        Ok(())
+        self.authorize_entry(role, scopes, self.entry(method)?, params)
     }
 
     /// Authorizes and serves one request.
+    ///
+    /// The catalogued identity is resolved exactly once for both the
+    /// authorization decision and the handler lookup.
     ///
     /// # Errors
     ///
@@ -251,16 +285,12 @@ impl MethodRegistry {
         context: MethodContext<'_>,
         params: Value,
     ) -> Result<Value, DispatchError> {
-        let method = context.method;
-        self.authorize_call(context.role, context.scopes, method, &params)?;
-        let entry = self
-            .entries
-            .get(method)
-            .ok_or_else(|| DispatchError::UnknownMethod(method.to_owned()))?;
+        let entry = self.entry(context.method)?;
+        self.authorize_entry(context.role, context.scopes, entry, &params)?;
         let Some(handler) = entry.handler.as_ref() else {
             return Err(DispatchError::NotImplemented {
-                method: method.to_owned(),
-                scope: scope_identity(entry.scope),
+                method: context.method.to_owned(),
+                scope: scope_identity(entry.descriptor.scope()),
             });
         };
         let handler = Arc::clone(handler);
