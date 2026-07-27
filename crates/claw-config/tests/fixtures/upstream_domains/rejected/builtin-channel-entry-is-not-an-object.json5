@@ -1,0 +1,4 @@
+// reject: decode channels.discord
+{
+  channels: { discord: 1 },
+}

@@ -1,0 +1,24 @@
+{
+  "description": "An unauthenticated invocation is refused before the tool port is reached.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "args": {},
+      "name": "echo"
+    },
+    "method": "POST",
+    "path": "/tools/invoke"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "Unauthorized",
+        "type": "unauthorized"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 401
+  }
+}

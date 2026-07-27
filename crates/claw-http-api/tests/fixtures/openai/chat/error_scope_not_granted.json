@@ -1,0 +1,31 @@
+{
+  "description": "A read-only operator is refused the write scope completions require.",
+  "feature_id": "interop.openai.chat-completions",
+  "request": {
+    "body": {
+      "messages": [
+        {
+          "content": "hello",
+          "role": "user"
+        }
+      ],
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "token": "read-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "missing scope: operator.write",
+        "type": "forbidden"
+      },
+      "ok": false
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 403
+  }
+}

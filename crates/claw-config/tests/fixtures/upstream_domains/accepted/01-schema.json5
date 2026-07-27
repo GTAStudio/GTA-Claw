@@ -1,0 +1,6 @@
+// Accepted fixture for pinned top-level domain `$schema`
+// (compat/upstream/inventories/config-domains.json).
+{
+  // Editor schema pointer for the pinned upstream document shape.
+  $schema: "https://openclaw.ai/schemas/openclaw-2026.7.2.json",
+}

@@ -1,0 +1,59 @@
+{
+  "description": "A pinned stop sequence truncates provider text at the first match before the completion is rendered.",
+  "feature_id": "interop.openai.chat-completions",
+  "request": {
+    "body": {
+      "messages": [
+        {
+          "content": "answer",
+          "role": "user"
+        }
+      ],
+      "model": "openclaw/main",
+      "stop": [
+        "<<END>>"
+      ]
+    },
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": "visible answer",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": "<created#1>",
+      "id": "<id:chatcmpl#1>",
+      "model": "openclaw/main",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 9,
+        "prompt_tokens": 4,
+        "total_tokens": 13
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "generate": {
+      "kind": "output",
+      "text": "visible answer<<END>>hidden continuation",
+      "usage": {
+        "input_tokens": 4,
+        "output_tokens": 9,
+        "total_tokens": 13
+      }
+    }
+  }
+}

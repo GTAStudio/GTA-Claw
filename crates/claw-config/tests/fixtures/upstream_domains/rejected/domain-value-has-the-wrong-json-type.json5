@@ -1,0 +1,4 @@
+// reject: decode logging
+{
+  logging: "info",
+}

@@ -35,6 +35,31 @@ pub enum CrestodianError {
         /// Decoder diagnostic.
         message: String,
     },
+    /// Durable ring-zero settings were malformed at an exact Serde path.
+    SettingsDecode {
+        /// Settings file path.
+        path: PathBuf,
+        /// Exact JSON path, or `<root>`.
+        json_path: String,
+        /// Decoder diagnostic.
+        message: String,
+    },
+    /// Durable ring-zero settings failed re-validation.
+    InvalidSettings {
+        /// Settings file path.
+        path: PathBuf,
+        /// Validation diagnostic.
+        message: String,
+    },
+    /// A persisted audit line could not be decoded.
+    AuditDecode {
+        /// Audit trail path.
+        path: PathBuf,
+        /// One-based line number, or `0` for a whole-file failure.
+        line: usize,
+        /// Decoder diagnostic.
+        message: String,
+    },
     /// First-run setup refused to overwrite an authored configuration.
     AlreadyConfigured(PathBuf),
     /// A path that must be a regular file had a different kind.
@@ -83,6 +108,27 @@ impl Display for CrestodianError {
                 "{}: state field {json_path}: {message}",
                 path.display()
             ),
+            Self::SettingsDecode {
+                path,
+                json_path,
+                message,
+            } => write!(
+                formatter,
+                "{}: settings field {json_path}: {message}",
+                path.display()
+            ),
+            Self::InvalidSettings { path, message } => {
+                write!(formatter, "{}: {message}", path.display())
+            }
+            Self::AuditDecode {
+                path,
+                line,
+                message,
+            } => write!(
+                formatter,
+                "{}: audit line {line}: {message}",
+                path.display()
+            ),
             Self::AlreadyConfigured(path) => write!(
                 formatter,
                 "{}: first-run setup refuses to overwrite authored configuration",
@@ -113,6 +159,9 @@ impl Error for CrestodianError {
             Self::Io { source, .. } => Some(source),
             Self::Rollback { operation, .. } => Some(operation),
             Self::StateDecode { .. }
+            | Self::SettingsDecode { .. }
+            | Self::InvalidSettings { .. }
+            | Self::AuditDecode { .. }
             | Self::AlreadyConfigured(_)
             | Self::UnsafePath { .. }
             | Self::InvalidAnswer { .. } => None,

@@ -1,0 +1,91 @@
+{
+  "description": "A completion carrying client tool calls pins the tool_calls finish reason and the function call envelope.",
+  "feature_id": "interop.openai.chat-completions",
+  "request": {
+    "body": {
+      "messages": [
+        {
+          "content": "What is the weather in Berlin?",
+          "role": "user"
+        }
+      ],
+      "model": "openclaw",
+      "tool_choice": "required",
+      "tools": [
+        {
+          "function": {
+            "description": "Looks up the weather",
+            "name": "get_weather",
+            "parameters": {
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "choices": [
+        {
+          "finish_reason": "tool_calls",
+          "index": 0,
+          "message": {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{\"city\":\"Berlin\"}",
+                  "name": "get_weather"
+                },
+                "id": "call_weather_1",
+                "type": "function"
+              }
+            ]
+          }
+        }
+      ],
+      "created": "<created#1>",
+      "id": "<id:chatcmpl#1>",
+      "model": "openclaw",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 13,
+        "prompt_tokens": 21,
+        "total_tokens": 34
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "generate": {
+      "kind": "output",
+      "text": "",
+      "tool_calls": [
+        {
+          "arguments": "{\"city\":\"Berlin\"}",
+          "id": "call_weather_1",
+          "name": "get_weather"
+        }
+      ],
+      "usage": {
+        "input_tokens": 21,
+        "output_tokens": 13,
+        "total_tokens": 34
+      }
+    }
+  }
+}

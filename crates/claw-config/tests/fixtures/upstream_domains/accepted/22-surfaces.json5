@@ -1,0 +1,9 @@
+// Accepted fixture for pinned top-level domain `surfaces`
+// (compat/upstream/inventories/config-domains.json).
+{
+  surfaces: {
+    "discord:guild": {
+      silentReply: { group: "disallow", internal: "allow" },
+    },
+  },
+}

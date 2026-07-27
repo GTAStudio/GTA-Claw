@@ -1,0 +1,4 @@
+// reject: decode env.CLAW_TOKEN
+{
+  env: { CLAW_TOKEN: 42 },
+}

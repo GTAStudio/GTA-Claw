@@ -24,6 +24,7 @@ wasmtime = { version = "=46.0.1", default-features = false, features = [
 
 [dev-dependencies]
 ed25519-dalek = "=3.0.0"
+serde.workspace = true
 wat = "=1.251.0"
 
 [lints]

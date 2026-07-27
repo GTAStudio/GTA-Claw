@@ -1,0 +1,60 @@
+{
+  "description": "A buffered chat completion pins the OpenAI envelope, the single assistant choice, the stop finish reason, and provider-reported usage.",
+  "feature_id": "interop.openai.chat-completions",
+  "request": {
+    "body": {
+      "messages": [
+        {
+          "content": "Answer in one sentence.",
+          "role": "system"
+        },
+        {
+          "content": "What is the weather in Berlin?",
+          "role": "user"
+        }
+      ],
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": "Berlin is sunny.",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": "<created#1>",
+      "id": "<id:chatcmpl#1>",
+      "model": "openclaw",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 7,
+        "prompt_tokens": 11,
+        "total_tokens": 18
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "generate": {
+      "kind": "output",
+      "text": "Berlin is sunny.",
+      "usage": {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "total_tokens": 18
+      }
+    }
+  }
+}

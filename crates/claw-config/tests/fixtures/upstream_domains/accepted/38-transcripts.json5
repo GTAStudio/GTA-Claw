@@ -1,0 +1,15 @@
+// Accepted fixture for pinned top-level domain `transcripts`
+// (compat/upstream/inventories/config-domains.json).
+{
+  transcripts: {
+    enabled: true,
+    maxUtterances: 500,
+    autoStart: [
+      {
+        providerId: "whisper",
+        sessionId: "main",
+        title: "Standup",
+      },
+    ],
+  },
+}

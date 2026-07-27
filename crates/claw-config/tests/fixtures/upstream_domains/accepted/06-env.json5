@@ -1,0 +1,9 @@
+// Accepted fixture for pinned top-level domain `env`
+// (compat/upstream/inventories/config-domains.json).
+{
+  env: {
+    shellEnv: { enabled: true, timeoutMs: 5000 },
+    vars: { CLAW_HOME: "/opt/claw" },
+    OPENAI_BASE_URL: "https://api.example.test/v1",
+  },
+}

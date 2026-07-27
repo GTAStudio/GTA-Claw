@@ -1,0 +1,39 @@
+{
+  "description": "A provider outage is a service-unavailable api_error carrying the safe provider message.",
+  "feature_id": "interop.openai.chat-completions",
+  "request": {
+    "body": {
+      "messages": [
+        {
+          "content": "hello",
+          "role": "user"
+        }
+      ],
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "upstream provider is unavailable",
+        "type": "api_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 503
+  },
+  "runtime": {
+    "generate": {
+      "error": {
+        "kind": "unavailable",
+        "message": "upstream provider is unavailable"
+      },
+      "kind": "error"
+    }
+  }
+}

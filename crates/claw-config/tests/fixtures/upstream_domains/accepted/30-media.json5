@@ -1,0 +1,8 @@
+// Accepted fixture for pinned top-level domain `media`
+// (compat/upstream/inventories/config-domains.json).
+{
+  media: {
+    preserveFilenames: true,
+    ttlHours: 72,
+  },
+}

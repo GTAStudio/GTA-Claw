@@ -1,0 +1,4 @@
+// reject: decode bindings[0]
+{
+  bindings: [{ type: "route", match: { channel: "discord" } }],
+}

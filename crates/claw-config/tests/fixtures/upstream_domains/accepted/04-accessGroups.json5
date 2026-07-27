@@ -1,0 +1,19 @@
+// Accepted fixture for pinned top-level domain `accessGroups`
+// (compat/upstream/inventories/config-domains.json).
+{
+  accessGroups: {
+    "release-reviewers": {
+      type: "message.senders",
+      members: {
+        discord: ["10010", "10011"],
+        slack: ["U01"],
+      },
+    },
+    "guild-audience": {
+      type: "discord.channelAudience",
+      guildId: "900001",
+      channelId: "900002",
+      membership: "canViewChannel",
+    },
+  },
+}

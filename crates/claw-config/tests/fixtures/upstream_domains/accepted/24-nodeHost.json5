@@ -1,0 +1,13 @@
+// Accepted fixture for pinned top-level domain `nodeHost`
+// (compat/upstream/inventories/config-domains.json).
+{
+  nodeHost: {
+    browserProxy: { enabled: true, allowProfiles: ["work"] },
+    mcp: {
+      servers: {
+        docs: { enabled: true, command: "claw-mcp", args: ["--stdio"] },
+      },
+    },
+    skills: { enabled: false },
+  },
+}

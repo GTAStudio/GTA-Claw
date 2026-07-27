@@ -1,0 +1,4 @@
+// reject: validation gateway.port
+{
+  gateway: { port: 0 },
+}

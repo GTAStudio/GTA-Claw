@@ -1,0 +1,15 @@
+// Accepted fixture for pinned top-level domain `web`
+// (compat/upstream/inventories/config-domains.json).
+{
+  web: {
+    enabled: true,
+    heartbeatSeconds: 30,
+    reconnect: {
+      initialMs: 500,
+      maxMs: 30000,
+      factor: 2,
+      jitter: 0.2,
+      maxAttempts: 10,
+    },
+  },
+}
