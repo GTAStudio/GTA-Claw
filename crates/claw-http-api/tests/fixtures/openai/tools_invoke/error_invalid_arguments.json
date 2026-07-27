@@ -1,0 +1,36 @@
+{
+  "description": "A schema violation reported by the tool port stays a request error.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "args": {
+        "message": 7
+      },
+      "name": "echo"
+    },
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "args.message must be a string",
+        "type": "tool_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 400
+  },
+  "runtime": {
+    "tool": {
+      "error": {
+        "kind": "invalid_request",
+        "message": "args.message must be a string"
+      },
+      "kind": "error"
+    }
+  }
+}

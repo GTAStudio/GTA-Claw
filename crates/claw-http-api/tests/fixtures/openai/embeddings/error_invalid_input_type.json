@@ -1,0 +1,27 @@
+{
+  "description": "An input that is neither a string nor an array of strings is refused rather than coerced.",
+  "feature_id": "interop.openai.embeddings",
+  "request": {
+    "body": {
+      "input": {
+        "text": "Berlin"
+      },
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/embeddings",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "`input` must be a string or an array of strings.",
+        "type": "invalid_request_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 400
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "description": "A model outside the configured routing set is a request error naming the accepted form.",
+  "feature_id": "interop.openai.openresponses",
+  "request": {
+    "body": {
+      "input": "hello",
+      "model": "gpt-4o"
+    },
+    "method": "POST",
+    "path": "/v1/responses",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "Invalid `model`. Use `openclaw` or `openclaw/<agentId>`.",
+        "type": "invalid_request_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 400
+  }
+}

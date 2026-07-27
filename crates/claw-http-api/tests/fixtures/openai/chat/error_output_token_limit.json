@@ -1,0 +1,42 @@
+{
+  "description": "A provider that overruns the requested output token budget is a bad-gateway api_error, and the overrun text is not returned.",
+  "feature_id": "interop.openai.chat-completions",
+  "request": {
+    "body": {
+      "max_completion_tokens": 8,
+      "messages": [
+        {
+          "content": "hello",
+          "role": "user"
+        }
+      ],
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "The provider exceeded the requested output token limit.",
+        "type": "api_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 502
+  },
+  "runtime": {
+    "generate": {
+      "kind": "output",
+      "text": "a much longer answer than was budgeted",
+      "usage": {
+        "input_tokens": 4,
+        "output_tokens": 64,
+        "total_tokens": 68
+      }
+    }
+  }
+}

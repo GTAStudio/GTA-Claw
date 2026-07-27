@@ -1,0 +1,56 @@
+{
+  "description": "A request that omits dimensions leaves the choice to the provider, which is what makes the requested-dimensions fixture meaningful.",
+  "feature_id": "interop.openai.embeddings",
+  "request": {
+    "body": {
+      "input": [
+        "Berlin",
+        "Paris"
+      ],
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/embeddings",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "data": [
+        {
+          "embedding": [
+            0.0,
+            0.25,
+            0.5
+          ],
+          "index": 0,
+          "object": "embedding"
+        },
+        {
+          "embedding": [
+            2.0,
+            2.25,
+            2.5
+          ],
+          "index": 1,
+          "object": "embedding"
+        }
+      ],
+      "model": "openclaw",
+      "object": "list",
+      "usage": {
+        "prompt_tokens": 0,
+        "total_tokens": 0
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "embed": {
+      "fallback": 3,
+      "kind": "dimensioned"
+    }
+  }
+}

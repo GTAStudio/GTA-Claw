@@ -1,0 +1,34 @@
+{
+  "description": "An authenticated invocation pins the success envelope and the pass-through of the tool result.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "args": {
+        "count": 2,
+        "message": "hello"
+      },
+      "name": "echo"
+    },
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "ok": true,
+      "result": {
+        "count": 2,
+        "message": "hello"
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "tool": {
+      "kind": "echo"
+    }
+  }
+}

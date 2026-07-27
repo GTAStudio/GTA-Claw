@@ -1,0 +1,26 @@
+{
+  "description": "An unmodelled request field is rejected rather than silently dropped.",
+  "feature_id": "interop.openai.openresponses",
+  "request": {
+    "body": {
+      "input": "hello",
+      "model": "openclaw",
+      "parallel_tool_calls": true
+    },
+    "method": "POST",
+    "path": "/v1/responses",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "invalid request",
+        "type": "invalid_request_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 400
+  }
+}

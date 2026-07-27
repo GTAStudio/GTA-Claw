@@ -1,0 +1,152 @@
+{
+  "description": "A streamed chat completion pins the complete event sequence: the assistant role chunk, every content delta, the stop chunk, the usage-only chunk requested through stream_options, and the [DONE] terminator.",
+  "feature_id": "interop.openai.chat-completions",
+  "request": {
+    "body": {
+      "messages": [
+        {
+          "content": "What is the weather in Berlin?",
+          "role": "user"
+        }
+      ],
+      "model": "openclaw",
+      "stream": true,
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "token": "operator-token"
+  },
+  "response": {
+    "events": [
+      {
+        "data": {
+          "choices": [
+            {
+              "delta": {
+                "role": "assistant"
+              },
+              "finish_reason": null,
+              "index": 0
+            }
+          ],
+          "created": "<created#1>",
+          "id": "<id:chatcmpl#1>",
+          "model": "openclaw",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "choices": [
+            {
+              "delta": {
+                "content": "Berlin "
+              },
+              "finish_reason": null,
+              "index": 0
+            }
+          ],
+          "created": "<created#1>",
+          "id": "<id:chatcmpl#1>",
+          "model": "openclaw",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "choices": [
+            {
+              "delta": {
+                "content": "is "
+              },
+              "finish_reason": null,
+              "index": 0
+            }
+          ],
+          "created": "<created#1>",
+          "id": "<id:chatcmpl#1>",
+          "model": "openclaw",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "choices": [
+            {
+              "delta": {
+                "content": "sunny."
+              },
+              "finish_reason": null,
+              "index": 0
+            }
+          ],
+          "created": "<created#1>",
+          "id": "<id:chatcmpl#1>",
+          "model": "openclaw",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "choices": [
+            {
+              "delta": {},
+              "finish_reason": "stop",
+              "index": 0
+            }
+          ],
+          "created": "<created#1>",
+          "id": "<id:chatcmpl#1>",
+          "model": "openclaw",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "choices": [],
+          "created": "<created#1>",
+          "id": "<id:chatcmpl#1>",
+          "model": "openclaw",
+          "object": "chat.completion.chunk",
+          "usage": {
+            "completion_tokens": 7,
+            "prompt_tokens": 11,
+            "total_tokens": 18
+          }
+        }
+      },
+      {
+        "data": "[DONE]"
+      }
+    ],
+    "headers": {
+      "cache-control": "no-cache",
+      "content-type": "text/event-stream; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "stream": {
+      "events": [
+        {
+          "text": "Berlin "
+        },
+        {
+          "text": "is "
+        },
+        {
+          "text": "sunny."
+        }
+      ],
+      "kind": "events",
+      "usage": {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "total_tokens": 18
+      }
+    }
+  }
+}

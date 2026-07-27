@@ -1,0 +1,29 @@
+{
+  "description": "An unauthenticated completion is refused with the OpenAI unauthorized envelope and never reaches the provider.",
+  "feature_id": "interop.openai.chat-completions",
+  "request": {
+    "body": {
+      "messages": [
+        {
+          "content": "hello",
+          "role": "user"
+        }
+      ],
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/chat/completions"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "Unauthorized",
+        "type": "unauthorized"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 401
+  }
+}

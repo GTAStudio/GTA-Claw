@@ -1,0 +1,26 @@
+{
+  "description": "A non-operator principal is refused even when it carries the operator scopes, and the refusal is worded identically to a missing scope so it leaks nothing about the principal.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "args": {},
+      "name": "echo"
+    },
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "node-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "missing scope: operator.write",
+        "type": "forbidden"
+      },
+      "ok": false
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 403
+  }
+}

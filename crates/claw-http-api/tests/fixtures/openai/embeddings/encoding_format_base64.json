@@ -1,0 +1,47 @@
+{
+  "description": "base64 encoding pins the little-endian float32 packing of the same vector the float path returns.",
+  "feature_id": "interop.openai.embeddings",
+  "request": {
+    "body": {
+      "encoding_format": "base64",
+      "input": "Berlin",
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/embeddings",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "data": [
+        {
+          "embedding": "AACAPgAAAL8AAEA/",
+          "index": 0,
+          "object": "embedding"
+        }
+      ],
+      "model": "openclaw",
+      "object": "list",
+      "usage": {
+        "prompt_tokens": 0,
+        "total_tokens": 0
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "embed": {
+      "kind": "vectors",
+      "vectors": [
+        [
+          0.25,
+          -0.5,
+          0.75
+        ]
+      ]
+    }
+  }
+}

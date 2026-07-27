@@ -1,0 +1,50 @@
+{
+  "description": "A single-input embedding request pins the list envelope, the indexed embedding object, the echoed model and the usage block.",
+  "feature_id": "interop.openai.embeddings",
+  "request": {
+    "body": {
+      "input": "Berlin",
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/embeddings",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "data": [
+        {
+          "embedding": [
+            0.25,
+            -0.5,
+            0.75
+          ],
+          "index": 0,
+          "object": "embedding"
+        }
+      ],
+      "model": "openclaw",
+      "object": "list",
+      "usage": {
+        "prompt_tokens": 0,
+        "total_tokens": 0
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "embed": {
+      "kind": "vectors",
+      "vectors": [
+        [
+          0.25,
+          -0.5,
+          0.75
+        ]
+      ]
+    }
+  }
+}
