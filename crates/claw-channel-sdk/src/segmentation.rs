@@ -135,6 +135,99 @@ impl Display for SegmentationError {
 
 impl Error for SegmentationError {}
 
+/// Lazy borrowed traversal of one message's canonical segments.
+///
+/// This iterator is the allocation-free transport path: ordinary segments are
+/// [`Cow::Borrowed`], no segment vector is built, and only a code fence that
+/// must be closed or reopened allocates its own string. It uses the exact same
+/// `next_segment` engine as [`segment_text`], so the eager and lazy APIs cannot
+/// diverge on limits, Unicode clusters, break preference, or fenced code.
+#[derive(Clone, Debug)]
+pub struct TextSegments<'a> {
+    remaining: &'a str,
+    limit: OutputLimit,
+    carry: Option<Fence<'a>>,
+    failed: bool,
+    single: bool,
+}
+
+impl<'a> TextSegments<'a> {
+    const fn new(text: &'a str, limit: OutputLimit, single: bool) -> Self {
+        Self {
+            remaining: text,
+            limit,
+            carry: None,
+            failed: false,
+            single,
+        }
+    }
+}
+
+impl<'a> Iterator for TextSegments<'a> {
+    type Item = Result<Cow<'a, str>, SegmentationError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed || self.remaining.is_empty() {
+            return None;
+        }
+        if self.single {
+            self.single = false;
+            let segment = self.remaining;
+            self.remaining = "";
+            return Some(Ok(Cow::Borrowed(segment)));
+        }
+        match next_segment(self.remaining, self.limit, self.carry) {
+            Ok(step) => {
+                self.remaining = step.rest;
+                self.carry = step.carry;
+                Some(Ok(step.segment))
+            }
+            Err(error) => {
+                self.failed = true;
+                Some(Err(error))
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.failed || self.remaining.is_empty() {
+            (0, Some(0))
+        } else if self.single {
+            (1, Some(1))
+        } else {
+            (1, None)
+        }
+    }
+}
+
+impl std::iter::FusedIterator for TextSegments<'_> {}
+
+/// Lazily segments `text` without allocating a segment collection.
+///
+/// Break order, Unicode cluster safety, fenced-code handling, and length units
+/// are exactly those documented on [`segment_text`]. The complete sequence is
+/// validated before this function returns, so a transport can consume it
+/// without discovering a deterministic segmentation failure after earlier
+/// segments have already been sent.
+///
+/// # Errors
+///
+/// Returns any [`SegmentationError`] the canonical engine finds. Validation uses
+/// no segment collection and ordinary text remains allocation-free.
+pub fn segment_text_iter(
+    text: &str,
+    limit: Option<OutputLimit>,
+) -> Result<TextSegments<'_>, SegmentationError> {
+    let Some(limit) = limit else {
+        return Err(SegmentationError::NoDeclaredLimit);
+    };
+    let single = limit.fits(text);
+    if !single {
+        validate_segments(text, limit)?;
+    }
+    Ok(TextSegments::new(text, limit, single))
+}
+
 /// Splits `text` into segments that each fit `limit`.
 ///
 /// # Break order
@@ -202,16 +295,7 @@ pub fn segment_text(
     limit: Option<OutputLimit>,
 ) -> Result<Vec<Cow<'_, str>>, SegmentationError> {
     let limit = limit.ok_or(SegmentationError::NoDeclaredLimit)?;
-    let mut segments = Vec::new();
-    let mut remaining = text;
-    let mut carry = None;
-    while !remaining.is_empty() {
-        let step = next_segment(remaining, limit, carry)?;
-        segments.push(step.segment);
-        carry = step.carry;
-        remaining = step.rest;
-    }
-    Ok(segments)
+    TextSegments::new(text, limit, false).collect()
 }
 
 /// One code fence, borrowed from the text that opened it.
@@ -300,6 +384,16 @@ fn next_segment<'a>(
             },
         });
     }
+}
+
+fn validate_segments(mut remaining: &str, limit: OutputLimit) -> Result<(), SegmentationError> {
+    let mut carry = None;
+    while !remaining.is_empty() {
+        let step = next_segment(remaining, limit, carry)?;
+        remaining = step.rest;
+        carry = step.carry;
+    }
+    Ok(())
 }
 
 /// Chooses the cut offset and reports the fence left open at it, if any.
@@ -654,6 +748,23 @@ mod tests {
         let text = "short enough";
         let produced = segment_text(text, Some(chars(64))).expect("segmentable text");
         assert!(matches!(produced.as_slice(), [Cow::Borrowed(borrowed)] if *borrowed == text));
+    }
+
+    #[test]
+    fn lazy_short_text_is_borrowed_without_a_segment_collection() {
+        let text = "short enough";
+        let mut produced = segment_text_iter(text, Some(chars(64))).expect("segmentable text");
+        assert!(matches!(produced.next(), Some(Ok(Cow::Borrowed(borrowed))) if borrowed == text));
+        assert_eq!(produced.next(), None);
+    }
+
+    #[test]
+    fn lazy_errors_are_reported_before_any_segment_can_be_consumed() {
+        let text = format!("{}\ne{}", "a".repeat(30), "\u{301}".repeat(25));
+        assert_eq!(
+            segment_text_iter(&text, Some(chars(20))).err(),
+            Some(SegmentationError::IndivisibleCluster)
+        );
     }
 
     #[test]

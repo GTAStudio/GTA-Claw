@@ -16,7 +16,7 @@ use serde_json::value::RawValue;
 use crate::bounded::BoundedQueue;
 use crate::diagnostics::{DiagnosticCode, DiagnosticLevel, DiagnosticSink, OperatorDiagnostic};
 use crate::transport::{MAX_PROVIDER_RESPONSE_BYTES, ProviderResponse, require_official_origin};
-use crate::{UnixClock, invalid_routing_identifier, segment_outbound_text};
+use crate::{UnixClock, invalid_routing_identifier, segment_outbound_text_iter};
 
 /// Delay before a disconnected gateway reconnects.
 pub const DISCORD_RECONNECT_DELAY: Duration = Duration::from_secs(3);
@@ -958,9 +958,7 @@ impl<T: DiscordTransport, C: UnixClock> Channel for DiscordChannel<T, C> {
             InvalidMessageReason::EmptyContent,
         ))?;
         let credential = credential.ok_or(ChannelError::Credential(SecretStoreError::NotFound))?;
-        let segments = segment_outbound_text("discord", text).map_err(|_| {
-            ChannelError::Configuration(ConfigurationError::InvalidAdapterConfiguration)
-        })?;
+        let segments = segment_outbound_text_iter("discord", text)?;
         let mut remote_message_id = None;
         credential
             .expose_for_origin(
@@ -970,6 +968,7 @@ impl<T: DiscordTransport, C: UnixClock> Channel for DiscordChannel<T, C> {
                 &self.rest_origin,
                 |bot_token| -> Result<(), ChannelError> {
                     for chunk in segments {
+                        let chunk = chunk?;
                         let response =
                             self.transport
                                 .create_message(&DiscordCreateMessageRequest {

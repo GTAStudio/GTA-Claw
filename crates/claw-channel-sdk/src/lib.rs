@@ -26,7 +26,9 @@ pub use lifecycle::{
     ChannelSession, ConnectionState, ConnectionStateMachine, ConnectionSupervisor,
     IllegalTransition, LifecycleEvent, LifecycleObserver,
 };
-pub use segmentation::{LengthUnit, OutputLimit, SegmentationError, segment_text};
+pub use segmentation::{
+    LengthUnit, OutputLimit, SegmentationError, TextSegments, segment_text, segment_text_iter,
+};
 
 /// Maximum number of attachment bytes accepted by the common message model.
 pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;

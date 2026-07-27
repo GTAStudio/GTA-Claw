@@ -17,7 +17,8 @@ use claw_channel_sdk::{
     Channel, ChannelCredential, ChannelError, ConfigurationError, CredentialBindingError,
     DeliveryAcknowledgement, DeliveryState, InboundMessage, InvalidMessageReason, LengthUnit,
     OutboundMessage, OutboundRetrySafety, OutputLimit, ProtocolErrorKind, SecretStoreError,
-    SegmentationError, TransportErrorKind, UnsupportedOperation, segment_text,
+    SegmentationError, TextSegments, TransportErrorKind, UnsupportedOperation, segment_text,
+    segment_text_iter,
 };
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
@@ -533,6 +534,26 @@ pub fn segment_outbound_text<'a>(
     Ok(segment_text(text, Some(limit))?)
 }
 
+/// Lazily yields the canonical outbound segments for one registered channel.
+///
+/// The iterator builds no segment vector and borrows ordinary text directly;
+/// only fenced-code continuation markers allocate. It shares the same engine
+/// and errors as [`segment_outbound_text`].
+///
+/// # Errors
+///
+/// - [`OutboundTextError::UnknownChannel`] when `channel_id` is unregistered.
+/// - [`OutboundTextError::NoProvenLimit`] when the channel has no declared
+///   output limit.
+pub fn segment_outbound_text_iter<'a>(
+    channel_id: &str,
+    text: &'a str,
+) -> Result<TextSegments<'a>, OutboundTextError> {
+    let limit = output_limit(channel_id).map_err(|_| OutboundTextError::UnknownChannel)?;
+    let limit = limit.ok_or(OutboundTextError::NoProvenLimit)?;
+    Ok(segment_text_iter(text, Some(limit))?)
+}
+
 /// Why outbound text could not be segmented for a registered channel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutboundTextError {
@@ -561,6 +582,17 @@ impl Error for OutboundTextError {}
 impl From<SegmentationError> for OutboundTextError {
     fn from(error: SegmentationError) -> Self {
         Self::Segmentation(error)
+    }
+}
+
+impl From<OutboundTextError> for ChannelError {
+    fn from(error: OutboundTextError) -> Self {
+        match error {
+            OutboundTextError::UnknownChannel | OutboundTextError::NoProvenLimit => {
+                Self::Configuration(ConfigurationError::InvalidAdapterConfiguration)
+            }
+            OutboundTextError::Segmentation(error) => error.into(),
+        }
     }
 }
 
@@ -926,14 +958,12 @@ where
         ))?;
         let credential = credential.ok_or(ChannelError::Credential(SecretStoreError::NotFound))?;
         match descriptor(self.channel_id).and_then(|entry| entry.output_limit) {
-            // Segmenting allocates, so a message that already fits keeps the
-            // original single-request path and borrows its text throughout.
-            Some(limit) if !limit.fits(text) => {
-                for segment in segment_text(text, Some(limit))? {
-                    self.post_text(segment.as_ref(), credential)?;
+            Some(limit) => {
+                for segment in segment_text_iter(text, Some(limit))? {
+                    self.post_text(segment?.as_ref(), credential)?;
                 }
             }
-            _ => self.post_text(text, credential)?,
+            None => self.post_text(text, credential)?,
         }
         Ok(DeliveryAcknowledgement {
             correlation_key: message.correlation_key.clone(),

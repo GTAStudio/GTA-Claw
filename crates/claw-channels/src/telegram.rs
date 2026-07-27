@@ -15,7 +15,7 @@ use serde::Deserialize;
 use crate::bounded::BoundedQueue;
 use crate::diagnostics::{DiagnosticCode, DiagnosticLevel, DiagnosticSink, OperatorDiagnostic};
 use crate::transport::{ProviderResponse, require_official_origin};
-use crate::{UnixClock, invalid_routing_identifier, segment_outbound_text};
+use crate::{UnixClock, invalid_routing_identifier, segment_outbound_text_iter};
 
 /// Telegram long-poll timeout sent to `getUpdates`.
 pub const TELEGRAM_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(25);
@@ -528,9 +528,7 @@ impl<T: TelegramTransport, C: UnixClock> Channel for TelegramChannel<T, C> {
             InvalidMessageReason::EmptyContent,
         ))?;
         let credential = credential.ok_or(ChannelError::Credential(SecretStoreError::NotFound))?;
-        let segments = segment_outbound_text("telegram", text).map_err(|_| {
-            ChannelError::Configuration(ConfigurationError::InvalidAdapterConfiguration)
-        })?;
+        let segments = segment_outbound_text_iter("telegram", text)?;
         let mut remote_message_id = None;
         credential
             .expose_for_origin(
@@ -540,6 +538,7 @@ impl<T: TelegramTransport, C: UnixClock> Channel for TelegramChannel<T, C> {
                 &self.origin,
                 |bot_token| -> Result<(), ChannelError> {
                     for chunk in segments {
+                        let chunk = chunk?;
                         let response = self.transport.send_message(&TelegramSendRequest {
                             bot_token,
                             chat_id,

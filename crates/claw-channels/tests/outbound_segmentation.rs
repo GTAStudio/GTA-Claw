@@ -5,18 +5,19 @@
 //! channel without such a file must refuse to segment rather than guess a
 //! bound and silently truncate somebody's message.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 
 use claw_channel_sdk::{
     Channel, ChannelCredential, ChannelError, CredentialBinding, CredentialKind, CredentialRequest,
-    LengthUnit, OutboundMessage, SegmentationError,
+    InvalidMessageReason, LengthUnit, OutboundMessage, SegmentationError,
 };
 use claw_channels::{
     ChannelCapability, ImplementationStatus, OutboundTextError, RoutingError, UnixClock,
     WebhookChannel, WebhookRequest, WebhookResponse, WebhookTransport, descriptor, output_limit,
-    registry, segment_outbound_text,
+    registry, segment_outbound_text, segment_outbound_text_iter,
 };
 
 /// Every limit this repository can prove, and nothing else.
@@ -146,6 +147,25 @@ fn declared_limits_count_utf16_code_units_like_the_legacy_call_sites() {
 }
 
 #[test]
+fn lazy_channel_segments_share_the_canonical_engine_without_a_vector() {
+    let text = "short reply";
+    let mut lazy = segment_outbound_text_iter("telegram", text).expect("proven limit");
+    assert!(matches!(
+        lazy.next(),
+        Some(Ok(Cow::Borrowed(borrowed))) if borrowed == text
+    ));
+    assert_eq!(lazy.next(), None);
+
+    let long = format!("{}\n{}", "alpha ".repeat(400), "omega ".repeat(400));
+    let eager = segment_outbound_text("discord", &long).expect("segmentable");
+    let lazy = segment_outbound_text_iter("discord", &long)
+        .expect("proven limit")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("segmentable");
+    assert_eq!(lazy, eager);
+}
+
+#[test]
 fn proven_limits_survive_compatibility_transport_promotion() {
     for id in ["msteams", "telegram", "whatsapp"] {
         let entry = descriptor(id).expect("registered channel");
@@ -233,6 +253,28 @@ fn segmentation_reports_text_it_cannot_split() {
             SegmentationError::IndivisibleCluster
         ))
     );
+}
+
+#[test]
+fn a_late_segmentation_error_posts_no_partial_prefix() {
+    let posts: PostedBodies = Rc::new(RefCell::new(Vec::new()));
+    let mut channel = WebhookChannel::new(
+        "discord",
+        "primary",
+        "room-1",
+        RecordingTransport::new("content", &posts),
+        FixedClock(42),
+    )
+    .expect("Discord webhook");
+    let text = format!("{}\ne{}", "a".repeat(2_000), "\u{301}".repeat(2_000));
+
+    assert_eq!(
+        channel.send_outbound(&outbound(&text), Some(&webhook_credential("discord"))),
+        Err(ChannelError::InvalidMessage(
+            InvalidMessageReason::UnsegmentableText
+        ))
+    );
+    assert!(posts.borrow().is_empty());
 }
 
 #[test]

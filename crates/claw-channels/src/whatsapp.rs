@@ -16,7 +16,7 @@ use serde::Deserialize;
 use crate::bounded::BoundedQueue;
 use crate::diagnostics::{DiagnosticCode, DiagnosticLevel, DiagnosticSink, OperatorDiagnostic};
 use crate::transport::{MAX_PROVIDER_RESPONSE_BYTES, ProviderResponse, require_official_origin};
-use crate::{UnixClock, invalid_routing_identifier, segment_outbound_text};
+use crate::{UnixClock, invalid_routing_identifier, segment_outbound_text_iter};
 
 /// Client-side timeout for one `WhatsApp` Graph API send.
 pub const WHATSAPP_SEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -638,9 +638,7 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
         pending: &mut PendingWhatsAppReply,
         credential: &ChannelCredential,
     ) -> Result<(), ChannelError> {
-        let segments = segment_outbound_text("whatsapp", &pending.text).map_err(|_| {
-            ChannelError::Configuration(ConfigurationError::InvalidAdapterConfiguration)
-        })?;
+        let segments = segment_outbound_text_iter("whatsapp", &pending.text)?;
         credential
             .expose_for_origin(
                 "whatsapp",
@@ -650,6 +648,7 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
                 |access_token| -> Result<(), ChannelError> {
                     for (index, chunk) in segments.into_iter().enumerate().skip(pending.next_chunk)
                     {
+                        let chunk = chunk?;
                         let response = match self.transport.send_text(&WhatsAppSendRequest {
                             access_token,
                             phone_number_id: &self.phone_number_id,
@@ -694,9 +693,7 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
         text: &str,
         credential: &ChannelCredential,
     ) -> Result<Option<String>, ChannelError> {
-        let segments = segment_outbound_text("whatsapp", text).map_err(|_| {
-            ChannelError::Configuration(ConfigurationError::InvalidAdapterConfiguration)
-        })?;
+        let segments = segment_outbound_text_iter("whatsapp", text)?;
         let mut remote_message_id = None;
         credential
             .expose_for_origin(
@@ -706,6 +703,7 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
                 &self.graph_origin,
                 |access_token| -> Result<(), ChannelError> {
                     for chunk in segments {
+                        let chunk = chunk?;
                         let response = self.transport.send_text(&WhatsAppSendRequest {
                             access_token,
                             phone_number_id: &self.phone_number_id,

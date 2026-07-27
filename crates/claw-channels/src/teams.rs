@@ -18,7 +18,7 @@ use crate::message_processor::{
 };
 use crate::routing::RoutingError;
 use crate::transport::MAX_PROVIDER_RESPONSE_BYTES;
-use crate::{invalid_routing_identifier, segment_outbound_text};
+use crate::{invalid_routing_identifier, segment_outbound_text_iter};
 
 /// Greeting sent for each newly added non-bot member.
 pub const TEAMS_GREETING: &str =
@@ -311,21 +311,22 @@ impl TeamsActivityHandler {
                 Ok(TeamsActivityOutcome::DeferredCommand(invocation))
             }
             DispatchOutcome::Reply { text, .. } => {
-                let chunks = segment_outbound_text("msteams", &text).map_err(|_| {
-                    TeamsActivityError::Channel(ChannelError::Configuration(
-                        ConfigurationError::InvalidAdapterConfiguration,
-                    ))
-                })?;
-                let chunk_count = chunks.len();
-                if self.actions.remaining_capacity() < chunk_count {
-                    self.actions.truncate(start_len);
-                    self.record_queue_full(diagnostics, Some(conversation_id));
-                    return Err(TeamsActivityError::ActionQueueFull);
-                }
+                let chunks =
+                    segment_outbound_text_iter("msteams", &text).map_err(ChannelError::from)?;
                 for chunk in chunks {
-                    self.actions
+                    let chunk = chunk.map_err(|error| {
+                        self.actions.truncate(start_len);
+                        TeamsActivityError::Channel(error.into())
+                    })?;
+                    if self
+                        .actions
                         .push(TeamsAction::Reply(chunk.into_owned()))
-                        .expect("capacity checked transactionally");
+                        .is_err()
+                    {
+                        self.actions.truncate(start_len);
+                        self.record_queue_full(diagnostics, Some(conversation_id));
+                        return Err(TeamsActivityError::ActionQueueFull);
+                    }
                 }
                 Ok(TeamsActivityOutcome::ActionsQueued {
                     count: self.actions.len() - start_len,
