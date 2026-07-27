@@ -24,6 +24,7 @@ impl Fixture {
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
         copy_directory(&upstream_root(), &root);
+        reset_mutable_transitions(&root);
         install_fixture_workspace(&root, "claw-gateway", &[("protocol", "tests/protocol.rs")]);
         install_transition_evidence(&root);
         Self { root }
@@ -333,6 +334,38 @@ fn mutate_json(path: &Path, mutate: impl FnOnce(&mut serde_json::Value)) {
         serde_json::to_vec_pretty(&value).expect("serialize JSON fixture"),
     )
     .expect("write JSON fixture");
+}
+
+fn reset_mutable_transitions(root: &Path) {
+    const BASELINE_DIFFERENCE: &str = "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline.";
+    for ledger in [
+        "gateway-core.json",
+        "official-integration.json",
+        "official-client-interop.json",
+    ] {
+        mutate_json(&root.join("ledgers").join(ledger), |document| {
+            for feature in document["features"]
+                .as_array_mut()
+                .expect("ledger features")
+            {
+                feature["status"] = serde_json::json!("unimplemented");
+                feature["acceptance_evidence"]["status"] = serde_json::json!("missing");
+                feature["acceptance_evidence"]["artifacts"] = serde_json::json!([]);
+                feature["known_differences"] = serde_json::json!([BASELINE_DIFFERENCE]);
+                feature
+                    .as_object_mut()
+                    .expect("feature object")
+                    .remove("implementation_pointers");
+            }
+        });
+    }
+    mutate_json(&root.join("manifest.json"), |manifest| {
+        manifest["evidence_policy"]["status_totals"] = serde_json::json!({
+            "unimplemented": 47,
+            "partial": 0,
+            "implemented": 0
+        });
+    });
 }
 
 fn enable_transition_policy(root: &Path, unimplemented: usize, partial: usize, implemented: usize) {
@@ -1477,17 +1510,9 @@ fn renamed_inventory_id_is_rejected_as_drift() {
 fn raised_ledger_status_without_evidence_is_rejected() {
     let fixture = Fixture::copy_upstream();
     let path = fixture.root.join("ledgers").join("gateway-core.json");
-    let source = fs::read_to_string(&path).expect("read ledger");
-    assert_eq!(source.matches("\"status\":  \"unimplemented\"").count(), 16);
-    fs::write(
-        &path,
-        source.replacen(
-            "\"status\":  \"unimplemented\"",
-            "\"status\":  \"implemented\"",
-            1,
-        ),
-    )
-    .expect("mutate ledger");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["status"] = serde_json::json!("implemented");
+    });
 
     let error = load_error(&fixture.root);
     assert_eq!(error.code(), ViolationCode::LedgerEvidence);
@@ -1502,7 +1527,7 @@ fn raised_ledger_status_without_evidence_is_rejected() {
 #[test]
 fn legitimate_ledger_transitions_do_not_require_frozen_hashes() {
     let fixture = Fixture::copy_upstream();
-    enable_transition_policy(&fixture.root, 37, 1, 9);
+    enable_transition_policy(&fixture.root, 45, 1, 1);
     let tests = fixture
         .root
         .join("crates")
@@ -1599,7 +1624,7 @@ fn legacy_schema_cannot_authorize_a_ledger_transition() {
 #[test]
 fn transition_manifest_policy_and_status_totals_are_accepted() {
     let fixture = Fixture::copy_upstream();
-    enable_transition_policy(&fixture.root, 39, 0, 8);
+    enable_transition_policy(&fixture.root, 47, 0, 0);
 
     let contract = Contract::load(&fixture.root).expect("load transition manifest");
     assert_eq!(contract.ledgers().len(), 3);
@@ -1991,13 +2016,9 @@ fn baseline_artifact_retains_an_independent_frozen_hash() {
 fn malformed_ledger_reports_the_precise_json_path() {
     let fixture = Fixture::copy_upstream();
     let path = fixture.root.join("ledgers").join("gateway-core.json");
-    let source = fs::read_to_string(&path).expect("read ledger");
-    assert_eq!(source.matches("\"tier\":  \"tier_1\"").count(), 16);
-    fs::write(
-        &path,
-        source.replacen("\"tier\":  \"tier_1\"", "\"tier\":  \"tier_9\"", 1),
-    )
-    .expect("mutate ledger");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["tier"] = serde_json::json!("tier_9");
+    });
 
     let error = load_error(&fixture.root);
     assert_eq!(error.code(), ViolationCode::JsonSchema);

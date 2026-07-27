@@ -104,9 +104,9 @@
                             "every_artifact_names_an_enabled_rust_test":  true,
                             "implementation_pointers_are_not_acceptance_evidence":  true,
                             "status_totals":  {
-                                                  "unimplemented":  39,
-                                                  "partial":  0,
-                                                  "implemented":  8
+                                                  "unimplemented":  33,
+                                                  "partial":  2,
+                                                  "implemented":  12
                                               }
                         }
 }

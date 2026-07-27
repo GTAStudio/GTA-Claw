@@ -394,6 +394,12 @@ HTTPS_PROXY=http://127.0.0.1:7890
 HTTP_PROXY=http://127.0.0.1:7890
 ```
 
+Outbound HTTPS webhooks resolve and validate the destination locally, then use the exact
+validated public IP as the proxy `CONNECT` authority. A hostname-only enterprise proxy
+may reject that IP-literal authority. GTA-Claw reports this as a policy-pinned proxy
+rejection and does not retry with the hostname, because doing so would delegate DNS and
+destination policy to the proxy.
+
 ---
 
 ## 7. FAQ
@@ -417,6 +423,15 @@ Set multiple `ENABLE_xxx=true` flags with their corresponding tokens in the conf
 1. Verify `TELEGRAM_BOT_TOKEN` is correct
 2. Check proxy settings (a proxy is needed to reach the Telegram API from some regions)
 3. Check logs for connection errors
+
+### Q: Why does local node discovery report mDNS as unavailable?
+GTA-Claw does not treat a successfully allocated mDNS daemon as proof that discovery
+works. Before browsing or advertising, it must observe a real IPv4 multicast query and
+response through the local network stack, then repeat that observation when the
+capability is consumed. Discovery records can still resolve both IPv4 and IPv6 endpoints.
+A probe timeout or later interface removal is reported as explicit unavailability, not
+as an empty peer list. Check multicast firewall policy and the routing-selected active
+interface; GTA-Claw will not convert this condition into "zero peers."
 
 ### Q: What AI models are supported?
 
