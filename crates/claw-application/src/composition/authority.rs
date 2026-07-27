@@ -712,7 +712,7 @@ mod tests {
                     .transition_to(LifecyclePhase::Draining)
                     .expect("running may drain");
 
-                Ok(Authorization::for_duration(Duration::from_secs(60)))
+                Ok(Authorization::for_duration(Duration::from_mins(1)))
             })
         }
     }
@@ -851,7 +851,7 @@ mod tests {
         let lifecycle = running_lifecycle();
         let clock = Arc::new(ManualClock::default());
         let issuer = GrantIssuer::new(
-            Arc::new(SwitchableAuthority::new(Duration::from_secs(3_600))),
+            Arc::new(SwitchableAuthority::new(Duration::from_hours(1))),
             Arc::clone(&clock) as Arc<dyn Clock>,
             lifecycle.epoch_gate(),
             Duration::from_millis(250),
@@ -877,10 +877,10 @@ mod tests {
         let mut lifecycle = running_lifecycle();
         let clock = Arc::new(ManualClock::default());
         let issuer = GrantIssuer::new(
-            Arc::new(SwitchableAuthority::new(Duration::from_secs(3_600))),
+            Arc::new(SwitchableAuthority::new(Duration::from_hours(1))),
             Arc::clone(&clock) as Arc<dyn Clock>,
             lifecycle.epoch_gate(),
-            Duration::from_secs(3_600),
+            Duration::from_hours(1),
         );
 
         let grant = issuer

@@ -415,6 +415,14 @@ pub trait ResourceGate {
     ///
     /// This consumes grant budget exactly as the initial request did, so a
     /// use-bounded grant cannot be stretched across extra resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PermissionError`] whose [`DenialReason`] names the refusal:
+    /// the capability is not granted, the grant has expired, its use budget is
+    /// exhausted, the resource is outside the grant's scope, or approval is
+    /// required and was not given. Implementations fail closed, so a broker
+    /// that cannot answer denies.
     fn authorize(&self, resource: &Resource) -> Result<GrantId, PermissionError>;
 }
 
@@ -458,6 +466,14 @@ impl<'a> Authorization<'a> {
     /// A tool must call this before touching any resource other than the one
     /// its [`crate::tool::Tool::resource`] derived, because only that first
     /// resource was authorized before execution began.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PermissionError`] whose [`DenialReason`] names the refusal:
+    /// the capability is not granted for the new resource, the grant expired
+    /// while the invocation was in flight, its use budget is exhausted, or the
+    /// resource falls outside the grant's scope. A refusal here aborts the
+    /// invocation; the tool must not fall back to the original resource.
     pub fn authorize(&self, resource: &Resource) -> Result<GrantId, PermissionError> {
         self.gate.authorize(resource)
     }

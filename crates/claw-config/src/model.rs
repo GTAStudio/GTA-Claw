@@ -39,6 +39,13 @@ pub struct SecretRef(String);
 
 impl SecretRef {
     /// Creates a reference to an environment variable without retaining its value.
+    ///
+    /// # Errors
+    ///
+    /// Returns the message `"environment name must match [A-Za-z_][A-Za-z0-9_]*"`
+    /// when `name` is empty, starts with a digit, or contains any character
+    /// outside that set. The rejected name is deliberately not echoed back,
+    /// because callers commonly pass the secret itself here by mistake.
     pub fn environment(name: impl Into<String>) -> Result<Self, &'static str> {
         let name = name.into();
         if !is_environment_name(&name) {
@@ -48,6 +55,20 @@ impl SecretRef {
     }
 
     /// Parses a persisted reference. Plaintext values are rejected.
+    ///
+    /// # Errors
+    ///
+    /// An `env:` value is forwarded to [`Self::environment`] and fails with its
+    /// message when the name is malformed. Any other value must be a
+    /// `keyring://`, `service://`, or `fd://` platform reference; anything else,
+    /// including bare plaintext, fails with
+    /// `"only env:<NAME> secret references are supported"`. Platform references
+    /// are additionally rejected when they contain `?`, `#`, `@`, `%`, control
+    /// characters, or surrounding whitespace, when a `keyring`/`service`
+    /// reference is not exactly `<service>/<account>` with each part 1..=128
+    /// alphanumeric-leading characters, or when an `fd` reference is not a
+    /// canonical non-negative decimal descriptor. The value is never included in
+    /// the message, because it may be the secret.
     pub fn parse(value: impl Into<String>) -> Result<Self, &'static str> {
         let value = value.into();
         if let Some(name) = value.strip_prefix("env:") {
@@ -172,10 +193,25 @@ pub trait PlatformSecretStore {
     type Error: Error + Send + Sync + 'static;
 
     /// Stores one value under a non-secret logical label.
+    ///
+    /// # Errors
+    ///
+    /// Returns the implementation's [`Self::Error`] when the platform backend
+    /// refuses the write, for example because the keychain is locked, the
+    /// caller is not authorized, or `label` collides with an existing entry.
+    /// Implementations must not include the plaintext in that error.
     fn store(&mut self, label: &str, secret: SecretMaterial<'_>) -> Result<SecretRef, Self::Error>;
 }
 
 /// Stores secret material without retaining it in configuration.
+///
+/// # Errors
+///
+/// Returns [`SecretStoreError::InvalidLabel`] when `label` is empty, longer than
+/// 128 bytes, or contains anything other than ASCII alphanumerics, `.`, `_`, and
+/// `-`; the backend is not called in that case. Returns
+/// [`SecretStoreError::Backend`] wrapping the platform failure when the store
+/// itself rejects the write. Neither variant carries `plaintext`.
 pub fn store_secret<S: PlatformSecretStore>(
     store: &mut S,
     label: &str,
@@ -389,7 +425,7 @@ impl ChannelsConfig {
         &self.discord
     }
 
-    /// Returns WhatsApp settings.
+    /// Returns `WhatsApp` settings.
     #[must_use]
     pub const fn whatsapp(&self) -> &WhatsappConfig {
         &self.whatsapp
@@ -451,7 +487,7 @@ impl DiscordConfig {
     }
 }
 
-/// WhatsApp channel settings.
+/// `WhatsApp` channel settings.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WhatsappConfig {
     pub(crate) enabled: bool,

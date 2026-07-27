@@ -167,6 +167,10 @@ impl SessionState {
 
     /// Resolves one transition without mutating any runtime state.
     ///
+    /// The table is grouped by target state: every arm lists the complete set
+    /// of `(state, event)` pairs that lands in it, and the pairs are disjoint,
+    /// so the arms may be read in any order.
+    ///
     /// # Errors
     ///
     /// Returns [`IllegalTransition`] when the contract forbids `event` in this state.
@@ -175,50 +179,56 @@ impl SessionState {
         event: SessionEvent,
     ) -> Result<SessionTransition, IllegalTransition> {
         use SessionEvent as E;
-        use SessionState as S;
 
         let target = match (self, event) {
-            (S::Draft, E::Enqueue) => S::Queued,
-            (S::Queued, E::Start) => S::Starting,
-            (S::Starting, E::Stream) => S::Running,
-            (S::Running, E::RequestApproval) => S::WaitingForApproval,
-            (S::WaitingForApproval, E::ResolveApproval) => S::Running,
-            (S::Running, E::AskQuestion) => S::WaitingForAnswer,
-            (S::WaitingForAnswer, E::ProvideAnswer) => S::Running,
+            (Self::Draft, E::Enqueue) | (Self::Blocked, E::Unblock) => Self::Queued,
+            (Self::Queued, E::Start) => Self::Starting,
+            (Self::Starting, E::Stream)
+            | (Self::WaitingForApproval, E::ResolveApproval)
+            | (Self::WaitingForAnswer, E::ProvideAnswer) => Self::Running,
+            (Self::Running, E::RequestApproval) => Self::WaitingForApproval,
+            (Self::Running, E::AskQuestion) => Self::WaitingForAnswer,
             (
-                S::Queued | S::Starting | S::Running | S::WaitingForApproval | S::WaitingForAnswer,
+                Self::Queued
+                | Self::Starting
+                | Self::Running
+                | Self::WaitingForApproval
+                | Self::WaitingForAnswer,
                 E::Pause,
-            ) => S::Paused,
-            (S::Paused, E::Resume) => return Ok(SessionTransition::RestorePrePause),
+            ) => Self::Paused,
+            (Self::Paused, E::Resume) => return Ok(SessionTransition::RestorePrePause),
             (
-                S::Queued | S::Starting | S::Running | S::WaitingForApproval | S::WaitingForAnswer,
+                Self::Queued
+                | Self::Starting
+                | Self::Running
+                | Self::WaitingForApproval
+                | Self::WaitingForAnswer,
                 E::Block,
-            ) => S::Blocked,
-            (S::Blocked, E::Unblock) => S::Queued,
-            (S::Running, E::Complete) => S::Completed,
-            (S::Running, E::CompleteWithChanges) => S::CompletedWithChanges,
+            ) => Self::Blocked,
+            (Self::Running, E::Complete) => Self::Completed,
+            (Self::Running, E::CompleteWithChanges) => Self::CompletedWithChanges,
             (
-                S::Draft
-                | S::Queued
-                | S::Starting
-                | S::Running
-                | S::WaitingForApproval
-                | S::WaitingForAnswer
-                | S::Paused
-                | S::Blocked,
+                Self::Draft
+                | Self::Queued
+                | Self::Starting
+                | Self::Running
+                | Self::WaitingForApproval
+                | Self::WaitingForAnswer
+                | Self::Paused
+                | Self::Blocked,
                 E::Cancel,
-            ) => S::Cancelled,
+            ) => Self::Cancelled,
             (
-                S::Draft
-                | S::Queued
-                | S::Starting
-                | S::Running
-                | S::WaitingForApproval
-                | S::WaitingForAnswer
-                | S::Paused
-                | S::Blocked,
+                Self::Draft
+                | Self::Queued
+                | Self::Starting
+                | Self::Running
+                | Self::WaitingForApproval
+                | Self::WaitingForAnswer
+                | Self::Paused
+                | Self::Blocked,
                 E::Fail,
-            ) => S::Failed,
+            ) => Self::Failed,
             _ => return Err(IllegalTransition { from: self, event }),
         };
 

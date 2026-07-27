@@ -62,8 +62,9 @@ pub enum LayeredConfigError {
 impl Display for LayeredConfigError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io { layer, error } => write!(formatter, "{layer:?} config: {error}"),
-            Self::Layer { layer, error } => write!(formatter, "{layer:?} config: {error}"),
+            Self::Io { layer, error } | Self::Layer { layer, error } => {
+                write!(formatter, "{layer:?} config: {error}")
+            }
             Self::Environment(error) => write!(formatter, "environment config: {error}"),
             Self::Result(error) => write!(formatter, "resolved config: {error}"),
         }
@@ -108,6 +109,12 @@ impl ConfigLayers {
     }
 
     /// Reads and sets a partial machine-wide JSON5 layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayeredConfigError::Io`] tagged [`ConfigLayerKind::System`]
+    /// when `path` cannot be opened or read, or does not hold UTF-8. The file is
+    /// not parsed here; malformed JSON5 surfaces from [`Self::resolve`].
     pub fn with_system_file(mut self, path: impl AsRef<Path>) -> Result<Self, LayeredConfigError> {
         self.system = Some(read_layer(path.as_ref(), ConfigLayerKind::System)?);
         Ok(self)
@@ -121,6 +128,12 @@ impl ConfigLayers {
     }
 
     /// Reads and sets a partial per-user JSON5 layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayeredConfigError::Io`] tagged [`ConfigLayerKind::User`] when
+    /// `path` cannot be opened or read, or does not hold UTF-8. The file is not
+    /// parsed here; malformed JSON5 surfaces from [`Self::resolve`].
     pub fn with_user_file(mut self, path: impl AsRef<Path>) -> Result<Self, LayeredConfigError> {
         self.user = Some(read_layer(path.as_ref(), ConfigLayerKind::User)?);
         Ok(self)
@@ -134,6 +147,12 @@ impl ConfigLayers {
     }
 
     /// Reads and sets a partial workspace/project JSON5 layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayeredConfigError::Io`] tagged [`ConfigLayerKind::Workspace`]
+    /// when `path` cannot be opened or read, or does not hold UTF-8. The file is
+    /// not parsed here; malformed JSON5 surfaces from [`Self::resolve`].
     pub fn with_workspace_file(
         mut self,
         path: impl AsRef<Path>,
@@ -165,6 +184,16 @@ impl ConfigLayers {
     }
 
     /// Resolves defaults, system, user, workspace, environment, then CLI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayeredConfigError::Layer`] when a partial layer is not JSON5
+    /// or does not parse to an object, [`LayeredConfigError::Environment`] when
+    /// a supplied legacy variable fails its frozen conversion or conflicts with
+    /// an alias, and [`LayeredConfigError::Result`] when the merged document
+    /// cannot be re-encoded or fails whole-document validation, for example
+    /// because a higher-precedence layer overrode a field with an out-of-range
+    /// value.
     pub fn resolve(&self) -> Result<ResolvedConfig, LayeredConfigError> {
         let mut merged = serde_json::to_value(EnvelopeWire::default())
             .map_err(ConfigError::from_serialize)
@@ -196,22 +225,6 @@ impl ConfigLayers {
             applied_layers.push(ConfigLayerKind::Environment);
         }
 
-        fn decode_envelope(value: &Value, source_name: &str) -> Result<EnvelopeWire, ConfigError> {
-            let bytes = serde_json::to_vec(value).map_err(ConfigError::from_serialize)?;
-            let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
-            serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
-                let path = error.path().to_string();
-                ConfigError::Decode {
-                    source_name: source_name.to_owned(),
-                    path: if path.is_empty() {
-                        "<root>".to_owned()
-                    } else {
-                        path
-                    },
-                    message: error.inner().to_string(),
-                }
-            })
-        }
         if let Some(source) = &self.command_line {
             merge_layer(&mut merged, source, ConfigLayerKind::CommandLine)?;
             applied_layers.push(ConfigLayerKind::CommandLine);
@@ -226,6 +239,23 @@ impl ConfigLayers {
             applied_layers,
         })
     }
+}
+
+fn decode_envelope(value: &Value, source_name: &str) -> Result<EnvelopeWire, ConfigError> {
+    let bytes = serde_json::to_vec(value).map_err(ConfigError::from_serialize)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
+        let path = error.path().to_string();
+        ConfigError::Decode {
+            source_name: source_name.to_owned(),
+            path: if path.is_empty() {
+                "<root>".to_owned()
+            } else {
+                path
+            },
+            message: error.inner().to_string(),
+        }
+    })
 }
 
 fn read_layer(path: &Path, layer: ConfigLayerKind) -> Result<String, LayeredConfigError> {

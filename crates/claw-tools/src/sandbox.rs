@@ -223,9 +223,16 @@ pub struct Sandbox {
 
 impl Sandbox {
     /// Canonicalizes and adopts an existing directory as the workspace root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::NotFound`] when `root` does not exist,
+    /// [`SandboxError::PermissionDenied`] when the operating system refuses to
+    /// canonicalize it, and [`SandboxError::RootNotADirectory`] when the
+    /// canonical root is a file or any other non-directory object.
     pub fn new(root: &Path, limits: SandboxLimits) -> Result<Self, SandboxError> {
-        let canonical = std::fs::canonicalize(root).map_err(map_io)?;
-        let metadata = std::fs::symlink_metadata(&canonical).map_err(map_io)?;
+        let canonical = std::fs::canonicalize(root).map_err(|error| map_io(&error))?;
+        let metadata = std::fs::symlink_metadata(&canonical).map_err(|error| map_io(&error))?;
         if !metadata.is_dir() {
             return Err(SandboxError::RootNotADirectory);
         }
@@ -248,14 +255,46 @@ impl Sandbox {
     }
 
     /// Validates caller-supplied text into a normalized relative path.
+    ///
+    /// This is lexical validation only; nothing is touched on disk.
+    ///
+    /// # Errors
+    ///
+    /// Names the first rule the input breaks:
+    /// [`SandboxError::EmptyPath`] for an empty string,
+    /// [`SandboxError::PathTooLong`] or [`SandboxError::ComponentTooLong`] past
+    /// the declared byte bounds, [`SandboxError::TooManyComponents`] past
+    /// [`SandboxLimits::max_path_components`],
+    /// [`SandboxError::AbsolutePathForbidden`] for absolute, UNC,
+    /// drive-qualified and `~`-relative forms,
+    /// [`SandboxError::ParentTraversalForbidden`] for a `..` component,
+    /// [`SandboxError::CurrentDirectoryComponentForbidden`] for a `.`
+    /// component, [`SandboxError::EmptyComponent`] for a repeated separator,
+    /// [`SandboxError::ControlCharacter`] or [`SandboxError::InvalidCharacter`]
+    /// for control and wildcard characters,
+    /// [`SandboxError::AlternateDataStreamForbidden`] for a `:`,
+    /// [`SandboxError::ReservedDeviceName`] for a Windows device name, and
+    /// [`SandboxError::TrailingDotOrSpace`] for a component that starts or ends
+    /// with a space or ends with a dot.
     pub fn relative(&self, input: &str) -> Result<RelativePath, SandboxError> {
         parse_relative(input, self.limits)
     }
 
     /// Resolves an existing directory inside the root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::NotFound`] when a component does not exist,
+    /// [`SandboxError::SymlinkForbidden`] when any component including the
+    /// final one is a link, junction or other reparse point,
+    /// [`SandboxError::EscapesRoot`] when the canonical path leaves the
+    /// workspace root, [`SandboxError::CaseMismatch`] when it stays inside the
+    /// root but under different casing, and [`SandboxError::NotADirectory`]
+    /// when the path exists but is not a directory.
     pub fn resolve_directory(&self, path: &RelativePath) -> Result<ResolvedPath, SandboxError> {
         let resolved = self.resolve_existing(path)?;
-        let metadata = std::fs::symlink_metadata(&resolved.absolute).map_err(map_io)?;
+        let metadata =
+            std::fs::symlink_metadata(&resolved.absolute).map_err(|error| map_io(&error))?;
         if !metadata.is_dir() {
             return Err(SandboxError::NotADirectory);
         }
@@ -263,9 +302,20 @@ impl Sandbox {
     }
 
     /// Resolves an existing regular file inside the root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::NotFound`] when a component does not exist,
+    /// [`SandboxError::SymlinkForbidden`] when any component is a link,
+    /// junction or other reparse point, [`SandboxError::NotADirectory`] when an
+    /// intermediate component is not a directory, [`SandboxError::EscapesRoot`]
+    /// or [`SandboxError::CaseMismatch`] when the canonical path is not exactly
+    /// the requested path below the root, and [`SandboxError::NotAFile`] when
+    /// the path exists but is not a regular file.
     pub fn resolve_file(&self, path: &RelativePath) -> Result<ResolvedPath, SandboxError> {
         let resolved = self.resolve_existing(path)?;
-        let metadata = std::fs::symlink_metadata(&resolved.absolute).map_err(map_io)?;
+        let metadata =
+            std::fs::symlink_metadata(&resolved.absolute).map_err(|error| map_io(&error))?;
         if !metadata.is_file() {
             return Err(SandboxError::NotAFile);
         }
@@ -293,6 +343,19 @@ impl Sandbox {
     /// invalidated the instant this returns, so nothing may act on it without
     /// going back through [`Sandbox::write_file`], which re-establishes the
     /// pinned ancestor chain before it opens anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::EmptyPath`] when `path` names the root itself,
+    /// [`SandboxError::NotFound`] when the parent directory does not exist,
+    /// [`SandboxError::SymlinkForbidden`] when the parent chain or an existing
+    /// leaf is a link, junction or other reparse point,
+    /// [`SandboxError::CaseCollision`] when a differently-cased name already
+    /// exists in the parent, [`SandboxError::AlreadyExists`] when the leaf
+    /// exists and `mode` is [`WriteMode::CreateNew`],
+    /// [`SandboxError::NotAFile`] when the leaf exists as a directory, and
+    /// [`SandboxError::EscapesRoot`] or [`SandboxError::CaseMismatch`] when an
+    /// existing leaf does not canonicalize back onto the requested path.
     pub fn resolve_for_write(
         &self,
         path: &RelativePath,
@@ -340,7 +403,7 @@ impl Sandbox {
                 true
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-            Err(error) => return Err(map_io(error)),
+            Err(error) => return Err(map_io(&error)),
         };
         Ok(PreparedWrite {
             pin,
@@ -350,10 +413,18 @@ impl Sandbox {
     }
 
     /// Reads an existing file, refusing links and oversized content.
+    ///
+    /// # Errors
+    ///
+    /// Returns everything [`Sandbox::resolve_file`] and
+    /// [`Sandbox::open_no_follow`] can return, plus
+    /// [`SandboxError::FileTooLarge`] when the file holds more than
+    /// [`SandboxLimits::max_file_bytes`] bytes, either at the time it was
+    /// measured or while it was being read.
     pub fn read_file(&self, path: &RelativePath) -> Result<Vec<u8>, SandboxError> {
         let resolved = self.resolve_file(path)?;
         let mut file = self.open_no_follow(&resolved)?;
-        let length = file.metadata().map_err(map_io)?.len();
+        let length = file.metadata().map_err(|error| map_io(&error))?.len();
         if length > self.limits.max_file_bytes {
             return Err(SandboxError::FileTooLarge);
         }
@@ -363,7 +434,7 @@ impl Sandbox {
         let read = Read::by_ref(&mut file)
             .take(limit)
             .read_to_end(&mut buffer)
-            .map_err(map_io)?;
+            .map_err(|error| map_io(&error))?;
         if u64::try_from(read).unwrap_or(u64::MAX) > self.limits.max_file_bytes {
             return Err(SandboxError::FileTooLarge);
         }
@@ -384,6 +455,15 @@ impl Sandbox {
     /// access to create for itself. It is refused before any content is
     /// written, but the cleanup path removes the in-root name rather than the
     /// file that was actually created, so that empty file can persist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::FileTooLarge`] when `content` is longer than
+    /// [`SandboxLimits::max_file_bytes`], everything
+    /// [`Sandbox::resolve_for_write`] can return, and
+    /// [`SandboxError::RaceDetected`] when the opened handle turns out not to
+    /// be the file the validated path names. On every one of these paths the
+    /// target is left untruncated and unwritten.
     pub fn write_file(
         &self,
         path: &RelativePath,
@@ -405,7 +485,9 @@ impl Sandbox {
             }
         }
         apply_no_follow(&mut options);
-        let mut file = options.open(&prepared.absolute).map_err(map_io)?;
+        let mut file = options
+            .open(&prepared.absolute)
+            .map_err(|error| map_io(&error))?;
         let verified = verify_handle_is_not_reparse_point(&file)
             .and_then(|()| self.verify_canonical(&prepared.absolute, &path.components))
             .and_then(|()| prepared.pin.verify())
@@ -418,9 +500,9 @@ impl Sandbox {
             return Err(error);
         }
         // The first mutation of the target happens here, after every check.
-        file.set_len(0).map_err(map_io)?;
-        file.write_all(content).map_err(map_io)?;
-        file.flush().map_err(map_io)?;
+        file.set_len(0).map_err(|error| map_io(&error))?;
+        file.write_all(content).map_err(|error| map_io(&error))?;
+        file.flush().map_err(|error| map_io(&error))?;
         Ok(ResolvedPath {
             relative: path.clone(),
             absolute: prepared.absolute,
@@ -428,6 +510,17 @@ impl Sandbox {
     }
 
     /// Enumerates one directory without following links.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::NotFound`] when the directory does not exist,
+    /// [`SandboxError::NotADirectory`] when a component on the path is not a
+    /// directory, [`SandboxError::SymlinkForbidden`] when one is a link,
+    /// junction or other reparse point, [`SandboxError::DirectoryTooLarge`]
+    /// when the directory holds more than
+    /// [`SandboxLimits::max_directory_entries`] entries, and
+    /// [`SandboxError::RaceDetected`] when a pinned directory changed identity
+    /// while it was being enumerated.
     pub fn read_directory(&self, path: &RelativePath) -> Result<Vec<DirectoryEntry>, SandboxError> {
         // The directory is enumerated through its own pinned handle, so the
         // listing cannot be redirected to another directory after the
@@ -454,6 +547,14 @@ impl Sandbox {
 
     /// Walks the tree below `path`, returning files only and never crossing a
     /// link, junction, or other reparse point.
+    ///
+    /// # Errors
+    ///
+    /// Returns everything [`Sandbox::read_directory`] can return for the
+    /// starting directory or for any directory below it, plus
+    /// [`SandboxError::DirectoryTooLarge`] when the walk visits more than
+    /// [`SandboxLimits::max_walked_files`] entries. A subtree deeper than
+    /// [`SandboxLimits::max_path_components`] is skipped rather than refused.
     pub fn walk_files(&self, path: &RelativePath) -> Result<Vec<RelativePath>, SandboxError> {
         let mut queue = vec![path.clone()];
         let mut files = Vec::new();
@@ -480,6 +581,18 @@ impl Sandbox {
     /// The ancestor chain is pinned again here rather than trusted from the
     /// earlier resolution, and re-verified after the handle exists, so the file
     /// behind the handle is provably the file that was validated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::NotAFile`] when `resolved` names the workspace
+    /// root itself, [`SandboxError::NotFound`] or
+    /// [`SandboxError::PermissionDenied`] when the open fails,
+    /// [`SandboxError::SymlinkForbidden`] when an ancestor or the final
+    /// component is a link, junction or other reparse point,
+    /// [`SandboxError::EscapesRoot`] or [`SandboxError::CaseMismatch`] when the
+    /// path no longer canonicalizes onto itself, and
+    /// [`SandboxError::RaceDetected`] when an ancestor or the opened handle
+    /// stopped matching the validated path between check and use.
     pub fn open_no_follow(&self, resolved: &ResolvedPath) -> Result<File, SandboxError> {
         let components = &resolved.relative.components;
         let Some(leaf) = components.last() else {
@@ -490,7 +603,7 @@ impl Sandbox {
         let mut options = OpenOptions::new();
         options.read(true);
         apply_no_follow(&mut options);
-        let file = options.open(&absolute).map_err(map_io)?;
+        let file = options.open(&absolute).map_err(|error| map_io(&error))?;
         verify_handle_is_not_reparse_point(&file)?;
         self.verify_canonical(&absolute, components)?;
         pin.verify()?;
@@ -517,7 +630,7 @@ impl Sandbox {
         let mut absolute = self.root.clone();
         for component in components {
             absolute.push(component);
-            let metadata = std::fs::symlink_metadata(&absolute).map_err(map_io)?;
+            let metadata = std::fs::symlink_metadata(&absolute).map_err(|error| map_io(&error))?;
             if is_link_like(&metadata) {
                 return Err(SandboxError::SymlinkForbidden);
             }
@@ -555,7 +668,7 @@ impl Sandbox {
         let last = path.components.len() - 1;
         for (index, component) in path.components.iter().enumerate() {
             absolute.push(component);
-            let metadata = std::fs::symlink_metadata(&absolute).map_err(map_io)?;
+            let metadata = std::fs::symlink_metadata(&absolute).map_err(|error| map_io(&error))?;
             if is_link_like(&metadata) {
                 return Err(SandboxError::SymlinkForbidden);
             }
@@ -571,7 +684,7 @@ impl Sandbox {
     }
 
     fn verify_canonical(&self, absolute: &Path, components: &[String]) -> Result<(), SandboxError> {
-        let canonical = std::fs::canonicalize(absolute).map_err(map_io)?;
+        let canonical = std::fs::canonicalize(absolute).map_err(|error| map_io(&error))?;
         let mut expected = self.root.clone();
         for component in components {
             expected.push(component);
@@ -655,9 +768,9 @@ fn identity_of(metadata: &std::fs::Metadata) -> DirectoryIdentity {
 #[derive(Debug)]
 struct PinnedDirectory {
     path: PathBuf,
-    /// Held open for the whole check-and-use window. It is never read: its
-    /// value is that the operating system knows it exists.
-    #[allow(dead_code)]
+    /// Held open for the whole check-and-use window, and enumerated through
+    /// directly by [`list_pinned_names`] on Unix. Even where nothing reads it,
+    /// its value is that the operating system knows it exists.
     handle: File,
     #[cfg(unix)]
     identity: DirectoryIdentity,
@@ -695,7 +808,8 @@ impl DirectoryPin {
     /// Re-checks that every pinned directory is still the same directory.
     fn verify(&self) -> Result<(), SandboxError> {
         for level in &self.levels {
-            let metadata = std::fs::symlink_metadata(&level.path).map_err(map_io)?;
+            let metadata =
+                std::fs::symlink_metadata(&level.path).map_err(|error| map_io(&error))?;
             if is_link_like(&metadata) || !metadata.is_dir() {
                 return Err(SandboxError::RaceDetected);
             }
@@ -711,7 +825,7 @@ impl DirectoryPin {
 /// Opens one directory handle without following a link at its final component.
 fn pin_directory(path: &Path) -> Result<PinnedDirectory, SandboxError> {
     let handle = open_directory_no_follow(path)?;
-    let metadata = handle.metadata().map_err(map_io)?;
+    let metadata = handle.metadata().map_err(|error| map_io(&error))?;
     if is_link_like(&metadata) {
         return Err(SandboxError::SymlinkForbidden);
     }
@@ -736,7 +850,7 @@ fn open_directory_no_follow(path: &Path) -> Result<File, SandboxError> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(map_io)
+        .map_err(|error| map_io(&error))
 }
 
 #[cfg(unix)]
@@ -747,12 +861,12 @@ fn open_directory_no_follow(path: &Path) -> Result<File, SandboxError> {
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(path)
-        .map_err(map_io)
+        .map_err(|error| map_io(&error))
 }
 
 #[cfg(not(any(windows, unix)))]
 fn open_directory_no_follow(path: &Path) -> Result<File, SandboxError> {
-    File::open(path).map_err(map_io)
+    File::open(path).map_err(|error| map_io(&error))
 }
 
 /// Removes a file this call created, and only if it is still empty.
@@ -793,7 +907,7 @@ fn apply_no_follow(_options: &mut OpenOptions) {}
 
 #[cfg(windows)]
 fn verify_handle_is_not_reparse_point(file: &File) -> Result<(), SandboxError> {
-    let metadata = file.metadata().map_err(map_io)?;
+    let metadata = file.metadata().map_err(|error| map_io(&error))?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
         Ok(())
     } else {
@@ -803,7 +917,7 @@ fn verify_handle_is_not_reparse_point(file: &File) -> Result<(), SandboxError> {
 
 #[cfg(not(windows))]
 fn verify_handle_is_not_reparse_point(file: &File) -> Result<(), SandboxError> {
-    let metadata = file.metadata().map_err(map_io)?;
+    let metadata = file.metadata().map_err(|error| map_io(&error))?;
     if metadata.file_type().is_symlink() {
         Err(SandboxError::SymlinkForbidden)
     } else {
@@ -828,8 +942,8 @@ fn verify_handle_is_not_reparse_point(file: &File) -> Result<(), SandboxError> {
 /// anything is truncated or read.
 #[cfg(unix)]
 fn verify_handle_matches_path(file: &File, absolute: &Path) -> Result<(), SandboxError> {
-    let opened = identity_of(&file.metadata().map_err(map_io)?);
-    let named = identity_of(&std::fs::symlink_metadata(absolute).map_err(map_io)?);
+    let opened = identity_of(&file.metadata().map_err(|error| map_io(&error))?);
+    let named = identity_of(&std::fs::symlink_metadata(absolute).map_err(|error| map_io(&error))?);
     if opened == named {
         Ok(())
     } else {
@@ -1025,8 +1139,8 @@ fn list_pinned_names(
     limit: usize,
 ) -> Result<Vec<String>, SandboxError> {
     let mut names = Vec::new();
-    for entry in std::fs::read_dir(path).map_err(map_io)? {
-        let entry = entry.map_err(map_io)?;
+    for entry in std::fs::read_dir(path).map_err(|error| map_io(&error))? {
+        let entry = entry.map_err(|error| map_io(&error))?;
         if names.len() >= limit {
             return Err(SandboxError::DirectoryTooLarge);
         }
@@ -1065,17 +1179,17 @@ fn stat_pinned_child(
     path: &Path,
     name: &str,
 ) -> Result<(EntryKind, u64), SandboxError> {
-    let metadata = std::fs::symlink_metadata(path.join(name)).map_err(map_io)?;
+    let metadata = std::fs::symlink_metadata(path.join(name)).map_err(|error| map_io(&error))?;
     Ok((classify(&metadata), metadata.len()))
 }
 
 /// Maps a `rustix` error onto the sandbox error type through `std::io`.
 #[cfg(unix)]
 fn map_errno(error: rustix::io::Errno) -> SandboxError {
-    map_io(io::Error::from_raw_os_error(error.raw_os_error()))
+    map_io(&io::Error::from_raw_os_error(error.raw_os_error()))
 }
 
-fn map_io(error: io::Error) -> SandboxError {
+fn map_io(error: &io::Error) -> SandboxError {
     // `O_NOFOLLOW` reports a final-component symlink as `ELOOP`, which has no
     // stable `ErrorKind` yet, so the raw code is matched directly.
     #[cfg(unix)]

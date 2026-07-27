@@ -94,19 +94,16 @@ fn generate_mapping(output: &mut String, mapping: &Mapping) {
 }
 
 fn variant_name(value: &str) -> String {
-    value
-        .split('_')
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            let first = chars.next().expect("nonempty environment name segment");
-            format!(
-                "{}{}",
-                first.to_ascii_uppercase(),
-                chars.as_str().to_ascii_lowercase()
-            )
-        })
-        .collect()
+    let mut name = String::with_capacity(value.len());
+    for part in value.split('_').filter(|part| !part.is_empty()) {
+        let mut characters = part.chars();
+        let first = characters
+            .next()
+            .expect("nonempty environment name segment");
+        name.push(first.to_ascii_uppercase());
+        name.extend(characters.map(|character| character.to_ascii_lowercase()));
+    }
+    name
 }
 
 fn literal(value: &str) -> String {

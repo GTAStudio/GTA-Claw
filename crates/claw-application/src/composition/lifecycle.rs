@@ -80,14 +80,11 @@ impl LifecyclePhase {
             (self, next),
             (Self::Created, Self::Initializing)
                 | (Self::Initializing, Self::Initialized)
-                | (Self::Initialized, Self::Starting)
-                | (Self::Initialized, Self::Stopping)
+                | (Self::Initialized, Self::Starting | Self::Stopping)
                 | (Self::Starting, Self::Running)
                 | (Self::Running, Self::Draining)
-                | (Self::Draining, Self::Stopping)
-                | (Self::Stopping, Self::Stopped)
-                | (Self::Failed, Self::Stopping)
-                | (Self::Failed, Self::Stopped)
+                | (Self::Draining | Self::Failed, Self::Stopping)
+                | (Self::Stopping | Self::Failed, Self::Stopped)
                 | (
                     Self::Created
                         | Self::Initializing

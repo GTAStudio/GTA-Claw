@@ -177,6 +177,18 @@ impl ParameterSchema {
     }
 
     /// Validates caller-supplied arguments against the closed schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchemaError::NotAnObject`] when the payload is not a JSON
+    /// object, [`SchemaError::UnknownField`] for any key the schema does not
+    /// declare (the schema is closed, so unexpected keys are refused rather
+    /// than ignored), [`SchemaError::MissingField`] when a required field is
+    /// absent or null, and the per-field failures raised by validation:
+    /// [`SchemaError::TypeMismatch`], [`SchemaError::Empty`],
+    /// [`SchemaError::TooLong`], [`SchemaError::ControlCharacter`],
+    /// [`SchemaError::OutOfRange`], [`SchemaError::TooManyItems`],
+    /// [`SchemaError::InvalidKey`], and [`SchemaError::NotAChoice`].
     pub fn validate(&self, value: &Value) -> Result<Arguments, SchemaError> {
         let object = value.as_object().ok_or(SchemaError::NotAnObject)?;
         for key in object.keys() {
@@ -202,7 +214,7 @@ impl ParameterSchema {
 }
 
 /// Names the JSON shape of a value without revealing any of its content.
-fn shape_of(value: &Value) -> &'static str {
+const fn shape_of(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "boolean",
@@ -421,6 +433,13 @@ impl Arguments {
     }
 
     /// Returns a required text value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchemaError::MissingField`] when `name` was not supplied or
+    /// was supplied as a non-text value. Validation already rejects wrong
+    /// types, so in practice this fires only for an optional field a tool
+    /// reads as required.
     pub fn required_text(&self, name: &'static str) -> Result<&str, SchemaError> {
         self.text(name).ok_or(SchemaError::MissingField(name))
     }

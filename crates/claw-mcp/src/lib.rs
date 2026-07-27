@@ -2,7 +2,7 @@
 //!
 //! The crate provides an MCP server, stdio/streamable-HTTP/legacy-SSE clients,
 //! OAuth authorization, configured-server lifecycle management, and the
-//! conversation projection used by the frozen OpenClaw compatibility surface.
+//! conversation projection used by the frozen `OpenClaw` compatibility surface.
 
 pub mod client;
 pub mod error;

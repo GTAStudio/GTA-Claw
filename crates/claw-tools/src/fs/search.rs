@@ -109,24 +109,23 @@ impl Tool for FsSearchTool {
         let mut total = 0_usize;
         let mut skipped_files = 0_usize;
         for file in context.sandbox.walk_files(&root)? {
-            let bytes = match context.sandbox.read_file(&file) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    skipped_files += 1;
-                    continue;
-                }
+            let Ok(bytes) = context.sandbox.read_file(&file) else {
+                skipped_files += 1;
+                continue;
             };
             let Ok(text) = String::from_utf8(bytes) else {
                 skipped_files += 1;
                 continue;
             };
             for (index, line) in text.lines().enumerate() {
-                let haystack = if case_sensitive {
-                    line.to_owned()
+                // The case-sensitive path is the common one and must not copy
+                // every line of every file just to look for a substring.
+                let found = if case_sensitive {
+                    line.contains(needle.as_str())
                 } else {
-                    line.to_lowercase()
+                    line.to_lowercase().contains(needle.as_str())
                 };
-                if !haystack.contains(&needle) {
+                if !found {
                     continue;
                 }
                 total += 1;

@@ -141,7 +141,7 @@ fn exec_helper_entry() {
                 .expect("the grandchild spawns");
             fs::write(directory.join("parent_started"), "1")
                 .expect("the helper can write its marker");
-            thread::sleep(Duration::from_secs(60));
+            thread::sleep(Duration::from_mins(1));
             // Unreachable in practice: the tree kill arrives first. It is here
             // so the helper never leaves a zombie if a test is interrupted.
             let _ = child.kill();
@@ -397,8 +397,7 @@ fn a_program_path_supplied_by_the_model_is_rejected_as_a_name() {
         assert!(
             matches!(
                 error.execution(),
-                Some(&ExecutionError::ProgramNameRejected)
-                    | Some(&ExecutionError::ProgramNotAllowed)
+                Some(&(ExecutionError::ProgramNameRejected | ExecutionError::ProgramNotAllowed))
             ),
             "unexpected error {error:?} for {candidate:?}"
         );

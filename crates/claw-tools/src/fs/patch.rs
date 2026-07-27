@@ -80,8 +80,23 @@ pub struct UnifiedPatch {
 }
 
 impl UnifiedPatch {
-    /// Parses a unified diff, verifying any file headers name `path`.
-    pub fn parse(patch: &str, path: &str) -> Result<Self, PatchError> {
+    /// Parses a unified diff, verifying any file headers name `expected_path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PatchError::Empty`] for a blank payload, [`PatchError::TooLong`]
+    /// past 256 KiB, [`PatchError::PathMismatch`] when a `---`/`+++` header names
+    /// anything other than `expected_path`, [`PatchError::MultipleFiles`] when a
+    /// second file header follows the first hunk,
+    /// [`PatchError::MissingHunkHeader`] when body lines precede any `@@` header
+    /// or the diff carries no hunk at all,
+    /// [`PatchError::MalformedHunkHeader`] for an unparsable `@@` range,
+    /// [`PatchError::TooManyHunks`] past 512 hunks,
+    /// [`PatchError::InvalidLinePrefix`] for a body line that starts with
+    /// anything other than a space, `-`, or `+`, and
+    /// [`PatchError::CountMismatch`] when a declared hunk length disagrees with
+    /// the body that follows it.
+    pub fn parse(patch: &str, expected_path: &str) -> Result<Self, PatchError> {
         if patch.trim().is_empty() {
             return Err(PatchError::Empty);
         }
@@ -100,14 +115,14 @@ impl UnifiedPatch {
                 if seen_hunk_header {
                     return Err(PatchError::MultipleFiles);
                 }
-                verify_header_path(header, path)?;
+                verify_header_path(header, expected_path)?;
                 continue;
             }
             if let Some(header) = line.strip_prefix("+++ ") {
                 if seen_hunk_header {
                     return Err(PatchError::MultipleFiles);
                 }
-                verify_header_path(header, path)?;
+                verify_header_path(header, expected_path)?;
                 continue;
             }
             if line.starts_with("diff ") || line.starts_with("index ") {
@@ -169,6 +184,15 @@ impl UnifiedPatch {
     }
 
     /// Applies the patch to `original`, returning the new content.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PatchError::HunksOutOfOrder`] when a hunk starts at or before
+    /// the line a previous hunk already consumed, [`PatchError::OutOfRange`]
+    /// when a hunk starts past the end of the file or claims more lines than
+    /// remain, and [`PatchError::ContextMismatch`] when a context or removal
+    /// line is not byte-identical to the file line it claims. `original` is
+    /// never modified, and a failure on any hunk abandons the whole patch.
     pub fn apply(&self, original: &str) -> Result<String, PatchError> {
         let ending = if original.contains("\r\n") {
             LineEnding::Crlf
@@ -191,7 +215,9 @@ impl UnifiedPatch {
             &lines[..]
         };
 
-        let mut output: Vec<String> = Vec::new();
+        // Borrowed, not owned: rewriting three lines of a large file must not
+        // copy every untouched line to rebuild it.
+        let mut output: Vec<&str> = Vec::new();
         let mut cursor = 0_usize;
         for hunk in &self.hunks {
             let start = hunk
@@ -204,7 +230,7 @@ impl UnifiedPatch {
             if start > lines.len() {
                 return Err(PatchError::OutOfRange);
             }
-            output.extend(lines[cursor..start].iter().map(|line| (*line).to_owned()));
+            output.extend_from_slice(&lines[cursor..start]);
             cursor = start;
             for entry in &hunk.body {
                 match entry {
@@ -214,15 +240,15 @@ impl UnifiedPatch {
                             return Err(PatchError::ContextMismatch);
                         }
                         if matches!(entry, HunkLine::Context(_)) {
-                            output.push((*actual).to_owned());
+                            output.push(actual);
                         }
                         cursor += 1;
                     }
-                    HunkLine::Added(text) => output.push(text.clone()),
+                    HunkLine::Added(text) => output.push(text.as_str()),
                 }
             }
         }
-        output.extend(lines[cursor..].iter().map(|line| (*line).to_owned()));
+        output.extend_from_slice(&lines[cursor..]);
         let mut joined = output.join(ending.as_str());
         if trailing_newline && !joined.is_empty() {
             joined.push_str(ending.as_str());
@@ -232,7 +258,7 @@ impl UnifiedPatch {
 
     /// Returns the number of hunks.
     #[must_use]
-    pub fn hunk_count(&self) -> usize {
+    pub const fn hunk_count(&self) -> usize {
         self.hunks.len()
     }
 }
@@ -392,9 +418,9 @@ impl Tool for FsPatchTool {
         _authorization: &Authorization<'_>,
     ) -> Result<ToolOutput, ToolError> {
         let path = required_path(arguments, context, "path")?;
-        let patch = UnifiedPatch::parse(arguments.required_text("patch")?, path.as_str())?;
+        let diff = UnifiedPatch::parse(arguments.required_text("patch")?, path.as_str())?;
         let original = decode_utf8(context.sandbox.read_file(&path)?)?;
-        let updated = patch.apply(&original)?;
+        let updated = diff.apply(&original)?;
         let resolved =
             context
                 .sandbox
@@ -402,12 +428,12 @@ impl Tool for FsPatchTool {
         Ok(ToolOutput::new(
             format!(
                 "applied {} hunk(s) to {}",
-                patch.hunk_count(),
+                diff.hunk_count(),
                 resolved.relative()
             ),
             json!({
                 "path": resolved.relative().as_str(),
-                "hunks": patch.hunk_count(),
+                "hunks": diff.hunk_count(),
                 "bytes_written": updated.len(),
             }),
         ))

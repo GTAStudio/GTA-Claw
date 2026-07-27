@@ -115,6 +115,12 @@ pub struct LegacySseTransport {
 
 impl LegacySseTransport {
     /// Creates a legacy SSE transport without starting network work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LegacySseError::Client`] when the shared HTTPS client cannot be
+    /// built — no usable platform trust anchors, or a `rustls` provider that the
+    /// process has already installed with an incompatible configuration.
     pub fn new(config: LegacySseConfig) -> Result<Self, LegacySseError> {
         let client = HttpClient::new(config.request_timeout).map_err(LegacySseError::Client)?;
         Ok(Self { config, client })
@@ -226,7 +232,7 @@ impl LegacySseTransport {
 
         loop {
             let response = tokio::select! {
-                _ = cancellation.cancelled() => {
+                () = cancellation.cancelled() => {
                     return Err(WorkerQuitReason::Cancelled);
                 }
                 response = self.connect(last_event_id.as_deref()) => response
@@ -238,7 +244,7 @@ impl LegacySseTransport {
             let mut stream = response.into_sse_stream();
             loop {
                 tokio::select! {
-                    _ = cancellation.cancelled() => {
+                    () = cancellation.cancelled() => {
                         return Err(WorkerQuitReason::Cancelled);
                     }
                     outgoing = context.recv_from_handler() => {
@@ -305,7 +311,7 @@ impl LegacySseTransport {
             };
             reconnects += 1;
             tokio::select! {
-                _ = cancellation.cancelled() => {
+                () = cancellation.cancelled() => {
                     return Err(WorkerQuitReason::Cancelled);
                 }
                 () = sleep(delay) => {}

@@ -53,7 +53,7 @@ pub struct PartialAssistantMessage {
 impl PartialAssistantMessage {
     /// Returns whether any content at all was recovered.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.text.is_empty()
             && self.reasoning.is_empty()
             && self.tool_calls.is_empty()

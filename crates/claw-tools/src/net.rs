@@ -16,7 +16,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use claw_security::ssrf::{
     HostAllowlist, ResolutionError, TargetError, TargetHost, TargetPolicy, ValidatedTarget,
@@ -115,6 +115,13 @@ impl PrivateOriginExceptions {
     ///
     /// The origin must be lowercase, carry an explicit port, and contain no
     /// path, query, fragment or credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::InvalidExceptionOrigin`] when `origin` does not
+    /// start with `http://` or `https://`, carries a `/`, `?`, `#`, `@` or `\`,
+    /// contains an uppercase character, omits the `:port` suffix, or names a
+    /// port that is not a non-zero decimal number below 65536.
     pub fn allow_origin(&mut self, origin: &str) -> Result<(), NetworkError> {
         let rest = origin
             .strip_prefix("http://")
@@ -210,6 +217,13 @@ impl UrlPolicy {
     }
 
     /// Restricts destinations to an exact host allowlist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::Target`] when an entry is not a syntactically
+    /// valid host that [`claw_security::ssrf::HostAllowlist`] accepts, such as
+    /// an empty name, a name carrying a scheme, port or path, or one that is
+    /// not valid ASCII.
     pub fn exact_hosts<I, S>(hosts: I) -> Result<Self, NetworkError>
     where
         I: IntoIterator<Item = S>,
@@ -268,6 +282,17 @@ impl UrlPolicy {
     }
 
     /// Validates one destination against the whole policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::UrlTooLong`] past 2048 bytes,
+    /// [`NetworkError::Target`] when the SSRF policy refuses the URL — a scheme
+    /// other than `http`/`https`, embedded credentials, a fragment, a
+    /// non-public or ambiguously encoded address, or a host outside an exact
+    /// allowlist — [`NetworkError::PortNotAllowed`] when the port is outside
+    /// the allowed set, and [`NetworkError::HostDenied`] when the host is a
+    /// known metadata endpoint or ends in an internal suffix such as
+    /// `.internal` or `.local`.
     pub fn validate(&self, url: &str) -> Result<Destination, NetworkError> {
         if url.len() > MAX_URL_BYTES {
             return Err(NetworkError::UrlTooLong);
@@ -284,6 +309,15 @@ impl UrlPolicy {
     }
 
     /// Validates a redirect hop against the whole policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::UrlTooLong`] when the `Location` value exceeds
+    /// 2048 bytes, [`NetworkError::Target`] when resolving it against
+    /// `current` yields something the SSRF policy refuses, including a
+    /// downgrade out of `https` or a hop onto a non-public address, plus
+    /// [`NetworkError::PortNotAllowed`] and [`NetworkError::HostDenied`] on the
+    /// same terms as [`UrlPolicy::validate`].
     pub fn validate_hop(
         &self,
         current: &ValidatedTarget,
@@ -356,6 +390,12 @@ impl Destination {
     /// For an excepted private origin the authority is taken from the origin
     /// the operator allowlisted, never from the request URL, so a URL that
     /// merely starts with an allowed origin cannot redirect the socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::InvalidExceptionOrigin`] when a stored private
+    /// origin no longer parses as `scheme://host:port` with a non-empty host
+    /// and a non-zero port. A public destination cannot fail.
     pub fn authority(&self) -> Result<(String, u16), NetworkError> {
         match self {
             Self::Public(target) => Ok((target.host().as_str(), target.port())),
@@ -433,9 +473,24 @@ pub struct HttpResponse {
 /// not follow redirects themselves: redirect policy belongs to this crate.
 pub trait HttpTransport {
     /// Resolves a host to the addresses a connection would use.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return [`NetworkError::Resolution`] when the name does
+    /// not resolve to at least one address, and
+    /// [`NetworkError::TransportRefused`] when the transport is not permitted
+    /// to reach the network at all.
     fn resolve(&mut self, host: &str) -> Result<Vec<IpAddr>, NetworkError>;
 
     /// Performs exactly one request without following redirects.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return [`NetworkError::TransportRefused`] when
+    /// [`HttpRequest::pinned`] is empty, when no pinned address accepts a
+    /// connection inside the connect timeout, or when the transport is
+    /// configured to reach nothing; and [`NetworkError::MalformedResponse`]
+    /// when the peer does not speak HTTP/1.x.
     fn fetch(&mut self, request: &HttpRequest) -> Result<HttpResponse, NetworkError>;
 }
 
@@ -484,6 +539,11 @@ impl Default for PinnedHttpTransport {
 
 impl PinnedHttpTransport {
     /// Creates a transport with five second connect and read timeouts.
+    ///
+    /// The read timeout is a deadline for the *whole* exchange, not for one
+    /// `read` syscall. A per-syscall timeout alone leaves a peer free to
+    /// trickle one byte per window and hold the calling thread for as long as
+    /// the byte cap allows.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -492,7 +552,7 @@ impl PinnedHttpTransport {
         }
     }
 
-    /// Overrides the connect and read timeouts.
+    /// Overrides the connect and whole-exchange read timeouts.
     #[must_use]
     pub const fn with_timeouts(mut self, connect: Duration, read: Duration) -> Self {
         self.connect_timeout = connect;
@@ -505,10 +565,9 @@ impl PinnedHttpTransport {
         let rest = url
             .strip_prefix("http://")
             .ok_or(NetworkError::TransportRefused)?;
-        match rest.find('/') {
-            Some(index) => Ok(rest[index..].to_owned()),
-            None => Ok("/".to_owned()),
-        }
+        Ok(rest
+            .find('/')
+            .map_or_else(|| "/".to_owned(), |index| rest[index..].to_owned()))
     }
 }
 
@@ -547,8 +606,12 @@ impl HttpTransport for PinnedHttpTransport {
             .peer_addr()
             .map_err(|_| NetworkError::TransportRefused)?
             .ip();
+        // The whole exchange, request included, shares one deadline.
+        let deadline = Instant::now() + self.read_timeout;
+        // A peer that accepts the connection and then never reads would
+        // otherwise block this thread forever once the send buffer fills.
         stream
-            .set_read_timeout(Some(self.read_timeout))
+            .set_write_timeout(Some(self.read_timeout))
             .map_err(|_| NetworkError::TransportRefused)?;
         let head = format!(
             "{} {} HTTP/1.1\r\nHost: {}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
@@ -564,10 +627,19 @@ impl HttpTransport for PinnedHttpTransport {
         let mut raw = Vec::new();
         let mut chunk = [0_u8; 8192];
         loop {
+            // Each read gets the budget that is left rather than the full
+            // timeout: a trickling peer must not be able to restart the clock
+            // once per byte.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining < MIN_READ_WINDOW {
+                break;
+            }
+            if stream.set_read_timeout(Some(remaining)).is_err() {
+                break;
+            }
             let read = match stream.read(&mut chunk) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(count) => count,
-                Err(_) => break,
             };
             raw.extend_from_slice(&chunk[..read]);
             if raw.len() >= ceiling {
@@ -587,6 +659,12 @@ impl HttpTransport for PinnedHttpTransport {
 
 /// Largest header block this transport will buffer.
 const MAX_HEADER_BYTES: usize = 32 * 1024;
+
+/// Shortest remaining budget still worth arming a socket read with.
+///
+/// A sub-millisecond timeout rounds to zero on several platforms, and zero
+/// means "block forever" to `setsockopt`, which is the opposite of the intent.
+const MIN_READ_WINDOW: Duration = Duration::from_millis(1);
 
 /// Parses a status line, the `Location` header, and a capped body.
 fn parse_http_response(
@@ -641,6 +719,12 @@ pub trait SearchProvider {
     fn name(&self) -> &str;
 
     /// Runs one query.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return [`NetworkError::TransportRefused`] when no
+    /// provider is configured, and [`NetworkError::TransportFailed`] when the
+    /// configured provider could not be reached or answered unusably.
     fn search(&mut self, query: &str, max_results: usize) -> Result<Vec<SearchHit>, NetworkError>;
 }
 
@@ -649,7 +733,7 @@ pub trait SearchProvider {
 pub struct DenyAllSearchProvider;
 
 impl SearchProvider for DenyAllSearchProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "denied"
     }
 
@@ -670,7 +754,7 @@ pub struct NetFetchTool<T: HttpTransport> {
 
 impl<T: HttpTransport> NetFetchTool<T> {
     /// Creates the tool from a policy and a transport port.
-    pub fn new(policy: UrlPolicy, transport: T) -> Self {
+    pub const fn new(policy: UrlPolicy, transport: T) -> Self {
         Self {
             policy,
             transport: std::cell::RefCell::new(transport),

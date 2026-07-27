@@ -656,10 +656,10 @@ impl StreamableHttpClient for HttpClient {
                     .bytes(DEFAULT_BODY_LIMIT)
                     .await
                     .map_err(StreamableHttpError::Client)?;
-                match serde_json::from_slice(&body) {
-                    Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
-                    Err(_) => Ok(StreamableHttpPostResponse::Accepted),
-                }
+                Ok(serde_json::from_slice(&body)
+                    .map_or(StreamableHttpPostResponse::Accepted, |message| {
+                        StreamableHttpPostResponse::Json(message, session_id)
+                    }))
             }
 
             _ => Err(StreamableHttpError::UnexpectedContentType(content_type)),
@@ -814,7 +814,7 @@ mod tests {
         .build()
         .expect("build fixture certificate verifier");
         let verification_time = SystemTime::now()
-            .checked_add(Duration::from_secs(30 * 24 * 60 * 60))
+            .checked_add(Duration::from_hours(30 * 24))
             .expect("fixture warning horizon must fit in system time")
             .duration_since(UNIX_EPOCH)
             .expect("system clock must follow the Unix epoch");

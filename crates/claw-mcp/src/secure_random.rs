@@ -11,10 +11,11 @@ pub(crate) fn bytes<const N: usize>() -> Result<[u8; N]> {
 }
 
 pub(crate) fn uuid_v4() -> Result<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
     let mut bytes = bytes::<16>()?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(36);
     for (index, byte) in bytes.into_iter().enumerate() {
         if matches!(index, 4 | 6 | 8 | 10) {

@@ -505,7 +505,7 @@ impl From<&ConfigSnapshot> for EnvelopeWire {
             core: CoreWire {
                 auth: AuthWire {
                     github: GithubAuthWire {
-                        pat: secret_string(core.auth.github_pat.as_ref()),
+                        pat: core.auth.github_pat.as_ref().map(secret_string),
                         device: DeviceAuthWire {
                             enabled: core.auth.device_enabled,
                             client_id: core.auth.device_client_id.clone(),
@@ -519,23 +519,33 @@ impl From<&ConfigSnapshot> for EnvelopeWire {
                     teams: TeamsWire {
                         enabled: core.channels.teams.enabled,
                         app_id: core.channels.teams.app_id.clone(),
-                        app_password: secret_string(core.channels.teams.app_password.as_ref()),
+                        app_password: core.channels.teams.app_password.as_ref().map(secret_string),
                     },
                     telegram: TelegramWire {
                         enabled: core.channels.telegram.enabled,
-                        bot_token: secret_string(core.channels.telegram.bot_token.as_ref()),
+                        bot_token: core.channels.telegram.bot_token.as_ref().map(secret_string),
                         poll_interval_ms: core.channels.telegram.poll_interval_ms,
                     },
                     discord: DiscordWire {
                         enabled: core.channels.discord.enabled,
-                        bot_token: secret_string(core.channels.discord.bot_token.as_ref()),
+                        bot_token: core.channels.discord.bot_token.as_ref().map(secret_string),
                         gateway_url: core.channels.discord.gateway_url.clone(),
                         gateway_intents: core.channels.discord.gateway_intents,
                     },
                     whatsapp: WhatsappWire {
                         enabled: core.channels.whatsapp.enabled,
-                        verify_token: secret_string(core.channels.whatsapp.verify_token.as_ref()),
-                        access_token: secret_string(core.channels.whatsapp.access_token.as_ref()),
+                        verify_token: core
+                            .channels
+                            .whatsapp
+                            .verify_token
+                            .as_ref()
+                            .map(secret_string),
+                        access_token: core
+                            .channels
+                            .whatsapp
+                            .access_token
+                            .as_ref()
+                            .map(secret_string),
                         phone_number_id: core.channels.whatsapp.phone_number_id.clone(),
                         webhook_path: core.channels.whatsapp.webhook_path.clone(),
                     },
@@ -569,10 +579,10 @@ impl From<&ConfigSnapshot> for EnvelopeWire {
                     enabled: core.updates.enabled,
                 },
                 admin: AdminWire {
-                    bearer_token: secret_string(core.admin.bearer_token.as_ref()),
+                    bearer_token: core.admin.bearer_token.as_ref().map(secret_string),
                 },
                 network: NetworkWire {
-                    proxy_url: secret_string(core.network.proxy_url.as_ref()),
+                    proxy_url: core.network.proxy_url.as_ref().map(secret_string),
                 },
             },
         }
@@ -616,8 +626,8 @@ fn secret(value: Option<String>, path: &str) -> Result<Option<SecretRef>, Config
         .transpose()
 }
 
-fn secret_string(value: Option<&SecretRef>) -> Option<String> {
-    value.map(|reference| reference.as_str().to_owned())
+fn secret_string(reference: &SecretRef) -> String {
+    reference.as_str().to_owned()
 }
 
 fn nonempty_optional(value: Option<String>, path: &str) -> Result<Option<String>, ConfigError> {

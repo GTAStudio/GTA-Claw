@@ -243,7 +243,7 @@ impl EgressPolicy {
 
     /// Permits cleartext HTTP.
     #[must_use]
-    pub fn allow_plain_http(mut self) -> Self {
+    pub const fn allow_plain_http(mut self) -> Self {
         self.allow_plain_http = true;
         self
     }
@@ -254,14 +254,14 @@ impl EgressPolicy {
     /// `127.0.0.1`. It must not be enabled in a deployed configuration: it is
     /// exactly the switch that turns a URL-taking feature into a port scanner.
     #[must_use]
-    pub fn allow_private_addresses(mut self) -> Self {
+    pub const fn allow_private_addresses(mut self) -> Self {
         self.allow_private_addresses = true;
         self
     }
 
     /// Overrides how long a resolution stays usable.
     #[must_use]
-    pub fn with_max_resolution_age(mut self, age: Duration) -> Self {
+    pub const fn with_max_resolution_age(mut self, age: Duration) -> Self {
         self.max_resolution_age = Some(age);
         self
     }
@@ -316,7 +316,7 @@ pub struct RedactedUrl(String);
 impl RedactedUrl {
     /// Reduces `raw` to `scheme://host[:port]`, discarding everything else.
     ///
-    /// A URL that does not parse reduces to [`UNPARSEABLE_DESTINATION`], because
+    /// A URL that does not parse reduces to the literal `<unparseable>`, because
     /// the userinfo cannot be located in a string the parser rejected.
     #[must_use]
     pub fn new(raw: &str) -> Self {
@@ -329,10 +329,10 @@ impl RedactedUrl {
             return Self(format!("{scheme}://{HOSTLESS_DESTINATION}"));
         };
 
-        match parsed.port() {
-            Some(port) => Self(format!("{scheme}://{host}:{port}")),
-            None => Self(format!("{scheme}://{host}")),
-        }
+        Self(parsed.port().map_or_else(
+            || format!("{scheme}://{host}"),
+            |port| format!("{scheme}://{host}:{port}"),
+        ))
     }
 }
 
@@ -518,7 +518,7 @@ impl ResolvedEndpoint {
 
     /// Returns how old the resolution is at `now`.
     #[must_use]
-    pub fn age_at(&self, now: MonotonicInstant) -> Duration {
+    pub const fn age_at(&self, now: MonotonicInstant) -> Duration {
         now.saturating_since(self.resolved_at)
     }
 

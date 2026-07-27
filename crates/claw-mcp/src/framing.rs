@@ -97,14 +97,36 @@ impl BoundedIoDiagnostics {
     }
 }
 
+/// Buffer capacity retained once every buffered byte has been consumed.
+///
+/// A single large frame would otherwise pin `max_frame_bytes` of heap for the
+/// lifetime of a long-running transport, so the carry-over buffer is released
+/// back to this working size whenever it drains completely.
+const IDLE_BUFFER_CAPACITY: usize = 64 * 1024;
+
 /// Incremental decoder for newline-delimited JSON-RPC messages.
 ///
 /// A decoder accepts arbitrarily split or coalesced byte reads. Empty lines are
 /// ignored, while malformed UTF-8, malformed JSON, and oversized frames fail
 /// explicitly.
+///
+/// # Bound
+///
+/// The decoder is fail-closed and cannot grow without limit. A frame that never
+/// terminates is rejected as soon as the carry-over buffer passes
+/// `max_frame_bytes`, so the peak retained size is `max_frame_bytes` plus the
+/// length of the chunk handed to the current [`JsonLineDecoder::push`] call —
+/// and a chunk that cannot possibly fit is rejected before it is even copied
+/// into the buffer.
 #[derive(Debug)]
 pub struct JsonLineDecoder {
     buffered: Vec<u8>,
+    /// Length of the `buffered` prefix already searched for a frame terminator.
+    ///
+    /// Rescanning from zero on every chunk makes decoding one large frame
+    /// quadratic in its size, which is exactly the shape a hostile peer would
+    /// pick. Only the newly appended bytes are ever scanned.
+    scanned: usize,
     max_frame_bytes: usize,
 }
 
@@ -114,34 +136,75 @@ impl JsonLineDecoder {
     pub const fn new(max_frame_bytes: usize) -> Self {
         Self {
             buffered: Vec::new(),
+            scanned: 0,
             max_frame_bytes,
         }
     }
 
     /// Appends one byte chunk and returns every complete JSON value it contains.
+    ///
+    /// Bytes that do not yet form a complete frame are carried over to the next
+    /// call. On error the offending frame has already been consumed, so a caller
+    /// that chooses to keep decoding resumes after it rather than replaying it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when a frame — or the unterminated
+    /// carry-over buffer — exceeds the decoder's `max_frame_bytes` limit, or
+    /// when a frame is not valid UTF-8. Returns [`McpError::Json`] when a frame
+    /// is valid UTF-8 but not a valid JSON value.
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<Value>> {
-        self.buffered.extend_from_slice(bytes);
-        if self.buffered.len() > self.max_frame_bytes && !self.buffered.contains(&b'\n') {
+        // Nothing buffered can complete a frame (`scanned` covers all of it), so
+        // a chunk without a terminator that already busts the limit is refused
+        // before it is copied in.
+        if self.scanned == self.buffered.len()
+            && self.buffered.len().saturating_add(bytes.len()) > self.max_frame_bytes
+            && !bytes.contains(&b'\n')
+        {
             return Err(McpError::Protocol("stdio frame exceeds byte limit".into()));
         }
+        self.buffered.extend_from_slice(bytes);
 
         let mut decoded = Vec::new();
-        while let Some(newline) = self.buffered.iter().position(|byte| *byte == b'\n') {
-            let mut frame: Vec<u8> = self.buffered.drain(..=newline).collect();
-            frame.pop();
-            if frame.last() == Some(&b'\r') {
-                frame.pop();
+        let mut consumed = 0;
+        let mut scan = self.scanned;
+        let outcome = loop {
+            let Some(offset) = self.buffered[scan..].iter().position(|byte| *byte == b'\n') else {
+                break Ok(());
+            };
+            let newline = scan + offset;
+            scan = newline + 1;
+            let mut end = newline;
+            if end > consumed && self.buffered[end - 1] == b'\r' {
+                end -= 1;
             }
+            let frame = &self.buffered[consumed..end];
+            consumed = newline + 1;
             if frame.is_empty() {
                 continue;
             }
             if frame.len() > self.max_frame_bytes {
-                return Err(McpError::Protocol("stdio frame exceeds byte limit".into()));
+                break Err(McpError::Protocol("stdio frame exceeds byte limit".into()));
             }
-            let text = std::str::from_utf8(&frame)
-                .map_err(|_| McpError::Protocol("stdio frame is not UTF-8".into()))?;
-            decoded.push(serde_json::from_str(text)?);
+            match std::str::from_utf8(frame) {
+                Ok(text) => match serde_json::from_str(text) {
+                    Ok(value) => decoded.push(value),
+                    Err(error) => break Err(McpError::Json(error)),
+                },
+                Err(_) => break Err(McpError::Protocol("stdio frame is not UTF-8".into())),
+            }
+        };
+
+        self.buffered.drain(..consumed);
+        if outcome.is_err() {
+            // The tail past the failing frame was never searched, so the next
+            // call has to start over rather than skip a terminator.
+            self.scanned = 0;
+        } else {
+            self.scanned = self.buffered.len();
         }
+        self.reclaim_idle_capacity();
+        outcome?;
         if self.buffered.len() > self.max_frame_bytes {
             return Err(McpError::Protocol("stdio frame exceeds byte limit".into()));
         }
@@ -149,14 +212,28 @@ impl JsonLineDecoder {
     }
 
     /// Signals end-of-input, rejecting a non-empty unterminated frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when the peer stopped writing part-way
+    /// through a frame, which for stdio means the child process exited or closed
+    /// its stdout mid-message. Trailing ASCII whitespace is not an error.
     pub fn finish(&mut self) -> Result<()> {
         if self.buffered.iter().all(u8::is_ascii_whitespace) {
             self.buffered.clear();
+            self.scanned = 0;
+            self.reclaim_idle_capacity();
             Ok(())
         } else {
             Err(McpError::Protocol(
                 "stdio ended with an unterminated JSON-RPC frame".into(),
             ))
+        }
+    }
+
+    fn reclaim_idle_capacity(&mut self) {
+        if self.buffered.is_empty() && self.buffered.capacity() > IDLE_BUFFER_CAPACITY {
+            self.buffered.shrink_to(IDLE_BUFFER_CAPACITY);
         }
     }
 }
@@ -168,6 +245,12 @@ impl Default for JsonLineDecoder {
 }
 
 /// Encodes one JSON-RPC value as a single newline-delimited frame.
+///
+/// # Errors
+///
+/// Returns [`McpError::Json`] when the value cannot be serialized — in practice
+/// a map with non-string keys or a float that is not a finite number, since a
+/// [`Value`] is otherwise always representable.
 pub fn encode(value: &Value) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
@@ -223,7 +306,7 @@ where
                 let count = tokio::select! {
                     biased;
                     result = input.read(&mut bytes) => result?,
-                    _ = reader_disconnected.cancelled() => return Ok(()),
+                    () = reader_disconnected.cancelled() => return Ok(()),
                 };
                 if count == 0 {
                     if let Err(error) = decoder.finish() {
@@ -254,7 +337,7 @@ where
                         }
                     };
                     let sent = tokio::select! {
-                        _ = reader_disconnected.cancelled() => return Ok(()),
+                        () = reader_disconnected.cancelled() => return Ok(()),
                         result = read_tx.send(message) => result,
                     };
                     if sent.is_err() {
@@ -265,7 +348,7 @@ where
         });
 
         let (writes, mut write_rx) = mpsc::channel::<WriteRequest<R>>(32);
-        let writer = tokio::spawn(async move {
+        let writer_task = tokio::spawn(async move {
             let writer_disconnected = disconnected.clone();
             let _disconnect_on_exit = disconnected.drop_guard();
             while let Some((message, acknowledgement)) = write_rx.recv().await {
@@ -296,7 +379,7 @@ where
             writes: Some(writes),
             reads,
             reader: Some(reader),
-            writer: Some(writer),
+            writer: Some(writer_task),
             diagnostics,
         }
     }
@@ -405,7 +488,10 @@ mod tests {
         time::{Duration, timeout},
     };
 
-    use super::{BoundedIoTransport, JsonLineDecoder, McpError, encode};
+    use super::{
+        BoundedIoTransport, DEFAULT_MAX_FRAME_BYTES, IDLE_BUFFER_CAPACITY, JsonLineDecoder,
+        McpError, encode,
+    };
 
     #[test]
     fn split_frame_is_reassembled_byte_for_byte() {
@@ -515,6 +601,65 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "MCP protocol violation: stdio frame exceeds byte limit"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_frame_stops_being_buffered_once_it_passes_the_limit() {
+        const LIMIT: usize = 64;
+        let mut decoder = JsonLineDecoder::new(LIMIT);
+        let chunk = vec![b'x'; LIMIT];
+
+        assert!(
+            decoder
+                .push(&chunk)
+                .expect("a frame exactly at the limit is not yet oversized")
+                .is_empty()
+        );
+        assert_eq!(decoder.buffered.len(), LIMIT);
+
+        for _ in 0..1_000 {
+            let error = decoder
+                .push(&chunk)
+                .expect_err("a peer that never terminates a frame must stay rejected");
+            assert_eq!(
+                error.to_string(),
+                "MCP protocol violation: stdio frame exceeds byte limit"
+            );
+            assert_eq!(
+                decoder.buffered.len(),
+                LIMIT,
+                "a chunk that cannot fit must be rejected before it is buffered"
+            );
+        }
+    }
+
+    #[test]
+    fn a_large_frame_split_across_chunks_decodes_and_releases_its_buffer() {
+        let payload = "y".repeat(4 * IDLE_BUFFER_CAPACITY);
+        let frame = format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{payload}\"}}");
+        let mut decoder = JsonLineDecoder::new(DEFAULT_MAX_FRAME_BYTES);
+
+        let mut values = Vec::new();
+        for chunk in frame.as_bytes().chunks(4096) {
+            values.extend(
+                decoder
+                    .push(chunk)
+                    .expect("a split frame must keep buffering"),
+            );
+        }
+        assert!(values.is_empty(), "no terminator has arrived yet");
+        values.extend(
+            decoder
+                .push(b"\n")
+                .expect("the terminated frame must decode"),
+        );
+
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["method"], payload);
+        assert!(
+            decoder.buffered.capacity() < frame.len(),
+            "a fully drained buffer must not pin the peak frame size"
         );
     }
 

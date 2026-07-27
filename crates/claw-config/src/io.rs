@@ -35,6 +35,15 @@ pub enum WriteWarning {
 }
 
 /// Loads and validates a UTF-8 JSON5 configuration file.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Io`] carrying `path` when the file cannot be opened
+/// or read, or when its bytes are not UTF-8. Otherwise returns whatever
+/// [`crate::parse_json5`] rejects: [`ConfigError::Syntax`] for malformed JSON5,
+/// [`ConfigError::Decode`] for a mistyped or unknown field,
+/// [`ConfigError::UnsupportedVersion`] for a foreign `schema_version`, and
+/// [`ConfigError::Validation`] for a violated domain invariant.
 pub fn load_file(path: impl AsRef<Path>) -> Result<ConfigSnapshot, ConfigError> {
     let path = path.as_ref();
     let source = fs::read_to_string(path).map_err(|error| ConfigError::io(path, error))?;
@@ -55,6 +64,22 @@ pub fn load_file(path: impl AsRef<Path>) -> Result<ConfigSnapshot, ConfigError> 
 /// streams, encryption, and compression. Windows has no documented equivalent
 /// for synchronizing directory metadata, so durability of the final directory
 /// entry across sudden power loss cannot be guaranteed.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Serialize`] when `snapshot` cannot be encoded as
+/// JSON5. Otherwise returns [`ConfigError::Io`] carrying `path` when any step of
+/// the atomic write fails: `path` has no file name, an ancestor directory or the
+/// destination itself is a symlink or Windows reparse point, the destination
+/// exists but is not a regular file, the parent cannot be canonicalized, no
+/// unique temporary name could be allocated in 128 attempts, or writing,
+/// flushing, `fsync`-ing, or publishing the temporary file failed. When
+/// publication fails the destination keeps its previous bytes; if removing the
+/// temporary file also fails, its path is appended to the returned message.
+///
+/// A successful call can still report non-fatal [`WriteWarning`] values in
+/// [`WriteOutcome::warnings`]; those are not errors and the new bytes are
+/// already published.
 pub fn write_file(
     path: impl AsRef<Path>,
     snapshot: &ConfigSnapshot,
@@ -69,6 +94,15 @@ pub fn write_file(
 ///
 /// This is intended for typed subsystem state colocated with configuration.
 /// Callers remain responsible for serializing only data that is safe to persist.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Io`] carrying `path` under exactly the same conditions
+/// as [`write_file`]: a rejected path shape, a symlink or reparse point anywhere
+/// in the ancestor chain or at the destination, a destination that exists but is
+/// not a regular file, exhausted temporary-name attempts, or a failed write,
+/// flush, `fsync`, or publication. The destination is left untouched whenever
+/// this returns an error.
 pub fn write_bytes_atomically(
     path: impl AsRef<Path>,
     contents: &[u8],
@@ -266,7 +300,7 @@ impl TemporaryArtifact {
         &self.path
     }
 
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         self.armed = false;
     }
 
@@ -358,7 +392,12 @@ fn sync_parent(_destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "publishing over an existing Windows destination requires ReplaceFileW, which has \
+              no safe std equivalent; the crate denies unsafe everywhere else so this module is \
+              the single audited FFI surface"
+)]
 mod windows_replace {
     use std::fs;
     use std::io;
@@ -370,6 +409,16 @@ mod windows_replace {
 
     use super::{TemporaryArtifact, WriteWarning};
 
+    /// Publishes `replacement` over an existing `destination` via `ReplaceFileW`.
+    ///
+    /// `ReplaceFileW` keeps the destination's ACLs, attributes, creation time,
+    /// named streams, encryption, and compression, which a plain rename would
+    /// discard. It writes the old destination to a reserved backup path first,
+    /// so a failed replacement can be rolled back to the exact original bytes.
+    ///
+    /// Returns `Ok(Some(_))` when the new bytes were published but the backup
+    /// could not be removed afterwards; the caller surfaces that as a non-fatal
+    /// [`WriteWarning::BackupCleanupFailed`] naming the retained backup.
     pub(super) fn replace_with_backup(
         destination: &Path,
         replacement: &Path,

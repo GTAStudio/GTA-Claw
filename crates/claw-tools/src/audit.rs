@@ -123,6 +123,13 @@ pub struct ToolAuditRecord {
 /// invocation whose audit write fails is aborted rather than silently allowed.
 pub trait ToolAuditSink {
     /// Persists exactly one record or fails the protected invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditError`] when the record could not be durably committed —
+    /// the sink could not be opened, the write failed, or the flush to durable
+    /// storage failed. The caller must treat this as fatal for the invocation
+    /// it protects: an unrecorded tool call is refused rather than allowed.
     fn persist(&mut self, record: &ToolAuditRecord) -> Result<(), AuditError>;
 }
 
@@ -216,7 +223,7 @@ pub fn opaque_arguments(value: &Value) -> Value {
 }
 
 /// Names the JSON shape of a value without revealing any of its content.
-fn shape_name(value: &Value) -> &'static str {
+const fn shape_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "boolean",

@@ -77,13 +77,13 @@ fn call(
     ledger: &mut GrantLedger,
     audit: &mut InMemoryAuditSink,
     name: &str,
-    arguments: Value,
+    arguments: &Value,
 ) -> Result<ToolOutput, claw_tools::error::ToolError> {
     let context = ToolContext {
         sandbox,
         clock: &FixedClock::new(NOW),
     };
-    registry.invoke(name, &arguments, &context, ledger, audit)
+    registry.invoke(name, arguments, &context, ledger, audit)
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn read_returns_the_requested_line_window_and_reports_the_total() {
         &mut ledger,
         &mut audit,
         "fs_read",
-        json!({ "path": "src/main.rs" }),
+        &json!({ "path": "src/main.rs" }),
     )
     .expect("the file is readable");
     assert_eq!(whole.content, "fn main() {\n    println!(\"hello\");\n}");
@@ -120,7 +120,7 @@ fn read_returns_the_requested_line_window_and_reports_the_total() {
         &mut ledger,
         &mut audit,
         "fs_read",
-        json!({ "path": "src/main.rs", "start_line": 2, "line_count": 1 }),
+        &json!({ "path": "src/main.rs", "start_line": 2, "line_count": 1 }),
     )
     .expect("the window is readable");
     assert_eq!(window.content, "    println!(\"hello\");");
@@ -142,7 +142,7 @@ fn write_creates_then_refuses_to_clobber_without_an_explicit_overwrite() {
         &mut ledger,
         &mut audit,
         "fs_write",
-        json!({ "path": "docs/notes.md", "content": "first" }),
+        &json!({ "path": "docs/notes.md", "content": "first" }),
     )
     .expect("a new file is writable");
     assert_eq!(
@@ -161,7 +161,7 @@ fn write_creates_then_refuses_to_clobber_without_an_explicit_overwrite() {
         &mut ledger,
         &mut audit,
         "fs_write",
-        json!({ "path": "docs/notes.md", "content": "second" }),
+        &json!({ "path": "docs/notes.md", "content": "second" }),
     )
     .expect_err("an implicit clobber must be refused");
     assert_eq!(clobbered.sandbox(), Some(SandboxError::AlreadyExists));
@@ -173,7 +173,7 @@ fn write_creates_then_refuses_to_clobber_without_an_explicit_overwrite() {
         &mut ledger,
         &mut audit,
         "fs_write",
-        json!({ "path": "docs/notes.md", "content": "second", "mode": "overwrite" }),
+        &json!({ "path": "docs/notes.md", "content": "second", "mode": "overwrite" }),
     )
     .expect("an explicit overwrite is allowed");
     assert_eq!(tree.read("workspace/docs/notes.md"), "second");
@@ -192,7 +192,7 @@ fn write_cannot_create_a_missing_parent_directory() {
         &mut ledger,
         &mut audit,
         "fs_write",
-        json!({ "path": "brand/new/tree.md", "content": "x" }),
+        &json!({ "path": "brand/new/tree.md", "content": "x" }),
     )
     .expect_err("the parent does not exist");
     assert_eq!(error.sandbox(), Some(SandboxError::NotFound));
@@ -212,7 +212,7 @@ fn list_reports_entries_without_following_anything() {
         &mut ledger,
         &mut audit,
         "fs_list",
-        json!({}),
+        &json!({}),
     )
     .expect("the root is listable");
     let entries: Vec<(&str, &str)> = root.structured["entries"]
@@ -243,7 +243,7 @@ fn list_reports_entries_without_following_anything() {
         &mut ledger,
         &mut audit,
         "fs_list",
-        json!({ "max_entries": 1 }),
+        &json!({ "max_entries": 1 }),
     )
     .expect("the root is listable");
     assert_eq!(
@@ -269,7 +269,7 @@ fn glob_walks_the_workspace_and_never_leaves_it() {
         &mut ledger,
         &mut audit,
         "fs_glob",
-        json!({ "pattern": "**/*.rs" }),
+        &json!({ "pattern": "**/*.rs" }),
     )
     .expect("the glob runs");
     assert_eq!(
@@ -285,7 +285,7 @@ fn glob_walks_the_workspace_and_never_leaves_it() {
         &mut ledger,
         &mut audit,
         "fs_glob",
-        json!({ "pattern": "*.md", "path": "docs" }),
+        &json!({ "pattern": "*.md", "path": "docs" }),
     )
     .expect("the scoped glob runs");
     assert_eq!(scoped.structured["matches"], json!(["docs/guide.md"]));
@@ -298,7 +298,7 @@ fn glob_walks_the_workspace_and_never_leaves_it() {
         &mut ledger,
         &mut audit,
         "fs_glob",
-        json!({ "pattern": "../**/*" }),
+        &json!({ "pattern": "../**/*" }),
     )
     .expect_err("a traversal pattern must be refused");
     assert_eq!(escape.sandbox(), Some(SandboxError::AbsolutePathForbidden));
@@ -317,7 +317,7 @@ fn search_finds_matches_with_line_numbers_and_honours_case_sensitivity() {
         &mut ledger,
         &mut audit,
         "fs_search",
-        json!({ "query": "TODO" }),
+        &json!({ "query": "TODO" }),
     )
     .expect("the search runs");
     assert_eq!(
@@ -344,7 +344,7 @@ fn search_finds_matches_with_line_numbers_and_honours_case_sensitivity() {
         &mut ledger,
         &mut audit,
         "fs_search",
-        json!({ "query": "todo" }),
+        &json!({ "query": "todo" }),
     )
     .expect("the search runs");
     assert_eq!(lowercase.structured["total_matches"], 0);
@@ -355,7 +355,7 @@ fn search_finds_matches_with_line_numbers_and_honours_case_sensitivity() {
         &mut ledger,
         &mut audit,
         "fs_search",
-        json!({ "query": "todo", "case_sensitive": false }),
+        &json!({ "query": "todo", "case_sensitive": false }),
     )
     .expect("the search runs");
     assert_eq!(insensitive.structured["total_matches"], 2);
@@ -366,7 +366,7 @@ fn search_finds_matches_with_line_numbers_and_honours_case_sensitivity() {
         &mut ledger,
         &mut audit,
         "fs_search",
-        json!({ "query": "TODO", "max_results": 1 }),
+        &json!({ "query": "TODO", "max_results": 1 }),
     )
     .expect("the search runs");
     assert_eq!(capped.structured["total_matches"], 2);
@@ -393,7 +393,7 @@ fn patch_applies_a_unified_diff_and_leaves_the_file_untouched_on_failure() {
         &mut ledger,
         &mut audit,
         "fs_patch",
-        json!({
+        &json!({
             "path": "README.md",
             "patch": "--- a/README.md\n+++ b/README.md\n@@ -1,2 +1,3 @@\n GTA Claw\n-readme body\n+rewritten body\n+new line\n",
         }),
@@ -418,7 +418,7 @@ fn patch_applies_a_unified_diff_and_leaves_the_file_untouched_on_failure() {
         &mut ledger,
         &mut audit,
         "fs_patch",
-        json!({
+        &json!({
             "path": "README.md",
             "patch": "--- a/README.md\n+++ b/README.md\n@@ -1,2 +1,2 @@\n GTA Claw\n-content that is not there\n+anything\n",
         }),
@@ -438,7 +438,7 @@ fn patch_applies_a_unified_diff_and_leaves_the_file_untouched_on_failure() {
         &mut ledger,
         &mut audit,
         "fs_patch",
-        json!({
+        &json!({
             "path": "README.md",
             "patch": "--- a/other.md\n+++ b/other.md\n@@ -1,1 +1,1 @@\n-GTA Claw\n+owned\n",
         }),
@@ -466,7 +466,7 @@ fn the_size_limit_stops_a_large_write_before_it_touches_the_disk() {
         &mut ledger,
         &mut audit,
         "fs_write",
-        json!({ "path": "big.txt", "content": "x".repeat(65) }),
+        &json!({ "path": "big.txt", "content": "x".repeat(65) }),
     )
     .expect_err("an oversized write must be refused");
     assert_eq!(error.sandbox(), Some(SandboxError::FileTooLarge));
@@ -478,7 +478,7 @@ fn the_size_limit_stops_a_large_write_before_it_touches_the_disk() {
         &mut ledger,
         &mut audit,
         "fs_write",
-        json!({ "path": "small.txt", "content": "x".repeat(64) }),
+        &json!({ "path": "small.txt", "content": "x".repeat(64) }),
     )
     .expect("a write at the limit is allowed");
     assert_eq!(tree.read("workspace/small.txt").len(), 64);
@@ -497,7 +497,7 @@ fn every_filesystem_invocation_is_audited_with_its_exact_resource() {
         &mut ledger,
         &mut audit,
         "fs_read",
-        json!({ "path": "src/main.rs" }),
+        &json!({ "path": "src/main.rs" }),
     )
     .expect("the read succeeds");
 
@@ -544,7 +544,7 @@ fn a_backslash_path_is_normalized_before_the_broker_sees_it() {
         &mut ledger,
         &mut audit,
         "fs_read",
-        json!({ "path": "src\\tools\\mod.rs" }),
+        &json!({ "path": "src\\tools\\mod.rs" }),
     )
     .expect("the grant covers the normalized path");
     assert_eq!(
@@ -559,7 +559,7 @@ fn a_backslash_path_is_normalized_before_the_broker_sees_it() {
         &mut ledger,
         &mut audit,
         "fs_read",
-        json!({ "path": "src\\main.rs" }),
+        &json!({ "path": "src\\main.rs" }),
     )
     .expect_err("the grant does not reach outside its prefix");
     assert!(

@@ -68,6 +68,15 @@ macro_rules! identifier {
 
         impl $name {
             /// Creates the identifier after enforcing the shared invariant.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`IdentifierError`] naming this identifier family when
+            /// the trimmed value is empty, is longer than
+            /// [`MAX_IDENTIFIER_BYTES`] bytes, or contains a control
+            /// character. All three mean the caller supplied a value that no
+            /// port will accept, so the request that carried it should be
+            /// rejected rather than retried.
             pub fn new(value: impl AsRef<str>) -> Result<Self, IdentifierError> {
                 parse_identifier($kind, value.as_ref()).map(Self)
             }

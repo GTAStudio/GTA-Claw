@@ -5,7 +5,10 @@
 //! operation is confined to that tree.
 
 // Each integration test binary compiles this module and uses a subset of it.
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "one copy of this module is compiled into every integration binary, and each suite uses only the scaffolding it needs; the unused remainder is deliberate rather than stale"
+)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -147,7 +150,7 @@ pub(crate) fn try_junction(original: &Path, link: &Path) -> bool {
 
 /// Junctions do not exist outside Windows.
 #[cfg(not(windows))]
-pub(crate) fn try_junction(_original: &Path, _link: &Path) -> bool {
+pub(crate) const fn try_junction(_original: &Path, _link: &Path) -> bool {
     false
 }
 

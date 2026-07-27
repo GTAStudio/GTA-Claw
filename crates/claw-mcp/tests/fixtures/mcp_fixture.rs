@@ -1,5 +1,8 @@
 //! Rust-only MCP subprocess fixture.
-#![allow(deprecated)]
+#![expect(
+    deprecated,
+    reason = "this fixture answers the sampling and logging requests that SEP-2577 deprecates, so the interop tests can exercise them"
+)]
 
 use std::{
     fs::OpenOptions,

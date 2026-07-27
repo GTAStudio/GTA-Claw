@@ -118,6 +118,19 @@ impl Error for MigrationError {
 /// are detected before equal values are deduplicated. Secret values are used
 /// only to determine presence; the output stores an [`SecretRef`] to the
 /// selected environment name.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::DuplicateVariable`] when the same name appears
+/// twice with different values, [`MigrationError::AliasConflict`] when a
+/// canonical name and one of its frozen aliases both carry different nonempty
+/// values for the same target, and [`MigrationError::InvalidValue`] naming the
+/// legacy variable and its target when a value fails its audited conversion, for
+/// example a non-boolean flag, an out-of-range integer, an unknown log level, an
+/// empty `AGENT_ROLE_URL`, or a secret whose environment name is not a valid
+/// [`SecretRef`]. Returns [`MigrationError::Config`] when the fully converted
+/// candidate still fails whole-document validation, which is how cross-field
+/// rules such as an enabled channel missing its credentials are reported.
 pub fn migrate_legacy_environment<'a>(
     variables: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<MigrationResult, MigrationError> {
@@ -185,7 +198,7 @@ fn apply_mappings(
                 if value.is_empty() {
                     return Err(invalid(mapping, "must not be empty"));
                 }
-                wire.core.role.source_url = value.to_owned();
+                value.clone_into(&mut wire.core.role.source_url);
             }
             MappingId::EnabledSkills => {
                 wire.core.legacy.skills.source_urls = split_trimmed(value);
@@ -415,10 +428,9 @@ fn parse_integer_prefix(value: &str) -> IntegerPrefix {
     if end == start_digits {
         return IntegerPrefix::Missing;
     }
-    match value[..end].parse() {
-        Ok(value) => IntegerPrefix::Parsed(value),
-        Err(_) => IntegerPrefix::Overflow,
-    }
+    value[..end]
+        .parse()
+        .map_or(IntegerPrefix::Overflow, IntegerPrefix::Parsed)
 }
 
 pub(crate) fn parse_legacy_integer(

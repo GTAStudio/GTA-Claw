@@ -224,7 +224,7 @@ impl ServiceHandle {
     /// These are the addresses actually bound, not the addresses requested, so
     /// a port of `0` is reported as the port the operating system chose.
     #[must_use]
-    pub fn listening(subsystem: SubsystemId, bound: Vec<SocketAddr>) -> Self {
+    pub const fn listening(subsystem: SubsystemId, bound: Vec<SocketAddr>) -> Self {
         Self {
             subsystem,
             bound,
@@ -372,7 +372,7 @@ pub trait Subsystem: Send + Sync + 'static {
     ///
     /// An error is recorded and shutdown continues, because refusing to quiesce
     /// must not be able to prevent teardown.
-    fn quiesce<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
+    fn quiesce(&self) -> BoxFuture<'_, Result<(), SubsystemError>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -384,7 +384,7 @@ pub trait Subsystem: Send + Sync + 'static {
     /// # Errors
     ///
     /// An error is recorded and shutdown continues.
-    fn drain<'a>(&'a self) -> BoxFuture<'a, Result<DrainReport, SubsystemError>> {
+    fn drain(&self) -> BoxFuture<'_, Result<DrainReport, SubsystemError>> {
         let subsystem = self.descriptor().id().clone();
 
         Box::pin(async move { Ok(DrainReport::clean(subsystem, 0)) })
@@ -400,7 +400,7 @@ pub trait Subsystem: Send + Sync + 'static {
     /// # Errors
     ///
     /// An error is recorded and shutdown continues to the next subsystem.
-    fn shutdown<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>>;
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), SubsystemError>>;
 }
 
 #[cfg(test)]

@@ -129,7 +129,7 @@ impl Tool for FsReadTool {
     ) -> Result<ToolOutput, ToolError> {
         let path = required_path(arguments, context, "path")?;
         let text = decode_utf8(context.sandbox.read_file(&path)?)?;
-        let lines: Vec<&str> = text.lines().collect();
+        let total_lines = text.lines().count();
         let start = arguments
             .count("start_line")
             .unwrap_or(1)
@@ -137,18 +137,19 @@ impl Tool for FsReadTool {
             .saturating_sub(1);
         let start = usize::try_from(start)
             .unwrap_or(usize::MAX)
-            .min(lines.len());
+            .min(total_lines);
         let requested = arguments.count("line_count").unwrap_or(MAX_READ_LINES);
         let limit = usize::try_from(requested.min(MAX_READ_LINES)).unwrap_or(0);
-        let end = start.saturating_add(limit).min(lines.len());
-        let selected = &lines[start..end];
-        let content = selected.join("\n");
-        let truncated = end < lines.len() || start > 0;
+        // Only the requested window is materialized: returning a prefix must
+        // not cost one pointer per line of the whole file.
+        let selected: Vec<&str> = text.lines().skip(start).take(limit).collect();
+        let rendered = selected.join("\n");
+        let truncated = start > 0 || start.saturating_add(selected.len()) < total_lines;
         Ok(ToolOutput::new(
-            content,
+            rendered,
             json!({
                 "path": path.as_str(),
-                "total_lines": lines.len(),
+                "total_lines": total_lines,
                 "start_line": start + 1,
                 "returned_lines": selected.len(),
             }),
@@ -197,19 +198,17 @@ impl Tool for FsWriteTool {
         _authorization: &Authorization<'_>,
     ) -> Result<ToolOutput, ToolError> {
         let path = required_path(arguments, context, "path")?;
-        let content = arguments.required_text("content")?;
+        let text = arguments.required_text("content")?;
         let mode = match arguments.text("mode") {
             Some("create") | None => WriteMode::CreateNew,
             Some(_) => WriteMode::Overwrite,
         };
-        let resolved = context
-            .sandbox
-            .write_file(&path, content.as_bytes(), mode)?;
+        let resolved = context.sandbox.write_file(&path, text.as_bytes(), mode)?;
         Ok(ToolOutput::new(
-            format!("wrote {} bytes to {}", content.len(), resolved.relative()),
+            format!("wrote {} bytes to {}", text.len(), resolved.relative()),
             json!({
                 "path": resolved.relative().as_str(),
-                "bytes_written": content.len(),
+                "bytes_written": text.len(),
                 "mode": if mode == WriteMode::CreateNew { "create" } else { "overwrite" },
             }),
         ))
@@ -261,11 +260,17 @@ impl Tool for FsListTool {
         let limit = usize::try_from(requested.min(MAX_LIST_ENTRIES)).unwrap_or(0);
         let truncated = entries.len() > limit;
         let selected = &entries[..entries.len().min(limit)];
-        let content = selected
-            .iter()
-            .map(|entry| format!("{} {}", entry.kind.as_str(), entry.path))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Appended in place rather than through one `format!` per entry: a
+        // listing is capped at a few thousand rows and each one is two pushes.
+        let mut rendered = String::new();
+        for entry in selected {
+            if !rendered.is_empty() {
+                rendered.push('\n');
+            }
+            rendered.push_str(entry.kind.as_str());
+            rendered.push(' ');
+            rendered.push_str(entry.path.as_str());
+        }
         let structured: Vec<Value> = selected
             .iter()
             .map(|entry| {
@@ -277,7 +282,7 @@ impl Tool for FsListTool {
             })
             .collect();
         Ok(ToolOutput::new(
-            content,
+            rendered,
             json!({
                 "path": path.as_str(),
                 "entries": structured,

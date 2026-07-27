@@ -76,6 +76,17 @@ enum Token {
 
 impl GlobPattern {
     /// Validates a caller-supplied glob pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GlobError::Empty`] for an empty pattern, [`GlobError::TooLong`]
+    /// past 256 bytes, [`GlobError::ControlCharacter`] when the pattern holds a
+    /// control character, [`GlobError::NotRelative`] for a leading separator, a
+    /// `:`, or a `.`/`..` segment, [`GlobError::TooManySegments`] past 24
+    /// segments, [`GlobError::EmptySegment`] for a repeated separator,
+    /// [`GlobError::UnterminatedClass`] for a `[` with no closing `]` or a stray
+    /// `]`, and [`GlobError::InvalidRange`] when a class range ends before it
+    /// starts.
     pub fn parse(pattern: &str) -> Result<Self, GlobError> {
         if pattern.is_empty() {
             return Err(GlobError::Empty);
@@ -111,6 +122,14 @@ impl GlobPattern {
         let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
         match_segments(&self.segments, &parts)
     }
+
+    /// Matches path components that the caller already has split apart.
+    ///
+    /// Walking a workspace yields components directly, so the tool loop uses
+    /// this to avoid rebuilding a joined path string for every candidate file.
+    fn matches_parts(&self, parts: &[&str]) -> bool {
+        match_segments(&self.segments, parts)
+    }
 }
 
 fn parse_tokens(segment: &str) -> Result<Vec<Token>, GlobError> {
@@ -125,11 +144,12 @@ fn parse_tokens(segment: &str) -> Result<Vec<Token>, GlobError> {
             }
             '?' => tokens.push(Token::AnyChar),
             '[' => {
-                let mut negated = false;
-                if matches!(characters.peek(), Some('!' | '^')) {
+                let negated = if matches!(characters.peek(), Some('!' | '^')) {
                     characters.next();
-                    negated = true;
-                }
+                    true
+                } else {
+                    false
+                };
                 let mut ranges = Vec::new();
                 let mut closed = false;
                 while let Some(item) = characters.next() {
@@ -163,11 +183,14 @@ fn parse_tokens(segment: &str) -> Result<Vec<Token>, GlobError> {
 /// Matches pattern segments against path segments with iterative `**` handling.
 fn match_segments(segments: &[Segment], parts: &[&str]) -> bool {
     // `reachable[index]` marks that the first `index` path parts have been
-    // consumed by the pattern prefix processed so far.
+    // consumed by the pattern prefix processed so far. The two buffers are
+    // swapped rather than reallocated: a pattern may hold 24 segments and the
+    // matcher runs once per walked file.
     let mut reachable = vec![false; parts.len() + 1];
+    let mut next = vec![false; parts.len() + 1];
     reachable[0] = true;
     for segment in segments {
-        let mut next = vec![false; parts.len() + 1];
+        next.fill(false);
         match segment {
             Segment::AnyDepth => {
                 let mut carry = false;
@@ -184,7 +207,7 @@ fn match_segments(segments: &[Segment], parts: &[&str]) -> bool {
                 }
             }
         }
-        reachable = next;
+        std::mem::swap(&mut reachable, &mut next);
         if !reachable.iter().any(|value| *value) {
             return false;
         }
@@ -228,8 +251,7 @@ fn match_tokens(tokens: &[Token], part: &str) -> bool {
 fn token_matches(token: &Token, character: char) -> bool {
     match token {
         Token::Literal(expected) => *expected == character,
-        Token::AnyChar => true,
-        Token::AnyRun => true,
+        Token::AnyChar | Token::AnyRun => true,
         Token::Class { negated, ranges } => {
             let inside = ranges
                 .iter()
@@ -340,9 +362,14 @@ impl Tool for FsGlobTool {
         let prefix_len = root.components().len();
         let mut matched = Vec::new();
         let mut total = 0_usize;
-        for file in context.sandbox.walk_files(&root)? {
-            let relative_to_root = file.components()[prefix_len..].join("/");
-            if pattern.matches(&relative_to_root) {
+        // The component slice is borrowed per file instead of joined back into
+        // a fresh `String`: a walk yields up to 20 000 paths.
+        let files = context.sandbox.walk_files(&root)?;
+        let mut parts: Vec<&str> = Vec::new();
+        for file in &files {
+            parts.clear();
+            parts.extend(file.components()[prefix_len..].iter().map(String::as_str));
+            if pattern.matches_parts(&parts) {
                 total += 1;
                 if matched.len() < limit {
                     matched.push(file.as_str().to_owned());

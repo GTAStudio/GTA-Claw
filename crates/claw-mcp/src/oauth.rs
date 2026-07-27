@@ -64,6 +64,14 @@ pub struct CredentialBinding {
 
 impl CredentialBinding {
     /// Creates a credential binding for a configured MCP resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when the profile name is empty or only
+    /// whitespace, when the resource URL is plain HTTP at a non-loopback host (a
+    /// credential must never be bound to an origin that would carry it in clear
+    /// text), or when the URL has no network origin — a `data:` or `file:` URL
+    /// serializes its origin as `null` and cannot own a credential.
     pub fn new(profile: impl Into<String>, resource: &Url) -> Result<Self> {
         let profile = profile.into();
         if profile.trim().is_empty() {
@@ -114,31 +122,31 @@ pub struct DiscoveredAuthorizationServer {
 impl DiscoveredAuthorizationServer {
     /// Returns the validated metadata document.
     #[must_use]
-    pub fn metadata(&self) -> &AuthorizationServerMetadata {
+    pub const fn metadata(&self) -> &AuthorizationServerMetadata {
         &self.metadata
     }
 
     /// Returns the validated issuer URL.
     #[must_use]
-    pub fn issuer(&self) -> &Url {
+    pub const fn issuer(&self) -> &Url {
         &self.issuer
     }
 
     /// Returns the metadata-authorized browser endpoint.
     #[must_use]
-    pub fn authorization_endpoint(&self) -> &Url {
+    pub const fn authorization_endpoint(&self) -> &Url {
         &self.authorization_endpoint
     }
 
     /// Returns the metadata-authorized token endpoint.
     #[must_use]
-    pub fn token_endpoint(&self) -> &Url {
+    pub const fn token_endpoint(&self) -> &Url {
         &self.token_endpoint
     }
 
     /// Returns the metadata-authorized dynamic registration endpoint.
     #[must_use]
-    pub fn registration_endpoint(&self) -> Option<&Url> {
+    pub const fn registration_endpoint(&self) -> Option<&Url> {
         self.registration_endpoint.as_ref()
     }
 }
@@ -222,6 +230,13 @@ pub struct PkcePair {
 
 impl PkcePair {
     /// Generates a high-entropy S256 PKCE pair from operating-system randomness.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when the operating system refuses to supply
+    /// randomness. A PKCE verifier derived from a weakened source would let anyone
+    /// who observes the authorization code redeem it, so this fails rather than
+    /// falling back.
     pub fn generate() -> Result<Self> {
         let mut random = crate::secure_random::bytes::<48>()?;
         let mut verifier = URL_SAFE_NO_PAD.encode(random);
@@ -267,6 +282,22 @@ pub struct AuthorizationRequest {
     pub pkce: PkcePair,
 }
 
+/// Values a browser redirect hands back, redeemed by [`OAuthClient::exchange_code`].
+///
+/// Grouping them keeps the authorization-code half of the exchange together and
+/// makes it impossible to swap the code and the state at a call site.
+#[derive(Debug)]
+pub struct AuthorizationCallback<'a> {
+    /// `code` query parameter returned on the redirect.
+    pub code: &'a str,
+    /// `state` query parameter echoed by the authorization server.
+    pub state: &'a str,
+    /// Request this callback answers, holding the PKCE verifier to present.
+    pub request: &'a AuthorizationRequest,
+    /// Redirect URI that was sent with the authorization request.
+    pub redirect_uri: &'a Url,
+}
+
 /// OAuth tokens stored behind a secure platform port.
 #[derive(Clone)]
 pub struct TokenSet {
@@ -303,7 +334,7 @@ impl TokenSet {
 
     /// Returns whether the authorization server supplied a refresh token.
     #[must_use]
-    pub fn can_refresh(&self) -> bool {
+    pub const fn can_refresh(&self) -> bool {
         self.refresh_token.is_some()
     }
 
@@ -399,17 +430,35 @@ impl CredentialStoreError {
 /// Secure persistence port for OAuth token sets.
 pub trait TokenStore: Send + Sync {
     /// Loads credentials for an origin-bound profile key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialStoreError`] when the backing secure store is
+    /// unreachable, locked, or returns an entry this adapter cannot decode. A
+    /// profile that simply has no stored credential is `Ok(None)`, not an error.
     fn load(
         &self,
         binding: &CredentialBinding,
     ) -> std::result::Result<Option<TokenSet>, CredentialStoreError>;
     /// Replaces credentials for an origin-bound profile key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialStoreError`] when the backing secure store rejects
+    /// the write — unreachable or locked keychain, denied permission, or an
+    /// entry larger than the platform allows.
     fn save(
         &self,
         binding: &CredentialBinding,
         tokens: TokenSet,
     ) -> std::result::Result<(), CredentialStoreError>;
     /// Deletes credentials for an origin-bound profile key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialStoreError`] when the backing secure store is
+    /// unreachable or refuses the deletion. Deleting a profile that holds no
+    /// credential is `Ok(())`.
     fn delete(&self, binding: &CredentialBinding) -> std::result::Result<(), CredentialStoreError>;
 }
 
@@ -506,6 +555,12 @@ impl Debug for OAuthClient {
 
 impl OAuthClient {
     /// Creates an OAuth client with redirects disabled and a bounded timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Http`] when the HTTPS client cannot be built — no usable
+    /// platform trust anchors, or a `rustls` crypto provider already installed with
+    /// an incompatible configuration.
     pub fn new(timeout: Duration) -> Result<Self> {
         let http = HttpClient::new(timeout)?;
         Ok(Self {
@@ -515,6 +570,14 @@ impl OAuthClient {
     }
 
     /// Reads protected-resource metadata from an explicit URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when the metadata URL is cleartext HTTP at a
+    /// non-loopback host or the server answers with a non-2xx status (the status is
+    /// included). Returns [`McpError::Http`] when the request fails, times out, or
+    /// the body exceeds the client's response limit, and [`McpError::Json`] when the
+    /// document is not a protected-resource metadata object.
     pub async fn discover_resource(&self, metadata_url: &Url) -> Result<ProtectedResourceMetadata> {
         validate_secure_endpoint(metadata_url, "OAuth resource metadata")?;
         let response = self
@@ -531,12 +594,23 @@ impl OAuthClient {
     }
 
     /// Reads authorization-server metadata from an issuer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when the issuer is cleartext HTTP at a
+    /// non-loopback host, the metadata request answers with a non-2xx status, the
+    /// document's `issuer` does not match the URL it was fetched from (a mix-up
+    /// attack), the server advertises PKCE methods but not `S256`, or an advertised
+    /// authorization, token, or registration endpoint is itself cleartext. Returns
+    /// [`McpError::Url`] when an advertised endpoint is not a valid absolute URL,
+    /// [`McpError::Http`] when the request fails or times out, and
+    /// [`McpError::Json`] when the document cannot be parsed.
     pub async fn discover_authorization_server(
         &self,
         issuer: &Url,
     ) -> Result<DiscoveredAuthorizationServer> {
         validate_secure_endpoint(issuer, "OAuth issuer")?;
-        let metadata_url = authorization_server_metadata_url(issuer)?;
+        let metadata_url = authorization_server_metadata_url(issuer);
         let response = self
             .http
             .request(Method::GET, &metadata_url, HeaderMap::new(), Vec::new())
@@ -585,6 +659,14 @@ impl OAuthClient {
     }
 
     /// Dynamically registers a public OAuth client at the discovered endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when the discovered metadata advertises no
+    /// registration endpoint, or the endpoint answers with a non-2xx status (the
+    /// status is included; a 401 or 403 usually means the server requires a
+    /// pre-provisioned client). Returns [`McpError::Http`] when the request fails or
+    /// times out, and [`McpError::Json`] when the response omits `client_id`.
     pub async fn register(
         &self,
         server: &DiscoveredAuthorizationServer,
@@ -618,6 +700,12 @@ impl OAuthClient {
     }
 
     /// Builds an authorization-code request with PKCE and CSRF state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when the operating system refuses to supply
+    /// the randomness the PKCE verifier and CSRF state are derived from. No network
+    /// work happens here, so nothing else can fail.
     pub fn authorization_request(
         &self,
         server: &DiscoveredAuthorizationServer,
@@ -649,28 +737,41 @@ impl OAuthClient {
     }
 
     /// Exchanges an authorization code and persists the returned tokens.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// The callback `state` is compared against the one minted by
+    /// [`OAuthClient::authorization_request`] before anything is sent, so a
+    /// forged redirect never reaches the token endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when the callback `state` does not match
+    /// the authorization request (a CSRF-injected redirect), when `resource`
+    /// names an origin other than the one the credential is bound to, when the
+    /// token endpoint is cleartext HTTP at a non-loopback host, when it answers
+    /// with a non-2xx status — `invalid_grant` here means the code expired, was
+    /// already redeemed, or the PKCE verifier did not match — or when the
+    /// returned `expires_in` overflows the system clock. Returns
+    /// [`McpError::CredentialStore`] when the new tokens cannot be persisted,
+    /// [`McpError::Http`] when the request fails or times out, and
+    /// [`McpError::Json`] when the token response cannot be parsed.
     pub async fn exchange_code(
         &self,
         binding: &CredentialBinding,
         store: &dyn TokenStore,
         server: &DiscoveredAuthorizationServer,
         client: &RegisteredClient,
-        code: &str,
-        callback_state: &str,
-        authorization: &AuthorizationRequest,
-        redirect_uri: &Url,
+        callback: AuthorizationCallback<'_>,
         resource: Option<&Url>,
     ) -> Result<TokenSet> {
-        if callback_state != authorization.state {
+        if callback.state != callback.request.state {
             return Err(McpError::Protocol("OAuth callback state mismatch".into()));
         }
         let mut fields = vec![
             ("grant_type", "authorization_code"),
             ("client_id", client.client_id()),
-            ("code", code),
-            ("redirect_uri", redirect_uri.as_str()),
-            ("code_verifier", authorization.pkce.verifier()),
+            ("code", callback.code),
+            ("redirect_uri", callback.redirect_uri.as_str()),
+            ("code_verifier", callback.request.pkce.verifier()),
         ];
         if let Some(secret) = client.client_secret() {
             fields.push(("client_secret", secret));
@@ -686,6 +787,22 @@ impl OAuthClient {
     }
 
     /// Refreshes a token while coalescing concurrent refreshes for this client and profile.
+    ///
+    /// Concurrent callers for the same binding queue on one lock, and a caller
+    /// that finds the token already rotated while it waited returns the newer
+    /// token instead of spending the (often single-use) refresh token again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when `resource` names an origin other than the
+    /// one the credential is bound to, when the store holds no credential for the
+    /// binding, when the stored credential has no refresh token, when the token
+    /// endpoint is cleartext HTTP at a non-loopback host, or when it answers with a
+    /// non-2xx status — which for `invalid_grant` means the refresh token was
+    /// revoked or already redeemed and the user must authorize again. Returns
+    /// [`McpError::CredentialStore`] when the rotated token cannot be persisted,
+    /// [`McpError::Http`] when the request fails or times out, and
+    /// [`McpError::Json`] when the token response cannot be parsed.
     pub async fn refresh(
         &self,
         binding: &CredentialBinding,
@@ -768,6 +885,16 @@ impl OAuthClient {
     }
 
     /// Returns a bearer header, refreshing first when required.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when `resource` names an origin other than the
+    /// one the credential is bound to, when the store holds no credential for the
+    /// binding, when an expired credential cannot be refreshed (see
+    /// [`OAuthClient::refresh`]), or when the access token contains bytes that are
+    /// not valid in an HTTP header value. Returns [`McpError::CredentialStore`],
+    /// [`McpError::Http`], or [`McpError::Json`] for the same reasons a refresh
+    /// does.
     pub async fn bearer_header(
         &self,
         binding: &CredentialBinding,
@@ -801,6 +928,15 @@ impl OAuthClient {
     }
 
     /// Injects a sensitive bearer header into one HTTP request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when the request URL is cleartext HTTP at a
+    /// non-loopback host, has no network origin, or has an origin other than the one
+    /// `bearer` is bound to — the check that stops a redirect or a misconfigured
+    /// server from collecting another origin's token. Returns [`McpError::Http`]
+    /// when the request fails, times out, or the response body exceeds the client's
+    /// buffering limit.
     pub async fn send_authorized(
         &self,
         method: Method,
@@ -829,6 +965,15 @@ impl OAuthClient {
     }
 
     /// Removes credentials for one origin-bound OAuth profile.
+    ///
+    /// Waits for any in-flight refresh for the same binding, so a token rotated
+    /// concurrently is deleted rather than written back after the logout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::CredentialStore`] when the platform store refuses the
+    /// deletion — an unreachable or locked keychain. Deleting a profile that holds
+    /// no credential succeeds.
     pub async fn logout(&self, binding: &CredentialBinding, store: &dyn TokenStore) -> Result<()> {
         let refresh_lock = self.refresh_lock(binding).await;
         let _guard = refresh_lock.lock().await;
@@ -843,10 +988,11 @@ impl Default for OAuthClient {
 }
 
 fn store_error(error: CredentialStoreError) -> McpError {
-    McpError::CredentialStore(error.to_string())
+    let CredentialStoreError { message } = error;
+    McpError::CredentialStore(message)
 }
 
-fn authorization_server_metadata_url(issuer: &Url) -> Result<Url> {
+fn authorization_server_metadata_url(issuer: &Url) -> Url {
     let mut metadata = issuer.clone();
     metadata.set_query(None);
     metadata.set_fragment(None);
@@ -857,7 +1003,7 @@ fn authorization_server_metadata_url(issuer: &Url) -> Result<Url> {
         format!("/.well-known/oauth-authorization-server/{issuer_path}")
     };
     metadata.set_path(&path);
-    Ok(metadata)
+    metadata
 }
 
 fn validate_secure_endpoint(endpoint: &Url, label: &str) -> Result<()> {
@@ -908,14 +1054,11 @@ fn load_tokens(binding: &CredentialBinding, store: &dyn TokenStore) -> Result<To
 
 fn same_token_generation(left: &TokenSet, right: &TokenSet) -> bool {
     left.access_token.expose_secret() == right.access_token.expose_secret()
-        && left
-            .refresh_token
-            .as_ref()
-            .map(|secret| secret.expose_secret())
+        && left.refresh_token.as_ref().map(ExposeSecret::expose_secret)
             == right
                 .refresh_token
                 .as_ref()
-                .map(|secret| secret.expose_secret())
+                .map(ExposeSecret::expose_secret)
         && left.expires_at == right.expires_at
 }
 
@@ -1052,15 +1195,11 @@ mod tests {
             Url::parse("https://auth.example/realms/tenant?ignored=1").expect("path issuer");
 
         assert_eq!(
-            authorization_server_metadata_url(&root)
-                .expect("root metadata URL")
-                .as_str(),
+            authorization_server_metadata_url(&root).as_str(),
             "https://auth.example/.well-known/oauth-authorization-server"
         );
         assert_eq!(
-            authorization_server_metadata_url(&tenant)
-                .expect("tenant metadata URL")
-                .as_str(),
+            authorization_server_metadata_url(&tenant).as_str(),
             "https://auth.example/.well-known/oauth-authorization-server/realms/tenant"
         );
     }
@@ -1137,16 +1276,19 @@ mod tests {
             .expect("loopback authorization URL");
         let store = MemoryTokenStore::default();
         let binding = CredentialBinding::new("fixture", &base).expect("credential binding");
+        let redirect_uri = Url::parse("http://127.0.0.1:8989/callback").expect("redirect URL");
         let state_error = oauth
             .exchange_code(
                 &binding,
                 &store,
                 &server_metadata,
                 &client,
-                "authorization-code",
-                "wrong-state",
-                &authorization,
-                &Url::parse("http://127.0.0.1:8989/callback").expect("redirect URL"),
+                AuthorizationCallback {
+                    code: "authorization-code",
+                    state: "wrong-state",
+                    request: &authorization,
+                    redirect_uri: &redirect_uri,
+                },
                 Some(&base),
             )
             .await
@@ -1161,10 +1303,12 @@ mod tests {
                 &store,
                 &server_metadata,
                 &client,
-                "authorization-code",
-                &authorization.state,
-                &authorization,
-                &Url::parse("http://127.0.0.1:8989/callback").expect("redirect URL"),
+                AuthorizationCallback {
+                    code: "authorization-code",
+                    state: &authorization.state,
+                    request: &authorization,
+                    redirect_uri: &redirect_uri,
+                },
                 Some(&base),
             )
             .await
@@ -1198,7 +1342,7 @@ mod tests {
         assert!(store.load(&binding).expect("load after logout").is_none());
 
         server.await.expect("fixture server task");
-        let requests = requests.lock().expect("request log");
+        let requests = std::mem::take(&mut *requests.lock().expect("request log"));
         assert_eq!(requests.len(), 6);
         assert_eq!(
             request_line(&requests[0]),
@@ -1395,7 +1539,7 @@ mod tests {
             }
         }
         server.await.expect("refresh fixture task");
-        let requests = requests.lock().expect("request log");
+        let requests = std::mem::take(&mut *requests.lock().expect("request log"));
         assert_eq!(requests.len(), 1);
         assert_eq!(request_line(&requests[0]), "POST /token HTTP/1.1");
         assert_eq!(

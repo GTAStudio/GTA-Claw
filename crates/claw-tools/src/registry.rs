@@ -34,6 +34,12 @@ impl ToolRegistry {
     }
 
     /// Registers one tool, refusing duplicate names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::DuplicateTool`] when a tool with the same
+    /// descriptor name is already registered. Registration is all-or-nothing:
+    /// the registry is unchanged when this fails.
     pub fn register(&mut self, tool: Box<dyn Tool>) -> Result<(), ToolError> {
         let name = tool.descriptor().name;
         if self.tools.contains_key(name) {
@@ -83,6 +89,19 @@ impl ToolRegistry {
     ///
     /// Failure at any gate is terminal: no partial execution occurs, and the
     /// refusal is durably audited before the error is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::UnknownTool`] when `name` is not registered,
+    /// [`ToolError::Schema`] when `arguments` fail the tool's declared schema
+    /// (missing required field, wrong type, value out of bounds),
+    /// [`ToolError::Permission`] when the broker denies the capability or the
+    /// grant has expired, whatever the tool itself returns (for example
+    /// [`ToolError::Sandbox`] for a path outside the workspace root or a file
+    /// over the read limit), and [`ToolError::Audit`] when the refusal or
+    /// completion record could not be durably persisted — an invocation whose
+    /// audit trail cannot be written is reported as failed even when the tool
+    /// succeeded.
     pub fn invoke<B, S>(
         &self,
         name: &str,
@@ -123,7 +142,7 @@ impl ToolRegistry {
         let validated = match descriptor.schema.validate(arguments) {
             Ok(validated) => validated,
             Err(error) => {
-                self.audit_refusal(
+                audit_refusal(
                     audit,
                     &descriptor,
                     None,
@@ -140,7 +159,7 @@ impl ToolRegistry {
             Ok(resource) => resource,
             Err(error) => {
                 let reason = error.audit_reason();
-                self.audit_refusal(audit, &descriptor, None, reason, None, redacted, now)?;
+                audit_refusal(audit, &descriptor, None, reason, None, redacted, now)?;
                 return Err(error);
             }
         };
@@ -155,7 +174,7 @@ impl ToolRegistry {
         let grant = match broker.evaluate(&request) {
             PermissionDecision::Granted(grant) => grant,
             PermissionDecision::Denied(reason) => {
-                self.audit_refusal(
+                audit_refusal(
                     audit,
                     &descriptor,
                     Some(resource),
@@ -222,32 +241,34 @@ impl ToolRegistry {
         })?;
         result
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
-    fn audit_refusal<S: ToolAuditSink>(
-        &self,
-        audit: &mut S,
-        descriptor: &ToolDescriptor,
-        resource: Option<Resource>,
-        reason: AuditReason,
-        denial: Option<DenialReason>,
-        arguments: Value,
-        unix_millis: u64,
-    ) -> Result<(), ToolError> {
-        let record = ToolAuditRecord {
-            tool: descriptor.name.to_owned(),
-            phase: AuditPhase::Completed,
-            capability: Some(descriptor.permission.capability),
-            resource,
-            grant: None,
-            outcome: AuditOutcome::Denied,
-            reason,
-            denial,
-            arguments,
-            unix_millis,
-        };
-        audit.persist(&record).map_err(ToolError::Audit)
-    }
+/// Records one terminal refusal before the error leaves the registry.
+///
+/// Free rather than a method: it needs nothing from the registry, and keeping
+/// it out of the impl also keeps it inside the seven-argument budget.
+fn audit_refusal<S: ToolAuditSink>(
+    audit: &mut S,
+    descriptor: &ToolDescriptor,
+    resource: Option<Resource>,
+    reason: AuditReason,
+    denial: Option<DenialReason>,
+    arguments: Value,
+    unix_millis: u64,
+) -> Result<(), ToolError> {
+    let record = ToolAuditRecord {
+        tool: descriptor.name.to_owned(),
+        phase: AuditPhase::Completed,
+        capability: Some(descriptor.permission.capability),
+        resource,
+        grant: None,
+        outcome: AuditOutcome::Denied,
+        reason,
+        denial,
+        arguments,
+        unix_millis,
+    };
+    audit.persist(&record).map_err(ToolError::Audit)
 }
 
 /// Re-authorization gate handed to a tool for the duration of one invocation.
@@ -267,7 +288,7 @@ struct BrokerGate<'a, B: PermissionBroker, S: ToolAuditSink> {
 }
 
 impl<B: PermissionBroker, S: ToolAuditSink> BrokerGate<'_, B, S> {
-    fn refusal(&self, reason: DenialReason) -> PermissionError {
+    const fn refusal(&self, reason: DenialReason) -> PermissionError {
         PermissionError {
             tool: self.tool,
             capability: self.capability,
