@@ -451,11 +451,16 @@ async fn a_v3_node_keeps_its_bounded_pending_window_across_reconnect() {
         .expect("the reconnect pull receives a response");
     assert!(second_pull.ok());
     let second_pull = payload(&second_pull);
-    assert_eq!(second_pull["count"], json!(1));
+    assert_eq!(second_pull["count"], json!(2));
     assert_eq!(
         second_pull["invocations"][0]["id"],
+        json!("invocation-1"),
+        "unacknowledged work must be reclaimed for at-least-once delivery"
+    );
+    assert_eq!(
+        second_pull["invocations"][1]["id"],
         json!("invocation-2"),
-        "an awaiting-ack invocation must not be redelivered after reconnect"
+        "reclaimed work must stay ahead of later pending work"
     );
 
     let acknowledged = reconnected

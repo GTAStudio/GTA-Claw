@@ -411,6 +411,7 @@ async fn serve_request(
         ));
     };
     let request_id = request.id().clone();
+
     // Keyed by borrowed text: the registry is a `BTreeMap<&'static str, _>`, so
     // only the identity that turns out *not* to be catalogued needs an owned
     // copy, and that is the path that is about to end the request anyway.
