@@ -26,7 +26,7 @@ const BYTES_PER_TOKEN: usize = 4;
 
 /// Returns whether an item is content the engine promised to keep.
 #[must_use]
-pub fn is_pinned(item: &ContextItem) -> bool {
+pub const fn is_pinned(item: &ContextItem) -> bool {
     matches!(
         item,
         ContextItem::SystemNote { .. } | ContextItem::GoalStatement { .. }
@@ -76,7 +76,7 @@ impl EngineState {
     }
 }
 
-fn item_bytes(item: &ContextItem) -> usize {
+const fn item_bytes(item: &ContextItem) -> usize {
     match item {
         ContextItem::UserInput { text }
         | ContextItem::AssistantMessage { text }

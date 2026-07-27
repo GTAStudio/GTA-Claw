@@ -72,13 +72,13 @@ const BULK_FILLER_BYTES: usize = 2_048;
 
 /// Returns the markers the suite expects to survive maintenance and compaction.
 #[must_use]
-pub fn pinned_markers() -> [&'static str; 2] {
+pub const fn pinned_markers() -> [&'static str; 2] {
     [PINNED_NOTE_MARKER, PINNED_GOAL_MARKER]
 }
 
 /// Returns every marker the probe corpus carries, in ingest order.
 #[must_use]
-pub fn probe_markers() -> [&'static str; 6] {
+pub const fn probe_markers() -> [&'static str; 6] {
     [
         PINNED_NOTE_MARKER,
         PINNED_GOAL_MARKER,
@@ -138,7 +138,7 @@ fn missing_markers(messages: &[PromptMessage], markers: &[&'static str]) -> Vec<
         .collect()
 }
 
-fn is_conflict<T>(outcome: &Result<T, PortError>) -> bool {
+const fn is_conflict<T>(outcome: &Result<T, PortError>) -> bool {
     matches!(outcome, Err(PortError::Conflict(_)))
 }
 
@@ -682,9 +682,15 @@ mod tests {
     fn the_probe_corpus_matches_its_declared_shape() {
         let items = probe_items();
 
-        assert_eq!(items.len() as u32, PROBE_ITEM_COUNT);
-        let pinned = items.iter().filter(|item| is_pinned(item)).count() as u32;
-        assert_eq!(pinned, PINNED_PROBE_ITEM_COUNT);
+        assert_eq!(
+            u32::try_from(items.len()).expect("the probe corpus is a handful of items"),
+            PROBE_ITEM_COUNT
+        );
+        let pinned = items.iter().filter(|item| is_pinned(item)).count();
+        assert_eq!(
+            u32::try_from(pinned).expect("the pinned probe items are a handful of items"),
+            PINNED_PROBE_ITEM_COUNT
+        );
         // The pinned items lead, so the usage reported after the first two ingests is exactly
         // the usage the corpus can be compacted down to without dropping pinned content.
         assert!(items.iter().take(2).all(is_pinned));

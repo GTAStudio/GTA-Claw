@@ -77,6 +77,11 @@ struct Pending {
 #[derive(Default)]
 struct BrokerState {
     pending: HashMap<ApprovalId, Pending>,
+    // Grows by one entry per (session, tool) pair that is ever answered with `remember`, and
+    // nothing removes those entries: a decision has to outlive the turn that made it, and this
+    // crate has no session-close hook to retire it at. `StatePort` is load/save only, and no
+    // command ends a session, so bounded cleanup needs a session-termination signal that does not
+    // exist yet. Long-lived hosts leak here in proportion to distinct sessions, slowly.
     remembered: HashMap<(String, String), ApprovalDecision>,
     next_id: u64,
 }
@@ -107,7 +112,7 @@ struct PendingGuard {
 
 impl PendingGuard {
     /// Hands ownership of the pending entry back to the caller.
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -140,10 +145,13 @@ pub struct ApprovalBroker {
 
 impl fmt::Debug for ApprovalBroker {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        // Counting under the lock beats cloning every pending request just to measure it, and the
+        // lock is released before any formatting happens.
+        let outstanding = self.lock().pending.len();
         formatter
             .debug_struct("ApprovalBroker")
             .field("timeout", &self.timeout)
-            .field("outstanding", &self.outstanding().len())
+            .field("outstanding", &outstanding)
             .finish_non_exhaustive()
     }
 }
@@ -167,12 +175,15 @@ impl ApprovalBroker {
     /// Returns every outstanding request, oldest identifier first.
     #[must_use]
     pub fn outstanding(&self) -> Vec<ApprovalRequest> {
-        let state = self.lock();
-        let mut requests: Vec<ApprovalRequest> = state
-            .pending
-            .values()
-            .map(|pending| pending.request.clone())
-            .collect();
+        // The clone-out happens under the lock; the sort does not.
+        let mut requests: Vec<ApprovalRequest> = {
+            let state = self.lock();
+            state
+                .pending
+                .values()
+                .map(|pending| pending.request.clone())
+                .collect()
+        };
         requests.sort_by(|left, right| {
             left.requested_at
                 .cmp(&right.requested_at)
@@ -184,18 +195,18 @@ impl ApprovalBroker {
     /// Returns the decision remembered for a tool in a session, if any.
     #[must_use]
     pub fn remembered(&self, session_id: &SessionId, tool_name: &str) -> Option<ApprovalDecision> {
-        self.lock()
-            .remembered
-            .get(&(session_id.as_str().to_owned(), tool_name.to_owned()))
-            .copied()
+        // The key is built before the lock is taken: this runs for every approval-gated tool call.
+        let key = (session_id.as_str().to_owned(), tool_name.to_owned());
+        self.lock().remembered.get(&key).copied()
     }
 
     /// Forgets a remembered decision so the next call asks again.
+    ///
+    /// Returns whether a decision was actually forgotten.
+    #[must_use]
     pub fn forget(&self, session_id: &SessionId, tool_name: &str) -> bool {
-        self.lock()
-            .remembered
-            .remove(&(session_id.as_str().to_owned(), tool_name.to_owned()))
-            .is_some()
+        let key = (session_id.as_str().to_owned(), tool_name.to_owned());
+        self.lock().remembered.remove(&key).is_some()
     }
 
     /// Answers one outstanding request.
@@ -297,31 +308,33 @@ impl ApprovalBroker {
             .checked_add(self.timeout)
             .ok_or(ApprovalError::DeadlineOverflow)?;
 
-        let (approval_id, receiver, request) = {
+        // Only the counter bump needs the lock; minting the identifier, building the request and
+        // allocating the channel all happen outside it.
+        let ordinal = {
             let mut state = self.lock();
             state.next_id = state.next_id.saturating_add(1);
-            let approval_id = ApprovalId::new(format!("approval-{}", state.next_id))
-                .map_err(|error| ApprovalError::Identifier(error.reason()))?;
-            let request = ApprovalRequest {
-                approval_id: approval_id.clone(),
-                session_id: ticket.session_id,
-                turn: ticket.turn,
-                call_id: ticket.call_id,
-                tool_name: ticket.tool_name,
-                arguments: ticket.arguments,
-                requested_at,
-                expires_at,
-            };
-            let (responder, receiver) = oneshot::channel();
-            state.pending.insert(
-                approval_id.clone(),
-                Pending {
-                    request: request.clone(),
-                    responder,
-                },
-            );
-            (approval_id, receiver, request)
+            state.next_id
         };
+        let approval_id = ApprovalId::new(format!("approval-{ordinal}"))
+            .map_err(|error| ApprovalError::Identifier(error.reason()))?;
+        let request = ApprovalRequest {
+            approval_id: approval_id.clone(),
+            session_id: ticket.session_id,
+            turn: ticket.turn,
+            call_id: ticket.call_id,
+            tool_name: ticket.tool_name,
+            arguments: ticket.arguments,
+            requested_at,
+            expires_at,
+        };
+        let (responder, receiver) = oneshot::channel();
+        self.lock().pending.insert(
+            approval_id.clone(),
+            Pending {
+                request: request.clone(),
+                responder,
+            },
+        );
 
         // Armed for exactly the window in which this future owns the pending entry.
         let mut guard = PendingGuard {
@@ -344,30 +357,30 @@ impl ApprovalBroker {
             () = self.clock.sleep_until(expires_at) => None,
         };
 
-        match outcome {
-            Some(decision) => {
-                // `resolve` already removed the entry when it woke this waiter.
-                guard.disarm();
-                self.approvals.settle(&approval_id).await?;
-                Ok(ApprovalOutcome::Decided {
-                    decision,
-                    remembered: false,
-                })
+        // Both outcomes below take deliberate ownership of the pending entry — one because
+        // `resolve` already removed it, the other because this path removes it itself — so the
+        // guard's unwind-time retraction is no longer wanted on either.
+        guard.disarm();
+
+        let Some(decision) = outcome else {
+            let still_pending = self.discard(&approval_id);
+            let reason = if cancel.is_cancelled() {
+                ApprovalWithdrawal::Cancelled
+            } else {
+                ApprovalWithdrawal::TimedOut
+            };
+            if still_pending {
+                self.approvals.withdraw(&approval_id, reason).await?;
             }
-            None => {
-                guard.disarm();
-                let still_pending = self.discard(&approval_id);
-                let reason = if cancel.is_cancelled() {
-                    ApprovalWithdrawal::Cancelled
-                } else {
-                    ApprovalWithdrawal::TimedOut
-                };
-                if still_pending {
-                    self.approvals.withdraw(&approval_id, reason).await?;
-                }
-                Ok(ApprovalOutcome::Withdrawn { reason })
-            }
-        }
+            return Ok(ApprovalOutcome::Withdrawn { reason });
+        };
+
+        // `resolve` already removed the entry when it woke this waiter.
+        self.approvals.settle(&approval_id).await?;
+        Ok(ApprovalOutcome::Decided {
+            decision,
+            remembered: false,
+        })
     }
 
     fn discard(&self, approval_id: &ApprovalId) -> bool {

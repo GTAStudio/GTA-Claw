@@ -342,7 +342,7 @@ impl StreamAssembler {
         Ok(())
     }
 
-    fn emit(&mut self, payload: StreamPayload) -> StreamEvent {
+    const fn emit(&mut self, payload: StreamPayload) -> StreamEvent {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
         StreamEvent { sequence, payload }

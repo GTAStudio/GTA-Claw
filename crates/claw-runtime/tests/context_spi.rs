@@ -51,7 +51,7 @@ async fn a_well_behaved_engine_passes_every_check() {
 struct BrokenEngine;
 
 impl BrokenEngine {
-    fn state(items: u32, used: u32, budget: u32, needs_compaction: bool) -> ContextState {
+    const fn state(items: u32, used: u32, budget: u32, needs_compaction: bool) -> ContextState {
         ContextState {
             item_count: items,
             used_tokens: used,

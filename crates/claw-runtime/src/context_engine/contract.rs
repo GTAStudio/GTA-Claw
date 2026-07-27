@@ -227,7 +227,7 @@ pub struct SpiReport {
 impl SpiReport {
     /// Builds a report from the checks that ran and the violations they found.
     #[must_use]
-    pub fn new(exercised: Vec<SpiRequirement>, violations: Vec<SpiViolation>) -> Self {
+    pub const fn new(exercised: Vec<SpiRequirement>, violations: Vec<SpiViolation>) -> Self {
         Self {
             exercised,
             violations,
@@ -242,7 +242,7 @@ impl SpiReport {
 
     /// Returns the number of individual checks the run executed.
     #[must_use]
-    pub fn checks_run(&self) -> usize {
+    pub const fn checks_run(&self) -> usize {
         self.exercised.len()
     }
 
@@ -276,7 +276,7 @@ impl SpiReport {
 
     /// Returns whether the engine honoured every requirement the run reached.
     #[must_use]
-    pub fn is_conformant(&self) -> bool {
+    pub const fn is_conformant(&self) -> bool {
         self.violations.is_empty()
     }
 

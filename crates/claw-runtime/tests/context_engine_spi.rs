@@ -247,7 +247,7 @@ impl Mutant {
     }
 }
 
-fn fabricated_state() -> ContextState {
+const fn fabricated_state() -> ContextState {
     ContextState {
         item_count: 0,
         used_tokens: 0,

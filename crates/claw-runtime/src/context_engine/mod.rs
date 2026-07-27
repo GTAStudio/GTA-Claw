@@ -1,6 +1,6 @@
 //! The context-engine service provider interface.
 //!
-//! Upstream OpenClaw describes the context engine as the component between raw session history
+//! Upstream `OpenClaw` describes the context engine as the component between raw session history
 //! and the prompt a provider is handed, with a fixed five-phase lifecycle: `bootstrap` opens a
 //! session, `ingest` offers items, `assemble` produces a prompt per provider round, `maintain`
 //! performs between-round upkeep, and `compact` sheds context under budget pressure. The port

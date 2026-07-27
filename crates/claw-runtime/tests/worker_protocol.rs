@@ -301,7 +301,7 @@ fn a_session_expires_without_heartbeats_and_a_heartbeat_extends_it() {
         .expect("the heartbeat lands before the deadline");
     assert_eq!(beaten.expires_at, Timestamp::from_millis(239_000));
 
-    clock.advance(Duration::from_secs(120));
+    clock.advance(Duration::from_mins(2));
     assert_eq!(
         registry
             .dispatch(&call("w1", session.fence, 1, "node.event"))

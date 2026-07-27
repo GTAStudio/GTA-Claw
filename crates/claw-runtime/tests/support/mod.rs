@@ -114,7 +114,7 @@ pub(crate) struct Round {
 
 impl Round {
     /// A round that replays `chunks` and then closes the stream.
-    pub(crate) fn new(chunks: Vec<ProviderChunk>) -> Self {
+    pub(crate) const fn new(chunks: Vec<ProviderChunk>) -> Self {
         Self {
             chunks,
             stall_at_end: false,
@@ -122,7 +122,7 @@ impl Round {
     }
 
     /// A round that replays `chunks` and then never produces anything again.
-    pub(crate) fn stalling(chunks: Vec<ProviderChunk>) -> Self {
+    pub(crate) const fn stalling(chunks: Vec<ProviderChunk>) -> Self {
         Self {
             chunks,
             stall_at_end: true,
@@ -241,6 +241,7 @@ impl StatePort for MemoryState {
             .map_or(0, |existing| existing.revision);
         if current != snapshot.revision {
             let held = snapshot.revision;
+            drop(data);
             return Box::pin(async move {
                 Err(PortError::Conflict(format!(
                     "expected revision {current}, caller held {held}"
@@ -254,6 +255,7 @@ impl StatePort for MemoryState {
         };
         data.history.push(stored.clone());
         data.sessions.insert(key, stored);
+        drop(data);
         Box::pin(async move { Ok(next) })
     }
 
@@ -322,6 +324,7 @@ impl GoalStorePort for MemoryGoals {
         let expected = existing.map_or(1, |index| goals[index].revision.saturating_add(1));
         if record.revision != expected {
             let held = record.revision;
+            drop(goals);
             return Box::pin(async move {
                 Err(PortError::Conflict(format!(
                     "expected revision {expected}, caller held {held}"
@@ -332,6 +335,7 @@ impl GoalStorePort for MemoryGoals {
             Some(index) => goals[index] = record,
             None => goals.push(record),
         }
+        drop(goals);
         Box::pin(async move { Ok(()) })
     }
 
@@ -575,20 +579,32 @@ impl SimpleContext {
         guard(&self.data).bootstraps
     }
 
-    fn tokens(items: &[ContextItem]) -> u32 {
-        let bytes: usize = items
-            .iter()
-            .map(|item| match item {
-                ContextItem::UserInput { text }
-                | ContextItem::AssistantMessage { text }
-                | ContextItem::SystemNote { text } => text.len(),
-                ContextItem::GoalStatement { objective } => objective.len(),
-                ContextItem::ToolResult {
-                    tool_name, output, ..
-                } => tool_name.len() + output.len(),
-            })
-            .sum();
+    const fn item_bytes(item: &ContextItem) -> usize {
+        match item {
+            ContextItem::UserInput { text }
+            | ContextItem::AssistantMessage { text }
+            | ContextItem::SystemNote { text } => text.len(),
+            ContextItem::GoalStatement { objective } => objective.len(),
+            ContextItem::ToolResult {
+                tool_name, output, ..
+            } => tool_name.len() + output.len(),
+        }
+    }
+
+    /// Converts a byte total into the token count the engine reports.
+    ///
+    /// Tokens are floored, so they are only additive through this byte total: `compact` tracks
+    /// bytes and converts once per step rather than summing per-item token counts.
+    fn tokens_for(bytes: usize) -> u32 {
         u32::try_from(bytes / 4).unwrap_or(u32::MAX)
+    }
+
+    fn bytes(items: &[ContextItem]) -> usize {
+        items.iter().map(Self::item_bytes).sum()
+    }
+
+    fn tokens(items: &[ContextItem]) -> u32 {
+        Self::tokens_for(Self::bytes(items))
     }
 
     fn snapshot(data: &ContextData) -> ContextState {
@@ -612,6 +628,7 @@ impl ContextEnginePort for SimpleContext {
         data.budget = request.token_budget;
         data.bootstraps = data.bootstraps.saturating_add(1);
         let state = Self::snapshot(&data);
+        drop(data);
         Box::pin(async move { Ok(state) })
     }
 
@@ -619,6 +636,7 @@ impl ContextEnginePort for SimpleContext {
         let mut data = guard(&self.data);
         data.items.push(request.item);
         let state = Self::snapshot(&data);
+        drop(data);
         Box::pin(async move { Ok(state) })
     }
 
@@ -656,6 +674,7 @@ impl ContextEnginePort for SimpleContext {
             messages,
             state: Self::snapshot(&data),
         };
+        drop(data);
         Box::pin(async move { Ok(assembled) })
     }
 
@@ -665,6 +684,7 @@ impl ContextEnginePort for SimpleContext {
     ) -> PortFuture<'_, Result<ContextState, PortError>> {
         let data = guard(&self.data);
         let state = Self::snapshot(&data);
+        drop(data);
         Box::pin(async move { Ok(state) })
     }
 
@@ -673,14 +693,19 @@ impl ContextEnginePort for SimpleContext {
         request: ContextCompaction,
     ) -> PortFuture<'_, Result<CompactionReport, PortError>> {
         let mut data = guard(&self.data);
-        let before = Self::tokens(&data.items);
-        let mut removed = 0_u32;
-        while !data.items.is_empty()
-            && before.saturating_sub(Self::tokens(&data.items)) < request.reclaim_tokens
+        let mut kept_bytes = Self::bytes(&data.items);
+        let before = Self::tokens_for(kept_bytes);
+        // The victim prefix is decided in one pass and drained once: removing the front of the
+        // vector inside the loop is quadratic in the item count.
+        let mut removed = 0_usize;
+        while removed < data.items.len()
+            && before.saturating_sub(Self::tokens_for(kept_bytes)) < request.reclaim_tokens
         {
-            data.items.remove(0);
+            kept_bytes = kept_bytes.saturating_sub(Self::item_bytes(&data.items[removed]));
             removed = removed.saturating_add(1);
         }
+        data.items.drain(..removed);
+        let removed = u32::try_from(removed).unwrap_or(u32::MAX);
         data.compacted = data.compacted.saturating_add(removed);
         let after = Self::tokens(&data.items);
         let report = CompactionReport {
@@ -688,6 +713,7 @@ impl ContextEnginePort for SimpleContext {
             reclaimed_tokens: before.saturating_sub(after),
             state: Self::snapshot(&data),
         };
+        drop(data);
         Box::pin(async move { Ok(report) })
     }
 }

@@ -24,7 +24,7 @@ pub struct ToolExecutorConfig {
 impl Default for ToolExecutorConfig {
     fn default() -> Self {
         Self {
-            call_timeout: Duration::from_secs(120),
+            call_timeout: Duration::from_mins(2),
         }
     }
 }

@@ -642,16 +642,15 @@ fn parse_number(
     argument: Option<&String>,
     default: u32,
 ) -> Result<u32, CommandError> {
-    match argument {
-        None => Ok(default),
-        Some(value) => value
+    argument.map_or(Ok(default), |value| {
+        value
             .parse::<u32>()
             .map_err(|_| CommandError::InvalidArgument {
                 command: invocation.name.clone(),
                 argument: value.clone(),
                 reason: "expected a non-negative whole number",
-            }),
-    }
+            })
+    })
 }
 
 fn builtin_commands() -> Vec<CommandSpec> {
@@ -934,8 +933,9 @@ impl DirectiveRegistry {
     /// Splits an input body into directives and remaining text.
     ///
     /// A directive owns a whole line and starts with `!`. Lines inside fenced code blocks
-    /// (delimited by ``` or `~~~`) are never directives, and a line starting with `\!` is body
-    /// text with the escape removed. Values may be written `!name value` or `!name=value`.
+    /// (delimited by ```` ``` ```` or `~~~`) are never directives, and a line starting with
+    /// `\!` is body text with the escape removed. Values may be written `!name value` or
+    /// `!name=value`.
     ///
     /// # Errors
     ///
@@ -980,20 +980,22 @@ impl DirectiveRegistry {
             }
         }
 
-        while body_lines
-            .first()
-            .is_some_and(|line| line.trim().is_empty())
-        {
-            body_lines.remove(0);
-        }
-        while body_lines.last().is_some_and(|line| line.trim().is_empty()) {
-            body_lines.pop();
-        }
+        // Blank lines at either end are trimmed by locating the surviving range once, rather than
+        // removing the front of the vector one line at a time, which is quadratic in the number of
+        // leading blanks. `rposition` always finds a line once `position` has, so its fallback is
+        // unreachable; a body that is entirely blank has no range at all and trims to nothing.
+        let body = body_lines
+            .iter()
+            .position(|line| !line.trim().is_empty())
+            .map_or_else(String::new, |first| {
+                let last = body_lines
+                    .iter()
+                    .rposition(|line| !line.trim().is_empty())
+                    .unwrap_or(first);
+                body_lines[first..=last].join("\n")
+            });
 
-        Ok(DirectiveScan {
-            directives,
-            body: body_lines.join("\n"),
-        })
+        Ok(DirectiveScan { directives, body })
     }
 
     /// Lowers directives into the options one turn runs with.
@@ -1010,11 +1012,11 @@ impl DirectiveRegistry {
             }
             match directive.name.as_str() {
                 "model" => {
-                    options.model = directive.value.clone();
+                    options.model.clone_from(&directive.value);
                 }
                 "no-tools" => options.tools_enabled = false,
                 "quiet" => options.quiet = true,
-                "goal" => options.goal = directive.value.clone(),
+                "goal" => options.goal.clone_from(&directive.value),
                 _ => {}
             }
         }

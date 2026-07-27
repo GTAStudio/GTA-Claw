@@ -82,8 +82,8 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             event_capacity: 64,
-            approval_timeout: Duration::from_secs(300),
-            tool_timeout: Duration::from_secs(120),
+            approval_timeout: Duration::from_mins(5),
+            tool_timeout: Duration::from_mins(2),
             max_rounds: 16,
             context_token_budget: 128_000,
             goals: GoalConfig::default(),
@@ -342,10 +342,9 @@ impl TurnHandle {
     /// Returns the turn's own failure, or [`RuntimeError::Abandoned`] when the task disappeared
     /// without reporting.
     pub async fn join(self) -> Result<TurnOutcome, RuntimeError> {
-        match self.completion.await {
-            Ok(result) => result,
-            Err(_) => Err(RuntimeError::Abandoned),
-        }
+        self.completion
+            .await
+            .unwrap_or(Err(RuntimeError::Abandoned))
     }
 }
 
@@ -392,7 +391,10 @@ pub enum CommandOutcome {
 struct LiveTurn {
     turn: TurnId,
     cancel: CancellationToken,
-    paused: watch::Sender<bool>,
+    /// Behind an [`Arc`] so [`Runtime::set_paused`] can lift the sender out of the live-turn map
+    /// and release that lock before notifying the turn: `send` wakes the turn's watcher, and
+    /// waking a task is work no other session should have to queue behind.
+    paused: Arc<watch::Sender<bool>>,
 }
 
 /// Releases a session's live-turn registration and its work permit when the turn task ends.
@@ -429,6 +431,11 @@ struct RuntimeInner {
     commands: CommandRegistry,
     directives: DirectiveRegistry,
     live: Mutex<HashMap<String, LiveTurn>>,
+    // Grows by one entry per session that ever selects a model, and only an explicit reset to the
+    // default removes one: an override has to outlive the turn that set it, and this crate has no
+    // session-close hook to retire it at. `StatePort` is load/save only, and no command ends a
+    // session, so bounded cleanup needs a session-termination signal that does not exist yet.
+    // Long-lived hosts leak here in proportion to distinct sessions, slowly.
     models: Mutex<HashMap<String, String>>,
     shutdown: CancellationToken,
 }
@@ -465,9 +472,11 @@ pub struct Runtime {
 
 impl fmt::Debug for Runtime {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        // Read out first: a `Debug` render must not hold the live-turn lock while it formats.
+        let live_turns = self.inner.live().len();
         formatter
             .debug_struct("Runtime")
-            .field("live_turns", &self.inner.live().len())
+            .field("live_turns", &live_turns)
             .field("tracked_tasks", &self.tracker.len())
             .field("shutting_down", &self.inner.shutdown.is_cancelled())
             .finish_non_exhaustive()
@@ -606,14 +615,24 @@ impl Runtime {
         let permit = self.inner.suspension.admit()?;
 
         let snapshot = self.inner.ports.state.load_session(session_id).await?;
-        let (turn, revision, reason) = match &snapshot {
-            Some(existing) => (
-                existing.turn.next(),
-                existing.revision,
-                BootstrapReason::Restart,
-            ),
-            None => (TurnId::FIRST, 0, BootstrapReason::NewSession),
-        };
+        let (turn, revision, reason) = snapshot.map_or(
+            (TurnId::FIRST, 0, BootstrapReason::NewSession),
+            |existing| {
+                (
+                    existing.turn.next(),
+                    existing.revision,
+                    BootstrapReason::Restart,
+                )
+            },
+        );
+
+        // `load_session` is the only await between the first check and the spawn, so re-checking
+        // here closes the window in which `shutdown` could have closed the task tracker while this
+        // call was parked. Past this point nothing yields, and the check happens before the
+        // live-turn entry is inserted so the early return cannot strand the session.
+        if self.inner.shutdown.is_cancelled() {
+            return Err(RuntimeError::ShuttingDown);
+        }
 
         let cancel = self.inner.shutdown.child_token();
         let (paused, pause_rx) = watch::channel(false);
@@ -621,16 +640,16 @@ impl Runtime {
         {
             let mut live = self.inner.live();
             if let Some(existing) = live.get(session_id.as_str()) {
-                return Err(RuntimeError::TurnInFlight {
-                    turn: existing.turn,
-                });
+                let turn = existing.turn;
+                drop(live);
+                return Err(RuntimeError::TurnInFlight { turn });
             }
             live.insert(
                 session_id.as_str().to_owned(),
                 LiveTurn {
                     turn,
                     cancel: cancel.clone(),
-                    paused,
+                    paused: Arc::new(paused),
                 },
             );
         }
@@ -711,11 +730,16 @@ impl Runtime {
             )),
             CommandEffect::ListTools => Ok(CommandOutcome::Tools(self.inner.tool_catalogue())),
             CommandEffect::CancelTurn => {
-                let live = self.inner.live();
-                let turn = live
-                    .get(session_id.as_str())
-                    .ok_or(RuntimeError::NoTurnInFlight)?;
-                turn.cancel.cancel();
+                // `CancellationToken::cancel` runs every registered waker, including the turn's
+                // own cleanup path, which takes this same lock. The token is lifted out and the
+                // guard released before it fires.
+                let cancel = {
+                    let live = self.inner.live();
+                    live.get(session_id.as_str())
+                        .map(|turn| turn.cancel.clone())
+                        .ok_or(RuntimeError::NoTurnInFlight)?
+                };
+                cancel.cancel();
                 Ok(CommandOutcome::Acknowledged)
             }
             CommandEffect::PauseTurn => self.set_paused(session_id, true),
@@ -832,11 +856,15 @@ impl Runtime {
         session_id: &SessionId,
         paused: bool,
     ) -> Result<CommandOutcome, RuntimeError> {
-        let live = self.inner.live();
-        let turn = live
-            .get(session_id.as_str())
-            .ok_or(RuntimeError::NoTurnInFlight)?;
-        turn.paused
+        // The sender is lifted out of the map so the watch notification — which wakes the turn
+        // task — happens outside the live-turn lock every other session contends for.
+        let sender = {
+            let live = self.inner.live();
+            live.get(session_id.as_str())
+                .map(|turn| Arc::clone(&turn.paused))
+                .ok_or(RuntimeError::NoTurnInFlight)?
+        };
+        sender
             .send(paused)
             .map_err(|_| RuntimeError::NoTurnInFlight)?;
         Ok(CommandOutcome::Acknowledged)
@@ -858,13 +886,16 @@ impl Runtime {
     /// override so the provider adapter falls back to its own default.
     fn select_model(&self, session_id: &SessionId, requested: &str) -> Option<String> {
         let requested = requested.trim();
-        let mut models = self.inner.models();
         if requested.eq_ignore_ascii_case(DEFAULT_MODEL_ARGUMENT) {
-            models.remove(session_id.as_str());
+            self.inner.models().remove(session_id.as_str());
             return None;
         }
-        models.insert(session_id.as_str().to_owned(), requested.to_owned());
-        Some(requested.to_owned())
+        // Both allocations happen before the lock is taken, so the critical section is one map
+        // insert.
+        let key = session_id.as_str().to_owned();
+        let selected = requested.to_owned();
+        self.inner.models().insert(key, selected.clone());
+        Some(selected)
     }
 }
 
@@ -993,7 +1024,7 @@ impl TurnExecution {
             }
 
             let round = *rounds;
-            let assembled = self
+            let prompt = self
                 .inner
                 .ports
                 .context
@@ -1012,7 +1043,7 @@ impl TurnExecution {
                     session_id: self.session_id.clone(),
                     turn: self.turn,
                     round,
-                    messages: assembled.messages,
+                    messages: prompt.messages,
                     tool_names: tool_names.clone(),
                     model: model.clone(),
                 })
@@ -1022,12 +1053,11 @@ impl TurnExecution {
                 self.advance(machine, SessionEvent::Stream).await?;
             }
 
-            let mut assembler = match partial.take() {
-                Some(recovered) => {
+            let mut assembler = partial
+                .take()
+                .map_or_else(StreamAssembler::new, |recovered| {
                     StreamAssembler::resume(recovered, crate::stream::MAX_ASSEMBLED_BYTES)
-                }
-                None => StreamAssembler::new(),
-            };
+                });
             let mut calls: Vec<ToolCall> = Vec::new();
 
             loop {
@@ -1204,7 +1234,7 @@ impl TurnExecution {
     /// Argument and goal-service failures become a failed [`ToolOutcome`] rather than a turn
     /// failure, so a model that sends bad arguments is told about it and can retry within the same
     /// turn. Only an event-channel failure can abort the turn, and that is not reachable here.
-    async fn run_goal_tool(&mut self, call: &ToolCall) -> Result<ToolOutcome, RuntimeError> {
+    async fn run_goal_tool(&self, call: &ToolCall) -> Result<ToolOutcome, RuntimeError> {
         let action = match parse_goal_action(&call.arguments) {
             Ok(action) => action,
             Err(error) => return Ok(Self::failed_goal_call(call, &error)),

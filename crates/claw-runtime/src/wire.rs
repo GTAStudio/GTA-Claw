@@ -14,6 +14,11 @@ pub(crate) mod goal_status {
     use serde::de::Error as _;
     use serde::{Deserialize, Deserializer, Serializer};
 
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's `serialize_with` hook is invoked with a reference to the field, so the \
+                  signature is fixed by the framework rather than by this function"
+    )]
     pub(crate) fn serialize<S>(value: &GoalStatus, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
