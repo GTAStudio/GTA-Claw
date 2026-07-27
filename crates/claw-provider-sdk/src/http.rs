@@ -10,11 +10,14 @@
 //! second `windows-sys` major line into the graph. See the private `tls`
 //! module for the detail.
 
+pub mod proxy;
 mod tls;
 
 use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
+use std::sync::{Arc, Once};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -26,6 +29,10 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use url::Url;
 
+pub use self::proxy::{
+    DirectReason, NoProxy, ProxyDecision, ProxyDiagnostic, ProxyRules, ProxyScheme, ProxySource,
+    ProxyUrl, ProxyUrlError,
+};
 use self::tls::{TlsConnectorService, TlsSetupError};
 use crate::cancel::CancelToken;
 use crate::error::{ErrorKind, Operation, ProviderError, parse_retry_after};
@@ -476,13 +483,18 @@ pub enum TlsPolicy {
 
 /// Where the transport should look for an HTTP proxy.
 ///
-/// Only `https` destinations are proxied, and only through a `CONNECT` tunnel,
-/// so a proxy never sees request headers. Loopback is never proxied regardless
-/// of policy.
+/// This is the configuration; [`ProxyRules`] is what it resolves to. Only
+/// `https` destinations are proxied, and only through a `CONNECT` tunnel, so a
+/// proxy never sees request headers. Loopback is never proxied regardless of
+/// policy.
 #[derive(Clone, Default, Eq, PartialEq)]
 pub enum ProxyPolicy {
-    /// Read `ALL_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` from the
-    /// environment, matching the conventions `curl` uses.
+    /// Read the proxy from the environment.
+    ///
+    /// [`proxy::PROXY_VARIABLES`] is consulted in the order the legacy Node
+    /// client used — `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`,
+    /// `ALL_PROXY`, `all_proxy` — and `NO_PROXY`/`no_proxy` supplies the bypass
+    /// list.
     #[default]
     FromEnvironment,
     /// Never use a proxy, whatever the environment says.
@@ -494,6 +506,23 @@ pub enum ProxyPolicy {
         /// Comma-separated hosts that must bypass the proxy.
         no_proxy: Option<String>,
     },
+}
+
+impl ProxyPolicy {
+    /// Resolves the policy into the rules a transport applies per connection.
+    ///
+    /// Resolution never fails. A proxy URL that cannot be parsed leaves rules
+    /// that connect directly and carry a [`ProxyDiagnostic`] saying so, which
+    /// is the legacy continue-without-proxy behavior with the URL kept out of
+    /// the message.
+    #[must_use]
+    pub fn rules(&self) -> ProxyRules {
+        match self {
+            Self::FromEnvironment => ProxyRules::from_environment(),
+            Self::Disabled => ProxyRules::disabled(),
+            Self::Explicit { url, no_proxy } => ProxyRules::explicit(url, no_proxy.as_deref()),
+        }
+    }
 }
 
 impl Debug for ProxyPolicy {
@@ -551,6 +580,7 @@ pub struct HttpTransport {
     client: HyperClient<TlsConnectorService, Full<Bytes>>,
     tls_policy: TlsPolicy,
     proxy_policy: ProxyPolicy,
+    proxy_rules: Arc<ProxyRules>,
     user_agent: String,
     request_timeout: Duration,
 }
@@ -563,6 +593,7 @@ impl Debug for HttpTransport {
             .debug_struct("HttpTransport")
             .field("tls_policy", &self.tls_policy)
             .field("proxy_policy", &self.proxy_policy)
+            .field("proxy_rules", &self.proxy_rules)
             .field("user_agent", &self.user_agent)
             .field("request_timeout", &self.request_timeout)
             .finish_non_exhaustive()
@@ -588,7 +619,16 @@ impl HttpTransport {
     /// usable root certificate, or when the RING provider rejects the
     /// requested TLS versions.
     pub fn with_config(config: &TransportConfig) -> Result<Self, ProviderError> {
-        let connector = TlsConnectorService::new(config.connect_timeout, &config.proxy_policy)
+        // A proxy the operator configured and is not getting is a
+        // security-relevant surprise, so it is reported rather than left to be
+        // inferred from traffic. The flag is process-wide because the legacy
+        // client announced this once at startup, not once per client.
+        static PROXY_ANNOUNCED: Once = Once::new();
+
+        let proxy_rules = Arc::new(config.proxy_policy.rules());
+        proxy_rules.announce(&PROXY_ANNOUNCED, &mut io::stderr().lock());
+
+        let connector = TlsConnectorService::new(config.connect_timeout, Arc::clone(&proxy_rules))
             .map_err(|error| {
                 let detail = match error {
                     TlsSetupError::NoRoots => {
@@ -607,6 +647,7 @@ impl HttpTransport {
             client,
             tls_policy: config.tls_policy,
             proxy_policy: config.proxy_policy.clone(),
+            proxy_rules,
             user_agent: config.user_agent.clone(),
             request_timeout: config.request_timeout,
         })
@@ -622,6 +663,18 @@ impl HttpTransport {
     #[must_use]
     pub const fn proxy_policy(&self) -> &ProxyPolicy {
         &self.proxy_policy
+    }
+
+    /// Returns the resolved proxy rules.
+    ///
+    /// This is how a caller sees what the policy actually became:
+    /// [`ProxyRules::proxy`] is the proxy in force, [`ProxyRules::diagnostics`]
+    /// lists what could not be used, and [`ProxyRules::fell_back_to_direct`]
+    /// reports the case where a proxy was configured and traffic is going
+    /// direct anyway.
+    #[must_use]
+    pub fn proxy_rules(&self) -> &ProxyRules {
+        &self.proxy_rules
     }
 
     /// Sends a request and buffers the whole response.
@@ -936,7 +989,7 @@ pub fn is_loopback(url: &Url) -> bool {
     match url.host() {
         Some(url::Host::Ipv4(address)) => address.is_loopback(),
         Some(url::Host::Ipv6(address)) => address.is_loopback(),
-        Some(url::Host::Domain(domain)) => tls::is_loopback_host(domain),
+        Some(url::Host::Domain(domain)) => proxy::is_loopback_host(domain),
         None => false,
     }
 }
