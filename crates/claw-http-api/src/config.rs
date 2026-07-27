@@ -92,7 +92,10 @@ impl Default for HttpLimits {
 #[derive(Clone, Debug)]
 pub struct ApiConfig {
     /// Bearer credentials for OpenAI, tools, models, and admin surfaces.
+    /// This caller domain excludes the independently configured admin surface.
     pub authenticator: BearerAuthenticator,
+    /// Admin HTTP RPC credential verifier.
+    pub admin_authenticator: BearerAuthenticator,
     /// MCP owner bearer token authenticator.
     pub mcp_owner_authenticator: BearerAuthenticator,
     /// MCP non-owner bearer token authenticator.
@@ -113,6 +116,7 @@ impl ApiConfig {
     pub fn new(authenticator: BearerAuthenticator) -> Self {
         Self {
             authenticator,
+            admin_authenticator: BearerAuthenticator::default(),
             mcp_owner_authenticator: BearerAuthenticator::default(),
             mcp_authenticator: BearerAuthenticator::default(),
             agents: vec!["main".to_owned()],

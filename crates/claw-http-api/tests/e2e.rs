@@ -149,8 +149,8 @@ fn credential(token: &str, scopes: impl IntoIterator<Item = Scope>) -> BearerCre
     BearerCredential::new(token, Role::Operator, ScopeSet::from_scopes(scopes))
 }
 
-fn config() -> ApiConfig {
-    let mut config = ApiConfig::new(BearerAuthenticator::new(vec![
+fn test_credentials() -> Vec<BearerCredential> {
+    vec![
         credential("operator-token", [Scope::OperatorAdmin]),
         credential("operator-two", [Scope::OperatorAdmin]),
         credential("read-token", [Scope::OperatorRead]),
@@ -159,7 +159,12 @@ fn config() -> ApiConfig {
             Role::Node,
             ScopeSet::from_scopes([Scope::OperatorAdmin]),
         ),
-    ]));
+    ]
+}
+
+fn config() -> ApiConfig {
+    let mut config = ApiConfig::new(BearerAuthenticator::new(test_credentials()));
+    config.admin_authenticator = BearerAuthenticator::new(test_credentials());
     config.mcp_owner_authenticator =
         BearerAuthenticator::new(vec![credential("mcp-owner", [Scope::OperatorAdmin])]);
     config.mcp_authenticator =
@@ -170,6 +175,150 @@ fn config() -> ApiConfig {
     );
     config.limits.heartbeat_interval = Duration::from_secs(60);
     config
+}
+
+#[tokio::test]
+async fn admin_authenticator_defaults_to_fail_closed() {
+    let config = ApiConfig::new(BearerAuthenticator::new(vec![credential(
+        "caller-domain-token",
+        [Scope::OperatorAdmin],
+    )]));
+    let server = spawn_with(config, DeterministicRuntime::new()).await;
+    let response = request(
+        &server,
+        "POST",
+        "/api/v1/admin/rpc",
+        Some("caller-domain-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({"id":"default-denial","method":"status"})),
+    )
+    .await;
+
+    assert_eq!(response.status, 401);
+    assert_eq!(
+        response.json(),
+        json!({"error":{"message":"Unauthorized","type":"unauthorized"}})
+    );
+}
+
+#[tokio::test]
+async fn admin_and_caller_authentication_domains_are_isolated() {
+    let runtime = DeterministicRuntime::new();
+    let mut config = ApiConfig::new(BearerAuthenticator::new(vec![credential(
+        "caller-domain-token",
+        [Scope::OperatorAdmin],
+    )]));
+    config.admin_authenticator = BearerAuthenticator::new(vec![credential(
+        "admin-domain-token",
+        [Scope::OperatorAdmin],
+    )]);
+    let server = spawn_with(config, runtime.clone()).await;
+
+    let caller_on_admin = request(
+        &server,
+        "POST",
+        "/api/v1/admin/rpc",
+        Some("caller-domain-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({"id":"cross-domain-admin","method":"status"})),
+    )
+    .await;
+    assert_eq!(caller_on_admin.status, 401);
+    assert_eq!(
+        caller_on_admin.json(),
+        json!({"error":{"message":"Unauthorized","type":"unauthorized"}})
+    );
+
+    let admin_on_models = request(
+        &server,
+        "GET",
+        "/v1/models",
+        Some("admin-domain-token"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(admin_on_models.status, 401);
+    assert_eq!(
+        admin_on_models.json(),
+        json!({"error":{"message":"Unauthorized","type":"unauthorized"}})
+    );
+
+    let admin_on_tools = request(
+        &server,
+        "POST",
+        "/tools/invoke",
+        Some("admin-domain-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({"name":"echo","args":{"domain":"admin"}})),
+    )
+    .await;
+    assert_eq!(admin_on_tools.status, 401);
+    assert_eq!(
+        admin_on_tools.json(),
+        json!({"error":{"message":"Unauthorized","type":"unauthorized"}})
+    );
+
+    let admin = request(
+        &server,
+        "POST",
+        "/api/v1/admin/rpc",
+        Some("admin-domain-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({"id":"admin-positive","method":"status"})),
+    )
+    .await;
+    assert_eq!(admin.status, 200);
+    assert_eq!(
+        admin.json(),
+        json!({
+            "id":"admin-positive",
+            "ok":true,
+            "payload":{"method":"status","params":null}
+        })
+    );
+
+    let models = request(
+        &server,
+        "GET",
+        "/v1/models",
+        Some("caller-domain-token"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(models.status, 200);
+    assert_eq!(
+        models.json(),
+        json!({
+            "object":"list",
+            "data":[
+                {"id":"openclaw","object":"model","created":0,"owned_by":"openclaw","permission":[]},
+                {"id":"openclaw/default","object":"model","created":0,"owned_by":"openclaw","permission":[]},
+                {"id":"openclaw/main","object":"model","created":0,"owned_by":"openclaw","permission":[]}
+            ]
+        })
+    );
+
+    let tool = request(
+        &server,
+        "POST",
+        "/tools/invoke",
+        Some("caller-domain-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({"name":"echo","args":{"domain":"caller"}})),
+    )
+    .await;
+    assert_eq!(tool.status, 200);
+    assert_eq!(tool.json(), json!({"ok":true,"result":{"domain":"caller"}}));
+    assert_eq!(
+        runtime
+            .audit_events()
+            .expect("domain isolation audits")
+            .len(),
+        3,
+        "only successful, scoped route authorizations reach the audit port"
+    );
 }
 
 async fn spawn_with(config: ApiConfig, runtime: Arc<DeterministicRuntime>) -> Server {

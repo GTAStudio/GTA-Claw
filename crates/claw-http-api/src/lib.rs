@@ -79,6 +79,8 @@ macro_rules! http_api_endpoints {
                 (POST, "/v1/chat/completions", openai::chat),
                 (POST, "/v1/responses", openai::responses),
                 (POST, "/tools/invoke", tools::invoke),
+            }
+            admin {
                 (POST, "/api/v1/admin/rpc", admin::rpc),
             }
             mcp {
@@ -92,6 +94,7 @@ macro_rules! build_route_groups {
     (
         public { $(($public_method:ident, $public_path:literal, $public_handler:path),)* }
         protected { $(($protected_method:ident, $protected_path:literal, $protected_handler:path),)* }
+        admin { $(($admin_method:ident, $admin_path:literal, $admin_handler:path),)* }
         mcp { $(($mcp_method:ident, $mcp_path:literal, $mcp_handler:path),)* }
     ) => {{
         let public = Router::new()
@@ -101,9 +104,14 @@ macro_rules! build_route_groups {
                 $protected_path,
                 method_router!($protected_method, $protected_handler),
             ))*;
+        let admin = Router::new()
+            $(.route(
+                $admin_path,
+                method_router!($admin_method, $admin_handler),
+            ))*;
         let mcp = Router::new()
             $(.route($mcp_path, method_router!($mcp_method, $mcp_handler)))*;
-        (public, protected, mcp)
+        (public, protected, admin, mcp)
     }};
 }
 
@@ -111,11 +119,13 @@ macro_rules! collect_registered_endpoints {
     (
         public { $(($public_method:ident, $public_path:literal, $public_handler:path),)* }
         protected { $(($protected_method:ident, $protected_path:literal, $protected_handler:path),)* }
+        admin { $(($admin_method:ident, $admin_path:literal, $admin_handler:path),)* }
         mcp { $(($mcp_method:ident, $mcp_path:literal, $mcp_handler:path),)* }
     ) => {
         &[
             $((stringify!($public_method), $public_path),)*
             $((stringify!($protected_method), $protected_path),)*
+            $((stringify!($admin_method), $admin_path),)*
             $((stringify!($mcp_method), $mcp_path),)*
         ]
     };
@@ -140,10 +150,18 @@ impl HttpApi {
             authenticator: config.authenticator.clone(),
             limits: config.limits.clone(),
         };
+        let admin_auth_state = AuthMiddlewareState {
+            authenticator: config.admin_authenticator.clone(),
+            limits: config.limits.clone(),
+        };
         let cors_origins = config.cors_origins.clone();
         let state = ApiState::new(config, services);
-        let (router, protected, mcp_router) = http_api_endpoints!(build_route_groups);
+        let (router, protected, admin, mcp_router) = http_api_endpoints!(build_route_groups);
         let protected = protected.layer(middleware::from_fn_with_state(auth_state, require_bearer));
+        let admin = admin.layer(middleware::from_fn_with_state(
+            admin_auth_state,
+            require_bearer,
+        ));
         let cors = CorsLayer::new()
             .allow_methods([Method::GET, Method::HEAD, Method::POST, Method::DELETE])
             .allow_headers([
@@ -165,6 +183,7 @@ impl HttpApi {
         };
         let router = router
             .merge(protected)
+            .merge(admin)
             .layer(SetResponseHeaderLayer::if_not_present(
                 HeaderName::from_static("x-content-type-options"),
                 HeaderValue::from_static("nosniff"),
