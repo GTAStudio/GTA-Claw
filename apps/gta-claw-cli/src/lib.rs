@@ -1,6 +1,5 @@
 //! Headless GTA Claw command-line adapter and bounded Gateway diagnostic.
 
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::ffi::OsString;
 use std::future::Future;
@@ -41,9 +40,11 @@ const MAX_TIMEOUT_MS: u64 = 120_000;
 const MAX_ARGUMENTS: usize = 32;
 const MAX_ENDPOINT_BYTES: usize = 2_048;
 const MAX_OUTPUT_TEXT_BYTES: usize = 256;
+const MAX_RENDERED_OUTPUT_BYTES: usize = 16 * 1_024;
 const MAX_SECRET_SOURCE_BYTES: usize = 4_096;
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const OUTPUT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+const CANCELLED_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 
 /// Runs the async CLI adapter with bounded process-output writes.
 pub async fn entrypoint(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
@@ -84,6 +85,7 @@ fn run_process_with_builder(
 }
 
 fn write_rendered_result(result: RenderedResult) -> ExitCode {
+    let result = enforce_output_bound(result);
     let intended_exit = result.exit_code;
     let (completion, finished) = mpsc::sync_channel(1);
     let writer = thread::Builder::new()
@@ -107,6 +109,22 @@ fn write_rendered_result(result: RenderedResult) -> ExitCode {
         Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
             ExitCode::from(ExitCategory::Internal.code())
         }
+    }
+}
+
+fn enforce_output_bound(result: RenderedResult) -> RenderedResult {
+    if result
+        .stdout
+        .len()
+        .checked_add(result.stderr.len())
+        .is_some_and(|size| size <= MAX_RENDERED_OUTPUT_BYTES)
+    {
+        result
+    } else {
+        RenderedResult::failure(
+            ExitCategory::Internal,
+            "error: rendered output exceeded the CLI safety limit\n".to_owned(),
+        )
     }
 }
 
@@ -665,25 +683,60 @@ async fn run_gateway(
 
     let attempt = execute_health(&client);
     tokio::pin!(attempt);
-    let mut attempt = tokio::select! {
-        result = &mut attempt => result,
+    let (mut attempt, control_finished) = tokio::select! {
+        result = &mut attempt => (result, false),
         signal = &mut interrupt => {
-            match signal {
+            let attempt = match signal {
                 Ok(()) => DiagnosticAttempt::failure(
                     DiagnosticFailure::timeout("cancelled", "Gateway diagnostic cancelled"),
                 ),
                 Err(()) => DiagnosticAttempt::failure(
                     DiagnosticFailure::internal("signal_error", "interrupt handler failed"),
                 ),
-            }
+            };
+            (attempt, true)
         }
-        () = &mut deadline => DiagnosticAttempt::failure(
-            DiagnosticFailure::timeout("timeout", "Gateway diagnostic timed out"),
+        () = &mut deadline => (
+            DiagnosticAttempt::failure(
+                DiagnosticFailure::timeout("timeout", "Gateway diagnostic timed out"),
+            ),
+            true,
         ),
     };
 
-    if let Err(error) = client.shutdown().await {
-        attempt.failure = Some(map_client_error(&error));
+    if control_finished {
+        // The command result is already fixed by timeout, Ctrl-C, or a signal
+        // handler failure. Give the client a small independent cleanup window,
+        // but never let cleanup replace that primary result or hold process exit.
+        let _ = tokio::time::timeout(CANCELLED_SHUTDOWN_GRACE, client.shutdown()).await;
+    } else {
+        let shutdown = client.shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            result = &mut shutdown => {
+                if let Err(error) = result {
+                    attempt.record_shutdown_error(&error);
+                }
+            }
+            signal = &mut interrupt => {
+                attempt.failure = Some(match signal {
+                    Ok(()) => DiagnosticFailure::timeout(
+                        "cancelled",
+                        "Gateway diagnostic cancelled",
+                    ),
+                    Err(()) => DiagnosticFailure::internal(
+                        "signal_error",
+                        "interrupt handler failed",
+                    ),
+                });
+            }
+            () = &mut deadline => {
+                attempt.failure = Some(DiagnosticFailure::timeout(
+                    "timeout",
+                    "Gateway diagnostic timed out",
+                ));
+            }
+        }
     }
     let summary = attempt.into_summary(endpoint, started.elapsed());
     render_diagnostic(&options, &summary)
@@ -892,18 +945,22 @@ async fn read_credential(options: &GatewayOptions) -> Result<GatewayCredential, 
     match options.secret_source {
         SecretSourceKind::None => Ok(GatewayCredential::None),
         SecretSourceKind::Stdin => {
-            let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_SECRET_SOURCE_BYTES));
-            tokio::io::stdin()
-                .take((MAX_SECRET_SOURCE_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
-                .await
-                .map_err(|_| {
+            let mut bytes = Zeroizing::new([0_u8; MAX_SECRET_SOURCE_BYTES + 1]);
+            let mut input = tokio::io::stdin().take(bytes.len() as u64);
+            let mut length = 0;
+            while length < bytes.len() {
+                let read = input.read(&mut bytes[length..]).await.map_err(|_| {
                     DiagnosticFailure::usage(
                         "secret_stdin_error",
                         "could not read token from stdin",
                     )
                 })?;
-            parse_secret(bytes.as_slice()).map(GatewayCredential::Token)
+                if read == 0 {
+                    break;
+                }
+                length += read;
+            }
+            parse_secret(&bytes[..length]).map(GatewayCredential::Token)
         }
         SecretSourceKind::UnsupportedFile => Err(DiagnosticFailure::usage(
             "token_file_unsupported",
@@ -1021,15 +1078,13 @@ impl TryFrom<ConnectionInfo> for SafeConnectionInfo {
             ));
         }
         validate_safe_output_text(&info.role)?;
-        let mut scopes = BTreeSet::new();
         for scope in info.scopes.iter() {
             validate_safe_output_text(scope)?;
-            scopes.insert(scope.clone());
         }
         Ok(Self {
             protocol: info.protocol.get(),
             role: info.role,
-            scopes: scopes.into_iter().collect(),
+            scopes: info.scopes.to_vec(),
         })
     }
 }
@@ -1069,6 +1124,17 @@ impl DiagnosticAttempt {
             info: Some(info),
             health: None,
             failure: Some(failure),
+        }
+    }
+
+    const fn record_shutdown_error(&mut self, error: &GatewayClientError) {
+        if self.failure.is_none()
+            || matches!(
+                error,
+                GatewayClientError::ShutdownTimedOut | GatewayClientError::Cancelled
+            )
+        {
+            self.failure = Some(map_client_error(error));
         }
     }
 
@@ -1369,7 +1435,7 @@ fn render_diagnostic(options: &GatewayOptions, summary: &DiagnosticSummary) -> R
             summary.endpoint.as_deref().unwrap_or("<invalid>"),
             summary.protocol.unwrap_or_default(),
             summary.role.as_deref().unwrap_or("<unknown>"),
-            summary.scopes.join(","),
+            summary.scopes.first().map_or("<unknown>", String::as_str),
             health.ok,
             health.timestamp_ms.unwrap_or_default(),
             health.duration_ms.unwrap_or_default(),
@@ -1470,10 +1536,13 @@ fn render_json(summary: &DiagnosticSummary) -> RenderedResult {
                 "error: could not serialize diagnostic summary\n".to_owned(),
             )
         },
-        |json| RenderedResult {
-            stdout: format!("{json}\n"),
-            stderr: String::new(),
-            exit_code,
+        |mut json| {
+            json.push('\n');
+            RenderedResult {
+                stdout: json,
+                stderr: String::new(),
+                exit_code,
+            }
         },
     )
 }
@@ -1803,6 +1872,46 @@ mod tests {
             assert_eq!(mapped.category.as_str(), expected_category);
         }
         assert_eq!(DiagnosticFailure::health_negative().category.code(), 6);
+    }
+
+    #[test]
+    fn shutdown_errors_preserve_primary_failures_except_for_teardown_timeout() {
+        let mut unhealthy = DiagnosticAttempt::failure(DiagnosticFailure::health_negative());
+        unhealthy.record_shutdown_error(&GatewayClientError::Transport(TransportFailure::Connect));
+        assert_eq!(
+            unhealthy.failure.as_ref().map(|failure| failure.status),
+            Some("unhealthy")
+        );
+
+        unhealthy.record_shutdown_error(&GatewayClientError::ShutdownTimedOut);
+        assert_eq!(
+            unhealthy.failure.as_ref().map(|failure| failure.status),
+            Some("timeout")
+        );
+
+        let mut successful = DiagnosticAttempt {
+            info: None,
+            health: None,
+            failure: None,
+        };
+        successful.record_shutdown_error(&GatewayClientError::Transport(TransportFailure::Connect));
+        assert_eq!(
+            successful.failure.as_ref().map(|failure| failure.status),
+            Some("transport_failure")
+        );
+    }
+
+    #[test]
+    fn rendered_process_output_has_a_hard_byte_bound() {
+        let result = enforce_output_bound(RenderedResult::success(
+            "x".repeat(MAX_RENDERED_OUTPUT_BYTES + 1),
+        ));
+        assert_eq!(result.exit_code, ExitCategory::Internal.code());
+        assert!(result.stdout.is_empty());
+        assert_eq!(
+            result.stderr,
+            "error: rendered output exceeded the CLI safety limit\n"
+        );
     }
 
     #[test]

@@ -87,7 +87,10 @@ non-secret identity mode. Peer-controlled server version text is never emitted;
 the version is `null` with `version_status: "redacted_peer_value"`. Human output
 uses the same explicit redaction. Command timeout and Ctrl-C also use bounded
 runtime teardown so an uncancellable platform resolver or stdin worker cannot
-keep the process alive indefinitely.
+keep the process alive indefinitely. Process output is capped at 16 KiB and a
+blocked output stream is abandoned after 250 ms; either safety limit exits `8`.
+If timeout or Ctrl-C wins, a clean shutdown gets one independent 250 ms grace
+window without replacing the timeout/cancel result.
 
 This command implements diagnostic health only. It is not a full OpenClaw CLI,
 admin/chat/provider surface, durable keyring identity, GUI, Gateway server, or
