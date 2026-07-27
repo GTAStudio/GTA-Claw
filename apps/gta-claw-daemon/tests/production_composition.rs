@@ -231,6 +231,14 @@ fn bound_http_is_ready_and_dispatches_to_the_composed_provider() {
         status.contains(r#""layers":["built_in","workspace","environment"]"#),
         "{status}"
     );
+    let status_body: serde_json::Value =
+        serde_json::from_str(response_body(&status)).expect("status body is JSON");
+    assert_eq!(status_body["payload"]["plugins"]["activated"], 0);
+    assert_eq!(status_body["payload"]["plugins"]["failed"], 0);
+    assert_eq!(
+        status_body["payload"]["plugins"]["outcomes"],
+        serde_json::json!([])
+    );
 
     let update = request(
         daemon.http,

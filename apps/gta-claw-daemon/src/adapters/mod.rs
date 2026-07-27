@@ -24,5 +24,6 @@ pub mod ingress;
 pub mod legacy;
 pub mod model;
 pub mod plugins;
+pub mod signed_plugins;
 pub mod state;
 pub mod support;

@@ -130,6 +130,22 @@ impl Diagnostics {
     }
 }
 
+/// Synchronous projection of host-registered tools into provider declarations.
+pub trait ModelToolCatalog: Send + Sync {
+    /// Returns the current ordered tool definitions.
+    fn definitions(&self) -> Vec<HttpToolDefinition>;
+}
+
+/// Empty model tool catalogue.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EmptyModelTools;
+
+impl ModelToolCatalog for EmptyModelTools {
+    fn definitions(&self) -> Vec<HttpToolDefinition> {
+        Vec::new()
+    }
+}
+
 /// HTTP/provider-SDK bridge with a startup-populated model cache.
 #[derive(Clone, Copy, Debug)]
 pub struct ProviderHistoryConfig {
@@ -157,6 +173,7 @@ pub struct ProviderAdapter {
     models: RwLock<Vec<ModelDescriptor>>,
     history: Mutex<ConversationHistory>,
     history_config: ProviderHistoryConfig,
+    model_tools: Arc<dyn ModelToolCatalog>,
     readiness: Arc<DependencyReadiness>,
     ready_gate: Arc<AtomicBool>,
 }
@@ -186,6 +203,7 @@ impl ProviderAdapter {
         default_model: impl Into<String>,
         role_prompt: impl Into<String>,
         history_config: ProviderHistoryConfig,
+        model_tools: Arc<dyn ModelToolCatalog>,
         readiness: Arc<DependencyReadiness>,
         ready_gate: Arc<AtomicBool>,
     ) -> Self {
@@ -197,6 +215,7 @@ impl ProviderAdapter {
             models: RwLock::new(Vec::new()),
             history: Mutex::new(ConversationHistory::default()),
             history_config,
+            model_tools,
             readiness,
             ready_gate,
         }
@@ -578,6 +597,7 @@ impl ProviderPort for ProviderAdapter {
 pub struct SwappableProvider {
     state: RwLock<SwappableState>,
     history_config: ProviderHistoryConfig,
+    model_tools: Arc<dyn ModelToolCatalog>,
     readiness: Arc<DependencyReadiness>,
     ready_gate: Arc<AtomicBool>,
 }
@@ -596,6 +616,7 @@ impl SwappableProvider {
         default_model: impl Into<String>,
         role_prompt: impl Into<String>,
         history_config: ProviderHistoryConfig,
+        model_tools: Arc<dyn ModelToolCatalog>,
         readiness: Arc<DependencyReadiness>,
     ) -> Self {
         Self {
@@ -606,6 +627,7 @@ impl SwappableProvider {
                 generation: 0,
             }),
             history_config,
+            model_tools,
             readiness,
             ready_gate: Arc::new(AtomicBool::new(false)),
         }
@@ -632,6 +654,7 @@ impl SwappableProvider {
                 model,
                 role,
                 self.history_config,
+                Arc::clone(&self.model_tools),
                 Arc::clone(&self.readiness),
                 Arc::clone(&self.ready_gate),
             ));
@@ -893,6 +916,20 @@ impl ProviderAdapter {
                 })
             })
             .collect::<Result<_, PortError>>()?;
+        completion.tools.extend(
+            self.model_tools
+                .definitions()
+                .into_iter()
+                .map(|tool| {
+                    Ok(ToolDefinition {
+                        name: tool.name,
+                        description: tool.description.unwrap_or_default(),
+                        parameters: ToolParameters::new(tool.input_schema)
+                            .map_err(|error| invalid_request(error.to_string()))?,
+                    })
+                })
+                .collect::<Result<Vec<_>, PortError>>()?,
+        );
         completion.tool_choice = match request.tool_choice {
             claw_http_api::ToolChoice::Auto => ProviderToolChoice::Auto,
             claw_http_api::ToolChoice::None => ProviderToolChoice::None,
@@ -1357,9 +1394,11 @@ impl WebhookPort for UnavailableExternalPorts {
 #[derive(Debug)]
 pub struct OperatorInventory {
     channels: Vec<Value>,
-    skill_count: usize,
+    registered_skill_count: usize,
+    active_skill_count: usize,
     updates_enabled: bool,
     config_resolution: Value,
+    plugin_activation: Value,
 }
 
 impl OperatorInventory {
@@ -1367,15 +1406,19 @@ impl OperatorInventory {
     #[must_use]
     pub const fn new(
         channels: Vec<Value>,
-        skill_count: usize,
+        registered_skill_count: usize,
+        active_skill_count: usize,
         updates_enabled: bool,
         config_resolution: Value,
+        plugin_activation: Value,
     ) -> Self {
         Self {
             channels,
-            skill_count,
+            registered_skill_count,
+            active_skill_count,
             updates_enabled,
             config_resolution,
+            plugin_activation,
         }
     }
 }
@@ -1420,10 +1463,11 @@ impl OperatorAdmin {
             "model": model,
             "configGeneration": generation,
             "configuration": self.inventory.config_resolution,
+            "plugins": self.inventory.plugin_activation,
             "channels": self.inventory.channels,
             "skills": {
-                "registered": self.inventory.skill_count,
-                "active": 0,
+                "registered": self.inventory.registered_skill_count,
+                "active": self.inventory.active_skill_count,
                 "state": "requires_native_ports",
             },
         }))
@@ -1691,8 +1735,8 @@ impl Provider for SmokeProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigController, DependencyReadiness, Diagnostics, ProviderHistoryConfig, SmokeProvider,
-        SwappableProvider, copilot_request_timeout_ms,
+        ConfigController, DependencyReadiness, Diagnostics, EmptyModelTools, ProviderHistoryConfig,
+        SmokeProvider, SwappableProvider, copilot_request_timeout_ms,
     };
     use std::sync::Arc;
 
@@ -1721,6 +1765,7 @@ mod tests {
             "gpt-4o",
             "",
             ProviderHistoryConfig::default(),
+            Arc::new(EmptyModelTools),
             Arc::clone(&readiness),
         );
 
@@ -1746,6 +1791,7 @@ mod tests {
             "gpt-4o",
             "",
             ProviderHistoryConfig::default(),
+            Arc::new(EmptyModelTools),
             Arc::clone(&readiness),
         ));
         provider
@@ -1784,6 +1830,7 @@ mod tests {
             "gpt-4o",
             "",
             ProviderHistoryConfig::default(),
+            Arc::new(EmptyModelTools),
             Arc::clone(&readiness),
         ));
         provider

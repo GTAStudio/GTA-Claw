@@ -47,13 +47,14 @@ use url::Url;
 
 use crate::adapters::http_api::{
     AppliedReload, ConfigController, DependencyReadiness, Diagnostics, DurableSecurityAudit,
-    OperatorAdmin, OperatorInventory, ProviderHistoryConfig, SmokeProvider, SwappableProvider,
-    UnavailableExternalPorts, UnavailableTools, copilot_request_timeout_ms, updates_enabled,
+    ModelToolCatalog, OperatorAdmin, OperatorInventory, ProviderHistoryConfig, SmokeProvider,
+    SwappableProvider, UnavailableExternalPorts, copilot_request_timeout_ms, updates_enabled,
 };
 use crate::adapters::legacy::{
     DeviceTaskReport, DeviceTokenActivator, GraphWhatsAppAdapter, LegacyDeviceFlowAdapter,
     LegacyTeamsAdapter, NativeLegacyHostAdmin,
 };
+use crate::adapters::signed_plugins::SignedPluginRuntime;
 
 /// Whole-process shutdown ceiling.
 pub const PRODUCTION_STOP_DEADLINE: Duration = Duration::from_secs(10);
@@ -481,6 +482,7 @@ struct DaemonLegacyReload {
     runtime: Arc<ProviderLegacyRuntime>,
     proxy: ProxyPolicy,
     diagnostics: Arc<Diagnostics>,
+    skill_count: usize,
 }
 
 impl LegacyReloadPort for DaemonLegacyReload {
@@ -527,14 +529,14 @@ impl LegacyReloadPort for DaemonLegacyReload {
                     .record(format!("legacy session reset failed: {}", error.message));
                 LegacyReloadError::Failed
             })?;
-            self.runtime.set_skill_count(0);
+            self.runtime.set_skill_count(self.skill_count);
             for diagnostic in &role.diagnostics {
                 self.diagnostics
                     .record(format!("legacy role reload: {diagnostic}"));
             }
             Ok(LegacyReloadResult {
                 role_model: role.model,
-                skill_count: 0,
+                skill_count: self.skill_count,
             })
         })
     }
@@ -553,6 +555,7 @@ pub struct ProductionService {
     http_tasks: JoinSet<(&'static str, io::Result<()>)>,
     gateway: Option<ServerHandle>,
     device_flow: Option<Arc<LegacyDeviceFlowAdapter>>,
+    plugins: Option<SignedPluginRuntime>,
     terminated_http_tasks: u64,
 }
 
@@ -712,17 +715,28 @@ impl ProductionService {
             "role loaded"
         );
 
-        let skill_count = claw_skills::registry().len();
-        readiness.set("skills", true);
+        let registered_skill_count = claw_skills::registry().len();
         diagnostics.record(format!(
-            "skills: 0 active, {skill_count} registered entries require native ports"
+            "skills: {registered_skill_count} registered entries require native ports"
         ));
         info!(
             stage = "skills",
-            registered = skill_count,
-            active = 0,
+            registered = registered_skill_count,
             "skill inventory classified"
         );
+        let plugins = SignedPluginRuntime::activate(&diagnostics)
+            .map_err(|error| ProductionError::message("plugins", error))?;
+        let plugin_tools = plugins.tools();
+        let active_skill_count = plugins.summary().activated();
+        let plugin_activation = plugins.summary().as_json();
+        diagnostics.record(format!("plugin activation report: {plugin_activation}"));
+        info!(
+            stage = "plugins",
+            activated = active_skill_count,
+            report = %plugin_activation,
+            "signed plugin discovery completed"
+        );
+        readiness.set("skills", true);
 
         let legacy_settings = legacy_settings(&loaded.snapshot)?;
         let channels = channel_statuses(&legacy_settings)?;
@@ -744,6 +758,7 @@ impl ProductionService {
                 max_conversations: legacy_settings.session_max_entries,
                 idle_timeout: legacy_settings.session_idle_timeout,
             },
+            Arc::clone(&plugin_tools) as Arc<dyn ModelToolCatalog>,
             Arc::clone(&readiness),
         ));
         let provider_to_activate: Option<Arc<dyn Provider>> = if options.smoke {
@@ -786,7 +801,7 @@ impl ProductionService {
             Arc::clone(&provider) as Arc<dyn claw_http_api::ProviderPort>,
             ProviderLegacyRuntimeConfig {
                 model: "openclaw".to_owned(),
-                skill_count: 0,
+                skill_count: active_skill_count,
                 max_sessions: legacy_settings.session_max_entries,
                 session_idle_timeout: legacy_settings.session_idle_timeout,
             },
@@ -866,6 +881,7 @@ impl ProductionService {
             runtime: Arc::clone(&legacy_runtime),
             proxy: proxy.clone(),
             diagnostics: Arc::clone(&diagnostics),
+            skill_count: active_skill_count,
         });
         let updates_enabled = updates_enabled(&loaded.snapshot)
             .map_err(|error| ProductionError::message("updates", error))?;
@@ -879,14 +895,21 @@ impl ProductionService {
             Arc::clone(&provider),
             Arc::clone(&readiness),
             Arc::clone(&diagnostics),
-            OperatorInventory::new(channels, skill_count, updates_enabled, config_resolution),
+            OperatorInventory::new(
+                channels,
+                registered_skill_count,
+                active_skill_count,
+                updates_enabled,
+                config_resolution,
+                plugin_activation,
+            ),
         ));
         let admin_token = admin_token(&loaded.snapshot)?;
         let external = Arc::new(UnavailableExternalPorts);
         let services = ApiServices {
             provider: Arc::clone(&provider) as Arc<dyn claw_http_api::ProviderPort>,
             readiness: Arc::clone(&readiness) as Arc<dyn claw_http_api::ReadinessPort>,
-            tools: Arc::new(UnavailableTools),
+            tools: Arc::clone(&plugin_tools) as Arc<dyn claw_http_api::ToolPort>,
             admin,
             watch_auth: Arc::clone(&external) as Arc<dyn claw_http_api::WatchAuthPort>,
             watch_results: Arc::clone(&external) as Arc<dyn claw_http_api::WatchResultPort>,
@@ -894,7 +917,7 @@ impl ProductionService {
             audit,
         };
         diagnostics
-            .record("tools/watch/webhooks are unavailable until their public ports are composable");
+            .record("watch/webhooks are unavailable until their public ports are composable");
 
         let serving = ServingStateHandle::starting();
         if admin_token.is_none() {
@@ -1097,6 +1120,7 @@ impl ProductionService {
             http_tasks,
             gateway: Some(gateway),
             device_flow,
+            plugins: Some(plugins),
             terminated_http_tasks: 0,
         })
     }
@@ -1243,6 +1267,63 @@ impl ProductionService {
         };
         abandoned = abandoned.saturating_add(device_report.abandoned);
 
+        let mut plugins_joined = false;
+        let mut plugin_invocations_spawned = 0;
+        let mut plugin_invocations_terminated = 0;
+        if let Some(plugins) = self.plugins.take() {
+            let report = plugins.drain_invocations(remaining(started)).await;
+            plugin_invocations_spawned = report.spawned;
+            plugin_invocations_terminated = report.terminated;
+            if report.cancelled > 0 {
+                warn!(
+                    stage = "shutdown",
+                    subsystem = "plugins",
+                    cancelled = report.cancelled,
+                    "cancelled plugin invocations after graceful drain"
+                );
+            }
+            if report.abandoned {
+                abandoned = abandoned.saturating_add(1);
+                warn!(
+                    stage = "shutdown",
+                    subsystem = "plugins",
+                    spawned = report.spawned,
+                    terminated = report.terminated,
+                    "plugin invocation drain deadline expired"
+                );
+            }
+            let mut task = tokio::task::spawn_blocking(move || plugins.shutdown_host());
+            match tokio::time::timeout(remaining(started), &mut task).await {
+                Ok(Ok(report)) => {
+                    plugins_joined = true;
+                    if report.failed > 0 {
+                        abandoned = abandoned
+                            .saturating_add(u32::try_from(report.failed).unwrap_or(u32::MAX));
+                    }
+                    info!(
+                        stage = "shutdown",
+                        subsystem = "plugins",
+                        attempted = report.attempted,
+                        failed = report.failed,
+                        "plugin shutdown complete"
+                    );
+                }
+                Ok(Err(error)) => {
+                    abandoned = abandoned.saturating_add(1);
+                    warn!(stage = "shutdown", subsystem = "plugins", error = %error);
+                }
+                Err(_) => {
+                    task.abort();
+                    abandoned = abandoned.saturating_add(1);
+                    warn!(
+                        stage = "shutdown",
+                        subsystem = "plugins",
+                        "plugin shutdown deadline expired"
+                    );
+                }
+            }
+        }
+
         let mut gateway_joined = false;
         if let Some(gateway) = self.gateway.take() {
             let mut task = tokio::spawn(gateway.shutdown());
@@ -1263,11 +1344,15 @@ impl ProductionService {
             }
         }
 
-        let spawned = 5_u64.saturating_add(device_report.spawned);
+        let spawned = 6_u64
+            .saturating_add(device_report.spawned)
+            .saturating_add(plugin_invocations_spawned);
         let terminated = self
             .terminated_http_tasks
             .saturating_add(if gateway_joined { 2 } else { 0 })
-            .saturating_add(device_report.terminated);
+            .saturating_add(u64::from(plugins_joined))
+            .saturating_add(device_report.terminated)
+            .saturating_add(plugin_invocations_terminated);
         let deadline_expired = started.elapsed() >= PRODUCTION_STOP_DEADLINE;
         let clean = abandoned == 0 && terminated == spawned && !deadline_expired && fault.is_none();
         if clean {
