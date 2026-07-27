@@ -4,6 +4,6 @@
 # Regenerate ONLY through the reviewed command, never by hand:
 #   powershell -NoProfile -File compat/upstream/validate.ps1 -WriteLedgerDigests
 # Format: <sha256>  <ledger path>
-4b9acba6bab704fd76148d19bcb0142b7526efba6c27617459e3981fb0a2d17d  ledgers/gateway-core.json
-01ac641cdcb208343bdbafa119ac6c2089c03a6ac23064351c5dae628eba1c47  ledgers/official-integration.json
-e09abccfcf890939ee220fa303b574673c346b21479bf0ff622d0e183cb44e0d  ledgers/official-client-interop.json
+36e73542fae3824158af538b711e3f350d14dcb019fa61c956a110e1c2544dcd  ledgers/gateway-core.json
+3ab0aad22ee7992215c487ba6eeee8161e93b398f397c1ef01e4474dd4a8ed5e  ledgers/official-integration.json
+317c650c6dcc88180ef8ed9bdf5fa594ca16778bb49300b402100ab06c396e9e  ledgers/official-client-interop.json

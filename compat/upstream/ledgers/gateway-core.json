@@ -17,17 +17,28 @@
                                                                "packages/gateway-protocol/src/version.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-protocol/tests/gateway_protocol.rs",
+                                                                           "test":  "negotiates_current_protocol_to_ready"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-protocol/tests/gateway_protocol.rs",
+                                                                           "test":  "admits_only_authenticated_v3_node_and_probe"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-protocol/tests/gateway_protocol.rs",
+                                                                           "test":  "decodes_full_hello_snapshot_fixture"
+                                                                       }
                                                                    ],
                                                      "required":  "A Rust protocol constant test proves v4 negotiation and rejects unsupported general-client versions."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Negotiation is proven in-process against the pinned frame contract; the upstream version constant is mirrored by hand in Rust rather than generated from the frozen source file."
                                                ]
                      },
                      {
@@ -44,17 +55,28 @@
                                                                "docs/gateway/protocol.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-protocol/tests/gateway_protocol.rs",
+                                                                           "test":  "admits_only_authenticated_v3_node_and_probe"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-protocol/tests/gateway_protocol.rs",
+                                                                           "test":  "n_minus_one_never_bypasses_authentication"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-protocol/tests/gateway_protocol.rs",
+                                                                           "test":  "rejects_cross_role_probe_and_inverted_ranges"
+                                                                       }
                                                                    ],
                                                      "required":  "Handshake tests prove authenticated node-mode v3 acceptance while general clients remain v4-only."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "The N-1 window is proven for node and probe client modes at the negotiation layer; no live-socket test drives a v3 node through a complete authenticated session."
                                                ]
                      },
                      {
@@ -71,17 +93,40 @@
                                                                "docs/gateway/protocol.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-protocol/tests/gateway_protocol.rs",
+                                                                           "test":  "decodes_exact_envelopes_and_preserves_null"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-protocol/tests/gateway_protocol.rs",
+                                                                           "test":  "decodes_connect_and_device_proof_fixture"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-protocol/tests/gateway_protocol.rs",
+                                                                           "test":  "decodes_full_hello_snapshot_fixture"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-protocol/tests/gateway_protocol.rs",
+                                                                           "test":  "enforces_size_collection_nesting_and_name_policies"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-protocol/tests/gateway_protocol.rs",
+                                                                           "test":  "rejects_contradictory_unknown_and_malformed_frames"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-gateway/tests/adversarial.rs",
+                                                                           "test":  "the_hello_advertises_the_frozen_catalog_and_the_negotiated_policy"
+                                                                       }
                                                                    ],
                                                      "required":  "Golden-frame tests cover connect.challenge, connect, hello-ok, req, res, event, limits, and error cases."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Golden frames are asserted as decoded Rust values against hand-transcribed fixtures rather than byte-for-byte against captured upstream traffic."
                                                ]
                      },
                      {
@@ -98,17 +143,28 @@
                                                                "src/gateway/server-methods-list.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-gateway/tests/frozen_catalog.rs",
+                                                                           "test":  "the_registry_holds_exactly_the_frozen_method_set"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-gateway/tests/frozen_catalog.rs",
+                                                                           "test":  "every_registered_method_keeps_its_frozen_authorization_scope"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-gateway/tests/frozen_catalog.rs",
+                                                                           "test":  "the_advertised_set_matches_the_frozen_advertised_flags"
+                                                                       }
                                                                    ],
                                                      "required":  "Generated Rust catalog matches every pinned core method name, scope, and advertised flag."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "The catalog is a hand-written Rust table cross-checked against the frozen inventory in both directions rather than generated from it; the behaviour of individual method handlers is covered by other rows."
                                                ]
                      },
                      {
@@ -125,17 +181,32 @@
                                                                "src/gateway/events.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-gateway/tests/frozen_catalog.rs",
+                                                                           "test":  "the_event_catalog_holds_exactly_the_frozen_event_set"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-protocol/tests/gateway_protocol.rs",
+                                                                           "test":  "decodes_proven_tick_and_shutdown_control_payloads"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-protocol/tests/gateway_protocol.rs",
+                                                                           "test":  "validates_response_ids_and_event_gaps_without_panics"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-gateway/tests/event_visibility.rs",
+                                                                           "test":  "the_handshake_event_is_never_delivered_over_an_authenticated_subscription"
+                                                                       }
                                                                    ],
                                                      "required":  "Generated Rust event catalog and event-envelope tests match all pinned events."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "All pinned event identities and the event-envelope shape are proven; per-event payload schemas are decoded only for the control events tick, shutdown and connect.challenge."
                                                ]
                      },
                      {
@@ -153,17 +224,24 @@
                                                                "docs/gateway/protocol.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-gateway/tests/authorization_matrix.rs",
+                                                                           "test":  "every_catalogued_method_obeys_the_rules_for_every_role_and_scope_subset"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-gateway/tests/authorization_matrix.rs",
+                                                                           "test":  "no_catalogued_method_is_reachable_by_a_worker"
+                                                                       }
                                                                    ],
                                                      "required":  "Authorization matrix tests cover operator, node, worker, and all six closed operator scopes."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "The matrix restates the expected rule independently of the production resolver and walks every role and scope subset; dynamic-scope catalog entries are resolved by a policy restated in the test because the frozen inventory carries no resolution column."
                                                ]
                      },
                      {
@@ -179,17 +257,21 @@
                                                                "src/gateway/server-http.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "partial",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "probes_reflect_real_dependency_state_and_hide_details_without_auth"
+                                                                       }
                                                                    ],
                                                      "required":  "HTTP tests prove /health, /healthz, /ready, and /readyz status and draining behavior."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Status codes, bodies, cache-control and unauthenticated detail hiding are proven for the health and readiness probes.",
+                                                   "Draining is not proven over HTTP: readiness is only flipped by a failing dependency, and the daemon drain is observed at process level in apps/gta-claw-daemon/tests/process_shutdown.rs, which never queries these routes."
                                                ]
                      },
                      {
@@ -205,17 +287,24 @@
                                                                "src/gateway/watch-node-http.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "watch_transport_covers_challenge_connect_queue_poll_result_and_disconnect"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "watch_transport_consumes_challenges_times_out_polls_and_closes_overflowed_queues"
+                                                                       }
                                                                    ],
                                                      "required":  "Transport tests cover challenge, connect, disconnect, long poll, result, authentication, and queue limits."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "The transport is exercised over real sockets against the in-process server; no separate node binary is driven through the long-poll loop."
                                                ]
                      },
                      {
@@ -231,17 +320,32 @@
                                                                "src/config/types.openclaw.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-config/tests/domains.rs",
+                                                                           "test":  "implemented_domain_set_matches_frozen_inventory_exactly"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-config/tests/domains.rs",
+                                                                           "test":  "all_frozen_domains_round_trip_without_name_drift"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-config/tests/domains.rs",
+                                                                           "test":  "fixed_domains_reject_unknown_fields_with_exact_paths"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-config/tests/domains.rs",
+                                                                           "test":  "every_frozen_domain_enforces_a_concrete_value_type"
+                                                                       }
                                                                    ],
                                                      "required":  "Rust config fixtures deserialize every pinned top-level domain and reject unknown contract-breaking shapes."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Every frozen top-level domain deserializes, round-trips without name drift and rejects unknown keys with an exact path; exhaustive field-level coverage below the top level exists only for the domains named in every_frozen_domain_enforces_a_concrete_value_type."
                                                ]
                      },
                      {
@@ -258,17 +362,24 @@
                                                                "docs/concepts/context-engine.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/context_spi.rs",
+                                                                           "test":  "a_well_behaved_engine_passes_every_check"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/context_spi.rs",
+                                                                           "test":  "a_broken_engine_is_reported_check_by_check"
+                                                                       }
                                                                    ],
                                                      "required":  "A Rust SPI conformance harness proves bootstrap, ingest, assemble, maintain, and compact lifecycle behavior."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "The conformance harness proves the documented lifecycle checks against in-repository engines; no third-party context engine has been run through it."
                                                ]
                      },
                      {
@@ -285,17 +396,29 @@
                                                                "src/auto-reply/reply/directives.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "partial",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/commands.rs",
+                                                                           "test":  "directives_are_stripped_from_the_prompt_and_lowered_into_turn_options"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/commands.rs",
+                                                                           "test":  "every_builtin_command_lowers_to_a_distinct_effect"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/commands.rs",
+                                                                           "test":  "a_read_only_operator_cannot_reach_write_or_admin_commands"
+                                                                       }
                                                                    ],
                                                      "required":  "Command registry and directive parsing golden tests match pinned aliases, authorization, and inline behavior."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Directive parsing, inline stripping into turn options, the builtin command registry and per-scope authorization are proven.",
+                                                   "Pinned aliases are not proven: the repository has no alias table and no test compares a registry alias set against the frozen upstream command list."
                                                ]
                      },
                      {
@@ -313,17 +436,36 @@
                                                                "src/agents/tools/goal-tools.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/goals_durable.rs",
+                                                                           "test":  "a_goal_survives_a_restart_with_its_progress_and_revision"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/goals_durable.rs",
+                                                                           "test":  "the_progress_budget_folds_the_oldest_entries_into_one_summary"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/goals_durable.rs",
+                                                                           "test":  "a_closed_goal_refuses_further_progress"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/commands.rs",
+                                                                           "test":  "the_goal_commands_drive_the_durable_goal"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/goal_tool.rs",
+                                                                           "test":  "a_goal_the_model_set_survives_a_restart_of_the_whole_runtime"
+                                                                       }
                                                                    ],
                                                      "required":  "Restart, compaction, command, model-tool, budget, and status transition tests prove durable goal behavior."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Durability is proven by rebuilding the runtime over the same store rather than by restarting a real operating-system process."
                                                ]
                      },
                      {
@@ -341,17 +483,33 @@
                                                                "src/config/types.crestodian.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "partial",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-crestodian/tests/rescue.rs",
+                                                                           "test":  "rescue_parser_accepts_only_the_closed_command_grammar"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-crestodian/tests/rescue.rs",
+                                                                           "test":  "sandbox_owner_and_direct_message_gates_are_fail_closed"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-crestodian/tests/rescue.rs",
+                                                                           "test":  "restart_requires_same_owner_approval_and_writes_metadata_only_audit"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-crestodian/tests/crestodian.rs",
+                                                                           "test":  "guided_setup_has_closed_typed_questions_and_persists_only_secret_references"
+                                                                       }
                                                                    ],
                                                      "required":  "Ring-zero tool, typed mutation, rescue grammar, owner-DM, and restart acceptance tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "The closed rescue grammar, owner and direct-message gating, same-owner restart approval and typed guided-setup mutation are proven.",
+                                                   "The ring-zero tool surface is not proven: the rescue control plane is a library API and no test registers or invokes it as an agent-callable tool, so nothing shows it is reachable from a session."
                                                ]
                      },
                      {
@@ -368,17 +526,20 @@
                                                                "extensions/admin-http-rpc/src/handler.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "tools_admin_mcp_and_webhooks_enforce_and_map_contracts"
+                                                                       }
                                                                    ],
                                                      "required":  "Authenticated POST /api/v1/admin/rpc dispatch tests prove method policy and error mapping."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Authenticated dispatch, the supported-method policy, scope denial and error mapping are proven for the admin RPC route; the unauthenticated rejection is covered by the shared HTTP auth layer rather than by a case naming this path."
                                                ]
                      },
                      {
@@ -395,17 +556,40 @@
                                                                "src/gateway/server-methods.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/suspension.rs",
+                                                                           "test":  "a_prepare_waits_for_in_flight_work_and_completes_when_the_permit_drops"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/suspension.rs",
+                                                                           "test":  "a_second_prepare_is_refused_while_one_is_draining"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/suspension.rs",
+                                                                           "test":  "an_expired_lease_releases_the_runtime_so_a_crashed_host_cannot_wedge_it"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/suspension.rs",
+                                                                           "test":  "only_the_owning_lease_may_resume"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/suspension.rs",
+                                                                           "test":  "every_phase_declares_whether_it_admits_work"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/suspension.rs",
+                                                                           "test":  "work_that_never_finishes_makes_the_drain_time_out_and_the_runtime_stays_active"
+                                                                       }
                                                                    ],
                                                      "required":  "Prepare, busy, lease expiry, status, resume, and draining integration tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "The controller is driven through an injected clock and synthetic work permits rather than a real host suspend and resume cycle."
                                                ]
                      },
                      {
@@ -422,17 +606,40 @@
                                                                "docs/gateway/protocol.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/worker_protocol.rs",
+                                                                           "test":  "the_allowlist_is_exactly_the_nine_frozen_machine_role_methods"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/worker_protocol.rs",
+                                                                           "test":  "a_worker_is_admitted_once_per_ticket"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/worker_protocol.rs",
+                                                                           "test":  "readmission_fences_the_previous_session"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/worker_protocol.rs",
+                                                                           "test":  "a_ticket_cannot_be_redeemed_by_another_worker_or_after_it_expires"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/worker_protocol.rs",
+                                                                           "test":  "calls_must_advance_the_sequence"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-runtime/tests/worker_protocol.rs",
+                                                                           "test":  "methods_and_payloads_are_checked_before_the_session_is_touched"
+                                                                       }
                                                                    ],
                                                      "required":  "Admission, fencing, expiry, RPC allowlist, replay, and payload-limit tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "The registry is proven in isolation with an injected clock; the allowlist is a Rust constant asserted against its nine documented method names rather than derived from the frozen gateway method inventory."
                                                ]
                      }
                  ]

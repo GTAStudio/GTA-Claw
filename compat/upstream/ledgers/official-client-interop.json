@@ -398,17 +398,28 @@
                                                                "src/gateway/openai-http.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "auth_models_embeddings_and_json_generation_match_contracts"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "chat_and_responses_sse_have_exact_framing_and_terminal_events"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "malformed_oversized_timeout_and_disconnect_fail_safely"
+                                                                       }
                                                                    ],
                                                      "required":  "JSON and SSE /v1/chat/completions golden tests match pinned request, stream, usage, and error contracts."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Request shape, JSON response, SSE framing, usage accounting and the error contract are proven against a deterministic runtime double; no upstream OpenAI client library is replayed against the surface."
                                                ]
                      },
                      {
@@ -425,17 +436,32 @@
                                                                "src/gateway/open-responses.schema.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "auth_models_embeddings_and_json_generation_match_contracts"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "chat_and_responses_sse_have_exact_framing_and_terminal_events"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "required_tool_choice_returns_structured_calls_on_both_openai_surfaces"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "malformed_oversized_timeout_and_disconnect_fail_safely"
+                                                                       }
                                                                    ],
                                                      "required":  "JSON and SSE /v1/responses golden tests match pinned item, event, tool, usage, and error contracts."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Item, event, tool-call and usage contracts plus the error shapes are proven against a deterministic runtime double; the emitted event list is the one this server produces, not a recording of upstream traffic."
                                                ]
                      },
                      {
@@ -451,17 +477,20 @@
                                                                "src/gateway/models-http.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "auth_models_embeddings_and_json_generation_match_contracts"
+                                                                       }
                                                                    ],
                                                      "required":  "List and retrieve model endpoint tests match pinned filtering, identifiers, and errors."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "List, retrieve, identifier encoding and both error shapes are proven for the models routes; the advertised set belongs to the test runtime, so this pins the endpoint contract rather than the production catalog."
                                                ]
                      },
                      {
@@ -477,17 +506,25 @@
                                                                "src/gateway/embeddings-http.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "partial",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "auth_models_embeddings_and_json_generation_match_contracts"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "malformed_oversized_timeout_and_disconnect_fail_safely"
+                                                                       }
                                                                    ],
                                                      "required":  "Embedding request, provider policy, dimensions, usage, and error fixtures pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Request shape, the dimensions parameter, usage accounting and the invalid-request and timeout error contracts are proven.",
+                                                   "Provider policy is not proven at this surface: no test drives the embeddings route through a provider that refuses or rewrites the request, and provider-side embedding support is asserted separately in crates/claw-providers/tests/wire.rs without reaching the HTTP layer."
                                                ]
                      },
                      {
@@ -503,17 +540,24 @@
                                                                "src/gateway/tools-invoke-http.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "tools_invoke_rejects_auth_schema_scope_and_maps_tool_errors"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "tools_admin_mcp_and_webhooks_enforce_and_map_contracts"
+                                                                       }
                                                                    ],
                                                      "required":  "Authenticated /tools/invoke schema, policy, result, and error tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Authentication, schema validation, scope policy, the success result with its lowered invocation context and the not-found error mapping are proven against a deterministic runtime double."
                                                ]
                      },
                      {
@@ -531,17 +575,32 @@
                                                                "extensions/browser/src/browser/bridge-server.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-relay/tests/relay_security.rs",
+                                                                           "test":  "endpoint_authenticates_exact_extension_origin_and_token"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-relay/tests/relay_security.rs",
+                                                                           "test":  "endpoint_rejects_unknown_extension_id_and_forged_origins"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-relay/tests/relay_security.rs",
+                                                                           "test":  "fixture_cdp_server_discovers_attaches_dispatches_and_streams"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-relay/tests/relay_security.rs",
+                                                                           "test":  "abrupt_browser_and_tab_disconnects_emit_detach_and_reap_sessions"
+                                                                       }
                                                                    ],
                                                      "required":  "MV3 pairing, relay auth, WebSocket subprotocol, CDP target, screenshot, and disconnect tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Pairing, subprotocol and origin authentication, CDP target discovery and attach, screenshot dispatch and disconnect reaping are proven against a fixture CDP server; no real Chrome MV3 extension is loaded."
                                                ]
                      },
                      {
@@ -587,17 +646,21 @@
                                                                "docs/install/migrating-claude.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "partial",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-migrate/tests/providers.rs",
+                                                                           "test":  "claude_plan_apply_and_rollback_are_side_effect_free_then_reversible"
+                                                                       }
                                                                    ],
                                                      "required":  "Plan/apply fixtures cover instructions, MCP servers, skills, memory, credentials, and safe config."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Instructions, MCP servers, skills, credential capture into keyring references and safe config are proven, together with a side-effect-free plan and a reversible apply.",
+                                                   "Memory is not proven: the Claude provider imports no memory artifact at all, so no fixture covers it; memory import exists only for the Hermes provider."
                                                ]
                      },
                      {
@@ -613,17 +676,28 @@
                                                                "extensions/codex/src/migration/provider.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-migrate/tests/providers.rs",
+                                                                           "test":  "codex_imports_config_auth_sessions_skills_and_sidecars"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-migrate/tests/providers.rs",
+                                                                           "test":  "codex_default_discovery_imports_cli_and_desktop_config_together"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-migrate/tests/providers.rs",
+                                                                           "test":  "codex_home_override_is_injected_without_real_environment_access"
+                                                                       }
                                                                    ],
                                                      "required":  "Plan/apply fixtures cover auth, session bindings, source discovery, targets, and sidecars."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Auth, session bindings, source discovery, target classification and sidecars are proven against synthetic Codex homes; no real Codex installation is migrated in CI."
                                                ]
                      },
                      {
@@ -640,17 +714,20 @@
                                                                "docs/install/migrating-hermes.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-migrate/tests/providers.rs",
+                                                                           "test":  "hermes_imports_config_memory_skills_sessions_and_secrets"
+                                                                       }
                                                                    ],
                                                      "required":  "Plan/apply fixtures cover config, models, memory, skills, secrets, credentials, and safe exclusions."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Config, models, memory, skills, sessions, secrets, credentials and the plugin and MCP-token safe exclusions are proven against a synthetic Hermes home; no real Hermes installation is migrated in CI."
                                                ]
                      }
                  ]
