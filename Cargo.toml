@@ -35,6 +35,7 @@ members = [
   "crates/claw-security",
   "crates/claw-skills",
   "crates/claw-tools",
+  "crates/claw-worker",
 ]
 exclude = ["android", "desktop", "ios"]
 resolver = "3"
