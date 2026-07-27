@@ -499,7 +499,8 @@ function Invoke-Validator {
     param(
         [string]$CaseRoot,
         [string]$RepositoryRootOverride,
-        [switch]$WriteLedgerDigests
+        [switch]$WriteLedgerDigests,
+        [string]$WriteStatusTotals
     )
     # The child is started through System.Diagnostics.Process rather than the
     # PowerShell call operator for three reasons:
@@ -523,6 +524,9 @@ function Invoke-Validator {
         (ConvertTo-PowerShellLiteral $repositoryRoot)
     if ($WriteLedgerDigests) {
         $invocation += " -WriteLedgerDigests"
+    }
+    if (-not [string]::IsNullOrEmpty($WriteStatusTotals)) {
+        $invocation += " -WriteStatusTotals " + (ConvertTo-PowerShellLiteral $WriteStatusTotals)
     }
     $command = '$ErrorActionPreference = ''Stop''; try { ' + $invocation +
         ' } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }'
@@ -615,6 +619,29 @@ function Set-FeatureTransition {
     if (-not $KeepBaselineDifference) {
         $Feature.known_differences = @("Rust parity proven by the cited acceptance evidence.")
     }
+}
+
+# Compares one file in a mutated case against the pristine contract it was copied
+# from. Used by the write-mode cases: a run that reports the right violation but
+# has already edited the tree is still a failure, and only the residue shows it.
+function Get-StatusTotalsResidueFailure {
+    param(
+        [string]$CaseRoot,
+        [int]$Unimplemented,
+        [int]$Partial,
+        [int]$Implemented,
+        [string]$Description
+    )
+    # Compares values rather than bytes: the fixtures rewrite manifest.json through
+    # the JSON round trip, so a byte comparison would report formatting instead of
+    # the thing under test.
+    $totals = (Read-Json (Join-Path $CaseRoot "manifest.json")).evidence_policy.status_totals
+    $expected = "$Unimplemented/$Partial/$Implemented"
+    $actual = "{0}/{1}/{2}" -f [int]$totals.unimplemented, [int]$totals.partial, [int]$totals.implemented
+    if (-not [string]::Equals($expected, $actual, [StringComparison]::Ordinal)) {
+        return "$Description rewrote status_totals to $actual even though it rejected the tree"
+    }
+    return ""
 }
 
 function Set-ManifestStatusTotals {
@@ -2654,6 +2681,48 @@ $cases = @(
             $path = Join-Path $caseRoot "validate-self-test.ps1"
             Add-Content -LiteralPath $path -Value "# harmless-looking comment"
         }
+    },
+    # -WriteStatusTotals performs the manifest edit; it does not decide the number.
+    # If it derived the totals from the rows it would be a tautology, and a stray or
+    # mismerged row edit could be papered over by reflex instead of being caught.
+    [ordered]@{
+        name = "status-totals-declaration-contradicting-the-rows-is-rejected"
+        expected_message = "-WriteStatusTotals declaration count 'unimplemented' must be"
+        write_status_totals = "unimplemented=40,partial=0,implemented=7"
+        mutate = {
+            param($caseRoot)
+        }
+        assert_after = {
+            param($caseRoot)
+            Get-StatusTotalsResidueFailure $caseRoot 39 0 8 "a rejected -WriteStatusTotals run"
+        }
+    },
+    # The write modes run last, after every evidence rule. A command that could
+    # bless a fabricated citation on its way to reporting one would be worse than
+    # no command at all, so the declaration here deliberately MATCHES the rows:
+    # the only thing standing between the forger and a written manifest is the
+    # artifact rule itself.
+    [ordered]@{
+        name = "status-totals-write-cannot-bless-a-missing-artifact"
+        expected_message = "does not exist in the working tree"
+        write_status_totals = "unimplemented=38,partial=0,implemented=9"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                [ordered]@{
+                    path = "crates/claw-gateway/tests/there_is_no_such_file.rs"
+                    test = "protocol_handshake_matches_upstream"
+                }
+            )
+            # Put the manifest back to the pre-transition totals so that a write,
+            # had one happened, would be visible on disk.
+            Set-ManifestStatusTotals $caseRoot 39 0 8
+        }
+        assert_after = {
+            param($caseRoot)
+            Get-StatusTotalsResidueFailure $caseRoot 39 0 8 "a rejected -WriteStatusTotals run"
+        }
     }
 )
 
@@ -2691,7 +2760,12 @@ try {
             Invoke-Validator $caseRoot -RepositoryRootOverride $caseRepositoryRoot -WriteLedgerDigests | Out-Null
         }
 
-        $result = Invoke-Validator $caseRoot -RepositoryRootOverride $caseRepositoryRoot
+        $caseStatusTotals = ""
+        if ($case.Contains("write_status_totals")) {
+            $caseStatusTotals = [string]$case.write_status_totals
+        }
+        $result = Invoke-Validator $caseRoot -RepositoryRootOverride $caseRepositoryRoot `
+            -WriteStatusTotals $caseStatusTotals
         # Every case is evaluated even after one fails, so a single regression
         # cannot hide the status of the cases behind it.
         $failure = ""
@@ -2711,6 +2785,16 @@ try {
                     $failure = ("failed for the wrong reason; expected '{0}' in: {1}" -f
                         $normalizedExpected, $normalizedOutput)
                 }
+            }
+        }
+        # Exit code and message are not enough for the write modes: a run that
+        # correctly reports a violation but has already edited the tree on its way
+        # to that verdict hands back a half-blessed contract. Cases that care assert
+        # the on-disk residue too.
+        if ($failure.Length -eq 0 -and $case.Contains("assert_after")) {
+            $residue = [string](& $case.assert_after $caseRoot)
+            if ($residue.Length -gt 0) {
+                $failure = $residue
             }
         }
         if ($failure.Length -eq 0) {
