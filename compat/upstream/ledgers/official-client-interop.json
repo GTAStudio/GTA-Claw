@@ -514,9 +514,9 @@
                                                                "src/gateway/embeddings-http.ts"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "partial",
                                                      "artifacts":  [
                                                                        {
                                                                            "path":  "crates/claw-http-api/tests/openai_embeddings.rs",
@@ -543,7 +543,7 @@
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "Usage is pinned as a constant zero because the scripted provider reports no token accounting, and an empty input list is accepted rather than refused; both are recorded in the fixtures as deliberate differences from upstream."
+                                                   "Request shape, provider policy, dimensions and error classification are proven against pinned fixtures. Usage is not proven as real accounting: prompt_tokens and total_tokens are hard-coded to zero and the test pins that constant rather than showing usage follow the provider."
                                                ]
                      },
                      {

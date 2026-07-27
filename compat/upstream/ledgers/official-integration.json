@@ -17,9 +17,9 @@
                                                                "docs/plugins/plugin-inventory.md"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "partial",
                                                      "artifacts":  [
                                                                        {
                                                                            "path":  "crates/claw-plugin-host/tests/plugin_inventory_decisions.rs",
@@ -34,7 +34,7 @@
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "Every core contract carries an explicit decision, but all of them resolve to a registration-only stub: this repository ships the plugin host and ABI rather than ports of the plugins themselves."
+                                                   "All 64 core plugin contracts are accounted for by a set comparison against the frozen inventory that fails both when a contract is missing and when one is invented, and each decision carries the frozen row own record_id, source_path and package_name. Every one of the 64 is an explicit stub: the install decision is BundledUpstreamNotPorted for all of them and COMPONENT_BACKED_PLUGIN_IDS is empty, so no core plugin has a working Rust registration behind it."
                                                ]
                      },
                      {
@@ -50,9 +50,9 @@
                                                                "docs/plugins/plugin-inventory.md"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "partial",
                                                      "artifacts":  [
                                                                        {
                                                                            "path":  "crates/claw-plugin-host/tests/plugin_inventory_decisions.rs",
@@ -67,7 +67,7 @@
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "Every official-external contract carries an explicit install and compatibility decision, but every install decision declines the npm package the frozen row names, so no external plugin is actually installable from this repository."
+                                                   "All 70 official external plugin contracts carry an install and a compatibility decision, cross-checked as a set against the frozen delivery-class split and against the frozen record identity. Every one of the 70 is declined rather than delivered: the install decision is DeclinedNpmOnDemand for all of them and no artifact is ever acquired, so no official external plugin is installable at this baseline."
                                                ]
                      },
                      {
@@ -287,9 +287,9 @@
                                                                "docs/cli/fleet.md"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "partial",
                                                      "artifacts":  [
                                                                        {
                                                                            "path":  "crates/claw-discovery/tests/fleet.rs",
@@ -316,7 +316,7 @@
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "Every lifecycle operation is proven at the planned-argv level against a pinned container CLI contract; no test starts a real container, so runtime behaviour of the cells themselves is unproven."
+                                                   "Create, status, logs, backup, doctor and remove are proven at the argv-planning contract, including a read-only data mount and refusal of values that would inject a flag or a mount option. No container is ever started: no container runtime is available in this environment, so none of the six operations is proven against a real local container cell."
                                                ]
                      },
                      {
@@ -334,9 +334,9 @@
                                                                "src/infra/widearea-dns.ts"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "partial",
                                                      "artifacts":  [
                                                                        {
                                                                            "path":  "crates/claw-discovery/tests/dns_sd.rs",
@@ -367,7 +367,7 @@
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "Advertise, browse, wide-area resolution and the TXT contract are proven against pinned wire-byte fixtures; no test binds a real multicast socket, so on-network behaviour is unproven."
+                                                   "mDNS advertisement, browse queries, wide-area SRV/TXT/address resolution, the RFC 6763 key-value contract and out-of-bailiwick refusal are proven byte for byte against pinned wire fixtures. Real multicast advertise and discover interoperability is not proven, and the wire fixtures are restated inside the test rather than extracted from the frozen upstream."
                                                ]
                      },
                      {

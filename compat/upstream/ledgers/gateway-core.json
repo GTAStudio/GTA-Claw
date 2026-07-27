@@ -608,9 +608,9 @@
                                                                "extensions/admin-http-rpc/src/handler.ts"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "partial",
                                                      "artifacts":  [
                                                                        {
                                                                            "path":  "crates/claw-http-api/tests/admin_rpc.rs",
@@ -637,7 +637,7 @@
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "Dispatch, method policy and error mapping are proven against a scripted gateway double, so the mapping is pinned rather than the behaviour of the real admin handlers behind it."
+                                                   "Method policy, error-class mapping and pre-dispatch authentication are proven against the AdminRpcService router, and the shared HTTP surface is proven end to end. That service is not mounted on the production route: POST /api/v1/admin/rpc is still dispatched to the older admin handler, so the proven policy and error mapping are not what the live endpoint executes."
                                                ]
                      },
                      {
