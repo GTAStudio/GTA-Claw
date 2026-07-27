@@ -1,0 +1,10 @@
+// Accepted fixture for pinned top-level domain `tools`
+// (compat/upstream/inventories/config-domains.json).
+{
+  tools: {
+    profile: "coding",
+    allow: ["fs_read"],
+    alsoAllow: ["web_search"],
+    deny: ["exec"],
+  },
+}

@@ -327,6 +327,14 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_path_to_error",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "claw-discovery"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -391,6 +399,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
+]
+
+[[package]]
+name = "claw-goals"
+version = "0.1.0"
+dependencies = [
+ "claw-application",
+ "claw-domain",
+ "claw-runtime",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
 ]
 
 [[package]]
@@ -504,6 +525,7 @@ dependencies = [
  "claw-security",
  "ed25519-dalek",
  "getrandom",
+ "serde",
  "serde_json",
  "wasmtime",
  "wat",
@@ -618,6 +640,16 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "claw-worker"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+ "subtle",
 ]
 
 [[package]]

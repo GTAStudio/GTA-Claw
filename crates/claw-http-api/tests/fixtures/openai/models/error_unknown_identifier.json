@@ -1,0 +1,26 @@
+{
+  "description": "A well-formed identifier for an agent that is not configured is a lookup miss naming the identifier.",
+  "feature_id": "interop.openai.models",
+  "request": {
+    "method": "GET",
+    "path": "/v1/models/openclaw%2Fghost",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "Model 'openclaw/ghost' not found.",
+        "type": "invalid_request_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 404
+  },
+  "runtime": {
+    "agents": [
+      "main"
+    ]
+  }
+}

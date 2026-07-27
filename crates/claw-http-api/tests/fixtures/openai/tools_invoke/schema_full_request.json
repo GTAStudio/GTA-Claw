@@ -1,0 +1,37 @@
+{
+  "description": "The full request schema is pinned: name, args, action, sessionKey, agentId, idempotencyKey and dryRun are all accepted together.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "action": "run",
+      "agentId": "agent-from-body",
+      "args": {
+        "message": "hello"
+      },
+      "dryRun": true,
+      "idempotencyKey": "idem-1",
+      "name": "echo",
+      "sessionKey": "session-from-body"
+    },
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "ok": true,
+      "result": {
+        "message": "hello"
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "tool": {
+      "kind": "echo"
+    }
+  }
+}

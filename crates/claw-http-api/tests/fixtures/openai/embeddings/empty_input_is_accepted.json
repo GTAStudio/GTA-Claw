@@ -1,0 +1,34 @@
+{
+  "description": "A known difference, pinned rather than hidden: an empty input list is accepted and answered with an empty data list instead of being refused as a request error.",
+  "feature_id": "interop.openai.embeddings",
+  "request": {
+    "body": {
+      "input": [],
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/embeddings",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "data": [],
+      "model": "openclaw",
+      "object": "list",
+      "usage": {
+        "prompt_tokens": 0,
+        "total_tokens": 0
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "embed": {
+      "kind": "vectors",
+      "vectors": []
+    }
+  }
+}

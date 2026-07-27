@@ -1,0 +1,13 @@
+// Accepted fixture for pinned top-level domain `approvals`
+// (compat/upstream/inventories/config-domains.json).
+{
+  approvals: {
+    exec: {
+      enabled: true,
+      mode: "session",
+      agentFilter: ["main"],
+      sessionFilter: ["main"],
+    },
+    plugin: { enabled: false },
+  },
+}

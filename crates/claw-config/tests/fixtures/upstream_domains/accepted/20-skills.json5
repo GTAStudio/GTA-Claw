@@ -1,0 +1,24 @@
+// Accepted fixture for pinned top-level domain `skills`
+// (compat/upstream/inventories/config-domains.json).
+{
+  skills: {
+    allowBundled: ["search"],
+    load: {
+      extraDirs: ["/opt/claw/skills"],
+      allowSymlinkTargets: ["/opt/claw"],
+      watch: true,
+      watchDebounceMs: 250,
+    },
+    limits: {
+      maxCandidatesPerRoot: 64,
+      maxSkillsInPrompt: 12,
+      maxSkillFileBytes: 262144,
+    },
+    entries: {
+      search: {
+        enabled: true,
+        env: { SEARCH_REGION: "eu" },
+      },
+    },
+  },
+}

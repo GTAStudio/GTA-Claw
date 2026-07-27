@@ -1,0 +1,48 @@
+{
+  "description": "A provider that overruns max_output_tokens yields a failed response resource with a bad-gateway status, and the overrun text is not returned.",
+  "feature_id": "interop.openai.openresponses",
+  "request": {
+    "body": {
+      "input": "hello",
+      "max_output_tokens": 8,
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/responses",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "created_at": "<created#1>",
+      "error": {
+        "code": "api_error",
+        "message": "The provider exceeded the requested output token limit."
+      },
+      "id": "<id:resp#1>",
+      "model": "openclaw",
+      "object": "response",
+      "output": [],
+      "status": "failed",
+      "usage": {
+        "input_tokens": 4,
+        "output_tokens": 64,
+        "total_tokens": 68
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 502
+  },
+  "runtime": {
+    "generate": {
+      "kind": "output",
+      "text": "a much longer answer than was budgeted",
+      "usage": {
+        "input_tokens": 4,
+        "output_tokens": 64,
+        "total_tokens": 68
+      }
+    }
+  }
+}

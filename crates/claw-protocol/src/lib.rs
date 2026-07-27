@@ -5,8 +5,12 @@ use std::fmt::{self, Display, Formatter};
 
 use claw_domain::{DomainError, SessionId};
 
+/// Pinned Gateway core event catalog projections and fail-closed envelopes.
+pub mod events;
 /// OpenClaw Gateway v4 wire contracts, negotiation, registries, and authorization.
 pub mod gateway;
+/// Pinned Gateway core method catalog projections and drift verification.
+pub mod methods;
 
 /// The protocol version implemented by this workspace.
 pub const PROTOCOL_VERSION: u16 = 1;

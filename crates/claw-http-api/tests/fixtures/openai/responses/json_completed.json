@@ -1,0 +1,58 @@
+{
+  "description": "A buffered response pins the response resource: object, status, the assistant output item tree, and provider usage under the Responses token names.",
+  "feature_id": "interop.openai.openresponses",
+  "request": {
+    "body": {
+      "input": "What is the weather in Berlin?",
+      "instructions": "Answer in one sentence.",
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/responses",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "created_at": "<created#1>",
+      "id": "<id:resp#1>",
+      "model": "openclaw",
+      "object": "response",
+      "output": [
+        {
+          "content": [
+            {
+              "text": "Berlin is sunny.",
+              "type": "output_text"
+            }
+          ],
+          "id": "<id:msg#1>",
+          "phase": "final_answer",
+          "role": "assistant",
+          "status": "completed",
+          "type": "message"
+        }
+      ],
+      "status": "completed",
+      "usage": {
+        "input_tokens": 13,
+        "output_tokens": 5,
+        "total_tokens": 18
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "generate": {
+      "kind": "output",
+      "text": "Berlin is sunny.",
+      "usage": {
+        "input_tokens": 13,
+        "output_tokens": 5,
+        "total_tokens": 18
+      }
+    }
+  }
+}

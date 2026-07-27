@@ -1,0 +1,21 @@
+// Accepted fixture for pinned top-level domain `browser`
+// (compat/upstream/inventories/config-domains.json).
+{
+  browser: {
+    enabled: true,
+    allowSystemProfileImport: false,
+    evaluateEnabled: true,
+    cdpUrl: "http://127.0.0.1:9222",
+    remoteCdpTimeoutMs: 30000,
+    remoteCdpHandshakeTimeoutMs: 10000,
+    localLaunchTimeoutMs: 20000,
+    localCdpReadyTimeoutMs: 15000,
+    actionTimeoutMs: 5000,
+    headless: true,
+    noSandbox: false,
+    attachOnly: false,
+    cdpPortRangeStart: 9222,
+    defaultProfile: "work",
+    extraArgs: ["--disable-gpu"],
+  },
+}

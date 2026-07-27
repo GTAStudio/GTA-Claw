@@ -1,0 +1,118 @@
+# Golden table for `/exec` directive option parsing.
+#
+# Source: openclaw/openclaw@b43e832fcc8000ed7287c7accc54e381db607f85
+#   src/auto-reply/reply/exec/directive.ts
+#   src/auto-reply/reply/directive-parsing.ts
+#
+# Parsing stops at the first token that is not a recognized `key=value` pair,
+# and only accepted options are consumed, so everything after the stop point
+# survives into `cleaned`.
+
+name: recognized options are consumed
+input: "/exec host=sandbox security=full ls -la"
+present: true
+has_options: true
+cleaned: "ls -la"
+host: sandbox
+security: full
+
+name: a colon may separate the key from the value
+input: "/exec host:gateway echo hi"
+present: true
+has_options: true
+cleaned: "echo hi"
+host: gateway
+
+name: a colon may follow the directive name
+input: "/exec: host=gateway echo hi"
+present: true
+has_options: true
+cleaned: "echo hi"
+host: gateway
+
+name: no options at all leaves the whole command
+input: "/exec ls -la"
+present: true
+has_options: false
+cleaned: "ls -la"
+
+name: an unrecognized key stops parsing and is left in the message
+input: "/exec foo=bar host=sandbox ls"
+present: true
+has_options: false
+cleaned: "foo=bar host=sandbox ls"
+
+name: parsing stops at the first bare token
+input: "/exec host=node ls security=deny"
+present: true
+has_options: true
+cleaned: "ls security=deny"
+host: node
+
+name: an unrecognized host value is reported and still consumed
+input: "/exec host=bogus run it"
+present: true
+has_options: true
+cleaned: "run it"
+raw_host: bogus
+invalid_host: true
+
+name: an unrecognized security value is reported
+input: "/exec security=maybe run"
+present: true
+has_options: true
+cleaned: run
+raw_security: maybe
+invalid_security: true
+
+name: an unrecognized ask value is reported
+input: "/exec ask=sometimes run"
+present: true
+has_options: true
+cleaned: run
+raw_ask: sometimes
+invalid_ask: true
+
+name: an empty node value is reported
+input: "/exec node= run"
+present: true
+has_options: true
+cleaned: run
+raw_node: ""
+invalid_node: true
+
+name: every option together
+input: "/exec host=node security=allowlist ask=on-miss node=beta uptime"
+present: true
+has_options: true
+cleaned: uptime
+host: node
+security: allowlist
+ask: on-miss
+node: beta
+
+name: option values are matched case-insensitively
+input: "/exec HOST=SandBox ls"
+present: true
+has_options: true
+cleaned: ls
+host: sandbox
+
+name: the directive is removed from the middle of the text
+input: "check /exec security=deny ls"
+present: true
+has_options: true
+cleaned: "check ls"
+security: deny
+
+name: a glued slash is not a directive
+input: "x/exec ls"
+present: false
+has_options: false
+cleaned: "x/exec ls"
+
+name: no directive leaves the body trimmed
+input: "  just text  "
+present: false
+has_options: false
+cleaned: "just text"

@@ -1,0 +1,24 @@
+{
+  "description": "A body with no input is a request error rather than an empty turn.",
+  "feature_id": "interop.openai.openresponses",
+  "request": {
+    "body": {
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/responses",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "invalid request",
+        "type": "invalid_request_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 400
+  }
+}

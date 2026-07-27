@@ -1,0 +1,34 @@
+{
+  "description": "A provider outage is a service-unavailable api_error.",
+  "feature_id": "interop.openai.embeddings",
+  "request": {
+    "body": {
+      "input": "Berlin",
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/embeddings",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "embedding provider is unavailable",
+        "type": "api_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 503
+  },
+  "runtime": {
+    "embed": {
+      "error": {
+        "kind": "unavailable",
+        "message": "embedding provider is unavailable"
+      },
+      "kind": "error"
+    }
+  }
+}

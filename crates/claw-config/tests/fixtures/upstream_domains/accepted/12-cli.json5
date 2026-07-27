@@ -1,0 +1,7 @@
+// Accepted fixture for pinned top-level domain `cli`
+// (compat/upstream/inventories/config-domains.json).
+{
+  cli: {
+    banner: { taglineMode: "random" },
+  },
+}

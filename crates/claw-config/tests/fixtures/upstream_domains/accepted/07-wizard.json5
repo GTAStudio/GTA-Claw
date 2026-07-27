@@ -1,0 +1,12 @@
+// Accepted fixture for pinned top-level domain `wizard`
+// (compat/upstream/inventories/config-domains.json).
+{
+  wizard: {
+    lastRunAt: "2026-07-02T12:00:00.000Z",
+    lastRunVersion: "2026.7.2",
+    lastRunCommit: "b43e832fcc8000ed7287c7accc54e381db607f85",
+    lastRunCommand: "openclaw onboard",
+    lastRunMode: "local",
+    securityAcknowledgedAt: "2026-07-02T12:05:00.000Z",
+  },
+}

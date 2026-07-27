@@ -1,0 +1,76 @@
+{
+  "description": "A batch request pins one indexed embedding per input, in request order.",
+  "feature_id": "interop.openai.embeddings",
+  "request": {
+    "body": {
+      "input": [
+        "Berlin",
+        "Paris",
+        "Rome"
+      ],
+      "model": "openclaw/main"
+    },
+    "method": "POST",
+    "path": "/v1/embeddings",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "data": [
+        {
+          "embedding": [
+            1.0,
+            0.0
+          ],
+          "index": 0,
+          "object": "embedding"
+        },
+        {
+          "embedding": [
+            0.0,
+            1.0
+          ],
+          "index": 1,
+          "object": "embedding"
+        },
+        {
+          "embedding": [
+            -1.0,
+            -1.0
+          ],
+          "index": 2,
+          "object": "embedding"
+        }
+      ],
+      "model": "openclaw/main",
+      "object": "list",
+      "usage": {
+        "prompt_tokens": 0,
+        "total_tokens": 0
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "embed": {
+      "kind": "vectors",
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0
+        ],
+        [
+          -1.0,
+          -1.0
+        ]
+      ]
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "description": "The legacy `tool` alias for `name` is pinned as accepted, and a request with no args is treated as an empty argument object.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "tool": "echo"
+    },
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "ok": true,
+      "result": {}
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "tool": {
+      "kind": "echo"
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "description": "A tool deadline is a gateway timeout, distinct from an outage.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "args": {},
+      "name": "echo"
+    },
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "tool execution deadline exceeded",
+        "type": "tool_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 504
+  },
+  "runtime": {
+    "tool": {
+      "error": {
+        "kind": "timeout",
+        "message": "tool execution deadline exceeded"
+      },
+      "kind": "error"
+    }
+  }
+}

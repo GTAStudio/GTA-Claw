@@ -1,0 +1,4 @@
+// reject: validation bindings[0].match.peer
+{
+  bindings: [{ type: "acp", agentId: "review", match: { channel: "slack" } }],
+}

@@ -1,0 +1,34 @@
+{
+  "description": "An unknown tool is a not-found error rather than a generic failure.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "args": {},
+      "name": "ghost"
+    },
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "unknown tool: ghost",
+        "type": "tool_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 404
+  },
+  "runtime": {
+    "tool": {
+      "error": {
+        "kind": "not_found",
+        "message": "unknown tool: ghost"
+      },
+      "kind": "error"
+    }
+  }
+}

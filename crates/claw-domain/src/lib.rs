@@ -1,5 +1,7 @@
 //! Core domain types and invariants shared by every GTA Claw runtime.
 
+pub mod commands;
+
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 

@@ -1,0 +1,33 @@
+{
+  "description": "An unmodelled request field is rejected rather than silently dropped, so a client cannot believe an unsupported option took effect.",
+  "feature_id": "interop.openai.chat-completions",
+  "request": {
+    "body": {
+      "logit_bias": {
+        "1234": 100
+      },
+      "messages": [
+        {
+          "content": "hello",
+          "role": "user"
+        }
+      ],
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "unknown field `logit_bias`, expected one of `model`, `stream`, `stream_options`, `tools`, `tool_choice`, `messages`, `user`, `max_tokens`, `max_completion_tokens`, `temperature`, `top_p`, `response_format`, `frequency_penalty`, `presence_penalty`, `seed`, `stop`",
+        "type": "invalid_request_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 400
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "description": "A provider not-found failure keeps its own status and request-error class instead of collapsing into a server error.",
+  "feature_id": "interop.openai.chat-completions",
+  "request": {
+    "body": {
+      "messages": [
+        {
+          "content": "hello",
+          "role": "user"
+        }
+      ],
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "no route matched the requested agent",
+        "type": "invalid_request_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 404
+  },
+  "runtime": {
+    "generate": {
+      "error": {
+        "kind": "not_found",
+        "message": "no route matched the requested agent"
+      },
+      "kind": "error"
+    }
+  }
+}

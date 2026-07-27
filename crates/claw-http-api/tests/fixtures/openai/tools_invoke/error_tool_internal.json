@@ -1,0 +1,34 @@
+{
+  "description": "An internal tool failure is the only class that becomes a server error, and it still carries the tool_error classification and a safe message.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "args": {},
+      "name": "echo"
+    },
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "tool runtime crashed",
+        "type": "tool_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 500
+  },
+  "runtime": {
+    "tool": {
+      "error": {
+        "kind": "internal",
+        "message": "tool runtime crashed"
+      },
+      "kind": "error"
+    }
+  }
+}

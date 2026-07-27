@@ -1,0 +1,378 @@
+# Golden alias table for the pinned command registry.
+#
+# Source: openclaw/openclaw@b43e832fcc8000ed7287c7accc54e381db607f85
+#   src/auto-reply/commands-registry.shared.ts (defineChatCommand + registerAlias)
+#   docs/tools/slash-commands.md (feature and owner gates)
+#
+# Extracted mechanically from the pinned TypeScript, then reviewed by hand.
+# `alias` repeats once per registered text alias, in registration order.
+
+key: help
+scope: both
+native_name: help
+alias: /help
+accepts_args: false
+owner_required: false
+
+key: commands
+scope: both
+native_name: commands
+alias: /commands
+accepts_args: false
+owner_required: false
+
+key: tools
+scope: both
+native_name: tools
+alias: /tools
+accepts_args: true
+owner_required: false
+
+key: skill
+scope: both
+native_name: skill
+alias: /skill
+accepts_args: true
+owner_required: false
+
+key: learn
+scope: both
+native_name: learn
+alias: /learn
+accepts_args: true
+owner_required: false
+
+key: status
+scope: both
+native_name: status
+alias: /status
+accepts_args: true
+feature: plugins
+feature_subcommands: plugins
+owner_required: false
+
+key: goal
+scope: both
+native_name: goal
+alias: /goal
+accepts_args: true
+owner_required: false
+
+key: diagnostics
+scope: both
+native_name: diagnostics
+alias: /diagnostics
+accepts_args: true
+owner_required: true
+
+key: login
+scope: both
+native_name: login
+alias: /login
+accepts_args: true
+owner_required: true
+
+key: crestodian
+scope: text
+alias: /crestodian
+accepts_args: true
+owner_required: true
+
+key: tasks
+scope: both
+native_name: tasks
+alias: /tasks
+accepts_args: false
+owner_required: false
+
+key: allowlist
+scope: text
+alias: /allowlist
+accepts_args: true
+feature: config
+feature_subcommands: add|remove
+owner_required: false
+
+key: approve
+scope: both
+native_name: approve
+alias: /approve
+accepts_args: true
+owner_required: false
+
+key: context
+scope: both
+native_name: context
+alias: /context
+accepts_args: true
+owner_required: false
+
+key: btw
+scope: both
+native_name: btw
+native_alias: side
+alias: /btw
+alias: /side
+accepts_args: true
+owner_required: false
+
+key: export-session
+scope: both
+native_name: export-session
+alias: /export-session
+alias: /export
+accepts_args: true
+owner_required: false
+
+key: export-trajectory
+scope: both
+native_name: export-trajectory
+alias: /export-trajectory
+alias: /trajectory
+accepts_args: true
+owner_required: false
+
+key: tts
+scope: both
+native_name: tts
+alias: /tts
+accepts_args: true
+owner_required: false
+
+key: whoami
+scope: both
+native_name: whoami
+alias: /whoami
+alias: /id
+accepts_args: false
+owner_required: false
+
+key: session
+scope: both
+native_name: session
+alias: /session
+accepts_args: true
+owner_required: false
+
+key: subagents
+scope: both
+native_name: subagents
+alias: /subagents
+accepts_args: true
+owner_required: false
+
+key: acp
+scope: both
+native_name: acp
+alias: /acp
+accepts_args: true
+owner_required: false
+
+key: focus
+scope: both
+native_name: focus
+alias: /focus
+accepts_args: true
+owner_required: false
+
+key: unfocus
+scope: both
+native_name: unfocus
+alias: /unfocus
+accepts_args: false
+owner_required: false
+
+key: agents
+scope: both
+native_name: agents
+alias: /agents
+accepts_args: false
+owner_required: false
+
+key: steer
+scope: both
+native_name: steer
+alias: /steer
+alias: /tell
+accepts_args: true
+owner_required: false
+
+key: config
+scope: both
+native_name: config
+alias: /config
+accepts_args: true
+feature: config
+owner_required: true
+
+key: mcp
+scope: both
+native_name: mcp
+alias: /mcp
+accepts_args: true
+feature: mcp
+owner_required: true
+
+key: plugins
+scope: both
+native_name: plugins
+alias: /plugins
+alias: /plugin
+accepts_args: true
+feature: plugins
+owner_required: true
+owner_subcommands: install|enable|disable
+
+key: debug
+scope: both
+native_name: debug
+alias: /debug
+accepts_args: true
+feature: debug
+owner_required: true
+
+key: usage
+scope: both
+native_name: usage
+alias: /usage
+accepts_args: true
+owner_required: false
+
+key: stop
+scope: both
+native_name: stop
+alias: /stop
+accepts_args: false
+owner_required: false
+
+key: restart
+scope: both
+native_name: restart
+alias: /restart
+accepts_args: false
+feature: restart
+owner_required: false
+
+key: activation
+scope: both
+native_name: activation
+alias: /activation
+accepts_args: true
+owner_required: false
+
+key: send
+scope: both
+native_name: send
+alias: /send
+accepts_args: true
+owner_required: true
+
+key: reset
+scope: both
+native_name: reset
+alias: /reset
+accepts_args: true
+owner_required: false
+
+key: new
+scope: both
+native_name: new
+alias: /new
+accepts_args: true
+owner_required: false
+
+key: name
+scope: both
+native_name: name
+alias: /name
+accepts_args: true
+owner_required: false
+
+key: compact
+scope: both
+native_name: compact
+alias: /compact
+accepts_args: true
+owner_required: false
+
+key: think
+scope: both
+native_name: think
+alias: /think
+alias: /thinking
+alias: /t
+accepts_args: true
+owner_required: false
+
+key: verbose
+scope: both
+native_name: verbose
+alias: /verbose
+alias: /v
+accepts_args: true
+owner_required: false
+
+key: trace
+scope: both
+native_name: trace
+alias: /trace
+accepts_args: true
+owner_required: false
+
+key: fast
+scope: both
+native_name: fast
+alias: /fast
+accepts_args: true
+owner_required: false
+
+key: reasoning
+scope: both
+native_name: reasoning
+alias: /reasoning
+alias: /reason
+accepts_args: true
+owner_required: false
+
+key: elevated
+scope: both
+native_name: elevated
+alias: /elevated
+alias: /elev
+accepts_args: true
+owner_required: false
+
+key: exec
+scope: both
+native_name: exec
+alias: /exec
+accepts_args: true
+owner_required: false
+
+key: model
+scope: both
+native_name: model
+alias: /model
+accepts_args: true
+owner_required: false
+
+key: models
+scope: both
+native_name: models
+alias: /models
+accepts_args: true
+owner_required: false
+
+key: queue
+scope: both
+native_name: queue
+alias: /queue
+accepts_args: true
+owner_required: false
+
+key: bash
+scope: text
+alias: /bash
+accepts_args: true
+feature: bash
+owner_required: false

@@ -1,0 +1,317 @@
+# Golden table for command authorization.
+#
+# Source: openclaw/openclaw@b43e832fcc8000ed7287c7accc54e381db607f85
+#   src/auto-reply/command-auth.ts
+#   src/auto-reply/commands-text-routing.ts
+#   docs/tools/slash-commands.md
+#
+# Each record either resolves to a command (`key`) or is denied with a pinned
+# reason (`denied` code plus the `reason` message). Denials are checked in the
+# order: surface routing, registry lookup, sender authorization, feature gate,
+# owner gate.
+#
+# Defaults: commands.text on, commands.restart on, every other flag off,
+# `commandAuthorized` true (the channel allowlist already accepted the sender),
+# no `commands.allowFrom` and no `commands.ownerAllowFrom`.
+
+name: an unconfigured deployment runs ungated commands
+body: "/help"
+sender_id: U1
+key: help
+
+name: text commands are dropped on a native surface when commands.text is off
+body: "/help"
+commands_text: false
+native_surface: true
+denied: text_commands_disabled
+reason: "Text commands are disabled on this surface"
+
+name: a native invocation is routed even when commands.text is off
+body: "/help"
+commands_text: false
+native_surface: true
+source: native
+key: help
+
+name: text commands survive on surfaces without native commands
+body: "/help"
+commands_text: false
+native_surface: false
+key: help
+
+name: an unregistered command is rejected before any authorization check
+body: "/definitely-not-a-command"
+denied: unknown_command
+reason: "Unknown command: /definitely-not-a-command"
+
+name: commands.allowFrom admits a listed sender
+body: "/help"
+commands_allow_from_key: "*"
+commands_allow_from: U-OK
+sender_id: U-OK
+key: help
+
+name: commands.allowFrom rejects an unlisted sender
+body: "/help"
+commands_allow_from_key: "*"
+commands_allow_from: U-OK
+sender_id: U-BAD
+denied: sender_not_authorized
+reason: "Sender is not authorized to run commands"
+
+name: commands.allowFrom is the sole source once configured
+body: "/help"
+provider: slack
+commands_allow_from_key: slack
+commands_allow_from: U-OK
+command_authorized: false
+sender_id: U-OK
+key: help
+
+name: a provider key overrides the global wildcard list
+body: "/help"
+provider: slack
+commands_allow_from_key: slack
+commands_allow_from: U-OK
+sender_id: U-STAR
+denied: sender_not_authorized
+reason: "Sender is not authorized to run commands"
+
+name: a wildcard entry in commands.allowFrom admits everyone
+body: "/help"
+commands_allow_from_key: "*"
+commands_allow_from: "*"
+sender_id: U-ANYONE
+key: help
+
+name: the channel verdict decides when commands.allowFrom is absent
+body: "/help"
+command_authorized: false
+sender_id: U1
+denied: sender_not_authorized
+reason: "Sender is not authorized to run commands"
+
+name: a disabled feature flag denies the command
+body: "/mcp list"
+sender_id: U1
+denied: feature_disabled
+reason: "Command requires commands.mcp"
+
+name: enabling the feature flag admits the command when no owner is configured
+body: "/mcp list"
+feature_on: mcp
+sender_id: U1
+key: mcp
+args: list
+
+name: commands.debug gates /debug
+body: "/debug dump"
+sender_id: U1
+denied: feature_disabled
+reason: "Command requires commands.debug"
+
+name: commands.bash gates /bash
+body: "/bash ls"
+sender_id: U1
+denied: feature_disabled
+reason: "Command requires commands.bash"
+
+name: commands.restart defaults to enabled
+body: "/restart"
+sender_id: U1
+key: restart
+
+name: commands.restart can be turned off
+body: "/restart"
+feature_off: restart
+sender_id: U1
+denied: feature_disabled
+reason: "Command requires commands.restart"
+
+name: a subcommand-scoped feature gate ignores unlisted subcommands
+body: "/allowlist show"
+sender_id: U1
+key: allowlist
+args: show
+
+name: a subcommand-scoped feature gate fires on a listed subcommand
+body: "/allowlist add +15551230000"
+sender_id: U1
+denied: feature_disabled
+reason: "Command requires commands.config"
+
+name: /status is ungated until its plugins subcommand is used
+body: "/status"
+sender_id: U1
+key: status
+
+name: /status plugins needs commands.plugins
+body: "/status plugins"
+sender_id: U1
+denied: feature_disabled
+reason: "Command requires commands.plugins"
+
+name: an owner allowlist rejects a non-owner outright
+body: "/send hello"
+owner_allow_from: U-OWNER
+sender_id: U-INTRUDER
+denied: sender_not_authorized
+reason: "Sender is not authorized to run commands"
+
+name: an owner allowlist admits the owner
+body: "/send hello"
+owner_allow_from: U-OWNER
+sender_id: U-OWNER
+key: send
+args: hello
+
+name: a wildcard owner allowlist admits everyone as an owner
+body: "/send hello"
+owner_allow_from: "*"
+sender_id: U-ANYONE
+key: send
+args: hello
+
+name: an authorized non-owner is denied owner-only commands with the owner reason
+body: "/send hello"
+commands_allow_from_key: "*"
+commands_allow_from: U-USER
+owner_allow_from: U-OWNER
+sender_id: U-USER
+denied: owner_required
+reason: "Command requires an owner: /send"
+
+name: owner-scoped subcommands leave reads open to authorized non-owners
+body: "/plugins list"
+feature_on: plugins
+commands_allow_from_key: "*"
+commands_allow_from: U-USER
+owner_allow_from: U-OWNER
+sender_id: U-USER
+key: plugins
+args: list
+
+name: owner-scoped subcommands still gate writes
+body: "/plugins install demo"
+feature_on: plugins
+commands_allow_from_key: "*"
+commands_allow_from: U-USER
+owner_allow_from: U-OWNER
+sender_id: U-USER
+denied: owner_required
+reason: "Command requires an owner: /plugins"
+
+name: the operator.admin scope grants ownership on internal channels
+body: "/send hello"
+owner_allow_from: U-OWNER
+sender_id: U-CLIENT
+internal_channel: true
+scope: operator.admin
+key: send
+args: hello
+
+name: the operator.admin scope is ignored off internal channels
+body: "/send hello"
+owner_allow_from: U-OWNER
+sender_id: U-CLIENT
+internal_channel: false
+scope: operator.admin
+denied: sender_not_authorized
+reason: "Sender is not authorized to run commands"
+
+name: a channel-scoped owner entry applies on its own channel
+body: "/send hello"
+provider: slack
+owner_allow_from: "slack:U-OWNER"
+sender_id: U-OWNER
+key: send
+args: hello
+
+name: a channel-scoped owner entry rejects other senders on its own channel
+body: "/send hello"
+provider: slack
+owner_allow_from: "slack:U-OWNER"
+sender_id: U-OTHER
+denied: sender_not_authorized
+reason: "Sender is not authorized to run commands"
+
+name: a channel-scoped owner entry is dropped on a different channel
+body: "/send hello"
+provider: discord
+owner_allow_from: "slack:U-OWNER"
+sender_id: U-ANYONE
+key: send
+args: hello
+
+name: an unknown prefix is kept as a literal owner identity
+body: "/send hello"
+provider: slack
+owner_allow_from: "myspace:U-OWNER"
+sender_id: "myspace:U-OWNER"
+key: send
+args: hello
+
+name: enforceOwnerForCommands falls back to the channel allowlist as owners
+body: "/help"
+enforce_owner: true
+channel_allow_from: U-A
+sender_id: U-A
+key: help
+
+name: enforceOwnerForCommands rejects senders outside the channel allowlist
+body: "/help"
+enforce_owner: true
+channel_allow_from: U-A
+sender_id: U-B
+denied: sender_not_authorized
+reason: "Sender is not authorized to run commands"
+
+name: enforceOwnerForCommands with an open channel allowlist leaves nobody an owner
+body: "/help"
+enforce_owner: true
+channel_allow_from: "*"
+channel_allow_from: U-A
+to: U-A
+sender_id: U-A
+denied: sender_not_authorized
+reason: "Sender is not authorized to run commands"
+
+name: enforceOwnerForCommands is satisfied by the operator.admin scope
+body: "/help"
+enforce_owner: true
+channel_allow_from: "*"
+sender_id: U-A
+internal_channel: true
+scope: operator.admin
+key: help
+
+name: the E164 sender is used when no sender id is present
+body: "/send hello"
+owner_allow_from: "+15551230000"
+sender_e164: "+15551230000"
+key: send
+args: hello
+
+name: the From identity is a fallback only in direct chats
+body: "/send hello"
+owner_allow_from: U-FROM
+from: U-FROM
+chat_type: direct
+key: send
+args: hello
+
+name: the From identity is not a fallback in group chats
+body: "/send hello"
+owner_allow_from: U-FROM
+from: U-FROM
+chat_type: group
+denied: sender_not_authorized
+reason: "Sender is not authorized to run commands"
+
+name: a conversation-like From identity is never a sender fallback
+body: "/send hello"
+owner_allow_from: "group:room1"
+from: "group:room1"
+chat_type: direct
+denied: sender_not_authorized
+reason: "Sender is not authorized to run commands"

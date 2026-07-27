@@ -1,0 +1,14 @@
+// Accepted fixture for pinned top-level domain `memory`
+// (compat/upstream/inventories/config-domains.json).
+{
+  memory: {
+    backend: "qmd",
+    citations: "auto",
+    qmd: {
+      command: "qmd",
+      searchMode: "vsearch",
+      rerank: true,
+      includeDefaultMemory: false,
+    },
+  },
+}

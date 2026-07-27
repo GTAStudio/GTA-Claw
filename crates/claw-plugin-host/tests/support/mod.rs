@@ -6,6 +6,8 @@
 
 #![allow(dead_code, unreachable_pub)]
 
+pub mod qa;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 

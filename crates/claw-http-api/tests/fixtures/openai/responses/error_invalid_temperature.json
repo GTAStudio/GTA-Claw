@@ -1,0 +1,26 @@
+{
+  "description": "A sampling parameter outside its pinned range is refused.",
+  "feature_id": "interop.openai.openresponses",
+  "request": {
+    "body": {
+      "input": "hello",
+      "model": "openclaw",
+      "temperature": 4.5
+    },
+    "method": "POST",
+    "path": "/v1/responses",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "invalid request",
+        "type": "invalid_request_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 400
+  }
+}

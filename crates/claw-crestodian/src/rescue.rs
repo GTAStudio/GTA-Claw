@@ -2,52 +2,136 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use claw_config::{CrestodianRescueConfig, RescueEnabled};
+use serde::{Deserialize, Serialize};
+
+use crate::mutation::{ConfigDigestChange, MutationRejection, TypedMutation};
+use crate::ring::CrestodianOperation;
+
+/// Exact prefix every rescue command must carry.
+const RESCUE_PREFIX: &str = "/crestodian ";
+
+/// Every accepted rescue command spelling, for the closed-grammar hint.
+const GRAMMAR_HINT: &str = "use status, validate config, restart gateway, \
+config set <path> <value>, config set-ref <path> env <NAME>, yes, or no";
 
 /// Closed deterministic remote rescue command grammar.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RescueCommand {
-    /// Show gateway/config health.
-    Status,
-    /// Validate the current configuration.
-    ValidateConfig,
-    /// Propose a gateway restart.
-    RestartGateway,
+    /// One typed Crestodian operation.
+    Operation(CrestodianOperation),
     /// Approve the exact pending mutation.
     Approve,
     /// Decline the pending mutation.
     Decline,
 }
 
+/// Why a message was not in the closed rescue grammar.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RescueParseReason {
+    /// The message is not a rescue command at all.
+    NotARescueCommand,
+    /// The command is outside the closed grammar.
+    UnknownCommand,
+    /// The command is known but its operands are incomplete.
+    IncompleteCommand {
+        /// Exact accepted spelling.
+        expected: &'static str,
+    },
+    /// The typed mutation surface refused the operands.
+    Mutation(MutationRejection),
+}
+
 /// A message was not in the closed rescue grammar.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RescueParseError {
     message: String,
+    reason: RescueParseReason,
+}
+
+impl RescueParseError {
+    /// Returns why the message was refused.
+    #[must_use]
+    pub const fn reason(&self) -> &RescueParseReason {
+        &self.reason
+    }
 }
 
 impl Display for RescueParseError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "unsupported Crestodian rescue command {:?}; use status, validate config, restart gateway, yes, or no",
-            self.message
-        )
+        match &self.reason {
+            RescueParseReason::NotARescueCommand => write!(
+                formatter,
+                "message {:?} is not a Crestodian rescue command; {GRAMMAR_HINT}",
+                self.message
+            ),
+            RescueParseReason::UnknownCommand => write!(
+                formatter,
+                "unsupported Crestodian rescue command {:?}; {GRAMMAR_HINT}",
+                self.message
+            ),
+            RescueParseReason::IncompleteCommand { expected } => write!(
+                formatter,
+                "incomplete Crestodian rescue command {:?}; expected {expected}",
+                self.message
+            ),
+            RescueParseReason::Mutation(rejection) => Display::fmt(rejection, formatter),
+        }
     }
 }
 
 impl Error for RescueParseError {}
 
 /// Parses exact `/crestodian` rescue commands without inference.
+///
+/// The grammar is closed: nothing is guessed, no model is ever consulted, and a
+/// message that is not spelled exactly is refused with the accepted spellings.
 pub fn parse_rescue_command(message: &str) -> Result<RescueCommand, RescueParseError> {
-    match message.trim() {
-        "/crestodian status" => Ok(RescueCommand::Status),
-        "/crestodian validate config" => Ok(RescueCommand::ValidateConfig),
-        "/crestodian restart gateway" => Ok(RescueCommand::RestartGateway),
-        "/crestodian yes" => Ok(RescueCommand::Approve),
-        "/crestodian no" => Ok(RescueCommand::Decline),
-        _ => Err(RescueParseError {
-            message: message.to_owned(),
-        }),
+    let trimmed = message.trim();
+    let refuse = |reason: RescueParseReason| RescueParseError {
+        message: trimmed.to_owned(),
+        reason,
+    };
+    let Some(rest) = trimmed.strip_prefix(RESCUE_PREFIX) else {
+        return Err(refuse(RescueParseReason::NotARescueCommand));
+    };
+    match rest {
+        "status" => return Ok(RescueCommand::Operation(CrestodianOperation::Status)),
+        "validate config" => {
+            return Ok(RescueCommand::Operation(
+                CrestodianOperation::ValidateConfig,
+            ));
+        }
+        "restart gateway" => {
+            return Ok(RescueCommand::Operation(
+                CrestodianOperation::RestartGateway,
+            ));
+        }
+        "yes" => return Ok(RescueCommand::Approve),
+        "no" => return Ok(RescueCommand::Decline),
+        _ => {}
     }
+    if let Some(operands) = rest.strip_prefix("config set-ref ") {
+        let tokens: Vec<&str> = operands.split(' ').collect();
+        let [path, source, name] = tokens.as_slice() else {
+            return Err(refuse(RescueParseReason::IncompleteCommand {
+                expected: "config set-ref <path> env <NAME>",
+            }));
+        };
+        return TypedMutation::set_reference(path, source, name)
+            .map(|mutation| RescueCommand::Operation(CrestodianOperation::Configure(mutation)))
+            .map_err(|rejection| refuse(RescueParseReason::Mutation(rejection)));
+    }
+    if let Some(operands) = rest.strip_prefix("config set ") {
+        let Some((path, value)) = operands.split_once(' ') else {
+            return Err(refuse(RescueParseReason::IncompleteCommand {
+                expected: "config set <path> <value>",
+            }));
+        };
+        return TypedMutation::set_text(path, value)
+            .map(|mutation| RescueCommand::Operation(CrestodianOperation::Configure(mutation)))
+            .map_err(|rejection| refuse(RescueParseReason::Mutation(rejection)));
+    }
+    Err(refuse(RescueParseReason::UnknownCommand))
 }
 
 /// Trusted message metadata used for authorization and audit.
@@ -80,6 +164,11 @@ pub enum RescueAuthorizationError {
     Sandboxed,
     /// Sender is not an explicitly verified owner.
     OwnerRequired,
+    /// Owner identity metadata is missing, so the sender is effectively anonymous.
+    AnonymousIdentity {
+        /// Identity field that was blank.
+        field: &'static str,
+    },
     /// Policy allows only owner direct messages.
     DirectMessageRequired,
 }
@@ -90,6 +179,10 @@ impl Display for RescueAuthorizationError {
             Self::Disabled => formatter.write_str("remote rescue is disabled for this posture"),
             Self::Sandboxed => formatter.write_str("remote rescue is forbidden while sandboxed"),
             Self::OwnerRequired => formatter.write_str("remote rescue requires a verified owner"),
+            Self::AnonymousIdentity { field } => write!(
+                formatter,
+                "remote rescue requires an explicit owner identity, but {field} is empty"
+            ),
             Self::DirectMessageRequired => {
                 formatter.write_str("remote rescue requires an owner direct message")
             }
@@ -100,6 +193,10 @@ impl Display for RescueAuthorizationError {
 impl Error for RescueAuthorizationError {}
 
 /// Authorizes a remote rescue context under the typed policy.
+///
+/// Every gate fails closed, and identity is required to be explicit: a context
+/// that claims owner verification without stable channel, account, sender, and
+/// source-address metadata is refused rather than trusted.
 pub fn authorize_rescue(
     policy: &CrestodianRescueConfig,
     context: &RescueContext,
@@ -116,6 +213,16 @@ pub fn authorize_rescue(
     }
     if !context.owner_verified {
         return Err(RescueAuthorizationError::OwnerRequired);
+    }
+    for (field, value) in [
+        ("channel", &context.channel),
+        ("account", &context.account),
+        ("sender", &context.sender),
+        ("source_address", &context.source_address),
+    ] {
+        if value.trim().is_empty() {
+            return Err(RescueAuthorizationError::AnonymousIdentity { field });
+        }
     }
     if policy.owner_dm_only && !context.direct_message {
         return Err(RescueAuthorizationError::DirectMessageRequired);
@@ -142,10 +249,14 @@ pub trait RescueControlPlane {
 
     /// Restarts the gateway.
     fn restart_gateway(&mut self) -> Result<(), Self::Error>;
+
+    /// Applies one approved typed mutation and reports both config digests.
+    fn apply(&mut self, mutation: &TypedMutation) -> Result<ConfigDigestChange, Self::Error>;
 }
 
 /// Audited rescue event kind.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RescueAuditKind {
     /// Exact mutation was approved before execution.
     Approved,
@@ -154,12 +265,17 @@ pub enum RescueAuditKind {
 }
 
 /// Metadata-only remote rescue audit event.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The operation is recorded by its stable label, and a configuration mutation
+/// also records the configuration digests on both sides of the write. No
+/// mutated value and no secret material ever reaches the audit trail.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RescueAuditEvent {
     /// Event kind.
     pub kind: RescueAuditKind,
-    /// Typed operation.
-    pub operation: RescueCommand,
+    /// Stable operation label.
+    pub operation: String,
     /// Stable channel identifier.
     pub channel: String,
     /// Stable account identifier.
@@ -170,6 +286,8 @@ pub struct RescueAuditEvent {
     pub source_address: String,
     /// Caller-supplied event time.
     pub unix_millis: u64,
+    /// Configuration digests recorded for an applied configuration mutation.
+    pub config_digest: Option<ConfigDigestChange>,
 }
 
 /// Mandatory durable rescue audit sink.
@@ -181,18 +299,66 @@ pub trait RescueAuditSink {
     fn persist(&mut self, event: &RescueAuditEvent) -> Result<(), Self::Error>;
 }
 
+/// A mutating operation staged for the owner's explicit approval.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PendingOperation {
+    /// Gateway restart.
+    RestartGateway,
+    /// Typed configuration mutation.
+    Configure(TypedMutation),
+}
+
+impl PendingOperation {
+    /// Stages a mutating operation, or reports that the operation is read-only.
+    #[must_use]
+    pub fn staged(operation: CrestodianOperation) -> Option<Self> {
+        match operation {
+            CrestodianOperation::Status | CrestodianOperation::ValidateConfig => None,
+            CrestodianOperation::RestartGateway => Some(Self::RestartGateway),
+            CrestodianOperation::Configure(mutation) => Some(Self::Configure(mutation)),
+        }
+    }
+
+    /// Returns the metadata-only audit label, never a mutated value.
+    #[must_use]
+    pub fn audit_label(&self) -> String {
+        match self {
+            Self::RestartGateway => "restart_gateway".to_owned(),
+            Self::Configure(mutation) => mutation.audit_label(),
+        }
+    }
+
+    /// Renders the approval proposal shown to the owner.
+    #[must_use]
+    pub fn proposal(&self) -> String {
+        match self {
+            Self::RestartGateway => "restart the gateway".to_owned(),
+            Self::Configure(mutation) => mutation.proposal(),
+        }
+    }
+}
+
 /// Deterministic rescue response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RescueResponse {
     /// Read-only status.
     Status(RescueStatus),
-    /// Exact restart awaits owner approval.
-    RestartPlanned {
+    /// The exact mutation awaits owner approval.
+    Planned {
+        /// Stable operation label.
+        operation: String,
+        /// Owner-facing proposal, with secrets rendered as references.
+        proposal: String,
         /// Expiration time.
         expires_at_unix_ms: u64,
     },
-    /// Pending restart was applied.
-    Restarted,
+    /// The pending mutation was applied.
+    Applied {
+        /// Stable operation label.
+        operation: String,
+        /// Configuration digests recorded for a configuration mutation.
+        config_digest: Option<ConfigDigestChange>,
+    },
     /// Pending mutation was declined.
     Declined,
 }
@@ -229,7 +395,7 @@ impl<ControlError: Display, AuditError: Display> Display for RescueError<Control
             Self::Audit(error) => write!(formatter, "rescue audit persistence failed: {error}"),
             Self::AppliedButAuditFailed(error) => write!(
                 formatter,
-                "gateway restart completed, but its audit receipt failed: {error}"
+                "rescue mutation completed, but its audit receipt failed: {error}"
             ),
         }
     }
@@ -243,7 +409,8 @@ where
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct PendingRestart {
+struct Pending {
+    operation: PendingOperation,
     expires_at_unix_ms: u64,
     channel: String,
     account: String,
@@ -252,23 +419,38 @@ struct PendingRestart {
 }
 
 /// Stateful deterministic rescue approval handler.
+///
+/// A pending approval lives only in memory, so a gateway restart always drops
+/// it and an approval that arrives after a restart has nothing to apply.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RescueSession {
     policy: CrestodianRescueConfig,
-    pending: Option<PendingRestart>,
+    pending: Option<Pending>,
 }
 
 impl RescueSession {
     /// Creates an empty rescue session under one immutable policy.
     #[must_use]
-    pub fn new(policy: CrestodianRescueConfig) -> Self {
+    pub const fn new(policy: CrestodianRescueConfig) -> Self {
         Self {
             policy,
             pending: None,
         }
     }
 
-    /// Executes read-only commands or manages one exact pending restart.
+    /// Whether an approval is currently pending.
+    #[must_use]
+    pub const fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Returns the policy this session enforces.
+    #[must_use]
+    pub const fn policy(&self) -> &CrestodianRescueConfig {
+        &self.policy
+    }
+
+    /// Executes read-only commands or manages one exact pending mutation.
     pub fn handle<C, A>(
         &mut self,
         command: RescueCommand,
@@ -283,22 +465,30 @@ impl RescueSession {
     {
         authorize_rescue(&self.policy, context).map_err(RescueError::Authorization)?;
         match command {
-            RescueCommand::Status | RescueCommand::ValidateConfig => control
-                .status()
-                .map(RescueResponse::Status)
-                .map_err(RescueError::Control),
-            RescueCommand::RestartGateway => {
-                let expires_at_unix_ms =
-                    unix_millis.saturating_add(u64::from(self.policy.pending_ttl_minutes) * 60_000);
-                self.pending = Some(PendingRestart {
-                    expires_at_unix_ms,
-                    channel: context.channel.clone(),
-                    account: context.account.clone(),
-                    sender: context.sender.clone(),
-                    source_address: context.source_address.clone(),
-                });
-                Ok(RescueResponse::RestartPlanned { expires_at_unix_ms })
-            }
+            RescueCommand::Operation(operation) => match PendingOperation::staged(operation) {
+                None => control
+                    .status()
+                    .map(RescueResponse::Status)
+                    .map_err(RescueError::Control),
+                Some(staged) => {
+                    let expires_at_unix_ms = unix_millis
+                        .saturating_add(u64::from(self.policy.pending_ttl_minutes) * 60_000);
+                    let response = RescueResponse::Planned {
+                        operation: staged.audit_label(),
+                        proposal: staged.proposal(),
+                        expires_at_unix_ms,
+                    };
+                    self.pending = Some(Pending {
+                        operation: staged,
+                        expires_at_unix_ms,
+                        channel: context.channel.clone(),
+                        account: context.account.clone(),
+                        sender: context.sender.clone(),
+                        source_address: context.source_address.clone(),
+                    });
+                    Ok(response)
+                }
+            },
             RescueCommand::Decline => {
                 self.pending = None;
                 Ok(RescueResponse::Declined)
@@ -315,27 +505,58 @@ impl RescueSession {
                 {
                     return Err(RescueError::ApprovalIdentityChanged);
                 }
+                let operation = pending.operation.audit_label();
                 audit
-                    .persist(&event(RescueAuditKind::Approved, context, unix_millis))
+                    .persist(&event(
+                        RescueAuditKind::Approved,
+                        operation.clone(),
+                        context,
+                        unix_millis,
+                        None,
+                    ))
                     .map_err(RescueError::Audit)?;
-                control.restart_gateway().map_err(RescueError::Control)?;
+                let config_digest = match &pending.operation {
+                    PendingOperation::RestartGateway => {
+                        control.restart_gateway().map_err(RescueError::Control)?;
+                        None
+                    }
+                    PendingOperation::Configure(mutation) => {
+                        Some(control.apply(mutation).map_err(RescueError::Control)?)
+                    }
+                };
                 audit
-                    .persist(&event(RescueAuditKind::Applied, context, unix_millis))
+                    .persist(&event(
+                        RescueAuditKind::Applied,
+                        operation.clone(),
+                        context,
+                        unix_millis,
+                        config_digest.clone(),
+                    ))
                     .map_err(RescueError::AppliedButAuditFailed)?;
-                Ok(RescueResponse::Restarted)
+                Ok(RescueResponse::Applied {
+                    operation,
+                    config_digest,
+                })
             }
         }
     }
 }
 
-fn event(kind: RescueAuditKind, context: &RescueContext, unix_millis: u64) -> RescueAuditEvent {
+fn event(
+    kind: RescueAuditKind,
+    operation: String,
+    context: &RescueContext,
+    unix_millis: u64,
+    config_digest: Option<ConfigDigestChange>,
+) -> RescueAuditEvent {
     RescueAuditEvent {
         kind,
-        operation: RescueCommand::RestartGateway,
+        operation,
         channel: context.channel.clone(),
         account: context.account.clone(),
         sender: context.sender.clone(),
         source_address: context.source_address.clone(),
         unix_millis,
+        config_digest,
     }
 }
