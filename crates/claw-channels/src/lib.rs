@@ -17,6 +17,16 @@ use claw_channel_sdk::{
     UnsupportedOperation,
 };
 
+pub mod commands;
+pub mod lifecycle;
+pub mod routing;
+
+pub use commands::{
+    InboundOutcome, classify_inbound, command_registry, command_surface, help_text,
+};
+pub use lifecycle::SupervisedChannel;
+pub use routing::{ChannelRouter, ExchangeSupport, RouterError, RoutingError, exchange_support};
+
 const CATALOG_PATH: &str = "scripts/lib/official-external-channel-catalog.json";
 const TEXT_OUT: &[ChannelCapability] = &[ChannelCapability::OutboundText];
 const QA_CAPABILITIES: &[ChannelCapability] = &[
