@@ -7,6 +7,7 @@
 //! * [`session`] — attempt ownership and Gateway client configuration.
 //! * [`identity`] — session device identity from the platform CSPRNG.
 //! * [`controller`] — Tokio ownership of one [`claw_gateway_client::GatewayClient`].
+//! * [`platform`] — shell-supplied lifecycle, network, identity and discovery facts.
 //!
 //! Nothing here links a toolkit, so the same core serves a native Android shell,
 //! headless use and test harnesses, and every behaviour that matters is verified
@@ -25,4 +26,5 @@
 pub mod controller;
 pub mod identity;
 pub mod onboarding;
+pub mod platform;
 pub mod session;

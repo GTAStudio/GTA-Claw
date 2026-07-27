@@ -16,6 +16,30 @@ use crate::onboarding::ConnectRequest;
 /// Longest accepted Gateway client metadata string, in bytes.
 const MAX_METADATA_BYTES: usize = 64;
 
+/// Mobile TCP/TLS/WebSocket opening timeout.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Mobile challenge/connect/hello timeout.
+pub const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Mobile request-response timeout.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Mobile close-handshake and task-shutdown timeout.
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Maximum transient retries after the initial connection attempt.
+pub const MAX_RECONNECT_ATTEMPTS: u32 = 3;
+
+/// Delay before the first transient retry.
+pub const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(750);
+
+/// Maximum reconnect delay before jitter.
+pub const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(6);
+
+/// Maximum additive reconnect jitter.
+pub const MAX_RECONNECT_JITTER: Duration = Duration::from_millis(250);
+
 /// Records which connection attempt currently owns the single Gateway socket.
 ///
 /// The controller commits to a generation here *before* it awaits the transport.
@@ -148,7 +172,25 @@ pub fn build_client_config(
     request: ConnectRequest,
     identity: Arc<DeviceIdentity>,
 ) -> GatewayClientConfig {
-    let (url, token, allow_insecure_remote_ws) = request.into_parts();
+    build_client_config_from_parts(request.into_parts(), identity)
+}
+
+/// Builds a fresh transport configuration while retaining the request.
+///
+/// Android lifecycle and network suspension use this form so the validated,
+/// redacted request remains available for foreground resume.
+#[must_use]
+pub fn build_client_config_for_attempt(
+    request: &ConnectRequest,
+    identity: Arc<DeviceIdentity>,
+) -> GatewayClientConfig {
+    build_client_config_from_parts(request.transport_parts(), identity)
+}
+
+fn build_client_config_from_parts(
+    (url, token, allow_insecure_remote_ws): (url::Url, Option<secrecy::SecretString>, bool),
+    identity: Arc<DeviceIdentity>,
+) -> GatewayClientConfig {
     let mut config = GatewayClientConfig::new(url, identity);
     config.credential = token.map_or(GatewayCredential::None, GatewayCredential::Token);
     config.role = Role::Operator;
@@ -167,16 +209,16 @@ pub fn build_client_config(
         completed_id_capacity: 32,
     };
     config.timeouts = ClientTimeouts {
-        connect: Duration::from_secs(15),
-        authentication: Duration::from_secs(15),
-        request: Duration::from_secs(20),
-        shutdown: Duration::from_secs(3),
+        connect: CONNECT_TIMEOUT,
+        authentication: AUTHENTICATION_TIMEOUT,
+        request: REQUEST_TIMEOUT,
+        shutdown: SHUTDOWN_TIMEOUT,
     };
     config.reconnect = ReconnectPolicy::Bounded {
-        max_attempts: 4,
-        initial_delay: Duration::from_millis(500),
-        max_delay: Duration::from_secs(8),
-        max_jitter: Duration::from_millis(250),
+        max_attempts: MAX_RECONNECT_ATTEMPTS,
+        initial_delay: INITIAL_RECONNECT_DELAY,
+        max_delay: MAX_RECONNECT_DELAY,
+        max_jitter: MAX_RECONNECT_JITTER,
     };
     config
 }
@@ -191,7 +233,9 @@ mod tests {
         ConnectionContract, ConnectionError, GatewayProfile, SurfaceId, surface,
         validate_gateway_profile,
     };
-    use claw_gateway_client::{AuthorizationExpectation, GatewayClientConfig, GatewayCredential};
+    use claw_gateway_client::{
+        AuthorizationExpectation, GatewayClientConfig, GatewayCredential, ReconnectPolicy,
+    };
     use claw_protocol::gateway::{
         ClientId, ClientMode, GATEWAY_PROTOCOL_VERSION, OperatorScope, Role as WireRole,
     };
@@ -201,7 +245,12 @@ mod tests {
     use crate::identity::generate_session_identity;
     use crate::onboarding::ConnectRequest;
 
-    use super::{AttemptSlot, android_client_metadata, build_client_config};
+    use super::{
+        AUTHENTICATION_TIMEOUT, AttemptSlot, CONNECT_TIMEOUT, INITIAL_RECONNECT_DELAY,
+        MAX_RECONNECT_ATTEMPTS, MAX_RECONNECT_DELAY, MAX_RECONNECT_JITTER, REQUEST_TIMEOUT,
+        SHUTDOWN_TIMEOUT, android_client_metadata, build_client_config,
+        build_client_config_for_attempt,
+    };
 
     fn test_identity() -> Arc<DeviceIdentity> {
         Arc::new(generate_session_identity().expect("host randomness available"))
@@ -210,7 +259,7 @@ mod tests {
     fn test_config() -> GatewayClientConfig {
         let request = ConnectRequest::prepare("wss://gateway.example.com", "", false)
             .expect("a valid request");
-        build_client_config(request, test_identity())
+        build_client_config_for_attempt(&request, test_identity())
     }
 
     /// Translates the scopes the transport will actually request into the frozen
@@ -310,6 +359,32 @@ mod tests {
     }
 
     #[test]
+    fn mobile_timeouts_and_retries_are_explicitly_bounded() {
+        let config = test_config();
+
+        assert_eq!(config.timeouts.connect, CONNECT_TIMEOUT);
+        assert_eq!(config.timeouts.authentication, AUTHENTICATION_TIMEOUT);
+        assert_eq!(config.timeouts.request, REQUEST_TIMEOUT);
+        assert_eq!(config.timeouts.shutdown, SHUTDOWN_TIMEOUT);
+        assert_eq!(
+            config.reconnect,
+            ReconnectPolicy::Bounded {
+                max_attempts: MAX_RECONNECT_ATTEMPTS,
+                initial_delay: INITIAL_RECONNECT_DELAY,
+                max_delay: MAX_RECONNECT_DELAY,
+                max_jitter: MAX_RECONNECT_JITTER,
+            },
+            "a phone must never inherit an unbounded or desktop-sized retry policy"
+        );
+        const {
+            assert!(
+                MAX_RECONNECT_ATTEMPTS <= 3,
+                "mobile reconnects must stop before repeated radio wakeups become open-ended"
+            );
+        }
+    }
+
+    #[test]
     fn a_busy_slot_refuses_a_second_attempt() {
         let slot = Arc::new(AttemptSlot::new());
         let first = slot.acquire(1).expect("the idle slot must grant a lease");
@@ -402,7 +477,7 @@ mod tests {
                     panic!("{endpoint} with opt-in {accepted} must be constructible, got {error:?}")
                 });
 
-            let config = build_client_config(request, test_identity());
+            let config = build_client_config_for_attempt(&request, test_identity());
 
             assert_eq!(
                 config.allow_insecure_remote_ws, *accepted,
