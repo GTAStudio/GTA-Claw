@@ -1,0 +1,88 @@
+{
+  "description": "Every Admin HTTP RPC failure class and the status, envelope and stable code it maps to. A class is listed exactly once; the test asserts this table is complete against the AdminRpcError enum, so a new class cannot be added without a reviewed row here.",
+  "envelopes": {
+    "transport": "{\"ok\":false,\"error\":{\"type\":..,\"message\":..}}",
+    "rpc": "{\"id\":..,\"ok\":false,\"error\":{\"code\":..,\"message\":..}}"
+  },
+  "classes": [
+    {
+      "class": "unauthenticated",
+      "status": 401,
+      "envelope": "transport",
+      "code": "unauthorized"
+    },
+    {
+      "class": "forbidden",
+      "status": 403,
+      "envelope": "transport",
+      "code": "forbidden"
+    },
+    {
+      "class": "authorization_unavailable",
+      "status": 503,
+      "envelope": "transport",
+      "code": "unavailable"
+    },
+    {
+      "class": "method_not_allowlisted",
+      "status": 400,
+      "envelope": "rpc",
+      "code": "INVALID_REQUEST"
+    },
+    {
+      "class": "method_not_registered",
+      "status": 400,
+      "envelope": "transport",
+      "code": "invalid_request"
+    },
+    {
+      "class": "method_not_operator_surface",
+      "status": 403,
+      "envelope": "transport",
+      "code": "forbidden"
+    },
+    {
+      "class": "malformed_request",
+      "status": 400,
+      "envelope": "transport",
+      "code": "invalid_request"
+    },
+    {
+      "class": "body_too_large",
+      "status": 413,
+      "envelope": "transport",
+      "code": "invalid_request"
+    },
+    {
+      "class": "body_timeout",
+      "status": 408,
+      "envelope": "transport",
+      "code": "invalid_request"
+    },
+    {
+      "class": "dispatch_timeout",
+      "status": 504,
+      "envelope": "rpc",
+      "code": "AGENT_TIMEOUT"
+    },
+    {
+      "class": "dispatch",
+      "status": 500,
+      "envelope": "rpc",
+      "code": "GATEWAY_CODE"
+    }
+  ],
+  "dispatch_codes": [
+    { "code": "INVALID_REQUEST", "status": 400 },
+    { "code": "UNAUTHORIZED", "status": 401 },
+    { "code": "FORBIDDEN", "status": 403 },
+    { "code": "NOT_FOUND", "status": 404 },
+    { "code": "APPROVAL_NOT_FOUND", "status": 404 },
+    { "code": "NOT_LINKED", "status": 409 },
+    { "code": "NOT_PAIRED", "status": 409 },
+    { "code": "RATE_LIMITED", "status": 429 },
+    { "code": "UNAVAILABLE", "status": 503 },
+    { "code": "AGENT_TIMEOUT", "status": 504 },
+    { "code": "SOMETHING_THE_GATEWAY_HAS_NOT_DEFINED", "status": 500 }
+  ]
+}
