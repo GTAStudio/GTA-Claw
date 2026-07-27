@@ -378,6 +378,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-goals"
+version = "0.1.0"
+dependencies = [
+ "claw-application",
+ "claw-domain",
+ "claw-runtime",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+]
+
+[[package]]
 name = "claw-http-api"
 version = "0.1.0"
 dependencies = [
