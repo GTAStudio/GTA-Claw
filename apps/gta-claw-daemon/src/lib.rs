@@ -4,14 +4,11 @@
 //! of its own: it decides which implementation satisfies which port, in what
 //! order the subsystems come up, and how they go down.
 //!
-//! # What is real here and what is standing in
-//!
-//! The composition, the lifecycle, the authorization flow, the task tracking
-//! and the shutdown path are real and are what will ship. The subsystem
-//! implementations in [`adapters`] are deterministic stand-ins for crates that
-//! are still on unmerged branches. Each one implements exactly the port its
-//! real counterpart will implement, so swapping them is a one-line change in
-//! [`compose`].
+//! [`production`] is the process composition used by the binary. It binds the
+//! shipped HTTP, MCP, and Gateway servers, wires the provider SDK, owns
+//! readiness and reload state, and supervises every ingress through shutdown.
+//! [`compose`] and the deterministic adapters remain as an in-process contract
+//! harness for the older `claw-application::composition` port family.
 //!
 //! # The two rules the composition enforces
 //!
@@ -30,6 +27,7 @@
 pub mod adapters;
 pub mod compose;
 pub mod control;
+pub mod production;
 pub mod runtime;
 
 pub use compose::{Daemon, DaemonBuilder, StopSummary};

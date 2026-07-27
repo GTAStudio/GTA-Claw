@@ -25,7 +25,8 @@
 use std::io;
 use std::time::Duration;
 
-use gta_claw_daemon::control::{DaemonMode, parse_mode, probe, serve};
+use gta_claw_daemon::control::{probe, serve_production};
+use gta_claw_daemon::production::{CommandLine, CommandMode, check_configuration, init_telemetry};
 
 /// How long the process waits at exit for blocking work that cannot be
 /// cancelled.
@@ -54,44 +55,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // `args_os`, not `args`: the latter panics part way through iteration when
-    // an argument is not valid Unicode, which would turn a mistyped invocation
-    // into a panic instead of the usage error below. Nothing this daemon
-    // accepts is non-Unicode, so a lossy conversion cannot swallow a valid
-    // argument — it can only fail to match one that was never valid.
-    let arguments = std::env::args_os()
-        .skip(1)
-        .map(|argument| argument.to_string_lossy().into_owned());
+    let command = CommandLine::parse(std::env::args_os().skip(1))?;
 
-    match parse_mode(arguments)? {
-        DaemonMode::Probe => {
+    match command.mode {
+        CommandMode::Probe => {
             probe(io::stdout().lock())?;
         }
-        DaemonMode::Serve => {
+        CommandMode::CheckConfig => {
+            let loaded = command.options.load_config()?;
+            check_configuration(&command.options, &loaded)?;
+            println!("configuration valid source={}", loaded.source);
+        }
+        CommandMode::Serve => {
+            let loaded = command.options.load_config()?;
+            let telemetry = init_telemetry(&loaded.snapshot)?;
             // `stdout()`, not `stdout().lock()`: a lock taken here would be held
             // for the whole run, so any other thread that printed would block
             // until the daemon exited. Each `writeln!` takes the lock for the
             // length of one line instead, and this daemon has one writer.
-            let summary = serve(io::stdout(), tokio::io::stdin()).await?;
+            let summary =
+                serve_production(io::stdout(), tokio::io::stdin(), &command.options, loaded)
+                    .await?;
 
             if !summary.is_clean() {
-                let error = if summary.deadline_expired() {
-                    io::Error::other(format!(
-                        "shutdown did not finish within its deadline: the composition is {:?}, {} of {} tasks joined",
-                        summary.phase(),
-                        summary.tasks().terminated(),
-                        summary.tasks().spawned(),
-                    ))
-                } else {
-                    io::Error::other(format!(
-                        "shutdown left work behind: {} abandoned, {} of {} tasks joined",
-                        summary.shutdown().abandoned(),
-                        summary.tasks().terminated(),
-                        summary.tasks().spawned(),
-                    ))
-                };
+                let error = summary.fault().map_or_else(
+                    || {
+                        if summary.deadline_expired() {
+                            io::Error::other(format!(
+                                "shutdown did not finish within its deadline: {} of {} service tasks joined",
+                                summary.terminated(),
+                                summary.spawned(),
+                            ))
+                        } else {
+                            io::Error::other(format!(
+                                "shutdown left work behind: {} abandoned, {} of {} tasks joined",
+                                summary.abandoned(),
+                                summary.terminated(),
+                                summary.spawned(),
+                            ))
+                        }
+                    },
+                    |fault| {
+                        io::Error::other(format!("runtime supervision failed: {fault}"))
+                    },
+                );
 
                 return Err(Box::<dyn std::error::Error>::from(error));
+            }
+            if let Some(error) = telemetry.take_writer_error()? {
+                return Err(Box::new(io::Error::other(format!(
+                    "telemetry writer failed: {error}"
+                ))));
             }
         }
     }

@@ -1,12 +1,14 @@
 //! Process-level checks that a real daemon process shuts down cleanly.
 //!
 //! These run the actual binary rather than the composition in-process, so they
-//! prove the whole path: build the composition, start twelve subsystems, print
+//! prove the whole path: build the composition, start three bound ingress services, print
 //! the ready contract, receive a stop signal from outside the process, drain,
 //! and join every task before exiting.
 
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// How long a drained daemon is given to leave the process table.
@@ -15,14 +17,16 @@ use std::time::Duration;
 /// exits", not to time the teardown.
 #[cfg(unix)]
 const EXIT_BUDGET: Duration = Duration::from_secs(5);
+static NEXT_STATE: AtomicU64 = AtomicU64::new(0);
 
 /// Kills the child if an assertion unwinds before the test gets to stop it.
-struct ChildGuard(Child);
+struct ChildGuard(Child, PathBuf);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        let _ = std::fs::remove_dir_all(&self.1);
     }
 }
 
@@ -87,13 +91,39 @@ impl StopLine {
 
 /// Spawns the daemon with a writable control channel and waits for readiness.
 fn started() -> (ChildGuard, BufReader<std::process::ChildStdout>) {
-    let child = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
+    let state = std::env::temp_dir().join(format!(
+        "gta-claw-process-shutdown-{}-{}",
+        std::process::id(),
+        NEXT_STATE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"));
+    command.env_clear();
+    let child = command
+        .args([
+            "--smoke",
+            "--listen",
+            "127.0.0.1:0",
+            "--gateway-listen",
+            "127.0.0.1:0",
+            "--mcp-listen",
+            "127.0.0.1:0",
+        ])
+        .env("GITHUB_TOKEN", "test")
+        .env("ENABLE_TEAMS", "false")
+        .env("ENABLE_TELEGRAM", "false")
+        .env("ENABLE_DISCORD", "false")
+        .env("ENABLE_WHATSAPP", "false")
+        .env("COPILOT_MODEL", "gpt-4o")
+        .env("AGENT_ROLE_URL", "https://example.test/role")
+        .env("GTA_CLAW_ADMIN_TOKEN", "test")
+        .env("GTA_CLAW_LOG", "off")
+        .env("GTA_CLAW_STATE_DIR", &state)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("daemon process starts");
-    let mut child = ChildGuard(child);
+    let mut child = ChildGuard(child, state);
     let stdout = child.0.stdout.take().expect("daemon stdout is piped");
     let mut reader = BufReader::new(stdout);
 
@@ -110,6 +140,15 @@ fn started() -> (ChildGuard, BufReader<std::process::ChildStdout>) {
     assert!(
         health.starts_with("healthy runtime="),
         "unexpected health line: {health:?}"
+    );
+
+    let mut service = String::new();
+    reader
+        .read_line(&mut service)
+        .expect("daemon service endpoints are readable");
+    assert!(
+        service.starts_with("service http=127.0.0.1:"),
+        "unexpected service line: {service:?}"
     );
 
     (child, reader)
@@ -149,8 +188,8 @@ fn the_control_channel_shuts_a_real_process_down_with_every_task_joined() {
     );
     assert_eq!(summary.abandoned, 0, "a subsystem was left running");
     assert_eq!(
-        summary.drained, 12,
-        "not every subsystem was drained on the way down"
+        summary.drained, 3,
+        "not every ingress service was drained on the way down"
     );
     assert_eq!(
         summary.completed, 0,
@@ -169,10 +208,16 @@ fn an_unrecognised_control_line_does_not_stop_the_process() {
     {
         let stdin = child.0.stdin.as_mut().expect("daemon stdin is piped");
         stdin
-            .write_all(b"status\nreload\n")
-            .expect("the control lines are writable");
+            .write_all(b"not-a-command\n")
+            .expect("the control line is writable");
         stdin.flush().expect("the control channel flushes");
     }
+
+    let mut ignored = String::new();
+    reader
+        .read_line(&mut ignored)
+        .expect("ignored control response is readable");
+    assert_eq!(ignored, "control ignored\n");
 
     std::thread::sleep(Duration::from_millis(150));
     assert!(
@@ -226,7 +271,7 @@ fn an_operating_system_interrupt_shuts_a_real_process_down_cleanly() {
         "the daemon did not stop cleanly: {summary:?}"
     );
     assert_eq!(summary.abandoned, 0);
-    assert_eq!(summary.drained, 12);
+    assert_eq!(summary.drained, 3);
     assert_eq!(summary.joined, summary.spawned);
 }
 
@@ -262,7 +307,7 @@ fn a_supervisor_termination_shuts_a_real_process_down_cleanly() {
         "the daemon did not stop cleanly: {summary:?}"
     );
     assert_eq!(summary.abandoned, 0);
-    assert_eq!(summary.drained, 12);
+    assert_eq!(summary.drained, 3);
     assert_eq!(
         summary.joined, summary.spawned,
         "a spawned task was not joined on a supervisor termination"
@@ -404,7 +449,7 @@ fn repeating_the_stop_signal_neither_deadlocks_the_drain_nor_skips_the_cleanup()
     );
     assert_eq!(summary.abandoned, 0);
     assert_eq!(
-        summary.drained, 12,
+        summary.drained, 3,
         "a repeated signal cut the drain short: {summary:?}"
     );
     assert_eq!(
