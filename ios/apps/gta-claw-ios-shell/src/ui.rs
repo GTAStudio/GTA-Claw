@@ -1,10 +1,8 @@
 //! Slint event-loop adapter for redaction-safe iOS snapshots.
 
-use std::sync::{Arc, Mutex, PoisonError};
-
 use slint::ComponentHandle;
 
-use crate::controller::{ControllerHandle, SnapshotSink, Tone, UiSnapshot};
+use crate::controller::{ControllerHandle, SnapshotSink, Tone, UiSnapshot, UiUpdate};
 use crate::generated_ui::{AppWindow, StatusTone};
 
 const fn status_tone(tone: Tone) -> StatusTone {
@@ -27,6 +25,10 @@ fn apply_snapshot(window: &AppWindow, snapshot: &UiSnapshot) {
     window.set_protocol_summary(snapshot.protocol.as_str().into());
     window.set_authorization_summary(snapshot.authorization.as_str().into());
     window.set_actions_summary(snapshot.available_actions.as_str().into());
+    window.set_snapshot_revision(snapshot.revision.as_str().into());
+    window.set_run_state_summary(snapshot.run_state.as_str().into());
+    window.set_network_path_summary(snapshot.network_path.as_str().into());
+    window.set_should_resume(snapshot.should_resume);
     window.set_busy(snapshot.busy);
     window.set_can_connect(snapshot.can_connect);
     window.set_can_cancel(snapshot.can_cancel);
@@ -37,23 +39,18 @@ fn apply_snapshot(window: &AppWindow, snapshot: &UiSnapshot) {
 
 pub(crate) fn snapshot_sink(window: &AppWindow) -> SnapshotSink {
     let weak_window = window.as_weak();
-    let latest = Arc::new(Mutex::new(None::<UiSnapshot>));
-    Arc::new(move |snapshot| {
-        let changed = {
-            let mut latest = latest.lock().unwrap_or_else(PoisonError::into_inner);
-            if latest.as_ref() == Some(&snapshot) {
-                false
-            } else {
-                *latest = Some(snapshot.clone());
-                true
-            }
-        };
-        if !changed {
-            return;
-        }
+    std::sync::Arc::new(move |update| {
         let weak_window = weak_window.clone();
         if let Err(error) = slint::invoke_from_event_loop(move || {
             if let Some(window) = weak_window.upgrade() {
+                let snapshot = match update {
+                    UiUpdate::Core(snapshot) => UiSnapshot::from_core(&snapshot),
+                    UiUpdate::Shell(snapshot) => *snapshot,
+                    UiUpdate::FormError(message) => {
+                        window.set_form_error(message.into());
+                        return;
+                    }
+                };
                 apply_snapshot(&window, &snapshot);
             }
         }) {

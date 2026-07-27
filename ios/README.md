@@ -3,12 +3,30 @@
 This independent Cargo workspace adds a Slint 1.17.1 iPhone/iPad shell over the
 existing `gta-claw-ios` core. A bounded Tokio controller owns one Gateway client,
 drains its event queue, releases the core attempt guard on every completion path,
-and sends deduplicated, redaction-safe snapshots to Slint's event loop.
+and sends revision-gated `Arc<IosViewSnapshot>` values to Slint's event loop.
 
 The UI responds to compact and regular widths, keeps fields inside a
 touch-pannable `ScrollView`, follows runtime safe-area and virtual-keyboard
 insets, uses 44pt-or-larger controls, and labels every input and action for
 assistive technologies.
+
+## Core lifecycle and host boundaries
+
+Before accepting a connection, the shell explicitly reports
+`AppRunState::Foreground` and one satisfied direct route. Every later lifecycle
+or path command is passed to `IosSessionModel`; `TransportDirective::Stop`
+cancels the matching attempt, waits for its guard to drop, then calls
+`reconcile`, and `Resume` creates a fresh generation. Gateway states reach the
+model only through `ConnectionAttempt::observe`. The shell publishes only
+`snapshot_if_changed` revisions and does not restate retry or resume policy.
+
+Shared tokens needed for a core-directed resume cross the `HostCredentialStore`
+port into a process-local implementation and are deleted on user disconnect.
+No Keychain claim is made. Discovery crosses an unavailable
+`HostDiscoveryProvider<GatewayMdnsBackend>` boundary; because the committed
+bundle declares no `NSBonjourServices`, the UI renders the core's typed
+`DiscoveryDiagnostic` and `DiscoveryRemediation` instead of reporting an empty
+network.
 
 ## Verified Skia prebuilt inputs
 
@@ -54,10 +72,10 @@ outside repository automation.
 
 ## Limits
 
-- The rebased iOS core now requires explicit UIKit lifecycle and `NWPathMonitor`
-  facts before it starts a socket. This Slint-only shell has no Apple-framework
-  adapter yet, so the core remains fail-closed instead of assuming foreground or
-  fabricating a usable route.
+- The shell bootstraps foreground plus a satisfied direct route so manual
+  connections can start, but it still has no UIKit lifecycle or `NWPathMonitor`
+  callback adapter. The controller is directive-complete; real subsequent
+  background and route changes require that Apple-framework bridge.
 - No Bonjour discovery, pairing, push notifications, background refresh,
   Keychain persistence, or Secure Enclave integration is implemented.
 - iOS may suspend the Tokio workers in the background; this shell does not claim

@@ -8,6 +8,7 @@ claw-platform = { path = "../crates/claw-platform", version = "0.1.0" }
 claw-security = { path = "../crates/claw-security", version = "0.1.0" }
 getrandom = { version = "=0.4.3", features = ["sys_rng"] }
 gta-claw-ios = { path = "../apps/gta-claw-ios", version = "0.1.0" }
+secrecy = "=0.10.3"
 skia-safe = { version = "=0.99.0", default-features = false, features = ["no-compile"] }
 slint = { version = "=1.17.1", default-features = false }
 slint-build = "=1.17.1"

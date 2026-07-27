@@ -1,30 +1,42 @@
 //! Bounded background ownership of one iOS Gateway connection.
 
 use std::fmt::{self, Display, Formatter};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
 
-use claw_gateway_client::{
-    ClientLimits, ClientTimeouts, ConnectionState, GatewayClient, GatewayClientConfig,
-    ReconnectPolicy,
-};
+use claw_gateway_client::{ConnectionState, GatewayClient, GatewayClientConfig};
 use claw_security::authorization::Scope;
 use claw_security::identity::DeviceIdentity;
 use getrandom::SysRng;
 use gta_claw_ios::{
-    ConnectionAttempt, GatewayEndpoint, IosAction, IosClientIdentity, IosCredential,
-    IosGatewayProfile, IosSessionModel, IosStatusKind, IosViewSnapshot, ObservedAuthorization,
-    UnobservedDeviceProbe,
+    AppRunState, ConnectionAttempt, CredentialKey, GatewayEndpoint, IosAction, IosClientIdentity,
+    IosCredential, IosGatewayProfile, IosNetworkPath, IosSessionModel, IosStatusKind,
+    IosViewSnapshot, ObservedAuthorization, PersistedCredentialKind, TransportDirective,
+    UnobservedDeviceProbe, delete_host_credential, load_host_credential, save_host_credential,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-const COMMAND_QUEUE_CAPACITY: usize = 4;
-const UPDATE_QUEUE_CAPACITY: usize = 24;
+use crate::host::HostBoundaries;
 
-pub(crate) type SnapshotSink = Arc<dyn Fn(UiSnapshot) + Send + Sync>;
+const COMMAND_QUEUE_CAPACITY: usize = 4;
+
+pub(crate) type SnapshotSink = Arc<dyn Fn(UiUpdate) + Send + Sync>;
+type WorkerSender = mpsc::UnboundedSender<(u64, WorkerUpdate)>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum UiUpdate {
+    Core(Arc<IosViewSnapshot>),
+    Shell(Box<UiSnapshot>),
+    FormError(String),
+}
+
+impl UiUpdate {
+    fn shell(snapshot: UiSnapshot) -> Self {
+        Self::Shell(Box::new(snapshot))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Tone {
@@ -50,6 +62,10 @@ pub(crate) struct UiSnapshot {
     pub(crate) protocol: String,
     pub(crate) authorization: String,
     pub(crate) available_actions: String,
+    pub(crate) revision: String,
+    pub(crate) run_state: String,
+    pub(crate) network_path: String,
+    pub(crate) should_resume: bool,
     pub(crate) busy: bool,
     pub(crate) can_connect: bool,
     pub(crate) can_cancel: bool,
@@ -70,6 +86,10 @@ impl UiSnapshot {
             protocol: "-".to_owned(),
             authorization: "Nothing confirmed".to_owned(),
             available_actions: "No actions confirmed".to_owned(),
+            revision: "0".to_owned(),
+            run_state: "inactive".to_owned(),
+            network_path: "checking network".to_owned(),
+            should_resume: false,
             busy: false,
             can_connect: true,
             can_cancel: false,
@@ -101,7 +121,16 @@ impl UiSnapshot {
         }
     }
 
-    fn from_core(snapshot: &IosViewSnapshot) -> Self {
+    fn fatal(title: impl Into<String>, detail: impl Into<String>, action: &str) -> Self {
+        Self {
+            can_connect: false,
+            can_cancel: false,
+            can_disconnect: false,
+            ..Self::failure(title, detail, action)
+        }
+    }
+
+    pub(crate) fn from_core(snapshot: &IosViewSnapshot) -> Self {
         let tone = match snapshot.status() {
             IosStatusKind::Neutral => Tone::Neutral,
             IosStatusKind::Progress => Tone::Progress,
@@ -141,6 +170,10 @@ impl UiSnapshot {
             } else {
                 actions.join(", ")
             },
+            revision: snapshot.revision().to_string(),
+            run_state: snapshot.run_state().label().to_owned(),
+            network_path: snapshot.network_path().label().to_owned(),
+            should_resume: snapshot.should_resume(),
             busy: snapshot.busy(),
             can_connect: snapshot.can_connect(),
             can_cancel: snapshot.can_cancel(),
@@ -158,6 +191,8 @@ impl UiSnapshot {
 enum Command {
     Connect { endpoint: String, token: String },
     Disconnect,
+    RunState(AppRunState),
+    NetworkPath(IosNetworkPath),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,6 +210,8 @@ impl Display for CommandError {
     }
 }
 
+impl std::error::Error for CommandError {}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ControllerHandle {
     sender: mpsc::Sender<Command>,
@@ -187,6 +224,14 @@ impl ControllerHandle {
 
     pub(crate) fn disconnect(&self) -> Result<(), CommandError> {
         self.send(Command::Disconnect)
+    }
+
+    pub(crate) fn set_run_state(&self, state: AppRunState) -> Result<(), CommandError> {
+        self.send(Command::RunState(state))
+    }
+
+    pub(crate) fn set_network_path(&self, path: IosNetworkPath) -> Result<(), CommandError> {
+        self.send(Command::NetworkPath(path))
     }
 
     fn send(&self, command: Command) -> Result<(), CommandError> {
@@ -204,14 +249,17 @@ pub(crate) struct IosController {
 }
 
 impl IosController {
-    pub(crate) fn start(sink: SnapshotSink) -> Result<Self, std::io::Error> {
+    pub(crate) fn start(
+        sink: SnapshotSink,
+        host: Arc<HostBoundaries>,
+    ) -> Result<Self, std::io::Error> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .thread_name("gta-claw-ios-gateway")
             .build()?;
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
-        runtime.spawn(run(commands_rx, sink));
+        runtime.spawn(run(commands_rx, sink, host));
         Ok(Self {
             handle: ControllerHandle {
                 sender: commands_tx,
@@ -227,8 +275,15 @@ impl IosController {
 
 struct PreparedConnection {
     config: GatewayClientConfig,
+    intent: ConnectionIntent,
+}
+
+struct ConnectionIntent {
+    endpoint: GatewayEndpoint,
+    credential_key: CredentialKey,
+    has_token: bool,
     model: IosSessionModel,
-    endpoint: String,
+    published_revision: Arc<Mutex<Option<u64>>>,
 }
 
 #[derive(Debug)]
@@ -256,6 +311,7 @@ fn prepare_connection(
     endpoint: &str,
     token: &str,
     session_identity: &mut Option<Arc<DeviceIdentity>>,
+    host: &HostBoundaries,
 ) -> Result<PreparedConnection, PreparationError> {
     let endpoint = GatewayEndpoint::parse(endpoint).map_err(|error| {
         PreparationError::new(
@@ -275,6 +331,14 @@ fn prepare_connection(
             )
         })?
     };
+    let credential_key = CredentialKey::parse("gta-claw-manual-gateway").map_err(|error| {
+        PreparationError::new(
+            "Credential host key is invalid",
+            error.to_string(),
+            "Restart the app; the bounded shell credential key is not usable.",
+        )
+    })?;
+    let has_token = credential.kind() == gta_claw_ios::IosCredentialKind::Token;
     let identity = IosClientIdentity::observe(&UnobservedDeviceProbe).map_err(|error| {
         PreparationError::new(
             "Device identity unavailable",
@@ -294,55 +358,154 @@ fn prepare_connection(
         })?;
         Arc::clone(session_identity.insert(Arc::new(generated)))
     };
-    let profile = IosGatewayProfile::new(endpoint, credential, identity, device)
+    if has_token {
+        save_host_credential(host.credentials(), &credential_key, &credential).map_err(
+            |error| {
+                PreparationError::new(
+                    "Credential host facility failed",
+                    error.to_string(),
+                    "Retry without persistence or attach a working Keychain adapter.",
+                )
+            },
+        )?;
+    } else {
+        delete_host_credential(
+            host.credentials(),
+            &credential_key,
+            PersistedCredentialKind::Token,
+        )
+        .unwrap_or_else(|never| match never {});
+    }
+    let profile = IosGatewayProfile::new(endpoint.clone(), credential, identity, device)
         .requesting([Scope::OperatorRead]);
     let model = profile.session_model();
-    let endpoint = profile.endpoint_summary().to_string();
-    let mut config = profile.into_client_config();
-    config.limits = ClientLimits {
-        max_in_flight_requests: 4,
-        command_queue_capacity: 8,
-        outbound_queue_bytes: 32 * 1024,
-        event_queue_capacity: 16,
-        event_queue_bytes: 64 * 1024,
-        completed_id_capacity: 32,
-    };
-    config.timeouts = ClientTimeouts {
-        connect: Duration::from_secs(15),
-        authentication: Duration::from_secs(15),
-        request: Duration::from_secs(20),
-        shutdown: Duration::from_secs(3),
-    };
-    config.reconnect = ReconnectPolicy::Bounded {
-        max_attempts: 4,
-        initial_delay: Duration::from_millis(500),
-        max_delay: Duration::from_secs(8),
-        max_jitter: Duration::from_millis(250),
-    };
+    let config = profile.into_client_config();
     Ok(PreparedConnection {
         config,
-        model,
-        endpoint,
+        intent: ConnectionIntent {
+            endpoint,
+            credential_key,
+            has_token,
+            model,
+            published_revision: Arc::new(Mutex::new(None)),
+        },
     })
 }
 
+fn resume_config(
+    intent: &ConnectionIntent,
+    session_identity: Option<&Arc<DeviceIdentity>>,
+    host: &HostBoundaries,
+) -> Result<GatewayClientConfig, PreparationError> {
+    let credential = if intent.has_token {
+        load_host_credential(
+            host.credentials(),
+            &intent.credential_key,
+            PersistedCredentialKind::Token,
+        )
+        .map_err(|error| {
+            PreparationError::new(
+                "Credential host facility failed",
+                error.to_string(),
+                "Unlock or repair the host credential facility, then retry.",
+            )
+        })?
+        .ok_or_else(|| {
+            PreparationError::new(
+                "Session credential is unavailable",
+                "The process-local credential host no longer contains the retained token.",
+                "Enter the token again.",
+            )
+        })?
+    } else {
+        IosCredential::none()
+    };
+    let identity = IosClientIdentity::observe(&UnobservedDeviceProbe).map_err(|error| {
+        PreparationError::new(
+            "Device identity unavailable",
+            error.to_string(),
+            "Restart the app. This build will not substitute guessed device metadata.",
+        )
+    })?;
+    let device = session_identity.cloned().ok_or_else(|| {
+        PreparationError::new(
+            "Session identity is unavailable",
+            "The controller lost its process identity before transport resume.",
+            "Restart the app and connect again.",
+        )
+    })?;
+    Ok(
+        IosGatewayProfile::new(intent.endpoint.clone(), credential, identity, device)
+            .requesting([Scope::OperatorRead])
+            .into_client_config(),
+    )
+}
+
+fn changed_snapshot(intent: &ConnectionIntent) -> Option<Arc<IosViewSnapshot>> {
+    changed_model_snapshot(&intent.model, &intent.published_revision)
+}
+
+fn changed_model_snapshot(
+    model: &IosSessionModel,
+    published_revision: &Arc<Mutex<Option<u64>>>,
+) -> Option<Arc<IosViewSnapshot>> {
+    let mut published = published_revision
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let snapshot = published.map_or_else(
+        || Some(model.snapshot()),
+        |known| model.snapshot_if_changed(known),
+    )?;
+    *published = Some(snapshot.revision());
+    drop(published);
+    Some(snapshot)
+}
+
 struct ActiveConnection {
-    endpoint: String,
+    generation: u64,
+    attempt_id: u64,
     cancellation: CancellationToken,
-    task: JoinHandle<()>,
+    task: JoinHandle<WorkerResult>,
+}
+
+type WorkerResult = Result<(), WorkerFailure>;
+
+struct WorkerFailure {
+    snapshot: Box<UiSnapshot>,
+    poisons_controller: bool,
+}
+
+impl WorkerFailure {
+    fn recoverable(snapshot: UiSnapshot) -> Self {
+        Self {
+            snapshot: Box::new(snapshot),
+            poisons_controller: false,
+        }
+    }
+
+    fn poisoned(snapshot: UiSnapshot) -> Self {
+        Self {
+            snapshot: Box::new(snapshot),
+            poisons_controller: true,
+        }
+    }
 }
 
 enum WorkerUpdate {
-    Snapshot(UiSnapshot),
-    Finished(UiSnapshot),
+    Changed,
+    Finished,
 }
 
-async fn run(mut commands: mpsc::Receiver<Command>, sink: SnapshotSink) {
-    let (updates_tx, mut updates_rx) = mpsc::channel::<(u64, WorkerUpdate)>(UPDATE_QUEUE_CAPACITY);
-    let mut generation = 0_u64;
+async fn run(mut commands: mpsc::Receiver<Command>, sink: SnapshotSink, host: Arc<HostBoundaries>) {
+    let (updates_tx, mut updates_rx) = mpsc::unbounded_channel::<(u64, WorkerUpdate)>();
     let mut active: Option<ActiveConnection> = None;
+    let mut intent: Option<ConnectionIntent> = None;
     let mut session_identity: Option<Arc<DeviceIdentity>> = None;
-    sink(UiSnapshot::initial());
+    let mut run_state = AppRunState::Inactive;
+    let mut network_path = IosNetworkPath::Unknown;
+    let mut poisoned = false;
+    let mut next_worker_generation = 0_u64;
+    sink(UiUpdate::shell(UiSnapshot::initial()));
 
     loop {
         tokio::select! {
@@ -350,90 +513,309 @@ async fn run(mut commands: mpsc::Receiver<Command>, sink: SnapshotSink) {
                 let Some(command) = command else { break };
                 match command {
                     Command::Connect { endpoint, token } => {
+                        if poisoned {
+                            sink(UiUpdate::shell(UiSnapshot::fatal(
+                                "Connection service requires restart",
+                                "A previous transport did not stop cleanly.",
+                                "Restart the app before connecting again.",
+                            )));
+                            continue;
+                        }
                         if active.is_some() {
-                            sink(UiSnapshot::failure(
-                                "Connection already active",
-                                "Stop the current connection before starting another.",
-                                "Use Cancel or Disconnect, then try again.",
+                            sink(UiUpdate::FormError(
+                                "A connection is already active. Disconnect it before starting another."
+                                    .to_owned(),
                             ));
                             continue;
                         }
-                        generation = generation.wrapping_add(1);
-                        let prepared =
-                            match prepare_connection(&endpoint, &token, &mut session_identity) {
+                        if let Some(previous) = intent.take() {
+                            clear_retained_credential(&previous, &host);
+                        }
+                        let prepared = match prepare_connection(
+                            &endpoint,
+                            &token,
+                            &mut session_identity,
+                            &host,
+                        ) {
                             Ok(prepared) => prepared,
                             Err(error) => {
-                                sink(error.into_snapshot());
-                                continue;
-                            }
-                            };
-                        let attempt = match prepared.model.begin_attempt() {
-                            Ok(attempt) => attempt,
-                            Err(error) => {
-                                sink(UiSnapshot::failure(
-                                    "Connection unavailable",
-                                    error.to_string(),
-                                    "The host lifecycle and network-path preconditions must be satisfied before retrying.",
-                                ));
+                                sink(UiUpdate::shell(error.into_snapshot()));
                                 continue;
                             }
                         };
-                        sink(UiSnapshot::from_core(&prepared.model.snapshot()));
-                        let cancellation = CancellationToken::new();
-                        let task = tokio::spawn(run_connection(
-                            generation,
+                        let session = prepared.intent;
+                        let _directive = session.model.set_run_state(run_state);
+                        let _directive = session.model.set_network_path(network_path);
+                        if let Some(snapshot) = changed_snapshot(&session) {
+                            sink(UiUpdate::Core(snapshot));
+                        }
+                        match start_transport(
                             prepared.config,
-                            prepared.model,
-                            attempt,
-                            cancellation.clone(),
-                            updates_tx.clone(),
-                        ));
-                        active = Some(ActiveConnection {
-                            endpoint: prepared.endpoint,
-                            cancellation,
-                            task,
-                        });
+                            &session,
+                            allocate_worker_generation(&mut next_worker_generation),
+                            &updates_tx,
+                            &sink,
+                        ) {
+                            Ok(connection) => {
+                                active = Some(connection);
+                                intent = Some(session);
+                            }
+                            Err(error) => {
+                                sink(UiUpdate::Shell(error));
+                                clear_retained_credential(&session, &host);
+                            }
+                        }
                     }
                     Command::Disconnect => {
-                        let endpoint = active
-                            .as_ref()
-                            .map_or_else(|| "No Gateway selected".to_owned(), |value| value.endpoint.clone());
-                        stop_connection(active.take()).await;
-                        generation = generation.wrapping_add(1);
-                        sink(UiSnapshot::disconnected(endpoint));
+                        if poisoned {
+                            if let Some(session) = intent.take() {
+                                clear_retained_credential(&session, &host);
+                            }
+                            continue;
+                        }
+                        if let Some(session) = intent.as_ref() {
+                            let directive = session.model.request_disconnect();
+                            process_directive(
+                                directive,
+                                session,
+                                &mut active,
+                                &mut poisoned,
+                                DirectiveContext {
+                                    session_identity: session_identity.as_ref(),
+                                    host: &host,
+                                    updates: &updates_tx,
+                                    sink: &sink,
+                                    next_worker_generation: &mut next_worker_generation,
+                                },
+                            )
+                            .await;
+                            clear_retained_credential(session, &host);
+                            if !poisoned
+                                && let Some(snapshot) = changed_snapshot(session)
+                            {
+                                sink(UiUpdate::Core(snapshot));
+                            }
+                            intent = None;
+                        } else {
+                            sink(UiUpdate::shell(UiSnapshot::disconnected(
+                                "No Gateway selected".to_owned(),
+                            )));
+                        }
+                    }
+                    Command::RunState(state) => {
+                        run_state = state;
+                        if poisoned {
+                            continue;
+                        }
+                        if let Some(session) = intent.as_ref() {
+                            let directive = session.model.set_run_state(state);
+                            if let Some(snapshot) = changed_snapshot(session) {
+                                sink(UiUpdate::Core(snapshot));
+                            }
+                            process_directive(
+                                directive,
+                                session,
+                                &mut active,
+                                &mut poisoned,
+                                DirectiveContext {
+                                    session_identity: session_identity.as_ref(),
+                                    host: &host,
+                                    updates: &updates_tx,
+                                    sink: &sink,
+                                    next_worker_generation: &mut next_worker_generation,
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                    Command::NetworkPath(path) => {
+                        network_path = path;
+                        if poisoned {
+                            continue;
+                        }
+                        if let Some(session) = intent.as_ref() {
+                            let directive = session.model.set_network_path(path);
+                            if let Some(snapshot) = changed_snapshot(session) {
+                                sink(UiUpdate::Core(snapshot));
+                            }
+                            process_directive(
+                                directive,
+                                session,
+                                &mut active,
+                                &mut poisoned,
+                                DirectiveContext {
+                                    session_identity: session_identity.as_ref(),
+                                    host: &host,
+                                    updates: &updates_tx,
+                                    sink: &sink,
+                                    next_worker_generation: &mut next_worker_generation,
+                                },
+                            )
+                            .await;
+                        }
                     }
                 }
             }
             update = updates_rx.recv() => {
-                let Some((update_generation, update)) = update else { break };
-                if update_generation != generation {
+                let Some((generation, update)) = update else { break };
+                if active.as_ref().map(|connection| connection.generation) != Some(generation) {
                     continue;
                 }
-                match update {
-                    WorkerUpdate::Snapshot(snapshot) => sink(snapshot),
-                    WorkerUpdate::Finished(snapshot) => {
-                        if let Some(connection) = active.take()
-                            && let Err(error) = connection.task.await
-                        {
-                            eprintln!("iOS Gateway worker join failed: {error}");
-                        }
-                        sink(snapshot);
+                let finished = matches!(update, WorkerUpdate::Finished)
+                    || active.as_ref().is_some_and(|connection| connection.task.is_finished());
+                let mut publish_core = true;
+                if finished {
+                    let result = match active.take() {
+                        Some(connection) => join_connection(connection).await,
+                        None => Ok(()),
+                    };
+                    if let Err(failure) = result {
+                        poisoned |= failure.poisons_controller;
+                        sink(UiUpdate::Shell(failure.snapshot));
+                        publish_core = false;
                     }
+                }
+                if publish_core
+                    && let Some(session) = intent.as_ref()
+                    && let Some(snapshot) = changed_snapshot(session)
+                {
+                    sink(UiUpdate::Core(snapshot));
                 }
             }
         }
     }
 
-    stop_connection(active.take()).await;
+    if let Err(failure) = stop_connection(active.take()).await {
+        sink(UiUpdate::Shell(failure.snapshot));
+    }
 }
 
-async fn stop_connection(connection: Option<ActiveConnection>) {
+fn start_transport(
+    config: GatewayClientConfig,
+    intent: &ConnectionIntent,
+    generation: u64,
+    updates: &WorkerSender,
+    sink: &SnapshotSink,
+) -> Result<ActiveConnection, Box<UiSnapshot>> {
+    let attempt = intent.model.begin_attempt().map_err(|error| {
+        Box::new(UiSnapshot::failure(
+            "Connection unavailable",
+            error.to_string(),
+            "The host lifecycle and network-path preconditions must be satisfied before retrying.",
+        ))
+    })?;
+    let attempt_id = attempt.id();
+    if let Some(snapshot) = changed_snapshot(intent) {
+        sink(UiUpdate::Core(snapshot));
+    }
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn(run_connection(
+        generation,
+        config,
+        attempt,
+        cancellation.clone(),
+        updates.clone(),
+    ));
+    Ok(ActiveConnection {
+        generation,
+        attempt_id,
+        cancellation,
+        task,
+    })
+}
+
+struct DirectiveContext<'a> {
+    session_identity: Option<&'a Arc<DeviceIdentity>>,
+    host: &'a HostBoundaries,
+    updates: &'a WorkerSender,
+    sink: &'a SnapshotSink,
+    next_worker_generation: &'a mut u64,
+}
+
+async fn process_directive(
+    mut directive: TransportDirective,
+    intent: &ConnectionIntent,
+    active: &mut Option<ActiveConnection>,
+    poisoned: &mut bool,
+    context: DirectiveContext<'_>,
+) {
+    loop {
+        match directive {
+            TransportDirective::None => return,
+            TransportDirective::Stop { attempt_id, .. } => {
+                if active.as_ref().map(|connection| connection.attempt_id) == Some(attempt_id)
+                    && let Err(failure) = stop_connection(active.take()).await
+                {
+                    *poisoned |= failure.poisons_controller;
+                    if failure.poisons_controller {
+                        let _directive = intent.model.request_disconnect();
+                        (context.sink)(UiUpdate::Shell(failure.snapshot));
+                        return;
+                    }
+                    (context.sink)(UiUpdate::Shell(failure.snapshot));
+                }
+                if let Some(snapshot) = changed_snapshot(intent) {
+                    (context.sink)(UiUpdate::Core(snapshot));
+                }
+                directive = intent.model.reconcile();
+            }
+            TransportDirective::Resume { .. } => {
+                if active.is_none() && !*poisoned {
+                    match resume_config(intent, context.session_identity, context.host) {
+                        Ok(config) => {
+                            match start_transport(
+                                config,
+                                intent,
+                                allocate_worker_generation(context.next_worker_generation),
+                                context.updates,
+                                context.sink,
+                            ) {
+                                Ok(connection) => *active = Some(connection),
+                                Err(snapshot) => (context.sink)(UiUpdate::Shell(snapshot)),
+                            }
+                        }
+                        Err(error) => (context.sink)(UiUpdate::shell(error.into_snapshot())),
+                    }
+                }
+                return;
+            }
+        }
+    }
+}
+
+const fn allocate_worker_generation(next: &mut u64) -> u64 {
+    *next = next.wrapping_add(1);
+    *next
+}
+
+fn clear_retained_credential(intent: &ConnectionIntent, host: &HostBoundaries) {
+    if intent.has_token {
+        delete_host_credential(
+            host.credentials(),
+            &intent.credential_key,
+            PersistedCredentialKind::Token,
+        )
+        .unwrap_or_else(|never| match never {});
+    }
+}
+
+async fn stop_connection(connection: Option<ActiveConnection>) -> Result<(), WorkerFailure> {
     let Some(connection) = connection else {
-        return;
+        return Ok(());
     };
     connection.cancellation.cancel();
-    if let Err(error) = connection.task.await {
-        eprintln!("iOS Gateway worker join failed during shutdown: {error}");
+    join_connection(connection).await
+}
+
+async fn join_connection(connection: ActiveConnection) -> Result<(), WorkerFailure> {
+    match connection.task.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(failure)) => Err(failure),
+        Err(error) => Err(WorkerFailure::poisoned(UiSnapshot::fatal(
+            "Connection task did not stop",
+            error.to_string(),
+            "Restart the app before starting another connection.",
+        ))),
     }
 }
 
@@ -451,26 +833,20 @@ const fn terminal(state: &ConnectionState) -> bool {
 async fn run_connection(
     generation: u64,
     config: GatewayClientConfig,
-    model: IosSessionModel,
     attempt: ConnectionAttempt,
     cancellation: CancellationToken,
-    updates: mpsc::Sender<(u64, WorkerUpdate)>,
-) {
+    updates: WorkerSender,
+) -> WorkerResult {
     let (client, mut events) = match GatewayClient::start(config) {
         Ok(started) => started,
         Err(error) => {
             drop(attempt);
-            let _ = updates
-                .send((
-                    generation,
-                    WorkerUpdate::Finished(UiSnapshot::failure(
-                        "Connection could not start",
-                        error.to_string(),
-                        "Check the address and restart the app if the service is unavailable.",
-                    )),
-                ))
-                .await;
-            return;
+            let _ = updates.send((generation, WorkerUpdate::Finished));
+            return Err(WorkerFailure::recoverable(UiSnapshot::failure(
+                "Connection could not start",
+                error.to_string(),
+                "Check the address and restart the app if the service is unavailable.",
+            )));
         }
     };
     let mut attempt = Some(attempt);
@@ -481,45 +857,25 @@ async fn run_connection(
         .as_ref()
         .expect("the connection attempt is held until transport shutdown")
         .observe(client.state());
-    if updates
-        .send((
-            generation,
-            WorkerUpdate::Snapshot(UiSnapshot::from_core(&model.snapshot())),
-        ))
-        .await
-        .is_err()
-    {
-        let _ = client.shutdown().await;
-        return;
-    }
+    let _ = updates.send((generation, WorkerUpdate::Changed));
 
     loop {
         let state = tokio::select! {
             biased;
             () = cancellation.cancelled() => {
+                let _ = updates.send((generation, WorkerUpdate::Finished));
                 match client.shutdown().await {
                     Ok(()) => {
                         if let Some(attempt) = attempt.as_ref() {
                             let _observation = attempt.observe(ConnectionState::Stopped);
                         }
                         drop(attempt.take());
-                        let _ = updates.send((
-                            generation,
-                            WorkerUpdate::Finished(UiSnapshot::from_core(&model.snapshot())),
-                        )).await;
+                        return Ok(());
                     }
                     Err(error) => {
-                        let _ = updates.send((
-                            generation,
-                            WorkerUpdate::Finished(UiSnapshot::failure(
-                                "Disconnect did not finish",
-                                error.to_string(),
-                                "The bounded shutdown timed out; restart the app before reconnecting.",
-                            )),
-                        )).await;
+                        return Err(shutdown_failure(error));
                     }
                 }
-                return;
             }
             changed = states.changed() => {
                 if changed.is_err() {
@@ -528,9 +884,9 @@ async fn run_connection(
                         "The Gateway service stopped without a final lifecycle state.",
                         "Reconnect. If this repeats, restart the app.",
                     );
-                    let _ = updates.send((generation, WorkerUpdate::Finished(snapshot))).await;
-                    let _ = client.shutdown().await;
-                    return;
+                    let _ = updates.send((generation, WorkerUpdate::Finished));
+                    client.shutdown().await.map_err(shutdown_failure)?;
+                    return Err(WorkerFailure::recoverable(snapshot));
                 }
                 states.borrow_and_update().clone()
             }
@@ -541,9 +897,9 @@ async fn run_connection(
                         "The bounded event stream ended before the connection stopped.",
                         "Reconnect. No event was silently discarded.",
                     );
-                    let _ = updates.send((generation, WorkerUpdate::Finished(snapshot))).await;
-                    let _ = client.shutdown().await;
-                    return;
+                    let _ = updates.send((generation, WorkerUpdate::Finished));
+                    client.shutdown().await.map_err(shutdown_failure)?;
+                    return Err(WorkerFailure::recoverable(snapshot));
                 }
                 continue;
             }
@@ -561,36 +917,44 @@ async fn run_connection(
         if terminal {
             drop(attempt.take());
         }
-        let snapshot = UiSnapshot::from_core(&model.snapshot());
         if terminal {
-            let _ = updates
-                .send((generation, WorkerUpdate::Finished(snapshot)))
-                .await;
+            let _ = updates.send((generation, WorkerUpdate::Finished));
             if let Err(error) = client.shutdown().await {
-                eprintln!("iOS Gateway terminal shutdown failed: {error}");
+                return Err(shutdown_failure(error));
             }
-            return;
+            return Ok(());
         }
-        if updates
-            .send((generation, WorkerUpdate::Snapshot(snapshot)))
-            .await
-            .is_err()
-        {
-            let _ = client.shutdown().await;
-            return;
-        }
+        let _ = updates.send((generation, WorkerUpdate::Changed));
     }
+}
+
+fn shutdown_failure(error: impl Display) -> WorkerFailure {
+    WorkerFailure::poisoned(UiSnapshot::fatal(
+        "Disconnect did not finish",
+        error.to_string(),
+        "The bounded shutdown failed; restart the app before reconnecting.",
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use claw_gateway_client::ConnectionState;
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use claw_gateway_client::{ConnectionState, GatewayCredential};
     use gta_claw_ios::{
         AppRunState, GatewayEndpoint, IosNetworkInterface, IosNetworkPath, IosNetworkRoute,
-        IosSessionModel,
+        IosSessionModel, TransportDirective, TransportResumeReason,
     };
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
 
-    use super::{Tone, UiSnapshot, prepare_connection};
+    use crate::host::HostBoundaries;
+
+    use super::{
+        ActiveConnection, DirectiveContext, SnapshotSink, Tone, UiSnapshot, UiUpdate,
+        WorkerFailure, allocate_worker_generation, changed_snapshot, prepare_connection,
+        process_directive, resume_config,
+    };
 
     #[test]
     fn initial_snapshot_is_actionable_and_not_busy() {
@@ -601,12 +965,21 @@ mod tests {
     }
 
     #[test]
+    fn worker_generations_do_not_reuse_model_local_attempt_ids() {
+        let mut generation = 0;
+        assert_eq!(allocate_worker_generation(&mut generation), 1);
+        assert_eq!(allocate_worker_generation(&mut generation), 2);
+    }
+
+    #[test]
     fn credential_bearing_endpoint_is_not_echoed_back() {
         let secret = "never-render-this";
+        let host = HostBoundaries::new();
         let Err(error) = prepare_connection(
             &format!("wss://gateway.example?token={secret}"),
             "",
             &mut None,
+            &host,
         ) else {
             panic!("credential-bearing URL must fail");
         };
@@ -617,13 +990,27 @@ mod tests {
     #[test]
     fn reconnects_reuse_one_process_identity() {
         let mut identity = None;
-        let first = prepare_connection("ws://127.0.0.1:1", "", &mut identity)
+        let host = HostBoundaries::new();
+        let first = prepare_connection("ws://127.0.0.1:1", "", &mut identity, &host)
             .expect("loopback profile is valid");
         let first_id = first.config.identity.device_id();
-        let second = prepare_connection("ws://127.0.0.1:1", "", &mut identity)
+        let second = prepare_connection("ws://127.0.0.1:1", "", &mut identity, &host)
             .expect("second loopback profile is valid");
 
         assert_eq!(second.config.identity.device_id(), first_id);
+    }
+
+    #[test]
+    fn resume_reloads_the_token_through_the_host_store() {
+        let mut identity = None;
+        let host = HostBoundaries::new();
+        let prepared =
+            prepare_connection("ws://127.0.0.1:1", "session-token", &mut identity, &host)
+                .expect("loopback profile is valid");
+        let resumed = resume_config(&prepared.intent, identity.as_ref(), &host)
+            .expect("host credential reload succeeds");
+
+        assert!(matches!(resumed.credential, GatewayCredential::Token(_)));
     }
 
     #[test]
@@ -661,5 +1048,137 @@ mod tests {
 
         drop(attempt);
         assert!(model.snapshot().can_connect());
+    }
+
+    #[test]
+    fn snapshot_publication_uses_core_revisions() {
+        let host = HostBoundaries::new();
+        let prepared = prepare_connection("ws://127.0.0.1:1", "", &mut None, &host)
+            .expect("loopback profile is valid");
+
+        let first = changed_snapshot(&prepared.intent).expect("first snapshot is published");
+        assert!(changed_snapshot(&prepared.intent).is_none());
+        let _directive = prepared.intent.model.set_run_state(AppRunState::Foreground);
+        let second = changed_snapshot(&prepared.intent).expect("changed snapshot is published");
+        assert_ne!(first.revision(), second.revision());
+        assert_eq!(
+            prepared.intent.model.snapshot().revision(),
+            second.revision()
+        );
+    }
+
+    #[test]
+    fn stopped_attempt_is_dropped_before_resume_reconciliation() {
+        let endpoint = GatewayEndpoint::parse("wss://gateway.example").expect("valid endpoint");
+        let model = IosSessionModel::new(&endpoint);
+        let _directive = model.set_run_state(AppRunState::Foreground);
+        let _directive = model.set_network_path(IosNetworkPath::Satisfied(IosNetworkRoute::new(
+            1,
+            IosNetworkInterface::Other,
+        )));
+        let attempt = model.begin_attempt().expect("attempt starts");
+        let attempt_id = attempt.id();
+        let _observation = attempt.observe(ConnectionState::Connecting);
+
+        assert!(matches!(
+            model.set_run_state(AppRunState::Background),
+            TransportDirective::Stop {
+                attempt_id: stopped,
+                ..
+            } if stopped == attempt_id
+        ));
+        assert_eq!(
+            model.set_run_state(AppRunState::Foreground),
+            TransportDirective::None,
+            "resume stays blocked while the stopped guard is still held"
+        );
+        drop(attempt);
+        assert_eq!(
+            model.reconcile(),
+            TransportDirective::Resume {
+                reason: TransportResumeReason::ReturnedToForeground
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_failure_clears_resume_instead_of_overlapping_transports() {
+        let host = Arc::new(HostBoundaries::new());
+        let mut identity = None;
+        let prepared =
+            prepare_connection("ws://127.0.0.1:1", "session-token", &mut identity, &host)
+                .expect("loopback profile is valid");
+        let _directive = prepared.intent.model.set_run_state(AppRunState::Foreground);
+        let _directive = prepared
+            .intent
+            .model
+            .set_network_path(IosNetworkPath::Satisfied(IosNetworkRoute::new(
+                1,
+                IosNetworkInterface::Other,
+            )));
+        let attempt = prepared
+            .intent
+            .model
+            .begin_attempt()
+            .expect("attempt starts");
+        let attempt_id = attempt.id();
+        let _observation = attempt.observe(ConnectionState::Connecting);
+        let stop = prepared.intent.model.set_run_state(AppRunState::Background);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(async move {
+            drop(attempt);
+            Err(WorkerFailure::poisoned(UiSnapshot::fatal(
+                "Disconnect did not finish",
+                "fixture timeout",
+                "Restart the app.",
+            )))
+        });
+        let mut active = Some(ActiveConnection {
+            generation: 1,
+            attempt_id,
+            cancellation,
+            task,
+        });
+        let (updates_tx, _updates_rx) = mpsc::unbounded_channel();
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let delivered_for_sink = Arc::clone(&delivered);
+        let sink: SnapshotSink = Arc::new(move |update| {
+            delivered_for_sink
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(update);
+        });
+        let mut poisoned = false;
+        let mut next_worker_generation = 1;
+
+        process_directive(
+            stop,
+            &prepared.intent,
+            &mut active,
+            &mut poisoned,
+            DirectiveContext {
+                session_identity: identity.as_ref(),
+                host: &host,
+                updates: &updates_tx,
+                sink: &sink,
+                next_worker_generation: &mut next_worker_generation,
+            },
+        )
+        .await;
+
+        assert!(active.is_none());
+        assert!(poisoned);
+        assert_eq!(
+            prepared.intent.model.set_run_state(AppRunState::Foreground),
+            TransportDirective::None
+        );
+        assert_eq!(prepared.intent.model.reconcile(), TransportDirective::None);
+        assert!(
+            delivered
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|update| matches!(update, UiUpdate::Shell(snapshot) if !snapshot.can_connect))
+        );
     }
 }

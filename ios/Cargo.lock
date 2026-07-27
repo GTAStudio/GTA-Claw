@@ -1924,6 +1924,7 @@ dependencies = [
  "claw-security",
  "getrandom 0.4.3",
  "gta-claw-ios",
+ "secrecy",
  "skia-safe",
  "slint",
  "slint-build",

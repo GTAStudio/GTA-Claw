@@ -108,6 +108,11 @@ component StatusCard inherits Rectangle {
     in property <string> protocol-summary;
     in property <string> authorization-summary;
     in property <string> actions-summary;
+    in property <string> snapshot-revision;
+    in property <string> run-state-summary;
+    in property <string> network-path-summary;
+    in property <bool> should-resume;
+    in property <string> credential-store-notice;
     in property <bool> can-cancel;
     in property <bool> can-disconnect;
     in property <bool> has-error;
@@ -124,7 +129,7 @@ component StatusCard inherits Rectangle {
     border-color: #dce4ef;
     border-width: 1px;
     border-radius: 22px;
-    min-height: 360px;
+    min-height: 430px;
 
     VerticalLayout {
         padding: 22px;
@@ -160,6 +165,14 @@ component StatusCard inherits Rectangle {
             wrap: word-wrap;
         }
 
+        if root.should-resume : Text {
+            text: @tr("A fresh transport will resume when host preconditions allow.");
+            color: #1769aa;
+            font-size: 13px;
+            font-weight: 600;
+            wrap: word-wrap;
+        }
+
         if root.has-error : Rectangle {
             background: #fff1f0;
             border-color: #f2b8b5;
@@ -192,19 +205,23 @@ component StatusCard inherits Rectangle {
             Text { row: 3; col: 1; text: root.authorization-summary; color: #28374c; horizontal-alignment: right; overflow: elide; }
             Text { row: 4; col: 0; text: @tr("Available actions"); color: #6c788a; }
             Text { row: 4; col: 1; text: root.actions-summary; color: #28374c; horizontal-alignment: right; overflow: elide; }
+            Text { row: 5; col: 0; text: @tr("App / network"); color: #6c788a; }
+            Text { row: 5; col: 1; text: @tr("{} / {}", root.run-state-summary, root.network-path-summary); color: #28374c; horizontal-alignment: right; }
+            Text { row: 6; col: 0; text: @tr("Revision"); color: #6c788a; }
+            Text { row: 6; col: 1; text: root.snapshot-revision; color: #28374c; horizontal-alignment: right; }
         }
 
         Rectangle {
             background: #f2f7fb;
             border-radius: 12px;
-            min-height: 78px;
+            min-height: 92px;
 
             Text {
                 x: 12px;
                 y: 10px;
                 width: parent.width - 24px;
                 height: parent.height - 20px;
-                text: @tr("Credentials and the generated device identity live only for this process. This build writes neither to Keychain.");
+                text: root.credential-store-notice;
                 color: #526176;
                 font-size: 13px;
                 wrap: word-wrap;
@@ -242,6 +259,14 @@ export component AppWindow inherits Window {
     in property <string> protocol-summary: "-";
     in property <string> authorization-summary: @tr("Nothing confirmed");
     in property <string> actions-summary: @tr("No actions confirmed");
+    in property <string> snapshot-revision: "0";
+    in property <string> run-state-summary: @tr("inactive");
+    in property <string> network-path-summary: @tr("checking network");
+    in property <bool> should-resume: false;
+    in property <string> credential-store-notice: "";
+    in property <string> discovery-title: "";
+    in property <string> discovery-explanation: "";
+    in property <string> discovery-action: "";
     in property <bool> busy: false;
     in property <bool> can-connect: true;
     in property <bool> can-cancel: false;
@@ -317,6 +342,11 @@ export component AppWindow inherits Window {
                         protocol-summary: root.protocol-summary;
                         authorization-summary: root.authorization-summary;
                         actions-summary: root.actions-summary;
+                        snapshot-revision: root.snapshot-revision;
+                        run-state-summary: root.run-state-summary;
+                        network-path-summary: root.network-path-summary;
+                        should-resume: root.should-resume;
+                        credential-store-notice: root.credential-store-notice;
                         can-cancel: root.can-cancel;
                         can-disconnect: root.can-disconnect;
                         has-error: root.has-error;
@@ -347,6 +377,11 @@ export component AppWindow inherits Window {
                         protocol-summary: root.protocol-summary;
                         authorization-summary: root.authorization-summary;
                         actions-summary: root.actions-summary;
+                        snapshot-revision: root.snapshot-revision;
+                        run-state-summary: root.run-state-summary;
+                        network-path-summary: root.network-path-summary;
+                        should-resume: root.should-resume;
+                        credential-store-notice: root.credential-store-notice;
                         can-cancel: root.can-cancel;
                         can-disconnect: root.can-disconnect;
                         has-error: root.has-error;
@@ -358,18 +393,31 @@ export component AppWindow inherits Window {
                 Rectangle {
                     background: #e8eef5;
                     border-radius: 14px;
-                    min-height: 112px;
+                    min-height: 148px;
 
-                    Text {
-                        x: 14px;
-                        y: 12px;
-                        width: parent.width - 28px;
-                        height: parent.height - 24px;
-                        text: @tr("Platform limits: no UIKit lifecycle or NWPathMonitor adapter, Bonjour discovery, pairing, push, background refresh, or Keychain persistence. The core remains fail-closed until lifecycle and path facts are attached.");
-                        color: #566479;
-                        font-size: 13px;
-                        wrap: word-wrap;
-                        vertical-alignment: center;
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 5px;
+
+                        Text {
+                            text: root.discovery-title;
+                            color: #34435a;
+                            font-weight: 700;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: root.discovery-explanation;
+                            color: #566479;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: root.discovery-action;
+                            color: #1769aa;
+                            font-size: 13px;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                        }
                     }
                 }
             }

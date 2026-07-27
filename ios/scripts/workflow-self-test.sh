@@ -4,6 +4,9 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 workspace="$repo_root/ios"
 workflow="$repo_root/.github/workflows/ios-packaging.yml"
+controller="$workspace/apps/gta-claw-ios-shell/src/controller.rs"
+host="$workspace/apps/gta-claw-ios-shell/src/host.rs"
+main="$workspace/apps/gta-claw-ios-shell/src/main.rs"
 
 find "$workspace/scripts" -type f -name '*.sh' -print0 |
   while IFS= read -r -d '' script; do
@@ -13,6 +16,15 @@ find "$workspace/scripts" -type f -name '*.sh' -print0 |
 grep -F 'version = "=1.17.1"' "$workspace/Cargo.toml" >/dev/null
 grep -F '"renderer-skia"' "$workspace/apps/gta-claw-ios-shell/Cargo.toml" >/dev/null
 grep -F '"no-compile"' "$workspace/Cargo.toml" >/dev/null
+grep -F 'handle.set_run_state(AppRunState::Foreground)' "$main" >/dev/null
+grep -F 'handle.set_network_path(IosNetworkPath::Satisfied' "$main" >/dev/null
+grep -F 'TransportDirective::Stop' "$controller" >/dev/null
+grep -F 'intent.model.reconcile()' "$controller" >/dev/null
+grep -F '.observe(state.clone())' "$controller" >/dev/null
+grep -F 'snapshot_if_changed' "$controller" >/dev/null
+grep -F 'impl HostCredentialStore for SessionCredentialStore' "$host" >/dev/null
+grep -F 'impl HostDiscoveryProvider<GatewayMdnsBackend>' "$host" >/dev/null
+grep -F 'DiscoveryRemediation::AddInfoPlistDeclaration' "$host" >/dev/null
 grep -F 'name = "skia-bindings"' "$workspace/Cargo.lock" >/dev/null
 grep -F 'version = "0.99.0"' "$workspace/Cargo.lock" >/dev/null
 grep -F '15e20f3265dfddd658f9ef0d0e30d50a73afccb88787812f65fb5e6cf4ec55c8' \
