@@ -9,7 +9,6 @@ repository.workspace = true
 include = [
   "Cargo.toml",
   "assets/**",
-  "build.rs",
   "src/**",
   "tests/**",
 ]

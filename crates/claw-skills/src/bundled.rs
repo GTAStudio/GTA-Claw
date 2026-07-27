@@ -3,9 +3,11 @@
 //! The bundled set is shipped as one `skill.json` per skill under
 //! `assets/bundled/<id>/`. Nothing here shells out, and no JavaScript runtime is
 //! involved: the manifests are plain JSON decoded by `serde_json` and validated
-//! against a closed model. The build script embeds whatever directories exist,
-//! so the compiled catalogue is derived from the shipped tree rather than from a
-//! list written by hand.
+//! against a closed model. The [`assets`] submodule embeds the shipped documents
+//! with `include_str!`, and the tests hold that table to a filesystem walk of the
+//! same directory, so the compiled catalogue cannot diverge from the tree.
+
+mod assets;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -14,7 +16,7 @@ use std::sync::OnceLock;
 
 use serde::Deserialize;
 
-include!(concat!(env!("OUT_DIR"), "/bundled_assets.rs"));
+use assets::EMBEDDED_BUNDLED_ASSETS;
 
 /// Manifest schema version this loader understands.
 pub const BUNDLED_SCHEMA_VERSION: u32 = 1;
@@ -322,13 +324,22 @@ pub fn discover_bundled_skills(root: &Path) -> Result<BundledSkillCatalog, Bundl
     load_bundled_skills(&borrowed)
 }
 
-/// Loads the manifests embedded into this crate at build time.
+/// Loads the manifests embedded into this crate at compile time.
 ///
 /// # Errors
 ///
 /// Returns the reason the shipped tree is not a valid bundled skill set.
 pub fn load_embedded_bundled_skills() -> Result<BundledSkillCatalog, BundledDiscoveryError> {
     load_bundled_skills(EMBEDDED_BUNDLED_ASSETS)
+}
+
+/// Returns the directory names embedded at compile time, in table order.
+#[must_use]
+pub fn embedded_bundled_directories() -> Vec<&'static str> {
+    EMBEDDED_BUNDLED_ASSETS
+        .iter()
+        .map(|(directory, _)| *directory)
+        .collect()
 }
 
 /// Returns the embedded bundled skill catalogue.

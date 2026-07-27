@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use claw_skills::{
     BUNDLED_BASELINE_SHA, BUNDLED_MANIFEST_FILE_NAME, BUNDLED_SCHEMA_VERSION,
     BundledDiscoveryError, BundledManifestError, SkillClassification, SkillPortStatus,
-    discover_bundled_skills, embedded_bundled_skills, load_bundled_skills,
-    load_embedded_bundled_skills, parse_bundled_manifest, registry,
+    discover_bundled_skills, embedded_bundled_directories, embedded_bundled_skills,
+    load_bundled_skills, load_embedded_bundled_skills, parse_bundled_manifest, registry,
 };
 use serde::Deserialize;
 
@@ -151,6 +151,36 @@ fn embedded_manifests_match_the_shipped_asset_tree() {
     assert_eq!(embedded_bundled_skills(), &discovered);
     assert!(!embedded.is_empty());
     assert_eq!(embedded.len(), 51);
+}
+
+#[test]
+fn every_shipped_asset_directory_is_embedded_exactly_once() {
+    let mut on_disk = std::fs::read_dir(assets_root())
+        .expect("read bundled asset root")
+        .map(|entry| {
+            entry
+                .expect("read bundled asset entry")
+                .file_name()
+                .into_string()
+                .expect("bundled asset directory name is UTF-8")
+        })
+        .collect::<Vec<_>>();
+    on_disk.sort();
+
+    let embedded = embedded_bundled_directories();
+    let mut sorted = embedded.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+
+    assert_eq!(
+        sorted.len(),
+        embedded.len(),
+        "a directory is embedded more than once"
+    );
+    assert_eq!(
+        sorted, on_disk,
+        "embedded table drifted from assets/bundled"
+    );
 }
 
 #[test]

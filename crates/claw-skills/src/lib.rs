@@ -14,8 +14,9 @@ mod schema;
 pub use bundled::{
     BUNDLED_BASELINE_SHA, BUNDLED_MANIFEST_FILE_NAME, BUNDLED_SCHEMA_VERSION,
     BundledDiscoveryError, BundledManifestError, BundledSkillCatalog, BundledSkillManifest,
-    SkillClassification, SkillPortStatus, discover_bundled_skills, embedded_bundled_skills,
-    load_bundled_skills, load_embedded_bundled_skills, parse_bundled_manifest,
+    SkillClassification, SkillPortStatus, discover_bundled_skills, embedded_bundled_directories,
+    embedded_bundled_skills, load_bundled_skills, load_embedded_bundled_skills,
+    parse_bundled_manifest,
 };
 pub use legacy::{
     LegacyBridge, LegacyParameterShape, LegacySkillDisposition, LegacySkillError,
