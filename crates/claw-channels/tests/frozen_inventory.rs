@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use claw_channels::{AuthMode, ChannelCapability, ImplementationStatus, registry};
+use claw_channels::{AuthMode, ChannelCapability, ImplementationStatus, descriptor, registry};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Eq, PartialEq)]
@@ -59,6 +59,43 @@ fn registry_matches_every_frozen_identity_and_provenance_field() {
     assert_eq!(frozen.items.len(), frozen.counts.total);
     assert_eq!(actual.len(), frozen.counts.total);
     assert_eq!(actual, frozen.items);
+}
+
+#[test]
+fn frozen_channel_identifiers_are_unique_and_individually_resolvable() {
+    let frozen = frozen_inventory();
+    let ids = frozen
+        .items
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let record_ids = frozen
+        .items
+        .iter()
+        .map(|item| item.record_id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(ids.len(), frozen.counts.total);
+    assert_eq!(record_ids.len(), frozen.counts.total);
+    for item in &frozen.items {
+        let entry = descriptor(&item.id)
+            .unwrap_or_else(|| panic!("frozen channel {} is unregistered", item.id));
+        assert_eq!(entry.id, item.id);
+        assert_eq!(entry.record_id, item.record_id);
+        assert_eq!(entry.record_id, format!("channel:{}", item.id));
+    }
+    assert_eq!(registry().len(), frozen.counts.total);
+    assert_eq!(
+        registry()
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<BTreeSet<_>>(),
+        ids,
+        "the registry must hold every frozen identifier and no other"
+    );
+    for absent in ["", "channel:slack", "SLACK", "slack ", " slack", "slack/"] {
+        assert!(descriptor(absent).is_none(), "{absent:?}");
+    }
 }
 
 #[test]

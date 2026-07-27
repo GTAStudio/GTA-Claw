@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "id": "github",
+  "classification": "official_integration",
+  "source_path": "skills/github/SKILL.md",
+  "license": "MIT",
+  "port_status": "requires_native_port",
+  "baseline_sha": "b43e832fcc8000ed7287c7accc54e381db607f85"
+}

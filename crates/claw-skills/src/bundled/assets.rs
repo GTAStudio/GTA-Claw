@@ -1,0 +1,210 @@
+//! Bundled skill manifests embedded from the shipped asset tree.
+//!
+//! Each entry pairs a skill directory name with its manifest document, pulled in
+//! by [`include_str!`] so the bytes compiled in are always the bytes on disk.
+//!
+//! The directory list is checked in rather than produced by a build script,
+//! because a build script is compiled by no `cargo test` target and would sit
+//! outside the reachability boundary the conformance harness enforces. It cannot
+//! drift unnoticed: `embedded_manifests_match_the_shipped_asset_tree` compares
+//! this table against a filesystem walk of the same directory, and
+//! `exactly_fifty_one_bundled_manifests_load_from_the_shipped_assets` compares
+//! that walk against the frozen upstream inventory in both directions, so an
+//! added, removed or renamed skill fails the suite whether or not this file was
+//! regenerated.
+
+/// Directory name and manifest document for every shipped bundled skill.
+pub(super) static EMBEDDED_BUNDLED_ASSETS: &[(&str, &str)] = &[
+    (
+        "1password",
+        include_str!("../../assets/bundled/1password/skill.json"),
+    ),
+    (
+        "apple-notes",
+        include_str!("../../assets/bundled/apple-notes/skill.json"),
+    ),
+    (
+        "apple-reminders",
+        include_str!("../../assets/bundled/apple-reminders/skill.json"),
+    ),
+    (
+        "bear-notes",
+        include_str!("../../assets/bundled/bear-notes/skill.json"),
+    ),
+    (
+        "blogwatcher",
+        include_str!("../../assets/bundled/blogwatcher/skill.json"),
+    ),
+    (
+        "blucli",
+        include_str!("../../assets/bundled/blucli/skill.json"),
+    ),
+    (
+        "camsnap",
+        include_str!("../../assets/bundled/camsnap/skill.json"),
+    ),
+    (
+        "clawhub",
+        include_str!("../../assets/bundled/clawhub/skill.json"),
+    ),
+    (
+        "coding-agent",
+        include_str!("../../assets/bundled/coding-agent/skill.json"),
+    ),
+    (
+        "diagram-maker",
+        include_str!("../../assets/bundled/diagram-maker/skill.json"),
+    ),
+    (
+        "eightctl",
+        include_str!("../../assets/bundled/eightctl/skill.json"),
+    ),
+    (
+        "gemini",
+        include_str!("../../assets/bundled/gemini/skill.json"),
+    ),
+    (
+        "gh-issues",
+        include_str!("../../assets/bundled/gh-issues/skill.json"),
+    ),
+    (
+        "gifgrep",
+        include_str!("../../assets/bundled/gifgrep/skill.json"),
+    ),
+    (
+        "github",
+        include_str!("../../assets/bundled/github/skill.json"),
+    ),
+    ("gog", include_str!("../../assets/bundled/gog/skill.json")),
+    (
+        "goplaces",
+        include_str!("../../assets/bundled/goplaces/skill.json"),
+    ),
+    (
+        "healthcheck",
+        include_str!("../../assets/bundled/healthcheck/skill.json"),
+    ),
+    (
+        "himalaya",
+        include_str!("../../assets/bundled/himalaya/skill.json"),
+    ),
+    (
+        "mcporter",
+        include_str!("../../assets/bundled/mcporter/skill.json"),
+    ),
+    (
+        "meme-maker",
+        include_str!("../../assets/bundled/meme-maker/skill.json"),
+    ),
+    (
+        "model-usage",
+        include_str!("../../assets/bundled/model-usage/skill.json"),
+    ),
+    (
+        "nano-pdf",
+        include_str!("../../assets/bundled/nano-pdf/skill.json"),
+    ),
+    (
+        "node-connect",
+        include_str!("../../assets/bundled/node-connect/skill.json"),
+    ),
+    (
+        "node-inspect-debugger",
+        include_str!("../../assets/bundled/node-inspect-debugger/skill.json"),
+    ),
+    (
+        "notion",
+        include_str!("../../assets/bundled/notion/skill.json"),
+    ),
+    (
+        "obsidian",
+        include_str!("../../assets/bundled/obsidian/skill.json"),
+    ),
+    (
+        "openai-whisper",
+        include_str!("../../assets/bundled/openai-whisper/skill.json"),
+    ),
+    (
+        "openai-whisper-api",
+        include_str!("../../assets/bundled/openai-whisper-api/skill.json"),
+    ),
+    (
+        "openhue",
+        include_str!("../../assets/bundled/openhue/skill.json"),
+    ),
+    (
+        "oracle",
+        include_str!("../../assets/bundled/oracle/skill.json"),
+    ),
+    (
+        "ordercli",
+        include_str!("../../assets/bundled/ordercli/skill.json"),
+    ),
+    (
+        "peekaboo",
+        include_str!("../../assets/bundled/peekaboo/skill.json"),
+    ),
+    (
+        "python-debugpy",
+        include_str!("../../assets/bundled/python-debugpy/skill.json"),
+    ),
+    ("sag", include_str!("../../assets/bundled/sag/skill.json")),
+    (
+        "session-logs",
+        include_str!("../../assets/bundled/session-logs/skill.json"),
+    ),
+    (
+        "sherpa-onnx-tts",
+        include_str!("../../assets/bundled/sherpa-onnx-tts/skill.json"),
+    ),
+    (
+        "skill-creator",
+        include_str!("../../assets/bundled/skill-creator/skill.json"),
+    ),
+    (
+        "songsee",
+        include_str!("../../assets/bundled/songsee/skill.json"),
+    ),
+    (
+        "sonoscli",
+        include_str!("../../assets/bundled/sonoscli/skill.json"),
+    ),
+    (
+        "spike",
+        include_str!("../../assets/bundled/spike/skill.json"),
+    ),
+    (
+        "spotify-player",
+        include_str!("../../assets/bundled/spotify-player/skill.json"),
+    ),
+    (
+        "summarize",
+        include_str!("../../assets/bundled/summarize/skill.json"),
+    ),
+    (
+        "taskflow",
+        include_str!("../../assets/bundled/taskflow/skill.json"),
+    ),
+    (
+        "taskflow-inbox-triage",
+        include_str!("../../assets/bundled/taskflow-inbox-triage/skill.json"),
+    ),
+    (
+        "things-mac",
+        include_str!("../../assets/bundled/things-mac/skill.json"),
+    ),
+    ("tmux", include_str!("../../assets/bundled/tmux/skill.json")),
+    (
+        "trello",
+        include_str!("../../assets/bundled/trello/skill.json"),
+    ),
+    (
+        "video-frames",
+        include_str!("../../assets/bundled/video-frames/skill.json"),
+    ),
+    (
+        "weather",
+        include_str!("../../assets/bundled/weather/skill.json"),
+    ),
+    ("xurl", include_str!("../../assets/bundled/xurl/skill.json")),
+];
