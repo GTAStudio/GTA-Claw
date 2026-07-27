@@ -96,6 +96,12 @@ pub struct ContextAssembler<C: TokenCounter> {
 
 impl<C: TokenCounter> ContextAssembler<C> {
     /// Creates an assembler, validating the retrieval share.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::InvalidShare`] when `retrieval_share_percent`
+    /// is above one hundred, which would reserve more of the input allowance
+    /// for retrieved memory than exists.
     pub fn new(
         budget: TokenBudget,
         counter: C,
@@ -124,13 +130,26 @@ impl<C: TokenCounter> ContextAssembler<C> {
     }
 
     /// Assembles the context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::Budget`] carrying
+    /// [`BudgetError::AnchorsExceedBudget`] when the system and pinned
+    /// messages cannot fit in what the retrieval share left behind — anchors
+    /// are never dropped to make the assembly succeed —
+    /// [`BudgetError::ReservationTooLarge`] when the admitted retrieved
+    /// memory leaves no room for the model's own reply, and
+    /// [`BudgetError::InconsistentMessages`] when the truncation plan names a
+    /// message the session does not hold, which means the session changed
+    /// between planning and assembly.
     pub fn assemble(
         &self,
         session: &Session,
         retrieved: &[RetrievedItem],
     ) -> Result<AssembledContext, ContextError> {
         let available = self.budget.available();
-        let retrieval_allowance = available * self.retrieval_share_percent as usize / 100;
+        let retrieval_allowance =
+            available.saturating_mul(self.retrieval_share_percent as usize) / 100;
 
         let mut admitted_retrieved: Vec<RetrievedItem> = Vec::new();
         let mut retrieval_used = 0_usize;

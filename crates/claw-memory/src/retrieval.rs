@@ -78,6 +78,14 @@ pub struct RetrievalQuery {
 
 impl RetrievalQuery {
     /// Creates a query, validating the free-text and the result bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RetrievalError::EmptyQuery`] when `text` is blank,
+    /// [`RetrievalError::QueryTooLong`] past [`MAX_QUERY_BYTES`], and
+    /// [`RetrievalError::InvalidLimit`] when `limit` is zero or above
+    /// [`MAX_RETRIEVAL_LIMIT`]. The length bound is checked before the text
+    /// ever reaches a tokenizer.
     pub fn new(text: &str, limit: usize) -> Result<Self, RetrievalError> {
         if text.trim().is_empty() {
             return Err(RetrievalError::EmptyQuery);
@@ -104,6 +112,11 @@ impl RetrievalQuery {
     }
 
     /// Restricts the query to a set of record kinds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RetrievalError::NoKindsSelected`] when `kinds` is empty,
+    /// because a query that admits no kind can only ever return nothing.
     pub fn of_kinds<I: IntoIterator<Item = RecordKind>>(
         mut self,
         kinds: I,
@@ -140,10 +153,9 @@ impl RetrievalQuery {
         if !self.kinds.contains(&record.kind) {
             return false;
         }
-        match &self.session {
-            Some(session) => *session == record.session,
-            None => true,
-        }
+        self.session
+            .as_ref()
+            .is_none_or(|session| *session == record.session)
     }
 }
 
@@ -159,15 +171,27 @@ pub struct RetrievedItem {
 /// Retrieval port.
 pub trait Retriever {
     /// Returns the best matching records, best first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RetrievalError::EmptyQuery`] when the query text carries no
+    /// searchable term for this retriever's tokenizer, and
+    /// [`RetrievalError::Vector`] when a retriever backed by an embedding
+    /// model or a vector index has that backend refuse the query.
     fn retrieve(&mut self, query: &RetrievalQuery) -> Result<Vec<RetrievedItem>, RetrievalError>;
 }
 
-/// Splits text into lowercase alphanumeric tokens.
-fn tokens(text: &str) -> BTreeSet<String> {
+/// Splits text into lowercase alphanumeric tokens, in order and with
+/// duplicates.
+fn token_stream(text: &str) -> impl Iterator<Item = String> {
     text.split(|character: char| !character.is_alphanumeric())
         .filter(|token| !token.is_empty())
         .map(str::to_lowercase)
-        .collect()
+}
+
+/// Splits text into its distinct lowercase alphanumeric tokens.
+fn tokens(text: &str) -> BTreeSet<String> {
+    token_stream(text).collect()
 }
 
 /// Deterministic lexical retriever with no external dependencies.
@@ -177,6 +201,10 @@ fn tokens(text: &str) -> BTreeSet<String> {
 /// corpus and query always produce the same ordering.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct KeywordRetriever {
+    // Not capacity-bounded: `insert` cannot report a refusal, so a bound here
+    // could only evict silently. The owner of the corpus decides what to keep
+    // and calls `remove`; `InMemoryMemoryStore` and `ExactVectorIndex` are the
+    // bounded holders of the same records.
     records: BTreeMap<RecordId, MemoryRecord>,
 }
 
@@ -212,22 +240,37 @@ impl KeywordRetriever {
 
 impl Retriever for KeywordRetriever {
     fn retrieve(&mut self, query: &RetrievalQuery) -> Result<Vec<RetrievedItem>, RetrievalError> {
-        let terms = tokens(query.text());
+        // The distinct query terms in ascending order, so each record is
+        // scored by looking its own tokens up here rather than by building a
+        // second token set per record.
+        let terms: Vec<String> = tokens(query.text()).into_iter().collect();
         if terms.is_empty() {
             return Err(RetrievalError::EmptyQuery);
         }
+        let mut present = vec![false; terms.len()];
         let mut scored: Vec<RetrievedItem> = Vec::new();
         for record in self.records.values() {
             if !query.accepts(record) {
                 continue;
             }
-            let present = tokens(&record.text);
-            let hits = terms.iter().filter(|term| present.contains(*term)).count();
+            present.fill(false);
+            for token in token_stream(&record.text) {
+                if let Ok(index) = terms.binary_search(&token) {
+                    present[index] = true;
+                }
+            }
+            let hits = present.iter().filter(|hit| **hit).count();
             if hits == 0 {
                 continue;
             }
             // Integer ratio first, then a single division, so the score is
             // reproducible across platforms.
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "both counts are distinct token counts from a query body capped at \
+                          MAX_QUERY_BYTES, so neither can exceed a few thousand and both convert \
+                          exactly inside f32's 2^24 integer range"
+            )]
             let score = hits as f32 / terms.len() as f32;
             scored.push(RetrievedItem {
                 record: record.clone(),
@@ -251,12 +294,15 @@ impl Retriever for KeywordRetriever {
 pub struct VectorRetriever<M: EmbeddingModel, I: VectorIndex> {
     model: M,
     index: I,
+    // Bounded transitively: `insert` only reaches this map after the index
+    // has accepted the embedding, so the index's capacity is this map's
+    // capacity too. `remove` evicts from both together.
     records: BTreeMap<RecordId, MemoryRecord>,
 }
 
 impl<M: EmbeddingModel, I: VectorIndex> VectorRetriever<M, I> {
     /// Creates a retriever over a model and an index.
-    pub fn new(model: M, index: I) -> Self {
+    pub const fn new(model: M, index: I) -> Self {
         Self {
             model,
             index,
@@ -265,6 +311,17 @@ impl<M: EmbeddingModel, I: VectorIndex> VectorRetriever<M, I> {
     }
 
     /// Embeds and indexes one record.
+    ///
+    /// The payload is stored only after the index has accepted the embedding,
+    /// so a refusal leaves the retriever exactly as it was.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RetrievalError::Vector`] when the model cannot embed the
+    /// record body, when the embedding's width is not the one the index
+    /// accepts ([`VectorError::DimensionMismatch`]), or when adding a new
+    /// record would take the index past its capacity
+    /// ([`VectorError::IndexFull`]).
     pub fn insert(&mut self, record: MemoryRecord) -> Result<(), RetrievalError> {
         let embedding = self
             .model
@@ -297,6 +354,13 @@ impl<M: EmbeddingModel, I: VectorIndex> VectorRetriever<M, I> {
     }
 
     /// Embeds arbitrary text with the configured model.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`VectorError`] the configured [`EmbeddingModel`] reports,
+    /// which for the models shipped here means a degenerate vector
+    /// ([`VectorError::ZeroEmbedding`], [`VectorError::NonFiniteComponent`])
+    /// or an unusable dimensionality.
     pub fn embed(&mut self, text: &str) -> Result<Embedding, VectorError> {
         self.model.embed(text)
     }

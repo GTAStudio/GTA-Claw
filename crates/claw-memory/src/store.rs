@@ -15,28 +15,76 @@ use crate::vector::RecordId;
 /// Persistence port for sessions and memory records.
 pub trait MemoryStore {
     /// Inserts or replaces one session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SessionCapacityExceeded`] when storing a session
+    /// that is not already present would take the adapter past its session
+    /// bound, or [`StoreError::Backend`] when the underlying store is
+    /// unavailable or rejects the write.
     fn put_session(&mut self, session: &Session) -> Result<(), StoreError>;
 
     /// Loads one session.
+    ///
+    /// A missing session is `Ok(None)`, never an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the underlying store is
+    /// unavailable or the stored representation cannot be decoded.
     fn get_session(&self, id: &SessionId) -> Result<Option<Session>, StoreError>;
 
     /// Lists every stored session identifier in ascending order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the underlying store is
+    /// unavailable or the listing cannot be read to completion.
     fn list_sessions(&self) -> Result<Vec<SessionId>, StoreError>;
 
     /// Deletes one session and every record that belongs to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the underlying store is
+    /// unavailable or the session and its records cannot be removed together.
     fn delete_session(&mut self, id: &SessionId) -> Result<bool, StoreError>;
 
     /// Inserts or replaces one memory record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::EmptyRecord`] for a record with an empty body,
+    /// [`StoreError::RecordCapacityExceeded`] when storing a record that is
+    /// not already present would take the adapter past its record bound, or
+    /// [`StoreError::Backend`] when the underlying store is unavailable.
     fn put_record(&mut self, record: MemoryRecord) -> Result<(), StoreError>;
 
     /// Loads one memory record.
+    ///
+    /// A missing record is `Ok(None)`, never an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the underlying store is
+    /// unavailable or the stored representation cannot be decoded.
     fn get_record(&self, id: &RecordId) -> Result<Option<MemoryRecord>, StoreError>;
 
     /// Lists records, optionally restricted to one session, in identifier
     /// order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the underlying store is
+    /// unavailable or the listing cannot be read to completion.
     fn records(&self, session: Option<&SessionId>) -> Result<Vec<MemoryRecord>, StoreError>;
 
     /// Deletes one record, reporting whether it existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the underlying store is
+    /// unavailable or the removal cannot be applied.
     fn delete_record(&mut self, id: &RecordId) -> Result<bool, StoreError>;
 }
 

@@ -56,7 +56,16 @@ impl Default for HeuristicTokenCounter {
 
 impl HeuristicTokenCounter {
     /// Creates a counter with an explicit character density.
-    pub fn new(characters_per_token: usize, framing_overhead: usize) -> Result<Self, BudgetError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BudgetError::InvalidDensity`] when `characters_per_token` is
+    /// zero, which would make every non-empty text cost an unbounded number
+    /// of tokens.
+    pub const fn new(
+        characters_per_token: usize,
+        framing_overhead: usize,
+    ) -> Result<Self, BudgetError> {
         if characters_per_token == 0 {
             return Err(BudgetError::InvalidDensity);
         }
@@ -89,7 +98,16 @@ pub struct TokenBudget {
 
 impl TokenBudget {
     /// Creates a budget, refusing one that leaves no room for input.
-    pub fn new(context_window: usize, reserved_for_output: usize) -> Result<Self, BudgetError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BudgetError::EmptyWindow`] when `context_window` is zero, and
+    /// [`BudgetError::ReservationTooLarge`] when `reserved_for_output` is at
+    /// least the whole window, which would leave no tokens for input.
+    pub const fn new(
+        context_window: usize,
+        reserved_for_output: usize,
+    ) -> Result<Self, BudgetError> {
         if context_window == 0 {
             return Err(BudgetError::EmptyWindow);
         }
@@ -189,6 +207,13 @@ impl TruncationPlan {
 }
 
 /// Applies the truncation rules to one message set.
+///
+/// # Errors
+///
+/// Returns [`BudgetError::AnchorsExceedBudget`] when the system and pinned
+/// messages alone cost more than `budget.available()`. Anchors are never
+/// dropped to make room, so an assembly that cannot hold them fails here
+/// instead of silently shipping a conversation without its instructions.
 pub fn plan_truncation<C: TokenCounter + ?Sized>(
     messages: &[Message],
     summaries: &[Summary],
@@ -218,7 +243,7 @@ pub fn plan_truncation<C: TokenCounter + ?Sized>(
     }
 
     let mut dropped: Vec<(u64, Admission)> = Vec::new();
-    let mut window: Vec<(u64, Admission)> = Vec::new();
+    let mut window: Vec<&Message> = Vec::new();
     let mut truncated = false;
     for message in messages.iter().rev().filter(|message| !message.is_anchor()) {
         if truncated {
@@ -232,32 +257,32 @@ pub fn plan_truncation<C: TokenCounter + ?Sized>(
             continue;
         }
         used += cost;
-        window.push((message.id.get(), Admission::Recent));
+        window.push(message);
     }
     window.reverse();
 
     // Rule 4: a window that opens on a tool result is missing the request it
     // answers, so the orphan is dropped until the window opens cleanly.
     //
-    // The window is consumed from an advancing offset rather than by removing
-    // the head, so a session whose window is entirely orphaned tool results
+    // The window holds the messages themselves and is consumed from an
+    // advancing offset, so neither recognising an orphan nor discarding it
+    // rescans the session: a window that is entirely orphaned tool results
     // costs linear rather than quadratic work.
     let mut opening = 0_usize;
-    while let Some((id, _)) = window.get(opening).copied() {
-        let message = messages
-            .iter()
-            .find(|message| message.id.get() == id)
-            .ok_or(BudgetError::InconsistentMessages)?;
+    while let Some(message) = window.get(opening) {
         if message.role != Role::Tool {
             break;
         }
         used = used.saturating_sub(counter.count_message(message));
-        dropped.push((id, Admission::OrphanedToolResult));
+        dropped.push((message.id.get(), Admission::OrphanedToolResult));
         opening += 1;
     }
-    window.drain(..opening);
 
-    admitted.extend(window);
+    admitted.extend(
+        window[opening..]
+            .iter()
+            .map(|message| (message.id.get(), Admission::Recent)),
+    );
     admitted.sort_unstable_by_key(|(id, _)| *id);
     dropped.sort_unstable_by_key(|(id, _)| *id);
     Ok(TruncationPlan {

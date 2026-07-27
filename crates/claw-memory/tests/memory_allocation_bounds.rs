@@ -121,6 +121,70 @@ fn a_session_stops_accepting_summaries_at_the_retained_summary_bound() {
 }
 
 #[test]
+fn a_persisted_document_cannot_restore_a_session_past_its_bounds() {
+    // Every bound above is enforced on the write path. Deserialization is the
+    // one way into a `Session` that skips it, so a stored or transmitted
+    // document is exactly where an unbounded history would come back in.
+    let mut messages = vec![
+        "{\"id\":0,\"role\":\"system\",\"content\":\"rules\",\
+         \"unix_millis\":1,\"pinned\":false}"
+            .to_owned(),
+    ];
+    for ordinal in 1..=MAX_MESSAGES {
+        let id = ordinal as u64;
+        messages.push(format!(
+            "{{\"id\":{id},\"role\":\"user\",\"content\":\"x\",\
+             \"unix_millis\":{id},\"pinned\":false}}"
+        ));
+    }
+    let summaries: Vec<String> = (0..=MAX_SUMMARIES)
+        .map(|ordinal| {
+            let first = ordinal as u64;
+            format!(
+                "{{\"first\":{first},\"last\":{first},\"text\":\"compacted\",\
+                 \"unix_millis\":1}}"
+            )
+        })
+        .collect();
+    let document = format!(
+        "{{\"id\":\"restored\",\"messages\":[{}],\"summaries\":[{}],\"next_ordinal\":0}}",
+        messages.join(","),
+        summaries.join(",")
+    );
+
+    let restored: Session = serde_json::from_str(&document)
+        .expect("an over-bound document loads rather than failing an existing save");
+    assert_eq!(
+        restored.len(),
+        MAX_MESSAGES,
+        "the retained-message bound holds after loading"
+    );
+    assert_eq!(
+        restored.summaries().len(),
+        MAX_SUMMARIES,
+        "the retained-summary bound holds after loading"
+    );
+    assert_eq!(
+        restored.messages()[0].id,
+        MessageId::new(0),
+        "the anchor is never what gets shed"
+    );
+    assert_eq!(
+        restored.last().map(|message| message.id),
+        Some(MessageId::new(MAX_MESSAGES as u64)),
+        "the newest message survives"
+    );
+
+    // The restored session is a working session, not just a bounded one: the
+    // next append is refused at the bound exactly as it would have been.
+    let mut restored = restored;
+    assert_eq!(
+        restored.append(Role::User, "one too many", 9_999).err(),
+        Some(SessionError::TooManyMessages)
+    );
+}
+
+#[test]
 fn a_retrieval_query_past_the_byte_bound_is_refused_before_tokenization() {
     let at_bound = RetrievalQuery::new(&"q".repeat(MAX_QUERY_BYTES), 5);
     assert_eq!(

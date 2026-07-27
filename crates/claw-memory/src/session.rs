@@ -7,6 +7,7 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
 /// Inclusive maximum byte length of a session identifier.
@@ -29,12 +30,22 @@ pub const MAX_SUMMARIES: usize = 10_000;
 /// A validated session identifier.
 ///
 /// Identifiers are restricted so they can be used as storage keys and appear
-/// in logs without escaping.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+/// in logs without escaping. [`Deserialize`] runs the same validation, so a
+/// stored or transmitted identifier cannot reintroduce one the constructor
+/// would have refused.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct SessionId(String);
 
 impl SessionId {
     /// Validates and creates a session identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::EmptySessionId`] for an empty `value`,
+    /// [`SessionError::SessionIdTooLong`] past [`MAX_SESSION_ID_BYTES`], and
+    /// [`SessionError::InvalidSessionId`] for anything outside ASCII
+    /// alphanumerics, `-`, `_` and `.`, so an identifier is always safe as a
+    /// storage key and in a log line.
     pub fn new(value: &str) -> Result<Self, SessionError> {
         if value.is_empty() {
             return Err(SessionError::EmptySessionId);
@@ -61,6 +72,16 @@ impl SessionId {
 impl Display for SessionId {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(de::Error::custom)
     }
 }
 
@@ -170,10 +191,19 @@ impl Summary {
 }
 
 /// One conversation with its accumulated summaries.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+///
+/// [`Deserialize`] re-applies the bounds the write path applies, so a stored
+/// document restores a session that is within them rather than one that is
+/// merely shaped like a session. See [`Session::restore`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Session {
     id: SessionId,
+    // Bounded by `MAX_MESSAGES` in `append`; `absorb` is the eviction path,
+    // replacing a covered run with one summary.
     messages: Vec<Message>,
+    // Bounded by `MAX_SUMMARIES` in `absorb`. There is deliberately no
+    // eviction path: dropping a summary would erase the only remaining record
+    // of the messages it replaced, so the bound fails loudly instead.
     summaries: Vec<Summary>,
     next_ordinal: u64,
 }
@@ -200,6 +230,15 @@ impl Session {
     ///
     /// Timestamps are never trusted for ordering: identifiers are assigned
     /// here and increase monotonically regardless of clock behaviour.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::EmptyMessage`] for an empty body,
+    /// [`SessionError::MessageTooLong`] past [`MAX_MESSAGE_BYTES`],
+    /// [`SessionError::TooManyMessages`] once the session already retains
+    /// [`MAX_MESSAGES`] messages, and [`SessionError::SessionExhausted`] if
+    /// the monotonic ordinal would overflow. Nothing is retained on any of
+    /// these paths, so a refused append leaves the session unchanged.
     pub fn append(
         &mut self,
         role: Role,
@@ -207,12 +246,7 @@ impl Session {
         unix_millis: u64,
     ) -> Result<MessageId, SessionError> {
         let content = content.into();
-        if content.is_empty() {
-            return Err(SessionError::EmptyMessage);
-        }
-        if content.len() > MAX_MESSAGE_BYTES {
-            return Err(SessionError::MessageTooLong);
-        }
+        check_body(&content)?;
         if self.messages.len() >= MAX_MESSAGES {
             return Err(SessionError::TooManyMessages);
         }
@@ -258,16 +292,17 @@ impl Session {
     ///
     /// Anchors are never removed: an operator instruction stays verbatim even
     /// when the surrounding conversation is compacted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::InvalidSummaryRange`] when `first` is after
+    /// `last`, [`SessionError::EmptyMessage`] for empty summary text,
+    /// [`SessionError::MessageTooLong`] past [`MAX_MESSAGE_BYTES`], and
+    /// [`SessionError::TooManySummaries`] once the session already retains
+    /// [`MAX_SUMMARIES`] summaries. Every check runs before any message is
+    /// removed, so a refused summary compacts nothing.
     pub fn absorb(&mut self, summary: Summary) -> Result<usize, SessionError> {
-        if summary.first > summary.last {
-            return Err(SessionError::InvalidSummaryRange);
-        }
-        if summary.text.is_empty() {
-            return Err(SessionError::EmptyMessage);
-        }
-        if summary.text.len() > MAX_MESSAGE_BYTES {
-            return Err(SessionError::MessageTooLong);
-        }
+        check_summary(&summary)?;
         if self.summaries.len() >= MAX_SUMMARIES {
             return Err(SessionError::TooManySummaries);
         }
@@ -286,14 +321,167 @@ impl Session {
 
     /// Returns the number of retained messages.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.messages.len()
     }
 
     /// Reports whether no messages are retained.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.messages.is_empty()
+    }
+}
+
+/// The body rule [`Session::append`] applies to a message and
+/// [`Session::absorb`] applies to a summary.
+///
+/// It lives here so the write path and the restore path cannot drift apart:
+/// a body that `append` would have refused is a body a decoded document may
+/// not carry either.
+const fn check_body(text: &str) -> Result<(), SessionError> {
+    if text.is_empty() {
+        return Err(SessionError::EmptyMessage);
+    }
+    if text.len() > MAX_MESSAGE_BYTES {
+        return Err(SessionError::MessageTooLong);
+    }
+    Ok(())
+}
+
+/// The rule [`Session::absorb`] applies to a summary before it is recorded.
+fn check_summary(summary: &Summary) -> Result<(), SessionError> {
+    if summary.first > summary.last {
+        return Err(SessionError::InvalidSummaryRange);
+    }
+    check_body(&summary.text)
+}
+
+/// Drops the oldest ordinary messages until at most [`MAX_MESSAGES`] remain.
+///
+/// This is the retention rule the rest of the crate already applies: anchors
+/// survive, and what is shed is the oldest non-anchor history — the same run
+/// [`crate::summarize::plan_summarization`] would have picked for compaction
+/// and the same messages [`crate::budget::plan_truncation`] leaves outside
+/// its window. `Vec::retain` visits front to back, so the surplus is taken
+/// from the oldest end.
+fn shed_oldest_history(messages: &mut Vec<Message>) {
+    let mut surplus = messages.len().saturating_sub(MAX_MESSAGES);
+    if surplus == 0 {
+        return;
+    }
+    messages.retain(|message| {
+        if surplus > 0 && !message.is_anchor() {
+            surplus -= 1;
+            return false;
+        }
+        true
+    });
+}
+
+/// The wire shape of a [`Session`], before its bounds are re-applied.
+///
+/// The field set and the name are exactly the derived ones, so the format a
+/// stored session was written in is the format it is read back from, down to
+/// the diagnostics a malformed document produces.
+#[derive(Deserialize)]
+#[serde(rename = "Session")]
+struct RawSession {
+    id: SessionId,
+    messages: Vec<Message>,
+    summaries: Vec<Summary>,
+    next_ordinal: u64,
+}
+
+/// Why a decoded session document could not be restored.
+enum RestoreError {
+    /// A retained message or summary broke a bound that shedding history
+    /// cannot repair.
+    Bound(SessionError),
+    /// Message identifiers were not strictly increasing, so "oldest" and
+    /// "newest" are undefined and no repair rule applies.
+    NonMonotonicMessages,
+}
+
+impl Display for RestoreError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bound(error) => Display::fmt(error, formatter),
+            Self::NonMonotonicMessages => {
+                formatter.write_str("message identifiers are not strictly increasing")
+            }
+        }
+    }
+}
+
+impl Session {
+    /// Rebuilds a session from a decoded document, re-applying the bounds the
+    /// write path applies.
+    ///
+    /// Deserialization is the one way into a `Session` that does not go
+    /// through [`Session::append`] and [`Session::absorb`], so without this a
+    /// stored or transmitted document would restore a session past every
+    /// bound the type advertises — and a store that can be loaded into an
+    /// invalid state has no bounds at all.
+    ///
+    /// Restoring repairs rather than refuses wherever the crate already has a
+    /// rule for what to shed, so an existing save never stops loading: an
+    /// over-long history sheds its oldest ordinary messages, exactly as
+    /// compaction would have done while the session was live, and surplus
+    /// summaries keep the newest, exactly as truncation admits them. Only
+    /// what no rule can repair is refused: an identifier order that makes
+    /// "oldest" meaningless, a body [`Session::append`] would have rejected,
+    /// or a history of anchors alone past [`MAX_MESSAGES`], which cannot be
+    /// shed without discarding an operator instruction.
+    ///
+    /// On any session the write path could have produced this is the identity
+    /// function.
+    fn restore(raw: RawSession) -> Result<Self, RestoreError> {
+        let RawSession {
+            id,
+            mut messages,
+            mut summaries,
+            next_ordinal,
+        } = raw;
+
+        // Recency is positional throughout this crate, so the ordering
+        // invariant has to hold before anything decides what is oldest.
+        if !messages.is_sorted_by(|earlier, later| earlier.id < later.id) {
+            return Err(RestoreError::NonMonotonicMessages);
+        }
+        shed_oldest_history(&mut messages);
+        if messages.len() > MAX_MESSAGES {
+            return Err(RestoreError::Bound(SessionError::TooManyMessages));
+        }
+        summaries.drain(..summaries.len().saturating_sub(MAX_SUMMARIES));
+
+        for message in &messages {
+            check_body(&message.content).map_err(RestoreError::Bound)?;
+        }
+        for summary in &summaries {
+            check_summary(summary).map_err(RestoreError::Bound)?;
+        }
+
+        // `append` hands out `next_ordinal` and then advances it, so it is
+        // always past every identifier the session holds. A document that
+        // disagrees would hand out a duplicate on the very next append.
+        let after_last = messages
+            .last()
+            .map_or(0, |message| message.id.get().saturating_add(1));
+        Ok(Self {
+            id,
+            messages,
+            summaries,
+            next_ordinal: next_ordinal.max(after_last),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Session {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::restore(RawSession::deserialize(deserializer)?).map_err(de::Error::custom)
     }
 }
 
@@ -342,9 +530,253 @@ impl Error for SessionError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn session() -> Session {
         Session::new(SessionId::new("s-1").expect("valid identifier"))
+    }
+
+    fn message_json(id: u64, role: Role, content: &str, pinned: bool) -> String {
+        format!(
+            "{{\"id\":{id},\"role\":\"{role}\",\"content\":\"{content}\",\
+             \"unix_millis\":{id},\"pinned\":{pinned}}}"
+        )
+    }
+
+    fn summary_json(first: u64, last: u64, text: &str) -> String {
+        format!("{{\"first\":{first},\"last\":{last},\"text\":\"{text}\",\"unix_millis\":1}}")
+    }
+
+    fn document(messages: &[String], summaries: &[String], next_ordinal: u64) -> String {
+        let mut json = String::from("{\"id\":\"restored\",\"messages\":[");
+        json.push_str(&messages.join(","));
+        json.push_str("],\"summaries\":[");
+        json.push_str(&summaries.join(","));
+        write!(json, "],\"next_ordinal\":{next_ordinal}}}").expect("writing to a string");
+        json
+    }
+
+    fn restore(document: &str) -> Result<Session, serde_json::Error> {
+        serde_json::from_str(document)
+    }
+
+    /// The property everything else depends on: normalization must be the
+    /// identity on any session the write path could have produced, or every
+    /// existing save is silently rewritten the first time it is loaded.
+    #[test]
+    fn a_valid_session_round_trips_through_serde_byte_for_byte() {
+        let mut original = session();
+        original.append(Role::System, "rules", 1).expect("appended");
+        let pinned = original.append(Role::User, "keep me", 2).expect("appended");
+        original.append(Role::Assistant, "a", 3).expect("appended");
+        original.append(Role::User, "b", 4).expect("appended");
+        assert!(original.pin(pinned));
+        original
+            .absorb(Summary {
+                first: MessageId::new(2),
+                last: MessageId::new(2),
+                text: "earlier discussion".to_owned(),
+                unix_millis: 5,
+            })
+            .expect("absorbed");
+        original.append(Role::Assistant, "c", 6).expect("appended");
+
+        let encoded = serde_json::to_string(&original).expect("serialized");
+        let restored: Session = serde_json::from_str(&encoded).expect("deserialized");
+        assert_eq!(
+            restored, original,
+            "restoring a valid session changes nothing"
+        );
+        assert_eq!(
+            serde_json::to_string(&restored).expect("serialized"),
+            encoded,
+            "a second round trip is byte-identical"
+        );
+
+        // The write path continues from where the document left off.
+        let mut restored = restored;
+        assert_eq!(
+            restored.append(Role::User, "next", 7).expect("appended"),
+            MessageId::new(5)
+        );
+    }
+
+    /// The one case where a naive "recompute the ordinal from the history"
+    /// repair would corrupt a perfectly valid session: compaction can remove
+    /// the newest messages, leaving the next identifier legitimately far
+    /// ahead of the last one retained.
+    #[test]
+    fn a_compacted_tail_never_rewinds_the_next_identifier() {
+        let mut original = session();
+        original.append(Role::System, "rules", 1).expect("appended");
+        for unix_millis in 2..6 {
+            original
+                .append(Role::User, "x", unix_millis)
+                .expect("appended");
+        }
+        original
+            .absorb(Summary {
+                first: MessageId::new(1),
+                last: MessageId::new(4),
+                text: "all of it".to_owned(),
+                unix_millis: 6,
+            })
+            .expect("absorbed");
+        assert_eq!(original.len(), 1, "only the anchor is left");
+
+        let encoded = serde_json::to_string(&original).expect("serialized");
+        let mut restored: Session = serde_json::from_str(&encoded).expect("deserialized");
+        assert_eq!(restored, original);
+        assert_eq!(
+            restored.append(Role::User, "next", 7).expect("appended"),
+            MessageId::new(5),
+            "the summarized identifiers are never handed out twice"
+        );
+    }
+
+    #[test]
+    fn an_over_long_history_sheds_its_oldest_ordinary_messages_and_still_loads() {
+        let mut messages = vec![
+            message_json(0, Role::System, "rules", false),
+            message_json(1, Role::User, "pinned", true),
+        ];
+        for id in 2..=(MAX_MESSAGES as u64 + 2) {
+            messages.push(message_json(id, Role::User, "x", false));
+        }
+        assert_eq!(messages.len(), MAX_MESSAGES + 3);
+
+        let restored = restore(&document(&messages, &[], MAX_MESSAGES as u64 + 3))
+            .expect("an over-long history loads rather than failing");
+        assert_eq!(restored.len(), MAX_MESSAGES, "the bound is restored");
+        let ids: Vec<u64> = restored
+            .messages()
+            .iter()
+            .map(|message| message.id.get())
+            .collect();
+        assert_eq!(
+            &ids[..3],
+            &[0, 1, 5],
+            "both anchors survive and the three oldest ordinary messages went"
+        );
+        assert_eq!(
+            ids.last().copied(),
+            Some(MAX_MESSAGES as u64 + 2),
+            "the newest message is always retained"
+        );
+    }
+
+    #[test]
+    fn a_history_of_anchors_alone_past_the_bound_is_refused_rather_than_shed() {
+        let messages: Vec<String> = (0..=MAX_MESSAGES as u64)
+            .map(|id| message_json(id, Role::System, "rules", false))
+            .collect();
+        let error = restore(&document(&messages, &[], MAX_MESSAGES as u64 + 1))
+            .expect_err("anchors cannot be shed to meet the bound");
+        assert!(
+            error.to_string().contains("maximum number of messages"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn surplus_summaries_are_restored_newest_first() {
+        let summaries: Vec<String> = (0..(MAX_SUMMARIES as u64 + 2))
+            .map(|ordinal| summary_json(ordinal, ordinal, "compacted"))
+            .collect();
+        let restored = restore(&document(&[], &summaries, 0)).expect("loads");
+        assert_eq!(restored.summaries().len(), MAX_SUMMARIES);
+        assert_eq!(
+            restored.summaries()[0].first,
+            MessageId::new(2),
+            "the two oldest summaries are the ones shed"
+        );
+    }
+
+    #[test]
+    fn a_document_whose_identifiers_are_not_strictly_increasing_is_refused() {
+        for out_of_order in [
+            vec![
+                message_json(1, Role::User, "a", false),
+                message_json(0, Role::User, "b", false),
+            ],
+            vec![
+                message_json(0, Role::User, "a", false),
+                message_json(0, Role::User, "b", false),
+            ],
+        ] {
+            let error = restore(&document(&out_of_order, &[], 2))
+                .expect_err("identifier order is not repairable");
+            assert!(
+                error.to_string().contains("strictly increasing"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retained_body_the_write_path_would_refuse_is_refused_on_load() {
+        let empty = vec![message_json(0, Role::User, "", false)];
+        let error = restore(&document(&empty, &[], 1)).expect_err("an empty body is refused");
+        assert!(
+            error.to_string().contains("must not be empty"),
+            "unexpected error: {error}"
+        );
+
+        let oversized = vec![message_json(
+            0,
+            Role::User,
+            &"x".repeat(MAX_MESSAGE_BYTES + 1),
+            false,
+        )];
+        let error =
+            restore(&document(&oversized, &[], 1)).expect_err("an oversized body is refused");
+        assert!(
+            error.to_string().contains("exceeds the maximum size"),
+            "unexpected error: {error}"
+        );
+
+        let backwards = vec![summary_json(5, 1, "x")];
+        let error =
+            restore(&document(&[], &backwards, 0)).expect_err("a backwards range is refused");
+        assert!(
+            error.to_string().contains("runs backwards"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn an_ordinal_behind_the_history_is_repaired_so_the_next_append_cannot_collide() {
+        let messages: Vec<String> = (0..3)
+            .map(|id| message_json(id, Role::User, "x", false))
+            .collect();
+        // A document claiming the next identifier is 0 would otherwise hand
+        // out identifiers that already exist.
+        let mut restored = restore(&document(&messages, &[], 0)).expect("loads");
+        assert_eq!(
+            restored.append(Role::User, "next", 9).expect("appended"),
+            MessageId::new(3)
+        );
+        assert!(
+            restored
+                .messages()
+                .is_sorted_by(|earlier, later| earlier.id < later.id)
+        );
+    }
+
+    #[test]
+    fn a_session_identifier_is_validated_on_load_too() {
+        assert_eq!(
+            serde_json::from_str::<SessionId>("\"good-1.id_x\"").expect("valid identifier"),
+            SessionId::new("good-1.id_x").expect("valid identifier")
+        );
+        for bad in ["\"\"", "\"a/b\"", "\"a b\"", "\"a\\nb\""] {
+            let error = serde_json::from_str::<SessionId>(bad)
+                .expect_err("an identifier the constructor refuses cannot be restored");
+            assert!(
+                error.to_string().contains("session identifier"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
@@ -428,7 +860,7 @@ mod tests {
         let removed = session
             .absorb(Summary {
                 first: MessageId(0),
-                last: MessageId(3),
+                last: MessageId::new(3),
                 text: "earlier discussion".to_owned(),
                 unix_millis: 6,
             })
@@ -451,7 +883,7 @@ mod tests {
         session.append(Role::User, "a", 1).expect("appended");
         assert_eq!(
             session.absorb(Summary {
-                first: MessageId(5),
+                first: MessageId::new(5),
                 last: MessageId(1),
                 text: "x".to_owned(),
                 unix_millis: 2,
@@ -474,15 +906,15 @@ mod tests {
     #[test]
     fn summary_coverage_is_inclusive_on_both_ends() {
         let summary = Summary {
-            first: MessageId(2),
+            first: MessageId::new(2),
             last: MessageId(4),
             text: "x".to_owned(),
             unix_millis: 1,
         };
         assert!(!summary.covers(MessageId(1)));
-        assert!(summary.covers(MessageId(2)));
-        assert!(summary.covers(MessageId(3)));
+        assert!(summary.covers(MessageId::new(2)));
+        assert!(summary.covers(MessageId::new(3)));
         assert!(summary.covers(MessageId(4)));
-        assert!(!summary.covers(MessageId(5)));
+        assert!(!summary.covers(MessageId::new(5)));
     }
 }
