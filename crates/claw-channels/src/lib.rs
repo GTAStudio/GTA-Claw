@@ -226,7 +226,7 @@ pub struct ChannelDescriptor {
     ///
     /// [`None`] means no source in this tree states a limit for this channel.
     /// It does not mean the provider has none; it means nothing here may guess
-    /// at it, so segmentation refuses. See [`declared_limit`] for the
+    /// at it, so segmentation refuses. See `declared_limit` for the
     /// provenance of every value that is present.
     ///
     /// A declared limit is metadata, exactly like [`Self::auth_modes`]. It says
