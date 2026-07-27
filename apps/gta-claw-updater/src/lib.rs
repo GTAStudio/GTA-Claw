@@ -1,4 +1,9 @@
 //! Signed, resumable, and rollback-safe GTA Claw updater.
+//!
+//! A verified artifact remains bound to its signed release until installation
+//! succeeds, so a restart-required retry reuses local bytes instead of fetching
+//! them again. Successful installs remove staging artifacts and obsolete
+//! anti-rollback floor files.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -484,8 +489,8 @@ impl Updater {
         bytes: &[u8],
         current: &Version,
     ) -> Result<UpdateDecision, UpdateError> {
-        let manifest = self.verify_manifest(bytes)?;
-        let rollback_state = self.accept_manifest(&manifest)?;
+        let (manifest, manifest_sha256) = self.verify_manifest_with_digest(bytes)?;
+        let rollback_state = self.accept_manifest_with_digest(&manifest, &manifest_sha256)?;
         let available =
             Version::parse(&manifest.version).map_err(|_| UpdateError::InvalidVersion)?;
         let current_revoked = rollback_state
@@ -516,7 +521,8 @@ impl Updater {
             None => return Err(UpdateError::ArtifactUnavailable),
         };
         validate_artifact(&artifact, self.allow_loopback_http)?;
-        let authorization = release_authorization(&manifest, &artifact)?;
+        let authorization =
+            release_authorization_with_digest(&manifest, &artifact, &manifest_sha256)?;
         Ok(UpdateDecision::Available {
             version: available,
             update: AvailableUpdate {
@@ -552,6 +558,14 @@ impl Updater {
     /// [`UpdateError::CredentialBearingUrl`] for a non-HTTPS or
     /// credential-bearing one.
     pub fn verify_manifest(&self, bytes: &[u8]) -> Result<ReleaseManifest, UpdateError> {
+        self.verify_manifest_with_digest(bytes)
+            .map(|(manifest, _)| manifest)
+    }
+
+    fn verify_manifest_with_digest(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(ReleaseManifest, String), UpdateError> {
         let length = u64::try_from(bytes.len()).map_err(|_| UpdateError::ManifestTooLarge)?;
         if length > MAX_MANIFEST_BYTES {
             return Err(UpdateError::ManifestTooLarge);
@@ -568,6 +582,7 @@ impl Updater {
         self.verifying_key
             .verify_strict(&canonical, &signature)
             .map_err(|_| UpdateError::ForgedManifest)?;
+        let manifest_sha256 = encode_hex(&Sha256::digest(&canonical));
         validate_manifest_metadata(&envelope.manifest, unix_time_now()?)?;
         for artifact in &envelope.manifest.artifacts {
             if artifact.release_sequence != envelope.manifest.sequence {
@@ -575,12 +590,22 @@ impl Updater {
             }
             validate_artifact(artifact, self.allow_loopback_http)?;
         }
-        Ok(envelope.manifest)
+        Ok((envelope.manifest, manifest_sha256))
     }
 
+    #[cfg(test)]
     fn accept_manifest(&self, manifest: &ReleaseManifest) -> Result<RollbackState, UpdateError> {
+        let manifest_sha256 = manifest_digest(manifest)?;
+        self.accept_manifest_with_digest(manifest, &manifest_sha256)
+    }
+
+    fn accept_manifest_with_digest(
+        &self,
+        manifest: &ReleaseManifest,
+        manifest_sha256: &str,
+    ) -> Result<RollbackState, UpdateError> {
         let guard = self.lock_rollback_state()?;
-        accept_manifest_locked(manifest, &guard)
+        accept_manifest_locked_with_digest(manifest, manifest_sha256, &guard)
     }
 
     fn lock_rollback_state(&self) -> Result<RollbackGuard, UpdateError> {
@@ -670,6 +695,42 @@ impl Updater {
                 .directory
                 .write_json_atomic(OsStr::new(RESUME_BINDING), &expected_binding)?;
         }
+        let expected_digest = decode_sha256(&artifact.sha256)?;
+        if binding_matches {
+            match stage
+                .directory
+                .open_regular(OsStr::new(STAGED_VERIFIED), false)
+            {
+                Ok(verified) => {
+                    let metadata = verified.metadata().map_err(UpdateError::Io)?;
+                    let digest = hash_handle(&verified).await?;
+                    if metadata.len() == artifact.size && digest == expected_digest {
+                        #[cfg(unix)]
+                        ensure_entry_identity(
+                            &stage.directory,
+                            OsStr::new(STAGED_VERIFIED),
+                            &verified,
+                        )?;
+                        let staged_path = stage.directory.path.join(STAGED_VERIFIED);
+                        return Ok(VerifiedArtifact {
+                            path: staged_path,
+                            file: verified,
+                            stage,
+                            digest,
+                            size: artifact.size,
+                            kind: artifact.kind,
+                            authorization: update.authorization.clone(),
+                        });
+                    }
+                    drop(verified);
+                    stage
+                        .directory
+                        .remove_file_if_exists(OsStr::new(STAGED_VERIFIED))?;
+                }
+                Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
 
         let retained = match stage.directory.open_regular(OsStr::new(STAGED_PART), false) {
             Ok(file) => file,
@@ -733,8 +794,7 @@ impl Updater {
             });
         }
         let digest = hash_handle(&retained).await?;
-        let expected = decode_sha256(&artifact.sha256)?;
-        if digest != expected {
+        if digest != expected_digest {
             drop(retained);
             let _ = stage.directory.remove_file(OsStr::new(STAGED_PART));
             let _ = stage.directory.remove_file(OsStr::new(RESUME_BINDING));
@@ -751,9 +811,6 @@ impl Updater {
                 OsStr::new(STAGED_VERIFIED),
             )
             .map_err(UpdateError::Io)?;
-        stage
-            .directory
-            .remove_file_if_exists(OsStr::new(RESUME_BINDING))?;
         #[cfg(unix)]
         ensure_entry_identity(&stage.directory, OsStr::new(STAGED_VERIFIED), &retained)?;
         let staged_path = stage.directory.path.join(STAGED_VERIFIED);
@@ -1028,14 +1085,23 @@ impl Updater {
     }
 }
 
+#[cfg(test)]
 fn accept_manifest_locked(
     manifest: &ReleaseManifest,
+    guard: &RollbackGuard,
+) -> Result<RollbackState, UpdateError> {
+    let manifest_sha256 = manifest_digest(manifest)?;
+    accept_manifest_locked_with_digest(manifest, &manifest_sha256, guard)
+}
+
+fn accept_manifest_locked_with_digest(
+    manifest: &ReleaseManifest,
+    manifest_sha256: &str,
     guard: &RollbackGuard,
 ) -> Result<RollbackState, UpdateError> {
     let state_directory = &guard.directory;
     let mut state = load_rollback_state(state_directory)?;
     let available = Version::parse(&manifest.version).map_err(|_| UpdateError::InvalidVersion)?;
-    let manifest_sha256 = manifest_digest(manifest)?;
 
     if manifest.sequence < state.highest_sequence {
         return Err(UpdateError::RollbackManifest {
@@ -1064,16 +1130,29 @@ fn accept_manifest_locked(
     if manifest.sequence > state.highest_sequence {
         state.highest_sequence = manifest.sequence;
         state.highest_version.clone_from(&manifest.version);
-        state.manifest_sha256 = manifest_sha256;
+        manifest_sha256.clone_into(&mut state.manifest_sha256);
     }
     state
         .revoked_versions
         .extend(manifest.revoked_versions.iter().cloned());
+    let state_name = rollback_state_name(state.highest_sequence);
     if state != previous {
-        let state_name = rollback_state_name(state.highest_sequence);
         state_directory.write_json_atomic(&state_name, &state)?;
     }
+    prune_rollback_states(state_directory, &state_name)?;
     Ok(state)
+}
+
+fn prune_rollback_states(
+    state_directory: &SecureDirectory,
+    retained: &OsStr,
+) -> Result<(), UpdateError> {
+    for name in state_directory.list_names()? {
+        if name != retained && rollback_sequence_from_name(&name).is_some() {
+            state_directory.remove_file_if_exists(&name)?;
+        }
+    }
+    state_directory.sync().map_err(UpdateError::Io)
 }
 
 fn authorize_install(
@@ -2154,6 +2233,7 @@ fn load_rollback_state(state_directory: &SecureDirectory) -> Result<RollbackStat
     Ok(state)
 }
 
+#[cfg(test)]
 fn manifest_digest(manifest: &ReleaseManifest) -> Result<String, UpdateError> {
     let bytes = serde_json::to_vec(manifest).map_err(UpdateError::ManifestJson)?;
     Ok(encode_hex(&Sha256::digest(bytes)))
@@ -2164,16 +2244,26 @@ fn artifact_digest(artifact: &ReleaseArtifact) -> Result<String, UpdateError> {
     Ok(encode_hex(&Sha256::digest(bytes)))
 }
 
+#[cfg(test)]
 fn release_authorization(
     manifest: &ReleaseManifest,
     artifact: &ReleaseArtifact,
+) -> Result<ReleaseAuthorization, UpdateError> {
+    let manifest_sha256 = manifest_digest(manifest)?;
+    release_authorization_with_digest(manifest, artifact, &manifest_sha256)
+}
+
+fn release_authorization_with_digest(
+    manifest: &ReleaseManifest,
+    artifact: &ReleaseArtifact,
+    manifest_sha256: &str,
 ) -> Result<ReleaseAuthorization, UpdateError> {
     Ok(ReleaseAuthorization {
         sequence: manifest.sequence,
         version: manifest.version.clone(),
         published_at_unix: manifest.published_at_unix,
         expires_at_unix: manifest.expires_at_unix,
-        manifest_sha256: manifest_digest(manifest)?,
+        manifest_sha256: manifest_sha256.to_owned(),
         artifact_sha256: artifact_digest(artifact)?,
     })
 }
@@ -2991,6 +3081,15 @@ fn atomic_swap_verified(
         .remove_file_if_exists(&prepared.source_name)?;
     stage
         .directory
+        .remove_file_if_exists(OsStr::new(STAGED_VERIFIED))?;
+    stage
+        .directory
+        .remove_file_if_exists(OsStr::new(STAGED_PART))?;
+    stage
+        .directory
+        .remove_file_if_exists(OsStr::new(RESUME_BINDING))?;
+    stage
+        .directory
         .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
     stage.parent.sync().map_err(UpdateError::Io)?;
     stage.directory.sync().map_err(UpdateError::Io)?;
@@ -3052,6 +3151,15 @@ fn atomic_swap_verified(
     stage
         .directory
         .remove_file_if_exists(&prepared.source_name)?;
+    stage
+        .directory
+        .remove_file_if_exists(OsStr::new(STAGED_VERIFIED))?;
+    stage
+        .directory
+        .remove_file_if_exists(OsStr::new(STAGED_PART))?;
+    stage
+        .directory
+        .remove_file_if_exists(OsStr::new(RESUME_BINDING))?;
     stage
         .directory
         .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;

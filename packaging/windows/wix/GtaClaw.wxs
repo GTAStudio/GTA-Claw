@@ -13,7 +13,10 @@
     Compressed="yes">
     <SummaryInformation Description="GTA Claw native Windows installer" />
     <MajorUpgrade
+      AllowSameVersionUpgrades="no"
       DowngradeErrorMessage="A newer version of GTA Claw is already installed."
+      IgnoreRemoveFailure="no"
+      MigrateFeatures="yes"
       Schedule="afterInstallInitialize" />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 

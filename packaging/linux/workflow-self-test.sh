@@ -518,7 +518,7 @@ validate_workflow() {
 
   assert_required_job \
     native-x86 \
-    cb0e04fca2614c6a4b7aaac15e35e61d0ead3270a8574190d28ec1fd3e7fd832 \
+    f928ea43ecff507e7c55a6bb29162f0ba9cf310247e0816122cc31acac7e9695 \
     "$(printf '%s\n' \
       'Checkout' \
       'Install native package inspection tools' \

@@ -504,7 +504,11 @@ pub async fn write_text(socket: &mut ServerWrite, bytes: Vec<u8>) -> Result<(), 
 ///
 /// Returns [`WireError::Write`] when the peer half is gone, or
 /// [`WireError::Protocol`] when the payload exceeds the control-frame limit.
-pub async fn write_ping(socket: &mut ServerWrite, payload: Vec<u8>) -> Result<(), WireError> {
+pub async fn write_ping(
+    socket: &mut ServerWrite,
+    payload: impl AsRef<[u8]>,
+) -> Result<(), WireError> {
+    let payload = payload.as_ref();
     if payload.len() > MAX_CONTROL_PAYLOAD_BYTES {
         return Err(WireError::Protocol("oversized control frame"));
     }
@@ -513,7 +517,7 @@ pub async fn write_ping(socket: &mut ServerWrite, payload: Vec<u8>) -> Result<()
             true,
             OpCode::Ping,
             None,
-            Payload::Owned(payload),
+            Payload::Borrowed(payload),
         ))
         .await
         .map_err(|_| WireError::Write)?;

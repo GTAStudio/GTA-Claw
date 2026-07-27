@@ -15,6 +15,11 @@
 //!   [`secret::SecretString`]. Neither type implements `serde::Serialize`, and
 //!   both redact themselves in `Debug` and `Display`.
 //! * Transport is pure Rust: `hyper` over `rustls`. No OpenSSL, no Node.js.
+//! * Outbound proxying is decided by one reviewed policy, [`http::proxy`],
+//!   which owns environment precedence, `NO_PROXY` matching, redaction and the
+//!   continue-without-proxy fallback. [`http::HttpTransport`] is currently its
+//!   only consumer; the role, channel, skill and MCP transports still carry
+//!   their own arrangements.
 
 pub mod cancel;
 pub mod circuit;

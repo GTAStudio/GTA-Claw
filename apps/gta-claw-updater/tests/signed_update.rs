@@ -614,6 +614,58 @@ async fn rejects_tampered_artifact_and_removes_untrusted_partial() {
 }
 
 #[tokio::test]
+async fn verified_stage_is_reused_without_redownload_and_cleaned_after_install() {
+    let directory = TestDir::new("verified-reuse");
+    let bytes = b"verified replacement bytes".to_vec();
+    let response = bytes.clone();
+    let server = LocalServer::spawn(handler(move |request, index| {
+        assert_eq!(index, 1, "verified retry must not reach the network");
+        assert_eq!(request.path, "/artifact");
+        ResponsePlan {
+            status: "200 OK",
+            headers: Vec::new(),
+            write_bytes: response.len(),
+            body: response.clone(),
+        }
+    }))
+    .await;
+    let release = artifact(&server.url("artifact"), &bytes, ArtifactKind::Executable);
+    let target = executable_target(&directory.path);
+    std::fs::write(target.path(), b"old executable").expect("write old executable");
+    let updater = updater(&directory.path);
+    let update = authorized_update(&updater, &release);
+
+    let first = updater
+        .download(&update, &target)
+        .await
+        .expect("first verified download");
+    let staged_path = first.path().to_owned();
+    drop(first);
+    let reused = updater
+        .download(&update, &target)
+        .await
+        .expect("reuse verified stage");
+    assert_eq!(reused.path(), staged_path);
+    updater
+        .install(reused, &target)
+        .await
+        .expect("install reused stage");
+
+    assert_eq!(
+        std::fs::read(target.path()).expect("read installed executable"),
+        bytes
+    );
+    assert_eq!(server.requests.lock().expect("request log lock").len(), 1);
+    assert_eq!(
+        std::fs::read_dir(directory.path.join(".gta-claw.exe.gta-claw-stage"))
+            .expect("read staging directory")
+            .count(),
+        0,
+        "successful install must remove verified, partial, binding, and journal files"
+    );
+}
+
+#[tokio::test]
 async fn rejects_mismatched_content_range_and_cross_artifact_resume() {
     let directory = TestDir::new("resume-binding");
     let first_bytes = b"first artifact payload".to_vec();
@@ -883,6 +935,13 @@ async fn installs_complete_macos_bundle_and_rejects_archive_traversal() {
         b"plist"
     );
     assert!(!target_path.join("old.txt").exists());
+    assert_eq!(
+        std::fs::read_dir(directory.path.join(".GTA Claw.app.gta-claw-stage"))
+            .expect("read bundle staging directory")
+            .count(),
+        0,
+        "successful bundle install must remove its verified archive"
+    );
 
     let unsafe_bundle = serde_json::to_vec(&json!({
         "format": "gta-claw-bundle-v1",
@@ -918,6 +977,53 @@ async fn installs_complete_macos_bundle_and_rejects_archive_traversal() {
         .expect_err("archive traversal rejected");
     assert_eq!(error.to_string(), "macOS bundle archive is invalid");
     assert!(!directory.path.join("escaped").exists());
+}
+
+#[test]
+fn advancing_release_floor_prunes_obsolete_state_files() {
+    let directory = TestDir::new("floor-cleanup");
+    let updater = updater(&directory.path);
+    let url = Url::parse("http://127.0.0.1/artifact").expect("loopback URL");
+    let release = artifact(&url, b"release", ArtifactKind::Executable);
+    let current = Version::parse("1.0.0").expect("current version");
+
+    updater
+        .check_manifest_bytes(
+            &signed_bytes(manifest("2.0.0", 1, Vec::new(), vec![release.clone()])),
+            &current,
+        )
+        .expect("accept first floor");
+    updater
+        .check_manifest_bytes(
+            &signed_bytes(manifest("3.0.0", 2, Vec::new(), vec![release])),
+            &current,
+        )
+        .expect("accept second floor");
+
+    let state_root = directory.path.join("updater-state");
+    let target_state = std::fs::read_dir(&state_root)
+        .expect("read state root")
+        .map(|entry| entry.expect("state entry").path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("target-"))
+        })
+        .expect("target state directory");
+    let floors = std::fs::read_dir(target_state)
+        .expect("read target state")
+        .map(|entry| entry.expect("floor entry").file_name())
+        .filter(|name| {
+            name.to_str()
+                .is_some_and(|name| name.starts_with("release-floor-"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        floors,
+        vec![std::ffi::OsString::from(
+            "release-floor-00000000000000000002.json"
+        )]
+    );
 }
 
 #[cfg(not(windows))]

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 const MAX_DIMENSIONS: usize = 8192;
 
 /// Default maximum number of records one in-crate index will hold.
-const DEFAULT_INDEX_CAPACITY: usize = 100_000;
+pub(crate) const DEFAULT_INDEX_CAPACITY: usize = 100_000;
 
 /// A dense embedding with a validated dimensionality.
 ///

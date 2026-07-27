@@ -39,6 +39,22 @@ pub enum DnsSdError {
     Truncated,
     /// Bytes remained after every declared section had been decoded.
     TrailingBytes,
+    /// A raw DNS message exceeded the 16-bit transport length ceiling.
+    MessageTooLarge {
+        /// Bytes presented or produced.
+        actual: usize,
+        /// Maximum raw DNS message bytes.
+        limit: usize,
+    },
+    /// Header section counts cannot fit in the bytes that follow the header.
+    ImpossibleSectionCounts {
+        /// Declared question count.
+        questions: usize,
+        /// Declared answer, authority and additional record count.
+        records: usize,
+        /// Bytes available after the header.
+        available: usize,
+    },
     /// A compression pointer did not point strictly backwards, or a label
     /// length byte used a reserved high-bit pattern.
     BadPointer,
@@ -80,6 +96,18 @@ impl fmt::Display for DnsSdError {
             Self::TrailingBytes => {
                 formatter.write_str("DNS message had bytes after the declared sections")
             }
+            Self::MessageTooLarge { actual, limit } => {
+                write!(formatter, "DNS message is {actual} bytes, limit is {limit}")
+            }
+            Self::ImpossibleSectionCounts {
+                questions,
+                records,
+                available,
+            } => write!(
+                formatter,
+                "DNS header declares {questions} questions and {records} records, which cannot fit \
+                 in the {available} bytes after the header"
+            ),
             Self::BadPointer => {
                 formatter.write_str("DNS name compression pointer did not point strictly backwards")
             }

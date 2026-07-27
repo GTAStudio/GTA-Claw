@@ -17,10 +17,19 @@ use rand_core::{TryCryptoRng, TryRng};
 use ring::rand::{SecureRandom, SystemRandom};
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use url::Url;
 
 use crate::model::{Prompt, RunState, SessionSummary, ToolActivity, TranscriptEntry};
+
+const MAX_SESSIONS: usize = 1_000;
+const MAX_DIFF_LINES: usize = 10_000;
+const MAX_ARTIFACTS: usize = 1_000;
+const MAX_PREVIEW_LINES: usize = 2_000;
+const MAX_EVENT_TEXT_BYTES: usize = 16 * 1024;
+const MAX_LABEL_BYTES: usize = 1_024;
+const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 /// Runtime configuration for the Gateway worker.
 #[derive(Clone)]
@@ -118,30 +127,148 @@ pub enum WorkerEvent {
 
 /// Starts Gateway work on the active Tokio runtime over bounded channels.
 #[must_use]
-pub fn spawn_gateway_worker(
-    options: GatewayOptions,
-) -> (mpsc::Sender<UiCommand>, mpsc::Receiver<WorkerEvent>) {
+pub fn spawn_gateway_worker(options: GatewayOptions) -> GatewayWorker {
     let (command_sender, command_receiver) = mpsc::channel(32);
     let (event_sender, event_receiver) = mpsc::channel(256);
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
     let endpoint = endpoint_label(&options.url);
-    tokio::spawn(async move {
-        if let Err(error) = run_worker(options, command_receiver, event_sender.clone()).await {
-            let _ = event_sender
-                .send(WorkerEvent::Notice(format!(
-                    "Gateway: {error} (tried {endpoint}; \
-                     start the gateway or pass --gateway, then press r to retry)"
-                )))
-                .await;
-        }
+    let task = tokio::spawn(async move {
+        run_worker(
+            options,
+            command_receiver,
+            event_sender,
+            shutdown_receiver,
+            endpoint,
+        )
+        .await;
     });
-    (command_sender, event_receiver)
+    GatewayWorker {
+        commands: command_sender,
+        events: event_receiver,
+        shutdown: Some(shutdown_sender),
+        task,
+    }
+}
+
+/// Owned Gateway worker resources.
+///
+/// Keeping the task handle makes shutdown observable and prevents a failed
+/// connection attempt from surviving after the terminal UI has exited.
+pub struct GatewayWorker {
+    /// Bounded command input.
+    pub commands: mpsc::Sender<UiCommand>,
+    /// Bounded event output.
+    pub events: mpsc::Receiver<WorkerEvent>,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+impl GatewayWorker {
+    /// Cancels Gateway work and waits for a bounded graceful shutdown.
+    pub async fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        drop(self.commands);
+        if tokio::time::timeout(WORKER_SHUTDOWN_GRACE, &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+            let _ = self.task.await;
+        }
+    }
 }
 
 async fn run_worker(
     options: GatewayOptions,
     mut commands: mpsc::Receiver<UiCommand>,
     sender: mpsc::Sender<WorkerEvent>,
-) -> Result<(), WorkerError> {
+    mut shutdown: oneshot::Receiver<()>,
+    endpoint: String,
+) {
+    loop {
+        if sender
+            .send(WorkerEvent::Connection(
+                "Gateway: connecting (bounded retries)".to_owned(),
+            ))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        match run_connection(options.clone(), &mut commands, &sender, &mut shutdown).await {
+            Ok(ConnectionExit::Shutdown) => return,
+            Ok(ConnectionExit::Disconnected) => {
+                if !report_unavailable(&sender, &endpoint, "connection closed by the Gateway").await
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                if !report_unavailable(&sender, &endpoint, &error.to_string()).await {
+                    return;
+                }
+            }
+        }
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => return,
+                command = commands.recv() => {
+                    match command {
+                        Some(UiCommand::Refresh) => break,
+                        Some(UiCommand::Shutdown) | None => return,
+                        Some(_) => {
+                            if sender.send(WorkerEvent::Notice(
+                                "Gateway unavailable; press r to retry".to_owned()
+                            )).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn report_unavailable(
+    sender: &mpsc::Sender<WorkerEvent>,
+    endpoint: &str,
+    error: &str,
+) -> bool {
+    if sender
+        .send(WorkerEvent::Connection(
+            "Gateway: unavailable (press r to retry)".to_owned(),
+        ))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    sender
+        .send(WorkerEvent::Notice(format!(
+            "Gateway: {} (tried {endpoint}; start the gateway or check --gateway, then press r)",
+            bounded_text(error, MAX_LABEL_BYTES)
+        )))
+        .await
+        .is_ok()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionExit {
+    Shutdown,
+    Disconnected,
+}
+
+async fn run_connection(
+    options: GatewayOptions,
+    commands: &mut mpsc::Receiver<UiCommand>,
+    sender: &mpsc::Sender<WorkerEvent>,
+    shutdown: &mut oneshot::Receiver<()>,
+) -> Result<ConnectionExit, WorkerError> {
     let identity = Arc::new(generate_identity()?);
     let mut config = GatewayClientConfig::new(options.url, identity);
     config.credential = options.token.map_or(GatewayCredential::None, |token| {
@@ -164,7 +291,12 @@ async fn run_worker(
         mode: ClientMode::Ui,
         instance_id: None,
     };
-    config.reconnect = ReconnectPolicy::default();
+    config.reconnect = ReconnectPolicy::Bounded {
+        max_attempts: 2,
+        initial_delay: Duration::from_millis(100),
+        max_delay: Duration::from_millis(500),
+        max_jitter: Duration::from_millis(50),
+    };
     config.timeouts = ClientTimeouts {
         connect: Duration::from_secs(10),
         authentication: Duration::from_secs(10),
@@ -174,35 +306,57 @@ async fn run_worker(
 
     let (client, mut gateway_events) =
         GatewayClient::start(config).map_err(|error| WorkerError(error.to_string()))?;
-    let ready = client.wait_ready().await.map_err(|error| {
-        WorkerError(format!(
-            "{error} while {}",
-            connection_label(&client.state())
-        ))
-    })?;
-    sender
+    let ready_result = tokio::select! {
+        biased;
+        _ = &mut *shutdown => {
+            let teardown = client
+                .shutdown()
+                .await
+                .map_err(|error| WorkerError(error.to_string()));
+            return connection_exit_after_teardown(ConnectionExit::Shutdown, teardown);
+        }
+        ready = client.wait_ready() => ready,
+    };
+    let ready = match ready_result {
+        Ok(ready) => ready,
+        Err(error) => {
+            let state = connection_label(&client.state());
+            let _ = client.shutdown().await;
+            return Err(WorkerError(format!("{error} while {state}")));
+        }
+    };
+    if sender
         .send(WorkerEvent::Connection(format!(
             "Gateway: ready (protocol {}, epoch {})",
             ready.info.protocol.get(),
             ready.epoch.get()
         )))
         .await
-        .map_err(|_| WorkerError("render loop stopped".to_owned()))?;
+        .is_err()
+    {
+        let _ = client.shutdown().await;
+        return Err(WorkerError("render loop stopped".to_owned()));
+    }
 
     let mut request_sequence = 1_u64;
-    send_sessions(&client, &sender, &mut request_sequence).await?;
-    loop {
+    if let Err(error) = send_sessions(&client, sender, &mut request_sequence).await {
+        let _ = client.shutdown().await;
+        return Err(error);
+    }
+    let outcome = loop {
         tokio::select! {
+            biased;
+            _ = &mut *shutdown => break ConnectionExit::Shutdown,
             command = commands.recv() => {
                 let Some(command) = command else {
-                    break;
+                    break ConnectionExit::Shutdown;
                 };
                 if matches!(command, UiCommand::Shutdown) {
-                    break;
+                    break ConnectionExit::Shutdown;
                 }
                 if let Err(error) = handle_command(
                     &client,
-                    &sender,
+                    sender,
                     &mut request_sequence,
                     command,
                 ).await {
@@ -211,21 +365,33 @@ async fn run_worker(
             }
             event = gateway_events.recv() => {
                 let Some(event) = event else {
-                    break;
+                    break ConnectionExit::Disconnected;
                 };
                 let frame = event.into_frame();
                 if let Some(mapped) = map_gateway_event(&frame)
                     && sender.send(mapped).await.is_err()
                 {
-                    break;
+                    break ConnectionExit::Shutdown;
                 }
             }
         }
-    }
-    client
+    };
+    let teardown = client
         .shutdown()
         .await
-        .map_err(|error| WorkerError(error.to_string()))
+        .map_err(|error| WorkerError(error.to_string()));
+    connection_exit_after_teardown(outcome, teardown)
+}
+
+fn connection_exit_after_teardown(
+    outcome: ConnectionExit,
+    teardown: Result<(), WorkerError>,
+) -> Result<ConnectionExit, WorkerError> {
+    if outcome == ConnectionExit::Shutdown {
+        return Ok(outcome);
+    }
+    teardown?;
+    Ok(outcome)
 }
 
 async fn handle_command(
@@ -255,7 +421,8 @@ async fn handle_command(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .lines()
-                .map(ToOwned::to_owned)
+                .take(MAX_DIFF_LINES)
+                .map(|line| bounded_text(line, MAX_EVENT_TEXT_BYTES))
                 .collect();
             sender
                 .send(WorkerEvent::Diff(lines))
@@ -275,19 +442,19 @@ async fn handle_command(
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
+                .take(MAX_ARTIFACTS)
                 .filter_map(|item| {
                     let name = item
                         .get("name")
                         .or_else(|| item.get("path"))
                         .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)?;
+                        .map(|name| bounded_text(name, MAX_LABEL_BYTES))?;
                     let id = item
                         .get("id")
                         .or_else(|| item.get("artifactId"))
                         .or_else(|| item.get("path"))
                         .and_then(Value::as_str)
-                        .unwrap_or(&name)
-                        .to_owned();
+                        .map_or_else(|| name.clone(), |id| bounded_text(id, MAX_LABEL_BYTES));
                     Some((name, id))
                 })
                 .collect::<Vec<_>>();
@@ -407,12 +574,15 @@ fn parse_sessions(value: &Value) -> Vec<SessionSummary> {
     items
         .into_iter()
         .flatten()
+        .take(MAX_SESSIONS)
         .filter_map(|item| {
-            let id = string_field(item, &["id", "sessionId", "key"])?;
-            let title =
-                string_field(item, &["title", "name", "label"]).unwrap_or_else(|| id.clone());
-            let workspace = string_field(item, &["workspace", "cwd", "path"]).unwrap_or_default();
-            let state = string_field(item, &["state", "status"])
+            let id = bounded_string_field(item, &["id", "sessionId", "key"], MAX_LABEL_BYTES)?;
+            let title = bounded_string_field(item, &["title", "name", "label"], MAX_LABEL_BYTES)
+                .unwrap_or_else(|| id.clone());
+            let workspace =
+                bounded_string_field(item, &["workspace", "cwd", "path"], MAX_LABEL_BYTES)
+                    .unwrap_or_default();
+            let state = bounded_string_field(item, &["state", "status"], 64)
                 .map_or(RunState::Draft, |state| RunState::parse(&state));
             let progress = item
                 .get("progress")
@@ -444,32 +614,50 @@ fn map_gateway_event(frame: &claw_protocol::gateway::EventFrame) -> Option<Worke
         "session.message" | "chat" => {
             if payload.get("question").is_some() || payload.get("questionId").is_some() {
                 Some(WorkerEvent::Prompt(Prompt::Question {
-                    id: string_field(&payload, &["questionId", "id"]).unwrap_or_default(),
-                    text: string_field(&payload, &["question", "text", "message"])
-                        .unwrap_or_else(|| "Agent is waiting for an answer".to_owned()),
+                    id: bounded_string_field(&payload, &["questionId", "id"], MAX_LABEL_BYTES)
+                        .unwrap_or_default(),
+                    text: bounded_string_field(
+                        &payload,
+                        &["question", "text", "message"],
+                        MAX_EVENT_TEXT_BYTES,
+                    )
+                    .unwrap_or_else(|| "Agent is waiting for an answer".to_owned()),
                 }))
             } else {
                 Some(WorkerEvent::Message(TranscriptEntry {
-                    role: string_field(&payload, &["role", "source"])
+                    role: bounded_string_field(&payload, &["role", "source"], 128)
                         .unwrap_or_else(|| "agent".to_owned()),
-                    text: string_field(&payload, &["text", "message", "content"])
-                        .unwrap_or_default(),
+                    text: bounded_string_field(
+                        &payload,
+                        &["text", "message", "content"],
+                        MAX_EVENT_TEXT_BYTES,
+                    )
+                    .unwrap_or_default(),
                 }))
             }
         }
         "session.tool" | "session.operation" => Some(WorkerEvent::Tool(ToolActivity {
-            name: string_field(&payload, &["tool", "name", "operation"])
+            name: bounded_string_field(&payload, &["tool", "name", "operation"], 128)
                 .unwrap_or_else(|| "operation".to_owned()),
-            status: string_field(&payload, &["status", "state"])
+            status: bounded_string_field(&payload, &["status", "state"], 128)
                 .unwrap_or_else(|| "running".to_owned()),
-            summary: string_field(&payload, &["summary", "message", "description"])
-                .unwrap_or_default(),
+            summary: bounded_string_field(
+                &payload,
+                &["summary", "message", "description"],
+                MAX_EVENT_TEXT_BYTES,
+            )
+            .unwrap_or_default(),
         })),
         "session.approval" | "exec.approval.requested" | "plugin.approval.requested" => {
             Some(WorkerEvent::Prompt(Prompt::Approval {
-                id: string_field(&payload, &["approvalId", "id"]).unwrap_or_default(),
-                text: string_field(&payload, &["prompt", "command", "message"])
-                    .unwrap_or_else(|| "Agent requests approval".to_owned()),
+                id: bounded_string_field(&payload, &["approvalId", "id"], MAX_LABEL_BYTES)
+                    .unwrap_or_default(),
+                text: bounded_string_field(
+                    &payload,
+                    &["prompt", "command", "message"],
+                    MAX_EVENT_TEXT_BYTES,
+                )
+                .unwrap_or_else(|| "Agent requests approval".to_owned()),
             }))
         }
         _ => None,
@@ -483,15 +671,39 @@ fn string_field(value: &Value, names: &[&str]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn bounded_string_field(value: &Value, names: &[&str], max_bytes: usize) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_str))
+        .map(|value| bounded_text(value, max_bytes))
+}
+
+fn bounded_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let suffix = if max_bytes >= '…'.len_utf8() {
+        "…"
+    } else {
+        ""
+    };
+    let mut end = max_bytes.saturating_sub(suffix.len()).min(value.len());
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut bounded = value[..end].to_owned();
+    bounded.push_str(suffix);
+    bounded
+}
+
 fn artifact_preview(value: &Value) -> Vec<String> {
-    const MAX_PREVIEW_LINES: usize = 2_000;
     let text = string_field(value, &["content", "text", "data"]).unwrap_or_else(|| {
         serde_json::to_string_pretty(value)
             .unwrap_or_else(|_| "Artifact preview unavailable".to_owned())
     });
     text.lines()
         .take(MAX_PREVIEW_LINES)
-        .map(ToOwned::to_owned)
+        .map(|line| bounded_text(line, MAX_EVENT_TEXT_BYTES))
         .collect()
 }
 
@@ -561,5 +773,20 @@ const fn connection_label(state: &ConnectionState) -> &'static str {
         ConnectionState::ProtocolFailed { .. } => "protocol failed",
         ConnectionState::ReconnectExhausted => "reconnect exhausted",
         ConnectionState::Stopped => "stopped",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConnectionExit, WorkerError, connection_exit_after_teardown};
+
+    #[test]
+    fn shutdown_decision_wins_over_a_teardown_error() {
+        let outcome = connection_exit_after_teardown(
+            ConnectionExit::Shutdown,
+            Err(WorkerError("simulated shutdown timeout".to_owned())),
+        );
+
+        assert!(matches!(outcome, Ok(ConnectionExit::Shutdown)));
     }
 }

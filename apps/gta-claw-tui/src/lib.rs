@@ -26,6 +26,16 @@ use terminal::{CrosstermControl, InputThread, TerminalSession};
 
 /// Endpoint used when `--gateway` and `GTA_CLAW_GATEWAY_URL` are both absent.
 const DEFAULT_GATEWAY_URL: &str = "ws://127.0.0.1:18789";
+const MAX_PALETTE_BYTES: usize = 128;
+const MAX_ANSWER_BYTES: usize = 4_096;
+const MAX_NOTICE_BYTES: usize = 4_096;
+const MAX_EVENT_TEXT_BYTES: usize = 16 * 1024;
+const MAX_SESSIONS: usize = 1_000;
+const MAX_TRANSCRIPT: usize = 2_000;
+const MAX_TOOLS: usize = 500;
+const MAX_DIFF_LINES: usize = 10_000;
+const MAX_ARTIFACTS: usize = 1_000;
+const MAX_ARTIFACT_LINES: usize = 2_000;
 
 /// Process options accepted by the TUI executable.
 #[derive(Clone)]
@@ -139,13 +149,13 @@ pub async fn run(options: Options) -> Result<(), String> {
 
 async fn run_plain(options: GatewayOptions) -> Result<(), String> {
     let endpoint = endpoint_label(&options.url);
-    let (commands, mut events) = spawn_gateway_worker(options);
+    let mut worker = spawn_gateway_worker(options);
     let mut model = AppModel::default();
     let deadline = tokio::time::sleep(Duration::from_secs(5));
     tokio::pin!(deadline);
     loop {
         tokio::select! {
-            event = events.recv() => {
+            event = worker.events.recv() => {
                 let Some(event) = event else {
                     break;
                 };
@@ -164,65 +174,74 @@ async fn run_plain(options: GatewayOptions) -> Result<(), String> {
             }
         }
     }
-    let _ = commands.send(UiCommand::Shutdown).await;
     println!("{}", render_plain(&model));
+    worker.shutdown().await;
     Ok(())
 }
 
 async fn run_interactive(options: GatewayOptions, no_color: bool) -> io::Result<()> {
     terminal::install_panic_hook();
     let control = Arc::new(CrosstermControl::default());
-    let _terminal = TerminalSession::enter(control)?;
-    let (_input_thread, mut inputs) = InputThread::spawn(64);
-    let (commands, mut worker_events) = spawn_gateway_worker(options);
+    let terminal = TerminalSession::enter(control)?;
+    let (input_thread, mut inputs) = InputThread::spawn(64)?;
+    let mut worker = spawn_gateway_worker(options);
     let mut model = AppModel::default();
     let mut stdout = io::stdout();
     let mut redraw = true;
     let mut painted: Option<render::Grid> = None;
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut signal = Box::pin(shutdown_signal());
+    let mut worker_events_open = true;
 
-    loop {
-        if redraw {
-            let (width, height) = crossterm_terminal::size().unwrap_or((100, 30));
-            let grid = render::render(&model, width, height, no_color);
-            render::flush_changes(&mut stdout, painted.as_ref(), &grid, no_color)?;
-            painted = Some(grid);
-            redraw = false;
-        }
-        tokio::select! {
-            input = inputs.recv() => {
-                let Some(input) = input else {
-                    break;
-                };
-                if matches!(input, Event::Resize(_, _)) {
-                    painted = None;
-                }
-                if handle_input(&mut model, input, &commands).await {
-                    break;
-                }
-                redraw = true;
+    let loop_result = async {
+        loop {
+            if redraw {
+                let (width, height) = crossterm_terminal::size().unwrap_or((100, 30));
+                let grid = render::render(&model, width, height, no_color);
+                render::flush_changes(&mut stdout, painted.as_ref(), &grid, no_color)?;
+                painted = Some(grid);
+                redraw = false;
             }
-            event = worker_events.recv() => {
-                let Some(event) = event else {
+            tokio::select! {
+                input = inputs.recv() => {
+                    let Some(input) = input else {
+                        break;
+                    };
+                    if matches!(input, Event::Resize(_, _)) {
+                        painted = None;
+                    }
+                    if handle_input(&mut model, &input, &worker.commands) {
+                        break;
+                    }
+                    redraw = true;
+                }
+                event = worker.events.recv(), if worker_events_open => {
+                    let Some(event) = event else {
+                        "Gateway: worker stopped".clone_into(&mut model.connection);
+                        model.notice = Some("Gateway worker stopped unexpectedly".to_owned());
+                        worker_events_open = false;
+                        redraw = true;
+                        continue;
+                    };
+                    apply_worker_event(&mut model, event);
+                    redraw = true;
+                }
+                result = &mut signal => {
+                    result?;
                     break;
-                };
-                apply_worker_event(&mut model, event);
-                redraw = true;
+                }
             }
-            _ = tick.tick() => {}
-            () = &mut signal => break,
         }
+        Ok(())
     }
-    let _ = commands.try_send(UiCommand::Shutdown);
-    Ok(())
+    .await;
+
+    drop(input_thread);
+    let restore_result = terminal.restore();
+    worker.shutdown().await;
+    loop_result.and(restore_result)
 }
 
-async fn handle_input(
-    model: &mut AppModel,
-    event: Event,
-    commands: &mpsc::Sender<UiCommand>,
-) -> bool {
+fn handle_input(model: &mut AppModel, event: &Event, commands: &mpsc::Sender<UiCommand>) -> bool {
     let Event::Key(key) = event else {
         return false;
     };
@@ -230,7 +249,7 @@ async fn handle_input(
         return true;
     }
     if model.palette_open {
-        return handle_palette(model, key, commands).await;
+        return handle_palette(model, key, commands);
     }
     if matches!(model.prompt, Some(Prompt::Question { .. })) {
         match key.code {
@@ -239,7 +258,9 @@ async fn handle_input(
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                model.answer.push(character);
+                if !push_bounded(&mut model.answer, character, MAX_ANSWER_BYTES) {
+                    model.notice = Some(format!("Answer limit reached ({MAX_ANSWER_BYTES} bytes)"));
+                }
                 return false;
             }
             KeyCode::Backspace => {
@@ -248,16 +269,18 @@ async fn handle_input(
             }
             KeyCode::Enter => {
                 if let (Some(Prompt::Question { id, .. }), Some(session)) =
-                    (model.prompt.take(), model.selected_session().cloned())
+                    (model.prompt.as_ref(), model.selected_session())
                 {
-                    let text = std::mem::take(&mut model.answer);
-                    let _ = commands
-                        .send(UiCommand::Answer {
-                            session_id: session.id,
-                            question_id: id,
-                            text,
-                        })
-                        .await;
+                    let command = UiCommand::Answer {
+                        session_id: session.id.clone(),
+                        question_id: id.clone(),
+                        text: model.answer.clone(),
+                    };
+                    if queue_command(model, commands, command) {
+                        model.prompt = None;
+                        model.answer.clear();
+                        model.notice = Some("Answer submitted".to_owned());
+                    }
                 }
                 return false;
             }
@@ -266,8 +289,14 @@ async fn handle_input(
     }
     match key.code {
         KeyCode::Char('q') => return true,
-        KeyCode::Tab => model.next_screen(),
-        KeyCode::BackTab => previous_screen(model),
+        KeyCode::Tab => {
+            model.next_screen();
+            load_screen(model, commands);
+        }
+        KeyCode::BackTab => {
+            previous_screen(model);
+            load_screen(model, commands);
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             if model.screen == Screen::Sessions {
                 model.select_previous();
@@ -285,14 +314,15 @@ async fn handle_input(
         KeyCode::Enter if model.screen == Screen::Sessions => {
             if let Some(session) = model.selected_session().cloned() {
                 model.screen = Screen::Workspace;
-                let _ = commands.send(UiCommand::SelectSession(session.id)).await;
+                let _ = queue_command(model, commands, UiCommand::SelectSession(session.id));
             }
         }
-        KeyCode::Char('y') => resolve_prompt(model, commands, true).await,
-        KeyCode::Char('n') => resolve_prompt(model, commands, false).await,
+        KeyCode::Char('y') => resolve_prompt(model, commands, true),
+        KeyCode::Char('n') => resolve_prompt(model, commands, false),
         KeyCode::Char('r') => {
-            let _ = commands.send(UiCommand::Refresh).await;
-            model.notice = Some("Refreshing sessions...".to_owned());
+            if queue_command(model, commands, UiCommand::Refresh) {
+                model.notice = Some("Refreshing sessions...".to_owned());
+            }
         }
         KeyCode::Char(':') => model.palette_open = true,
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -302,16 +332,17 @@ async fn handle_input(
         KeyCode::Char(character @ '1'..='6') => {
             let index = usize::from(character as u8 - b'1');
             model.screen = Screen::ALL[index];
-            load_screen(model, commands).await;
+            model.scroll = 0;
+            load_screen(model, commands);
         }
         _ => {}
     }
     false
 }
 
-async fn handle_palette(
+fn handle_palette(
     model: &mut AppModel,
-    key: KeyEvent,
+    key: &KeyEvent,
     commands: &mpsc::Sender<UiCommand>,
 ) -> bool {
     match key.code {
@@ -327,7 +358,9 @@ async fn handle_palette(
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
-            model.palette.push(character);
+            if !push_bounded(&mut model.palette, character, MAX_PALETTE_BYTES) {
+                model.notice = Some(format!("Command limit reached ({MAX_PALETTE_BYTES} bytes)"));
+            }
         }
         KeyCode::Enter => {
             let command = std::mem::take(&mut model.palette);
@@ -340,28 +373,40 @@ async fn handle_palette(
                 "artifacts" => model.screen = Screen::Artifacts,
                 "help" => model.screen = Screen::Help,
                 "refresh" => {
-                    let _ = commands.send(UiCommand::Refresh).await;
+                    if queue_command(model, commands, UiCommand::Refresh) {
+                        model.notice = Some("Refreshing sessions...".to_owned());
+                    }
                 }
                 "quit" | "q" => return true,
                 "" => {}
                 unknown => model.notice = Some(format!("Unknown command: {unknown}")),
             }
-            load_screen(model, commands).await;
+            model.scroll = 0;
+            load_screen(model, commands);
         }
         _ => {}
     }
     false
 }
 
-async fn resolve_prompt(model: &mut AppModel, commands: &mpsc::Sender<UiCommand>, approved: bool) {
-    if let Some(Prompt::Approval { id, .. }) = model.prompt.take() {
-        let _ = commands
-            .send(UiCommand::ResolveApproval { id, approved })
-            .await;
+fn resolve_prompt(model: &mut AppModel, commands: &mpsc::Sender<UiCommand>, approved: bool) {
+    if let Some(Prompt::Approval { id, .. }) = model.prompt.as_ref() {
+        let command = UiCommand::ResolveApproval {
+            id: id.clone(),
+            approved,
+        };
+        if queue_command(model, commands, command) {
+            model.prompt = None;
+            model.notice = Some(if approved {
+                "Approval submitted".to_owned()
+            } else {
+                "Denial submitted".to_owned()
+            });
+        }
     }
 }
 
-async fn load_screen(model: &AppModel, commands: &mpsc::Sender<UiCommand>) {
+fn load_screen(model: &mut AppModel, commands: &mpsc::Sender<UiCommand>) {
     let Some(session) = model.selected_session() else {
         return;
     };
@@ -372,8 +417,34 @@ async fn load_screen(model: &AppModel, commands: &mpsc::Sender<UiCommand>) {
         Screen::Sessions | Screen::Runs | Screen::Help => None,
     };
     if let Some(command) = command {
-        let _ = commands.send(command).await;
+        let _ = queue_command(model, commands, command);
     }
+}
+
+fn queue_command(
+    model: &mut AppModel,
+    commands: &mpsc::Sender<UiCommand>,
+    command: UiCommand,
+) -> bool {
+    match commands.try_send(command) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            model.notice = Some("Gateway is busy; wait and try again".to_owned());
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            model.notice = Some("Gateway worker stopped; restart the TUI".to_owned());
+            false
+        }
+    }
+}
+
+fn push_bounded(value: &mut String, character: char, max_bytes: usize) -> bool {
+    if value.len().saturating_add(character.len_utf8()) > max_bytes {
+        return false;
+    }
+    value.push(character);
+    true
 }
 
 fn previous_screen(model: &mut AppModel) {
@@ -387,35 +458,91 @@ fn previous_screen(model: &mut AppModel) {
 
 fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
     match event {
-        WorkerEvent::Connection(connection) => model.connection = connection,
+        WorkerEvent::Connection(connection) => {
+            model.connection = bounded_owned(connection, MAX_NOTICE_BYTES);
+        }
         WorkerEvent::Sessions(sessions) => {
-            model.sessions = sessions;
+            model.sessions = sessions.into_iter().take(MAX_SESSIONS).collect();
             model.selected = model.selected.min(model.sessions.len().saturating_sub(1));
+            model.scroll = model.scroll.min(model.sessions.len().saturating_sub(1));
             model.notice = None;
         }
-        WorkerEvent::Message(message) => {
-            const MAX_TRANSCRIPT: usize = 2_000;
+        WorkerEvent::Message(mut message) => {
+            message.role = bounded_owned(message.role, 128);
+            message.text = bounded_owned(message.text, MAX_EVENT_TEXT_BYTES);
             model.transcript.push_back(message);
             while model.transcript.len() > MAX_TRANSCRIPT {
                 model.transcript.pop_front();
             }
         }
-        WorkerEvent::Tool(tool) => {
-            const MAX_TOOLS: usize = 500;
+        WorkerEvent::Tool(mut tool) => {
+            tool.name = bounded_owned(tool.name, 128);
+            tool.status = bounded_owned(tool.status, 128);
+            tool.summary = bounded_owned(tool.summary, MAX_EVENT_TEXT_BYTES);
             model.tools.push_back(tool);
             while model.tools.len() > MAX_TOOLS {
                 model.tools.pop_front();
             }
         }
-        WorkerEvent::Prompt(prompt) => model.prompt = Some(prompt),
-        WorkerEvent::Diff(diff) => model.diff = diff,
-        WorkerEvent::Artifacts(artifacts) => {
-            model.artifacts = artifacts;
-            model.artifact_content.clear();
+        WorkerEvent::Prompt(prompt) => {
+            model.prompt = Some(match prompt {
+                Prompt::Approval { id, text } => Prompt::Approval {
+                    id: bounded_owned(id, 1_024),
+                    text: bounded_owned(text, MAX_EVENT_TEXT_BYTES),
+                },
+                Prompt::Question { id, text } => Prompt::Question {
+                    id: bounded_owned(id, 1_024),
+                    text: bounded_owned(text, MAX_EVENT_TEXT_BYTES),
+                },
+            });
+            model.answer.clear();
         }
-        WorkerEvent::ArtifactContent(content) => model.artifact_content = content,
-        WorkerEvent::Notice(notice) => model.notice = Some(notice),
+        WorkerEvent::Diff(diff) => {
+            model.diff = diff
+                .into_iter()
+                .take(MAX_DIFF_LINES)
+                .map(|line| bounded_owned(line, MAX_EVENT_TEXT_BYTES))
+                .collect();
+            model.scroll = 0;
+        }
+        WorkerEvent::Artifacts(artifacts) => {
+            model.artifacts = artifacts
+                .into_iter()
+                .take(MAX_ARTIFACTS)
+                .map(|name| bounded_owned(name, 1_024))
+                .collect();
+            model.artifact_content.clear();
+            model.scroll = 0;
+        }
+        WorkerEvent::ArtifactContent(content) => {
+            model.artifact_content = content
+                .into_iter()
+                .take(MAX_ARTIFACT_LINES)
+                .map(|line| bounded_owned(line, MAX_EVENT_TEXT_BYTES))
+                .collect();
+        }
+        WorkerEvent::Notice(notice) => {
+            model.notice = Some(bounded_owned(notice, MAX_NOTICE_BYTES));
+        }
     }
+}
+
+fn bounded_owned(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let suffix = if max_bytes >= '…'.len_utf8() {
+        "…"
+    } else {
+        ""
+    };
+    let mut end = max_bytes.saturating_sub(suffix.len()).min(value.len());
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value.truncate(end);
+    value.push_str(suffix);
+    value
 }
 
 fn render_plain(model: &AppModel) -> String {
@@ -443,20 +570,19 @@ fn render_plain(model: &AppModel) -> String {
 }
 
 #[cfg(unix)]
-async fn shutdown_signal() {
+async fn shutdown_signal() -> io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
 
-    let mut terminate =
-        signal(SignalKind::terminate()).expect("install SIGTERM handler for terminal restoration");
+    let mut terminate = signal(SignalKind::terminate())?;
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = terminate.recv() => {}
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
     }
 }
 
 #[cfg(not(unix))]
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+async fn shutdown_signal() -> io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 const fn help_text() -> &'static str {
@@ -482,4 +608,112 @@ const fn help_text() -> &'static str {
      \x20     r refresh  : or Ctrl-P palette  1..6 jump  ? help  q quit\n\
      \n\
      Exit codes: 0 success, 2 usage, 1 terminal or runtime failure."
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    use super::{
+        MAX_PALETTE_BYTES, MAX_SESSIONS, MAX_TRANSCRIPT, Screen, UiCommand, WorkerEvent,
+        apply_worker_event, handle_input,
+    };
+    use crate::model::{AppModel, Prompt, SessionSummary, TranscriptEntry};
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::empty()))
+    }
+
+    #[test]
+    fn command_palette_input_is_bounded() {
+        let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+        let mut model = AppModel {
+            palette_open: true,
+            ..AppModel::default()
+        };
+        for _ in 0..MAX_PALETTE_BYTES + 20 {
+            assert!(!handle_input(
+                &mut model,
+                &key(KeyCode::Char('x')),
+                &commands
+            ));
+        }
+        assert_eq!(model.palette.len(), MAX_PALETTE_BYTES);
+        assert_eq!(
+            model.notice.as_deref(),
+            Some("Command limit reached (128 bytes)")
+        );
+    }
+
+    #[test]
+    fn a_busy_gateway_does_not_consume_an_approval() {
+        let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+        commands.try_send(UiCommand::Refresh).expect("fill queue");
+        let mut model = AppModel {
+            prompt: Some(Prompt::Approval {
+                id: "approval-1".to_owned(),
+                text: "Run tests?".to_owned(),
+            }),
+            ..AppModel::default()
+        };
+        handle_input(&mut model, &key(KeyCode::Char('y')), &commands);
+        assert!(matches!(model.prompt, Some(Prompt::Approval { .. })));
+        assert_eq!(
+            model.notice.as_deref(),
+            Some("Gateway is busy; wait and try again")
+        );
+    }
+
+    #[test]
+    fn cycling_to_a_data_screen_requests_its_content() {
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+        let mut model = AppModel {
+            screen: Screen::Runs,
+            sessions: vec![SessionSummary {
+                id: "session-1".to_owned(),
+                ..SessionSummary::default()
+            }],
+            ..AppModel::default()
+        };
+        handle_input(&mut model, &key(KeyCode::Tab), &commands);
+        assert_eq!(model.screen, Screen::Diff);
+        assert_eq!(
+            receiver.try_recv().expect("diff request"),
+            UiCommand::LoadDiff("session-1".to_owned())
+        );
+    }
+
+    #[test]
+    fn gateway_collections_and_event_text_are_bounded() {
+        let mut model = AppModel::default();
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::Sessions(
+                (0..MAX_SESSIONS + 5)
+                    .map(|index| SessionSummary {
+                        id: index.to_string(),
+                        ..SessionSummary::default()
+                    })
+                    .collect(),
+            ),
+        );
+        assert_eq!(model.sessions.len(), MAX_SESSIONS);
+
+        for index in 0..=MAX_TRANSCRIPT {
+            apply_worker_event(
+                &mut model,
+                WorkerEvent::Message(TranscriptEntry {
+                    role: "assistant".to_owned(),
+                    text: if index == MAX_TRANSCRIPT {
+                        "x".repeat(20_000)
+                    } else {
+                        index.to_string()
+                    },
+                }),
+            );
+        }
+        assert_eq!(model.transcript.len(), MAX_TRANSCRIPT);
+        assert_eq!(model.transcript.front().expect("oldest retained").text, "1");
+        assert!(model.transcript.back().expect("newest retained").text.len() <= 16 * 1024);
+    }
 }

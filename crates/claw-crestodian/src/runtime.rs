@@ -48,12 +48,11 @@ impl CrestodianRuntime {
     pub fn start(settings_path: impl Into<PathBuf>) -> Result<Self, CrestodianError> {
         let settings_path = settings_path.into();
         let mut last_write_warnings = Vec::new();
-        let settings = if let Some(bytes) = read_optional_file(&settings_path)? {
-            decode(&settings_path, &bytes)?
+        let (settings, publish_defaults) = if let Some(bytes) = read_optional_file(&settings_path)?
+        {
+            (decode(&settings_path, &bytes)?, false)
         } else {
-            let settings = CrestodianSettings::default();
-            last_write_warnings = write_settings(&settings_path, &settings)?;
-            settings
+            (CrestodianSettings::default(), true)
         };
         settings
             .validate()
@@ -61,6 +60,9 @@ impl CrestodianRuntime {
                 path: settings_path.clone(),
                 message,
             })?;
+        if publish_defaults {
+            last_write_warnings = write_settings(&settings_path, &settings)?;
+        }
         Ok(Self {
             settings_path,
             settings,

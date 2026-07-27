@@ -196,11 +196,6 @@ pub(crate) struct EvidencePolicy {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct InventoryHeader {
-    pub(crate) inventory_id: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 #[expect(
     clippy::struct_field_names,

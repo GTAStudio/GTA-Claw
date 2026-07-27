@@ -1,6 +1,8 @@
 //! Native Gateway onboarding with Slint retaining ownership of the main thread.
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
+mod command_palette;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 mod controller;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod onboarding;
@@ -25,6 +27,8 @@ use std::fmt::{self, Display, Formatter};
 use std::rc::Rc;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
+use command_palette::{CommandPaletteState, PaletteAction, PaletteCatalogError};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use controller::{
     CommandRejection, ControllerSender, ControllerShutdownError, ControllerStartError,
     DesktopController,
@@ -37,7 +41,7 @@ use product_state::{
     SemanticTone, TranscriptRole, render_side_by_side, render_unified,
 };
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use slint::{CloseRequestResponse, ComponentHandle};
+use slint::{CloseRequestResponse, ComponentHandle, Model};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use ui_adapter::{UiTheme, VisualPreferencesState};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -300,19 +304,41 @@ fn apply_product_state(window: &AppWindow, models: &ProductModels, state: &Produ
 struct ProductView {
     models: ProductModels,
     state: RefCell<ProductState>,
+    palette: RefCell<CommandPaletteState>,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 impl ProductView {
-    fn attach(window: &AppWindow, state: ProductState) -> Self {
-        Self {
+    fn attach(window: &AppWindow, state: ProductState) -> Result<Self, PaletteCatalogError> {
+        let palette = CommandPaletteState::new(window.get_command_catalog().iter())?;
+        Ok(Self {
             models: ProductModels::attach(window),
             state: RefCell::new(state),
-        }
+            palette: RefCell::new(palette),
+        })
     }
 
     fn apply(&self, window: &AppWindow) {
         apply_product_state(window, &self.models, &self.state.borrow());
+        self.apply_palette(window);
+    }
+
+    fn apply_palette(&self, window: &AppWindow) {
+        let palette = self.palette.borrow();
+        let visible = palette.visible_items().collect::<Vec<_>>();
+        let selected = visible.get(palette.selected_index());
+        let selected_action_id = selected.map_or(-1, |command| command.action_id);
+        let selected_label = selected
+            .map(|command| command.title.clone())
+            .unwrap_or_default();
+        let command_count = i32::try_from(visible.len()).unwrap_or(i32::MAX);
+        reconcile(self.models.palette_commands(), visible);
+        window.set_palette_selected_index(
+            i32::try_from(palette.selected_index()).unwrap_or(i32::MAX),
+        );
+        window.set_palette_command_count(command_count);
+        window.set_palette_selected_action_id(selected_action_id);
+        window.set_palette_selected_label(selected_label);
     }
 }
 
@@ -326,6 +352,28 @@ fn mutate_product(
     if let Some(window) = weak_window.upgrade() {
         view.apply(&window);
     }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn apply_palette_action(state: &mut ProductState, action: PaletteAction) {
+    match action {
+        PaletteAction::Focus => state.select_destination(PrimaryDestination::Focus),
+        PaletteAction::Workspaces => state.select_destination(PrimaryDestination::Workspaces),
+        PaletteAction::Runs => state.select_destination(PrimaryDestination::Runs),
+        PaletteAction::Schedules => state.select_destination(PrimaryDestination::Schedules),
+        PaletteAction::Deliverables => {
+            state.select_destination(PrimaryDestination::Deliverables);
+        }
+        PaletteAction::Extensions => state.select_destination(PrimaryDestination::Extensions),
+        PaletteAction::Settings => state.select_destination(PrimaryDestination::Settings),
+        PaletteAction::KeyboardShortcuts => {
+            state.select_settings_section(5);
+            state.select_destination(PrimaryDestination::Settings);
+        }
+        PaletteAction::Update => state.open_update(),
+        PaletteAction::Diagnostics => state.open_diagnostics(),
+    }
+    state.close_palette();
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -515,13 +563,54 @@ fn wire_callbacks(
     let weak_window = window.as_weak();
     let view = Rc::clone(product_view);
     window.on_palette_toggle_requested(move || {
-        mutate_product(&weak_window, &view, ProductState::toggle_palette);
+        let opening = !view.state.borrow().palette_open();
+        if opening {
+            view.palette.borrow_mut().reset();
+        }
+        view.state.borrow_mut().toggle_palette();
+        if let Some(window) = weak_window.upgrade() {
+            if opening {
+                window.set_palette_query(slint::SharedString::default());
+            }
+            view.apply(&window);
+        }
     });
 
     let weak_window = window.as_weak();
     let view = Rc::clone(product_view);
     window.on_palette_dismiss_requested(move || {
         mutate_product(&weak_window, &view, ProductState::close_palette);
+    });
+
+    let weak_window = window.as_weak();
+    let view = Rc::clone(product_view);
+    window.on_palette_query_changed(move |query| {
+        let changed = view.palette.borrow_mut().update_query(query.as_str());
+        if changed && let Some(window) = weak_window.upgrade() {
+            view.apply_palette(&window);
+        }
+    });
+
+    let weak_window = window.as_weak();
+    let view = Rc::clone(product_view);
+    window.on_palette_selection_step_requested(move |step| {
+        view.palette.borrow_mut().move_selection(step);
+        if let Some(window) = weak_window.upgrade() {
+            view.apply_palette(&window);
+        }
+    });
+
+    let weak_window = window.as_weak();
+    let view = Rc::clone(product_view);
+    window.on_palette_command_requested(move |action_id| {
+        let action = PaletteAction::from_id(action_id)
+            .expect("Slint palette commands must use a catalog action");
+        view.palette.borrow_mut().reset();
+        apply_palette_action(&mut view.state.borrow_mut(), action);
+        if let Some(window) = weak_window.upgrade() {
+            window.set_palette_query(slint::SharedString::default());
+            view.apply(&window);
+        }
     });
 
     let weak_window = window.as_weak();
@@ -725,20 +814,18 @@ fn wire_callbacks(
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn main() -> Result<(), DesktopError> {
     let window = AppWindow::new().map_err(DesktopError::Platform)?;
-    let weak_window = window.as_weak();
-    let controller = DesktopController::spawn(move |snapshot| {
-        let weak_window = weak_window.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = weak_window.upgrade() {
-                apply_snapshot(&window, &snapshot);
-            }
-        });
-    })
-    .map_err(DesktopError::ControllerStart)?;
     let preferences = Rc::new(RefCell::new(VisualPreferencesState::default()));
-    let product_view = Rc::new(ProductView::attach(&window, ProductState::default()));
+    let product_view = Rc::new(
+        ProductView::attach(&window, ProductState::default())
+            .map_err(DesktopError::PaletteCatalog)?,
+    );
     apply_preferences(&window, *preferences.borrow());
     product_view.apply(&window);
+    let weak_window = window.as_weak();
+    let controller = DesktopController::spawn(move |snapshot| {
+        let _ = weak_window.upgrade_in_event_loop(move |window| apply_snapshot(&window, &snapshot));
+    })
+    .map_err(DesktopError::ControllerStart)?;
     wire_callbacks(&window, controller.sender(), preferences, &product_view);
     window.run().map_err(DesktopError::Platform)?;
     controller
@@ -752,6 +839,7 @@ enum DesktopError {
     Platform(slint::PlatformError),
     ControllerStart(ControllerStartError),
     ControllerShutdown(ControllerShutdownError),
+    PaletteCatalog(PaletteCatalogError),
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -763,6 +851,7 @@ impl Display for DesktopError {
             Self::ControllerShutdown(_) => {
                 "the desktop Gateway controller could not stop within bounds"
             }
+            Self::PaletteCatalog(_) => "the desktop command catalog is invalid",
         })
     }
 }
@@ -774,6 +863,7 @@ impl Error for DesktopError {
             Self::Platform(error) => Some(error),
             Self::ControllerStart(error) => Some(error),
             Self::ControllerShutdown(error) => Some(error),
+            Self::PaletteCatalog(error) => Some(error),
         }
     }
 }
@@ -804,7 +894,8 @@ mod tests {
         apply_snapshot(window, &OnboardingModel::default().snapshot());
         let mut initial_product = ProductState::default();
         initial_product.select_onboarding_stage(OnboardingStage::GatewayConnection);
-        let product_view = Rc::new(ProductView::attach(window, initial_product));
+        let product_view =
+            Rc::new(ProductView::attach(window, initial_product).expect("valid command catalog"));
         product_view.apply(window);
         wire_callbacks(window, sender, preferences, &product_view);
 
@@ -998,6 +1089,7 @@ mod tests {
         let app = include_str!("../ui/app-window.slint");
         let onboarding = include_str!("../ui/modules/gateway-onboarding.slint");
         let primitives = include_str!("../ui/modules/primitives.slint");
+        let product_shell = include_str!("../ui/modules/product-shell.slint");
         let build = include_str!("../build.rs");
         let generated = include_str!(concat!(env!("OUT_DIR"), "/app-window.rs"));
 
@@ -1057,7 +1149,47 @@ mod tests {
         assert!(primitives.contains("before-focus-boundary := FocusScope"));
         assert!(primitives.contains("after-focus-boundary := FocusScope"));
         assert!(primitives.contains("sheet-pointer-guard := TouchArea"));
+        assert!(app.contains("out property <[CommandItem]> command-catalog"));
+        assert!(app.contains("title: @tr(\"Go to Focus\")"));
+        assert!(product_shell.contains("accessible-name: @tr(\"Search commands\")"));
+        assert!(product_shell.contains("accessible-role: list-item"));
+        assert!(product_shell.contains("accessible-role: search"));
+        assert!(product_shell.contains("event.text == Key.UpArrow"));
+        assert!(product_shell.contains("event.modifiers.meta"));
+        assert!(product_shell.contains("changed palette-open"));
+        assert!(primitives.contains("in property <bool> focus-on-init"));
+        assert!(primitives.contains("intercept-vertical-navigation"));
         assert!(build.contains("\"windows\" => \"fluent\""));
         assert!(build.contains("\"macos\" => \"cupertino\""));
+    }
+
+    #[test]
+    fn palette_actions_reach_primary_and_auxiliary_surfaces() {
+        for (action, screen) in [
+            (PaletteAction::Focus, 0),
+            (PaletteAction::Workspaces, 1),
+            (PaletteAction::Runs, 2),
+            (PaletteAction::Schedules, 3),
+            (PaletteAction::Deliverables, 4),
+            (PaletteAction::Extensions, 5),
+            (PaletteAction::Settings, 6),
+            (PaletteAction::Update, 8),
+            (PaletteAction::Diagnostics, 9),
+        ] {
+            let mut state = ProductState::default();
+            state.toggle_palette();
+
+            apply_palette_action(&mut state, action);
+
+            assert_eq!(state.surface().screen_index(), screen);
+            assert!(!state.palette_open());
+        }
+
+        let mut state = ProductState::default();
+        state.toggle_palette();
+        apply_palette_action(&mut state, PaletteAction::KeyboardShortcuts);
+        assert_eq!(state.surface().screen_index(), 6);
+        assert_eq!(state.selected_settings_section(), 5);
+        assert!(!state.palette_open());
     }
 }

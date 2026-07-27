@@ -42,6 +42,41 @@ use crate::state::{ApiState, unix_seconds};
 /// every other request sharing the host.
 const MAX_EMBEDDING_DIMENSIONS: u16 = 8_192;
 
+/// Largest provider output one streaming request may retain before it is refused.
+///
+/// Both streaming coordinators hold part of the provider response in memory:
+/// `/v1/chat/completions` withholds every delta while an output constraint is
+/// pending, and `/v1/responses` must retain the whole message because
+/// `response.output_text.done` and the terminal `response.completed` resource
+/// carry it in full. Neither is optional — the first is what makes constraint
+/// enforcement meaningful, the second is the Responses wire contract — but
+/// nothing else bounds the buffer: the body limits cap the *request*, and
+/// `stream_buffer` caps only the in-flight channel. Without a ceiling a single
+/// caller can set `max_tokens` and let one broken or hostile upstream grow that
+/// buffer until the process dies, taking every other in-flight request with it.
+///
+/// 8 MiB is far above any honest response. The widest published output ceiling
+/// is around 128k tokens and even CJK- or emoji-dense text stays under six UTF-8
+/// bytes per token, so a complete maximal response is well under 1 MiB.
+const MAX_STREAM_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Bytes of provider output one requested output token is allowed to expand to.
+///
+/// A request carrying `max_tokens`/`max_output_tokens` has already stated its
+/// own bound, so the buffer is sized from the request rather than from the
+/// absolute ceiling. The factor is an order of magnitude above any real
+/// tokenizer ratio, so a provider that honours the requested limit is never
+/// refused; one that ignores it by a factor of sixty is already failing
+/// [`enforce_output_constraints`].
+const STREAM_OUTPUT_BYTES_PER_TOKEN: usize = 64;
+
+/// Smallest per-request output buffer, whatever the request asked for.
+///
+/// A very small `max_tokens` would otherwise derive a buffer of a few hundred
+/// bytes — exactly the range where the token-to-byte ratio is least predictable
+/// and where bounding the buffer saves no memory worth having.
+const MIN_STREAM_OUTPUT_BYTES: usize = 64 * 1024;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChatBody {
@@ -570,13 +605,22 @@ fn chat_stream(state: &ApiState, request: GenerationRequest, include_usage: bool
             return;
         }
         let mut tool_calls = Vec::new();
-        let mut buffered_text = Vec::new();
+        let mut buffered_text = String::new();
         let buffer_until_validation = generation_requires_output_validation(&request);
+        let mut budget = StreamBudget::new(&request);
         while let Some(event) = provider_rx.recv().await {
+            if !budget.admits(retained_bytes(&event, buffer_until_validation)) {
+                cancellation.cancel();
+                let error = oversized_stream_error();
+                if send_event(&sse_tx, json_event(error.body), &cancellation).await {
+                    let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
+                }
+                return;
+            }
             let value = match event {
                 GenerationEvent::Text(text) => {
                     if buffer_until_validation {
-                        buffered_text.push(text);
+                        buffered_text.push_str(&text);
                         continue;
                     }
                     chat_chunk(&request, created, &json!({"content": text}), &Value::Null)
@@ -627,8 +671,8 @@ fn chat_stream(state: &ApiState, request: GenerationRequest, include_usage: bool
                     return;
                 }
                 let mut output = GenerationOutput {
-                    text: buffered_text.concat(),
-                    tool_calls: tool_calls.clone(),
+                    text: buffered_text,
+                    tool_calls,
                     usage,
                 };
                 if let Err(error) = enforce_output_constraints(&request, &mut output) {
@@ -668,7 +712,7 @@ fn chat_stream(state: &ApiState, request: GenerationRequest, include_usage: bool
                         }
                     }
                 }
-                let finish = if tool_calls.is_empty() {
+                let finish = if output.tool_calls.is_empty() {
                     "stop"
                 } else {
                     "tool_calls"
@@ -787,7 +831,27 @@ fn responses_stream(
         let mut text = String::new();
         let mut calls = Vec::new();
         let buffer_until_validation = generation_requires_output_validation(&request);
+        let mut budget = StreamBudget::new(&request);
         while let Some(event) = provider_rx.recv().await {
+            // Unlike chat, this coordinator retains every delta whether or not
+            // it forwards it, because the terminal events carry the whole text.
+            if !budget.admits(retained_bytes(&event, true)) {
+                cancellation.cancel();
+                let error = oversized_stream_error();
+                send_response_failure(
+                    &sse_tx,
+                    &response_id,
+                    &request.model,
+                    PortError::new(
+                        PortErrorKind::Unavailable,
+                        constraint_error_message(&error).to_owned(),
+                    ),
+                    Usage::default(),
+                    created,
+                )
+                .await;
+                return;
+            }
             match event {
                 GenerationEvent::Text(delta) => {
                     text.push_str(&delta);
@@ -2227,6 +2291,75 @@ const fn generation_requires_output_validation(request: &GenerationRequest) -> b
         || request.response_format.is_some()
 }
 
+/// The ceiling on provider output one streaming request may retain.
+///
+/// A request that states `max_tokens` bounds its own legitimate response, so the
+/// ceiling is derived from it; anything else gets the absolute ceiling.
+fn stream_output_limit(request: &GenerationRequest) -> usize {
+    request
+        .max_tokens
+        .and_then(|tokens| usize::try_from(tokens).ok())
+        .and_then(|tokens| tokens.checked_mul(STREAM_OUTPUT_BYTES_PER_TOKEN))
+        .map_or(MAX_STREAM_OUTPUT_BYTES, |bytes| {
+            bytes.clamp(MIN_STREAM_OUTPUT_BYTES, MAX_STREAM_OUTPUT_BYTES)
+        })
+}
+
+/// Remaining bytes of provider output one streaming coordinator may still hold.
+///
+/// The coordinators differ in *what* they retain — chat keeps text only while a
+/// constraint is pending, Responses always keeps it, both always keep tool calls
+/// — so the budget only counts bytes and the caller decides which ones it is
+/// about to store.
+struct StreamBudget {
+    remaining: usize,
+}
+
+impl StreamBudget {
+    /// Opens a budget sized for one request.
+    fn new(request: &GenerationRequest) -> Self {
+        Self {
+            remaining: stream_output_limit(request),
+        }
+    }
+
+    /// Charges `bytes` against the budget, reporting whether they still fit.
+    ///
+    /// A refusal leaves the budget unchanged, so the caller can only ever hold
+    /// the bytes it was granted.
+    const fn admits(&mut self, bytes: usize) -> bool {
+        let Some(remaining) = self.remaining.checked_sub(bytes) else {
+            return false;
+        };
+        self.remaining = remaining;
+        true
+    }
+}
+
+/// Bytes one provider event adds to what a coordinator keeps until the stream ends.
+///
+/// Chat forwards text deltas immediately unless a constraint is pending, so
+/// `retains_text` is what that coordinator decided; both coordinators retain
+/// every tool call, because the terminal framing and the final tool-choice check
+/// are computed from the complete list.
+const fn retained_bytes(event: &GenerationEvent, retains_text: bool) -> usize {
+    match event {
+        GenerationEvent::Text(text) => {
+            if retains_text {
+                text.len()
+            } else {
+                0
+            }
+        }
+        GenerationEvent::ToolCall(call) => call.id.len() + call.name.len() + call.arguments.len(),
+    }
+}
+
+/// The upstream fault reported when a provider overruns the retained-output ceiling.
+fn oversized_stream_error() -> ApiError {
+    output_constraint_error("The provider exceeded the maximum buffered response size.")
+}
+
 fn enforce_output_constraints(
     request: &GenerationRequest,
     output: &mut GenerationOutput,
@@ -2410,5 +2543,82 @@ fn provider_api_error(error: PortError) -> ApiError {
             "internal error",
             "api_error",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GenerationRequest, MAX_STREAM_OUTPUT_BYTES, MIN_STREAM_OUTPUT_BYTES,
+        STREAM_OUTPUT_BYTES_PER_TOKEN, ToolChoice, stream_output_limit,
+    };
+
+    /// A request carrying nothing but the output token bound under test.
+    fn request(max_tokens: Option<u64>) -> GenerationRequest {
+        GenerationRequest {
+            model: "openclaw".to_owned(),
+            prompt: String::new(),
+            instructions: None,
+            media: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: ToolChoice::Auto,
+            max_tokens,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            stop: None,
+            response_format: None,
+            request_id: String::new(),
+            session_id: String::new(),
+        }
+    }
+
+    /// A request that states no output bound falls back to the absolute ceiling.
+    ///
+    /// This is the branch every unconstrained `/v1/responses` stream takes, and
+    /// the one no wire test can reach without moving eight megabytes.
+    #[test]
+    fn an_unbounded_request_gets_the_absolute_ceiling() {
+        assert_eq!(stream_output_limit(&request(None)), MAX_STREAM_OUTPUT_BYTES);
+    }
+
+    /// A stated bound sizes the buffer instead of the absolute ceiling.
+    #[test]
+    fn a_stated_token_bound_sizes_the_buffer() {
+        const TOKENS: u64 = 32_768;
+        const EXPECTED: usize = 32_768 * STREAM_OUTPUT_BYTES_PER_TOKEN;
+
+        assert_eq!(stream_output_limit(&request(Some(TOKENS))), EXPECTED);
+    }
+
+    /// A tiny bound still gets the floor, where the byte ratio is least predictable.
+    #[test]
+    fn a_tiny_token_bound_still_gets_the_floor() {
+        for tokens in [1, 16, 512] {
+            assert_eq!(
+                stream_output_limit(&request(Some(tokens))),
+                MIN_STREAM_OUTPUT_BYTES,
+                "a {tokens}-token request must keep the floor"
+            );
+        }
+    }
+
+    /// A bound a caller cannot honestly mean is clamped rather than trusted.
+    ///
+    /// `u64::MAX` also proves the derivation cannot overflow into a small or
+    /// panicking limit, which is the one way this ceiling could be turned into
+    /// the defect it exists to prevent.
+    #[test]
+    fn an_absurd_token_bound_is_clamped_to_the_ceiling() {
+        for tokens in [u64::from(u32::MAX), u64::MAX] {
+            assert_eq!(
+                stream_output_limit(&request(Some(tokens))),
+                MAX_STREAM_OUTPUT_BYTES,
+                "a {tokens}-token request must not raise the ceiling"
+            );
+        }
     }
 }

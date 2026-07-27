@@ -6,7 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use claw_conformance::{Contract, Registry, discover_claim_files, generate_report};
+use claw_conformance::{
+    ConformanceError, Contract, Registry, discover_claim_files, generate_report,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OutputFormat {
@@ -42,10 +44,11 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let arguments = parse_arguments(raw_arguments.into_iter())?;
-    let contract = Contract::load(&arguments.contract_root).map_err(|error| error.to_string())?;
+    let contract = Contract::load(&arguments.contract_root)
+        .map_err(|error| conformance_error("contract load", &error))?;
     let repository_root = repository_root(&arguments.contract_root)?;
-    let mut claim_files =
-        discover_claim_files(&repository_root).map_err(|error| error.to_string())?;
+    let mut claim_files = discover_claim_files(&repository_root)
+        .map_err(|error| conformance_error("claim discovery", &error))?;
     claim_files.extend(arguments.claim_files);
     let claim_files = claim_files
         .into_iter()
@@ -59,10 +62,10 @@ fn run() -> Result<(), String> {
     for path in claim_files {
         registry
             .load_claims_file(path)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| conformance_error("claim loading", &error))?;
     }
     let report = generate_report(&contract, &registry, &repository_root)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| conformance_error("report generation", &error))?;
     match arguments.format {
         OutputFormat::Human => print!("{}", report.to_human_table()),
         OutputFormat::Json => println!(
@@ -83,6 +86,10 @@ fn run() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn conformance_error(stage: &str, error: &ConformanceError) -> String {
+    format!("{stage} failed [{}]: {error}", error.code().as_str())
 }
 
 fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<Arguments, String> {

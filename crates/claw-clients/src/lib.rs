@@ -40,6 +40,7 @@
 pub mod clawhub;
 pub mod conformance;
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -697,6 +698,7 @@ pub struct EventDelivery {
     max_payload_bytes: usize,
     next_sequence: u64,
     queue: VecDeque<DeliveredEvent>,
+    closed: bool,
 }
 
 impl EventDelivery {
@@ -721,6 +723,7 @@ impl EventDelivery {
             max_payload_bytes,
             next_sequence: 1,
             queue: VecDeque::with_capacity(capacity),
+            closed: false,
         })
     }
 
@@ -728,18 +731,23 @@ impl EventDelivery {
     ///
     /// # Errors
     ///
-    /// Returns [`DeliveryError::EventNotAllowed`] when the surface's frozen
-    /// contract does not list `kind`, [`DeliveryError::QueueFull`] when this
-    /// connection already holds `capacity` undelivered events,
+    /// Returns [`DeliveryError::Closed`] after terminal shutdown,
+    /// [`DeliveryError::EventNotAllowed`] when the surface's frozen contract
+    /// does not list `kind`, [`DeliveryError::QueueFull`] when this connection
+    /// already holds `capacity` undelivered events,
     /// [`DeliveryError::PayloadTooLarge`] when the encoded payload exceeds
     /// `max_payload_bytes`, and [`DeliveryError::SequenceExhausted`] when the
     /// per-connection sequence counter reached [`u64::MAX`]. The event is not
-    /// queued in any of those cases.
-    pub fn push(
+    /// queued in any of those cases. Borrowed payloads are validated before
+    /// allocation.
+    pub fn push<'a>(
         &mut self,
         kind: SessionEventKind,
-        payload: impl Into<String>,
+        payload: impl Into<Cow<'a, str>>,
     ) -> Result<u64, DeliveryError> {
+        if self.closed {
+            return Err(DeliveryError::Closed);
+        }
         if !surface(self.surface).events.contains(&kind) {
             return Err(DeliveryError::EventNotAllowed(kind));
         }
@@ -761,9 +769,27 @@ impl EventDelivery {
         self.queue.push_back(DeliveredEvent {
             sequence,
             kind,
-            payload,
+            payload: payload.into_owned(),
         });
         Ok(sequence)
+    }
+
+    /// Terminates this connection queue and discards undelivered events.
+    ///
+    /// Returns the number of discarded events. Shutdown is idempotent. A
+    /// reconnect must construct a new queue so its sequence starts from one and
+    /// no event from the previous connection can cross the lifecycle boundary.
+    pub fn close(&mut self) -> usize {
+        self.closed = true;
+        let discarded = self.queue.len();
+        self.queue.clear();
+        discarded
+    }
+
+    /// Reports whether terminal shutdown has occurred.
+    #[must_use]
+    pub const fn is_closed(&self) -> bool {
+        self.closed
     }
 
     /// Removes and returns the oldest pending event.
@@ -789,6 +815,8 @@ impl EventDelivery {
 pub enum DeliveryError {
     /// Queue and payload limits must be positive.
     InvalidBound,
+    /// The connection queue has completed terminal shutdown.
+    Closed,
     /// The surface does not consume this event class.
     EventNotAllowed(SessionEventKind),
     /// The per-connection queue is full.
@@ -808,6 +836,7 @@ impl Display for DeliveryError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidBound => formatter.write_str("event delivery bounds must be positive"),
+            Self::Closed => formatter.write_str("client event connection is closed"),
             Self::EventNotAllowed(kind) => write!(formatter, "event {kind:?} is not allowed"),
             Self::QueueFull => formatter.write_str("client event queue is full"),
             Self::PayloadTooLarge { actual, limit } => {
@@ -1280,6 +1309,24 @@ mod tests {
                 .expect("valid bounds")
                 .push(SessionEventKind::Chat, "{}"),
             Err(DeliveryError::EventNotAllowed(SessionEventKind::Chat))
+        );
+
+        assert_eq!(second.close(), 1);
+        assert!(second.is_closed());
+        assert!(second.is_empty());
+        assert_eq!(second.pop(), None);
+        assert_eq!(second.close(), 0, "shutdown must be idempotent");
+        assert_eq!(
+            second.push(SessionEventKind::Agent, "late"),
+            Err(DeliveryError::Closed)
+        );
+
+        let mut reconnected =
+            EventDelivery::new(SurfaceId::Cli, 1, 8).expect("fresh connection queue");
+        assert_eq!(
+            reconnected.push(SessionEventKind::Agent, String::from("fresh")),
+            Ok(1),
+            "a reconnect must not inherit the prior connection sequence"
         );
     }
 }

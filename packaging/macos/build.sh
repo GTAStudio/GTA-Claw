@@ -10,6 +10,7 @@ require_macos
 for tool in cargo rustc rustup lipo otool; do
   require_tool "$tool"
 done
+assert_pinned_rust_toolchain
 
 mode="${1:-native}"
 case "$mode" in

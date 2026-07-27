@@ -3,13 +3,25 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ConformanceError, ViolationCode};
+
+const MAX_CLAIMS_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_CARGO_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_RUST_SOURCE_BYTES: u64 = 1024 * 1024;
+const MAX_CACHED_EVIDENCE_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TOTAL_REACHABLE_RUST_BYTES: usize = 128 * 1024 * 1024;
+const MAX_DISCOVERED_DIRECTORIES: usize = 65_536;
+const MAX_DISCOVERED_MANIFESTS: usize = 4096;
+const MAX_REACHABLE_RUST_SOURCES: usize = 20_000;
+const MAX_EVIDENCE_ITEMS_PER_CLAIM: usize = 1024;
 
 /// Claimed implementation level.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -325,10 +337,25 @@ fn matching_manifest_target<'a>(
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct CargoTestTargets {
     repository_root: PathBuf,
-    source_paths: BTreeSet<PathBuf>,
+    source_paths: Arc<BTreeSet<PathBuf>>,
+    resolver: OrdinalPathResolver,
+    evidence_tokens: BTreeMap<PathBuf, Arc<[RustToken]>>,
+    evidence_source_bytes: usize,
+}
+
+impl Clone for CargoTestTargets {
+    fn clone(&self) -> Self {
+        Self {
+            repository_root: self.repository_root.clone(),
+            source_paths: Arc::clone(&self.source_paths),
+            resolver: OrdinalPathResolver::default(),
+            evidence_tokens: self.evidence_tokens.clone(),
+            evidence_source_bytes: self.evidence_source_bytes,
+        }
+    }
 }
 
 impl CargoTestTargets {
@@ -438,15 +465,55 @@ impl CargoTestTargets {
                 }
             }
         }
-        let source_paths = reachable_rust_sources(&canonical_root, target_roots, code)?;
+        let mut resolver = OrdinalPathResolver::default();
+        let source_paths =
+            reachable_rust_sources(&canonical_root, target_roots, &mut resolver, code)?;
         Ok(Self {
             repository_root: canonical_root,
-            source_paths,
+            source_paths: Arc::new(source_paths),
+            resolver,
+            evidence_tokens: BTreeMap::new(),
+            evidence_source_bytes: 0,
         })
     }
 
     fn contains_compiled_source(&self, path: &Path) -> bool {
         self.source_paths.contains(path)
+    }
+
+    fn resolve_file(&mut self, relative_path: &str) -> io::Result<Option<PathBuf>> {
+        self.resolver
+            .resolve_file(&self.repository_root, relative_path)
+    }
+
+    fn declares_enabled_test(&mut self, path: &Path, test_name: &str) -> io::Result<bool> {
+        if !self.evidence_tokens.contains_key(path) {
+            let source = read_utf8_file_bounded(path, MAX_RUST_SOURCE_BYTES)?;
+            let cached_bytes = self
+                .evidence_source_bytes
+                .checked_add(source.len())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "cached evidence source byte count overflowed",
+                    )
+                })?;
+            if cached_bytes > MAX_CACHED_EVIDENCE_SOURCE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "evidence sources exceed the {MAX_CACHED_EVIDENCE_SOURCE_BYTES}-byte cache limit"
+                    ),
+                ));
+            }
+            self.evidence_tokens
+                .insert(path.to_path_buf(), Arc::from(rust_tokens(&source)));
+            self.evidence_source_bytes = cached_bytes;
+        }
+        Ok(self
+            .evidence_tokens
+            .get(path)
+            .is_some_and(|tokens| declares_enabled_test_tokens(tokens.as_ref(), test_name)))
     }
 
     pub(crate) fn is_for_repository(&self, repository_root: &Path) -> bool {
@@ -466,13 +533,14 @@ fn load_manifest_scope(
             .strip_prefix(repository_root)
             .unwrap_or(manifest_path),
     );
-    let source = fs::read_to_string(manifest_path).map_err(|error| {
-        ConformanceError::new(
-            code,
-            Some(subject.clone()),
-            format!("cannot read Cargo manifest: {error}"),
-        )
-    })?;
+    let source =
+        read_utf8_file_bounded(manifest_path, MAX_CARGO_MANIFEST_BYTES).map_err(|error| {
+            ConformanceError::new(
+                code,
+                Some(subject.clone()),
+                format!("cannot read Cargo manifest: {error}"),
+            )
+        })?;
     let document = source.parse::<toml_edit::DocumentMut>().map_err(|error| {
         ConformanceError::new(
             code,
@@ -593,13 +661,14 @@ fn load_manifest_targets(
             .strip_prefix(repository_root)
             .unwrap_or(manifest_path),
     );
-    let source = fs::read_to_string(manifest_path).map_err(|error| {
-        ConformanceError::new(
-            code,
-            Some(subject.clone()),
-            format!("cannot read Cargo manifest: {error}"),
-        )
-    })?;
+    let source =
+        read_utf8_file_bounded(manifest_path, MAX_CARGO_MANIFEST_BYTES).map_err(|error| {
+            ConformanceError::new(
+                code,
+                Some(subject.clone()),
+                format!("cannot read Cargo manifest: {error}"),
+            )
+        })?;
     toml::from_str(&source).map_err(|error| {
         ConformanceError::new(
             code,
@@ -741,9 +810,45 @@ fn trusted_executable(repository_root: &Path, candidate: &Path) -> Result<PathBu
     Ok(executable)
 }
 
+fn read_file_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let reported_size = file.metadata()?.len();
+    if reported_size > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "'{}' is {reported_size} bytes and exceeds the {max_bytes}-byte limit",
+                path.display()
+            ),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(reported_size)
+            .unwrap_or(usize::MAX)
+            .min(usize::try_from(max_bytes).unwrap_or(usize::MAX)),
+    );
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "'{}' grew beyond the {max_bytes}-byte limit while it was read",
+                path.display()
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_utf8_file_bounded(path: &Path, max_bytes: u64) -> io::Result<String> {
+    String::from_utf8(read_file_bounded(path, max_bytes)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
 fn discover_cargo_manifests(repository_root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     let mut manifests = Vec::new();
     let mut directories = VecDeque::from([repository_root.to_path_buf()]);
+    let mut discovered_directories = 1_usize;
     while let Some(directory) = directories.pop_front() {
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
@@ -757,10 +862,27 @@ fn discover_cargo_manifests(repository_root: &Path) -> Result<Vec<PathBuf>, std:
                     entry.file_name().to_str(),
                     Some(".git" | "target" | "node_modules")
                 ) {
+                    discovered_directories += 1;
+                    if discovered_directories > MAX_DISCOVERED_DIRECTORIES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "repository traversal exceeded {MAX_DISCOVERED_DIRECTORIES} directories"
+                            ),
+                        ));
+                    }
                     directories.push_back(path);
                 }
             } else if metadata.is_file() && entry.file_name() == "Cargo.toml" {
                 manifests.push(path);
+                if manifests.len() > MAX_DISCOVERED_MANIFESTS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "repository traversal exceeded {MAX_DISCOVERED_MANIFESTS} Cargo manifests"
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -783,8 +905,18 @@ struct ReachableRustSource {
 fn reachable_rust_sources(
     repository_root: &Path,
     target_roots: BTreeSet<(PathBuf, PathBuf)>,
+    resolver: &mut OrdinalPathResolver,
     code: ViolationCode,
 ) -> Result<BTreeSet<PathBuf>, ConformanceError> {
+    if target_roots.len() > MAX_REACHABLE_RUST_SOURCES {
+        return Err(ConformanceError::new(
+            code,
+            Some("Cargo.toml".to_owned()),
+            format!(
+                "test-enabled Cargo targets exceed the {MAX_REACHABLE_RUST_SOURCES}-source reachability limit"
+            ),
+        ));
+    }
     let mut reachable = target_roots
         .iter()
         .map(|(path, _)| path.clone())
@@ -801,24 +933,45 @@ fn reachable_rust_sources(
             })
         })
         .collect::<VecDeque<_>>();
+    let mut total_source_bytes = 0_usize;
 
     while let Some(current) = queue.pop_front() {
-        let source = fs::read_to_string(&current.path).map_err(|error| {
-            ConformanceError::new(
+        let source =
+            read_utf8_file_bounded(&current.path, MAX_RUST_SOURCE_BYTES).map_err(|error| {
+                ConformanceError::new(
+                    code,
+                    Some(normalized_api_path(
+                        current
+                            .path
+                            .strip_prefix(repository_root)
+                            .unwrap_or(&current.path),
+                    )),
+                    format!(
+                        "cannot read test-enabled Cargo source '{}': {error}",
+                        current.path.display()
+                    ),
+                )
+            })?;
+        total_source_bytes = total_source_bytes
+            .checked_add(source.len())
+            .ok_or_else(|| {
+                ConformanceError::new(
+                    code,
+                    Some("Cargo.toml".to_owned()),
+                    "reachable Rust source byte count overflowed".to_owned(),
+                )
+            })?;
+        if total_source_bytes > MAX_TOTAL_REACHABLE_RUST_BYTES {
+            return Err(ConformanceError::new(
                 code,
-                Some(normalized_api_path(
-                    current
-                        .path
-                        .strip_prefix(repository_root)
-                        .unwrap_or(&current.path),
-                )),
+                Some("Cargo.toml".to_owned()),
                 format!(
-                    "cannot read test-enabled Cargo source '{}': {error}",
-                    current.path.display()
+                    "reachable Rust sources exceed the {MAX_TOTAL_REACHABLE_RUST_BYTES}-byte traversal limit"
                 ),
-            )
-        })?;
-        for reference in rust_module_references(&source) {
+            ));
+        }
+        let tokens = rust_tokens(&source);
+        for reference in rust_module_references_from_tokens(&tokens) {
             let mut scope = current.module_directory.clone();
             for (index, directory) in reference.inline_modules.iter().enumerate() {
                 match directory {
@@ -843,25 +996,27 @@ fn reachable_rust_sources(
                     child_directory.join("mod.rs"),
                 ]
             };
-            let mut resolved = Vec::new();
+            let mut resolved_paths = Vec::new();
             for candidate in candidates {
-                let Some(path) = resolve_module_file(&current.package_directory, &candidate)
-                    .map_err(|error| {
-                        ConformanceError::new(
-                            code,
-                            Some("Cargo.toml".to_owned()),
-                            format!(
-                                "cannot resolve Rust module source '{}': {error}",
-                                candidate.display()
-                            ),
-                        )
-                    })?
+                let Some(path) =
+                    resolve_module_file(&current.package_directory, &candidate, resolver).map_err(
+                        |error| {
+                            ConformanceError::new(
+                                code,
+                                Some("Cargo.toml".to_owned()),
+                                format!(
+                                    "cannot resolve Rust module source '{}': {error}",
+                                    candidate.display()
+                                ),
+                            )
+                        },
+                    )?
                 else {
                     continue;
                 };
-                resolved.push(path);
+                resolved_paths.push(path);
             }
-            if reference.path.is_none() && resolved.len() > 1 {
+            if reference.path.is_none() && resolved_paths.len() > 1 {
                 return Err(ConformanceError::new(
                     code,
                     Some(normalized_api_path(
@@ -876,8 +1031,17 @@ fn reachable_rust_sources(
                     ),
                 ));
             }
-            for path in resolved {
+            for path in resolved_paths {
                 if visited.insert((path.clone(), current.package_directory.clone())) {
+                    if reachable.len() >= MAX_REACHABLE_RUST_SOURCES {
+                        return Err(ConformanceError::new(
+                            code,
+                            Some("Cargo.toml".to_owned()),
+                            format!(
+                                "Rust module reachability exceeded {MAX_REACHABLE_RUST_SOURCES} sources"
+                            ),
+                        ));
+                    }
                     reachable.insert(path.clone());
                     let module_directory = module_directory_for_source(&path);
                     queue.push_back(ReachableRustSource {
@@ -906,11 +1070,12 @@ fn module_directory_for_source(path: &Path) -> PathBuf {
 fn resolve_module_file(
     repository_root: &Path,
     candidate: &Path,
+    resolver: &mut OrdinalPathResolver,
 ) -> Result<Option<PathBuf>, std::io::Error> {
     let Some(relative) = normalized_repository_relative(repository_root, candidate) else {
         return Ok(None);
     };
-    resolve_ordinal_file(repository_root, &normalized_api_path(&relative))
+    resolver.resolve_file(repository_root, &normalized_api_path(&relative))
 }
 
 fn normalized_repository_relative(repository_root: &Path, path: &Path) -> Option<PathBuf> {
@@ -993,7 +1158,7 @@ impl Registry {
     /// contained claims collides with a claim already in the registry.
     pub fn load_claims_file(&mut self, path: impl AsRef<Path>) -> Result<(), ConformanceError> {
         let path = path.as_ref();
-        let bytes = fs::read(path).map_err(|error| {
+        let bytes = read_file_bounded(path, MAX_CLAIMS_FILE_BYTES).map_err(|error| {
             ConformanceError::new(
                 ViolationCode::Io,
                 Some(path.display().to_string()),
@@ -1113,6 +1278,16 @@ pub(crate) fn validate_evidence_as(
             "claim has no recorded evidence".to_owned(),
         ));
     }
+    if evidence.len() > MAX_EVIDENCE_ITEMS_PER_CLAIM {
+        return Err(ConformanceError::new(
+            code,
+            Some(subject.to_owned()),
+            format!(
+                "claim has {} evidence artifacts and exceeds the {MAX_EVIDENCE_ITEMS_PER_CLAIM}-artifact limit",
+                evidence.len()
+            ),
+        ));
+    }
     let mut identities = std::collections::BTreeSet::new();
     for item in evidence {
         let path_text = item.path.as_str();
@@ -1169,7 +1344,13 @@ pub(crate) fn validate_evidence_as(
                 "claim repeats the same evidence artifact".to_owned(),
             ));
         }
-        let path = resolve_ordinal_file(repository_root, path_text).map_err(|error| {
+        if cargo_test_targets.is_none() {
+            *cargo_test_targets = Some(CargoTestTargets::load(repository_root, code)?);
+        }
+        let targets = cargo_test_targets
+            .as_mut()
+            .expect("Cargo test targets were initialized");
+        let path = targets.resolve_file(path_text).map_err(|error| {
             ConformanceError::new(
                 code,
                 Some(subject.to_owned()),
@@ -1183,13 +1364,6 @@ pub(crate) fn validate_evidence_as(
                 format!("evidence file '{}' does not exist", item.path),
             ));
         };
-        let canonical_root = repository_root.canonicalize().map_err(|error| {
-            ConformanceError::new(
-                code,
-                Some(subject.to_owned()),
-                format!("cannot resolve repository root: {error}"),
-            )
-        })?;
         let canonical_path = path.canonicalize().map_err(|error| {
             ConformanceError::new(
                 code,
@@ -1197,7 +1371,7 @@ pub(crate) fn validate_evidence_as(
                 format!("cannot resolve evidence file '{}': {error}", item.path),
             )
         })?;
-        if !canonical_path.starts_with(&canonical_root) {
+        if !canonical_path.starts_with(&targets.repository_root) {
             return Err(ConformanceError::new(
                 code,
                 Some(subject.to_owned()),
@@ -1207,14 +1381,15 @@ pub(crate) fn validate_evidence_as(
                 ),
             ));
         }
-        let source = fs::read_to_string(&canonical_path).map_err(|error| {
-            ConformanceError::new(
-                code,
-                Some(subject.to_owned()),
-                format!("cannot read evidence file '{}': {error}", item.path),
-            )
-        })?;
-        let declared = declares_enabled_test(&source, &item.test);
+        let declared = targets
+            .declares_enabled_test(&canonical_path, &item.test)
+            .map_err(|error| {
+                ConformanceError::new(
+                    code,
+                    Some(subject.to_owned()),
+                    format!("cannot read evidence file '{}': {error}", item.path),
+                )
+            })?;
         if !declared {
             return Err(ConformanceError::new(
                 code,
@@ -1225,13 +1400,7 @@ pub(crate) fn validate_evidence_as(
                 ),
             ));
         }
-        if cargo_test_targets.is_none() {
-            *cargo_test_targets = Some(CargoTestTargets::load(repository_root, code)?);
-        }
-        let is_test_target = cargo_test_targets
-            .as_ref()
-            .is_some_and(|targets| targets.contains_compiled_source(&canonical_path));
-        if !is_test_target {
+        if !targets.contains_compiled_source(&canonical_path) {
             return Err(ConformanceError::new(
                 code,
                 Some(subject.to_owned()),
@@ -1365,29 +1534,77 @@ fn normalized_api_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+#[derive(Clone, Debug)]
+struct OrdinalEntry {
+    path: PathBuf,
+    is_file: bool,
+    is_symlink_or_reparse: bool,
+}
+
+#[derive(Debug, Default)]
+struct OrdinalPathResolver {
+    directories: BTreeMap<PathBuf, BTreeMap<OsString, OrdinalEntry>>,
+    directory_reads: usize,
+}
+
+impl OrdinalPathResolver {
+    fn resolve_file(
+        &mut self,
+        repository_root: &Path,
+        relative_path: &str,
+    ) -> io::Result<Option<PathBuf>> {
+        let mut current = repository_root.to_path_buf();
+        let mut is_file = false;
+        for segment in relative_path.split('/') {
+            let entry = self
+                .directory_entries(&current)?
+                .get(OsStr::new(segment))
+                .cloned();
+            let Some(entry) = entry else {
+                return Ok(None);
+            };
+            if entry.is_symlink_or_reparse {
+                return Ok(None);
+            }
+            is_file = entry.is_file;
+            current = entry.path;
+        }
+        Ok(is_file.then_some(current))
+    }
+
+    fn directory_entries(
+        &mut self,
+        directory: &Path,
+    ) -> io::Result<&BTreeMap<OsString, OrdinalEntry>> {
+        if !self.directories.contains_key(directory) {
+            let mut entries = BTreeMap::new();
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                let metadata = fs::symlink_metadata(entry.path())?;
+                entries.insert(
+                    entry.file_name(),
+                    OrdinalEntry {
+                        path: entry.path(),
+                        is_file: metadata.is_file(),
+                        is_symlink_or_reparse: is_symlink_or_reparse(&metadata),
+                    },
+                );
+            }
+            self.directory_reads += 1;
+            self.directories.insert(directory.to_path_buf(), entries);
+        }
+        Ok(self
+            .directories
+            .get(directory)
+            .expect("directory cache was populated"))
+    }
+}
+
 fn resolve_ordinal_file(
     repository_root: &Path,
     relative_path: &str,
 ) -> Result<Option<PathBuf>, std::io::Error> {
-    let mut current = repository_root.to_path_buf();
-    for segment in relative_path.split('/') {
-        let mut exact = None;
-        for entry in fs::read_dir(&current)? {
-            let entry = entry?;
-            if entry.file_name().to_str() == Some(segment) {
-                if is_symlink_or_reparse(&fs::symlink_metadata(entry.path())?) {
-                    return Ok(None);
-                }
-                exact = Some(entry.path());
-                break;
-            }
-        }
-        let Some(path) = exact else {
-            return Ok(None);
-        };
-        current = path;
-    }
-    Ok(current.is_file().then_some(current))
+    OrdinalPathResolver::default().resolve_file(repository_root, relative_path)
 }
 
 fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
@@ -1482,9 +1699,14 @@ enum InlineModuleDirectory {
 
 // This is the normative enabled-test decision. The transition validator ports
 // this behavior and must be updated whenever this function changes.
+#[cfg(test)]
 fn declares_enabled_test(source: &str, test_name: &str) -> bool {
+    declares_enabled_test_tokens(&rust_tokens(source), test_name)
+}
+
+fn declares_enabled_test_tokens(tokens: &[RustToken], test_name: &str) -> bool {
     let target = test_name.split("::").collect::<Vec<_>>();
-    declares_in_items(&rust_tokens(source), 0, None, &[], &target)
+    declares_in_items(tokens, 0, None, &[], &target)
 }
 
 fn declares_in_items(
@@ -1587,10 +1809,9 @@ fn parse_attributes(
     (attributes, index)
 }
 
-fn rust_module_references(source: &str) -> Vec<RustModuleReference> {
-    let tokens = rust_tokens(source);
+fn rust_module_references_from_tokens(tokens: &[RustToken]) -> Vec<RustModuleReference> {
     let mut references = Vec::new();
-    collect_rust_module_references(&tokens, 0, tokens.len(), &[], &mut references);
+    collect_rust_module_references(tokens, 0, tokens.len(), &[], &mut references);
     references
 }
 
@@ -2050,14 +2271,15 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use serde::Deserialize;
 
     use super::{
-        CargoTestTargets, cargo_executable, cargo_pattern_matches, declares_enabled_test,
-        load_manifest_scope, normalized_api_path, resolve_cargo_executable,
-        resolve_external_executable,
+        CargoTestTargets, OrdinalPathResolver, cargo_executable, cargo_pattern_matches,
+        declares_enabled_test, load_manifest_scope, normalized_api_path, read_file_bounded,
+        resolve_cargo_executable, resolve_external_executable,
     };
     use crate::ViolationCode;
 
@@ -2194,6 +2416,105 @@ mod tests {
                 "{variable} must be absent from compiler oracle subprocesses"
             );
         }
+    }
+
+    #[test]
+    fn ordinal_resolution_enumerates_each_directory_once() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-resolver-cache-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let tests = root.join("tests");
+        fs::create_dir_all(&tests).expect("create resolver fixture");
+        fs::write(tests.join("one.rs"), "").expect("write first source");
+        fs::write(tests.join("two.rs"), "").expect("write second source");
+
+        let mut resolver = OrdinalPathResolver::default();
+        assert!(
+            resolver
+                .resolve_file(&root, "tests/one.rs")
+                .expect("resolve first")
+                .is_some()
+        );
+        assert!(
+            resolver
+                .resolve_file(&root, "tests/two.rs")
+                .expect("resolve sibling")
+                .is_some()
+        );
+        assert!(
+            resolver
+                .resolve_file(&root, "tests/missing.rs")
+                .expect("resolve missing sibling")
+                .is_none()
+        );
+        assert_eq!(
+            resolver.directory_reads, 2,
+            "root and tests should each be enumerated once"
+        );
+        fs::remove_dir_all(root).expect("remove resolver fixture");
+    }
+
+    #[test]
+    fn evidence_tokenization_is_cached_per_source() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-token-cache-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("create token fixture");
+        let source = root.join("evidence.rs");
+        fs::write(&source, "#[test]\nfn first() {}\n#[test]\nfn second() {}\n")
+            .expect("write evidence source");
+        let mut targets = CargoTestTargets {
+            repository_root: root.clone(),
+            source_paths: Arc::new(BTreeSet::from([source.clone()])),
+            resolver: OrdinalPathResolver::default(),
+            evidence_tokens: BTreeMap::new(),
+            evidence_source_bytes: 0,
+        };
+
+        assert!(
+            targets
+                .declares_enabled_test(&source, "first")
+                .expect("first declaration")
+        );
+        assert!(
+            targets
+                .declares_enabled_test(&source, "second")
+                .expect("second declaration")
+        );
+        assert_eq!(targets.evidence_tokens.len(), 1);
+        let cloned = targets.clone();
+        assert!(Arc::ptr_eq(
+            targets
+                .evidence_tokens
+                .get(&source)
+                .expect("original token cache"),
+            cloned
+                .evidence_tokens
+                .get(&source)
+                .expect("cloned token cache")
+        ));
+        fs::remove_dir_all(root).expect("remove token fixture");
+    }
+
+    #[test]
+    fn bounded_reader_rejects_growth_before_allocating_it_all() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-bounded-read-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("create bounded read fixture");
+        let path = root.join("large.rs");
+        fs::write(&path, b"12345").expect("write bounded read fixture");
+
+        let error = read_file_bounded(&path, 4).expect_err("five bytes exceed four-byte limit");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds the 4-byte limit"));
+        fs::remove_dir_all(root).expect("remove bounded read fixture");
     }
 
     #[test]

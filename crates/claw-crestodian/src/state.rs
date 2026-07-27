@@ -34,14 +34,13 @@ impl Default for CrestodianState {
     }
 }
 
-pub(crate) fn read_state(path: &Path) -> Result<CrestodianState, CrestodianError> {
-    let bytes = fs::read(path).map_err(|source| CrestodianError::io(path, source))?;
+pub(crate) fn decode_state(path: &Path, bytes: &[u8]) -> Result<CrestodianState, CrestodianError> {
     let refuse = |json_path: String, message: String| CrestodianError::StateDecode {
         path: path.to_owned(),
         json_path,
         message,
     };
-    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let state = serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
         let json_path = error.path().to_string();
         refuse(

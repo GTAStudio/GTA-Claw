@@ -69,12 +69,30 @@ impl TelemetryHandle {
     pub fn take_writer_error(&self) -> Result<Option<String>, TelemetryError> {
         self.layer.take_error().map_err(TelemetryError)
     }
+
+    /// Flushes telemetry and closes the ordinary-log writer to new records.
+    ///
+    /// The result is deterministic and shared by every clone of this handle.
+    /// Call this after application tasks that can emit telemetry have stopped.
+    /// Repeated calls return the same result without flushing again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError`] when an earlier write failed, the final flush
+    /// fails, or the writer lock is poisoned. An attempted event after shutdown
+    /// is reported separately by [`Self::take_writer_error`] and never rewrites
+    /// this method's completed result.
+    pub fn shutdown(&self) -> Result<(), TelemetryError> {
+        self.layer.shutdown().map_err(TelemetryError)
+    }
 }
 
 /// Installs the global redacting tracing subscriber.
 ///
 /// Filter directives use `tracing-subscriber` syntax, including per-module
 /// directives such as `info,claw_gateway=debug,hyper=warn`.
+/// The returned [`TelemetryHandle`] should be retained and shut down after all
+/// telemetry-producing tasks have completed.
 ///
 /// # Errors
 ///

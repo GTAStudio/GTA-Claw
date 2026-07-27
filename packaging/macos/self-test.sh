@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 require_macos
-for tool in clang codesign lipo otool xcrun; do
+for tool in clang codesign ditto lipo otool pkgbuild pkgutil plutil xcrun; do
   require_tool "$tool"
 done
 
@@ -34,7 +34,10 @@ expect_success() {
 work="$OUTPUT_ROOT/self-test"
 safe_reset_dir "$work"
 common="$MACOS_DIR/lib/common.sh"
-outside="$(mktemp -d "${TMPDIR:-/tmp}/gta-claw-output-escape.XXXXXX")"
+outside="$REPO_ROOT/target/gta-claw-output-escape-$$"
+[[ ! -e "$outside" && ! -L "$outside" ]] ||
+  die "self-test outside fixture already exists: $outside"
+mkdir "$outside"
 escape_link="$REPO_ROOT/target/gta-claw-output-link-$$"
 cleanup() {
   local link
@@ -97,6 +100,30 @@ expect_failure invalid-app-archive-label \
 expect_failure invalid-distribution-architectures \
   bash -c "source '$common'; distribution_expected_arches 'arm64 riscv64'"
 
+expect_success pinned-rust-toolchain bash -c "source '$common'; assert_pinned_rust_toolchain"
+toolchain_file_version="$(
+  awk -F'"' '$1 ~ /^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' \
+    "$REPO_ROOT/rust-toolchain.toml"
+)"
+[[ "$toolchain_file_version" == "$PINNED_RUST_VERSION" ]] ||
+  die "macOS Rust pin differs from rust-toolchain.toml"
+tests=$((tests + 1))
+mkdir -p "$work/wrong-rust"
+cat >"$work/wrong-rust/rustc" <<'EOF'
+#!/bin/sh
+printf 'rustc 1.96.0 (self-test)\n'
+EOF
+cat >"$work/wrong-rust/cargo" <<'EOF'
+#!/bin/sh
+printf 'cargo 1.96.0 (self-test)\n'
+EOF
+chmod +x "$work/wrong-rust/rustc" "$work/wrong-rust/cargo"
+expect_failure wrong-rust-toolchain \
+  env PATH="$work/wrong-rust:$PATH" bash -c "source '$common'; assert_pinned_rust_toolchain"
+grep -F "rustc $PINNED_RUST_VERSION is required" "$work/wrong-rust-toolchain.stderr" >/dev/null ||
+  die "Rust version failure omitted the required pinned version"
+tests=$((tests + 1))
+
 mkdir -p "$work/mock-cargo"
 cat >"$work/mock-cargo/cargo" <<'EOF'
 #!/bin/sh
@@ -157,6 +184,91 @@ expect_failure executable-name-backslash env EXECUTABLE_NAME='gta\claw' bash -c 
 expect_failure executable-name-space env EXECUTABLE_NAME='gta claw' bash -c "source '$common'"
 expect_failure missing-tool bash -c "source '$common'; require_tool gta-claw-tool-that-does-not-exist"
 expect_failure path-traversal bash -c "source '$common'; assert_output_path '$OUTPUT_ROOT/../escape'"
+
+publication="$work/publication"
+mkdir "$publication"
+printf 'artifact bytes\n' >"$publication/artifact.bin"
+printf 'manifest bytes\n' >"$publication/SHA256SUMS"
+expect_success flat-publication \
+  bash -c "source '$common'; assert_flat_publication_allowlist '$publication' \$'artifact.bin\\nSHA256SUMS'"
+mkdir "$publication/unexpected-directory"
+expect_failure publication-directory \
+  bash -c "source '$common'; assert_flat_publication_allowlist '$publication' \$'artifact.bin\\nSHA256SUMS'"
+rmdir "$publication/unexpected-directory"
+expect_failure publication-missing-file \
+  bash -c "source '$common'; assert_flat_publication_allowlist '$publication' \$'artifact.bin\\nmissing.bin\\nSHA256SUMS'"
+
+publish_candidate="$work/publish-candidate"
+publish_destination="$work/published"
+mkdir "$publish_candidate" "$publish_destination"
+printf 'new bytes\n' >"$publish_candidate/value"
+printf 'old bytes\n' >"$publish_destination/value"
+expect_success transactional-publication \
+  bash -c "source '$common'; publish_output_directory '$publish_candidate' '$publish_destination'"
+[[ "$(cat "$publish_destination/value")" == "new bytes" &&
+  ! -e "$publish_destination.rollback" ]] ||
+  die "transactional publication did not replace and clean the previous output"
+
+rollback_candidate="$work/rollback-candidate"
+mkdir "$rollback_candidate"
+printf 'candidate bytes\n' >"$rollback_candidate/value"
+printf 'validated bytes\n' >"$publish_destination/value"
+mkdir "$work/failing-publish-mv"
+cat >"$work/failing-publish-mv/mv" <<'EOF'
+#!/usr/bin/env bash
+set -e
+count=0
+[[ ! -f "$MV_COUNT" ]] || count="$(cat "$MV_COUNT")"
+count=$((count + 1))
+printf '%s\n' "$count" >"$MV_COUNT"
+if [[ "$count" -eq 2 ]]; then
+  exit 91
+fi
+/bin/mv "$@"
+EOF
+chmod +x "$work/failing-publish-mv/mv"
+expect_failure transactional-publication-rollback \
+  env PATH="$work/failing-publish-mv:$PATH" MV_COUNT="$work/mv-count" \
+  bash -c "source '$common'; publish_output_directory '$rollback_candidate' '$publish_destination'"
+[[ "$(cat "$publish_destination/value")" == "validated bytes" &&
+  ! -e "$publish_destination.rollback" ]] ||
+  die "failed publication did not restore the previous validated output"
+
+cleanup_candidate="$work/cleanup-candidate"
+mkdir "$cleanup_candidate"
+printf 'committed despite cleanup failure\n' >"$cleanup_candidate/value"
+mkdir "$work/failing-publish-rm"
+cat >"$work/failing-publish-rm/rm" <<'EOF'
+#!/usr/bin/env bash
+last=""
+for argument in "$@"; do
+  last="$argument"
+done
+if [[ "$last" == "$RM_FAIL_PATH" ]]; then
+  exit 92
+fi
+/bin/rm "$@"
+EOF
+chmod +x "$work/failing-publish-rm/rm"
+expect_success transactional-publication-cleanup-failure \
+  env PATH="$work/failing-publish-rm:$PATH" \
+  RM_FAIL_PATH="$publish_destination.rollback" \
+  bash -c "source '$common'; publish_output_directory '$cleanup_candidate' '$publish_destination'"
+[[ "$(cat "$publish_destination/value")" == "committed despite cleanup failure" &&
+  "$(cat "$publish_destination.rollback/value")" == "validated bytes" ]] ||
+  die "post-publication cleanup failure changed the committed output"
+grep -F 'the next publication will retry any stale cleanup before replacing the destination' \
+  "$work/transactional-publication-cleanup-failure.stderr" >/dev/null ||
+  die "post-publication cleanup failure omitted its recovery action"
+
+recovery_candidate="$work/cleanup-recovery-candidate"
+mkdir "$recovery_candidate"
+printf 'recovered publication\n' >"$recovery_candidate/value"
+expect_success transactional-publication-cleanup-recovery \
+  bash -c "source '$common'; publish_output_directory '$recovery_candidate' '$publish_destination'"
+[[ "$(cat "$publish_destination/value")" == "recovered publication" &&
+  ! -e "$publish_destination.rollback" ]] ||
+  die "the next publication did not recover stale rollback cleanup"
 
 mkdir -p "$outside/output-root-existing"
 ln -s "$outside/output-root-existing" "$escape_link"
@@ -322,6 +434,11 @@ expect_failure assemble-executable-name-traversal \
 expect_success archive-first \
   "$MACOS_DIR/archive-headless.sh" "$work/hello-$host_arch" gta-claw-cli "$host_arch" "$host_arch"
 archive="$OUTPUT_ROOT/headless/$host_arch/gta-claw-cli-$VERSION-macos-$host_arch.tar.gz"
+grep -F '"cargoProfile":"release"' "$archive.provenance.json" >/dev/null ||
+  die "provenance does not identify the Cargo release profile"
+if grep -F '"offline":' "$archive.provenance.json" >/dev/null; then
+  die "provenance claims an unverifiable build network mode"
+fi
 cp "$archive" "$work/first-headless.tar.gz"
 expect_success archive-second \
   "$MACOS_DIR/archive-headless.sh" "$work/hello-$host_arch" gta-claw-cli "$host_arch" "$host_arch"
@@ -390,6 +507,31 @@ second_manifest="$work/second-app.sha256"
 write_sha256_manifest "$fixture_app" "$second_manifest"
 cmp -s "$first_manifest" "$second_manifest" || die "app assembly is not deterministic on rerun"
 tests=$((tests + 1))
+
+pkg_contract="$work/pkg-contract"
+pkg_root="$pkg_contract/root"
+pkg_app="$pkg_root/Applications/$APP_NAME.app"
+pkg_component_plist="$pkg_contract/components.plist"
+pkg_component="$pkg_contract/component.pkg"
+pkg_expanded="$pkg_contract/expanded"
+mkdir -p "$pkg_root/Applications"
+copy_app_bundle "$fixture_app" "$pkg_app"
+write_pkg_component_plist "$pkg_component_plist"
+pkgbuild \
+  --root "$pkg_root" \
+  --component-plist "$pkg_component_plist" \
+  --install-location / \
+  --identifier "$BUNDLE_ID.pkg.component" \
+  --version "$VERSION" \
+  --ownership recommended \
+  "$pkg_component" >/dev/null
+pkgutil --expand "$pkg_component" "$pkg_expanded"
+expect_success pkg-upgrade-contract \
+  bash -c "source '$common'; assert_expanded_pkg_install_contract '$pkg_expanded'"
+package_info="$pkg_expanded/PackageInfo"
+sed -i '' '/<upgrade-bundle>/,/<\/upgrade-bundle>/d' "$package_info"
+expect_failure pkg-missing-upgrade-contract \
+  bash -c "source '$common'; assert_expanded_pkg_install_contract '$pkg_expanded'"
 
 mkdir -p "$outside/notarization-existing"
 printf 'outside sentinel\n' >"$outside/notarization-existing/sentinel"

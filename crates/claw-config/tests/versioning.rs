@@ -85,6 +85,7 @@ fn incompatible_future_version_fails_without_creating_backup() {
             assert_eq!(found, 99);
             assert_eq!(current, 1);
         }
+
         other => panic!("expected unsupported path, got {other}"),
     }
     assert_eq!(
@@ -96,5 +97,25 @@ fn incompatible_future_version_fails_without_creating_backup() {
             .expect("read directory")
             .count(),
         1
+    );
+}
+
+#[test]
+fn current_version_is_validated_without_creating_a_backup() {
+    let directory = common::TestDirectory::create();
+    let path = directory.path().join("config.json5");
+    let current = VERSION_ZERO.replace("schema_version: 0", "schema_version: 1");
+    std::fs::write(&path, current.as_bytes()).expect("write current version");
+
+    assert_eq!(
+        migrate_config_file(&path).expect("validate current version"),
+        ConfigMigrationOutcome::Current
+    );
+    assert_eq!(
+        std::fs::read_dir(directory.path())
+            .expect("read directory")
+            .count(),
+        1,
+        "validation must not allocate a migration backup"
     );
 }

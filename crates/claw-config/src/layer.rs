@@ -6,9 +6,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::migration::{MigrationError, apply_legacy_environment_layer};
+use crate::migration::{MigrationDiagnostic, MigrationError, apply_legacy_environment_layer};
 use crate::wire::EnvelopeWire;
-use crate::{ConfigError, ConfigSnapshot, parse_json5};
+use crate::{ConfigError, ConfigSnapshot};
 
 /// Configuration source order, from lowest to highest precedence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,6 +34,8 @@ pub struct ResolvedConfig {
     pub config: ConfigSnapshot,
     /// Sources that contributed an explicit value, in precedence order.
     pub applied_layers: Vec<ConfigLayerKind>,
+    /// Ordered legacy-environment mappings and ignored inputs.
+    pub environment_diagnostics: Vec<MigrationDiagnostic>,
 }
 
 /// Failure to read, merge, migrate, or validate one configuration layer.
@@ -199,6 +201,7 @@ impl ConfigLayers {
             .map_err(ConfigError::from_serialize)
             .map_err(LayeredConfigError::Result)?;
         let mut applied_layers = vec![ConfigLayerKind::BuiltIn];
+        let mut environment_diagnostics = Vec::new();
         for (kind, source) in [
             (ConfigLayerKind::System, self.system.as_deref()),
             (ConfigLayerKind::User, self.user.as_deref()),
@@ -212,7 +215,7 @@ impl ConfigLayers {
         if !self.environment.is_empty() {
             let base = decode_envelope(&merged, "<lower-precedence-layers>")
                 .map_err(LayeredConfigError::Result)?;
-            let resolved = apply_legacy_environment_layer(
+            let (resolved, diagnostics) = apply_legacy_environment_layer(
                 base,
                 self.environment
                     .iter()
@@ -222,21 +225,26 @@ impl ConfigLayers {
             merged = serde_json::to_value(resolved)
                 .map_err(ConfigError::from_serialize)
                 .map_err(LayeredConfigError::Result)?;
-            applied_layers.push(ConfigLayerKind::Environment);
+            if diagnostics
+                .iter()
+                .any(|diagnostic| matches!(diagnostic, MigrationDiagnostic::Applied { .. }))
+            {
+                applied_layers.push(ConfigLayerKind::Environment);
+            }
+            environment_diagnostics = diagnostics;
         }
 
         if let Some(source) = &self.command_line {
             merge_layer(&mut merged, source, ConfigLayerKind::CommandLine)?;
             applied_layers.push(ConfigLayerKind::CommandLine);
         }
-        let source = serde_json::to_string(&merged)
-            .map_err(ConfigError::from_serialize)
+        let config = decode_envelope(&merged, "<layered-config>")
+            .and_then(EnvelopeWire::validate)
             .map_err(LayeredConfigError::Result)?;
-        let config =
-            parse_json5(&source, "<layered-config>").map_err(LayeredConfigError::Result)?;
         Ok(ResolvedConfig {
             config,
             applied_layers,
+            environment_diagnostics,
         })
     }
 }

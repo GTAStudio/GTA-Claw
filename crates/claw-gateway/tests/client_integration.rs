@@ -115,6 +115,28 @@ fn method(name: &str) -> GatewayMethodName {
     GatewayMethodName::Core(resolve_core_method(name).expect("the method is catalogued"))
 }
 
+async fn wait_for_node_state(
+    handle: &ServerHandle,
+    node_id: &str,
+    expected_present: bool,
+) -> Option<claw_gateway::ConnectionInfo> {
+    for _ in 0..1_000 {
+        let node = handle.directory().node(node_id);
+        if node.is_some() == expected_present {
+            return node;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!(
+        "node `{node_id}` did not become {}",
+        if expected_present {
+            "present"
+        } else {
+            "absent"
+        }
+    );
+}
+
 #[tokio::test]
 async fn an_operator_completes_the_v4_handshake_and_calls_health() {
     let identity = device(11);
@@ -322,6 +344,168 @@ async fn claiming_the_node_role_without_node_client_mode_cannot_enter_the_v3_win
         other => panic!("expected a rejected handshake, got {other}"),
     }
 
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_v3_node_keeps_its_bounded_pending_window_across_reconnect() {
+    let operator = device(44);
+    let node = device(45);
+    let node_id = node.device_id().gateway_wire_id();
+    let handle = start(
+        StaticAuthenticator::new(CredentialPolicy::None, Arc::new(claw_gateway::SystemClock))
+            .with_paired_device(
+                operator.device_id().gateway_wire_id(),
+                Grant::new(Role::Operator, [OperatorScope::Write]),
+            )
+            .with_paired_device(node_id.clone(), Grant::new(Role::Node, [])),
+    )
+    .await;
+
+    let mut node_config = client_config(&handle, Arc::clone(&node), SecurityRole::Node, &[]);
+    node_config.client.id = ClientId::NodeHost;
+    node_config.client.mode = ClientMode::Node;
+    node_config.min_protocol = ProtocolVersion::new(3).unwrap();
+    node_config.max_protocol = ProtocolVersion::new(3).unwrap();
+    let (node_client, _node_events) =
+        GatewayClient::start(node_config).expect("the v3 node configuration is valid");
+    node_client
+        .wait_ready()
+        .await
+        .expect("the v3 node enters the N-1 compatibility window");
+    let node_info = wait_for_node_state(&handle, &node_id, true)
+        .await
+        .expect("the authenticated node is registered");
+    assert_eq!(node_info.compatibility, "legacy-node");
+    assert_eq!(node_info.protocol, 4);
+
+    let (operator_client, _operator_events) = GatewayClient::start(client_config(
+        &handle,
+        Arc::clone(&operator),
+        SecurityRole::Operator,
+        &[Scope::OperatorWrite],
+    ))
+    .expect("the operator configuration is valid");
+    operator_client
+        .wait_ready()
+        .await
+        .expect("the operator handshake succeeds");
+
+    for (index, invocation_id) in ["invocation-1", "invocation-2"].into_iter().enumerate() {
+        let response = operator_client
+            .request(
+                request_id(&format!("enqueue-{index}")),
+                method("node.pending.enqueue"),
+                &json!({
+                    "nodeId": node_id,
+                    "id": invocation_id,
+                    "command": "echo",
+                    "payload": format!("payload-{index}"),
+                }),
+            )
+            .await
+            .expect("the operator enqueue receives a response");
+        assert!(response.ok());
+        assert_eq!(payload(&response)["queueDepth"], json!(index + 1));
+    }
+
+    let first_pull = node_client
+        .request(
+            request_id("pull-before-reconnect"),
+            method("node.pending.pull"),
+            &json!({ "limit": 1 }),
+        )
+        .await
+        .expect("the first pull receives a response");
+    assert!(first_pull.ok());
+    let first_pull = payload(&first_pull);
+    assert_eq!(first_pull["count"], json!(1));
+    assert_eq!(first_pull["invocations"][0]["id"], json!("invocation-1"));
+
+    node_client
+        .shutdown()
+        .await
+        .expect("the first node connection stops cleanly");
+    wait_for_node_state(&handle, &node_id, false).await;
+
+    let mut reconnect_config = client_config(&handle, Arc::clone(&node), SecurityRole::Node, &[]);
+    reconnect_config.client.id = ClientId::NodeHost;
+    reconnect_config.client.mode = ClientMode::Node;
+    reconnect_config.min_protocol = ProtocolVersion::new(3).unwrap();
+    reconnect_config.max_protocol = ProtocolVersion::new(3).unwrap();
+    let (reconnected, _reconnected_events) =
+        GatewayClient::start(reconnect_config).expect("the reconnect configuration is valid");
+    reconnected
+        .wait_ready()
+        .await
+        .expect("the same v3 node reconnects inside the compatibility window");
+    wait_for_node_state(&handle, &node_id, true).await;
+
+    let second_pull = reconnected
+        .request(
+            request_id("pull-after-reconnect"),
+            method("node.pending.pull"),
+            &json!({ "limit": 2 }),
+        )
+        .await
+        .expect("the reconnect pull receives a response");
+    assert!(second_pull.ok());
+    let second_pull = payload(&second_pull);
+    assert_eq!(second_pull["count"], json!(2));
+    assert_eq!(
+        second_pull["invocations"][0]["id"],
+        json!("invocation-1"),
+        "unacknowledged work must be reclaimed for at-least-once delivery"
+    );
+    assert_eq!(
+        second_pull["invocations"][1]["id"],
+        json!("invocation-2"),
+        "reclaimed work must stay ahead of later pending work"
+    );
+
+    let acknowledged = reconnected
+        .request(
+            request_id("ack-after-reconnect"),
+            method("node.pending.ack"),
+            &json!({ "id": "invocation-1" }),
+        )
+        .await
+        .expect("the reconnect acknowledgement receives a response");
+    assert!(acknowledged.ok());
+    assert_eq!(payload(&acknowledged)["acked"], json!(true));
+
+    let drained = reconnected
+        .request(
+            request_id("drain-after-reconnect"),
+            method("node.pending.drain"),
+            &json!({}),
+        )
+        .await
+        .expect("the drain receives a response");
+    assert!(drained.ok());
+    let drained = payload(&drained);
+    assert_eq!(drained["count"], json!(1));
+    assert_eq!(drained["invocations"][0]["id"], json!("invocation-2"));
+
+    let empty = reconnected
+        .request(
+            request_id("pull-empty"),
+            method("node.pending.pull"),
+            &json!({ "limit": 2 }),
+        )
+        .await
+        .expect("the empty pull receives a response");
+    assert!(empty.ok());
+    assert_eq!(payload(&empty)["count"], json!(0));
+
+    reconnected
+        .shutdown()
+        .await
+        .expect("the reconnected node stops cleanly");
+    operator_client
+        .shutdown()
+        .await
+        .expect("the operator stops cleanly");
     handle.shutdown().await;
 }
 
@@ -879,7 +1063,7 @@ async fn a_shared_token_policy_refuses_a_client_that_presents_none() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn withdrawing_a_pairing_closes_an_already_open_connection() {
+async fn withdrawing_a_pairing_closes_the_connection_and_refuses_reconnect() {
     let identity = device(27);
     let wire_id = identity.device_id().gateway_wire_id();
     let (handle, devices) = start_with_devices(
@@ -948,6 +1132,30 @@ async fn withdrawing_a_pairing_closes_an_already_open_connection() {
             response.error()
         ),
     }
+
+    client.shutdown().await.ok();
+    let (reconnecting, _events) = GatewayClient::start(client_config(
+        &handle,
+        Arc::clone(&identity),
+        SecurityRole::Operator,
+        &[Scope::OperatorAdmin],
+    ))
+    .expect("the reconnect configuration is valid");
+    let error = reconnecting
+        .wait_ready()
+        .await
+        .expect_err("a revoked device cannot immediately reconnect");
+    match error {
+        GatewayClientError::Authentication(failure) => {
+            assert_eq!(
+                failure.detail_code(),
+                Some(ConnectErrorDetailCode::PairingRequired)
+            );
+            assert!(!failure.device_retry_recommended());
+        }
+        other => panic!("expected reconnect authentication refusal, got {other}"),
+    }
+    reconnecting.shutdown().await.ok();
 
     handle.shutdown().await;
 }

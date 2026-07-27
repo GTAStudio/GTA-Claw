@@ -17,10 +17,21 @@
 //! # Durability
 //!
 //! Every file is written to a uniquely named temporary sibling, flushed with
-//! [`File::sync_all`](std::fs::File::sync_all), and then renamed over its target. `rename` over an
-//! existing path is atomic on POSIX and on Windows, so a reader sees either the whole previous
-//! record or the whole new one. A write is only acknowledged after the rename returns, which is
-//! what lets [`FileGoalStore::open`] promise that an acknowledged goal survives the process.
+//! [`File::sync_all`](std::fs::File::sync_all), renamed over its target, and then the directory
+//! holding it is opened and `fsync`-ed in turn. `rename` over an existing path is atomic on POSIX
+//! and on Windows, so a reader sees either the whole previous record or the whole new one; the
+//! directory sync is what makes the rename itself survive sudden power loss, because a synced
+//! file whose new directory entry is still only in the page cache can come back under its old
+//! name. A write is only acknowledged once both steps have run, which is what lets
+//! [`FileGoalStore::open`] promise that an acknowledged goal survives the process — and, when the
+//! directory sync succeeded, the machine.
+//!
+//! Only Unix exposes directory synchronization through [`std`]. On every other target the step is
+//! skipped, and [`FileGoalStore::synced_publications`] does not count the publication, so the
+//! store never claims a guarantee the platform did not give it. A directory sync that is attempted
+//! and fails is *not* an error: by then the new bytes are published and the previous ones are
+//! gone, so there is nothing to roll back and nothing to retry. It is counted in
+//! [`FileGoalStore::unsynced_publications`] instead, which is the only signal that carries it.
 //!
 //! The record is written before the session index, so a crash between the two leaves a goal file
 //! that no index mentions. That is the orphan case [`FileGoalStore::open`] repairs, and it is
@@ -197,6 +208,24 @@ fn digest_of(value: &str) -> String {
     hex
 }
 
+/// Flushes a directory's own entries, reporting whether the flush was actually performed.
+///
+/// `Ok(false)` means the target has no directory synchronization to perform, not that one was
+/// skipped: [`std`] exposes it only on Unix, so the same platform split `claw-config` uses for its
+/// atomic writer is reproduced here. Callers distinguish the two so that a store never reports a
+/// power-loss guarantee the platform never gave.
+#[cfg(unix)]
+fn sync_directory_entries(directory: &Path) -> std::io::Result<bool> {
+    File::open(directory)?.sync_all()?;
+    Ok(true)
+}
+
+/// Reports that no directory synchronization exists on this target.
+#[cfg(not(unix))]
+fn sync_directory_entries(_directory: &Path) -> std::io::Result<bool> {
+    Ok(false)
+}
+
 /// A durable [`GoalStorePort`] backed by a directory.
 #[derive(Debug)]
 pub struct FileGoalStore {
@@ -213,6 +242,8 @@ pub struct FileGoalStore {
     /// Feeds the unique suffix of temporary files so two concurrent writers never share one.
     sequence: AtomicU64,
     accepted_writes: AtomicU64,
+    synced_publications: AtomicU64,
+    unsynced_publications: AtomicU64,
 }
 
 impl FileGoalStore {
@@ -249,6 +280,8 @@ impl FileGoalStore {
             writes: Mutex::new(()),
             sequence: AtomicU64::new(0),
             accepted_writes: AtomicU64::new(0),
+            synced_publications: AtomicU64::new(0),
+            unsynced_publications: AtomicU64::new(0),
         };
         store.recovery = store.recover()?;
         Ok(store)
@@ -279,6 +312,32 @@ impl FileGoalStore {
     #[must_use]
     pub fn accepted_writes(&self) -> u64 {
         self.accepted_writes.load(Ordering::SeqCst)
+    }
+
+    /// Returns how many files this store published into a synchronized directory.
+    ///
+    /// A save publishes the record, and a save that adds a goal to a session publishes the index
+    /// too, so this counts files rather than saves. It is incremented only after the directory
+    /// holding the file has been `fsync`-ed, which makes it the evidence that the rename itself is
+    /// power-loss durable and not merely atomic.
+    ///
+    /// This stays at zero on targets where [`std`] exposes no directory synchronization, which is
+    /// everything but Unix. Zero there means "the platform offers no such step", not "the step was
+    /// skipped".
+    #[must_use]
+    pub fn synced_publications(&self) -> u64 {
+        self.synced_publications.load(Ordering::SeqCst)
+    }
+
+    /// Returns how many files were published but whose directory could not be synchronized.
+    ///
+    /// This is not an error count: every write it counts is on disk and was acknowledged. It is
+    /// the one signal that separates "the bytes are published" from "the publication will still be
+    /// there after a power cut", so a caller that must not confuse the two has to read it. A
+    /// healthy store leaves it at zero.
+    #[must_use]
+    pub fn unsynced_publications(&self) -> u64 {
+        self.unsynced_publications.load(Ordering::SeqCst)
     }
 
     /// Returns what one session currently occupies.
@@ -321,7 +380,12 @@ impl FileGoalStore {
             .join(format!("{}.{RECORD_EXTENSION}", digest_of(session_id)))
     }
 
-    /// Writes `contents` to `path` so that a reader sees all of it or none of it.
+    /// Writes `contents` to `path` so that a reader sees all of it or none of it, and so that the
+    /// publication survives a power cut rather than only a process crash.
+    ///
+    /// The temporary sibling is flushed before the rename and the directory holding it is flushed
+    /// after, because a rename whose directory entry is still only in the page cache can be lost
+    /// even though every byte of the file it names was already on the platter.
     fn write_atomically(&self, path: &Path, contents: &str) -> Result<(), StoreError> {
         let directory = path.parent().unwrap_or(&self.root);
         let ordinal = self.sequence.fetch_add(1, Ordering::SeqCst);
@@ -335,13 +399,26 @@ impl FileGoalStore {
                 .map_err(|error| io_error(&temporary, error))?;
         }
 
-        match fs::rename(&temporary, path) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let _ = fs::remove_file(&temporary);
-                Err(io_error(path, error))
+        if let Err(error) = fs::rename(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(io_error(path, error));
+        }
+
+        // Both the temporary file's creation and its rename are entries in this one directory, so
+        // a single sync after the rename covers the whole publication. A failure here is recorded
+        // rather than returned: the new bytes are already in place and the previous ones are
+        // already gone, so reporting failure would tell the caller to retry a write that in fact
+        // landed, and the revision check would then refuse the retry.
+        match sync_directory_entries(directory) {
+            Ok(true) => {
+                self.synced_publications.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(false) => {}
+            Err(_) => {
+                self.unsynced_publications.fetch_add(1, Ordering::SeqCst);
             }
         }
+        Ok(())
     }
 
     fn read_record_at(path: &Path) -> Result<Option<GoalRecord>, StoreError> {

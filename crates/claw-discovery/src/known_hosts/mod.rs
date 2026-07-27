@@ -107,6 +107,27 @@ impl fmt::Display for RejectionCause {
     }
 }
 
+impl RejectionCause {
+    /// Returns non-secret operator guidance for resolving this refusal safely.
+    #[must_use]
+    pub const fn remediation(self) -> &'static str {
+        match self {
+            Self::Revoked => {
+                "do not connect; remove the revocation only after re-establishing host trust"
+            }
+            Self::Mismatch => {
+                "verify the host out of band before replacing the recorded known_hosts key"
+            }
+            Self::Unknown => {
+                "pair and record the host key through a trusted channel before connecting"
+            }
+            Self::CertificateAuthorityOnly => {
+                "use a host certificate signed by the recorded authority or add an explicit host key"
+            }
+        }
+    }
+}
+
 /// A refusal, carrying both its machine-readable cause and an operator message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostKeyRejection {
@@ -150,6 +171,15 @@ impl HostKeyVerdict {
         match self {
             Self::Accepted { .. } => None,
             Self::Rejected(rejection) => Some(&rejection.detail),
+        }
+    }
+
+    /// Returns safe operator guidance for a rejection.
+    #[must_use]
+    pub const fn remediation(&self) -> Option<&'static str> {
+        match self {
+            Self::Accepted { .. } => None,
+            Self::Rejected(rejection) => Some(rejection.cause.remediation()),
         }
     }
 }
@@ -289,13 +319,10 @@ impl KnownHosts {
     #[must_use]
     pub fn verify(&self, host: &str, port: u16, key: &HostKey) -> HostKeyVerdict {
         let subject = Self::match_key(host, port);
-        let matching: Vec<&KnownHostEntry> = self
-            .entries
-            .iter()
-            .filter(|entry| entry.matches(&subject))
-            .collect();
-
-        for entry in &matching {
+        let mut accepted = None;
+        let mut recorded = Vec::new();
+        let mut saw_authority = None;
+        for entry in self.entries.iter().filter(|entry| entry.matches(&subject)) {
             if entry.marker == Some(Marker::Revoked) && entry.key == *key {
                 return HostKeyVerdict::Rejected(HostKeyRejection {
                     cause: RejectionCause::Revoked,
@@ -306,23 +333,22 @@ impl KnownHosts {
                     ),
                 });
             }
-        }
-
-        let mut recorded = Vec::new();
-        let mut saw_authority = None;
-        for entry in &matching {
             match entry.marker {
                 Some(Marker::Revoked) => {}
                 Some(Marker::CertAuthority) => saw_authority = Some(entry.line),
                 None => {
                     if entry.key == *key {
-                        return HostKeyVerdict::Accepted { line: entry.line };
+                        accepted.get_or_insert(entry.line);
+                    } else {
+                        recorded.push(entry.key.fingerprint());
                     }
-                    recorded.push(entry.key.fingerprint());
                 }
             }
         }
 
+        if let Some(line) = accepted {
+            return HostKeyVerdict::Accepted { line };
+        }
         if !recorded.is_empty() {
             return HostKeyVerdict::Rejected(HostKeyRejection {
                 cause: RejectionCause::Mismatch,

@@ -6,6 +6,9 @@ use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 
 use crate::model::{AppModel, Prompt, RunState, Screen};
 
+const MAX_GRID_WIDTH: u16 = 512;
+const MAX_GRID_HEIGHT: u16 = 256;
+
 /// Styling attached to one terminal cell.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CellStyle {
@@ -43,6 +46,8 @@ impl Grid {
     /// Creates a blank bounded cell grid.
     #[must_use]
     pub fn new(width: u16, height: u16) -> Self {
+        let width = width.clamp(1, MAX_GRID_WIDTH);
+        let height = height.clamp(1, MAX_GRID_HEIGHT);
         Self {
             width,
             height,
@@ -97,8 +102,9 @@ impl Grid {
 
     pub(crate) fn write(&mut self, x: u16, y: u16, text: &str, style: CellStyle) {
         let available = self.width.saturating_sub(x);
-        for (offset, symbol) in sanitize(text)
+        for (offset, symbol) in text
             .chars()
+            .map(sanitize_character)
             .take(usize::from(available))
             .enumerate()
         {
@@ -122,7 +128,7 @@ impl Grid {
 /// Renders the complete application into a deterministic grid.
 #[must_use]
 pub fn render(model: &AppModel, width: u16, height: u16, no_color: bool) -> Grid {
-    let mut grid = Grid::new(width.max(1), height.max(1));
+    let mut grid = Grid::new(width, height);
     let normal = CellStyle::default();
     let accent = colored(45, no_color);
     grid.write(0, 0, " GTA Claw ", accent);
@@ -168,10 +174,15 @@ pub fn flush<W: Write>(writer: &mut W, grid: &Grid, no_color: bool) -> io::Resul
     for y in 0..grid.height() {
         queue!(writer, MoveTo(0, y))?;
         let mut active = None;
+        let mut cursor_known = true;
         for x in 0..grid.width() {
             let cell = grid.cell(x, y).unwrap_or_default();
+            if !cursor_known {
+                queue!(writer, MoveTo(x, y))?;
+            }
             active = queue_style(writer, cell, active, no_color)?;
             queue!(writer, Print(cell.symbol))?;
+            cursor_known = cell.symbol.is_ascii();
         }
         queue!(writer, ResetColor)?;
     }
@@ -213,7 +224,7 @@ pub fn flush_changes<W: Write>(
             }
             active = queue_style(writer, cell, active, no_color)?;
             queue!(writer, Print(cell.symbol))?;
-            cursor = Some((x.saturating_add(1), y));
+            cursor = cell.symbol.is_ascii().then_some((x.saturating_add(1), y));
         }
     }
     if active.is_some() {
@@ -244,12 +255,24 @@ fn draw_sessions(grid: &mut Grid, model: &AppModel, no_color: bool) {
     grid.write(2, 4, "SESSION", colored(45, no_color));
     grid.write(28, 4, "STATE", colored(45, no_color));
     grid.write(55, 4, "WORKSPACE", colored(45, no_color));
-    for (row, session) in model.sessions.iter().skip(model.scroll).enumerate() {
+    let visible_rows = usize::from(grid.height().saturating_sub(7));
+    let max_start = model.sessions.len().saturating_sub(visible_rows);
+    let mut start = model.scroll.min(max_start);
+    if model.selected < start {
+        start = model.selected;
+    } else if visible_rows > 0 && model.selected >= start.saturating_add(visible_rows) {
+        start = model
+            .selected
+            .saturating_add(1)
+            .saturating_sub(visible_rows)
+            .min(max_start);
+    }
+    for (row, session) in model.sessions.iter().skip(start).enumerate() {
         let y = 5_u16.saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
         if y >= grid.height().saturating_sub(2) {
             break;
         }
-        let selector = if row + model.scroll == model.selected {
+        let selector = if row + start == model.selected {
             ">"
         } else {
             " "
@@ -339,7 +362,7 @@ fn draw_workspace(grid: &mut Grid, model: &AppModel, no_color: bool) {
 
 fn draw_runs(grid: &mut Grid, model: &AppModel, no_color: bool) {
     grid.write(2, 4, "Run monitor", colored(45, no_color));
-    for (row, session) in model.sessions.iter().enumerate() {
+    for (row, session) in model.sessions.iter().skip(model.scroll).enumerate() {
         let y = 6_u16.saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
         if y >= grid.height().saturating_sub(2) {
             break;
@@ -404,7 +427,7 @@ fn draw_artifacts(grid: &mut Grid, model: &AppModel) {
         }
         grid.write(2, y, &format!("* {artifact}"), CellStyle::default());
     }
-    for (row, line) in model.artifact_content.iter().enumerate() {
+    for (row, line) in model.artifact_content.iter().skip(model.scroll).enumerate() {
         let y = 6_u16.saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
         if y >= grid.height().saturating_sub(2) {
             break;
@@ -465,7 +488,7 @@ fn draw_palette(grid: &mut Grid, model: &AppModel, no_color: bool) {
     let width = grid.width().saturating_sub(8).min(70);
     let x = (grid.width().saturating_sub(width)) / 2;
     let y = grid.height() / 3;
-    for row in y..y.saturating_add(5).min(grid.height()) {
+    for row in y..y.saturating_add(6).min(grid.height()) {
         for column in x..x.saturating_add(width).min(grid.width()) {
             grid.put(column, row, ' ', colored(236, no_color));
         }
@@ -485,7 +508,13 @@ fn draw_palette(grid: &mut Grid, model: &AppModel, no_color: bool) {
     grid.write(
         x.saturating_add(2),
         y.saturating_add(3),
-        "sessions | workspace | runs | diff | artifacts | refresh | quit",
+        "screens: sessions workspace runs diff artifacts help",
+        colored(245, no_color),
+    );
+    grid.write(
+        x.saturating_add(2),
+        y.saturating_add(4),
+        "actions: refresh quit | Esc close",
         colored(245, no_color),
     );
 }
@@ -511,16 +540,12 @@ const fn colored(value: u8, no_color: bool) -> CellStyle {
     }
 }
 
-fn sanitize(text: &str) -> String {
-    text.chars()
-        .map(|character| {
-            if character == '\n' || character == '\r' || character == '\t' {
-                ' '
-            } else if character.is_control() {
-                '\u{fffd}'
-            } else {
-                character
-            }
-        })
-        .collect()
+fn sanitize_character(character: char) -> char {
+    if character == '\n' || character == '\r' || character == '\t' {
+        ' '
+    } else if character.is_control() {
+        '\u{fffd}'
+    } else {
+        character
+    }
 }

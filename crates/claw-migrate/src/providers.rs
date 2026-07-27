@@ -359,7 +359,7 @@ fn build_claude_operations(
             ("settings.json", root.join("settings.json")),
             ("settings.local.json", root.join("settings.local.json")),
         ] {
-            add_json_transform(
+            add_claude_settings_transform(
                 &mut operations,
                 &file,
                 &target
@@ -368,8 +368,8 @@ fn build_claude_operations(
                     .join("claude")
                     .join(name),
                 &format!("claude-{name}"),
+                diagnostics,
             )?;
-            add_claude_manual_diagnostic(&file, diagnostics)?;
         }
         if let Some(home) = root.parent() {
             add_json_transform(
@@ -455,7 +455,7 @@ fn build_claude_operations(
         )?;
         for name in ["settings.json", "settings.local.json"] {
             let file = root.join(".claude").join(name);
-            add_json_transform(
+            add_claude_settings_transform(
                 &mut operations,
                 &file,
                 &target
@@ -464,8 +464,8 @@ fn build_claude_operations(
                     .join("claude")
                     .join(format!("project-{name}")),
                 &format!("claude-project-{name}"),
+                diagnostics,
             )?;
-            add_claude_manual_diagnostic(&file, diagnostics)?;
         }
         collect_skill_directories(
             &root.join(".claude").join("skills"),
@@ -779,21 +779,9 @@ fn add_claude_exclusion_diagnostic(root: &Path, diagnostics: &mut Vec<Diagnostic
     ));
 }
 
-fn add_claude_manual_diagnostic(
-    path: &Path,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Result<(), MigrationError> {
-    if !path.is_file() {
-        return Ok(());
-    }
-    let text = read_text(path)?;
-    let value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|_| MigrationError::InvalidInput {
-            path: path.to_path_buf(),
-            reason: "JSON configuration is malformed".to_owned(),
-        })?;
+fn add_claude_manual_diagnostic(value: &serde_json::Value, diagnostics: &mut Vec<Diagnostic>) {
     let Some(object) = value.as_object() else {
-        return Ok(());
+        return;
     };
     for (key, code, message) in [
         (
@@ -826,7 +814,6 @@ fn add_claude_manual_diagnostic(
             "A Claude setting names an external credential command; it was preserved for review and is never executed.",
         ));
     }
-    Ok(())
 }
 
 fn add_copy_checked(
@@ -874,6 +861,26 @@ fn add_json_transform(
             namespace: namespace.to_owned(),
         });
     }
+    Ok(())
+}
+
+fn add_claude_settings_transform(
+    operations: &mut Vec<MigrationOperation>,
+    source: &Path,
+    target: &Path,
+    namespace: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<(), MigrationError> {
+    if !source.is_file() {
+        return Ok(());
+    }
+    let value = read_json(source)?;
+    operations.push(MigrationOperation::TransformJson {
+        source: source.to_path_buf(),
+        target: target.to_path_buf(),
+        namespace: namespace.to_owned(),
+    });
+    add_claude_manual_diagnostic(&value, diagnostics);
     Ok(())
 }
 
@@ -998,13 +1005,15 @@ fn path_is_occupied(path: &Path) -> bool {
 }
 
 fn validate_json(path: &Path) -> Result<(), MigrationError> {
+    read_json(path).map(|_| ())
+}
+
+fn read_json(path: &Path) -> Result<serde_json::Value, MigrationError> {
     let text = read_text(path)?;
-    serde_json::from_str::<serde_json::Value>(&text)
-        .map(|_| ())
-        .map_err(|_| MigrationError::InvalidInput {
-            path: path.to_path_buf(),
-            reason: "JSON configuration is malformed".to_owned(),
-        })
+    serde_json::from_str(&text).map_err(|_| MigrationError::InvalidInput {
+        path: path.to_path_buf(),
+        reason: "JSON configuration is malformed".to_owned(),
+    })
 }
 
 fn validate_text(path: &Path) -> Result<(), MigrationError> {

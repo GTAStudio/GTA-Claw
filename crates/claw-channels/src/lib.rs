@@ -4,17 +4,20 @@
 //! registry coverage separate from executable behavior so metadata-only entries
 //! cannot be mistaken for working integrations.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::fmt::{self, Debug, Formatter};
+use std::error::Error;
+use std::fmt::{self, Debug, Display, Formatter};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use claw_channel_sdk::{
     Channel, ChannelCredential, ChannelError, ConfigurationError, CredentialBindingError,
-    DeliveryAcknowledgement, DeliveryState, InboundMessage, InvalidMessageReason, OutboundMessage,
-    OutboundRetrySafety, ProtocolErrorKind, SecretStoreError, TransportErrorKind,
-    UnsupportedOperation,
+    DeliveryAcknowledgement, DeliveryState, InboundMessage, InvalidMessageReason, LengthUnit,
+    OutboundMessage, OutboundRetrySafety, OutputLimit, ProtocolErrorKind, SecretStoreError,
+    SegmentationError, TransportErrorKind, UnsupportedOperation, segment_text,
 };
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
@@ -52,6 +55,39 @@ const PRIVATE_KEY: &[AuthMode] = &[AuthMode::PrivateKey];
 const PROFILE: &[AuthMode] = &[AuthMode::Profile];
 const TOKEN_AND_WEBHOOK: &[AuthMode] = &[AuthMode::AccessToken, AuthMode::WebhookSecret];
 const WEBHOOK_URL: &[AuthMode] = &[AuthMode::WebhookUrl];
+
+/// Declared outbound length limits, and where each number came from.
+///
+/// Every value below is transcribed from a file in this repository. None of
+/// them is recalled from a provider's documentation, because a limit that
+/// cannot be re-derived from the tree is a limit nobody can review, and a wrong
+/// one silently truncates a user's message.
+///
+/// The frozen channel inventory at `compat/upstream/inventories/channels.json`
+/// carries identity and provenance only — no lengths — so the source is the
+/// frozen legacy behavior ledger. `compat/legacy/ledger/behaviors.json` records
+/// `behavior.message.channel-limits` as `"Teams and Telegram use 4000-character
+/// chunks, Discord 1900, and WhatsApp 3500"`, and the four call sites it points
+/// at are `src/bot/teamsBot.ts` (`TEAMS_MAX_MESSAGE_LENGTH = 4000`),
+/// `src/channels/telegramPolling.ts` (`splitMessage(text, 4000)`),
+/// `src/channels/discordGateway.ts` (`splitMessage(text, 1900)`) and
+/// `src/channels/whatsappWebhook.ts` (`splitMessage(text, 3500)`).
+///
+/// The unit is [`LengthUnit::Utf16CodeUnits`] rather than characters. The
+/// ledger prose says "character", but every one of those call sites measures
+/// with JavaScript `String.length`, which counts UTF-16 code units. The two
+/// disagree exactly on astral-plane text — one emoji is 1 character and 2 code
+/// units — and the obligation being discharged is behavioral parity with the
+/// program that is still in production, so the implementation's unit wins.
+///
+/// The other 25 registered channels have no limit anywhere in this repository
+/// and are therefore modelled as absent. Segmentation refuses for them.
+const fn declared_limit(max: u32) -> Option<OutputLimit> {
+    match NonZeroU32::new(max) {
+        Some(max) => Some(OutputLimit::new(max, LengthUnit::Utf16CodeUnits)),
+        None => None,
+    }
+}
 
 /// One channel capability implemented by this Rust crate.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -138,12 +174,26 @@ pub struct ChannelDescriptor {
     ///
     /// The frozen channel inventory does not specify authentication modes.
     pub auth_modes: &'static [AuthMode],
+    /// Maximum length of one outbound message, when this repository can prove it.
+    ///
+    /// [`None`] means no source in this tree states a limit for this channel.
+    /// It does not mean the provider has none; it means nothing here may guess
+    /// at it, so segmentation refuses. See [`declared_limit`] for the
+    /// provenance of every value that is present.
+    ///
+    /// A declared limit is metadata, exactly like [`Self::auth_modes`]. It says
+    /// nothing about whether this crate can talk to the channel; that remains
+    /// [`Self::implementation`]'s job.
+    pub output_limit: Option<OutputLimit>,
     /// Executable coverage, kept distinct from registry presence.
     pub implementation: ImplementationStatus,
 }
 
 macro_rules! source_channel {
     ($id:literal, $auth:expr, $capabilities:expr, $implementation:expr) => {
+        source_channel!($id, $auth, $capabilities, $implementation, None)
+    };
+    ($id:literal, $auth:expr, $capabilities:expr, $implementation:expr, $limit:expr) => {
         ChannelDescriptor {
             record_id: concat!("channel:", $id),
             id: $id,
@@ -156,6 +206,7 @@ macro_rules! source_channel {
             catalog_source_path: Some(CATALOG_PATH),
             capabilities: $capabilities,
             auth_modes: $auth,
+            output_limit: $limit,
             implementation: $implementation,
         }
     };
@@ -163,6 +214,9 @@ macro_rules! source_channel {
 
 macro_rules! source_only_channel {
     ($id:literal, $auth:expr, $capabilities:expr, $implementation:expr) => {
+        source_only_channel!($id, $auth, $capabilities, $implementation, None)
+    };
+    ($id:literal, $auth:expr, $capabilities:expr, $implementation:expr, $limit:expr) => {
         ChannelDescriptor {
             record_id: concat!("channel:", $id),
             id: $id,
@@ -175,6 +229,7 @@ macro_rules! source_only_channel {
             catalog_source_path: None,
             capabilities: $capabilities,
             auth_modes: $auth,
+            output_limit: $limit,
             implementation: $implementation,
         }
     };
@@ -194,6 +249,7 @@ macro_rules! catalog_channel {
             catalog_source_path: None,
             capabilities: NO_CAPABILITIES,
             auth_modes: $auth,
+            output_limit: None,
             implementation: ImplementationStatus::RegistrationOnly,
         }
     };
@@ -210,7 +266,8 @@ static REGISTRY: [ChannelDescriptor; 29] = [
         "msteams",
         APP_CREDENTIALS,
         NO_CAPABILITIES,
-        ImplementationStatus::RegistrationOnly
+        ImplementationStatus::RegistrationOnly,
+        declared_limit(4000)
     ),
     source_channel!(
         "feishu",
@@ -301,7 +358,8 @@ static REGISTRY: [ChannelDescriptor; 29] = [
         "discord",
         WEBHOOK_URL,
         TEXT_OUT,
-        ImplementationStatus::OutboundWebhook
+        ImplementationStatus::OutboundWebhook,
+        declared_limit(1900)
     ),
     source_channel!(
         "twitch",
@@ -342,13 +400,15 @@ static REGISTRY: [ChannelDescriptor; 29] = [
         "whatsapp",
         PLATFORM_SESSION,
         NO_CAPABILITIES,
-        ImplementationStatus::RegistrationOnly
+        ImplementationStatus::RegistrationOnly,
+        declared_limit(3500)
     ),
     source_only_channel!(
         "telegram",
         BOT_TOKEN,
         NO_CAPABILITIES,
-        ImplementationStatus::RegistrationOnly
+        ImplementationStatus::RegistrationOnly,
+        declared_limit(4000)
     ),
     source_channel!(
         "qqbot",
@@ -379,6 +439,81 @@ pub const fn registry() -> &'static [ChannelDescriptor] {
 #[must_use]
 pub fn descriptor(id: &str) -> Option<&'static ChannelDescriptor> {
     REGISTRY.iter().find(|entry| entry.id == id)
+}
+
+/// Returns the proven outbound length limit for one registered channel.
+///
+/// `Ok(None)` states that this repository contains no limit for that channel.
+/// That is a different fact from "the identifier is unknown" and from "the
+/// provider imposes no limit", and it is the case in which nothing may be
+/// segmented.
+///
+/// # Errors
+///
+/// Returns [`RoutingError::UnknownChannel`] when `channel_id` is not one of the
+/// 29 frozen official identifiers.
+pub fn output_limit(channel_id: &str) -> Result<Option<OutputLimit>, RoutingError> {
+    descriptor(channel_id)
+        .map(|entry| entry.output_limit)
+        .ok_or(RoutingError::UnknownChannel)
+}
+
+/// Splits outbound text into the segments one registered channel would send.
+///
+/// Segments borrow from `text` wherever possible; only a segment that had to
+/// re-open a code fence owns its bytes.
+///
+/// This is the honest surface for the channels whose limit this repository can
+/// prove but whose transport is not implemented: the segmentation is real and
+/// testable even where the delivery is not.
+///
+/// # Errors
+///
+/// - [`OutboundTextError::UnknownChannel`] when `channel_id` is not one of the
+///   29 frozen official identifiers.
+/// - [`OutboundTextError::NoProvenLimit`] when the channel is registered but no
+///   source in this repository states its limit. Guessing one would silently
+///   truncate the caller's message, so this refuses instead.
+/// - [`OutboundTextError::Segmentation`] when the text cannot be split to the
+///   declared limit without corrupting a cluster or a code fence.
+pub fn segment_outbound_text<'a>(
+    channel_id: &str,
+    text: &'a str,
+) -> Result<Vec<Cow<'a, str>>, OutboundTextError> {
+    let limit = output_limit(channel_id).map_err(|_| OutboundTextError::UnknownChannel)?;
+    let limit = limit.ok_or(OutboundTextError::NoProvenLimit)?;
+    Ok(segment_text(text, Some(limit))?)
+}
+
+/// Why outbound text could not be segmented for a registered channel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutboundTextError {
+    /// The identifier is not one of the 29 frozen official channels.
+    UnknownChannel,
+    /// The channel is registered but this repository states no limit for it.
+    NoProvenLimit,
+    /// The declared limit exists and the text still could not be segmented.
+    Segmentation(SegmentationError),
+}
+
+impl Display for OutboundTextError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownChannel => formatter.write_str("channel identifier is not registered"),
+            Self::NoProvenLimit => {
+                formatter.write_str("channel has no proven outbound length limit")
+            }
+            Self::Segmentation(error) => Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl Error for OutboundTextError {}
+
+impl From<SegmentationError> for OutboundTextError {
+    fn from(error: SegmentationError) -> Self {
+        Self::Segmentation(error)
+    }
 }
 
 /// Clock port used to make delivery acknowledgements deterministic.
@@ -592,6 +727,11 @@ fn parse_status(response: &[u8]) -> Result<u16, ChannelError> {
 }
 
 /// Outbound text adapter for webhook-compatible official channels.
+///
+/// Text longer than the channel's proven output limit is segmented and posted
+/// as several sequential requests. Only `discord` has such a limit today; the
+/// other three webhook channels have none in this repository, so their text is
+/// posted exactly as before rather than split against an invented bound.
 pub struct WebhookChannel<T, C> {
     channel_id: &'static str,
     account_id: String,
@@ -644,6 +784,39 @@ impl<T, C> WebhookChannel<T, C> {
             transport,
             clock,
         })
+    }
+}
+
+impl<T: WebhookTransport, C> WebhookChannel<T, C> {
+    /// Posts exactly one segment and maps its status to a channel error.
+    ///
+    /// A multi-segment message calls this once per segment and stops at the
+    /// first failure, which leaves the segments already accepted delivered.
+    /// This is why the adapter declares [`OutboundRetrySafety::NotSafeToRepeat`]:
+    /// repeating the whole message would repost those segments.
+    fn post_text(&self, text: &str, credential: &ChannelCredential) -> Result<(), ChannelError> {
+        let body = serde_json::to_vec(&WebhookPayload {
+            field: self.payload_field,
+            text,
+        })
+        .map_err(|_| ChannelError::Protocol(ProtocolErrorKind::InvalidField))?;
+        let response = credential
+            .expose_embedded_endpoint(self.channel_id, &self.account_id, |endpoint| {
+                self.transport.post_json(&WebhookRequest {
+                    endpoint,
+                    body: &body,
+                    redirect_policy: RedirectPolicy::Reject,
+                })
+            })
+            .map_err(map_credential_binding)??;
+        match response.status {
+            200..=299 => Ok(()),
+            401 | 403 => Err(ChannelError::Authentication),
+            429 => Err(ChannelError::RateLimited {
+                retry_after: Duration::from_secs(1),
+            }),
+            status => Err(ChannelError::RemoteRejected { status }),
+        }
     }
 }
 
@@ -704,33 +877,22 @@ where
             InvalidMessageReason::EmptyContent,
         ))?;
         let credential = credential.ok_or(ChannelError::Credential(SecretStoreError::NotFound))?;
-        let body = serde_json::to_vec(&WebhookPayload {
-            field: self.payload_field,
-            text,
-        })
-        .map_err(|_| ChannelError::Protocol(ProtocolErrorKind::InvalidField))?;
-        let response = credential
-            .expose_embedded_endpoint(self.channel_id, &self.account_id, |endpoint| {
-                self.transport.post_json(&WebhookRequest {
-                    endpoint,
-                    body: &body,
-                    redirect_policy: RedirectPolicy::Reject,
-                })
-            })
-            .map_err(map_credential_binding)??;
-        match response.status {
-            200..=299 => Ok(DeliveryAcknowledgement {
-                correlation_key: message.correlation_key.clone(),
-                remote_message_id: None,
-                state: DeliveryState::Accepted,
-                accepted_at_unix_ms: self.clock.now_unix_ms(),
-            }),
-            401 | 403 => Err(ChannelError::Authentication),
-            429 => Err(ChannelError::RateLimited {
-                retry_after: Duration::from_secs(1),
-            }),
-            status => Err(ChannelError::RemoteRejected { status }),
+        match descriptor(self.channel_id).and_then(|entry| entry.output_limit) {
+            // Segmenting allocates, so a message that already fits keeps the
+            // original single-request path and borrows its text throughout.
+            Some(limit) if !limit.fits(text) => {
+                for segment in segment_text(text, Some(limit))? {
+                    self.post_text(segment.as_ref(), credential)?;
+                }
+            }
+            _ => self.post_text(text, credential)?,
         }
+        Ok(DeliveryAcknowledgement {
+            correlation_key: message.correlation_key.clone(),
+            remote_message_id: None,
+            state: DeliveryState::Accepted,
+            accepted_at_unix_ms: self.clock.now_unix_ms(),
+        })
     }
 }
 

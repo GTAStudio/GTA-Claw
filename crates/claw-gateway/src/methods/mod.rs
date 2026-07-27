@@ -8,6 +8,15 @@
 //! therefore this crate's design and are **not** claimed to be byte-compatible
 //! with upstream `OpenClaw` payloads. They are strict: unknown fields are
 //! rejected and every identity is length-bounded.
+//!
+//! # One handler is not atomic
+//!
+//! [`crate::store::GatewayStore`] has no transaction, so a handler that issues
+//! two writes for one request cannot be all-or-nothing. `set-heartbeats` is the
+//! only such handler: it toggles the enable flag and then records one heartbeat
+//! through it. If the second write fails the request fails, but the flag has
+//! already changed, and the `previous` value the client is not told about is
+//! the one a retry will report. Every other handler performs at most one write.
 
 mod nodes;
 mod sessions;

@@ -7,7 +7,9 @@ use std::fmt::{self, Display, Formatter};
 use serde::{Deserialize, Serialize};
 
 use crate::session::SessionId;
-use crate::vector::{Embedding, EmbeddingModel, RecordId, VectorError, VectorIndex};
+use crate::vector::{
+    DEFAULT_INDEX_CAPACITY, Embedding, EmbeddingModel, RecordId, VectorError, VectorIndex,
+};
 
 /// Inclusive maximum number of results one query may request.
 pub const MAX_RETRIEVAL_LIMIT: usize = 100;
@@ -199,25 +201,76 @@ fn tokens(text: &str) -> BTreeSet<String> {
 /// Scoring is the fraction of distinct query terms present in the record.
 /// Ties break on newest first, then ascending record identifier, so the same
 /// corpus and query always produce the same ordering.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+///
+/// The corpus is capacity-bounded for the same reason
+/// [`ExactVectorIndex`](crate::vector::ExactVectorIndex) is: every record it
+/// holds can come from attacker-influenced text, so an unbounded corpus is an
+/// unbounded allocation reachable from ordinary agent output. Exceeding the
+/// bound is a refusal, never a silent eviction; [`KeywordRetriever::remove`]
+/// is the only way a record leaves.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeywordRetriever {
-    // Not capacity-bounded: `insert` cannot report a refusal, so a bound here
-    // could only evict silently. The owner of the corpus decides what to keep
-    // and calls `remove`; `InMemoryMemoryStore` and `ExactVectorIndex` are the
-    // bounded holders of the same records.
+    capacity: usize,
+    // Bounded by `capacity` in `insert`; `remove` is the eviction path.
     records: BTreeMap<RecordId, MemoryRecord>,
 }
 
+impl Default for KeywordRetriever {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KeywordRetriever {
-    /// Creates an empty retriever.
+    /// Creates an empty retriever with the crate's default record capacity,
+    /// which is the one [`ExactVectorIndex::new`](crate::vector::ExactVectorIndex::new) uses.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self {
+            capacity: DEFAULT_INDEX_CAPACITY,
+            records: BTreeMap::new(),
+        }
+    }
+
+    /// Creates an empty retriever with an explicit record capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RetrievalError::EmptyCapacity`] when `capacity` is zero,
+    /// which would make the retriever refuse every record.
+    pub const fn with_capacity(capacity: usize) -> Result<Self, RetrievalError> {
+        if capacity == 0 {
+            return Err(RetrievalError::EmptyCapacity);
+        }
+        Ok(Self {
+            capacity,
+            records: BTreeMap::new(),
+        })
+    }
+
+    /// Returns the maximum number of records this retriever will hold.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Inserts or replaces one record.
-    pub fn insert(&mut self, record: MemoryRecord) {
+    ///
+    /// A refusal leaves the retriever exactly as it was.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RetrievalError::RetrieverFull`] when storing a record that is
+    /// not already present would take the corpus past its capacity. Replacing
+    /// an existing record is never refused for capacity, so a full retriever
+    /// stays usable rather than becoming read-only — the same rule
+    /// [`ExactVectorIndex`](crate::vector::ExactVectorIndex) applies.
+    pub fn insert(&mut self, record: MemoryRecord) -> Result<(), RetrievalError> {
+        if !self.records.contains_key(&record.id) && self.records.len() >= self.capacity {
+            return Err(RetrievalError::RetrieverFull);
+        }
         self.records.insert(record.id.clone(), record);
+        Ok(())
     }
 
     /// Removes one record, reporting whether it existed.
@@ -420,6 +473,10 @@ pub enum RetrievalError {
     InvalidLimit,
     /// A kind filter selected nothing.
     NoKindsSelected,
+    /// The requested retriever capacity was zero.
+    EmptyCapacity,
+    /// The retriever already holds its maximum number of records.
+    RetrieverFull,
     /// The embedding model or index refused the operation.
     Vector(VectorError),
 }
@@ -431,6 +488,12 @@ impl Display for RetrievalError {
             Self::QueryTooLong => formatter.write_str("query text exceeds the maximum size"),
             Self::InvalidLimit => formatter.write_str("query result limit is out of range"),
             Self::NoKindsSelected => formatter.write_str("query selected no record kinds"),
+            Self::EmptyCapacity => {
+                formatter.write_str("retriever capacity must be at least one record")
+            }
+            Self::RetrieverFull => {
+                formatter.write_str("retriever holds its maximum number of records")
+            }
             Self::Vector(error) => write!(formatter, "vector backend refused: {error}"),
         }
     }
@@ -492,15 +555,21 @@ mod tests {
     #[test]
     fn keyword_scores_are_the_fraction_of_query_terms_present() {
         let mut retriever = KeywordRetriever::new();
-        retriever.insert(record(
-            "all",
-            "s",
-            RecordKind::Note,
-            "deploy the gateway service",
-            10,
-        ));
-        retriever.insert(record("some", "s", RecordKind::Note, "deploy the cat", 20));
-        retriever.insert(record("none", "s", RecordKind::Note, "unrelated text", 30));
+        retriever
+            .insert(record(
+                "all",
+                "s",
+                RecordKind::Note,
+                "deploy the gateway service",
+                10,
+            ))
+            .expect("indexed");
+        retriever
+            .insert(record("some", "s", RecordKind::Note, "deploy the cat", 20))
+            .expect("indexed");
+        retriever
+            .insert(record("none", "s", RecordKind::Note, "unrelated text", 30))
+            .expect("indexed");
         assert_eq!(retriever.len(), 3);
 
         let query = RetrievalQuery::new("deploy gateway service", 10).expect("valid query");
@@ -515,9 +584,15 @@ mod tests {
     #[test]
     fn keyword_ties_break_on_newest_then_identifier() {
         let mut retriever = KeywordRetriever::new();
-        retriever.insert(record("b", "s", RecordKind::Note, "alpha", 100));
-        retriever.insert(record("a", "s", RecordKind::Note, "alpha", 100));
-        retriever.insert(record("c", "s", RecordKind::Note, "alpha", 500));
+        retriever
+            .insert(record("b", "s", RecordKind::Note, "alpha", 100))
+            .expect("indexed");
+        retriever
+            .insert(record("a", "s", RecordKind::Note, "alpha", 100))
+            .expect("indexed");
+        retriever
+            .insert(record("c", "s", RecordKind::Note, "alpha", 500))
+            .expect("indexed");
         let query = RetrievalQuery::new("alpha", 10).expect("valid query");
         let hits = retriever.retrieve(&query).expect("retrieved");
         assert_eq!(
@@ -531,9 +606,15 @@ mod tests {
     #[test]
     fn session_and_kind_filters_exclude_records_entirely() {
         let mut retriever = KeywordRetriever::new();
-        retriever.insert(record("m", "one", RecordKind::Message, "shared term", 1));
-        retriever.insert(record("n", "one", RecordKind::Note, "shared term", 2));
-        retriever.insert(record("o", "two", RecordKind::Note, "shared term", 3));
+        retriever
+            .insert(record("m", "one", RecordKind::Message, "shared term", 1))
+            .expect("indexed");
+        retriever
+            .insert(record("n", "one", RecordKind::Note, "shared term", 2))
+            .expect("indexed");
+        retriever
+            .insert(record("o", "two", RecordKind::Note, "shared term", 3))
+            .expect("indexed");
 
         let scoped = RetrievalQuery::new("shared", 10)
             .expect("valid query")
@@ -563,13 +644,15 @@ mod tests {
     fn the_limit_is_honoured_and_removal_works() {
         let mut retriever = KeywordRetriever::new();
         for index in 0..5_u64 {
-            retriever.insert(record(
-                &format!("r{index}"),
-                "s",
-                RecordKind::Note,
-                "common",
-                index,
-            ));
+            retriever
+                .insert(record(
+                    &format!("r{index}"),
+                    "s",
+                    RecordKind::Note,
+                    "common",
+                    index,
+                ))
+                .expect("indexed");
         }
         let query = RetrievalQuery::new("common", 2).expect("valid query");
         assert_eq!(retriever.retrieve(&query).expect("retrieved").len(), 2);
@@ -636,5 +719,61 @@ mod tests {
 
         assert!(retriever.remove(&RecordId::new("b").expect("valid identifier")));
         assert!(retriever.retrieve(&query).expect("retrieved").is_empty());
+    }
+
+    #[test]
+    fn the_keyword_corpus_is_bounded_by_the_same_default_its_vector_sibling_uses() {
+        assert_eq!(
+            KeywordRetriever::new().capacity(),
+            ExactVectorIndex::new(8).expect("valid index").capacity()
+        );
+        assert_eq!(
+            KeywordRetriever::with_capacity(0),
+            Err(RetrievalError::EmptyCapacity)
+        );
+        assert_eq!(
+            KeywordRetriever::with_capacity(4)
+                .expect("valid capacity")
+                .capacity(),
+            4
+        );
+    }
+
+    #[test]
+    fn a_full_keyword_corpus_refuses_new_records_but_still_accepts_replacements() {
+        let mut retriever = KeywordRetriever::with_capacity(2).expect("valid capacity");
+        retriever
+            .insert(record("a", "s", RecordKind::Note, "first body", 1))
+            .expect("indexed");
+        retriever
+            .insert(record("b", "s", RecordKind::Note, "second body", 2))
+            .expect("indexed");
+
+        assert_eq!(
+            retriever.insert(record("c", "s", RecordKind::Note, "third body", 3)),
+            Err(RetrievalError::RetrieverFull),
+            "a bound that could be exceeded is not a bound"
+        );
+        assert_eq!(retriever.len(), 2, "a refusal must store nothing");
+        assert!(
+            retriever
+                .retrieve(&RetrievalQuery::new("third", 5).expect("valid query"))
+                .expect("retrieved")
+                .is_empty(),
+            "a refused record must not be searchable"
+        );
+
+        // A full retriever stays usable: replacing a record it already holds cannot grow it.
+        retriever
+            .insert(record("a", "s", RecordKind::Note, "rewritten body", 4))
+            .expect("a replacement is never refused for capacity");
+        assert_eq!(retriever.len(), 2);
+
+        // `remove` is the eviction path, and it frees a slot.
+        assert!(retriever.remove(&RecordId::new("b").expect("valid identifier")));
+        retriever
+            .insert(record("c", "s", RecordKind::Note, "third body", 5))
+            .expect("removing a record frees its slot");
+        assert_eq!(retriever.len(), 2);
     }
 }

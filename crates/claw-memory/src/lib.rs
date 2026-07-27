@@ -18,8 +18,9 @@
 //!   dependency-free and deterministic, so the crate is fully testable
 //!   offline; production adapters live outside it.
 //! * **Bounded by construction.** Identifier lengths, embedding
-//!   dimensionality, retrieval limits and store capacity all have explicit
-//!   ceilings. Nothing grows without a bound an operator chose.
+//!   dimensionality, retrieval limits, retriever corpora and store capacity
+//!   all have explicit ceilings. Nothing grows without a bound an operator
+//!   chose.
 //!
 //! # Layout
 //!

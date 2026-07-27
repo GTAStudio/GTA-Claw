@@ -4,6 +4,12 @@
 //! The additive [`OpenClawConfig`] model covers the frozen 47-domain upstream
 //! source surface. The original [`ConfigSnapshot`] API remains the strict,
 //! validated GTA legacy runtime envelope used by existing callers.
+//!
+//! [`parse_role_document`] owns the interpretation half of the frozen remote
+//! role contract: the size bound, the JSON and plain-text encodings, the
+//! `content`/`prompt` precedence, the optional model, and the diagnostics.
+//! The transport half stays behind the [`RoleSourceFetcher`] port, because this
+//! crate has no HTTP client and does not gain one.
 
 /// Strongly typed source configuration for the frozen 47-domain contract.
 pub mod domains;
@@ -13,6 +19,7 @@ mod layer;
 mod migration;
 mod model;
 mod reload;
+mod role;
 mod versioning;
 mod wire;
 
@@ -50,6 +57,11 @@ pub use model::{
 pub use reload::{
     ConfigChange, ConfigFileWatcher, ConfigHub, ConfigHubError, ConfigSubscription, ReloadManager,
     ReloadOutcome,
+};
+pub use role::{
+    ROLE_DOCUMENT_MAX_BYTES, ROLE_FETCH_ACCEPT, ROLE_FETCH_TIMEOUT_MS, RoleDiagnostic,
+    RoleDocument, RoleDocumentOutcome, RoleFetchRequest, RoleJsonRejection, RoleLoadError,
+    RoleParseError, RoleResponse, RoleSourceFetcher, load_role, parse_role_document,
 };
 pub use versioning::{
     ConfigMigrationError, ConfigMigrationOutcome, ConfigMigrationRecord, migrate_config_file,

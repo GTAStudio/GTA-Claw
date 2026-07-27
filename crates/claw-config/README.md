@@ -21,16 +21,40 @@ are persisted only as validated environment or platform-store references.
 the explicit platform store port is the only API that receives borrowed
 plaintext.
 
+The frozen remote role contract is split in two. `parse_role_document` owns the
+interpretation half: the `ROLE_DOCUMENT_MAX_BYTES` bound, the JSON and
+plain-text encodings, a string `content` winning over `prompt`, an absent or
+non-string `content` falling back to a string `prompt`, a rejected empty
+selection, an optional string `model`, and ordered `RoleDiagnostic` values in
+place of the log lines the legacy loader emitted. A body that declares a JSON
+content type is rejected outright when it is not a usable role; a body that
+merely looks like JSON falls back to being used verbatim. `load_role` drives
+the `RoleSourceFetcher` port and rejects non-2xx responses, an over-long
+declared length, an over-long body, and a body that is not UTF-8.
+
+This crate owns no HTTP client and does not gain one, so no adapter implementing
+`RoleSourceFetcher` ships here and nothing in this crate fetches a role. Three
+deliberate differences from the legacy loader are recorded rather than hidden:
+the size bound counts UTF-8 bytes instead of UTF-16 code units, a non-UTF-8 body
+is rejected instead of being decoded with replacement characters, and the
+unknown-model warning belongs to whichever component owns a provider catalog,
+because a model string is returned exactly as the document spelled it.
+
 Layered runtime resolution uses built-in, system, user, workspace, frozen
 legacy environment, then command-line precedence. Nested objects merge
 recursively while arrays and scalars replace lower layers. File migrations keep
 exact durable backups and expose rollback. `ConfigHub` and `ConfigFileWatcher`
 publish complete immutable snapshots and ordered typed notifications.
+`ResolvedConfig::environment_diagnostics` records each exact legacy mapping that
+contributed and each unknown input that was ignored, while `applied_layers`
+includes the environment layer only when a runtime mapping actually applied.
 
 Legacy conversion supports the runtime rows in
 `compat/legacy/config/env-mapping.json`, except `COPILOT_CLI_PATH`, because the
 production Rust runtime does not execute Copilot CLI. Present deployer, build,
-CI, and Copilot CLI rows produce ordered `ManualRequired` diagnostics:
+CI, and Copilot CLI rows produce ordered `ManualRequired` diagnostics. Runtime
+rows produce `Applied` diagnostics and unknown supplied names produce
+`IgnoredUnknown`, allowing a caller to render a complete deterministic report:
 
 - `COPILOT_CLI_PATH`
 - `DOCKER_IMAGE`

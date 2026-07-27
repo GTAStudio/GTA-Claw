@@ -157,6 +157,25 @@ struct MockTerminal {
     restored: AtomicUsize,
 }
 
+#[derive(Default)]
+struct FailOnceTerminal {
+    restores: AtomicUsize,
+}
+
+impl TerminalControl for FailOnceTerminal {
+    fn enter(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn restore(&self) -> std::io::Result<()> {
+        if self.restores.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(std::io::Error::other("simulated restore failure"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl TerminalControl for MockTerminal {
     fn enter(&self) -> std::io::Result<()> {
         self.entered.fetch_add(1, Ordering::SeqCst);
@@ -181,6 +200,22 @@ fn panic_unwind_always_restores_terminal() {
     assert!(result.is_err());
     assert_eq!(control.entered.load(Ordering::SeqCst), 1);
     assert_eq!(control.restored.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn explicit_shutdown_reports_restoration_and_restores_only_once() {
+    let control = Arc::new(MockTerminal::default());
+    let terminal = TerminalSession::enter(Arc::clone(&control)).expect("enter mock terminal");
+    terminal.restore().expect("restore mock terminal");
+    assert_eq!(control.restored.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_failed_explicit_restoration_is_retried_by_the_drop_guard() {
+    let control = Arc::new(FailOnceTerminal::default());
+    let terminal = TerminalSession::enter(Arc::clone(&control)).expect("enter mock terminal");
+    assert!(terminal.restore().is_err());
+    assert_eq!(control.restores.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -287,6 +322,46 @@ fn degenerate_terminal_sizes_render_and_flush_without_panicking() {
 }
 
 #[test]
+fn extreme_terminal_dimensions_are_capped_to_a_responsive_grid() {
+    let grid = render(
+        &populated_model(Screen::Workspace, usize::MAX),
+        u16::MAX,
+        u16::MAX,
+        false,
+    );
+    assert_eq!(grid.width(), 512);
+    assert_eq!(grid.height(), 256);
+    let mut out = Vec::new();
+    flush(&mut out, &grid, false).expect("flush capped large frame");
+}
+
+#[test]
+fn selected_sessions_and_scrolled_runs_remain_visible() {
+    let mut model = AppModel {
+        screen: Screen::Sessions,
+        ..AppModel::default()
+    };
+    model.sessions = (0..20)
+        .map(|index| SessionSummary {
+            id: format!("s-{index}"),
+            title: format!("Run {index:02}"),
+            ..SessionSummary::default()
+        })
+        .collect();
+    model.selected = 19;
+    let sessions = render(&model, 60, 10, true);
+    assert!(
+        sessions.text().contains("> Run 19"),
+        "the selected session must be scrolled into view"
+    );
+
+    model.screen = Screen::Runs;
+    model.scroll = 5;
+    let runs = render(&model, 60, 12, true);
+    assert!(runs.line(6).contains("Run 05"));
+}
+
+#[test]
 fn unchanged_frames_write_nothing_and_a_changed_line_writes_far_less_than_a_repaint() {
     let quiet = AppModel {
         connection: "Gateway: ready".to_owned(),
@@ -319,6 +394,22 @@ fn unchanged_frames_write_nothing_and_a_changed_line_writes_far_less_than_a_repa
         "a one-line change wrote {} bytes against a {}-byte full repaint",
         partial.len(),
         repaint.len()
+    );
+}
+
+#[test]
+fn unicode_output_reanchors_the_terminal_cursor() {
+    let model = AppModel {
+        connection: "界 ready".to_owned(),
+        ..AppModel::default()
+    };
+    let grid = render(&model, 40, 10, true);
+    let mut out = Vec::new();
+    flush(&mut out, &grid, true).expect("flush unicode frame");
+    assert!(
+        out.windows(b"\x1b[1;13H".len())
+            .any(|window| window == b"\x1b[1;13H"),
+        "the cell after a non-ASCII glyph must use an absolute cursor position"
     );
 }
 

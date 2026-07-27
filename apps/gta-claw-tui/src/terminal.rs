@@ -61,13 +61,17 @@ impl TerminalControl for CrosstermControl {
             LeaveAlternateScreen
         );
         let raw_result = disable_raw_mode();
-        screen_result.and(raw_result)
+        let result = screen_result.and(raw_result);
+        if result.is_err() {
+            self.active.store(true, Ordering::Release);
+        }
+        result
     }
 }
 
 /// RAII guard that restores raw mode on return, signal unwinding, or panic.
 pub struct TerminalSession<C: TerminalControl> {
-    control: Arc<C>,
+    control: Option<Arc<C>>,
 }
 
 impl<C: TerminalControl> TerminalSession<C> {
@@ -79,13 +83,37 @@ impl<C: TerminalControl> TerminalSession<C> {
     /// that case, so nothing needs to be restored.
     pub fn enter(control: Arc<C>) -> io::Result<Self> {
         control.enter()?;
-        Ok(Self { control })
+        Ok(Self {
+            control: Some(control),
+        })
+    }
+
+    /// Restores the terminal and reports restoration failures to the caller.
+    ///
+    /// The `Drop` fallback remains active and is harmless because controls are
+    /// required to make restoration idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reported by the terminal control while leaving raw or
+    /// alternate-screen mode.
+    pub fn restore(mut self) -> io::Result<()> {
+        let Some(control) = self.control.as_ref() else {
+            return Ok(());
+        };
+        let result = control.restore();
+        if result.is_ok() {
+            self.control.take();
+        }
+        result
     }
 }
 
 impl<C: TerminalControl> Drop for TerminalSession<C> {
     fn drop(&mut self) {
-        let _ = self.control.restore();
+        if let Some(control) = self.control.take() {
+            let _ = control.restore();
+        }
     }
 }
 
@@ -97,34 +125,47 @@ pub struct InputThread {
 
 impl InputThread {
     /// Starts a bounded Crossterm event pump.
-    #[must_use]
-    pub fn spawn(capacity: usize) -> (Self, mpsc::Receiver<Event>) {
-        let (sender, receiver) = mpsc::channel(capacity);
+    ///
+    /// # Errors
+    ///
+    /// Returns an operating-system error when the reader thread cannot be
+    /// created. The caller can then restore a terminal it has already entered.
+    pub fn spawn(capacity: usize) -> io::Result<(Self, mpsc::Receiver<Event>)> {
+        let (sender, receiver) = mpsc::channel(capacity.max(1));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
-        let handle = thread::spawn(move || {
-            while !thread_stop.load(Ordering::Acquire) {
-                match crossterm::event::poll(Duration::from_millis(100)) {
-                    Ok(true) => match crossterm::event::read() {
-                        Ok(event) => {
-                            if sender.blocking_send(event).is_err() {
-                                break;
+        let handle = thread::Builder::new()
+            .name("gta-claw-tui-input".to_owned())
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    match crossterm::event::poll(Duration::from_millis(100)) {
+                        Ok(true) => match crossterm::event::read() {
+                            Ok(event) => {
+                                if !send_input(&sender, event) {
+                                    break;
+                                }
                             }
-                        }
+                            Err(_) => break,
+                        },
+                        Ok(false) => {}
                         Err(_) => break,
-                    },
-                    Ok(false) => {}
-                    Err(_) => break,
+                    }
                 }
-            }
-        });
-        (
+            })?;
+        Ok((
             Self {
                 stop,
                 handle: Some(handle),
             },
             receiver,
-        )
+        ))
+    }
+}
+
+fn send_input(sender: &mpsc::Sender<Event>, event: Event) -> bool {
+    match sender.try_send(event) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
     }
 }
 
@@ -184,7 +225,9 @@ pub fn best_effort_restore() {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::install_panic_hook_with;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    use super::{install_panic_hook_with, send_input};
 
     static RESTORED: AtomicUsize = AtomicUsize::new(0);
 
@@ -202,5 +245,20 @@ mod tests {
 
         assert!(std::panic::catch_unwind(|| panic!("second simulated panic")).is_err());
         assert_eq!(RESTORED.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_full_input_queue_never_blocks_the_reader_thread() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let key = || Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert!(send_input(&sender, key()));
+        assert!(
+            send_input(&sender, key()),
+            "a full queue drops the new event"
+        );
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_err());
+        drop(receiver);
+        assert!(!send_input(&sender, key()));
     }
 }

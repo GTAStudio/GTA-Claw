@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod commands;
 pub mod lifecycle;
+pub mod segmentation;
 
 pub use commands::{
     COMMAND_PREFIX, CommandDispatchError, CommandInvocation, CommandParseError, CommandRegistry,
@@ -25,6 +26,7 @@ pub use lifecycle::{
     ChannelSession, ConnectionState, ConnectionSupervisor, IllegalTransition, LifecycleEvent,
     LifecycleObserver,
 };
+pub use segmentation::{LengthUnit, OutputLimit, SegmentationError, segment_text};
 
 /// Maximum number of attachment bytes accepted by the common message model.
 pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
@@ -1063,6 +1065,9 @@ pub enum InvalidMessageReason {
     EmptyContent,
     /// Text contains a forbidden null character.
     InvalidText,
+    /// Text exceeds the destination's declared output limit and cannot be
+    /// segmented without corrupting a cluster or a code fence.
+    UnsegmentableText,
     /// Media type syntax is invalid.
     InvalidMediaType,
     /// Attachment exceeds the common size bound.
@@ -1235,6 +1240,25 @@ impl Display for ChannelError {
 }
 
 impl Error for ChannelError {}
+
+impl From<SegmentationError> for ChannelError {
+    /// Reports a segmentation refusal without inventing a delivery attempt.
+    ///
+    /// A cluster or fence that cannot be cut is the message's problem, so it
+    /// surfaces as [`InvalidMessageReason::UnsegmentableText`]. An adapter that
+    /// reached the segmenter without a declared limit is the adapter's problem,
+    /// so it surfaces as [`ConfigurationError::InvalidAdapterConfiguration`].
+    fn from(error: SegmentationError) -> Self {
+        match error {
+            SegmentationError::NoDeclaredLimit => {
+                Self::Configuration(ConfigurationError::InvalidAdapterConfiguration)
+            }
+            SegmentationError::LimitTooSmall | SegmentationError::IndivisibleCluster => {
+                Self::InvalidMessage(InvalidMessageReason::UnsegmentableText)
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

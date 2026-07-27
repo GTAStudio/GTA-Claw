@@ -19,6 +19,19 @@ LINUX_DEBIAN_SNAPSHOT="20260701T000000Z"
 # shellcheck disable=SC2034
 LINUX_MINIMAL_IMAGE="debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df"
 
+workspace_rust_toolchain="$(
+  awk -F'"' '$1 ~ /^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' \
+    "$REPO_ROOT/rust-toolchain.toml"
+)"
+dockerfile_rust_toolchain="$(
+  awk -F= '$1 == "ENV RUSTUP_TOOLCHAIN" { print $2; exit }' \
+    "$LINUX_DIR/Dockerfile.build"
+)"
+[[ "$workspace_rust_toolchain" == "$LINUX_RUST_TOOLCHAIN" ]] ||
+  die "Linux toolchain $LINUX_RUST_TOOLCHAIN differs from rust-toolchain.toml ($workspace_rust_toolchain)"
+[[ "$dockerfile_rust_toolchain" == "$LINUX_RUST_TOOLCHAIN" ]] ||
+  die "Dockerfile RUSTUP_TOOLCHAIN differs from pinned Linux toolchain $LINUX_RUST_TOOLCHAIN"
+
 workspace_version="$(
   awk '
     /^\[workspace\.package\]$/ { in_package = 1; next }

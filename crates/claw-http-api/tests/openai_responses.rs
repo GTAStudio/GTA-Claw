@@ -9,7 +9,8 @@
 mod openai_support;
 
 use openai_support::{
-    RequestSpec, assert_error_contracts_are_distinct, run_fixture, script, spawn,
+    FLOOD_CHUNK_BYTES, RequestSpec, STREAM_OUTPUT_FLOOR_BYTES, assert_error_contracts_are_distinct,
+    observe, run_fixture, script, spawn, text_flood,
 };
 use serde_json::{Value, json};
 
@@ -395,6 +396,111 @@ async fn response_rejects_the_wrong_method_at_the_router() {
         .collect::<Vec<_>>();
     assert!(allow.contains(&"POST".to_owned()), "Allow was {allow:?}");
     assert!(run.server.runtime.generation_requests().is_empty());
+}
+
+/// A constrained stream that fits the buffer ceiling is delivered unchanged.
+///
+/// The Responses contract genuinely needs the whole message — `output_text.done`
+/// and the terminal resource both carry it — so the ceiling has to be invisible
+/// to any response that stays under it. 63 KiB under a 64 KiB ceiling is one
+/// byte-count away from the refusal below.
+#[tokio::test]
+async fn response_stream_delivers_a_constrained_response_that_fits_the_ceiling() {
+    let chunks = STREAM_OUTPUT_FLOOR_BYTES / FLOOD_CHUNK_BYTES - 1;
+    let server = spawn(text_flood(chunks)).await;
+
+    let response = server.send(&constrained_stream_request()).await;
+
+    assert_eq!(response.status, 200);
+    let observed = observe(&response);
+    let expected = "a".repeat(chunks * FLOOD_CHUNK_BYTES);
+    let deltas = payloads(&observed, "response.output_text.delta");
+    assert_eq!(
+        deltas
+            .iter()
+            .filter_map(|payload| payload["delta"].as_str())
+            .collect::<String>(),
+        expected,
+        "text under the ceiling must reach the client whole"
+    );
+    let done = payloads(&observed, "response.output_text.done");
+    assert_eq!(done[0]["text"], expected);
+    let completed = payloads(&observed, "response.completed");
+    assert_eq!(completed[0]["response"]["status"], "completed");
+    assert_eq!(
+        completed[0]["response"]["output"][0]["content"][0]["text"], expected,
+        "the terminal resource must carry the same complete text"
+    );
+    assert_eq!(
+        server.runtime.stream_events_delivered(),
+        chunks,
+        "the adapter must consume the whole provider stream"
+    );
+}
+
+/// A provider that overruns the buffer ceiling is failed, mid-stream.
+///
+/// The delivered-event count is the actual assertion: an adapter that
+/// accumulated the whole megabyte and complained at the end would still emit
+/// the `response.failed` frame below.
+#[tokio::test]
+async fn response_stream_fails_a_response_that_overruns_the_buffer_ceiling() {
+    let ceiling_chunks = STREAM_OUTPUT_FLOOR_BYTES / FLOOD_CHUNK_BYTES;
+    let offered = ceiling_chunks * 16;
+    let server = spawn(text_flood(offered)).await;
+
+    let response = server.send(&constrained_stream_request()).await;
+
+    assert_eq!(
+        response.status, 200,
+        "the status is already committed when the overrun is detected"
+    );
+    let observed = observe(&response);
+    let names = event_names(&observed);
+    assert!(
+        !names.contains(&"response.completed"),
+        "a refused stream must not also claim completion: {names:?}"
+    );
+    assert_eq!(names.last(), Some(&"[DONE]"));
+
+    let failed = payloads(&observed, "response.failed");
+    assert_eq!(failed[0]["response"]["status"], "failed");
+    assert_eq!(
+        failed[0]["response"]["error"]["code"], "api_error",
+        "an upstream that will not stop talking is an upstream fault, not a client fault"
+    );
+    assert_eq!(
+        failed[0]["response"]["error"]["message"],
+        "The provider exceeded the maximum buffered response size."
+    );
+
+    let delivered = server.runtime.stream_events_delivered();
+    assert!(
+        delivered >= ceiling_chunks,
+        "the ceiling clipped a response that still fitted: {delivered} of {offered} chunks"
+    );
+    assert!(
+        delivered <= ceiling_chunks + 32,
+        "the coordinator kept accumulating past the ceiling: {delivered} of {offered} chunks"
+    );
+}
+
+/// A streamed response whose `max_output_tokens` puts it on the buffered path.
+///
+/// `max_output_tokens` does two things at once: it makes the coordinator
+/// withhold deltas until the constraint has been checked, and it is the bound
+/// the buffer ceiling is derived from.
+fn constrained_stream_request() -> RequestSpec {
+    RequestSpec::post(
+        "/v1/responses",
+        "operator-token",
+        json!({
+            "model": "openclaw",
+            "input": "hello",
+            "stream": true,
+            "max_output_tokens": 8
+        }),
+    )
 }
 
 /// Returns the ordered event names of a pinned stream.
