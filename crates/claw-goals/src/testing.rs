@@ -17,13 +17,96 @@ use std::time::Duration;
 use claw_application::model::goal::{GoalRecord, GoalStatus};
 use claw_application::model::ids::GoalId;
 use claw_application::model::time::Timestamp;
+use claw_application::ports::PortError;
 use claw_application::ports::PortFuture;
 use claw_application::ports::clock::ClockPort;
+use claw_application::ports::goal::GoalStorePort;
 use claw_domain::SessionId;
 use claw_runtime::{GoalConfig, GoalService};
 
 use crate::budget::GoalBudget;
 use crate::store::FileGoalStore;
+
+/// Goal-store wrapper that injects one deterministic optimistic-concurrency conflict.
+///
+/// This is useful for proving a caller retries a fresh read/write transaction
+/// without relying on scheduler timing.
+pub struct ConflictOnceStore {
+    inner: Arc<dyn GoalStorePort>,
+    armed: AtomicU64,
+    after_commit: bool,
+}
+
+impl std::fmt::Debug for ConflictOnceStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConflictOnceStore")
+            .field("armed", &self.armed.load(Ordering::SeqCst))
+            .field("after_commit", &self.after_commit)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConflictOnceStore {
+    /// Wraps a store with one armed save conflict.
+    #[must_use]
+    pub fn new(inner: Arc<dyn GoalStorePort>) -> Self {
+        Self {
+            inner,
+            armed: AtomicU64::new(1),
+            after_commit: false,
+        }
+    }
+
+    /// Wraps a store with one conflict reported after the delegated save commits.
+    ///
+    /// This models a multi-write operation whose first record committed before
+    /// a later optimistic-concurrency check failed.
+    #[must_use]
+    pub fn after_commit(inner: Arc<dyn GoalStorePort>) -> Self {
+        Self {
+            inner,
+            armed: AtomicU64::new(1),
+            after_commit: true,
+        }
+    }
+
+    /// Arms one conflict for the next save.
+    pub fn arm(&self) {
+        self.armed.store(1, Ordering::SeqCst);
+    }
+}
+
+impl GoalStorePort for ConflictOnceStore {
+    fn load(&self, goal_id: &GoalId) -> PortFuture<'_, Result<Option<GoalRecord>, PortError>> {
+        self.inner.load(goal_id)
+    }
+
+    fn save(&self, record: GoalRecord) -> PortFuture<'_, Result<(), PortError>> {
+        if self.armed.swap(0, Ordering::SeqCst) == 1 {
+            if self.after_commit {
+                let committed = self.inner.save(record);
+                return Box::pin(async move {
+                    committed.await?;
+                    Err(PortError::Conflict(
+                        "deterministic post-commit conflict".to_owned(),
+                    ))
+                });
+            }
+            return Box::pin(std::future::ready(Err(PortError::Conflict(
+                "deterministic injected conflict".to_owned(),
+            ))));
+        }
+        self.inner.save(record)
+    }
+
+    fn list_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> PortFuture<'_, Result<Vec<GoalRecord>, PortError>> {
+        self.inner.list_for_session(session_id)
+    }
+}
 
 /// Runs a future to completion on the calling thread.
 ///

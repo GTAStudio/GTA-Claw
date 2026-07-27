@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use crate::retrieval::MemoryRecord;
+use crate::retrieval::{MemoryRecord, RecordError};
 use crate::session::{Session, SessionId};
 use crate::vector::RecordId;
 
@@ -54,7 +54,8 @@ pub trait MemoryStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::EmptyRecord`] for a record with an empty body,
+    /// Returns a record-validation error for an empty or oversized body or
+    /// oversized tag set,
     /// [`StoreError::RecordCapacityExceeded`] when storing a record that is
     /// not already present would take the adapter past its record bound, or
     /// [`StoreError::Backend`] when the underlying store is unavailable.
@@ -156,9 +157,7 @@ impl MemoryStore for InMemoryMemoryStore {
     }
 
     fn put_record(&mut self, record: MemoryRecord) -> Result<(), StoreError> {
-        if record.text.is_empty() {
-            return Err(StoreError::EmptyRecord);
-        }
+        record.validate().map_err(StoreError::from)?;
         if !self.records.contains_key(&record.id) && self.records.len() >= self.max_records {
             return Err(StoreError::RecordCapacityExceeded);
         }
@@ -193,6 +192,12 @@ pub enum StoreError {
     RecordCapacityExceeded,
     /// A record body was empty.
     EmptyRecord,
+    /// A record body exceeded the processing bound.
+    RecordTooLarge,
+    /// A record had too many tags.
+    TooManyTags,
+    /// One record tag exceeded its byte bound.
+    TagTooLong,
     /// The adapter failed for an implementation-specific reason.
     Backend,
 }
@@ -203,6 +208,9 @@ impl Display for StoreError {
             Self::SessionCapacityExceeded => "session capacity exceeded",
             Self::RecordCapacityExceeded => "record capacity exceeded",
             Self::EmptyRecord => "record body must not be empty",
+            Self::RecordTooLarge => "record body exceeds the maximum size",
+            Self::TooManyTags => "record has too many tags",
+            Self::TagTooLong => "record tag exceeds the maximum size",
             Self::Backend => "memory store backend failed",
         };
         formatter.write_str(message)
@@ -210,6 +218,17 @@ impl Display for StoreError {
 }
 
 impl Error for StoreError {}
+
+impl From<RecordError> for StoreError {
+    fn from(error: RecordError) -> Self {
+        match error {
+            RecordError::EmptyText => Self::EmptyRecord,
+            RecordError::TextTooLong => Self::RecordTooLarge,
+            RecordError::TooManyTags => Self::TooManyTags,
+            RecordError::TagTooLong => Self::TagTooLong,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

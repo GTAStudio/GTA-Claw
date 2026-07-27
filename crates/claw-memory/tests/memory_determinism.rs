@@ -394,6 +394,15 @@ fn assembly_splits_the_budget_and_hands_back_what_retrieval_did_not_use() {
     assert_eq!(context.retrieved.len(), 2);
     assert_eq!(context.dropped_retrieved, 1);
     assert_eq!(
+        context
+            .truncation
+            .retrieved
+            .iter()
+            .map(RecordId::as_str)
+            .collect::<Vec<_>>(),
+        vec!["note-2"]
+    );
+    assert_eq!(
         context.retrieved[0].record.id,
         RecordId::new("note-0").expect("valid")
     );
@@ -475,6 +484,9 @@ fn the_assembled_context_serializes_every_part_it_carries() {
     assert_eq!(json["remaining_tokens"], 46);
     assert_eq!(json["dropped_messages"], 0);
     assert_eq!(json["dropped_retrieved"], 0);
+    assert_eq!(json["truncation"]["messages"], serde_json::json!([]));
+    assert_eq!(json["truncation"]["retrieved"], serde_json::json!([]));
+    assert_eq!(json["truncation"]["unexamined_retrieved"], 0);
     let messages = json["messages"].as_array().expect("an array of messages");
     assert_eq!(messages.len(), 5);
     assert_eq!(messages[0]["role"], "system");

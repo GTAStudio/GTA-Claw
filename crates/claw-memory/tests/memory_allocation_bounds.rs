@@ -8,14 +8,18 @@
 
 use claw_memory::budget::{Admission, plan_truncation};
 use claw_memory::retrieval::{
-    KeywordRetriever, MAX_QUERY_BYTES, MAX_RETRIEVAL_LIMIT, MemoryRecord, RecordKind,
-    RetrievalError, RetrievalQuery, Retriever,
+    KeywordRetriever, MAX_KEYWORD_RECORD_TERMS, MAX_QUERY_BYTES, MAX_RECORD_BYTES, MAX_RECORD_TAGS,
+    MAX_RETRIEVAL_LIMIT, MAX_TAG_BYTES, MemoryRecord, RecordError, RecordKind, RetrievalCoverage,
+    RetrievalError, RetrievalQuery, Retriever, VectorRetriever,
 };
 use claw_memory::session::{
     MAX_MESSAGE_BYTES, MAX_MESSAGES, MAX_SUMMARIES, MessageId, Role, Session, SessionError,
     SessionId, Summary,
 };
-use claw_memory::vector::{Embedding, ExactVectorIndex, RecordId, VectorError, VectorIndex};
+use claw_memory::store::{InMemoryMemoryStore, MemoryStore, StoreError};
+use claw_memory::vector::{
+    Embedding, ExactVectorIndex, HashingEmbeddingModel, RecordId, VectorError, VectorIndex,
+};
 use claw_memory::{HeuristicTokenCounter, TokenBudget};
 use std::collections::BTreeSet;
 
@@ -207,6 +211,125 @@ fn a_retrieval_limit_past_the_result_bound_is_refused() {
         RetrievalQuery::new("term", 0).err(),
         Some(RetrievalError::InvalidLimit)
     );
+}
+
+#[test]
+fn memory_record_bounds_are_enforced_before_storage_or_indexing() {
+    let at_bound = record("at-bound", &"x".repeat(MAX_RECORD_BYTES), 1);
+    assert_eq!(at_bound.validate(), Ok(()));
+
+    let oversized = record("oversized", &"x".repeat(MAX_RECORD_BYTES + 1), 2);
+    assert_eq!(oversized.validate(), Err(RecordError::TextTooLong));
+
+    let mut store = InMemoryMemoryStore::default();
+    assert_eq!(
+        store.put_record(oversized.clone()),
+        Err(StoreError::RecordTooLarge)
+    );
+
+    let mut keyword = KeywordRetriever::new();
+    assert_eq!(
+        keyword.insert(oversized.clone()),
+        Err(RetrievalError::InvalidRecord(RecordError::TextTooLong))
+    );
+
+    let mut vector = VectorRetriever::new(
+        HashingEmbeddingModel::new(8).expect("valid model"),
+        ExactVectorIndex::new(8).expect("valid index"),
+    );
+    assert_eq!(
+        vector.insert(oversized),
+        Err(RetrievalError::InvalidRecord(RecordError::TextTooLong))
+    );
+    assert!(keyword.is_empty());
+    assert!(vector.is_empty());
+}
+
+#[test]
+fn record_tag_count_and_size_are_bounded() {
+    let mut too_many = record("too-many-tags", "body", 1);
+    too_many.tags = (0..=MAX_RECORD_TAGS)
+        .map(|index| format!("tag-{index}"))
+        .collect();
+    assert_eq!(too_many.validate(), Err(RecordError::TooManyTags));
+
+    let mut oversized = record("oversized-tag", "body", 2);
+    oversized.tags.insert("x".repeat(MAX_TAG_BYTES + 1));
+    assert_eq!(oversized.validate(), Err(RecordError::TagTooLong));
+
+    let mut store = InMemoryMemoryStore::default();
+    assert_eq!(store.put_record(too_many), Err(StoreError::TooManyTags));
+    assert_eq!(store.put_record(oversized), Err(StoreError::TagTooLong));
+}
+
+#[test]
+fn keyword_records_with_unbounded_lexical_indexes_are_refused() {
+    let text = (0..=MAX_KEYWORD_RECORD_TERMS)
+        .map(|index| format!("term{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(text.len() < MAX_RECORD_BYTES);
+    let mut retriever = KeywordRetriever::new();
+    assert_eq!(
+        retriever.insert(record("many-terms", &text, 1)),
+        Err(RetrievalError::TooManyRecordTerms)
+    );
+    assert!(retriever.is_empty());
+}
+
+#[test]
+fn retrieval_reports_when_the_result_limit_hides_matches() {
+    let mut retriever = KeywordRetriever::with_capacity(3).expect("valid capacity");
+    for index in 0..3_u64 {
+        retriever
+            .insert(record(&format!("r{index}"), "common", index))
+            .expect("indexed");
+    }
+
+    let limited = RetrievalQuery::new("common", 2).expect("valid query");
+    let report = retriever.retrieve_with_report(&limited).expect("retrieved");
+    assert_eq!(report.items.len(), 2);
+    assert_eq!(report.examined_records, 3);
+    assert_eq!(report.matched_records, 3);
+    assert_eq!(report.coverage, RetrievalCoverage::Partial);
+    assert!(!report.is_complete());
+
+    let complete = RetrievalQuery::new("common", 3).expect("valid query");
+    let report = retriever
+        .retrieve_with_report(&complete)
+        .expect("retrieved");
+    assert_eq!(report.items.len(), 3);
+    assert_eq!(report.coverage, RetrievalCoverage::Complete);
+    assert!(report.is_complete());
+}
+
+#[test]
+fn vector_retrieval_reports_when_its_candidate_window_is_not_exhaustive() {
+    let mut retriever = VectorRetriever::new(
+        HashingEmbeddingModel::new(16).expect("valid model"),
+        ExactVectorIndex::with_capacity(16, 5).expect("valid index"),
+    );
+    for index in 0..5_u64 {
+        retriever
+            .insert(record(&format!("r{index}"), "identical common text", index))
+            .expect("indexed");
+    }
+
+    let limited = RetrievalQuery::new("identical common text", 1).expect("valid query");
+    let report = retriever.retrieve_with_report(&limited).expect("retrieved");
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(report.examined_records, 4);
+    assert_eq!(report.matched_records, 4);
+    assert_eq!(report.coverage, RetrievalCoverage::Partial);
+
+    let complete = RetrievalQuery::new("identical common text", 5).expect("valid query");
+    let report = retriever
+        .retrieve_with_report(&complete)
+        .expect("retrieved");
+    assert_eq!(report.items.len(), 5);
+    assert_eq!(report.examined_records, 5);
+    assert_eq!(report.matched_records, 5);
+    assert_eq!(report.coverage, RetrievalCoverage::Complete);
 }
 
 /// The keyword retriever keeps a bounded working set instead of cloning every

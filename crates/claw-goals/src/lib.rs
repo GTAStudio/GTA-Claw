@@ -72,6 +72,7 @@
 pub mod anchor;
 pub mod budget;
 pub mod command;
+mod retry;
 pub mod store;
 pub mod testing;
 pub mod tool;
@@ -81,7 +82,10 @@ pub mod wire;
 pub use anchor::{AnchoredContext, CompactionOutcome, GoalAnchor};
 pub use budget::{BudgetError, BudgetUsage, GoalBudget};
 pub use command::{GoalCommandError, GoalCommandOutcome, apply_command_effect, execute_command};
-pub use store::{FileGoalStore, RecoveryReport, StoreError};
+pub use store::{
+    CompactionSummary, FileGoalStore, RecoveryReport, StoreError, StoreOperationSemantics,
+    WRITE_LOCK_ATTEMPTS, WRITE_LOCK_RETRY_DELAY,
+};
 pub use tool::{GoalToolOutcome, ToolInvocationError, invoke_goal_tool};
 pub use transition::{GoalOperation, TransitionError, admit, legal_targets, transition};
 pub use wire::{WireError, decode, encode};

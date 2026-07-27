@@ -15,6 +15,8 @@ use claw_runtime::{
     CommandEffect, CommandError, CommandRegistry, GoalError, GoalService, ScopeSet,
 };
 
+use crate::retry::{retry_conflicts, start_with_conflict_recovery};
+
 /// What a goal command did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GoalCommandOutcome {
@@ -91,17 +93,25 @@ pub async fn apply_command_effect(
 ) -> Result<GoalCommandOutcome, GoalCommandError> {
     match effect {
         CommandEffect::ShowGoal => Ok(GoalCommandOutcome::Shown(service.active(session_id).await?)),
-        CommandEffect::SetGoal(objective) => Ok(GoalCommandOutcome::Set(
-            service.start(session_id, objective).await?,
-        )),
-        CommandEffect::CloseGoal(status) => {
-            let Some(active) = service.active(session_id).await? else {
-                return Ok(GoalCommandOutcome::NothingToClose);
-            };
-            Ok(GoalCommandOutcome::Closed(
-                service.close(&active.goal_id, *status).await?,
-            ))
+        CommandEffect::SetGoal(objective) => {
+            start_with_conflict_recovery(service, session_id, objective)
+                .await
+                .map(GoalCommandOutcome::Set)
+                .map_err(GoalCommandError::from)
         }
+        CommandEffect::CloseGoal(status) => retry_conflicts(|| {
+            Box::pin(async {
+                let Some(active) = service.active(session_id).await? else {
+                    return Ok(GoalCommandOutcome::NothingToClose);
+                };
+                service
+                    .close(&active.goal_id, *status)
+                    .await
+                    .map(GoalCommandOutcome::Closed)
+            })
+        })
+        .await
+        .map_err(GoalCommandError::from),
         other => Err(GoalCommandError::NotAGoalCommand(other.clone())),
     }
 }

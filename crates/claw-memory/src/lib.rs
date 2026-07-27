@@ -76,10 +76,13 @@ pub use budget::{
     Admission, BudgetError, HeuristicTokenCounter, TokenBudget, TokenCounter, TruncationPlan,
     plan_truncation,
 };
-pub use context::{AssembledContext, ContextAssembler, ContextError};
+pub use context::{
+    AssembledContext, ContextAssembler, ContextError, ContextTruncation, DroppedMessage,
+};
 pub use retrieval::{
-    KeywordRetriever, MAX_RETRIEVAL_LIMIT, MemoryRecord, RecordKind, RetrievalError,
-    RetrievalQuery, RetrievedItem, Retriever, VectorRetriever,
+    KeywordRetriever, MAX_KEYWORD_RECORD_TERMS, MAX_QUERY_BYTES, MAX_RECORD_BYTES, MAX_RECORD_TAGS,
+    MAX_RETRIEVAL_LIMIT, MAX_TAG_BYTES, MemoryRecord, RecordError, RecordKind, RetrievalCoverage,
+    RetrievalError, RetrievalQuery, RetrievalReport, RetrievedItem, Retriever, VectorRetriever,
 };
 pub use session::{Message, MessageId, Role, Session, SessionError, SessionId, Summary};
 pub use store::{InMemoryMemoryStore, MemoryStore, StoreError};

@@ -6,11 +6,16 @@
 //! ends as bytes on a filesystem, and that an unauthorized or malformed one ends as nothing at
 //! all.
 
+use std::sync::Arc;
+
 use claw_application::model::goal::GoalStatus;
-use claw_goals::testing::{TempRoot, block_on, open_durable, session_id};
-use claw_goals::{GoalCommandError, GoalCommandOutcome, execute_command};
+use claw_goals::testing::{
+    ConflictOnceStore, FixedClock, TempRoot, block_on, open_durable, session_id,
+};
+use claw_goals::{FileGoalStore, GoalCommandError, GoalCommandOutcome, execute_command};
 use claw_runtime::{
-    CommandEffect, CommandError, CommandRegistry, GoalError, OperatorScope, ScopeSet,
+    CommandEffect, CommandError, CommandRegistry, GoalConfig, GoalError, GoalService,
+    OperatorScope, ScopeSet,
 };
 
 fn registry() -> CommandRegistry {
@@ -55,6 +60,72 @@ fn the_goal_command_records_an_objective_that_a_later_process_can_read() {
         "ship the durable goal crate"
     );
     assert_eq!(shown.record().expect("present").status, GoalStatus::Active);
+}
+
+#[test]
+fn the_goal_command_retries_one_fresh_transaction_after_a_conflict() {
+    let root = TempRoot::new("command-conflict");
+    let session = session_id("command-conflict");
+    let file_store = Arc::new(FileGoalStore::open(root.path()).expect("store opens"));
+    let conflicting = Arc::new(ConflictOnceStore::new(file_store.clone()));
+    let service = GoalService::new(
+        conflicting,
+        Arc::new(FixedClock::new(1_000)),
+        GoalConfig::default(),
+    );
+
+    let outcome = block_on(execute_command(
+        &registry(),
+        &service,
+        &session,
+        ScopeSet::all(),
+        "/goal survive a routine race",
+    ))
+    .expect("the bounded retry succeeds");
+
+    assert_eq!(
+        outcome.record().expect("set").objective,
+        "survive a routine race"
+    );
+    assert_eq!(file_store.accepted_writes(), 1);
+}
+
+#[test]
+fn a_post_commit_conflict_is_reconciled_without_creating_a_duplicate_goal() {
+    let root = TempRoot::new("command-post-commit-conflict");
+    let session = session_id("command-post-commit-conflict");
+    let file_store = Arc::new(FileGoalStore::open(root.path()).expect("store opens"));
+    let setup = GoalService::new(
+        file_store.clone(),
+        Arc::new(FixedClock::new(1_000)),
+        GoalConfig::default(),
+    );
+    block_on(setup.start(&session, "first objective")).expect("first goal");
+
+    let conflicting = Arc::new(ConflictOnceStore::after_commit(file_store));
+    let service = GoalService::new(
+        conflicting,
+        Arc::new(FixedClock::new(2_000)),
+        GoalConfig::default(),
+    );
+    let outcome = block_on(execute_command(
+        &registry(),
+        &service,
+        &session,
+        ScopeSet::all(),
+        "/goal second objective",
+    ))
+    .expect("the committed goal is reconciled");
+
+    assert_eq!(
+        outcome.record().expect("set").goal_id.as_str(),
+        "command-post-commit-conflict:goal-2"
+    );
+    let history = block_on(service.history(&session)).expect("history");
+    assert_eq!(history.len(), 2, "the retry must not mint goal-3");
+    assert_eq!(history[0].status, GoalStatus::Superseded);
+    assert_eq!(history[1].status, GoalStatus::Active);
+    assert_eq!(history[1].objective, "second objective");
 }
 
 #[test]

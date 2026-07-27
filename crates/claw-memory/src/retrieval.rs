@@ -19,6 +19,18 @@ pub const MAX_RETRIEVAL_LIMIT: usize = 100;
 /// Query text reaches the tokenizer, which allocates proportionally to it.
 pub const MAX_QUERY_BYTES: usize = 4096;
 
+/// Inclusive maximum byte length of one stored memory record.
+pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
+
+/// Inclusive maximum number of operator-assigned tags on one record.
+pub const MAX_RECORD_TAGS: usize = 64;
+
+/// Inclusive maximum byte length of one record tag.
+pub const MAX_TAG_BYTES: usize = 128;
+
+/// Inclusive maximum number of distinct terms indexed from one record.
+pub const MAX_KEYWORD_RECORD_TERMS: usize = 16_384;
+
 /// What a stored memory record represents.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +80,58 @@ pub struct MemoryRecord {
     /// Operator-assigned labels.
     pub tags: BTreeSet<String>,
 }
+
+impl MemoryRecord {
+    /// Validates the bounds that keep storage, embedding, and assembly work predictable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RecordError`] when the body is empty or oversized, when the
+    /// tag count is over [`MAX_RECORD_TAGS`], or when one tag is over
+    /// [`MAX_TAG_BYTES`].
+    pub fn validate(&self) -> Result<(), RecordError> {
+        if self.text.is_empty() {
+            return Err(RecordError::EmptyText);
+        }
+        if self.text.len() > MAX_RECORD_BYTES {
+            return Err(RecordError::TextTooLong);
+        }
+        if self.tags.len() > MAX_RECORD_TAGS {
+            return Err(RecordError::TooManyTags);
+        }
+        if self.tags.iter().any(|tag| tag.len() > MAX_TAG_BYTES) {
+            return Err(RecordError::TagTooLong);
+        }
+        Ok(())
+    }
+}
+
+/// Why a memory record is unsafe to retain or process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordError {
+    /// The body was empty.
+    EmptyText,
+    /// The body exceeded [`MAX_RECORD_BYTES`].
+    TextTooLong,
+    /// The tag count exceeded [`MAX_RECORD_TAGS`].
+    TooManyTags,
+    /// One tag exceeded [`MAX_TAG_BYTES`].
+    TagTooLong,
+}
+
+impl Display for RecordError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::EmptyText => "record body must not be empty",
+            Self::TextTooLong => "record body exceeds the maximum size",
+            Self::TooManyTags => "record has too many tags",
+            Self::TagTooLong => "record tag exceeds the maximum size",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl Error for RecordError {}
 
 /// A retrieval request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -170,6 +234,42 @@ pub struct RetrievedItem {
     pub score: f32,
 }
 
+/// Whether a retrieval report covers every matching record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalCoverage {
+    /// Every matching record was considered and returned.
+    Complete,
+    /// A result or backend-candidate limit left known work outside the report.
+    Partial,
+    /// The retriever cannot determine whether more matches exist.
+    Unknown,
+}
+
+/// Bounded retrieval results with enough state for a caller to decide what to do next.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RetrievalReport {
+    /// The best matching records, best first.
+    pub items: Vec<RetrievedItem>,
+    /// Number of records or backend candidates examined.
+    pub examined_records: usize,
+    /// Number of matches observed while examining those records.
+    ///
+    /// This is a lower bound when [`Self::coverage`] is not
+    /// [`RetrievalCoverage::Complete`].
+    pub matched_records: usize,
+    /// Whether limits left possible matches unexamined or unreturned.
+    pub coverage: RetrievalCoverage,
+}
+
+impl RetrievalReport {
+    /// Reports whether every match is represented in [`Self::items`].
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        matches!(self.coverage, RetrievalCoverage::Complete)
+    }
+}
+
 /// Retrieval port.
 pub trait Retriever {
     /// Returns the best matching records, best first.
@@ -181,6 +281,28 @@ pub trait Retriever {
     /// [`RetrievalError::Vector`] when a retriever backed by an embedding
     /// model or a vector index has that backend refuse the query.
     fn retrieve(&mut self, query: &RetrievalQuery) -> Result<Vec<RetrievedItem>, RetrievalError>;
+
+    /// Returns results plus bounded-work and truncation state.
+    ///
+    /// Implementations that cannot expose backend coverage retain compatibility
+    /// through the default [`RetrievalCoverage::Unknown`] report.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same [`RetrievalError`] as [`Self::retrieve`].
+    fn retrieve_with_report(
+        &mut self,
+        query: &RetrievalQuery,
+    ) -> Result<RetrievalReport, RetrievalError> {
+        let items = self.retrieve(query)?;
+        let returned = items.len();
+        Ok(RetrievalReport {
+            items,
+            examined_records: returned,
+            matched_records: returned,
+            coverage: RetrievalCoverage::Unknown,
+        })
+    }
 }
 
 /// Splits text into lowercase alphanumeric tokens, in order and with
@@ -194,6 +316,23 @@ fn token_stream(text: &str) -> impl Iterator<Item = String> {
 /// Splits text into its distinct lowercase alphanumeric tokens.
 fn tokens(text: &str) -> BTreeSet<String> {
     token_stream(text).collect()
+}
+
+fn bounded_record_tokens(text: &str) -> Result<BTreeSet<String>, RetrievalError> {
+    let mut indexed = BTreeSet::new();
+    for token in token_stream(text) {
+        indexed.insert(token);
+        if indexed.len() > MAX_KEYWORD_RECORD_TERMS {
+            return Err(RetrievalError::TooManyRecordTerms);
+        }
+    }
+    Ok(indexed)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KeywordRecord {
+    record: MemoryRecord,
+    terms: BTreeSet<String>,
 }
 
 /// Deterministic lexical retriever with no external dependencies.
@@ -212,7 +351,7 @@ fn tokens(text: &str) -> BTreeSet<String> {
 pub struct KeywordRetriever {
     capacity: usize,
     // Bounded by `capacity` in `insert`; `remove` is the eviction path.
-    records: BTreeMap<RecordId, MemoryRecord>,
+    records: BTreeMap<RecordId, KeywordRecord>,
 }
 
 impl Default for KeywordRetriever {
@@ -254,22 +393,26 @@ impl KeywordRetriever {
         self.capacity
     }
 
-    /// Inserts or replaces one record.
+    /// Inserts or replaces one validated record.
     ///
-    /// A refusal leaves the retriever exactly as it was.
+    /// Record terms are indexed once here so query latency depends on the
+    /// configured corpus bound rather than repeatedly scanning every body.
     ///
     /// # Errors
     ///
-    /// Returns [`RetrievalError::RetrieverFull`] when storing a record that is
-    /// not already present would take the corpus past its capacity. Replacing
-    /// an existing record is never refused for capacity, so a full retriever
-    /// stays usable rather than becoming read-only — the same rule
-    /// [`ExactVectorIndex`](crate::vector::ExactVectorIndex) applies.
+    /// Returns [`RetrievalError::InvalidRecord`] for an invalid record,
+    /// [`RetrievalError::TooManyRecordTerms`] when its lexical index would be
+    /// too large, or [`RetrievalError::RetrieverFull`] when a new record would
+    /// exceed this retriever's capacity. Replacements remain allowed at
+    /// capacity.
     pub fn insert(&mut self, record: MemoryRecord) -> Result<(), RetrievalError> {
+        record.validate().map_err(RetrievalError::InvalidRecord)?;
         if !self.records.contains_key(&record.id) && self.records.len() >= self.capacity {
             return Err(RetrievalError::RetrieverFull);
         }
-        self.records.insert(record.id.clone(), record);
+        let terms = bounded_record_tokens(&record.text)?;
+        self.records
+            .insert(record.id.clone(), KeywordRecord { record, terms });
         Ok(())
     }
 
@@ -289,35 +432,28 @@ impl KeywordRetriever {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
-}
 
-impl Retriever for KeywordRetriever {
-    fn retrieve(&mut self, query: &RetrievalQuery) -> Result<Vec<RetrievedItem>, RetrievalError> {
-        // The distinct query terms in ascending order, so each record is
-        // scored by looking its own tokens up here rather than by building a
-        // second token set per record.
+    fn retrieve_report(&self, query: &RetrievalQuery) -> Result<RetrievalReport, RetrievalError> {
         let terms: Vec<String> = tokens(query.text()).into_iter().collect();
         if terms.is_empty() {
             return Err(RetrievalError::EmptyQuery);
         }
-        let mut present = vec![false; terms.len()];
         let mut scored: Vec<RetrievedItem> = Vec::new();
-        for record in self.records.values() {
-            if !query.accepts(record) {
+        let mut examined_records = 0_usize;
+        let mut matched_records = 0_usize;
+        for indexed in self.records.values() {
+            examined_records += 1;
+            if !query.accepts(&indexed.record) {
                 continue;
             }
-            present.fill(false);
-            for token in token_stream(&record.text) {
-                if let Ok(index) = terms.binary_search(&token) {
-                    present[index] = true;
-                }
-            }
-            let hits = present.iter().filter(|hit| **hit).count();
+            let hits = terms
+                .iter()
+                .filter(|term| indexed.terms.contains(*term))
+                .count();
             if hits == 0 {
                 continue;
             }
-            // Integer ratio first, then a single division, so the score is
-            // reproducible across platforms.
+            matched_records += 1;
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "both counts are distinct token counts from a query body capped at \
@@ -326,11 +462,9 @@ impl Retriever for KeywordRetriever {
             )]
             let score = hits as f32 / terms.len() as f32;
             scored.push(RetrievedItem {
-                record: record.clone(),
+                record: indexed.record.clone(),
                 score,
             });
-            // The working set never exceeds twice the requested bound, so a
-            // query that matches every record still allocates a fixed amount.
             if scored.len() >= query.limit().saturating_mul(2) {
                 sort_results(&mut scored);
                 scored.truncate(query.limit());
@@ -338,7 +472,30 @@ impl Retriever for KeywordRetriever {
         }
         sort_results(&mut scored);
         scored.truncate(query.limit());
-        Ok(scored)
+        let coverage = if matched_records > scored.len() {
+            RetrievalCoverage::Partial
+        } else {
+            RetrievalCoverage::Complete
+        };
+        Ok(RetrievalReport {
+            items: scored,
+            examined_records,
+            matched_records,
+            coverage,
+        })
+    }
+}
+
+impl Retriever for KeywordRetriever {
+    fn retrieve(&mut self, query: &RetrievalQuery) -> Result<Vec<RetrievedItem>, RetrievalError> {
+        self.retrieve_report(query).map(|report| report.items)
+    }
+
+    fn retrieve_with_report(
+        &mut self,
+        query: &RetrievalQuery,
+    ) -> Result<RetrievalReport, RetrievalError> {
+        self.retrieve_report(query)
     }
 }
 
@@ -376,6 +533,7 @@ impl<M: EmbeddingModel, I: VectorIndex> VectorRetriever<M, I> {
     /// record would take the index past its capacity
     /// ([`VectorError::IndexFull`]).
     pub fn insert(&mut self, record: MemoryRecord) -> Result<(), RetrievalError> {
+        record.validate().map_err(RetrievalError::InvalidRecord)?;
         let embedding = self
             .model
             .embed(&record.text)
@@ -417,21 +575,22 @@ impl<M: EmbeddingModel, I: VectorIndex> VectorRetriever<M, I> {
     pub fn embed(&mut self, text: &str) -> Result<Embedding, VectorError> {
         self.model.embed(text)
     }
-}
 
-impl<M: EmbeddingModel, I: VectorIndex> Retriever for VectorRetriever<M, I> {
-    fn retrieve(&mut self, query: &RetrievalQuery) -> Result<Vec<RetrievedItem>, RetrievalError> {
+    fn retrieve_report(
+        &mut self,
+        query: &RetrievalQuery,
+    ) -> Result<RetrievalReport, RetrievalError> {
         let embedded = self
             .model
             .embed(query.text())
             .map_err(RetrievalError::Vector)?;
-        // Filters are applied after scoring, so the index is asked for more
-        // candidates than the caller wants.
         let candidates = query.limit().saturating_mul(4).min(MAX_RETRIEVAL_LIMIT * 4);
         let hits = self
             .index
             .search(&embedded, candidates)
             .map_err(RetrievalError::Vector)?;
+        let examined_records = hits.len();
+        let backend_exhausted = examined_records < candidates || candidates >= self.records.len();
         let mut scored: Vec<RetrievedItem> = Vec::new();
         for hit in hits {
             let Some(record) = self.records.get(&hit.id) else {
@@ -446,8 +605,32 @@ impl<M: EmbeddingModel, I: VectorIndex> Retriever for VectorRetriever<M, I> {
             });
         }
         sort_results(&mut scored);
+        let matched_records = scored.len();
         scored.truncate(query.limit());
-        Ok(scored)
+        let coverage = if backend_exhausted && matched_records <= scored.len() {
+            RetrievalCoverage::Complete
+        } else {
+            RetrievalCoverage::Partial
+        };
+        Ok(RetrievalReport {
+            items: scored,
+            examined_records,
+            matched_records,
+            coverage,
+        })
+    }
+}
+
+impl<M: EmbeddingModel, I: VectorIndex> Retriever for VectorRetriever<M, I> {
+    fn retrieve(&mut self, query: &RetrievalQuery) -> Result<Vec<RetrievedItem>, RetrievalError> {
+        self.retrieve_report(query).map(|report| report.items)
+    }
+
+    fn retrieve_with_report(
+        &mut self,
+        query: &RetrievalQuery,
+    ) -> Result<RetrievalReport, RetrievalError> {
+        self.retrieve_report(query)
     }
 }
 
@@ -473,6 +656,10 @@ pub enum RetrievalError {
     InvalidLimit,
     /// A kind filter selected nothing.
     NoKindsSelected,
+    /// A record failed its shared size validation.
+    InvalidRecord(RecordError),
+    /// A lexical record had too many distinct terms to index predictably.
+    TooManyRecordTerms,
     /// The requested retriever capacity was zero.
     EmptyCapacity,
     /// The retriever already holds its maximum number of records.
@@ -488,6 +675,10 @@ impl Display for RetrievalError {
             Self::QueryTooLong => formatter.write_str("query text exceeds the maximum size"),
             Self::InvalidLimit => formatter.write_str("query result limit is out of range"),
             Self::NoKindsSelected => formatter.write_str("query selected no record kinds"),
+            Self::InvalidRecord(error) => write!(formatter, "invalid memory record: {error}"),
+            Self::TooManyRecordTerms => {
+                formatter.write_str("record has too many distinct terms to index")
+            }
             Self::EmptyCapacity => {
                 formatter.write_str("retriever capacity must be at least one record")
             }
@@ -502,6 +693,7 @@ impl Display for RetrievalError {
 impl Error for RetrievalError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::InvalidRecord(error) => Some(error),
             Self::Vector(error) => Some(error),
             _ => None,
         }

@@ -41,18 +41,20 @@
 //! # Blocking
 //!
 //! [`GoalStorePort`] is asynchronous, but local filesystem I/O is not. The futures returned here
-//! are already-complete: the work happens before the future is handed back. That is honest for a
-//! local disk and keeps the adapter usable from any executor; a network-backed store would want a
-//! genuinely asynchronous implementation instead.
+//! are already-complete: the work happens before the future is handed back. Dropping one of these
+//! futures therefore cannot cancel or roll back the operation; callers that need pre-commit
+//! cancellation must decide that before invoking the port.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter, Write as _};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use claw_application::model::goal::GoalRecord;
 use claw_application::model::ids::GoalId;
@@ -69,6 +71,13 @@ const GOALS_DIR: &str = "goals";
 const SESSIONS_DIR: &str = "sessions";
 const RECORD_EXTENSION: &str = "json";
 const TEMP_PREFIX: &str = "pending-";
+const WRITE_LOCK_FILE: &str = ".goal-store.lock";
+
+/// Maximum attempts made to acquire the cross-process store lock.
+pub const WRITE_LOCK_ATTEMPTS: usize = 64;
+
+/// Delay between cross-process store-lock attempts.
+pub const WRITE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 /// The persisted order of one session's goals.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -101,6 +110,42 @@ impl RecoveryReport {
     }
 }
 
+/// Observable result of compacting progress payloads in closed goals.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompactionSummary {
+    /// Closed goals inspected.
+    pub closed_goals_examined: usize,
+    /// Goal records rewritten with a smaller progress history.
+    pub goals_rewritten: usize,
+    /// Progress entries removed from rewritten records.
+    pub progress_entries_removed: usize,
+    /// On-disk record bytes reclaimed.
+    pub reclaimed_bytes: u64,
+    /// Goal identities retained in the session history.
+    pub goal_ids_preserved: usize,
+}
+
+impl CompactionSummary {
+    /// Returns whether every closed goal was already within the requested history bound.
+    #[must_use]
+    pub const fn is_noop(&self) -> bool {
+        self.goals_rewritten == 0
+    }
+}
+
+/// Execution semantics callers may need before invoking the synchronous disk port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreOperationSemantics {
+    /// Whether dropping the returned future can stop work that has not committed.
+    pub cancellable_after_invocation: bool,
+    /// Whether mutations are serialized with other store instances and processes.
+    pub cross_process_serialized: bool,
+    /// Maximum attempts made before a contended operation reports [`StoreError::Busy`].
+    pub write_lock_attempts: usize,
+    /// Delay between lock attempts.
+    pub write_lock_retry_delay: Duration,
+}
+
 /// A failure of the on-disk goal store.
 #[derive(Debug)]
 pub enum StoreError {
@@ -126,6 +171,11 @@ pub enum StoreError {
         expected: u64,
         /// The revision the caller held.
         held: u64,
+    },
+    /// Another process held the store lock for the full bounded wait.
+    Busy {
+        /// Number of acquisition attempts made.
+        attempts: usize,
     },
     /// The write would exceed a session's budget.
     Budget(crate::budget::BudgetError),
@@ -157,6 +207,12 @@ impl Display for StoreError {
                     "expected revision {expected}, caller held {held}"
                 )
             }
+            Self::Busy { attempts } => {
+                write!(
+                    formatter,
+                    "goal store remained busy after {attempts} lock attempts"
+                )
+            }
             Self::Budget(source) => Display::fmt(source, formatter),
         }
     }
@@ -168,7 +224,7 @@ impl Error for StoreError {
             Self::Io { source, .. } => Some(source),
             Self::Corrupt { source, .. } | Self::Encoding(source) => Some(source),
             Self::Budget(source) => Some(source),
-            Self::Conflict { .. } => None,
+            Self::Conflict { .. } | Self::Busy { .. } => None,
         }
     }
 }
@@ -185,6 +241,9 @@ impl From<StoreError> for PortError {
             StoreError::Conflict { expected, held } => {
                 Self::Conflict(format!("expected revision {expected}, caller held {held}"))
             }
+            StoreError::Busy { attempts } => {
+                Self::Conflict(format!("goal store busy after {attempts} lock attempts"))
+            }
             StoreError::Budget(error) => Self::Invalid(error.to_string()),
             other => Self::Unavailable(other.to_string()),
         }
@@ -195,6 +254,30 @@ fn io_error(path: &Path, source: std::io::Error) -> StoreError {
     StoreError::Io {
         path: path.to_path_buf(),
         source,
+    }
+}
+
+struct HeldStoreLock<'a> {
+    file: &'a File,
+    path: &'a Path,
+    released: bool,
+}
+
+impl HeldStoreLock<'_> {
+    fn release(mut self) -> Result<(), StoreError> {
+        self.file
+            .unlock()
+            .map_err(|error| io_error(self.path, error))?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for HeldStoreLock<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self.file.unlock();
+        }
     }
 }
 
@@ -232,13 +315,11 @@ pub struct FileGoalStore {
     root: PathBuf,
     budget: GoalBudget,
     recovery: RecoveryReport,
-    /// Serialises the read-modify-write of a save within one process.
-    ///
-    /// The revision check is only meaningful if the load and the rename cannot interleave with
-    /// another save of the same goal. Across processes the same protection comes from the
-    /// revision itself: the loser's rename lands, but its revision no longer matches and the
-    /// caller is told to re-read.
+    /// Serialises lock acquisition within one process.
     writes: Mutex<()>,
+    /// Advisory lock held across each read/check/write transaction.
+    write_lock: File,
+    write_lock_path: PathBuf,
     /// Feeds the unique suffix of temporary files so two concurrent writers never share one.
     sequence: AtomicU64,
     accepted_writes: AtomicU64,
@@ -272,18 +353,28 @@ impl FileGoalStore {
         for directory in [root.join(GOALS_DIR), root.join(SESSIONS_DIR)] {
             fs::create_dir_all(&directory).map_err(|error| io_error(&directory, error))?;
         }
+        let write_lock_path = root.join(WRITE_LOCK_FILE);
+        let write_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&write_lock_path)
+            .map_err(|error| io_error(&write_lock_path, error))?;
 
         let mut store = Self {
             root,
             budget,
             recovery: RecoveryReport::default(),
             writes: Mutex::new(()),
+            write_lock,
+            write_lock_path,
             sequence: AtomicU64::new(0),
             accepted_writes: AtomicU64::new(0),
             synced_publications: AtomicU64::new(0),
             unsynced_publications: AtomicU64::new(0),
         };
-        store.recovery = store.recover()?;
+        store.recovery = store.with_store_lock(|| store.recover())?;
         Ok(store)
     }
 
@@ -303,6 +394,17 @@ impl FileGoalStore {
     #[must_use]
     pub const fn recovery(&self) -> &RecoveryReport {
         &self.recovery
+    }
+
+    /// Returns the cancellation, concurrency, and bounded-wait behavior of this adapter.
+    #[must_use]
+    pub const fn operation_semantics(&self) -> StoreOperationSemantics {
+        StoreOperationSemantics {
+            cancellable_after_invocation: false,
+            cross_process_serialized: true,
+            write_lock_attempts: WRITE_LOCK_ATTEMPTS,
+            write_lock_retry_delay: WRITE_LOCK_RETRY_DELAY,
+        }
     }
 
     /// Returns how many writes this store instance accepted.
@@ -346,6 +448,10 @@ impl FileGoalStore {
     ///
     /// Returns [`StoreError::Io`] when the index or a record cannot be inspected.
     pub fn usage(&self, session_id: &SessionId) -> Result<BudgetUsage, StoreError> {
+        self.with_store_lock(|| self.usage_unlocked(session_id))
+    }
+
+    fn usage_unlocked(&self, session_id: &SessionId) -> Result<BudgetUsage, StoreError> {
         let index = self.read_index(session_id)?;
         let mut usage = BudgetUsage {
             goals: index.goal_ids.len(),
@@ -360,6 +466,78 @@ impl FileGoalStore {
             }
         }
         Ok(usage)
+    }
+
+    /// Compacts progress payloads in closed goals while preserving every goal identity.
+    ///
+    /// Goal files and index entries are deliberately retained: the runtime mints
+    /// the next goal identifier from history length, so deleting an old entry
+    /// would permit identifier reuse. The newest `keep_recent_progress` entries
+    /// remain available on each closed goal; older entries are folded into
+    /// `compacted_entries`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Busy`] when another process holds the store lock
+    /// for the bounded acquisition window, or the relevant encoding and I/O
+    /// failures.
+    pub fn compact_closed_history(
+        &self,
+        session_id: &SessionId,
+        keep_recent_progress: usize,
+    ) -> Result<CompactionSummary, StoreError> {
+        self.with_store_lock(|| {
+            let index = self.read_index(session_id)?;
+            let mut summary = CompactionSummary {
+                goal_ids_preserved: index.goal_ids.len(),
+                ..CompactionSummary::default()
+            };
+            for goal_id in &index.goal_ids {
+                let path = self.record_path_for(goal_id);
+                let Some(mut record) = Self::read_record_at(&path)? else {
+                    return Err(StoreError::Corrupt {
+                        path,
+                        source: WireError::Invalid {
+                            field: "goal_ids",
+                            reason: format!("the index names {goal_id}, which no longer exists"),
+                        },
+                    });
+                };
+                if !record.status.is_closed() {
+                    continue;
+                }
+                summary.closed_goals_examined += 1;
+                let remove = record.progress.len().saturating_sub(keep_recent_progress);
+                if remove == 0 {
+                    continue;
+                }
+
+                let previous_bytes = fs::metadata(&path)
+                    .map_err(|error| io_error(&path, error))?
+                    .len();
+                let newly_compacted = record.progress[..remove]
+                    .iter()
+                    .filter(|entry| !entry.compacted)
+                    .count();
+                record.progress.drain(..remove);
+                record.compacted_entries = record
+                    .compacted_entries
+                    .saturating_add(u64::try_from(newly_compacted).unwrap_or(u64::MAX));
+                record.revision = record.revision.saturating_add(1);
+
+                let encoded = wire::encode(&record).map_err(StoreError::Encoding)?;
+                self.write_atomically(&path, &encoded)?;
+                self.accepted_writes.fetch_add(1, Ordering::SeqCst);
+
+                summary.goals_rewritten += 1;
+                summary.progress_entries_removed =
+                    summary.progress_entries_removed.saturating_add(remove);
+                summary.reclaimed_bytes = summary
+                    .reclaimed_bytes
+                    .saturating_add(previous_bytes.saturating_sub(encoded.len() as u64));
+            }
+            Ok(summary)
+        })
     }
 
     fn goals_dir(&self) -> PathBuf {
@@ -457,6 +635,50 @@ impl FileGoalStore {
             .map_err(|error| StoreError::Encoding(WireError::Malformed(error.to_string())))?;
         text.push('\n');
         self.write_atomically(&path, &text)
+    }
+
+    fn with_store_lock<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let _guard = self.writes.lock().unwrap_or_else(|poisoned| {
+            // Disk state, not mutex poison, decides whether the next operation is valid.
+            poisoned.into_inner()
+        });
+        let mut acquired = false;
+        for attempt in 1..=WRITE_LOCK_ATTEMPTS {
+            match self.write_lock.try_lock() {
+                Ok(()) => {
+                    acquired = true;
+                    break;
+                }
+                Err(std::fs::TryLockError::WouldBlock) if attempt < WRITE_LOCK_ATTEMPTS => {
+                    thread::sleep(WRITE_LOCK_RETRY_DELAY);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(StoreError::Busy {
+                        attempts: WRITE_LOCK_ATTEMPTS,
+                    });
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(io_error(&self.write_lock_path, error));
+                }
+            }
+        }
+        if !acquired {
+            return Err(StoreError::Busy {
+                attempts: WRITE_LOCK_ATTEMPTS,
+            });
+        }
+
+        let lock = HeldStoreLock {
+            file: &self.write_lock,
+            path: &self.write_lock_path,
+            released: false,
+        };
+        let outcome = operation();
+        lock.release()?;
+        outcome
     }
 
     /// Loads every record on disk, keyed by goal id.
@@ -581,65 +803,63 @@ impl FileGoalStore {
         let encoded = wire::encode(record).map_err(StoreError::Encoding)?;
         let path = self.record_path_for(record.goal_id.as_str());
 
-        let _guard = self.writes.lock().unwrap_or_else(|poisoned| {
-            // A poisoned lock means some other caller panicked mid-save. The next save still has
-            // to check the revision it finds on disk, which is unaffected by that panic.
-            poisoned.into_inner()
-        });
+        self.with_store_lock(|| {
+            let existing = Self::read_record_at(&path)?;
+            let expected = existing
+                .as_ref()
+                .map_or(1, |stored| stored.revision.saturating_add(1));
+            if record.revision != expected {
+                return Err(StoreError::Conflict {
+                    expected,
+                    held: record.revision,
+                });
+            }
 
-        let existing = Self::read_record_at(&path)?;
-        let expected = existing
-            .as_ref()
-            .map_or(1, |stored| stored.revision.saturating_add(1));
-        if record.revision != expected {
-            return Err(StoreError::Conflict {
-                expected,
-                held: record.revision,
-            });
-        }
+            let mut index = self.read_index(&record.session_id)?;
+            let is_new = !index
+                .goal_ids
+                .iter()
+                .any(|goal_id| goal_id == record.goal_id.as_str());
 
-        let mut index = self.read_index(&record.session_id)?;
-        let is_new = !index
-            .goal_ids
-            .iter()
-            .any(|goal_id| goal_id == record.goal_id.as_str());
+            let mut held = self.usage_unlocked(&record.session_id)?;
+            if !is_new {
+                // A replacement is charged its new size, not its old size as well.
+                let existing_bytes = fs::metadata(&path).map_or(0, |metadata| metadata.len());
+                held.bytes = held.bytes.saturating_sub(existing_bytes);
+            }
+            self.budget
+                .admit(held, encoded.len(), is_new)
+                .map_err(StoreError::Budget)?;
 
-        let mut held = self.usage(&record.session_id)?;
-        if !is_new {
-            // A replacement is charged its new size, not its old size as well.
-            let existing_bytes = fs::metadata(&path).map_or(0, |metadata| metadata.len());
-            held.bytes = held.bytes.saturating_sub(existing_bytes);
-        }
-        self.budget
-            .admit(held, encoded.len(), is_new)
-            .map_err(StoreError::Budget)?;
+            self.write_atomically(&path, &encoded)?;
 
-        self.write_atomically(&path, &encoded)?;
+            if is_new {
+                index.goal_ids.push(record.goal_id.as_str().to_owned());
+                self.write_index(&index)?;
+            }
 
-        if is_new {
-            index.goal_ids.push(record.goal_id.as_str().to_owned());
-            self.write_index(&index)?;
-        }
-
-        self.accepted_writes.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+            self.accepted_writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
     }
 
     fn list_blocking(&self, session_id: &SessionId) -> Result<Vec<GoalRecord>, StoreError> {
-        let index = self.read_index(session_id)?;
-        let mut records = Vec::with_capacity(index.goal_ids.len());
-        for goal_id in &index.goal_ids {
-            let path = self.record_path_for(goal_id);
-            let record = Self::read_record_at(&path)?.ok_or_else(|| StoreError::Corrupt {
-                path,
-                source: WireError::Invalid {
-                    field: "goal_ids",
-                    reason: format!("the index names {goal_id}, which no longer exists"),
-                },
-            })?;
-            records.push(record);
-        }
-        Ok(records)
+        self.with_store_lock(|| {
+            let index = self.read_index(session_id)?;
+            let mut records = Vec::with_capacity(index.goal_ids.len());
+            for goal_id in &index.goal_ids {
+                let path = self.record_path_for(goal_id);
+                let record = Self::read_record_at(&path)?.ok_or_else(|| StoreError::Corrupt {
+                    path,
+                    source: WireError::Invalid {
+                        field: "goal_ids",
+                        reason: format!("the index names {goal_id}, which no longer exists"),
+                    },
+                })?;
+                records.push(record);
+            }
+            Ok(records)
+        })
     }
 }
 
@@ -651,6 +871,8 @@ impl GoalStorePort for FileGoalStore {
     }
 
     fn save(&self, record: GoalRecord) -> PortFuture<'_, Result<(), PortError>> {
+        // Work intentionally completes before this future exists. Dropping it
+        // cannot cancel or roll back a local filesystem mutation.
         let outcome = self.save_blocking(&record).map_err(PortError::from);
         Box::pin(async move { outcome })
     }
@@ -668,8 +890,12 @@ impl GoalStorePort for FileGoalStore {
 mod tests {
     use super::{FileGoalStore, StoreError, digest_of};
     use crate::budget::{BudgetError, GoalBudget};
-    use crate::testing::{TempRoot, goal_id, record, session_id};
+    use crate::testing::{TempRoot, block_on, goal_id, record, session_id};
     use claw_application::ports::PortError;
+    use claw_application::ports::goal::GoalStorePort;
+    use std::fs::OpenOptions;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[test]
     fn identifiers_become_fixed_width_lowercase_filenames() {
@@ -728,6 +954,83 @@ mod tests {
     }
 
     #[test]
+    fn independent_store_instances_serialize_the_same_revision() {
+        let root = TempRoot::new("cross-instance-write");
+        let first = Arc::new(FileGoalStore::open(root.path()).expect("first store opens"));
+        let second = Arc::new(FileGoalStore::open(root.path()).expect("second store opens"));
+        let barrier = Arc::new(Barrier::new(3));
+
+        let workers = [Arc::clone(&first), Arc::clone(&second)].map(|store| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let candidate = record("s", "s:goal-1", "objective", 1);
+                barrier.wait();
+                store.save_blocking(&candidate)
+            })
+        });
+        barrier.wait();
+        let outcomes = workers.map(|worker| worker.join().expect("writer did not panic"));
+
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Err(StoreError::Conflict { .. })))
+                .count(),
+            1
+        );
+        assert_eq!(
+            first.accepted_writes() + second.accepted_writes(),
+            1,
+            "only the serialized winner is acknowledged"
+        );
+    }
+
+    #[test]
+    fn lock_contention_has_a_bounded_actionable_failure() {
+        let root = TempRoot::new("write-lock-busy");
+        let store = FileGoalStore::open(root.path()).expect("store opens");
+        let external = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&store.write_lock_path)
+            .expect("lock file opens");
+        external.lock().expect("external holder acquires the lock");
+
+        let error = store
+            .save_blocking(&record("s", "s:goal-1", "objective", 1))
+            .expect_err("the bounded wait expires");
+        assert!(matches!(
+            error,
+            StoreError::Busy {
+                attempts: super::WRITE_LOCK_ATTEMPTS
+            }
+        ));
+
+        external.unlock().expect("external lock releases");
+        store
+            .save_blocking(&record("s", "s:goal-1", "objective", 1))
+            .expect("the operation succeeds once contention clears");
+    }
+
+    #[test]
+    fn dropping_an_unpolled_save_future_does_not_claim_cancellation() {
+        let root = TempRoot::new("save-cancellation");
+        let store = FileGoalStore::open(root.path()).expect("store opens");
+        let semantics = store.operation_semantics();
+        assert!(!semantics.cancellable_after_invocation);
+        assert!(semantics.cross_process_serialized);
+
+        let future = GoalStorePort::save(&store, record("s", "s:goal-1", "objective", 1));
+        drop(future);
+
+        let loaded = block_on(GoalStorePort::load(&store, &goal_id("s:goal-1")))
+            .expect("load succeeds")
+            .expect("the synchronous save committed before its future was returned");
+        assert_eq!(loaded.objective, "objective");
+    }
+
+    #[test]
     fn a_budget_refusal_leaves_the_store_untouched() {
         let root = TempRoot::new("budget");
         let store = FileGoalStore::open_with_budget(
@@ -768,6 +1071,13 @@ mod tests {
             PortError::Conflict("expected revision 2, caller held 1".to_owned())
         );
         assert!(conflict.is_retryable());
+
+        let busy: PortError = StoreError::Busy { attempts: 64 }.into();
+        assert_eq!(
+            busy,
+            PortError::Conflict("goal store busy after 64 lock attempts".to_owned())
+        );
+        assert!(busy.is_retryable());
 
         let budget: PortError =
             StoreError::Budget(BudgetError::TooManyGoals { limit: 1, held: 1 }).into();
