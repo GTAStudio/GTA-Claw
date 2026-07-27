@@ -295,7 +295,7 @@ pub enum CellOperation {
 pub struct CommandPlan {
     /// Executable to run.
     pub program: PathBuf,
-    /// Arguments, excluding argv[0].
+    /// Arguments, excluding `argv[0]`.
     pub argv: Vec<String>,
 }
 

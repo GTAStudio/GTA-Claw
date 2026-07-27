@@ -5,11 +5,11 @@ use std::fmt::{self, Display, Formatter};
 
 use claw_domain::{DomainError, SessionId};
 
-/// Pinned Gateway core event catalog projections and fail-closed envelopes.
+// These modules carry their own `//!` documentation. An outer `///` here would
+// make rustdoc resolve the links inside those `//!` blocks against this scope
+// instead of the module's own, silently breaking every one of them.
 pub mod events;
-/// OpenClaw Gateway v4 wire contracts, negotiation, registries, and authorization.
 pub mod gateway;
-/// Pinned Gateway core method catalog projections and drift verification.
 pub mod methods;
 
 /// The protocol version implemented by this workspace.

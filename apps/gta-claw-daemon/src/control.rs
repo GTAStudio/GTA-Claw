@@ -75,7 +75,7 @@ impl StopTrigger {
 /// drain is in progress therefore cannot kill the process — the signal is
 /// delivered to a stream nobody is reading, the drain finishes, and the stop
 /// summary is still printed. The bound on how long that can take is
-/// [`STOP_DEADLINE`](crate::compose::STOP_DEADLINE), not the operator's
+/// [`STOP_DEADLINE`], not the operator's
 /// patience.
 pub struct StopSignals {
     #[cfg(unix)]

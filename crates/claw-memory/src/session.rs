@@ -194,7 +194,7 @@ impl Summary {
 ///
 /// [`Deserialize`] re-applies the bounds the write path applies, so a stored
 /// document restores a session that is within them rather than one that is
-/// merely shaped like a session. See [`Session::restore`].
+/// merely shaped like a session. See the private `Session::restore`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Session {
     id: SessionId,

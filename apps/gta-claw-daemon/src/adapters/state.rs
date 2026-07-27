@@ -224,7 +224,7 @@ struct StoredCredential {
 
 /// Origin-bound credentials held in memory.
 ///
-/// No `Debug`: it holds [`StoredCredential`], so deriving one would defeat the
+/// No `Debug`: it holds `StoredCredential`, so deriving one would defeat the
 /// protection that type exists to provide. Absence of a trait cannot be
 /// asserted at run time, so the compiler is the assertion:
 ///

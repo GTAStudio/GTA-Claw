@@ -450,7 +450,7 @@ impl std::fmt::Debug for Daemon {
 /// Assembles a [`Daemon`].
 ///
 /// `Debug` is hand-written because `provider_url` is credential-bearing. The
-/// builder holds it before [`EgressGuard`](claw_application::composition::EgressGuard)
+/// builder holds it before [`EgressGuard`]
 /// has rejected any userinfo it carries, so a derived `Debug` would print
 /// `user:password@` for exactly as long as the value is unvalidated. The host
 /// and addresses are printed instead, which are the useful diagnostics and
@@ -504,7 +504,8 @@ impl DaemonBuilder {
     ///
     /// This is the seam for anything that owns a real resource — a bound
     /// `TcpListener` serving an HTTP router, for example. The subsystem is
-    /// ordered by the dependencies its own [`SubsystemDescriptor`] declares,
+    /// ordered by the dependencies its own
+    /// [`SubsystemDescriptor`](claw_application::composition::SubsystemDescriptor) declares,
     /// not by the order it is added in, and it is started, quiesced and shut
     /// down exactly like a built-in one. Its background work must be spawned
     /// through [`StartContext::spawner`] so it is counted in the task ledger,

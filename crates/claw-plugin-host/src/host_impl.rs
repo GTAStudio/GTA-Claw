@@ -2,7 +2,7 @@
 //!
 //! Each function follows the same shape:
 //!
-//! 1. [`PluginState::enter`] proves the capability was granted, the call is
+//! 1. `PluginState::enter` proves the capability was granted, the call is
 //!    inside the wall-clock budget and a host-call slot is free.
 //! 2. The arguments are validated against the *grant's* scope, not just
 //!    against the capability. A granted capability with a narrower scope still

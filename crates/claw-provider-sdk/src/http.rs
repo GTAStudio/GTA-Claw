@@ -7,7 +7,8 @@
 //! `hyper` is driven directly rather than through `reqwest` because every
 //! rustls feature `reqwest` 0.13 exposes hard-depends on
 //! `rustls-platform-verifier`, which pulls a CDLA-Permissive-2.0 crate and a
-//! second `windows-sys` major line into the graph. See [`tls`] for the detail.
+//! second `windows-sys` major line into the graph. See the private `tls`
+//! module for the detail.
 
 mod tls;
 
@@ -121,7 +122,7 @@ impl Body {
 /// No header value is ever rendered. An earlier version redacted only a fixed
 /// list of well-known credential header names, which leaked the key of any
 /// provider that authenticates through a header outside that list — and
-/// [`AuthStyle`](crate::model::AuthStyle) lets a provider name any header it
+/// `claw-providers`' `AuthStyle` lets a provider name any header it
 /// likes. Header *names* are still shown because they are what makes a request
 /// log useful, and they are not secret.
 #[derive(Clone)]

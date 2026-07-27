@@ -1,4 +1,4 @@
-//! Transport-independent OpenClaw Gateway protocol v4 support.
+//! Transport-independent `OpenClaw` Gateway protocol v4 support.
 //!
 //! The contracts are pinned to
 //! `openclaw/openclaw@b43e832fcc8000ed7287c7accc54e381db607f85`.

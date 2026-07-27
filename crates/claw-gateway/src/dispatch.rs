@@ -5,7 +5,7 @@
 //! frozen catalog: no method can be silently missing and no unknown method can
 //! be added. Methods this server really implements carry a handler; every other
 //! catalogued method answers with
-//! [`DispatchError::NotImplemented`](crate::error::DispatchError::NotImplemented).
+//! [`DispatchError::NotImplemented`].
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;

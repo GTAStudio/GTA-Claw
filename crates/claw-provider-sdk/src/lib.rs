@@ -10,8 +10,7 @@
 //! * The public API never exposes untyped JSON documents. The only places where
 //!   raw JSON is unavoidable — JSON-Schema tool parameter declarations and
 //!   model-generated tool-call arguments — are wrapped in the validated
-//!   [`ToolParameters`](model::ToolParameters) and
-//!   [`ToolArguments`](model::ToolArguments) newtypes.
+//!   [`model::ToolParameters`] and [`model::ToolArguments`] newtypes.
 //! * Secret material is confined to [`secret::ApiKey`] and
 //!   [`secret::SecretString`]. Neither type implements `serde::Serialize`, and
 //!   both redact themselves in `Debug` and `Display`.

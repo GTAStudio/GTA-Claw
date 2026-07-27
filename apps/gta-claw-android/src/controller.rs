@@ -97,7 +97,7 @@ impl ControllerHandle {
     /// # Errors
     ///
     /// Returns [`CommandRejection::QueueFull`] when the Gateway task already
-    /// has [`COMMAND_QUEUE_CAPACITY`] commands waiting, and
+    /// has `COMMAND_QUEUE_CAPACITY` commands waiting, and
     /// [`CommandRejection::Stopped`] when the control loop has ended and the
     /// command channel is closed. Nothing is ever blocked on or dropped
     /// silently: this is called from the UI thread, which must not wait.
@@ -110,7 +110,7 @@ impl ControllerHandle {
     /// # Errors
     ///
     /// Returns [`CommandRejection::QueueFull`] when the Gateway task already
-    /// has [`COMMAND_QUEUE_CAPACITY`] commands waiting, and
+    /// has `COMMAND_QUEUE_CAPACITY` commands waiting, and
     /// [`CommandRejection::Stopped`] when the control loop has ended and the
     /// command channel is closed.
     pub fn reject(&self, rejection: SubmissionRejection) -> Result<(), CommandRejection> {
@@ -122,7 +122,7 @@ impl ControllerHandle {
     /// # Errors
     ///
     /// Returns [`CommandRejection::QueueFull`] when the Gateway task already
-    /// has [`COMMAND_QUEUE_CAPACITY`] commands waiting, and
+    /// has `COMMAND_QUEUE_CAPACITY` commands waiting, and
     /// [`CommandRejection::Stopped`] when the control loop has ended and the
     /// command channel is closed. A `Stopped` disconnect needs no retry: the
     /// loop cancels and joins any live attempt as it ends.

@@ -389,7 +389,7 @@ pub trait SecretStore: Send + Sync + Debug {
     /// lock on. The default implementation is a read followed by a write, which
     /// is *not* atomic; a backend that can create-or-fail in one step should
     /// override it. [`MemorySecretStore`] does so under its own mutex and
-    /// [`FileSecretStore`](file::FileSecretStore) does so with `O_EXCL` /
+    /// [`file::FileSecretStore`] does so with `O_EXCL` /
     /// `CREATE_NEW`, which also serialises separate processes.
     ///
     /// # Errors
@@ -410,7 +410,7 @@ pub trait SecretStore: Send + Sync + Debug {
     /// Starts a transaction and returns its opaque identifier.
     ///
     /// The identifier is the only part of a transaction that is safe to write to
-    /// a caller-owned journal or receipt; see the [`transaction`] module for the
+    /// a caller-owned journal or receipt; see the private `transaction` module for the
     /// durability and non-disclosure rules.
     ///
     /// # Errors

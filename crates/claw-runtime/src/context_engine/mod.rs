@@ -14,7 +14,7 @@
 //! - [`suite`] is the reusable conformance harness. Any implementer — in this repository or in a
 //!   plug-in — calls [`verify_spi_conformance`] and gets back an [`SpiReport`] naming exactly
 //!   which requirements it failed and what the harness observed.
-//! - [`reference`] is a real engine that passes the suite, so the SPI has a working implementer
+//! - [`mod@reference`] is a real engine that passes the suite, so the SPI has a working implementer
 //!   and the suite has a subject that is meant to succeed.
 //!
 //! A conformance suite whose only subject passes is worthless, because it cannot distinguish an

@@ -249,7 +249,7 @@ impl ApprovalBroker {
 
     /// Withdraws every outstanding request, waking each waiter with `reason`.
     ///
-    /// Abandoned requests are not reported here: [`PendingGuard`] retracts and dismisses them
+    /// Abandoned requests are not reported here: the private `PendingGuard` retracts and dismisses them
     /// synchronously at drop time, so by the time this runs they are already gone. Nothing is
     /// accumulated between a drop and a shutdown, which is why the broker keeps no orphan list.
     ///
