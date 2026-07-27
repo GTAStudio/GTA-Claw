@@ -6,6 +6,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use claw_channels::{ExchangeSupport, ImplementationStatus, descriptor, exchange_support};
@@ -20,7 +21,11 @@ use claw_gateway::{
     StaticAuthenticator,
 };
 use claw_http_api::{
-    ApiConfig, ApiServices, BearerAuthenticator, BearerCredential, HttpApi, ServingStateHandle,
+    ApiConfig, ApiServices, BearerAuthenticator, BearerCredential, HttpApi, LegacyAdminCredential,
+    LegacyApiConfig, LegacyApiServices, LegacyChannelStatus, LegacyHttpApi, LegacyReloadError,
+    LegacyReloadPort, LegacyReloadResult, LegacyRuntimePort, LegacyWhatsAppConfig,
+    LegacyWhatsAppServices, PortError, PortErrorKind, PortFuture, ProviderLegacyRuntime,
+    ProviderLegacyRuntimeConfig, ServingStateHandle,
 };
 use claw_observability::{LogFormat, TelemetryConfig, TelemetryHandle};
 use claw_provider_sdk::clock::{PseudoRandomJitter, SystemClock as ProviderClock};
@@ -28,8 +33,8 @@ use claw_provider_sdk::http::{
     HttpRequest, HttpTransport, Method, ProxyPolicy, TlsPolicy, TransportConfig,
 };
 use claw_provider_sdk::{CancelToken, Operation, Provider, SecretString};
-use claw_providers::github_copilot::GitHubCopilotConfig;
-use claw_providers::{GitHubCopilot, ProviderRuntime};
+use claw_providers::github_copilot::{DeviceFlowConfig, GitHubCopilotConfig};
+use claw_providers::{DeviceFlow, GitHubCopilot, ProviderRuntime};
 use claw_security::authorization::{Role, Scope, ScopeSet};
 use futures_util::StreamExt;
 use secrecy::SecretString as GatewaySecret;
@@ -42,8 +47,12 @@ use url::Url;
 
 use crate::adapters::http_api::{
     AppliedReload, ConfigController, DependencyReadiness, Diagnostics, DurableSecurityAudit,
-    OperatorAdmin, OperatorInventory, ProviderAdapter, SmokeProvider, UnavailableExternalPorts,
-    UnavailableTools, copilot_request_timeout_ms, updates_enabled,
+    OperatorAdmin, OperatorInventory, ProviderHistoryConfig, SmokeProvider, SwappableProvider,
+    UnavailableExternalPorts, UnavailableTools, copilot_request_timeout_ms, updates_enabled,
+};
+use crate::adapters::legacy::{
+    DeviceTaskReport, DeviceTokenActivator, GraphWhatsAppAdapter, LegacyDeviceFlowAdapter,
+    LegacyTeamsAdapter, NativeLegacyHostAdmin,
 };
 
 /// Whole-process shutdown ceiling.
@@ -51,8 +60,9 @@ pub const PRODUCTION_STOP_DEADLINE: Duration = Duration::from_secs(10);
 const DEFAULT_GATEWAY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const DEFAULT_MCP: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const USAGE: &str = "usage: gta-claw-daemon [--probe | --check-config] [--config PATH] \
-                     [--listen ADDRESS] [--gateway-listen ADDRESS] [--mcp-listen ADDRESS] \
-                     [--state-dir PATH] [--tls-terminated-by-frontend] [--smoke]";
+                     [--listen ADDRESS] [--legacy-listen ADDRESS] \
+                     [--gateway-listen ADDRESS] [--mcp-listen ADDRESS] [--state-dir PATH] \
+                     [--tls-terminated-by-frontend] [--smoke]";
 
 /// Top-level command selected by the process arguments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,6 +105,9 @@ impl CommandLine {
                 "--config" => options.config_path = Some(required_path(&mut arguments, flag)?),
                 "--state-dir" => options.state_dir = Some(required_path(&mut arguments, flag)?),
                 "--listen" => options.http_listen = Some(required_address(&mut arguments, flag)?),
+                "--legacy-listen" => {
+                    options.legacy_listen = Some(required_address(&mut arguments, flag)?);
+                }
                 "--gateway-listen" => {
                     options.gateway_listen = Some(required_address(&mut arguments, flag)?);
                 }
@@ -108,6 +121,7 @@ impl CommandLine {
         }
         if mode != CommandMode::Serve
             && (options.http_listen.is_some()
+                || options.legacy_listen.is_some()
                 || options.gateway_listen.is_some()
                 || options.mcp_listen.is_some()
                 || options.smoke
@@ -163,6 +177,8 @@ pub struct ProductionOptions {
     pub config_path: Option<PathBuf>,
     /// Main HTTP listener override.
     pub http_listen: Option<SocketAddr>,
+    /// Legacy Node-compatible HTTP listener override.
+    pub legacy_listen: Option<SocketAddr>,
     /// Gateway listener override.
     pub gateway_listen: Option<SocketAddr>,
     /// Loopback MCP listener override.
@@ -392,21 +408,142 @@ struct RoleProfile {
     diagnostics: Vec<RoleDiagnostic>,
 }
 
+struct LegacySettings {
+    device_flow_enabled: bool,
+    channels: LegacyChannelStatus,
+    teams: Option<LegacyTeamsSettings>,
+    whatsapp: Option<LegacyWhatsAppSettings>,
+    teams_rate_limit_per_minute: u32,
+    trust_proxy: bool,
+    session_max_entries: usize,
+    session_idle_timeout: Duration,
+}
+
+struct LegacyTeamsSettings {
+    app_id: String,
+    app_password: SecretString,
+}
+
+struct LegacyWhatsAppSettings {
+    route: LegacyWhatsAppConfig,
+    access_token: SecretString,
+    phone_number_id: String,
+}
+
 /// Bound service addresses reported after readiness.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BoundAddresses {
     /// Main HTTP API.
     pub http: SocketAddr,
+    /// Legacy Node-compatible HTTP facade.
+    pub legacy: SocketAddr,
     /// Gateway WebSocket server.
     pub gateway: SocketAddr,
     /// Loopback MCP HTTP endpoint.
     pub mcp: SocketAddr,
 }
 
+struct CopilotDeviceActivator {
+    provider: Arc<SwappableProvider>,
+    runtime: Arc<ProviderLegacyRuntime>,
+    proxy: ProxyPolicy,
+    request_timeout: Duration,
+}
+
+impl DeviceTokenActivator for CopilotDeviceActivator {
+    fn activate(&self, token: SecretString) -> PortFuture<'_, Result<(), PortError>> {
+        Box::pin(async move {
+            let client = build_copilot_from_token(token, self.proxy.clone(), self.request_timeout)
+                .map_err(|error| production_port_error(&error))?;
+            self.provider
+                .activate(Arc::new(client))
+                .await
+                .map_err(|error| provider_port_error(&error))?;
+            self.runtime.set_authenticated(true)?;
+            self.provider.mark_ready();
+            Ok(())
+        })
+    }
+}
+
+struct ReloadGuard<'a>(&'a AtomicBool);
+
+impl Drop for ReloadGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+struct DaemonLegacyReload {
+    in_progress: AtomicBool,
+    config: Arc<ConfigController>,
+    provider: Arc<SwappableProvider>,
+    runtime: Arc<ProviderLegacyRuntime>,
+    proxy: ProxyPolicy,
+    diagnostics: Arc<Diagnostics>,
+}
+
+impl LegacyReloadPort for DaemonLegacyReload {
+    fn reload(
+        &self,
+        cancellation: CancellationToken,
+    ) -> PortFuture<'_, Result<LegacyReloadResult, LegacyReloadError>> {
+        Box::pin(async move {
+            if self
+                .in_progress
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(LegacyReloadError::InProgress);
+            }
+            let _guard = ReloadGuard(&self.in_progress);
+            let snapshot = self.config.snapshot().map_err(|error| {
+                self.diagnostics
+                    .record(format!("legacy reload snapshot failed: {error}"));
+                LegacyReloadError::Failed
+            })?;
+            let role = tokio::select! {
+                result = load_role(&snapshot, self.proxy.clone()) => {
+                    result.map_err(|error| {
+                        self.diagnostics.record(format!("legacy role reload failed: {error}"));
+                        LegacyReloadError::Failed
+                    })?
+                }
+                () = cancellation.cancelled() => return Err(LegacyReloadError::Failed),
+            };
+            let model = role
+                .model
+                .as_deref()
+                .unwrap_or_else(|| snapshot.core().copilot().default_model());
+            self.provider.set_default_model(model).map_err(|error| {
+                self.diagnostics
+                    .record(format!("legacy role model rejected: {error}"));
+                LegacyReloadError::Failed
+            })?;
+            self.provider.set_role_prompt(&role.prompt);
+            self.provider.clear_history();
+            self.runtime.clear_sessions().map_err(|error| {
+                self.diagnostics
+                    .record(format!("legacy session reset failed: {}", error.message));
+                LegacyReloadError::Failed
+            })?;
+            self.runtime.set_skill_count(0);
+            for diagnostic in &role.diagnostics {
+                self.diagnostics
+                    .record(format!("legacy role reload: {diagnostic}"));
+            }
+            Ok(LegacyReloadResult {
+                role_model: role.model,
+                skill_count: 0,
+            })
+        })
+    }
+}
+
 /// A complete production service after every dependency is live.
 pub struct ProductionService {
     addresses: BoundAddresses,
-    provider: Arc<ProviderAdapter>,
+    provider: Arc<SwappableProvider>,
     readiness: Arc<DependencyReadiness>,
     serving: ServingStateHandle,
     config: Arc<ConfigController>,
@@ -415,6 +552,7 @@ pub struct ProductionService {
     http_shutdown: CancellationToken,
     http_tasks: JoinSet<(&'static str, io::Result<()>)>,
     gateway: Option<ServerHandle>,
+    device_flow: Option<Arc<LegacyDeviceFlowAdapter>>,
     terminated_http_tasks: u64,
 }
 
@@ -506,7 +644,16 @@ impl ProductionService {
         });
 
         let readiness = Arc::new(DependencyReadiness::new([
-            "config", "audit", "role", "skills", "provider", "channels", "gateway", "http", "mcp",
+            "config",
+            "audit",
+            "role",
+            "skills",
+            "provider",
+            "channels",
+            "gateway",
+            "http",
+            "legacy-http",
+            "mcp",
         ]));
         readiness.set("config", true);
         info!(
@@ -577,7 +724,8 @@ impl ProductionService {
             "skill inventory classified"
         );
 
-        let channels = channel_statuses(&loaded.snapshot)?;
+        let legacy_settings = legacy_settings(&loaded.snapshot)?;
+        let channels = channel_statuses(&legacy_settings)?;
         readiness.set("channels", true);
         info!(
             stage = "channels",
@@ -585,38 +733,140 @@ impl ProductionService {
             "channel lifecycle validated"
         );
 
-        let provider: Arc<dyn Provider> = if options.smoke {
-            warn!(stage = "provider", "explicit smoke provider enabled");
-            Arc::new(SmokeProvider::new().map_err(|error| ProductionError::new("provider", error))?)
-        } else {
-            Arc::new(build_copilot(&loaded.snapshot, proxy)?)
-        };
         let configured_model = role
             .model
             .clone()
             .unwrap_or_else(|| loaded.snapshot.core().copilot().default_model().to_owned());
-        let provider = Arc::new(ProviderAdapter::new(
-            provider,
+        let provider = Arc::new(SwappableProvider::new(
             configured_model,
             role.prompt,
+            ProviderHistoryConfig {
+                max_conversations: legacy_settings.session_max_entries,
+                idle_timeout: legacy_settings.session_idle_timeout,
+            },
             Arc::clone(&readiness),
         ));
-        provider
-            .initialize()
-            .await
-            .map_err(|error| ProductionError::new("provider-readiness", error))?;
-        info!(
-            stage = "provider",
-            provider = provider.provider_name(),
-            model = provider.default_model(),
-            "provider is live"
-        );
+        let provider_to_activate: Option<Arc<dyn Provider>> = if options.smoke {
+            warn!(stage = "provider", "explicit smoke provider enabled");
+            Some(Arc::new(
+                SmokeProvider::new().map_err(|error| ProductionError::new("provider", error))?,
+            ))
+        } else if loaded.snapshot.core().auth().github_pat().is_some() {
+            Some(Arc::new(build_copilot(&loaded.snapshot, proxy.clone())?))
+        } else {
+            None
+        };
+        if let Some(provider_to_activate) = provider_to_activate {
+            provider
+                .activate(provider_to_activate)
+                .await
+                .map_err(|error| ProductionError::new("provider-readiness", error))?;
+            provider.mark_ready();
+            info!(
+                stage = "provider",
+                provider = provider.provider_name(),
+                model = provider.default_model(),
+                "provider is live"
+            );
+        } else {
+            diagnostics.record("provider authentication is pending GitHub Device Flow");
+            warn!(
+                stage = "provider",
+                model = provider.default_model(),
+                "provider authentication is pending"
+            );
+        }
 
         let config = Arc::new(ConfigController::new(
             loaded.snapshot.clone(),
             Arc::clone(&provider),
             Arc::clone(&diagnostics),
         ));
+        let legacy_runtime = ProviderLegacyRuntime::new(
+            Arc::clone(&provider) as Arc<dyn claw_http_api::ProviderPort>,
+            ProviderLegacyRuntimeConfig {
+                model: "openclaw".to_owned(),
+                skill_count: 0,
+                max_sessions: legacy_settings.session_max_entries,
+                session_idle_timeout: legacy_settings.session_idle_timeout,
+            },
+        )
+        .map_err(|error| ProductionError::new("legacy-runtime", error))?;
+        if !provider.is_active() {
+            legacy_runtime
+                .set_authenticated(false)
+                .map_err(|error| ProductionError::new("legacy-runtime", error))?;
+        }
+
+        let teams = if let Some(teams) = legacy_settings.teams {
+            let transport = HttpTransport::with_config(&TransportConfig {
+                proxy_policy: proxy.clone(),
+                request_timeout: Duration::from_secs(15),
+                ..TransportConfig::default()
+            })
+            .map_err(|error| ProductionError::new("teams-transport", error))?;
+            Some(LegacyTeamsAdapter::new(
+                Arc::clone(&legacy_runtime) as Arc<dyn claw_http_api::LegacyChannelMessagePort>,
+                transport,
+                teams.app_id,
+                teams.app_password,
+            ))
+        } else {
+            None
+        };
+        let whatsapp = if let Some(whatsapp) = legacy_settings.whatsapp {
+            let transport = HttpTransport::with_config(&TransportConfig {
+                proxy_policy: proxy.clone(),
+                request_timeout: Duration::from_secs(10),
+                ..TransportConfig::default()
+            })
+            .map_err(|error| ProductionError::new("whatsapp-transport", error))?;
+            let sender = GraphWhatsAppAdapter::new(
+                transport,
+                &whatsapp.phone_number_id,
+                whatsapp.access_token,
+            )
+            .map_err(|error| ProductionError::new("whatsapp", error))?;
+            Some((
+                whatsapp.route,
+                LegacyWhatsAppServices {
+                    messages: Arc::clone(&legacy_runtime)
+                        as Arc<dyn claw_http_api::LegacyChannelMessagePort>,
+                    sender,
+                },
+            ))
+        } else {
+            None
+        };
+
+        let request_timeout = Duration::from_millis(
+            copilot_request_timeout_ms(&loaded.snapshot)
+                .map_err(|error| ProductionError::message("provider-config", error))?,
+        );
+        let device_flow = if legacy_settings.device_flow_enabled {
+            let flow = build_device_flow(&loaded.snapshot, proxy.clone())?;
+            let activator = Arc::new(CopilotDeviceActivator {
+                provider: Arc::clone(&provider),
+                runtime: Arc::clone(&legacy_runtime),
+                proxy: proxy.clone(),
+                request_timeout,
+            });
+            Some(LegacyDeviceFlowAdapter::new(
+                flow,
+                activator,
+                Arc::clone(&diagnostics),
+            ))
+        } else {
+            None
+        };
+        let reload = Arc::new(DaemonLegacyReload {
+            in_progress: AtomicBool::new(false),
+            config: Arc::clone(&config),
+            provider: Arc::clone(&provider),
+            runtime: Arc::clone(&legacy_runtime),
+            proxy: proxy.clone(),
+            diagnostics: Arc::clone(&diagnostics),
+        });
         let updates_enabled = updates_enabled(&loaded.snapshot)
             .map_err(|error| ProductionError::message("updates", error))?;
         if updates_enabled {
@@ -631,6 +881,7 @@ impl ProductionService {
             Arc::clone(&diagnostics),
             OperatorInventory::new(channels, skill_count, updates_enabled, config_resolution),
         ));
+        let admin_token = admin_token(&loaded.snapshot)?;
         let external = Arc::new(UnavailableExternalPorts);
         let services = ApiServices {
             provider: Arc::clone(&provider) as Arc<dyn claw_http_api::ProviderPort>,
@@ -646,7 +897,6 @@ impl ProductionService {
             .record("tools/watch/webhooks are unavailable until their public ports are composable");
 
         let serving = ServingStateHandle::starting();
-        let admin_token = admin_token(&loaded.snapshot)?;
         if admin_token.is_none() {
             diagnostics.record(
                 "protected HTTP routes are disabled; set GTA_CLAW_ADMIN_TOKEN to enable them",
@@ -657,12 +907,49 @@ impl ProductionService {
             );
         }
         let api = HttpApi::with_serving_state(
-            api_config(admin_token),
+            api_config(admin_token.clone()),
             services,
             Arc::new(serving.clone()),
         );
+        let mut legacy_channels = LegacyChannelStatus::default();
+        legacy_channels.set_teams(legacy_settings.channels.teams());
+        legacy_channels.set_telegram(legacy_settings.channels.telegram());
+        legacy_channels.set_discord(legacy_settings.channels.discord());
+        legacy_channels.set_whatsapp(whatsapp.is_some());
+        let legacy_config = LegacyApiConfig {
+            device_flow_enabled: legacy_settings.device_flow_enabled,
+            channels: legacy_channels,
+            default_model: provider.default_model(),
+            teams_rate_limit_per_minute: legacy_settings.teams_rate_limit_per_minute,
+            trust_proxy: legacy_settings.trust_proxy,
+            admin_credential: admin_token.as_deref().map(LegacyAdminCredential::new),
+            whatsapp: whatsapp.as_ref().map(|(config, _)| config.clone()),
+            ..LegacyApiConfig::default()
+        };
+        let legacy_services = LegacyApiServices {
+            runtime: Arc::clone(&legacy_runtime) as Arc<dyn LegacyRuntimePort>,
+            readiness: Arc::clone(&readiness) as Arc<dyn claw_http_api::ReadinessPort>,
+            device_flow: device_flow
+                .as_ref()
+                .map(|flow| Arc::clone(flow) as Arc<dyn claw_http_api::LegacyDeviceFlowPort>),
+            teams: teams
+                .as_ref()
+                .map(|teams| Arc::clone(teams) as Arc<dyn claw_http_api::LegacyTeamsPort>),
+            whatsapp: whatsapp.map(|(_, services)| services),
+            reload: Some(reload),
+            admin: admin_token.as_ref().map(|_| {
+                NativeLegacyHostAdmin::new() as Arc<dyn claw_http_api::LegacyHostAdminPort>
+            }),
+        };
+        let legacy_api = LegacyHttpApi::with_serving_state(
+            legacy_config,
+            legacy_services,
+            Arc::new(serving.clone()),
+        )
+        .map_err(|error| ProductionError::new("legacy-http-build", error))?;
 
-        let http_requested = options.http_listen.unwrap_or_else(|| {
+        let http_requested = options.http_listen.unwrap_or(DEFAULT_MCP);
+        let legacy_requested = options.legacy_listen.unwrap_or_else(|| {
             SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
                 loaded.snapshot.core().server().port(),
@@ -713,6 +1000,12 @@ impl ProductionService {
         let http_address = http_listener
             .local_addr()
             .map_err(|error| ProductionError::new("http-bind", error))?;
+        let legacy_listener = TcpListener::bind(legacy_requested)
+            .await
+            .map_err(|error| ProductionError::new("legacy-http-bind", error))?;
+        let legacy_address = legacy_listener
+            .local_addr()
+            .map_err(|error| ProductionError::new("legacy-http-bind", error))?;
         let mcp_listener = TcpListener::bind(mcp_requested)
             .await
             .map_err(|error| ProductionError::new("mcp-bind", error))?;
@@ -749,18 +1042,33 @@ impl ProductionService {
                     .await,
             )
         });
+        let legacy_shutdown = http_shutdown.clone();
+        let legacy_router = legacy_api
+            .router()
+            .into_make_service_with_connect_info::<SocketAddr>();
+        http_tasks.spawn(async move {
+            (
+                "legacy-http",
+                axum::serve(legacy_listener, legacy_router)
+                    .with_graceful_shutdown(legacy_shutdown.cancelled_owned())
+                    .await,
+            )
+        });
         readiness.set("http", true);
+        readiness.set("legacy-http", true);
         readiness.set("mcp", true);
 
         serving.begin_serving();
         let addresses = BoundAddresses {
             http: http_address,
+            legacy: legacy_address,
             gateway: gateway_address,
             mcp: mcp_address,
         };
         diagnostics.record(format!(
-            "ready: http={} gateway={} mcp={} provider={} model={}",
+            "ready: http={} legacy={} gateway={} mcp={} provider={} model={}",
             addresses.http,
+            addresses.legacy,
             addresses.gateway,
             addresses.mcp,
             provider.provider_name(),
@@ -769,6 +1077,7 @@ impl ProductionService {
         info!(
             stage = "ready",
             http = %addresses.http,
+            legacy = %addresses.legacy,
             gateway = %addresses.gateway,
             mcp = %addresses.mcp,
             provider = provider.provider_name(),
@@ -787,6 +1096,7 @@ impl ProductionService {
             http_shutdown,
             http_tasks,
             gateway: Some(gateway),
+            device_flow,
             terminated_http_tasks: 0,
         })
     }
@@ -799,7 +1109,7 @@ impl ProductionService {
 
     /// Returns the provider identifier.
     #[must_use]
-    pub fn provider_name(&self) -> &str {
+    pub fn provider_name(&self) -> String {
         self.provider.provider_name()
     }
 
@@ -808,9 +1118,10 @@ impl ProductionService {
     pub fn status_line(&self) -> String {
         let (model, generation) = self.config.model_generation();
         format!(
-            "status ready={} http={} gateway={} mcp={} provider={} model={} config_generation={}",
+            "status ready={} http={} legacy={} gateway={} mcp={} provider={} model={} config_generation={}",
             self.readiness.is_ready() && self.serving.state().accepts_work(),
             self.addresses.http,
+            self.addresses.legacy,
             self.addresses.gateway,
             self.addresses.mcp,
             self.provider.provider_name(),
@@ -874,6 +1185,7 @@ impl ProductionService {
         let started = Instant::now();
         self.serving.begin_draining();
         self.readiness.set("http", false);
+        self.readiness.set("legacy-http", false);
         self.readiness.set("mcp", false);
         self.readiness.set("gateway", false);
         info!(stage = "shutdown", "readiness disabled; draining ingress");
@@ -920,6 +1232,17 @@ impl ProductionService {
             );
         }
 
+        let device_report = if let Some(device_flow) = self.device_flow.as_ref() {
+            device_flow.shutdown(remaining(started)).await
+        } else {
+            DeviceTaskReport {
+                spawned: 0,
+                terminated: 0,
+                abandoned: 0,
+            }
+        };
+        abandoned = abandoned.saturating_add(device_report.abandoned);
+
         let mut gateway_joined = false;
         if let Some(gateway) = self.gateway.take() {
             let mut task = tokio::spawn(gateway.shutdown());
@@ -940,10 +1263,11 @@ impl ProductionService {
             }
         }
 
-        let spawned = 4_u64;
+        let spawned = 5_u64.saturating_add(device_report.spawned);
         let terminated = self
             .terminated_http_tasks
-            .saturating_add(if gateway_joined { 2 } else { 0 });
+            .saturating_add(if gateway_joined { 2 } else { 0 })
+            .saturating_add(device_report.terminated);
         let deadline_expired = started.elapsed() >= PRODUCTION_STOP_DEADLINE;
         let clean = abandoned == 0 && terminated == spawned && !deadline_expired && fault.is_none();
         if clean {
@@ -960,7 +1284,7 @@ impl ProductionService {
         }
         ProductionStopSummary {
             clean,
-            drained: 3,
+            drained: 4,
             completed: 0,
             abandoned,
             spawned,
@@ -1090,6 +1414,7 @@ fn normalize_http_result(
 fn validate_exposure(options: &ProductionOptions) -> Result<(), ProductionError> {
     for (name, address) in [
         ("http", options.http_listen),
+        ("legacy", options.legacy_listen),
         ("gateway", options.gateway_listen),
     ] {
         if address.is_some_and(|address| !address.ip().is_loopback())
@@ -1106,6 +1431,7 @@ fn validate_exposure(options: &ProductionOptions) -> Result<(), ProductionError>
     if options.smoke
         && [
             options.http_listen,
+            options.legacy_listen,
             options.gateway_listen,
             options.mcp_listen,
         ]
@@ -1121,13 +1447,12 @@ fn validate_exposure(options: &ProductionOptions) -> Result<(), ProductionError>
     Ok(())
 }
 
-fn channel_statuses(snapshot: &ConfigSnapshot) -> Result<Vec<Value>, ProductionError> {
-    let channels = snapshot.core().channels();
+fn channel_statuses(settings: &LegacySettings) -> Result<Vec<Value>, ProductionError> {
     let configured = [
-        ("msteams", channels.teams().enabled()),
-        ("telegram", channels.telegram().enabled()),
-        ("discord", channels.discord().enabled()),
-        ("whatsapp", channels.whatsapp().enabled()),
+        ("msteams", settings.channels.teams()),
+        ("telegram", settings.channels.telegram()),
+        ("discord", settings.channels.discord()),
+        ("whatsapp", settings.whatsapp.is_some()),
     ];
     let mut statuses = Vec::with_capacity(configured.len());
     for (id, enabled) in configured {
@@ -1153,8 +1478,12 @@ fn channel_statuses(snapshot: &ConfigSnapshot) -> Result<Vec<Value>, ProductionE
                 ExchangeSupport::InboundOnly => "inbound_only",
                 ExchangeSupport::Bidirectional => "bidirectional",
             },
+            "legacyHttpAdapter": enabled && matches!(id, "msteams" | "whatsapp"),
         }));
-        if enabled && exchange != ExchangeSupport::Bidirectional {
+        if enabled
+            && !matches!(id, "msteams" | "whatsapp")
+            && exchange != ExchangeSupport::Bidirectional
+        {
             return Err(ProductionError::message(
                 "channels",
                 format!(
@@ -1197,6 +1526,114 @@ fn admin_token(snapshot: &ConfigSnapshot) -> Result<Option<String>, ProductionEr
     let reference = SecretRef::parse(reference)
         .map_err(|error| ProductionError::message("http-auth", error))?;
     Ok(Some(resolve_secret(&reference)?.expose().to_owned()))
+}
+
+fn legacy_settings(snapshot: &ConfigSnapshot) -> Result<LegacySettings, ProductionError> {
+    let encoded =
+        to_json5(snapshot).map_err(|error| ProductionError::new("legacy-config", error))?;
+    let value = json5::from_str::<Value>(&encoded)
+        .map_err(|error| ProductionError::new("legacy-config", error))?;
+    let get = |path: &[&str]| {
+        path.iter()
+            .try_fold(&value, |value, field| value.get(*field))
+    };
+    let required_bool = |path: &[&str]| {
+        get(path).and_then(Value::as_bool).ok_or_else(|| {
+            ProductionError::message(
+                "legacy-config",
+                format!("{} is not a boolean", path.join(".")),
+            )
+        })
+    };
+    let required_u64 = |path: &[&str]| {
+        get(path).and_then(Value::as_u64).ok_or_else(|| {
+            ProductionError::message(
+                "legacy-config",
+                format!("{} is not an unsigned integer", path.join(".")),
+            )
+        })
+    };
+    let teams_enabled = required_bool(&["core", "channels", "teams", "enabled"])?;
+    let telegram_enabled = required_bool(&["core", "channels", "telegram", "enabled"])?;
+    let discord_enabled = required_bool(&["core", "channels", "discord", "enabled"])?;
+    let whatsapp_enabled = required_bool(&["core", "channels", "whatsapp", "enabled"])?;
+    let mut channels = LegacyChannelStatus::default();
+    channels.set_teams(teams_enabled);
+    channels.set_telegram(telegram_enabled);
+    channels.set_discord(discord_enabled);
+    channels.set_whatsapp(whatsapp_enabled);
+    let teams = if teams_enabled {
+        let app_id = get(&["core", "channels", "teams", "app_id"])
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProductionError::message("legacy-config", "Teams app id is missing"))?;
+        let password_reference = get(&["core", "channels", "teams", "app_password"])
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProductionError::message("legacy-config", "Teams app password is missing")
+            })?;
+        let password_reference = SecretRef::parse(password_reference)
+            .map_err(|error| ProductionError::message("legacy-config", error))?;
+        Some(LegacyTeamsSettings {
+            app_id: app_id.to_owned(),
+            app_password: resolve_secret(&password_reference)?,
+        })
+    } else {
+        None
+    };
+    let whatsapp = if whatsapp_enabled {
+        let verify_reference = get(&["core", "channels", "whatsapp", "verify_token"])
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProductionError::message("legacy-config", "WhatsApp verify token is missing")
+            })?;
+        let access_reference = get(&["core", "channels", "whatsapp", "access_token"])
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProductionError::message("legacy-config", "WhatsApp access token is missing")
+            })?;
+        let verify_reference = SecretRef::parse(verify_reference)
+            .map_err(|error| ProductionError::message("legacy-config", error))?;
+        let access_reference = SecretRef::parse(access_reference)
+            .map_err(|error| ProductionError::message("legacy-config", error))?;
+        let verify_token = resolve_secret(&verify_reference)?;
+        let access_token = resolve_secret(&access_reference)?;
+        let path = get(&["core", "channels", "whatsapp", "webhook_path"])
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProductionError::message("legacy-config", "WhatsApp webhook path is missing")
+            })?;
+        let phone_number_id = get(&["core", "channels", "whatsapp", "phone_number_id"])
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProductionError::message("legacy-config", "WhatsApp phone number id is missing")
+            })?;
+        Some(LegacyWhatsAppSettings {
+            route: LegacyWhatsAppConfig::new(path, verify_token.expose())
+                .map_err(|error| ProductionError::new("legacy-config", error))?,
+            access_token,
+            phone_number_id: phone_number_id.to_owned(),
+        })
+    } else {
+        None
+    };
+    Ok(LegacySettings {
+        device_flow_enabled: snapshot.core().auth().device_enabled(),
+        channels,
+        teams,
+        whatsapp,
+        teams_rate_limit_per_minute: u32::try_from(required_u64(&[
+            "core",
+            "server",
+            "teams_rate_limit_per_minute",
+        ])?)
+        .map_err(|_| ProductionError::message("legacy-config", "Teams rate limit exceeds u32"))?,
+        trust_proxy: required_bool(&["core", "server", "trust_proxy"])?,
+        session_max_entries: usize::try_from(required_u64(&["core", "sessions", "max_entries"])?)
+            .map_err(|_| {
+            ProductionError::message("legacy-config", "session capacity exceeds usize")
+        })?,
+        session_idle_timeout: Duration::from_millis(required_u64(&["core", "sessions", "ttl_ms"])?),
+    })
 }
 
 fn resolve_secret(reference: &SecretRef) -> Result<SecretString, ProductionError> {
@@ -1376,25 +1813,27 @@ fn build_copilot(
     proxy: ProxyPolicy,
 ) -> Result<GitHubCopilot, ProductionError> {
     let auth = snapshot.core().auth();
-    if auth.device_enabled() {
-        return Err(ProductionError::message(
-            "provider-auth",
-            "device flow is configured but the shipped HTTP crate has no /auth/device composition port; supply an env-backed GitHub token for unattended startup",
-        ));
-    }
     let reference = auth.github_pat().ok_or_else(|| {
         ProductionError::message("provider-auth", "GitHub token reference is missing")
     })?;
     let token = resolve_secret(reference)?;
+    let request_timeout = Duration::from_millis(
+        copilot_request_timeout_ms(snapshot)
+            .map_err(|error| ProductionError::message("provider-config", error))?,
+    );
+    build_copilot_from_token(token, proxy, request_timeout)
+}
+
+fn build_copilot_from_token(
+    token: SecretString,
+    proxy: ProxyPolicy,
+    request_timeout: Duration,
+) -> Result<GitHubCopilot, ProductionError> {
     let config = GitHubCopilotConfig::new(token)
         .map_err(|error| ProductionError::new("provider-build", error))?;
     let reliability = config.reliability;
     let provider = GitHubCopilot::new(config)
         .map_err(|error| ProductionError::new("provider-build", error))?;
-    let request_timeout = Duration::from_millis(
-        copilot_request_timeout_ms(snapshot)
-            .map_err(|error| ProductionError::message("provider-config", error))?,
-    );
     let transport = HttpTransport::with_config(&TransportConfig {
         proxy_policy: proxy,
         request_timeout,
@@ -1408,6 +1847,52 @@ fn build_copilot(
         Arc::new(ProviderClock),
         Arc::new(PseudoRandomJitter::from_entropy()),
     )))
+}
+
+fn build_device_flow(
+    snapshot: &ConfigSnapshot,
+    proxy: ProxyPolicy,
+) -> Result<DeviceFlow, ProductionError> {
+    let mut config =
+        DeviceFlowConfig::github().map_err(|error| ProductionError::new("device-flow", error))?;
+    snapshot
+        .core()
+        .auth()
+        .device_client_id()
+        .ok_or_else(|| ProductionError::message("device-flow", "client id is missing"))?
+        .clone_into(&mut config.client_id);
+    "copilot".clone_into(&mut config.scope);
+    let reliability = config.reliability;
+    let flow =
+        DeviceFlow::new(config).map_err(|error| ProductionError::new("device-flow", error))?;
+    let transport = HttpTransport::with_config(&TransportConfig {
+        tls_policy: TlsPolicy::RequireHttps,
+        proxy_policy: proxy,
+        request_timeout: Duration::from_secs(15),
+        ..TransportConfig::default()
+    })
+    .map_err(|error| ProductionError::new("device-flow", error))?;
+    Ok(flow.with_runtime(ProviderRuntime::with_parts(
+        "github-copilot-device-flow",
+        transport,
+        reliability,
+        Arc::new(ProviderClock),
+        Arc::new(PseudoRandomJitter::from_entropy()),
+    )))
+}
+
+fn provider_port_error(error: &claw_provider_sdk::ProviderError) -> PortError {
+    let kind = match error.kind() {
+        claw_provider_sdk::ErrorKind::InvalidRequest => PortErrorKind::InvalidRequest,
+        claw_provider_sdk::ErrorKind::Timeout => PortErrorKind::Timeout,
+        claw_provider_sdk::ErrorKind::Unsupported => PortErrorKind::NotFound,
+        _ => PortErrorKind::Unavailable,
+    };
+    PortError::new(kind, error.to_string())
+}
+
+fn production_port_error(error: &ProductionError) -> PortError {
+    PortError::new(PortErrorKind::Unavailable, error.to_string())
 }
 
 /// Runs the same non-network composition checks used before startup.
@@ -1427,19 +1912,18 @@ pub fn check_configuration(
     let _ = admin_token(&loaded.snapshot)?;
     let _ = updates_enabled(&loaded.snapshot)
         .map_err(|error| ProductionError::message("updates", error))?;
-    let _ = channel_statuses(&loaded.snapshot)?;
+    let legacy_settings = legacy_settings(&loaded.snapshot)?;
+    let _ = channel_statuses(&legacy_settings)?;
     if !options.smoke {
         let auth = loaded.snapshot.core().auth();
-        if auth.device_enabled() {
+        if let Some(reference) = auth.github_pat() {
+            let _ = resolve_secret(reference)?;
+        } else if !auth.device_enabled() {
             return Err(ProductionError::message(
                 "provider-auth",
-                "device flow cannot yet be composed into unattended startup",
+                "GitHub token reference is missing and Device Flow is disabled",
             ));
         }
-        let reference = auth.github_pat().ok_or_else(|| {
-            ProductionError::message("provider-auth", "GitHub token reference is missing")
-        })?;
-        let _ = resolve_secret(reference)?;
     }
     Ok(())
 }
@@ -1464,6 +1948,8 @@ mod tests {
                 "--config",
                 "config.json5",
                 "--listen",
+                "127.0.0.1:0",
+                "--legacy-listen",
                 "127.0.0.1:0",
                 "--gateway-listen",
                 "127.0.0.1:0",

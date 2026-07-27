@@ -21,6 +21,7 @@
 pub mod engine;
 pub mod http_api;
 pub mod ingress;
+pub mod legacy;
 pub mod model;
 pub mod plugins;
 pub mod state;

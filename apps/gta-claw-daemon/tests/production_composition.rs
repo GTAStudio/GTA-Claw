@@ -20,6 +20,7 @@ struct Running {
     root: PathBuf,
     config: PathBuf,
     http: SocketAddr,
+    legacy: SocketAddr,
 }
 
 struct StartupChildGuard(Child, PathBuf);
@@ -34,6 +35,18 @@ impl Drop for StartupChildGuard {
 
 impl Running {
     fn start(model: &str) -> Self {
+        Self::start_with_channels(model, false, false)
+    }
+
+    fn start_with_channels(model: &str, teams: bool, whatsapp: bool) -> Self {
+        Self::start_fixture(model, teams, whatsapp, "https://example.test/role")
+    }
+
+    fn start_with_role(model: &str, role_url: &str) -> Self {
+        Self::start_fixture(model, false, false, role_url)
+    }
+
+    fn start_fixture(model: &str, teams: bool, whatsapp: bool, role_url: &str) -> Self {
         let root = std::env::temp_dir().join(format!(
             "gta-claw-production-composition-{}-{}",
             std::process::id(),
@@ -41,7 +54,7 @@ impl Running {
         ));
         std::fs::create_dir_all(&root).expect("temporary root is created");
         let config = root.join("config.json5");
-        write_config(&config, model);
+        write_config_fixture(&config, model, role_url, teams, whatsapp);
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"));
         command.env_clear();
@@ -52,6 +65,8 @@ impl Running {
                 config.to_str().expect("temporary path is UTF-8"),
                 "--listen",
                 "127.0.0.1:0",
+                "--legacy-listen",
+                "127.0.0.1:0",
                 "--gateway-listen",
                 "127.0.0.1:0",
                 "--mcp-listen",
@@ -61,6 +76,11 @@ impl Running {
             ])
             .env("GITHUB_TOKEN", "test")
             .env("ADMIN_TOKEN", "operator-token")
+            .env("MicrosoftAppId", "teams-app")
+            .env("MicrosoftAppPassword", "teams-password")
+            .env("WHATSAPP_VERIFY_TOKEN", "verify-token")
+            .env("WHATSAPP_ACCESS_TOKEN", "access-token")
+            .env("WHATSAPP_PHONE_NUMBER_ID", "phone-id")
             .env("GTA_CLAW_LOG", "off")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -87,6 +107,7 @@ impl Running {
             root,
             config,
             http: "127.0.0.1:0".parse().expect("placeholder address parses"),
+            legacy: "127.0.0.1:0".parse().expect("placeholder address parses"),
         };
 
         let ready = running.read_line();
@@ -96,6 +117,9 @@ impl Running {
         running.http = field(&service, "http")
             .parse()
             .expect("reported HTTP address parses");
+        running.legacy = field(&service, "legacy")
+            .parse()
+            .expect("reported legacy address parses");
         running
     }
 
@@ -142,6 +166,44 @@ fn bound_http_is_ready_and_dispatches_to_the_composed_provider() {
     let ready = request(daemon.http, "GET", "/ready", None, None);
     assert!(ready.starts_with("HTTP/1.1 200"), "{ready}");
     assert!(ready.contains(r#""ready":true"#), "{ready}");
+
+    let legacy_health = request(daemon.legacy, "GET", "/health", None, None);
+    assert!(legacy_health.starts_with("HTTP/1.1 200"), "{legacy_health}");
+    assert!(
+        legacy_health.contains(r#""status":"ok""#),
+        "{legacy_health}"
+    );
+    assert!(
+        legacy_health.contains(r#""authenticated":true"#),
+        "{legacy_health}"
+    );
+    let legacy_chat = request(
+        daemon.legacy,
+        "POST",
+        "/chat",
+        None,
+        Some(r#"{"message":"legacy hello","conversation_id":"legacy-1"}"#),
+    );
+    assert!(legacy_chat.starts_with("HTTP/1.1 200"), "{legacy_chat}");
+    assert!(legacy_chat.contains("smoke: legacy hello"), "{legacy_chat}");
+    let legacy_system = request(
+        daemon.legacy,
+        "GET",
+        "/admin/system",
+        Some("operator-token"),
+        None,
+    );
+    assert!(legacy_system.starts_with("HTTP/1.1 200"), "{legacy_system}");
+    assert!(legacy_system.contains(r#""platform":"#), "{legacy_system}");
+    let legacy_exec = request(
+        daemon.legacy,
+        "POST",
+        "/admin/exec",
+        Some("operator-token"),
+        Some(r#"{"action":"hostname"}"#),
+    );
+    assert!(legacy_exec.starts_with("HTTP/1.1 200"), "{legacy_exec}");
+    assert!(legacy_exec.contains(r#""success":true"#), "{legacy_exec}");
 
     let models = request(
         daemon.http,
@@ -226,6 +288,198 @@ fn bound_http_is_ready_and_dispatches_to_the_composed_provider() {
 }
 
 #[test]
+fn legacy_conditional_channel_routes_use_composed_adapters() {
+    let daemon = Running::start_with_channels("gpt-4o", true, true);
+
+    let teams = request(
+        daemon.legacy,
+        "POST",
+        "/api/messages",
+        None,
+        Some(
+            r#"{"type":"message","text":"from teams","conversation":{"id":"teams-1"},"from":{"name":"Ada"}}"#,
+        ),
+    );
+    assert!(teams.starts_with("HTTP/1.1 200"), "{teams}");
+    let health = request(daemon.legacy, "GET", "/health", None, None);
+    assert!(health.contains(r#""teams":true"#), "{health}");
+    assert!(health.contains(r#""whatsapp":true"#), "{health}");
+    assert!(health.contains(r#""sessions":1"#), "{health}");
+
+    let verified = request(
+        daemon.legacy,
+        "GET",
+        "/whatsapp/webhook?hub.mode=subscribe&hub.verify_token=verify-token&hub.challenge=challenge-1",
+        None,
+        None,
+    );
+    assert!(verified.starts_with("HTTP/1.1 200"), "{verified}");
+    assert!(verified.ends_with("challenge-1"), "{verified}");
+    let empty_webhook = request(
+        daemon.legacy,
+        "POST",
+        "/whatsapp/webhook",
+        None,
+        Some(r#"{"entry":[]}"#),
+    );
+    assert!(empty_webhook.starts_with("HTTP/1.1 200"), "{empty_webhook}");
+    assert!(empty_webhook.contains(r#""ok":true"#), "{empty_webhook}");
+
+    daemon.stop();
+}
+
+#[test]
+fn legacy_admin_reload_uses_the_shared_role_transaction() {
+    let role_server =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("role fixture binds to loopback");
+    let role_address = role_server.local_addr().expect("role address is available");
+    let server = thread::spawn(move || {
+        for body in [
+            r#"{"content":"reloaded role","model":"gpt-4.1"}"#,
+            r#"{"content":"default model role"}"#,
+        ] {
+            let (mut stream, _) = role_server.accept().expect("daemon requests the role");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).expect("role request is readable");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("role response is written");
+            stream.flush().expect("role response is flushed");
+        }
+    });
+    let mut daemon = Running::start_with_role("gpt-4o", &format!("http://{role_address}/role"));
+    let before = request(
+        daemon.legacy,
+        "POST",
+        "/chat",
+        None,
+        Some(r#"{"message":"before reload","conversation_id":"reload-session"}"#),
+    );
+    assert!(before.contains("before reload"), "{before}");
+
+    let reloaded = request(
+        daemon.legacy,
+        "POST",
+        "/admin/reload",
+        Some("operator-token"),
+        Some("{}"),
+    );
+    assert!(reloaded.starts_with("HTTP/1.1 200"), "{reloaded}");
+    assert!(reloaded.contains(r#""message":"Reloaded""#), "{reloaded}");
+    assert!(reloaded.contains(r#""model":"gpt-4.1""#), "{reloaded}");
+    let status = daemon.control("status");
+    assert!(status.contains("model=gpt-4.1"), "{status}");
+    let after = request(
+        daemon.legacy,
+        "POST",
+        "/chat",
+        None,
+        Some(r#"{"message":"after reload","conversation_id":"reload-session"}"#),
+    );
+    assert!(after.contains("after reload"), "{after}");
+    assert!(!after.contains("before reload"), "{after}");
+    let reset = request(
+        daemon.legacy,
+        "POST",
+        "/admin/reload",
+        Some("operator-token"),
+        Some("{}"),
+    );
+    assert!(reset.starts_with("HTTP/1.1 200"), "{reset}");
+    assert!(reset.contains(r#""model":"gpt-4o""#), "{reset}");
+    let status = daemon.control("status");
+    assert!(status.contains("model=gpt-4o"), "{status}");
+
+    daemon.stop();
+    server.join().expect("role fixture exits");
+}
+
+#[test]
+fn device_flow_mode_serves_legacy_onboarding_before_provider_authentication() {
+    let role_server =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("role fixture binds to loopback");
+    let role_address = role_server.local_addr().expect("role address is available");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = role_server.accept().expect("daemon requests the role");
+        let mut request = [0_u8; 2048];
+        let _ = stream.read(&mut request).expect("role request is readable");
+        let body = r#"{"content":"device flow role"}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("role response is written");
+        stream.flush().expect("role response is flushed");
+    });
+    let root = std::env::temp_dir().join(format!(
+        "gta-claw-device-flow-composition-{}-{}",
+        std::process::id(),
+        NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("temporary root is created");
+    let config = root.join("config.json5");
+    write_device_config(&config, &format!("http://{role_address}/role"));
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"));
+    command.env_clear();
+    let mut child = command
+        .args([
+            "--config",
+            config.to_str().expect("temporary path is UTF-8"),
+            "--listen",
+            "127.0.0.1:0",
+            "--legacy-listen",
+            "127.0.0.1:0",
+            "--gateway-listen",
+            "127.0.0.1:0",
+            "--mcp-listen",
+            "127.0.0.1:0",
+            "--state-dir",
+            root.to_str().expect("temporary path is UTF-8"),
+        ])
+        .env("ADMIN_TOKEN", "operator-token")
+        .env("GTA_CLAW_LOG", "off")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("daemon process starts");
+    let mut stdin = child.stdin.take().expect("control channel is piped");
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let mut child = StartupChildGuard(child, root);
+    let mut stdout = BufReader::new(stdout);
+    assert_eq!(read_buffered_line(&mut stdout), "ready protocol=1");
+    assert!(read_buffered_line(&mut stdout).starts_with("healthy runtime="));
+    let service = read_buffered_line(&mut stdout);
+    let legacy: SocketAddr = field(&service, "legacy")
+        .parse()
+        .expect("legacy address parses");
+
+    let health = request(legacy, "GET", "/health", None, None);
+    assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+    assert!(health.contains(r#""authenticated":false"#), "{health}");
+    assert!(health.contains(r#""deviceFlowEnabled":true"#), "{health}");
+    let ready = request(legacy, "GET", "/ready", Some("operator-token"), None);
+    assert!(ready.starts_with("HTTP/1.1 503"), "{ready}");
+    assert!(ready.contains(r#""provider""#), "{ready}");
+
+    writeln!(stdin, "shutdown").expect("shutdown is written");
+    stdin.flush().expect("shutdown is flushed");
+    let stopped = read_buffered_line(&mut stdout);
+    assert!(
+        stopped.starts_with("stopped reason=control clean=true"),
+        "{stopped}"
+    );
+    let status = child.0.wait().expect("daemon exits");
+    assert!(status.success(), "daemon exited with {status}");
+    server.join().expect("role fixture exits");
+}
+
+#[test]
 fn reload_commits_a_live_model_and_rolls_back_a_bad_candidate() {
     let mut daemon = Running::start("gpt-4o");
 
@@ -292,6 +546,8 @@ fn a_termination_during_dependency_startup_cancels_before_readiness() {
             config.to_str().expect("temporary path is UTF-8"),
             "--listen",
             "127.0.0.1:0",
+            "--legacy-listen",
+            "127.0.0.1:0",
             "--gateway-listen",
             "127.0.0.1:0",
             "--mcp-listen",
@@ -356,17 +612,30 @@ fn a_termination_during_dependency_startup_cancels_before_readiness() {
 }
 
 fn write_config(path: &Path, model: &str) {
-    write_config_with_role(path, model, "https://example.test/role");
+    write_config_with_channels(path, model, false, false);
+}
+
+fn write_config_with_channels(path: &Path, model: &str, teams: bool, whatsapp: bool) {
+    write_config_fixture(path, model, "https://example.test/role", teams, whatsapp);
 }
 
 fn write_config_with_role(path: &Path, model: &str, role_url: &str) {
+    write_config_fixture(path, model, role_url, false, false);
+}
+
+fn write_config_fixture(path: &Path, model: &str, role_url: &str, teams: bool, whatsapp: bool) {
     let migrated = migrate_legacy_environment([
         ("GITHUB_TOKEN", "test"),
         ("ADMIN_TOKEN", "operator-token"),
-        ("ENABLE_TEAMS", "false"),
+        ("ENABLE_TEAMS", if teams { "true" } else { "false" }),
+        ("MicrosoftAppId", "teams-app"),
+        ("MicrosoftAppPassword", "teams-password"),
         ("ENABLE_TELEGRAM", "false"),
         ("ENABLE_DISCORD", "false"),
-        ("ENABLE_WHATSAPP", "false"),
+        ("ENABLE_WHATSAPP", if whatsapp { "true" } else { "false" }),
+        ("WHATSAPP_VERIFY_TOKEN", "verify-token"),
+        ("WHATSAPP_ACCESS_TOKEN", "access-token"),
+        ("WHATSAPP_PHONE_NUMBER_ID", "phone-id"),
         ("COPILOT_MODEL", model),
         ("AGENT_ROLE_URL", role_url),
     ])
@@ -376,6 +645,25 @@ fn write_config_with_role(path: &Path, model: &str, role_url: &str) {
         to_json5(&migrated.config).expect("fixture configuration serializes"),
     )
     .expect("fixture configuration is written");
+}
+
+fn write_device_config(path: &Path, role_url: &str) {
+    let migrated = migrate_legacy_environment([
+        ("DEVICE_FLOW_ENABLED", "true"),
+        ("GITHUB_CLIENT_ID", "device-client"),
+        ("ADMIN_TOKEN", "operator-token"),
+        ("ENABLE_TEAMS", "false"),
+        ("ENABLE_TELEGRAM", "false"),
+        ("ENABLE_DISCORD", "false"),
+        ("ENABLE_WHATSAPP", "false"),
+        ("AGENT_ROLE_URL", role_url),
+    ])
+    .expect("device configuration migrates");
+    std::fs::write(
+        path,
+        to_json5(&migrated.config).expect("device configuration serializes"),
+    )
+    .expect("device configuration is written");
 }
 
 fn request(
@@ -429,4 +717,11 @@ fn response_body(response: &str) -> &str {
         || panic!("response has no body separator: {response:?}"),
         |(_, body)| body,
     )
+}
+
+fn read_buffered_line(reader: &mut impl BufRead) -> String {
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("line is readable");
+    assert!(!line.is_empty(), "daemon closed stdout before reporting");
+    line.trim_end().to_owned()
 }

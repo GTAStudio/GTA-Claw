@@ -35,6 +35,8 @@ fn command() -> (Command, PathBuf) {
             "--smoke",
             "--listen",
             "127.0.0.1:0",
+            "--legacy-listen",
+            "127.0.0.1:0",
             "--gateway-listen",
             "127.0.0.1:0",
             "--mcp-listen",

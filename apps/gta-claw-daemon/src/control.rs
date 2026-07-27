@@ -467,8 +467,9 @@ pub async fn serve_production(
         writeln!(output, "{}", application.health())?;
         writeln!(
             output,
-            "service http={} gateway={} mcp={} provider={} config_generation={}",
+            "service http={} legacy={} gateway={} mcp={} provider={} config_generation={}",
             addresses.http,
+            addresses.legacy,
             addresses.gateway,
             addresses.mcp,
             service.provider_name(),

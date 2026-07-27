@@ -1,7 +1,7 @@
 //! Process-level checks that a real daemon process shuts down cleanly.
 //!
 //! These run the actual binary rather than the composition in-process, so they
-//! prove the whole path: build the composition, start three bound ingress services, print
+//! prove the whole path: build the composition, start four bound ingress services, print
 //! the ready contract, receive a stop signal from outside the process, drain,
 //! and join every task before exiting.
 
@@ -103,6 +103,8 @@ fn started() -> (ChildGuard, BufReader<std::process::ChildStdout>) {
             "--smoke",
             "--listen",
             "127.0.0.1:0",
+            "--legacy-listen",
+            "127.0.0.1:0",
             "--gateway-listen",
             "127.0.0.1:0",
             "--mcp-listen",
@@ -188,7 +190,7 @@ fn the_control_channel_shuts_a_real_process_down_with_every_task_joined() {
     );
     assert_eq!(summary.abandoned, 0, "a subsystem was left running");
     assert_eq!(
-        summary.drained, 3,
+        summary.drained, 4,
         "not every ingress service was drained on the way down"
     );
     assert_eq!(
@@ -271,7 +273,7 @@ fn an_operating_system_interrupt_shuts_a_real_process_down_cleanly() {
         "the daemon did not stop cleanly: {summary:?}"
     );
     assert_eq!(summary.abandoned, 0);
-    assert_eq!(summary.drained, 3);
+    assert_eq!(summary.drained, 4);
     assert_eq!(summary.joined, summary.spawned);
 }
 
@@ -307,7 +309,7 @@ fn a_supervisor_termination_shuts_a_real_process_down_cleanly() {
         "the daemon did not stop cleanly: {summary:?}"
     );
     assert_eq!(summary.abandoned, 0);
-    assert_eq!(summary.drained, 3);
+    assert_eq!(summary.drained, 4);
     assert_eq!(
         summary.joined, summary.spawned,
         "a spawned task was not joined on a supervisor termination"
@@ -449,7 +451,7 @@ fn repeating_the_stop_signal_neither_deadlocks_the_drain_nor_skips_the_cleanup()
     );
     assert_eq!(summary.abandoned, 0);
     assert_eq!(
-        summary.drained, 3,
+        summary.drained, 4,
         "a repeated signal cut the drain short: {summary:?}"
     );
     assert_eq!(

@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Instant;
 
@@ -33,7 +34,6 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-const MAX_CONVERSATIONS: usize = 100;
 const MAX_HISTORY_MESSAGES: usize = 32;
 
 /// Dependency state shared with `/ready` and operator diagnostics.
@@ -131,20 +131,45 @@ impl Diagnostics {
 }
 
 /// HTTP/provider-SDK bridge with a startup-populated model cache.
+#[derive(Clone, Copy, Debug)]
+pub struct ProviderHistoryConfig {
+    /// Maximum retained conversation histories.
+    pub max_conversations: usize,
+    /// Inactive history retention.
+    pub idle_timeout: std::time::Duration,
+}
+
+impl Default for ProviderHistoryConfig {
+    fn default() -> Self {
+        Self {
+            max_conversations: 100,
+            idle_timeout: std::time::Duration::from_mins(30),
+        }
+    }
+}
+
+/// HTTP/provider-SDK bridge with a startup-populated model cache.
 pub struct ProviderAdapter {
     provider: Arc<dyn Provider>,
     provider_name: String,
     default_model: RwLock<String>,
-    role_prompt: String,
+    role_prompt: RwLock<String>,
     models: RwLock<Vec<ModelDescriptor>>,
     history: Mutex<ConversationHistory>,
+    history_config: ProviderHistoryConfig,
     readiness: Arc<DependencyReadiness>,
+    ready_gate: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Default)]
 struct ConversationHistory {
-    messages: BTreeMap<String, VecDeque<ChatMessage>>,
-    recency: VecDeque<String>,
+    messages: BTreeMap<String, HistoryEntry>,
+}
+
+#[derive(Debug)]
+struct HistoryEntry {
+    messages: VecDeque<ChatMessage>,
+    seen: Instant,
 }
 
 struct PreparedCompletion {
@@ -160,16 +185,20 @@ impl ProviderAdapter {
         provider: Arc<dyn Provider>,
         default_model: impl Into<String>,
         role_prompt: impl Into<String>,
+        history_config: ProviderHistoryConfig,
         readiness: Arc<DependencyReadiness>,
+        ready_gate: Arc<AtomicBool>,
     ) -> Self {
         Self {
             provider_name: provider.id().as_str().to_owned(),
             provider,
             default_model: RwLock::new(default_model.into()),
-            role_prompt: role_prompt.into(),
+            role_prompt: RwLock::new(role_prompt.into()),
             models: RwLock::new(Vec::new()),
             history: Mutex::new(ConversationHistory::default()),
+            history_config,
             readiness,
+            ready_gate,
         }
     }
 
@@ -194,7 +223,6 @@ impl ProviderAdapter {
             ));
         }
         *self.models.write().unwrap_or_else(PoisonError::into_inner) = models;
-        self.readiness.set("provider", true);
         Ok(())
     }
 
@@ -240,6 +268,15 @@ impl ProviderAdapter {
         Ok(())
     }
 
+    /// Replaces the role prompt used by subsequent requests.
+    pub fn set_role_prompt(&self, prompt: &str) {
+        let mut role = self
+            .role_prompt
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        prompt.clone_into(&mut role);
+    }
+
     /// Returns cached public model identities.
     ///
     /// # Errors
@@ -259,7 +296,10 @@ impl ProviderAdapter {
 
     fn observe<T>(&self, result: &Result<T, ProviderError>) {
         match result {
-            Ok(_) => self.readiness.set("provider", true),
+            Ok(_) if self.ready_gate.load(Ordering::Acquire) => {
+                self.readiness.set("provider", true);
+            }
+            Ok(_) => {}
             Err(error) => self.observe_error(error),
         }
     }
@@ -280,36 +320,59 @@ impl ProviderAdapter {
     }
 
     fn history(&self, session_id: &str) -> Vec<ChatMessage> {
+        let now = Instant::now();
         let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
-        if !history.messages.contains_key(session_id) {
-            return Vec::new();
-        }
-        touch(&mut history.recency, session_id);
         history
             .messages
-            .get(session_id)
-            .map(|messages| messages.iter().cloned().collect())
+            .retain(|_, entry| now.duration_since(entry.seen) < self.history_config.idle_timeout);
+        history
+            .messages
+            .get_mut(session_id)
+            .map(|entry| {
+                entry.seen = now;
+                entry.messages.iter().cloned().collect()
+            })
             .unwrap_or_default()
     }
 
     fn remember(&self, session_id: &str, user: ChatMessage, assistant: AssistantMessage) {
+        let now = Instant::now();
         let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
-        touch(&mut history.recency, session_id);
-        let messages = history.messages.entry(session_id.to_owned()).or_default();
-        messages.push_back(user);
-        messages.push_back(ChatMessage::Assistant(assistant));
-        while messages.len() > MAX_HISTORY_MESSAGES {
-            messages.pop_front();
+        history
+            .messages
+            .retain(|_, entry| now.duration_since(entry.seen) < self.history_config.idle_timeout);
+        if !history.messages.contains_key(session_id)
+            && history.messages.len() >= self.history_config.max_conversations.max(1)
+            && let Some(oldest) = history
+                .messages
+                .iter()
+                .min_by_key(|(_, entry)| entry.seen)
+                .map(|(id, _)| id.clone())
+        {
+            history.messages.remove(&oldest);
         }
-        while history.messages.len() > MAX_CONVERSATIONS {
-            let Some(oldest) = history.recency.pop_front() else {
-                break;
-            };
-            if oldest != session_id {
-                history.messages.remove(&oldest);
-            }
+        let entry = history
+            .messages
+            .entry(session_id.to_owned())
+            .or_insert_with(|| HistoryEntry {
+                messages: VecDeque::new(),
+                seen: now,
+            });
+        entry.seen = now;
+        entry.messages.push_back(user);
+        entry.messages.push_back(ChatMessage::Assistant(assistant));
+        while entry.messages.len() > MAX_HISTORY_MESSAGES {
+            entry.messages.pop_front();
         }
         drop(history);
+    }
+
+    fn clear_history(&self) {
+        self.history
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .messages
+            .clear();
     }
 
     async fn complete(
@@ -461,7 +524,9 @@ impl ProviderPort for ProviderAdapter {
                     }
                 }
             }
-            self.readiness.set("provider", true);
+            if self.ready_gate.load(Ordering::Acquire) {
+                self.readiness.set("provider", true);
+            }
             if accumulator.finish_reason().is_some() {
                 self.remember(&prepared.session_id, prepared.user, accumulator.message());
             }
@@ -509,6 +574,231 @@ impl ProviderPort for ProviderAdapter {
     }
 }
 
+/// Provider port that can start unauthenticated and atomically activate later.
+pub struct SwappableProvider {
+    state: RwLock<SwappableState>,
+    history_config: ProviderHistoryConfig,
+    readiness: Arc<DependencyReadiness>,
+    ready_gate: Arc<AtomicBool>,
+}
+
+struct SwappableState {
+    current: Option<Arc<ProviderAdapter>>,
+    default_model: String,
+    role_prompt: String,
+    generation: u64,
+}
+
+impl SwappableProvider {
+    /// Creates an unauthenticated provider slot.
+    #[must_use]
+    pub fn new(
+        default_model: impl Into<String>,
+        role_prompt: impl Into<String>,
+        history_config: ProviderHistoryConfig,
+        readiness: Arc<DependencyReadiness>,
+    ) -> Self {
+        Self {
+            state: RwLock::new(SwappableState {
+                current: None,
+                default_model: default_model.into(),
+                role_prompt: role_prompt.into(),
+                generation: 0,
+            }),
+            history_config,
+            readiness,
+            ready_gate: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Pings and publishes a concrete provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider's typed model-listing failure, an unknown-model
+    /// refusal, or an internal error when the provider slot is poisoned.
+    pub async fn activate(&self, provider: Arc<dyn Provider>) -> Result<(), ProviderError> {
+        loop {
+            let (generation, model, role) = {
+                let state = self.state.read().map_err(|_| provider_slot_error())?;
+                (
+                    state.generation,
+                    state.default_model.clone(),
+                    state.role_prompt.clone(),
+                )
+            };
+            let adapter = Arc::new(ProviderAdapter::new(
+                Arc::clone(&provider),
+                model,
+                role,
+                self.history_config,
+                Arc::clone(&self.readiness),
+                Arc::clone(&self.ready_gate),
+            ));
+            adapter.initialize().await?;
+            let mut state = self.state.write().map_err(|_| provider_slot_error())?;
+            if state.generation != generation {
+                continue;
+            }
+            state.current = Some(adapter);
+            drop(state);
+            return Ok(());
+        }
+    }
+
+    /// Returns whether a provider is currently active.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .current
+            .is_some()
+    }
+
+    /// Returns the active provider identity or the pending state.
+    #[must_use]
+    pub fn provider_name(&self) -> String {
+        self.state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .current
+            .as_ref()
+            .map_or_else(
+                || "device-flow-pending".to_owned(),
+                |provider| provider.provider_name().to_owned(),
+            )
+    }
+
+    /// Returns the selected model.
+    #[must_use]
+    pub fn default_model(&self) -> String {
+        self.state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .default_model
+            .clone()
+    }
+
+    /// Changes the default model, validating it when a provider is active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the active catalogue rejects `model` or a provider
+    /// slot lock is poisoned.
+    pub fn set_default_model(&self, model: &str) -> Result<(), String> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "provider slot is unavailable".to_owned())?;
+        if let Some(provider) = state.current.as_ref() {
+            provider.set_default_model(model)?;
+        }
+        model.clone_into(&mut state.default_model);
+        state.generation = state.generation.saturating_add(1);
+        drop(state);
+        Ok(())
+    }
+
+    /// Replaces the role prompt for the active provider and future activations.
+    pub fn set_role_prompt(&self, prompt: &str) {
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        if let Some(provider) = state.current.as_ref() {
+            provider.set_role_prompt(prompt);
+        }
+        prompt.clone_into(&mut state.role_prompt);
+        state.generation = state.generation.saturating_add(1);
+    }
+
+    /// Publishes provider readiness after every dependent runtime sees activation.
+    pub fn mark_ready(&self) {
+        self.ready_gate.store(true, Ordering::Release);
+        self.readiness.set("provider", true);
+    }
+
+    /// Clears all retained conversation context.
+    pub fn clear_history(&self) {
+        if let Some(provider) = self
+            .state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .current
+            .as_ref()
+        {
+            provider.clear_history();
+        }
+    }
+
+    /// Returns cached model identities from the active provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns unavailable while Device Flow is pending, or the active
+    /// provider's typed cache error.
+    pub fn model_ids(&self) -> Result<Vec<String>, PortError> {
+        self.active()?.model_ids()
+    }
+
+    fn active(&self) -> Result<Arc<ProviderAdapter>, PortError> {
+        self.state
+            .read()
+            .map_err(|_| PortError::new(PortErrorKind::Internal, "provider slot unavailable"))?
+            .current
+            .clone()
+            .ok_or_else(|| {
+                PortError::new(
+                    PortErrorKind::Unavailable,
+                    "provider authentication is pending",
+                )
+            })
+    }
+}
+
+impl std::fmt::Debug for SwappableProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SwappableProvider")
+            .field("provider", &self.provider_name())
+            .field("default_model", &self.default_model())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProviderPort for SwappableProvider {
+    fn models(&self) -> PortFuture<'_, Result<Vec<Model>, PortError>> {
+        let provider = self.active();
+        Box::pin(async move { provider?.models().await })
+    }
+
+    fn generate(
+        &self,
+        request: GenerationRequest,
+        cancellation: CancellationToken,
+    ) -> PortFuture<'_, Result<GenerationOutput, PortError>> {
+        let provider = self.active();
+        Box::pin(async move { provider?.generate(request, cancellation).await })
+    }
+
+    fn stream(
+        &self,
+        request: GenerationRequest,
+        events: mpsc::Sender<GenerationEvent>,
+        cancellation: CancellationToken,
+    ) -> PortFuture<'_, Result<HttpUsage, PortError>> {
+        let provider = self.active();
+        Box::pin(async move { provider?.stream(request, events, cancellation).await })
+    }
+
+    fn embed(
+        &self,
+        request: EmbeddingRequest,
+        cancellation: CancellationToken,
+    ) -> PortFuture<'_, Result<Vec<Vec<f32>>, PortError>> {
+        let provider = self.active();
+        Box::pin(async move { provider?.embed(request, cancellation).await })
+    }
+}
+
 impl ProviderAdapter {
     fn to_completion(&self, request: GenerationRequest) -> Result<PreparedCompletion, PortError> {
         if request.frequency_penalty.is_some_and(|value| value != 0.0)
@@ -534,8 +824,13 @@ impl ProviderAdapter {
             request.model
         };
         let mut messages = Vec::new();
-        if !self.role_prompt.is_empty() {
-            messages.push(ChatMessage::System(self.role_prompt.clone()));
+        let role_prompt = self
+            .role_prompt
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if !role_prompt.is_empty() {
+            messages.push(ChatMessage::System(role_prompt));
         }
         if let Some(instructions) = request.instructions {
             messages.push(ChatMessage::System(instructions));
@@ -639,13 +934,6 @@ impl ProviderAdapter {
     }
 }
 
-fn touch(recency: &mut VecDeque<String>, session_id: &str) {
-    if let Some(position) = recency.iter().position(|candidate| candidate == session_id) {
-        recency.remove(position);
-    }
-    recency.push_back(session_id.to_owned());
-}
-
 fn scaled_thousand(
     value: Option<f64>,
     maximum: f64,
@@ -715,6 +1003,15 @@ fn invalid_request(message: impl Into<String>) -> PortError {
     PortError::new(PortErrorKind::InvalidRequest, message)
 }
 
+fn provider_slot_error() -> ProviderError {
+    ProviderError::new(
+        ErrorKind::Protocol,
+        "daemon",
+        claw_provider_sdk::Operation::ListModels,
+        "provider slot is unavailable",
+    )
+}
+
 /// Result of one transactional configuration reload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppliedReload {
@@ -728,7 +1025,7 @@ pub struct AppliedReload {
 #[derive(Debug)]
 pub struct ConfigController {
     state: Mutex<ConfigState>,
-    provider: Arc<ProviderAdapter>,
+    provider: Arc<SwappableProvider>,
     diagnostics: Arc<Diagnostics>,
 }
 
@@ -743,7 +1040,7 @@ impl ConfigController {
     #[must_use]
     pub fn new(
         initial: ConfigSnapshot,
-        provider: Arc<ProviderAdapter>,
+        provider: Arc<SwappableProvider>,
         diagnostics: Arc<Diagnostics>,
     ) -> Self {
         Self {
@@ -839,6 +1136,9 @@ impl ConfigController {
         {
             state.manager = ReloadManager::new((*previous).clone());
             return Err(format!("reload rolled back: {error}"));
+        }
+        if !outcome.changed_domains.is_empty() {
+            self.provider.clear_history();
         }
         state.generation = state.generation.saturating_add(1);
         let generation = state.generation;
@@ -1084,7 +1384,7 @@ impl OperatorInventory {
 #[derive(Debug)]
 pub struct OperatorAdmin {
     config: Arc<ConfigController>,
-    provider: Arc<ProviderAdapter>,
+    provider: Arc<SwappableProvider>,
     readiness: Arc<DependencyReadiness>,
     diagnostics: Arc<Diagnostics>,
     inventory: OperatorInventory,
@@ -1095,7 +1395,7 @@ impl OperatorAdmin {
     #[must_use]
     pub const fn new(
         config: Arc<ConfigController>,
-        provider: Arc<ProviderAdapter>,
+        provider: Arc<SwappableProvider>,
         readiness: Arc<DependencyReadiness>,
         diagnostics: Arc<Diagnostics>,
         inventory: OperatorInventory,
@@ -1391,8 +1691,8 @@ impl Provider for SmokeProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigController, DependencyReadiness, Diagnostics, ProviderAdapter, SmokeProvider,
-        copilot_request_timeout_ms,
+        ConfigController, DependencyReadiness, Diagnostics, ProviderHistoryConfig, SmokeProvider,
+        SwappableProvider, copilot_request_timeout_ms,
     };
     use std::sync::Arc;
 
@@ -1415,15 +1715,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rejected_reload_restores_the_last_known_good_model() {
+    async fn provider_slot_transitions_from_device_pending_to_live() {
         let readiness = Arc::new(DependencyReadiness::new(["provider"]));
-        let provider = Arc::new(ProviderAdapter::new(
-            Arc::new(SmokeProvider::new().expect("smoke provider")),
+        let provider = SwappableProvider::new(
             "gpt-4o",
             "",
+            ProviderHistoryConfig::default(),
+            Arc::clone(&readiness),
+        );
+
+        assert!(!provider.is_active());
+        assert_eq!(provider.provider_name(), "device-flow-pending");
+        assert!(!readiness.is_ready());
+
+        provider
+            .activate(Arc::new(SmokeProvider::new().expect("smoke provider")))
+            .await
+            .expect("provider activates");
+        provider.mark_ready();
+
+        assert!(provider.is_active());
+        assert_eq!(provider.provider_name(), "smoke");
+        assert!(readiness.is_ready());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_reload_restores_the_last_known_good_model() {
+        let readiness = Arc::new(DependencyReadiness::new(["provider"]));
+        let provider = Arc::new(SwappableProvider::new(
+            "gpt-4o",
+            "",
+            ProviderHistoryConfig::default(),
             Arc::clone(&readiness),
         ));
-        provider.initialize().await.expect("provider starts");
+        provider
+            .activate(Arc::new(SmokeProvider::new().expect("smoke provider")))
+            .await
+            .expect("provider starts");
         let controller = ConfigController::new(
             snapshot("gpt-4o"),
             Arc::clone(&provider),
@@ -1452,13 +1780,16 @@ mod tests {
     #[tokio::test]
     async fn a_timeout_only_reload_is_rejected_instead_of_falsely_committed() {
         let readiness = Arc::new(DependencyReadiness::new(["provider"]));
-        let provider = Arc::new(ProviderAdapter::new(
-            Arc::new(SmokeProvider::new().expect("smoke provider")),
+        let provider = Arc::new(SwappableProvider::new(
             "gpt-4o",
             "",
+            ProviderHistoryConfig::default(),
             Arc::clone(&readiness),
         ));
-        provider.initialize().await.expect("provider starts");
+        provider
+            .activate(Arc::new(SmokeProvider::new().expect("smoke provider")))
+            .await
+            .expect("provider starts");
         let controller = ConfigController::new(
             snapshot_with_timeout("gpt-4o", "120000"),
             provider,
