@@ -769,6 +769,9 @@ fn codex_default_discovery_imports_cli_and_desktop_config_together() {
             .apply(&mut apply, &plan)
             .expect("apply combined Codex sources")
     };
+    // The imported document keeps the member order of the user's original
+    // Codex config (`theme` before `api_token`) instead of re-sorting it, so a
+    // migrated file stays diff-comparable against the source it came from.
     assert_eq!(
         fs::read_to_string(
             target
@@ -778,7 +781,7 @@ fn codex_default_discovery_imports_cli_and_desktop_config_together() {
                 .join("desktop.json"),
         )
         .expect("read desktop config"),
-        "{\n  \"api_token\": \"keyring://gta-claw/codex-desktop-9de92caff5340b4d\",\n  \"theme\": \"dark\"\n}"
+        "{\n  \"theme\": \"dark\",\n  \"api_token\": \"keyring://gta-claw/codex-desktop-9de92caff5340b4d\"\n}"
     );
     assert_eq!(secrets.values.len(), 1);
     let mut rollback = ApplyContext {

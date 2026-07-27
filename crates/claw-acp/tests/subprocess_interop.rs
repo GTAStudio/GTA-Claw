@@ -4,10 +4,11 @@ use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 
 use claw_acp::debug_client::{DebugClient, DebugClientConfig, DebugRunRequest, DenyPermissions};
 use claw_acp::error::AcpInteropError;
-use claw_acp::schema::{
+use claw_acp::schema::ProtocolVersion;
+use claw_acp::schema_v1::{
     ClientCapabilities, ContentBlock, ContentChunk, InitializeRequest, NewSessionRequest,
-    PromptRequest, ProtocolVersion, SessionConfigId, SessionConfigValueId, SessionId,
-    SessionModeId, SessionUpdate, StopReason, TextContent,
+    PromptRequest, SessionConfigId, SessionConfigValueId, SessionId, SessionModeId, SessionUpdate,
+    StopReason, TextContent,
 };
 use serde_json::json;
 use tokio::{

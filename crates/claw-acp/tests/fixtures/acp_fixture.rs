@@ -16,7 +16,7 @@ use std::{
 use claw_acp::bridge::{AcpBackend, AcpBridge, AcpFuture, AcpSessionContext};
 use claw_acp::{
     Error,
-    schema::{
+    schema_v1::{
         AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse,
         ContentBlock, ContentChunk, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
         LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse, PermissionOption,
@@ -189,7 +189,10 @@ impl AcpBackend for FixtureBackend {
         Box::pin(async move {
             if request.session_id.to_string() != "fixture-session"
                 || request.config_id.to_string() != "model"
-                || request.value.to_string() != "fixture-model"
+                || request
+                    .value
+                    .as_value_id()
+                    .is_none_or(|value| value.to_string() != "fixture-model")
             {
                 return Err(Error::invalid_params().data("unexpected configuration request"));
             }

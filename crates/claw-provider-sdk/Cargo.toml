@@ -12,17 +12,17 @@ publish = false
 bytes = "=1.12.1"
 futures-core = "=0.3.33"
 futures-util = { version = "=0.3.33", default-features = false, features = ["std"] }
-http = "=1.4.0"
+http = "=1.4.2"
 http-body-util = "=0.1.4"
 hyper = { version = "=1.11.0", default-features = false, features = ["client", "http1"] }
 hyper-util = { version = "=0.1.20", default-features = false, features = ["client-legacy", "client-proxy", "http1", "tokio"] }
 keyring-core = "=1.0.0"
-rustls = { version = "=0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "=0.8.4"
 rustls-pki-types = "=1.15.1"
 serde.workspace = true
 serde_json.workspace = true
-tokio = { version = "=1.52.3", default-features = false, features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 tower-service = "=0.3.3"
 url = "=2.5.8"
@@ -39,7 +39,7 @@ apple-native-keyring-store = { version = "=1.0.1", default-features = false, fea
 [dev-dependencies]
 futures-util = { version = "=0.3.33", default-features = false, features = ["std"] }
 serde_json.workspace = true
-tokio = { version = "=1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "=1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 url = "=2.5.8"
 
 [lints]

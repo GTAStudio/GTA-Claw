@@ -14,15 +14,15 @@ base64 = "=0.22.1"
 claw-protocol.workspace = true
 claw-security.workspace = true
 futures-core = "=0.3.33"
-http = "=1.4.0"
+http = "=1.4.2"
 ring = "=0.17.14"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 subtle = "=2.6.1"
-tokio = { version = "=1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-stream = "=0.1.18"
-tokio-util = { version = "=0.7.18", features = ["rt"] }
+tokio = { version = "=1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-stream = "=0.1.19"
+tokio-util = { version = "=0.7.19", features = ["rt"] }
 tower-http = { version = "=0.6.8", features = ["cors", "set-header"] }
 url = "=2.5.8"
 

@@ -16,7 +16,7 @@ claw-protocol.workspace = true
 claw-security.workspace = true
 getrandom = { version = "=0.4.3", features = ["sys_rng"] }
 secrecy = "=0.10.3"
-serde_json = { version = "=1.0.150", features = ["raw_value"] }
+serde_json = { version = "=1.0.151", features = ["preserve_order", "raw_value"] }
 slint = { version = "=1.17.1", default-features = false, features = [
   "accessibility",
   "backend-winit-x11",
@@ -25,8 +25,8 @@ slint = { version = "=1.17.1", default-features = false, features = [
   "renderer-software",
   "std",
 ] }
-tokio = { version = "=1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "=0.7.18", features = ["rt"] }
+tokio = { version = "=1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "=0.7.19", features = ["rt"] }
 url = "=2.5.8"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.build-dependencies]

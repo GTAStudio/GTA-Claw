@@ -18,7 +18,7 @@ use claw_acp::{
     },
     debug_client::DebugClientConfig,
     error::{AcpInteropError, Result as AcpResult},
-    schema::{ContentBlock, TextContent},
+    schema_v1::{ContentBlock, TextContent},
 };
 use claw_mcp::registry::{ServerConfig, ServerTransportConfig};
 use serde_json::json;

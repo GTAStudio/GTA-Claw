@@ -9,7 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-agent-client-protocol-schema = { version = "=0.13.5", features = ["unstable_mcp_over_acp"] }
+agent-client-protocol-schema = { version = "=1.6.0", features = ["unstable_mcp_over_acp"] }
 claw-mcp.workspace = true
 process-wrap = { version = "=9.1.0", default-features = false, features = [
   "job-object",
@@ -20,8 +20,8 @@ process-wrap = { version = "=9.1.0", default-features = false, features = [
 serde.workspace = true
 serde_json.workspace = true
 thiserror = "=2.0.19"
-tokio = { version = "=1.52.3", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "=0.7.18", features = ["rt"] }
+tokio = { version = "=1.53.1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "=0.7.19", features = ["rt"] }
 
 [[bin]]
 name = "claw-acp-fixture"

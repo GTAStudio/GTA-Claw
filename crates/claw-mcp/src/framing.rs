@@ -437,9 +437,11 @@ mod tests {
             "params": {}
         });
 
+        // `serde_json` is built with `preserve_order`, so a frame carries the
+        // member order it was constructed with rather than a sorted one.
         assert_eq!(
             encode(&value).expect("encode frame"),
-            br#"{"id":7,"jsonrpc":"2.0","method":"tools/list","params":{}}
+            br#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}
 "#
         );
     }

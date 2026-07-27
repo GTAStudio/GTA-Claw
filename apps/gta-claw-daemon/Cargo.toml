@@ -13,7 +13,7 @@ claw-domain.workspace = true
 claw-platform.workspace = true
 claw-protocol.workspace = true
 secrecy = "=0.10.3"
-tokio = { version = "=1.52.3", features = [
+tokio = { version = "=1.53.1", features = [
   "io-std",
   "io-util",
   "macros",
@@ -22,7 +22,7 @@ tokio = { version = "=1.52.3", features = [
   "sync",
   "time",
 ] }
-tokio-util = { version = "=0.7.18", features = ["rt"] }
+tokio-util = { version = "=0.7.19", features = ["rt"] }
 
 [lints]
 workspace = true

@@ -11,7 +11,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::schema::{
+use crate::schema_v1::{
     ContentBlock, McpServer, McpServerHttp, McpServerSse, McpServerStdio, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
     SessionModeId,
@@ -577,7 +577,7 @@ pub fn mcp_bridge_from_registry(config: &McpServerConfig) -> Result<McpServer> {
                 .env(
                     environment
                         .iter()
-                        .map(|(name, value)| crate::schema::EnvVariable::new(name, value))
+                        .map(|(name, value)| crate::schema_v1::EnvVariable::new(name, value))
                         .collect(),
                 ),
         ),
@@ -607,7 +607,7 @@ fn normalize_name(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{
+    use crate::schema_v1::{
         PermissionOption, PermissionOptionId, PermissionOptionKind, ToolCall, ToolCallId,
     };
 

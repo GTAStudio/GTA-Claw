@@ -23,16 +23,17 @@ use crate::{
     Error,
     error::{AcpInteropError, Result},
     protocol::{RpcPeer, decode, is_response_message, message_parts, read_message, response_id},
-    schema,
-    schema::{
+    schema::ProtocolVersion,
+    schema_v1,
+    schema_v1::{
         CancelNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock,
         InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
         LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse,
-        PromptRequest, PromptResponse, ProtocolVersion, RequestPermissionOutcome,
-        RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
-        ResumeSessionResponse, SessionConfigId, SessionConfigValueId, SessionId, SessionModeId,
-        SessionNotification, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-        SetSessionModeRequest, SetSessionModeResponse,
+        PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
+        RequestPermissionResponse, ResumeSessionRequest, ResumeSessionResponse, SessionConfigId,
+        SessionConfigValueId, SessionId, SessionModeId, SessionNotification,
+        SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+        SetSessionModeResponse,
     },
 };
 
@@ -396,7 +397,7 @@ impl DebugClient {
                 .request(
                     "initialize",
                     InitializeRequest::new(ProtocolVersion::V1).client_info(
-                        schema::Implementation::new(
+                        schema_v1::Implementation::new(
                             "gta-claw-acp-debug",
                             env!("CARGO_PKG_VERSION"),
                         ),

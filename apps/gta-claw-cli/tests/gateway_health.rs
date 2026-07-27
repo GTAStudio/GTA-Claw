@@ -453,23 +453,26 @@ async fn successful_hello_health_is_redacted_deterministic_and_closes_once() {
         .keys()
         .map(String::as_str)
         .collect::<Vec<_>>();
+    // Field order is now the declaration order of the summary struct rather
+    // than an alphabetical accident, so the diagnostic reads top-down: what ran,
+    // how it went, then the connection facts behind that verdict.
     assert_eq!(
         keys,
         [
-            "category",
+            "schema_version",
             "command",
-            "elapsed_ms",
-            "endpoint",
-            "health",
-            "identity",
+            "status",
+            "category",
             "message",
-            "pairing_entry_possible",
+            "endpoint",
             "protocol",
             "role",
-            "schema_version",
             "scopes",
             "server",
-            "status",
+            "health",
+            "elapsed_ms",
+            "identity",
+            "pairing_entry_possible",
         ]
     );
     assert_eq!(summary["category"], "success");

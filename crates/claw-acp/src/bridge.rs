@@ -14,15 +14,15 @@ use tokio::{
 use crate::{
     Error, Result,
     protocol::{RpcPeer, decode, is_response_message, message_parts, read_message, response_id},
-    schema::{
+    schema::ProtocolVersion,
+    schema_v1::{
         AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse,
         Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
         ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-        NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion,
-        RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
-        ResumeSessionResponse, SessionId, SessionNotification, SessionUpdate,
-        SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-        SetSessionModeResponse,
+        NewSessionResponse, PromptRequest, PromptResponse, RequestPermissionRequest,
+        RequestPermissionResponse, ResumeSessionRequest, ResumeSessionResponse, SessionId,
+        SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+        SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
     },
 };
 
