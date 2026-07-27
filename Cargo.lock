@@ -605,6 +605,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-worker"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+ "subtle",
+]
+
+[[package]]
 name = "cobs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
