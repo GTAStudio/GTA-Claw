@@ -1155,10 +1155,21 @@ mod tests {
         assert!(product_shell.contains("accessible-role: list-item"));
         assert!(product_shell.contains("accessible-role: search"));
         assert!(product_shell.contains("event.text == Key.UpArrow"));
-        assert!(product_shell.contains("event.modifiers.meta"));
-        assert!(product_shell.contains("changed palette-open"));
+        assert!(app.contains("application-focus := FocusScope"));
+        assert!(app.contains("event.modifiers.meta"));
+        assert!(app.contains("changed observed-palette-open"));
+        assert!(product_shell.contains("width: max(0px, min(680px"));
+        assert!(product_shell.contains("focus-received =>"));
+        assert!(product_shell.contains("viewport-y"));
         assert!(primitives.contains("in property <bool> focus-on-init"));
         assert!(primitives.contains("intercept-vertical-navigation"));
+        assert!(
+            primitives.contains("if (root.enabled) {\n                    touch-area.clicked();")
+        );
+        assert!(!onboarding.contains("if (root.can-connect && !root.can-retry)"));
+        assert!(!onboarding.contains("if (root.can-retry) : PrimaryButton"));
+        assert!(!onboarding.contains("if (root.can-cancel) : SecondaryButton"));
+        assert!(!onboarding.contains("if (root.can-disconnect) : DangerButton"));
         assert!(build.contains("\"windows\" => \"fluent\""));
         assert!(build.contains("\"macos\" => \"cupertino\""));
     }

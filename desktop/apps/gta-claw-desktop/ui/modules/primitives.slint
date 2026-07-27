@@ -22,11 +22,13 @@ component FocusableClickArea {
 
     focus-scope := FocusScope {
         width: 0px;
-        enabled: root.enabled;
+        focus-on-tab-navigation: root.enabled;
 
         key-pressed(event) => {
             if (event.text == " " || event.text == "\n") {
-                touch-area.clicked();
+                if (root.enabled) {
+                    touch-area.clicked();
+                }
                 return accept;
             }
             return reject;
@@ -49,8 +51,12 @@ export component ActionButton {
     in property <bool> enabled: true;
     in property <bool> checkable: false;
     in property <bool> checked: false;
+    in property <bool> compact: false;
     in property <ButtonTone> tone: ButtonTone.secondary;
     callback clicked;
+    callback focus-received;
+    callback focus-changed(bool);
+    out property <bool> has-focus: interaction.has-focus;
 
     private property <color> base-background: root.tone == ButtonTone.primary
         ? DesignTokens.accent
@@ -64,6 +70,12 @@ export component ActionButton {
     horizontal-stretch: 0;
     vertical-stretch: 0;
     forward-focus: interaction;
+    changed has-focus => {
+        root.focus-changed(root.has-focus);
+        if (root.has-focus) {
+            root.focus-received();
+        }
+    }
 
     accessible-role: button;
     accessible-label: root.accessible-name;
@@ -100,8 +112,8 @@ export component ActionButton {
     }
 
     content := HorizontalLayout {
-        padding-left: Metrics.space-4;
-        padding-right: Metrics.space-4;
+        padding-left: root.compact ? Metrics.space-2 : Metrics.space-4;
+        padding-right: root.compact ? Metrics.space-2 : Metrics.space-4;
         padding-top: Metrics.space-2;
         padding-bottom: Metrics.space-2;
         alignment: center;
@@ -127,7 +139,7 @@ export component ActionButton {
         y: -Metrics.focus-offset;
         width: parent.width + 2 * Metrics.focus-offset;
         height: parent.height + 2 * Metrics.focus-offset;
-        active: interaction.has-focus && root.enabled;
+        active: interaction.has-focus;
     }
 }
 
@@ -173,12 +185,19 @@ export component ToolbarIconButton {
     in property <bool> checkable: false;
     in property <bool> checked: false;
     callback clicked;
+    callback focus-received;
+    out property <bool> has-focus: interaction.has-focus;
 
     width: Metrics.control-medium;
     height: Metrics.control-medium;
     horizontal-stretch: 0;
     vertical-stretch: 0;
     forward-focus: interaction;
+    changed has-focus => {
+        if (root.has-focus) {
+            root.focus-received();
+        }
+    }
 
     accessible-role: button;
     accessible-label: root.accessible-name;
@@ -226,7 +245,7 @@ export component ToolbarIconButton {
         y: -Metrics.focus-offset;
         width: parent.width + 2 * Metrics.focus-offset;
         height: parent.height + 2 * Metrics.focus-offset;
-        active: interaction.has-focus && root.enabled;
+        active: interaction.has-focus;
     }
 }
 
@@ -238,9 +257,16 @@ export component NavigationItem {
     in property <bool> selected: false;
     in property <bool> enabled: true;
     callback clicked;
+    callback focus-received;
+    out property <bool> has-focus: interaction.has-focus;
 
     min-height: max(Metrics.control-large, content.min-height);
     forward-focus: interaction;
+    changed has-focus => {
+        if (root.has-focus) {
+            root.focus-received();
+        }
+    }
 
     accessible-role: button;
     accessible-label: root.accessible-name;
@@ -329,7 +355,7 @@ export component NavigationItem {
         y: -Metrics.focus-offset;
         width: parent.width + 2 * Metrics.focus-offset;
         height: parent.height + 2 * Metrics.focus-offset;
-        active: interaction.has-focus && root.enabled;
+        active: interaction.has-focus;
     }
 }
 
@@ -876,11 +902,15 @@ export component ModalSheetShell {
     in property <bool> compact-content: false;
     callback dismiss-requested;
 
+    min-width: 0px;
+    min-height: 0px;
     forward-focus: dialog-focus;
     accessible-role: region;
     accessible-label: root.title;
 
     dialog-focus := FocusScope {
+        width: 100%;
+        height: 100%;
         focus-on-tab-navigation: false;
         init => {
             if (root.focus-close-on-init) {

@@ -64,6 +64,7 @@ export component AppWindow inherits Window {
     in-out property <bool> consent-checked: false;
     in property <length> layout-width: root.width;
     out property <bool> narrow-layout: root.layout-width < 900px;
+    out property <string> connection-focused-action: "";
     in property <bool> workspace-ready: false;
     in property <int> onboarding-stage: 0;
     in property <int> selected-screen: 0;
@@ -75,6 +76,7 @@ export component AppWindow inherits Window {
     in property <int> palette-command-count: 0;
     in property <int> palette-selected-action-id: -1;
     in property <string> palette-selected-label: "";
+    in-out property <int> palette-focused-command-index: -1;
     out property <[CommandItem]> command-catalog: [
         {
             action-id: 0,
@@ -178,6 +180,7 @@ export component AppWindow inherits Window {
     in property <string> run-page-label: "Page 1 of 1";
     in property <bool> can-previous-run-page: false;
     in property <bool> can-next-run-page: false;
+    in-out property <int> focused-run-index: -1;
     in-out property <ThemeMode> theme-mode <=> VisualPreferences.theme-mode;
     in-out property <bool> high-contrast <=> VisualPreferences.high-contrast;
     in-out property <bool> reduced-motion <=> VisualPreferences.reduced-motion;
@@ -235,6 +238,102 @@ export component AppWindow inherits Window {
         root.endpoint-reset-selector = !root.endpoint-reset-selector;
     }
 
+    application-focus := FocusScope {
+        width: 100%;
+        height: 100%;
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        private property <bool> observed-workspace-ready: root.workspace-ready;
+        private property <int> observed-onboarding-stage: root.onboarding-stage;
+        private property <bool> observed-palette-open: root.palette-open;
+
+        init => { self.focus(); }
+        changed observed-workspace-ready => {
+            root.connection-focused-action = "";
+            self.focus();
+        }
+        changed observed-onboarding-stage => {
+            root.connection-focused-action = "";
+            self.focus();
+        }
+        changed observed-palette-open => {
+            if (!self.observed-palette-open) {
+                self.focus();
+            }
+        }
+
+        key-pressed(event) => {
+            if (root.workspace-ready
+                && (event.text == Key.F1
+                    || ((event.modifiers.control || event.modifiers.meta)
+                        && (event.text == "k" || event.text == "K")))) {
+                root.palette-toggle-requested();
+                return accept;
+            }
+            if (root.workspace-ready
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "1") {
+                root.navigate-requested(0);
+                return accept;
+            }
+            if (root.workspace-ready
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "2") {
+                root.navigate-requested(1);
+                return accept;
+            }
+            if (root.workspace-ready
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "3") {
+                root.navigate-requested(2);
+                return accept;
+            }
+            if (root.workspace-ready
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "4") {
+                root.navigate-requested(3);
+                return accept;
+            }
+            if (root.workspace-ready
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "5") {
+                root.navigate-requested(4);
+                return accept;
+            }
+            if (root.workspace-ready
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "6") {
+                root.navigate-requested(5);
+                return accept;
+            }
+            if (root.workspace-ready
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "7") {
+                root.navigate-requested(6);
+                return accept;
+            }
+            if (event.text == Key.Escape) {
+                if (root.palette-open) {
+                    root.palette-dismiss-requested();
+                    return accept;
+                }
+                if (!root.workspace-ready && root.onboarding-stage > 0
+                    && root.onboarding-stage < 3) {
+                    root.onboarding-stage-requested(root.onboarding-stage - 1);
+                    return accept;
+                }
+                if (!root.workspace-ready && root.onboarding-stage == 3 && root.can-cancel) {
+                    root.cancel-requested();
+                    return accept;
+                }
+                if (!root.workspace-ready && root.onboarding-stage == 3 && root.can-disconnect) {
+                    root.disconnect-requested();
+                    return accept;
+                }
+            }
+            return reject;
+        }
+
     // `if` instead of `visible`: a hidden element still exists, is laid out and
     // keeps its whole subtree alive, so all three surfaces used to be built at
     // startup. `if` builds exactly the surface that is on screen.
@@ -286,9 +385,10 @@ export component AppWindow inherits Window {
         cancel-requested => { root.cancel-requested(); }
         disconnect-requested => { root.disconnect-requested(); }
         error-dismiss-requested => { root.error-dismiss-requested(); }
-        focus-changed(endpoint-focused, token-focused) => {
+        focus-changed(endpoint-focused, token-focused, focused-action) => {
             root.onboarding-endpoint-has-focus = endpoint-focused;
             root.onboarding-token-has-focus = token-focused;
+            root.connection-focused-action = focused-action;
         }
     }
 
@@ -305,6 +405,7 @@ export component AppWindow inherits Window {
         palette-command-count: root.palette-command-count;
         palette-selected-action-id: root.palette-selected-action-id;
         palette-selected-label: root.palette-selected-label;
+        palette-focused-command-index <=> root.palette-focused-command-index;
         diff-mode: root.diff-mode;
         runs: root.runs;
         workspaces: root.workspaces;
@@ -336,6 +437,7 @@ export component AppWindow inherits Window {
         run-page-label: root.run-page-label;
         can-previous-run-page: root.can-previous-run-page;
         can-next-run-page: root.can-next-run-page;
+        focused-run-index <=> root.focused-run-index;
         navigate-requested(index) => { root.navigate-requested(index); }
         palette-toggle-requested => { root.palette-toggle-requested(); }
         palette-dismiss-requested => { root.palette-dismiss-requested(); }
@@ -361,5 +463,6 @@ export component AppWindow inherits Window {
         extension-toggled(index) => { root.extension-toggled(index); }
         deliverable-selected(index) => { root.deliverable-selected(index); }
         deliverable-pin-toggle-requested => { root.deliverable-pin-toggle-requested(); }
+    }
     }
 }

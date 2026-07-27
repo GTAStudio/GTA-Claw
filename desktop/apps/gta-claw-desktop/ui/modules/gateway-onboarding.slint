@@ -94,15 +94,12 @@ component ConnectionForm {
     in-out property <bool> consent-checked;
     in property <bool> busy;
     in property <bool> can-connect;
-    in property <bool> can-cancel;
     in property <bool> can-disconnect;
     in property <bool> can-retry;
     out property <bool> endpoint-has-focus: endpoint-field.has-focus;
     out property <bool> token-has-focus: token-field.has-focus;
     callback connect-requested(string, string, bool);
     callback retry-requested(string, string, bool);
-    callback cancel-requested;
-    callback disconnect-requested;
     // Raised synchronously whenever either field gains or loses focus so an
     // ancestor can mirror `endpoint-has-focus` / `token-has-focus` without
     // holding a reference to this instance.
@@ -202,34 +199,94 @@ component ConnectionForm {
             accessible-name: "Gateway operation in progress";
         }
 
-        HorizontalLayout {
-            spacing: Metrics.space-2;
+    }
+}
 
-            if (root.can-connect && !root.can-retry) : PrimaryButton {
-                text: "Connect";
-                accessible-name: "Connect to Gateway";
-                clicked => { root.submit-form(); }
-            }
+component ConnectionActions {
+    in property <bool> can-connect;
+    in property <bool> can-cancel;
+    in property <bool> can-disconnect;
+    in property <bool> can-retry;
+    out property <string> focused-action: "";
+    callback connect-requested;
+    callback retry-requested;
+    callback cancel-requested;
+    callback disconnect-requested;
+    callback focus-changed;
 
-            if (root.can-retry) : PrimaryButton {
-                text: "Retry";
-                accessible-name: "Retry Gateway connection";
-                clicked => { root.submit-form(); }
-            }
+    function record-action-focus(action: string, focused: bool) {
+        if (focused) {
+            root.focused-action = action;
+        } else if (root.focused-action == action) {
+            root.focused-action = "";
+        }
+        root.focus-changed();
+    }
 
-            if (root.can-cancel) : SecondaryButton {
-                text: "Cancel";
-                accessible-name: "Cancel Gateway connection attempt";
-                clicked => { root.cancel-requested(); }
-            }
+    accessible-role: region;
+    accessible-label: "Gateway connection actions";
+    min-height: actions.min-height;
 
-            if (root.can-disconnect) : DangerButton {
-                text: "Disconnect";
-                accessible-name: "Disconnect from Gateway";
-                clicked => { root.disconnect-requested(); }
-            }
+    Rectangle {
+        background: DesignTokens.surface-pane;
+        border-width: 1px;
+        border-color: DesignTokens.border-default;
+    }
 
-            Rectangle { horizontal-stretch: 1; }
+    actions := GridLayout {
+        padding: Metrics.space-2;
+        spacing: Metrics.space-2;
+
+        PrimaryButton {
+            row: 0;
+            col: 0;
+            min-width: 0px;
+            horizontal-stretch: 1;
+            compact: true;
+            text: "Connect";
+            accessible-name: "Connect to Gateway";
+            enabled: root.can-connect && !root.can-retry;
+            focus-changed(focused) => { root.record-action-focus("Connect", focused); }
+            clicked => { root.connect-requested(); }
+        }
+
+        PrimaryButton {
+            row: 0;
+            col: 1;
+            min-width: 0px;
+            horizontal-stretch: 1;
+            compact: true;
+            text: "Retry";
+            accessible-name: "Retry Gateway connection";
+            enabled: root.can-retry;
+            focus-changed(focused) => { root.record-action-focus("Retry", focused); }
+            clicked => { root.retry-requested(); }
+        }
+
+        SecondaryButton {
+            row: 1;
+            col: 0;
+            min-width: 0px;
+            horizontal-stretch: 1;
+            compact: true;
+            text: "Cancel";
+            accessible-name: "Cancel Gateway connection attempt";
+            enabled: root.can-cancel;
+            focus-changed(focused) => { root.record-action-focus("Cancel", focused); }
+            clicked => { root.cancel-requested(); }
+        }
+
+        DangerButton {
+            row: 1;
+            col: 1;
+            min-width: 0px;
+            horizontal-stretch: 1;
+            compact: true;
+            text: "Disconnect";
+            accessible-name: "Disconnect from Gateway";
+            enabled: root.can-disconnect;
+            focus-changed(focused) => { root.record-action-focus("Disconnect", focused); }
+            clicked => { root.disconnect-requested(); }
         }
     }
 }
@@ -266,13 +323,14 @@ export component GatewayOnboardingSurface inherits FocusScope {
     out property <bool> narrow-layout: root.available-width < 900px;
     out property <bool> endpoint-has-focus: connection-form.endpoint-has-focus;
     out property <bool> token-has-focus: connection-form.token-has-focus;
+    out property <string> focused-action: connection-actions.focused-action;
 
     callback connect-requested(string, string, bool);
     callback retry-requested(string, string, bool);
     callback cancel-requested;
     callback disconnect-requested;
     callback error-dismiss-requested;
-    callback focus-changed(bool, bool);
+    callback focus-changed(bool, bool, string);
 
     // The surface is created on demand, so claim keyboard focus for the Escape
     // handler - unless a field is being restored after a reset.
@@ -370,6 +428,38 @@ export component GatewayOnboardingSurface inherits FocusScope {
             }
         }
 
+        connection-actions := ConnectionActions {
+            width: 100%;
+            vertical-stretch: 0;
+            can-connect: root.can-connect;
+            can-cancel: root.can-cancel;
+            can-disconnect: root.can-disconnect;
+            can-retry: root.can-retry;
+            connect-requested => {
+                root.connect-requested(
+                    root.endpoint-input,
+                    root.token-input,
+                    root.consent-checked
+                );
+            }
+            retry-requested => {
+                root.retry-requested(
+                    root.endpoint-input,
+                    root.token-input,
+                    root.consent-checked
+                );
+            }
+            cancel-requested => { root.cancel-requested(); }
+            disconnect-requested => { root.disconnect-requested(); }
+            focus-changed => {
+                root.focus-changed(
+                    root.endpoint-has-focus,
+                    root.token-has-focus,
+                    self.focused-action
+                );
+            }
+        }
+
         ScrollView {
             vertical-stretch: 1;
             viewport-width: self.width;
@@ -435,7 +525,6 @@ export component GatewayOnboardingSurface inherits FocusScope {
                         consent-checked <=> root.consent-checked;
                         busy: root.busy;
                         can-connect: root.can-connect;
-                        can-cancel: root.can-cancel;
                         can-disconnect: root.can-disconnect;
                         can-retry: root.can-retry;
                         connect-requested(endpoint, token, consent) => {
@@ -444,10 +533,12 @@ export component GatewayOnboardingSurface inherits FocusScope {
                         retry-requested(endpoint, token, consent) => {
                             root.retry-requested(endpoint, token, consent);
                         }
-                        cancel-requested => { root.cancel-requested(); }
-                        disconnect-requested => { root.disconnect-requested(); }
                         focus-changed => {
-                            root.focus-changed(self.endpoint-has-focus, self.token-has-focus);
+                            root.focus-changed(
+                                self.endpoint-has-focus,
+                                self.token-has-focus,
+                                root.focused-action
+                            );
                         }
                     }
 
@@ -476,5 +567,6 @@ export component GatewayOnboardingSurface inherits FocusScope {
                 }
             }
         }
+
     }
 }

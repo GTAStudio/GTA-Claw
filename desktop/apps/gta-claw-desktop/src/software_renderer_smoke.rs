@@ -64,6 +64,14 @@ fn fingerprint(pixels: &[RgbPixel]) -> u64 {
     })
 }
 
+fn changed_pixel_count(before: &[RgbPixel], after: &[RgbPixel]) -> usize {
+    before
+        .iter()
+        .zip(after)
+        .filter(|(before, after)| before != after)
+        .count()
+}
+
 fn model<T: Clone + 'static>(rows: Vec<T>) -> slint::ModelRc<T> {
     Rc::new(slint::VecModel::from(rows)).into()
 }
@@ -75,12 +83,60 @@ fn dispatch_key(app: &AppWindow, text: slint::SharedString) {
         .dispatch_event(slint::platform::WindowEvent::KeyReleased { text });
 }
 
+fn dispatch_modified_key(
+    app: &AppWindow,
+    modifier: slint::platform::Key,
+    text: slint::SharedString,
+) {
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+            text: modifier.into(),
+        });
+    dispatch_key(app, text);
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::KeyReleased {
+            text: modifier.into(),
+        });
+}
+
 fn region(pixels: &[RgbPixel], width: usize, x: usize, y: usize) -> Vec<RgbPixel> {
     pixels
         .chunks_exact(width)
         .skip(y)
         .flat_map(|row| row[x..].iter().copied())
         .collect()
+}
+
+fn render(window: &MinimalSoftwareWindow, width: usize, height: usize) -> Vec<RgbPixel> {
+    window.request_redraw();
+    let mut pixels = vec![RgbPixel::default(); width * height];
+    assert!(window.draw_if_needed(|renderer| {
+        renderer.render(&mut pixels, width);
+    }));
+    pixels
+}
+
+fn tab_until_connection_action(
+    app: &AppWindow,
+    window: &MinimalSoftwareWindow,
+    width: usize,
+    height: usize,
+    target: &str,
+) {
+    let mut previous = render(window, width, height);
+    for _ in 0..16 {
+        dispatch_key(app, slint::platform::Key::Tab.into());
+        let current = render(window, width, height);
+        if app.get_connection_focused_action() == target {
+            assert!(
+                changed_pixel_count(&previous, &current) > 8,
+                "focused {target} action must be visibly revealed"
+            );
+            return;
+        }
+        previous = current;
+    }
+    panic!("{target} action must be keyboard reachable");
 }
 
 #[test]
@@ -364,4 +420,379 @@ fn software_renderer_constructs_onboarding_and_every_product_screen() {
             text: slint::platform::Key::Control.into(),
         });
     assert!(app.get_palette_open());
+}
+
+#[test]
+fn palette_geometry_and_every_tab_stop_are_visible() {
+    const WIDTH: usize = 720;
+    const HEIGHT: usize = 520;
+
+    let software_window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+    slint::platform::set_platform(Box::new(SoftwarePlatform {
+        window: software_window.clone(),
+        started: Instant::now(),
+    }))
+    .expect("install isolated software-renderer platform");
+
+    let app = AppWindow::new().expect("construct the complete external Slint tree");
+    let commands = app.get_command_catalog().iter().collect::<Vec<_>>();
+    app.set_palette_commands(model(commands));
+    app.set_palette_command_count(10);
+    app.set_palette_selected_action_id(0);
+    app.set_palette_selected_label("Go to Focus".into());
+    app.set_workspace_ready(true);
+    app.set_layout_width(f32::from(u16::try_from(WIDTH).expect("logical width")));
+    app.global::<VisualPreferences>().set_density_scale(2.0);
+    software_window.set_size(slint::PhysicalSize::new(
+        u32::try_from(WIDTH).expect("width"),
+        u32::try_from(HEIGHT).expect("height"),
+    ));
+    app.show().expect("show the software-rendered window");
+
+    let closed = render(&software_window, WIDTH, HEIGHT);
+    app.set_palette_open(true);
+    let mut previous = render(&software_window, WIDTH, HEIGHT);
+    assert!(
+        changed_pixel_count(&closed, &previous) > WIDTH * HEIGHT / 8,
+        "opening the palette must paint a full-window scrim and a positive-height sheet"
+    );
+
+    // Search, ten commands, the footer close button, and the title-bar close
+    // button form one complete cycle.
+    for tab_stop in 0..13 {
+        dispatch_key(&app, slint::platform::Key::Tab.into());
+        let current = render(&software_window, WIDTH, HEIGHT);
+        assert!(
+            changed_pixel_count(&previous, &current) > 8,
+            "tab stop {tab_stop} must move a visible focus indicator or scroll the focused row"
+        );
+        if tab_stop < 10 {
+            assert_eq!(
+                app.get_palette_focused_command_index(),
+                tab_stop,
+                "Tab must reach every command row in order, including rows below the viewport"
+            );
+        }
+        previous = current;
+    }
+
+    app.set_palette_open(false);
+    let _ = render(&software_window, WIDTH, HEIGHT);
+    assert!(
+        !software_window.draw_if_needed(|_| panic!("an idle UI must not render continuously")),
+        "the closed, idle palette must remain at zero frames per second"
+    );
+}
+
+#[test]
+fn global_shortcuts_survive_conditional_focus_destruction() {
+    const WIDTH: usize = 720;
+    const HEIGHT: usize = 520;
+
+    let software_window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+    slint::platform::set_platform(Box::new(SoftwarePlatform {
+        window: software_window.clone(),
+        started: Instant::now(),
+    }))
+    .expect("install isolated software-renderer platform");
+
+    let app = AppWindow::new().expect("construct the complete external Slint tree");
+    let commands = app.get_command_catalog().iter().collect::<Vec<_>>();
+    app.set_palette_commands(model(commands));
+    app.set_palette_command_count(10);
+    app.set_palette_selected_action_id(0);
+    app.set_palette_selected_label("Go to Focus".into());
+    app.set_workspace_ready(true);
+    app.set_layout_width(f32::from(u16::try_from(WIDTH).expect("logical width")));
+    software_window.set_size(slint::PhysicalSize::new(
+        u32::try_from(WIDTH).expect("width"),
+        u32::try_from(HEIGHT).expect("height"),
+    ));
+
+    let weak_app = app.as_weak();
+    app.on_palette_toggle_requested(move || {
+        if let Some(app) = weak_app.upgrade() {
+            app.set_palette_open(!app.get_palette_open());
+        }
+    });
+    let weak_app = app.as_weak();
+    app.on_palette_dismiss_requested(move || {
+        if let Some(app) = weak_app.upgrade() {
+            app.set_palette_open(false);
+        }
+    });
+    let weak_app = app.as_weak();
+    app.on_navigate_requested(move |screen| {
+        if let Some(app) = weak_app.upgrade() {
+            app.set_palette_open(false);
+            app.set_selected_screen(screen);
+        }
+    });
+    let weak_app = app.as_weak();
+    app.on_onboarding_stage_requested(move |stage| {
+        if let Some(app) = weak_app.upgrade() {
+            app.set_onboarding_stage(stage);
+        }
+    });
+
+    app.show().expect("show the software-rendered window");
+    let _ = render(&software_window, WIDTH, HEIGHT);
+
+    dispatch_key(&app, slint::platform::Key::F1.into());
+    assert!(app.get_palette_open());
+    dispatch_key(&app, slint::platform::Key::Escape.into());
+    assert!(!app.get_palette_open());
+
+    dispatch_modified_key(&app, slint::platform::Key::Control, "2".into());
+    assert_eq!(app.get_selected_screen(), 1);
+    dispatch_key(&app, slint::platform::Key::F1.into());
+    assert!(
+        app.get_palette_open(),
+        "F1 must survive destruction of the prior screen subtree"
+    );
+    dispatch_key(&app, slint::platform::Key::Escape.into());
+    assert!(!app.get_palette_open());
+
+    dispatch_modified_key(&app, slint::platform::Key::Meta, "7".into());
+    assert_eq!(
+        app.get_selected_screen(),
+        6,
+        "the macOS command modifier must navigate through the persistent host"
+    );
+
+    app.set_workspace_ready(false);
+    app.set_onboarding_stage(0);
+    let _ = render(&software_window, WIDTH, HEIGHT);
+    for _ in 0..4 {
+        dispatch_key(&app, slint::platform::Key::Tab.into());
+        dispatch_key(&app, "\n".into());
+        if app.get_onboarding_stage() == 1 {
+            break;
+        }
+    }
+    assert_eq!(app.get_onboarding_stage(), 1);
+    dispatch_key(&app, slint::platform::Key::Escape.into());
+    assert_eq!(
+        app.get_onboarding_stage(),
+        0,
+        "Escape must work after the focused Continue button is destroyed"
+    );
+
+    app.set_workspace_ready(true);
+    let _ = render(&software_window, WIDTH, HEIGHT);
+    dispatch_key(&app, slint::platform::Key::F1.into());
+    assert!(
+        app.get_palette_open(),
+        "F1 must recover after the first-run surface is destroyed"
+    );
+}
+
+#[test]
+fn tab_focus_scrolls_every_bounded_run_row_into_view() {
+    const WIDTH: usize = 720;
+    const HEIGHT: usize = 520;
+
+    let software_window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+    slint::platform::set_platform(Box::new(SoftwarePlatform {
+        window: software_window.clone(),
+        started: Instant::now(),
+    }))
+    .expect("install isolated software-renderer platform");
+
+    let app = AppWindow::new().expect("construct the complete external Slint tree");
+    app.set_runs(model(
+        (0..24)
+            .map(|index| RunItem {
+                id: format!("run-{index}").into(),
+                title: format!("Keyboard run {index}").into(),
+                workspace: "GTA-Claw".into(),
+                state: "Running".into(),
+                detail: "Verify focus scrolling".into(),
+                updated: "Now".into(),
+                tone: 1,
+            })
+            .collect(),
+    ));
+    app.set_workspace_ready(true);
+    app.set_selected_screen(2);
+    app.set_can_previous_run_page(true);
+    app.set_layout_width(f32::from(u16::try_from(WIDTH).expect("logical width")));
+    software_window.set_size(slint::PhysicalSize::new(
+        u32::try_from(WIDTH).expect("width"),
+        u32::try_from(HEIGHT).expect("height"),
+    ));
+    app.show().expect("show the software-rendered window");
+    let _ = render(&software_window, WIDTH, HEIGHT);
+
+    for _ in 0..32 {
+        dispatch_key(&app, slint::platform::Key::Tab.into());
+        if app.get_focused_run_index() == 0 {
+            break;
+        }
+    }
+    assert_eq!(app.get_focused_run_index(), 0);
+
+    let mut previous = render(&software_window, WIDTH, HEIGHT);
+    for expected_index in 1..24 {
+        dispatch_key(&app, slint::platform::Key::Tab.into());
+        let current = render(&software_window, WIDTH, HEIGHT);
+        assert_eq!(
+            app.get_focused_run_index(),
+            expected_index,
+            "Tab must reach virtualized run row {expected_index}"
+        );
+        assert!(
+            changed_pixel_count(&previous, &current) > 8,
+            "run row {expected_index} must be visibly focused or scroll into view"
+        );
+        previous = current;
+    }
+
+    dispatch_key(&app, slint::platform::Key::Tab.into());
+    let after_list = render(&software_window, WIDTH, HEIGHT);
+    assert!(changed_pixel_count(&previous, &after_list) > 8);
+    dispatch_modified_key(
+        &app,
+        slint::platform::Key::Shift,
+        slint::platform::Key::Tab.into(),
+    );
+    let mut previous = render(&software_window, WIDTH, HEIGHT);
+    assert_eq!(app.get_focused_run_index(), 23);
+    assert!(changed_pixel_count(&after_list, &previous) > 8);
+
+    for expected_index in (0..23).rev() {
+        dispatch_modified_key(
+            &app,
+            slint::platform::Key::Shift,
+            slint::platform::Key::Tab.into(),
+        );
+        let current = render(&software_window, WIDTH, HEIGHT);
+        assert_eq!(
+            app.get_focused_run_index(),
+            expected_index,
+            "Shift+Tab must reach bounded run row {expected_index}"
+        );
+        assert!(
+            changed_pixel_count(&previous, &current) > 8,
+            "run row {expected_index} must visibly scroll back into view"
+        );
+        previous = current;
+    }
+}
+
+#[test]
+fn connection_actions_keep_focus_and_disabled_buttons_consume_activation() {
+    const WIDTH: usize = 900;
+    const HEIGHT: usize = 720;
+
+    let software_window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+    slint::platform::set_platform(Box::new(SoftwarePlatform {
+        window: software_window.clone(),
+        started: Instant::now(),
+    }))
+    .expect("install isolated software-renderer platform");
+
+    let app = AppWindow::new().expect("construct the complete external Slint tree");
+    app.set_workspace_ready(false);
+    app.set_onboarding_stage(3);
+    app.set_can_connect(true);
+    app.set_can_retry(false);
+    app.set_can_cancel(false);
+    app.set_can_disconnect(false);
+    app.set_layout_width(f32::from(u16::try_from(WIDTH).expect("logical width")));
+    app.global::<VisualPreferences>().set_density_scale(2.0);
+    software_window.set_size(slint::PhysicalSize::new(
+        u32::try_from(WIDTH).expect("width"),
+        u32::try_from(HEIGHT).expect("height"),
+    ));
+
+    let connect_count = Rc::new(Cell::new(0));
+    let observed_connects = Rc::clone(&connect_count);
+    let weak_app = app.as_weak();
+    app.on_connect_requested(move |_, _, _| {
+        observed_connects.set(observed_connects.get() + 1);
+        if let Some(app) = weak_app.upgrade() {
+            app.set_can_connect(false);
+            app.set_can_cancel(true);
+            app.set_busy(true);
+        }
+    });
+    let retry_count = Rc::new(Cell::new(0));
+    let observed_retries = Rc::clone(&retry_count);
+    let weak_app = app.as_weak();
+    app.on_retry_requested(move |_, _, _| {
+        observed_retries.set(observed_retries.get() + 1);
+        if let Some(app) = weak_app.upgrade() {
+            app.set_can_retry(false);
+            app.set_can_disconnect(true);
+        }
+    });
+    let cancel_count = Rc::new(Cell::new(0));
+    let observed_cancels = Rc::clone(&cancel_count);
+    let weak_app = app.as_weak();
+    app.on_cancel_requested(move || {
+        observed_cancels.set(observed_cancels.get() + 1);
+        if let Some(app) = weak_app.upgrade() {
+            app.set_busy(false);
+            app.set_can_cancel(false);
+            app.set_can_retry(true);
+        }
+    });
+    let disconnect_count = Rc::new(Cell::new(0));
+    let observed_disconnects = Rc::clone(&disconnect_count);
+    let weak_app = app.as_weak();
+    app.on_disconnect_requested(move || {
+        observed_disconnects.set(observed_disconnects.get() + 1);
+        if let Some(app) = weak_app.upgrade() {
+            app.set_can_disconnect(false);
+            app.set_can_connect(true);
+        }
+    });
+
+    app.show().expect("show the software-rendered window");
+    let _ = render(&software_window, WIDTH, HEIGHT);
+
+    tab_until_connection_action(&app, &software_window, WIDTH, HEIGHT, "Connect");
+    assert_eq!(app.get_connection_focused_action(), "Connect");
+    dispatch_key(&app, "\n".into());
+    assert_eq!(connect_count.get(), 1);
+    assert_eq!(
+        app.get_connection_focused_action(),
+        "Connect",
+        "disabling a retained action must not discard focus"
+    );
+    dispatch_key(&app, " ".into());
+    dispatch_key(&app, "\n".into());
+    assert_eq!(
+        connect_count.get(),
+        1,
+        "a disabled custom control must consume Space and Enter without activation"
+    );
+
+    tab_until_connection_action(&app, &software_window, WIDTH, HEIGHT, "Cancel");
+    assert_eq!(app.get_connection_focused_action(), "Cancel");
+    dispatch_key(&app, "\n".into());
+    assert_eq!(cancel_count.get(), 1);
+    assert_eq!(app.get_connection_focused_action(), "Cancel");
+    dispatch_key(&app, " ".into());
+    dispatch_key(&app, "\n".into());
+    assert_eq!(cancel_count.get(), 1);
+
+    tab_until_connection_action(&app, &software_window, WIDTH, HEIGHT, "Retry");
+    assert_eq!(app.get_connection_focused_action(), "Retry");
+    dispatch_key(&app, "\n".into());
+    assert_eq!(retry_count.get(), 1);
+    assert_eq!(app.get_connection_focused_action(), "Retry");
+    dispatch_key(&app, " ".into());
+    dispatch_key(&app, "\n".into());
+    assert_eq!(retry_count.get(), 1);
+
+    tab_until_connection_action(&app, &software_window, WIDTH, HEIGHT, "Disconnect");
+    assert_eq!(app.get_connection_focused_action(), "Disconnect");
+    dispatch_key(&app, "\n".into());
+    assert_eq!(disconnect_count.get(), 1);
+    assert_eq!(app.get_connection_focused_action(), "Disconnect");
+    dispatch_key(&app, " ".into());
+    dispatch_key(&app, "\n".into());
+    assert_eq!(disconnect_count.get(), 1);
 }
