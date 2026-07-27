@@ -634,10 +634,10 @@ impl ProductState {
                 "Native desktop architecture\n\n• Rust owns application state\n• Slint provides typed presentation adapters\n• Tokio runs Gateway work off the UI thread\n• Approval and diff review remain explicit"
             }
             1 => {
-                "Image preview\n\nSettings screen at 1080 × 720 logical pixels.\nTheme: light · Density: 100% · Accessibility labels: active"
+                "Image preview\n\nSettings screen at 1080 × 720 logical pixels.\nTheme: light · Density: 100% · Accessibility labels included in preview"
             }
             _ => {
-                "{\n  \"gateway\": \"healthy\",\n  \"renderer\": \"software-fallback-ready\",\n  \"accessibility\": \"active\"\n}"
+                "{\n  \"availability\": \"preview-only\",\n  \"gateway\": \"see live connection summary\",\n  \"renderer\": \"not reported\",\n  \"accessibility\": \"use platform inspector\"\n}"
             }
         }
     }
@@ -1008,23 +1008,23 @@ fn demo_workspaces() -> Vec<WorkspaceSummary> {
     vec![
         WorkspaceSummary {
             name: "GTA-Claw".to_owned(),
-            location: r"C:\work\GTA-Claw".to_owned(),
-            kind: "Git repository".to_owned(),
-            branch: "desktop-slint-application".to_owned(),
+            location: "No trusted path loaded".to_owned(),
+            kind: "Preview workspace".to_owned(),
+            branch: "Workspace trust is not composed".to_owned(),
             active_runs: 3,
         },
         WorkspaceSummary {
             name: "Gateway lab".to_owned(),
-            location: r"D:\labs\gateway-double".to_owned(),
-            kind: "Local directory".to_owned(),
-            branch: "Not versioned".to_owned(),
+            location: "No trusted path loaded".to_owned(),
+            kind: "Preview workspace".to_owned(),
+            branch: "Workspace trust is not composed".to_owned(),
             active_runs: 1,
         },
         WorkspaceSummary {
             name: "Release workspace".to_owned(),
-            location: "ssh://builder/release".to_owned(),
-            kind: "Remote workspace".to_owned(),
-            branch: "main".to_owned(),
+            location: "No remote workspace loaded".to_owned(),
+            kind: "Preview workspace".to_owned(),
+            branch: "Remote workspace integration is not composed".to_owned(),
             active_runs: 0,
         },
     ]
@@ -1073,10 +1073,10 @@ fn demo_deliverables() -> Vec<DeliverableSummary> {
             pinned: true,
         },
         DeliverableSummary {
-            name: "diagnostics.json".to_owned(),
+            name: "diagnostic-availability.json".to_owned(),
             kind: "Structured data".to_owned(),
-            source: "Gateway lab".to_owned(),
-            size: "7 KB".to_owned(),
+            source: "Desktop preview".to_owned(),
+            size: "180 B".to_owned(),
             pinned: false,
         },
     ]
@@ -1510,7 +1510,10 @@ mod tests {
         assert!(!state.extensions()[0].enabled);
         assert_eq!(state.selected_deliverable().name, "desktop-architecture.md");
         state.select_deliverable(2);
-        assert_eq!(state.selected_deliverable().name, "diagnostics.json");
+        assert_eq!(
+            state.selected_deliverable().name,
+            "diagnostic-availability.json"
+        );
         assert!(!state.selected_deliverable().pinned);
         state.toggle_selected_deliverable_pin();
         assert!(state.selected_deliverable().pinned);

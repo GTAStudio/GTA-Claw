@@ -117,7 +117,7 @@ Everything below should be read against that fact.
 | `gta-claw-updater` | Implemented | Signed, resumable, rollback-safe update with staged installs and a restart-required outcome. On Linux it refuses and defers to the system package manager. |
 | `gta-claw-android` | Partial | Client core only: endpoint and credential intake, Gateway identity, transport assembly, connection lifecycle. **No Android UI exists in this repository** and cannot, under the trusted supply-chain policy. |
 | `gta-claw-ios` | Partial | Same scope and same constraint. |
-| `gta-claw-desktop` | Partial | A native Slint shell for Windows and macOS with a four-stage onboarding model (welcome, device authorization, workspace trust, Gateway connection) driving a real `claw-gateway-client` connection, plus a product shell. Linux is rejected by design and CI asserts the rejection. |
+| `gta-claw-desktop` | Partial | A native Slint shell for Windows and macOS. The wired path performs a real bounded `claw-gateway-client` connection, authentication, protocol negotiation and health probe. First-run screens explicitly report that desktop device authorization and workspace trust are not composed; they issue no fake code or path. The product shell is preview state, in-app update orchestration is not connected, and desktop diagnostics expose only the live Gateway summary. Linux is rejected by design and CI asserts the rejection. |
 
 ## Legacy replacement obligations
 

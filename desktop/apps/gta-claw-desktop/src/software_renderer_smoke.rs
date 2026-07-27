@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::command_palette::CommandPaletteState;
 use crate::generated_ui::{
     ActivityItem, AppWindow, CommandItem, DeliverableItem, DiffItem, ExtensionItem, FileItem,
-    RunItem, ScheduleItem, TranscriptItem, VisualPreferences, WorkspaceItem,
+    RunItem, ScheduleItem, StatusKind, TranscriptItem, VisualPreferences, WorkspaceItem,
 };
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType, TargetPixel,
@@ -163,9 +163,9 @@ fn software_renderer_constructs_onboarding_and_every_product_screen() {
     }]));
     app.set_workspaces(model(vec![WorkspaceItem {
         name: "GTA-Claw".into(),
-        location: r"C:\work\GTA-Claw".into(),
-        kind: "Git repository".into(),
-        branch: "desktop-slint-application".into(),
+        location: "No trusted path loaded".into(),
+        kind: "Preview workspace".into(),
+        branch: "Workspace trust is not composed".into(),
         active_runs: 1,
     }]));
     app.set_schedules(model(vec![ScheduleItem {
@@ -231,6 +231,14 @@ fn software_renderer_constructs_onboarding_and_every_product_screen() {
     app.set_approval_prompt("Allow this bounded renderer action?".into());
     app.set_approval_scope("run-smoke · no network access".into());
     app.set_question("Continue execution or pause the run?".into());
+    app.set_status_text("Connected".into());
+    app.set_status_label("Gateway status".into());
+    app.set_status_icon("OK".into());
+    app.set_status_kind(StatusKind::Success);
+    app.set_server_summary("Gateway test fixture".into());
+    app.set_role_summary("operator".into());
+    app.set_scopes_summary("operator.read".into());
+    app.set_health_summary("Health RPC returned ok=true".into());
     app.set_layout_width(1080.0);
     software_window.set_size(slint::PhysicalSize::new(1080, 720));
     app.show().expect("show the software-rendered window");
@@ -585,6 +593,50 @@ fn global_shortcuts_survive_conditional_focus_destruction() {
         app.get_palette_open(),
         "F1 must recover after the first-run surface is destroyed"
     );
+}
+
+#[test]
+fn unavailable_first_run_steps_still_reach_the_gateway_with_keys() {
+    const WIDTH: usize = 720;
+    const HEIGHT: usize = 520;
+
+    let software_window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+    slint::platform::set_platform(Box::new(SoftwarePlatform {
+        window: software_window.clone(),
+        started: Instant::now(),
+    }))
+    .expect("install isolated software-renderer platform");
+
+    let app = AppWindow::new().expect("construct the complete external Slint tree");
+    app.set_workspace_ready(false);
+    app.set_onboarding_stage(0);
+    app.set_layout_width(f32::from(u16::try_from(WIDTH).expect("logical width")));
+    software_window.set_size(slint::PhysicalSize::new(
+        u32::try_from(WIDTH).expect("width"),
+        u32::try_from(HEIGHT).expect("height"),
+    ));
+    let weak_app = app.as_weak();
+    app.on_onboarding_stage_requested(move |stage| {
+        if let Some(app) = weak_app.upgrade() {
+            app.set_onboarding_stage(stage);
+        }
+    });
+
+    app.show().expect("show the software-rendered window");
+    for expected_stage in 1..=3 {
+        let _ = render(&software_window, WIDTH, HEIGHT);
+        dispatch_modified_key(
+            &app,
+            slint::platform::Key::Shift,
+            slint::platform::Key::Tab.into(),
+        );
+        dispatch_key(&app, "\n".into());
+        assert_eq!(
+            app.get_onboarding_stage(),
+            expected_stage,
+            "the final action in each honest availability step must advance"
+        );
+    }
 }
 
 #[test]

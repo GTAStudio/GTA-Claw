@@ -733,6 +733,7 @@ export component StatusBadge {
         : (root.kind == StatusKind.warning
             ? "Warning"
             : (root.kind == StatusKind.danger ? "Danger" : (root.kind == StatusKind.info ? "Information" : "Status")));
+    in property <string> accessible-name: root.semantic-label + ": " + root.text + ", symbol " + root.icon-text;
     private property <color> semantic-color: root.kind == StatusKind.success
         ? DesignTokens.success
         : (root.kind == StatusKind.warning
@@ -749,7 +750,7 @@ export component StatusBadge {
     horizontal-stretch: 0;
     vertical-stretch: 0;
     accessible-role: AccessibleRole.text;
-    accessible-label: root.semantic-label + ": " + root.text + ", symbol " + root.icon-text;
+    accessible-label: root.accessible-name;
     accessible-live-region: polite;
 
     Rectangle {

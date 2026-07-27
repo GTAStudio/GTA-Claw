@@ -1175,6 +1175,47 @@ mod tests {
     }
 
     #[test]
+    fn desktop_surfaces_do_not_claim_unwired_backends() {
+        let app = include_str!("../ui/app-window.slint");
+        let first_run = include_str!("../ui/modules/first-run.slint");
+        let onboarding = include_str!("../ui/modules/gateway-onboarding.slint");
+        let product_shell = include_str!("../ui/modules/product-shell.slint");
+        let product_state = include_str!("product_state.rs");
+        let progress = include_str!("../../../../docs/PROGRESS.md");
+
+        for invented_claim in [
+            "GTAC-7K2M",
+            r"C:\work\GTA-Claw",
+            r"D:\labs\gateway-double",
+            "ssh://builder/release",
+            "Gateway healthy",
+            "GTA Claw 0.2.0 is ready",
+            "Signature verified",
+            "A signed native update is available for review.",
+            "4 worker threads",
+            "\"gateway\": \"healthy\"",
+            "software-fallback-ready",
+            "\"accessibility\": \"active\"",
+        ] {
+            assert!(!first_run.contains(invented_claim));
+            assert!(!product_shell.contains(invented_claim));
+            assert!(!product_state.contains(invented_claim));
+        }
+
+        assert!(first_run.contains("@tr(\"Account authorization isn't available\")"));
+        assert!(first_run.contains("@tr(\"Workspace trust isn't available\")"));
+        assert!(onboarding.contains("@tr(\"Desktop device authorization is not composed."));
+        assert!(product_state.contains("\"No trusted path loaded\""));
+        assert!(app.contains("gateway-status-text: root.status-text"));
+        assert!(product_shell.contains("@tr(\"In-app updates are not available\")"));
+        assert!(product_shell.contains("@tr(\"Diagnostic coverage\")"));
+        assert!(app.contains("@tr(\"View update availability\")"));
+        assert!(app.contains("@tr(\"View diagnostic availability\")"));
+        assert!(progress.contains("device authorization and workspace trust are not composed"));
+        assert!(progress.contains("diagnostics expose only the live Gateway summary"));
+    }
+
+    #[test]
     fn palette_actions_reach_primary_and_auxiliary_surfaces() {
         for (action, screen) in [
             (PaletteAction::Focus, 0),

@@ -137,16 +137,16 @@ export component AppWindow inherits Window {
         {
             action-id: 8,
             glyph: "U",
-            title: @tr("Check for updates"),
+            title: @tr("View update availability"),
             detail: @tr("Settings"),
-            keywords: @tr("update upgrade release version"),
+            keywords: @tr("update upgrade release version unavailable guidance"),
         },
         {
             action-id: 9,
             glyph: "H",
-            title: @tr("Open diagnostics"),
+            title: @tr("View diagnostic availability"),
             detail: @tr("Settings"),
-            keywords: @tr("diagnostics health renderer gateway accessibility"),
+            keywords: @tr("diagnostics health renderer gateway accessibility availability"),
         },
     ];
     in property <int> diff-mode: 0;
@@ -438,6 +438,14 @@ export component AppWindow inherits Window {
         can-previous-run-page: root.can-previous-run-page;
         can-next-run-page: root.can-next-run-page;
         focused-run-index <=> root.focused-run-index;
+        gateway-status-text: root.status-text;
+        gateway-status-label: root.status-label;
+        gateway-status-icon: root.status-icon;
+        gateway-status-kind: root.status-kind;
+        gateway-server: root.server-summary;
+        gateway-role: root.role-summary;
+        gateway-scopes: root.scopes-summary;
+        gateway-health: root.health-summary;
         navigate-requested(index) => { root.navigate-requested(index); }
         palette-toggle-requested => { root.palette-toggle-requested(); }
         palette-dismiss-requested => { root.palette-dismiss-requested(); }

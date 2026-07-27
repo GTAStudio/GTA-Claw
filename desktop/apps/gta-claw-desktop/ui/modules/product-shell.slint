@@ -398,8 +398,8 @@ component WorkspacesScreen {
 
             SectionTitle {
                 eyebrow: "WORKSPACES";
-                title: "Places your agents can work";
-                detail: "Local directories, Git repositories, and remote environments with explicit trust.";
+                title: @tr("Workspace previews");
+                detail: @tr("Workspace trust and discovery are not composed. These rows are product previews and do not represent trusted paths.");
             }
 
             for workspace[index] in root.workspaces : Card {
@@ -453,8 +453,8 @@ component WorkspacesScreen {
 
                     Rectangle { horizontal-stretch: 1; }
                     SecondaryButton {
-                        text: "Open";
-                        accessible-name: "Open " + workspace.name;
+                        text: @tr("Open preview");
+                        accessible-name: @tr("Open {} preview", workspace.name);
                         clicked => { root.open-workspace-requested(index); }
                     }
                 }
@@ -786,6 +786,14 @@ component ExtensionsScreen {
 
 component SettingsScreen {
     in property <int> selected-section;
+    in property <string> gateway-status-text;
+    in property <string> gateway-status-label;
+    in property <string> gateway-status-icon;
+    in property <StatusKind> gateway-status-kind;
+    in property <string> gateway-server;
+    in property <string> gateway-role;
+    in property <string> gateway-scopes;
+    in property <string> gateway-health;
     callback section-requested(int);
     callback disconnect-requested;
     callback update-requested;
@@ -887,10 +895,18 @@ component SettingsScreen {
 
                     if (root.selected-section == 0) : VerticalLayout {
                         spacing: Metrics.space-3;
-                        Text { text: "Gateway account"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
-                        Text { text: "Connected as local desktop · read-only health scope"; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
+                        Text { text: @tr("Gateway session"); color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                        StatusBadge {
+                            text: root.gateway-status-text;
+                            semantic-label: root.gateway-status-label;
+                            icon-text: root.gateway-status-icon;
+                            kind: root.gateway-status-kind;
+                        }
+                        Text { text: @tr("Server: {}", root.gateway-server); color: DesignTokens.text-secondary; font-size: Metrics.type-small; wrap: word-wrap; accessible-role: text; }
+                        Text { text: @tr("Role: {} · Effective scopes: {}", root.gateway-role, root.gateway-scopes); color: DesignTokens.text-secondary; font-size: Metrics.type-small; wrap: word-wrap; accessible-role: text; }
+                        Text { text: @tr("Health probe: {}", root.gateway-health); color: DesignTokens.text-muted; font-size: Metrics.type-caption; wrap: word-wrap; accessible-role: text; }
                         DangerButton {
-                            text: "Disconnect Gateway";
+                            text: @tr("Disconnect Gateway");
                             clicked => { root.disconnect-requested(); }
                         }
                     }
@@ -1007,16 +1023,17 @@ component SettingsScreen {
 
                     if (root.selected-section == 6) : VerticalLayout {
                         spacing: Metrics.space-3;
-                        Text { text: "GTA Claw 0.1.0"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
-                        Text { text: "A signed native update is available for review."; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
-                        PrimaryButton { text: "Review update"; clicked => { root.update-requested(); } }
+                        Text { text: @tr("In-app updates are not composed"); color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                        SemanticBadge { text: @tr("Unavailable"); tone: 2; }
+                        Text { text: @tr("This desktop shell does not query a release feed or invoke the native updater. Use your deployment channel to check for a signed release."); color: DesignTokens.text-secondary; font-size: Metrics.type-small; wrap: word-wrap; accessible-role: text; }
+                        PrimaryButton { text: @tr("View update guidance"); clicked => { root.update-requested(); } }
                     }
 
                     if (root.selected-section == 7) : VerticalLayout {
                         spacing: Metrics.space-3;
-                        Text { text: "Diagnostics"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
-                        Text { text: "Gateway transport, renderer, accessibility, policy, and storage checks."; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
-                        PrimaryButton { text: "Open diagnostics"; clicked => { root.diagnostics-requested(); } }
+                        Text { text: @tr("Diagnostic availability"); color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                        Text { text: @tr("The live Gateway connection summary is available. Renderer, accessibility, policy, storage, and worker diagnostics are not wired."); color: DesignTokens.text-secondary; font-size: Metrics.type-small; wrap: word-wrap; accessible-role: text; }
+                        PrimaryButton { text: @tr("View diagnostic availability"); clicked => { root.diagnostics-requested(); } }
                     }
                 }
             }
@@ -1416,25 +1433,20 @@ component UpdateScreen {
             spacing: Metrics.space-4;
 
             SectionTitle {
-                eyebrow: "UPDATE";
-                title: "GTA Claw 0.2.0 is ready";
-                detail: "Review the signed native release before installing.";
+                eyebrow: @tr("UPDATE");
+                title: @tr("In-app updates are not available");
+                detail: @tr("No release feed or updater adapter is connected to this desktop shell.");
             }
             Card {
-                accessible-name: "Update details";
-                SemanticBadge { text: "Signature verified"; tone: 4; }
-                Text { text: "What’s new"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
-                Text { text: "• Faster workspace indexing\n• Improved screen-reader announcements\n• Safer connector permission review\n• Gateway protocol compatibility fixes"; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
+                accessible-name: @tr("Update availability");
+                SemanticBadge { text: @tr("Not composed"); tone: 2; }
+                Text { text: @tr("What you can do"); color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                Text { text: @tr("Check the release source or package channel used to install GTA Claw. Verify the signed artifact there before replacing this build."); color: DesignTokens.text-secondary; font-size: Metrics.type-small; wrap: word-wrap; accessible-role: text; }
                 Divider { }
-                Text { text: "The application will restart after installation. Running sessions remain paused until reconnection."; color: DesignTokens.text-muted; font-size: Metrics.type-caption; wrap: word-wrap; accessible-role: text; }
+                Text { text: @tr("No update was downloaded, verified, staged, or installed by this screen."); color: DesignTokens.text-muted; font-size: Metrics.type-caption; wrap: word-wrap; accessible-role: text; }
                 HorizontalLayout {
                     alignment: end;
-                    SecondaryButton { text: "Back"; clicked => { root.back-requested(); } }
-                    PrimaryButton {
-                        text: "Installer unavailable";
-                        accessible-name: "Installer unavailable in this development build";
-                        enabled: false;
-                    }
+                    SecondaryButton { text: @tr("Back"); clicked => { root.back-requested(); } }
                 }
             }
         }
@@ -1442,6 +1454,12 @@ component UpdateScreen {
 }
 
 component DiagnosticsScreen {
+    in property <string> gateway-status-text;
+    in property <string> gateway-status-label;
+    in property <string> gateway-status-icon;
+    in property <StatusKind> gateway-status-kind;
+    in property <string> gateway-server;
+    in property <string> gateway-health;
     callback back-requested;
 
     accessible-role: main;
@@ -1457,22 +1475,33 @@ component DiagnosticsScreen {
             spacing: Metrics.space-4;
 
             SectionTitle {
-                eyebrow: "DIAGNOSTICS";
-                title: "Desktop health";
-                detail: "Safe summaries only; secrets and raw Gateway payloads are excluded.";
+                eyebrow: @tr("DIAGNOSTICS");
+                title: @tr("Diagnostic coverage");
+                detail: @tr("Only the live Gateway connection summary is wired. Other desktop checks are not composed.");
             }
 
             Card {
-                accessible-name: "Diagnostic checks";
-                HorizontalLayout { Text { text: "Gateway v4 transport"; color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; } Rectangle { horizontal-stretch: 1; } SemanticBadge { text: "Healthy"; tone: 4; } }
-                HorizontalLayout { Text { text: "Slint renderer"; color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; } Rectangle { horizontal-stretch: 1; } SemanticBadge { text: "FemtoVG · software fallback"; tone: 4; } }
-                HorizontalLayout { Text { text: "Accessibility bridge"; color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; } Rectangle { horizontal-stretch: 1; } SemanticBadge { text: "Active"; tone: 4; } }
-                HorizontalLayout { Text { text: "Policy database"; color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; } Rectangle { horizontal-stretch: 1; } SemanticBadge { text: "Current"; tone: 4; } }
-                HorizontalLayout { Text { text: "Background runtime"; color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; } Rectangle { horizontal-stretch: 1; } SemanticBadge { text: "4 worker threads"; tone: 1; } }
+                accessible-name: @tr("Diagnostic availability");
+                HorizontalLayout {
+                    Text { text: @tr("Gateway connection"); color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; }
+                    Rectangle { horizontal-stretch: 1; }
+                    StatusBadge {
+                        text: root.gateway-status-text;
+                        semantic-label: root.gateway-status-label;
+                        icon-text: root.gateway-status-icon;
+                        kind: root.gateway-status-kind;
+                    }
+                }
+                Text { text: @tr("Server: {} · Health probe: {}", root.gateway-server, root.gateway-health); color: DesignTokens.text-secondary; font-size: Metrics.type-caption; wrap: word-wrap; accessible-role: text; }
+                HorizontalLayout { Text { text: @tr("Renderer report"); color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; } Rectangle { horizontal-stretch: 1; } SemanticBadge { text: @tr("Not wired"); tone: 0; } }
+                HorizontalLayout { Text { text: @tr("Accessibility inspection"); color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; } Rectangle { horizontal-stretch: 1; } SemanticBadge { text: @tr("Use OS inspector"); tone: 1; } }
+                HorizontalLayout { Text { text: @tr("Policy and storage checks"); color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; } Rectangle { horizontal-stretch: 1; } SemanticBadge { text: @tr("Not wired"); tone: 0; } }
+                HorizontalLayout { Text { text: @tr("Worker runtime report"); color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; } Rectangle { horizontal-stretch: 1; } SemanticBadge { text: @tr("Not wired"); tone: 0; } }
+                Text { text: @tr("For renderer and accessibility details, use the platform diagnostics and accessibility tools for the running application bundle."); color: DesignTokens.text-muted; font-size: Metrics.type-caption; wrap: word-wrap; accessible-role: text; }
                 Divider { }
                 HorizontalLayout {
                     alignment: end;
-                    SecondaryButton { text: "Back"; clicked => { root.back-requested(); } }
+                    SecondaryButton { text: @tr("Back"); clicked => { root.back-requested(); } }
                 }
             }
         }
@@ -1684,6 +1713,10 @@ component CommandPalette inherits FocusScope {
 component PrimaryNavigation {
     in property <int> selected-screen;
     in property <bool> compact;
+    in property <string> gateway-status-text;
+    in property <string> gateway-status-label;
+    in property <string> gateway-status-icon;
+    in property <StatusKind> gateway-status-kind;
     callback navigate-requested(int);
 
     function reveal-navigation-item(item-y: length, item-height: length) {
@@ -1749,7 +1782,13 @@ component PrimaryNavigation {
                 NavigationItem { glyph: "E"; text: root.compact ? "" : "Extensions"; detail: root.compact ? "" : "Roles and tools"; accessible-name: "Extensions, roles and tools"; selected: root.selected-screen == 5; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.navigate-requested(5); } }
                 Divider { }
                 NavigationItem { glyph: "G"; text: root.compact ? "" : "Settings"; detail: root.compact ? "" : "Preferences"; accessible-name: "Settings, preferences"; selected: root.selected-screen == 6 || root.selected-screen == 8 || root.selected-screen == 9; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.navigate-requested(6); } }
-                SemanticBadge { text: root.compact ? "OK" : "Gateway healthy"; tone: 4; }
+                StatusBadge {
+                    text: root.compact ? "" : root.gateway-status-text;
+                    semantic-label: root.gateway-status-label;
+                    icon-text: root.gateway-status-icon;
+                    accessible-name: @tr("{}: {}", root.gateway-status-label, root.gateway-status-text);
+                    kind: root.gateway-status-kind;
+                }
             }
         }
     }
@@ -1799,6 +1838,14 @@ export component ProductShell inherits FocusScope {
     in property <bool> can-previous-run-page: false;
     in property <bool> can-next-run-page: false;
     in-out property <int> focused-run-index: -1;
+    in property <string> gateway-status-text;
+    in property <string> gateway-status-label;
+    in property <string> gateway-status-icon;
+    in property <StatusKind> gateway-status-kind;
+    in property <string> gateway-server;
+    in property <string> gateway-role;
+    in property <string> gateway-scopes;
+    in property <string> gateway-health;
     out property <bool> compact-navigation: root.available-width < 900px;
 
     callback navigate-requested(int);
@@ -1851,6 +1898,10 @@ export component ProductShell inherits FocusScope {
             horizontal-stretch: 0;
             selected-screen: root.selected-screen;
             compact: root.compact-navigation;
+            gateway-status-text: root.gateway-status-text;
+            gateway-status-label: root.gateway-status-label;
+            gateway-status-icon: root.gateway-status-icon;
+            gateway-status-kind: root.gateway-status-kind;
             navigate-requested(index) => { root.navigate-requested(index); }
         }
 
@@ -1966,6 +2017,14 @@ export component ProductShell inherits FocusScope {
             }
             if (root.selected-screen == 6) : SettingsScreen {
                 selected-section: root.selected-settings-section;
+                gateway-status-text: root.gateway-status-text;
+                gateway-status-label: root.gateway-status-label;
+                gateway-status-icon: root.gateway-status-icon;
+                gateway-status-kind: root.gateway-status-kind;
+                gateway-server: root.gateway-server;
+                gateway-role: root.gateway-role;
+                gateway-scopes: root.gateway-scopes;
+                gateway-health: root.gateway-health;
                 section-requested(index) => { root.settings-section-requested(index); }
                 disconnect-requested => { root.disconnect-requested(); }
                 update-requested => {
@@ -2012,6 +2071,12 @@ export component ProductShell inherits FocusScope {
                 }
             }
             if (root.selected-screen == 9) : DiagnosticsScreen {
+                gateway-status-text: root.gateway-status-text;
+                gateway-status-label: root.gateway-status-label;
+                gateway-status-icon: root.gateway-status-icon;
+                gateway-status-kind: root.gateway-status-kind;
+                gateway-server: root.gateway-server;
+                gateway-health: root.gateway-health;
                 back-requested => {
                     root.back-requested();
                     root.focus();
