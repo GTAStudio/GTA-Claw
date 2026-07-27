@@ -51,12 +51,6 @@ pub struct HttpLimits {
     pub operation_timeout: Duration,
     /// Bounded SSE/provider channel capacity.
     pub stream_buffer: usize,
-    /// Maximum provider events accepted by one streamed response.
-    pub stream_events: usize,
-    /// Maximum bytes accepted in one provider stream event.
-    pub stream_event_bytes: usize,
-    /// Maximum aggregate provider bytes accepted by one streamed response.
-    pub stream_output_bytes: usize,
     /// SSE heartbeat interval.
     pub heartbeat_interval: Duration,
     /// Watch long-poll timeout.
@@ -86,9 +80,6 @@ impl Default for HttpLimits {
             body_timeout: Duration::from_secs(30),
             operation_timeout: Duration::from_mins(2),
             stream_buffer: 16,
-            stream_events: 16_384,
-            stream_event_bytes: 256 * 1024,
-            stream_output_bytes: 8 * 1024 * 1024,
             heartbeat_interval: Duration::from_secs(15),
             watch_poll_timeout: Duration::from_secs(20),
             watch_idle_timeout: Duration::from_secs(75),

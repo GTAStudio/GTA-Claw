@@ -2504,50 +2504,6 @@ async fn draining_rejects_new_main_api_work_before_dispatch() {
 }
 
 #[tokio::test]
-async fn provider_stream_budgets_fail_deterministically_without_unbounded_buffering() {
-    let runtime = DeterministicRuntime::new();
-    runtime
-        .set_output(GenerationOutput {
-            text: "x".repeat(128),
-            tool_calls: Vec::new(),
-            usage: Usage {
-                input_tokens: 1,
-                output_tokens: 128,
-                total_tokens: 129,
-            },
-        })
-        .expect("set oversized stream output");
-    let mut limits = config();
-    limits.limits.stream_event_bytes = 16;
-    limits.limits.stream_output_bytes = 32;
-    limits.limits.stream_events = 2;
-    let server = spawn_with(limits, runtime).await;
-
-    let response = request(
-        &server,
-        "POST",
-        "/v1/chat/completions",
-        Some("operator-token"),
-        &[("Content-Type", "application/json")],
-        &json_body(&json!({
-            "model":"openclaw",
-            "stream":true,
-            "messages":[{"role":"user","content":"overflow"}]
-        })),
-    )
-    .await;
-    assert_eq!(response.status, 200);
-    assert!(
-        response
-            .text()
-            .contains("provider stream exceeded configured limits"),
-        "stream omitted its deterministic budget failure: {}",
-        response.text()
-    );
-    assert!(response.text().contains("[DONE]"));
-}
-
-#[tokio::test]
 async fn watch_session_capacity_evicts_the_oldest_live_node() {
     let runtime = DeterministicRuntime::new();
     let mut watch_config = config();

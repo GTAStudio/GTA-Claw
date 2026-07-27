@@ -19,7 +19,6 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::auth::{Principal, authorize_scope};
-use crate::config::HttpLimits;
 use crate::error::ApiError;
 use crate::http_support::{
     CancelOnDrop, json_response, read_json, read_json_value, rejected_response,
@@ -538,7 +537,6 @@ pub(crate) async fn responses(
 
 fn chat_stream(state: &ApiState, request: GenerationRequest, include_usage: bool) -> Response {
     let capacity = state.inner.config.limits.stream_buffer.max(1);
-    let stream_limits = StreamLimits::from_http(&state.inner.config.limits);
     let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, Infallible>>(capacity);
     let (provider_tx, mut provider_rx) = mpsc::channel::<GenerationEvent>(capacity);
     let cancellation = CancellationToken::new();
@@ -550,13 +548,13 @@ fn chat_stream(state: &ApiState, request: GenerationRequest, include_usage: bool
     let coordinator_cancellation = cancellation.clone();
     tokio::spawn(async move {
         let cancellation = coordinator_cancellation;
-        let provider_task = AbortOnDrop::new(tokio::spawn(async move {
+        let provider_task = tokio::spawn(async move {
             timeout(
                 operation_timeout,
                 provider.stream(stream_request, provider_tx, provider_cancellation),
             )
             .await
-        }));
+        });
         if !send_event(
             &sse_tx,
             json_event(chat_chunk(
@@ -572,29 +570,13 @@ fn chat_stream(state: &ApiState, request: GenerationRequest, include_usage: bool
             return;
         }
         let mut tool_calls = Vec::new();
-        let mut buffered_text = String::new();
-        let mut budget = StreamBudget::new(stream_limits);
+        let mut buffered_text = Vec::new();
         let buffer_until_validation = generation_requires_output_validation(&request);
-        loop {
-            let event = tokio::select! {
-                () = cancellation.cancelled() => return,
-                event = provider_rx.recv() => event,
-            };
-            let Some(event) = event else {
-                break;
-            };
-            if let Err(error) = budget.observe(&event) {
-                cancellation.cancel();
-                let api = provider_api_error(error);
-                if send_event(&sse_tx, json_event(api.body), &cancellation).await {
-                    let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
-                }
-                return;
-            }
+        while let Some(event) = provider_rx.recv().await {
             let value = match event {
                 GenerationEvent::Text(text) => {
                     if buffer_until_validation {
-                        buffered_text.push_str(&text);
+                        buffered_text.push(text);
                         continue;
                     }
                     chat_chunk(&request, created, &json!({"content": text}), &Value::Null)
@@ -628,14 +610,11 @@ fn chat_stream(state: &ApiState, request: GenerationRequest, include_usage: bool
                 return;
             }
         }
-        let provider_result = tokio::select! {
-            () = cancellation.cancelled() => return,
-            result = provider_task => match result {
-                Ok(Ok(Ok(usage))) => Ok(usage),
-                Ok(Ok(Err(error))) => Err(error),
-                Ok(Err(_)) => Err(PortError::new(PortErrorKind::Timeout, "request timed out")),
-                Err(_) => Err(PortError::new(PortErrorKind::Internal, "internal error")),
-            },
+        let provider_result = match provider_task.await {
+            Ok(Ok(Ok(usage))) => Ok(usage),
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Err(_)) => Err(PortError::new(PortErrorKind::Timeout, "request timed out")),
+            Err(_) => Err(PortError::new(PortErrorKind::Internal, "internal error")),
         };
         match provider_result {
             Ok(usage) => {
@@ -648,8 +627,8 @@ fn chat_stream(state: &ApiState, request: GenerationRequest, include_usage: bool
                     return;
                 }
                 let mut output = GenerationOutput {
-                    text: buffered_text,
-                    tool_calls,
+                    text: buffered_text.concat(),
+                    tool_calls: tool_calls.clone(),
                     usage,
                 };
                 if let Err(error) = enforce_output_constraints(&request, &mut output) {
@@ -689,7 +668,7 @@ fn chat_stream(state: &ApiState, request: GenerationRequest, include_usage: bool
                         }
                     }
                 }
-                let finish = if output.tool_calls.is_empty() {
+                let finish = if tool_calls.is_empty() {
                     "stop"
                 } else {
                     "tool_calls"
@@ -745,7 +724,6 @@ fn responses_stream(
     item_id: String,
 ) -> Response {
     let capacity = state.inner.config.limits.stream_buffer.max(1);
-    let stream_limits = StreamLimits::from_http(&state.inner.config.limits);
     let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, Infallible>>(capacity);
     let (provider_tx, mut provider_rx) = mpsc::channel::<GenerationEvent>(capacity);
     let cancellation = CancellationToken::new();
@@ -799,38 +777,17 @@ fn responses_stream(
                 return;
             }
         }
-        let provider_task = AbortOnDrop::new(tokio::spawn(async move {
+        let provider_task = tokio::spawn(async move {
             timeout(
                 operation_timeout,
                 provider.stream(stream_request, provider_tx, provider_cancellation),
             )
             .await
-        }));
+        });
         let mut text = String::new();
         let mut calls = Vec::new();
-        let mut budget = StreamBudget::new(stream_limits);
         let buffer_until_validation = generation_requires_output_validation(&request);
-        loop {
-            let event = tokio::select! {
-                () = cancellation.cancelled() => return,
-                event = provider_rx.recv() => event,
-            };
-            let Some(event) = event else {
-                break;
-            };
-            if let Err(error) = budget.observe(&event) {
-                cancellation.cancel();
-                send_response_failure(
-                    &sse_tx,
-                    &response_id,
-                    &request.model,
-                    error,
-                    Usage::default(),
-                    created,
-                )
-                .await;
-                return;
-            }
+        while let Some(event) = provider_rx.recv().await {
             match event {
                 GenerationEvent::Text(delta) => {
                     text.push_str(&delta);
@@ -895,13 +852,10 @@ fn responses_stream(
                 }
             }
         }
-        let provider_result = tokio::select! {
-            () = cancellation.cancelled() => return,
-            result = provider_task => match result {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err(PortError::new(PortErrorKind::Timeout, "request timed out")),
-                Err(_) => Err(PortError::new(PortErrorKind::Internal, "internal error")),
-            },
+        let provider_result = match provider_task.await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(PortError::new(PortErrorKind::Timeout, "request timed out")),
+            Err(_) => Err(PortError::new(PortErrorKind::Internal, "internal error")),
         };
         let usage = match provider_result {
             Ok(usage) => usage,
@@ -1064,102 +1018,6 @@ fn responses_stream(
     )
 }
 
-#[derive(Clone, Copy)]
-struct StreamLimits {
-    events: usize,
-    event_bytes: usize,
-    output_bytes: usize,
-}
-
-impl StreamLimits {
-    fn from_http(limits: &HttpLimits) -> Self {
-        Self {
-            events: limits.stream_events.max(1),
-            event_bytes: limits.stream_event_bytes.max(1),
-            output_bytes: limits.stream_output_bytes.max(1),
-        }
-    }
-}
-
-struct StreamBudget {
-    limits: StreamLimits,
-    events: usize,
-    bytes: usize,
-}
-
-impl StreamBudget {
-    const fn new(limits: StreamLimits) -> Self {
-        Self {
-            limits,
-            events: 0,
-            bytes: 0,
-        }
-    }
-
-    fn observe(&mut self, event: &GenerationEvent) -> Result<(), PortError> {
-        let event_bytes = match event {
-            GenerationEvent::Text(text) => text.len(),
-            GenerationEvent::ToolCall(call) => call
-                .id
-                .len()
-                .saturating_add(call.name.len())
-                .saturating_add(call.arguments.len()),
-        };
-        let next_events = self.events.saturating_add(1);
-        let next_bytes = self.bytes.saturating_add(event_bytes);
-        if event_bytes > self.limits.event_bytes
-            || next_events > self.limits.events
-            || next_bytes > self.limits.output_bytes
-        {
-            return Err(PortError::new(
-                PortErrorKind::Unavailable,
-                "provider stream exceeded configured limits",
-            ));
-        }
-        self.events = next_events;
-        self.bytes = next_bytes;
-        Ok(())
-    }
-}
-
-struct AbortOnDrop<T> {
-    handle: Option<tokio::task::JoinHandle<T>>,
-}
-
-impl<T> AbortOnDrop<T> {
-    const fn new(handle: tokio::task::JoinHandle<T>) -> Self {
-        Self {
-            handle: Some(handle),
-        }
-    }
-}
-
-impl<T> std::future::Future for AbortOnDrop<T> {
-    type Output = Result<T, tokio::task::JoinError>;
-
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let result = std::future::Future::poll(
-            std::pin::Pin::new(self.handle.as_mut().expect("join handle is present")),
-            context,
-        );
-        if result.is_ready() {
-            self.handle.take();
-        }
-        result
-    }
-}
-
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-        }
-    }
-}
-
 async fn send_event(
     sender: &mpsc::Sender<Result<Event, Infallible>>,
     event: Event,
@@ -1200,7 +1058,8 @@ async fn send_chat_tool_call(
     {
         return false;
     }
-    for delta in ArgumentChunks::new(&call.arguments) {
+    let deltas = split_arguments_for_streaming(&call.arguments);
+    for delta in deltas {
         if !send_event(
             sender,
             json_event(chat_chunk(
@@ -1222,39 +1081,26 @@ async fn send_chat_tool_call(
     true
 }
 
-struct ArgumentChunks<'a> {
-    remaining: &'a str,
-    empty_pending: bool,
-}
-
-impl<'a> ArgumentChunks<'a> {
-    const fn new(arguments: &'a str) -> Self {
-        Self {
-            remaining: arguments,
-            empty_pending: arguments.is_empty(),
-        }
+fn split_arguments_for_streaming(arguments: &str) -> Vec<String> {
+    if arguments.is_empty() {
+        return vec![String::new()];
     }
-}
-
-impl<'a> Iterator for ArgumentChunks<'a> {
-    type Item = &'a str;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining.is_empty() {
-            return self.empty_pending.then(|| {
-                self.empty_pending = false;
-                ""
-            });
+    let mut chunks = Vec::new();
+    let mut chunk = String::new();
+    let mut characters = 0;
+    for character in arguments.chars() {
+        if characters == 256 {
+            chunks.push(chunk);
+            chunk = String::new();
+            characters = 0;
         }
-        let boundary = self
-            .remaining
-            .char_indices()
-            .nth(256)
-            .map_or(self.remaining.len(), |(index, _)| index);
-        let (chunk, remaining) = self.remaining.split_at(boundary);
-        self.remaining = remaining;
-        Some(chunk)
+        chunk.push(character);
+        characters += 1;
     }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
 }
 
 async fn send_response_failure(
