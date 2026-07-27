@@ -44,6 +44,12 @@ impl ManualClock {
     }
 
     /// Advances the clock and returns the new value.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "tests call this for the side effect of moving time forward; the returned \
+                  timestamp is a convenience for the assertions that need it, so requiring \
+                  every caller to bind it would be noise"
+    )]
     pub fn advance(&self, millis: u64) -> u64 {
         self.millis.fetch_add(millis, Ordering::SeqCst) + millis
     }

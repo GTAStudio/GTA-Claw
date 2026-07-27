@@ -6,7 +6,7 @@
 //! *identities*, their authorization classification, and whether they are
 //! advertised. It records no request or response schema. The shapes below are
 //! therefore this crate's design and are **not** claimed to be byte-compatible
-//! with upstream OpenClaw payloads. They are strict: unknown fields are
+//! with upstream `OpenClaw` payloads. They are strict: unknown fields are
 //! rejected and every identity is length-bounded.
 
 mod nodes;

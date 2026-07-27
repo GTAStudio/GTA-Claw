@@ -132,6 +132,15 @@ pub fn event_visibility(event: &str) -> Option<EventVisibility> {
 }
 
 /// Returns every catalogued event identity paired with its visibility policy.
+///
+/// # Panics
+///
+/// Panics when [`claw_protocol::gateway::core_events`] carries an identity that
+/// [`event_visibility`] has no policy for. The two tables are pinned against
+/// each other by `catalog_covers_every_frozen_event_exactly_once`, so this can
+/// only fire if the frozen catalog gains an event and this module is not
+/// updated with it — a missing policy must be a hard failure rather than a
+/// silently unrouted event.
 #[must_use]
 pub fn event_catalog() -> Vec<(&'static str, EventVisibility)> {
     core_events()
@@ -219,7 +228,7 @@ impl TopicFilter {
 
     /// Returns the session allowlist; empty means unrestricted.
     #[must_use]
-    pub fn sessions(&self) -> &BTreeSet<String> {
+    pub const fn sessions(&self) -> &BTreeSet<String> {
         &self.sessions
     }
 
@@ -236,10 +245,9 @@ impl TopicFilter {
         if !subscribed {
             return false;
         }
-        match envelope.session_id() {
-            None => true,
-            Some(session) => self.sessions.is_empty() || self.sessions.contains(session),
-        }
+        envelope
+            .session_id()
+            .is_none_or(|session| self.sessions.is_empty() || self.sessions.contains(session))
     }
 }
 
@@ -340,13 +348,24 @@ pub struct EventDraft {
 impl EventDraft {
     /// Creates a broadcast draft for a catalogued event identity.
     ///
-    /// Fails when the identity is outside the frozen 33-event catalog, when the
-    /// identity is handshake-only, or when the payload cannot be serialized.
+    /// # Errors
+    ///
+    /// Returns [`EventError::UnknownEvent`] when `event` is outside the frozen
+    /// 33-event catalog, [`EventError::HandshakeOnly`] for `connect.challenge`,
+    /// which the pre-authentication handshake writes directly and the bus must
+    /// never fan out, and [`EventError::Encode`] when `payload` does not
+    /// serialize to JSON.
     pub fn broadcast<T: Serialize>(event: &str, payload: &T) -> Result<Self, EventError> {
         Self::build(event, payload, EventAudience::Broadcast)
     }
 
     /// Creates a draft addressed to exactly one connection.
+    ///
+    /// # Errors
+    ///
+    /// The same three failures as [`Self::broadcast`]: an identity outside the
+    /// frozen catalog, the handshake-only identity, or a payload that does not
+    /// serialize to JSON.
     pub fn targeted<T: Serialize>(
         event: &str,
         payload: &T,
@@ -447,6 +466,22 @@ struct LagState {
     queued_bytes: AtomicUsize,
 }
 
+impl LagState {
+    /// Classifies why a closed subscription stopped delivering.
+    ///
+    /// `first_missed` is zero until fan-out records a gap, and
+    /// [`EventSequence`] rejects exactly zero, so the conversion *is* the
+    /// distinction between "closed cleanly" and "closed because it lagged".
+    /// Deriving it this way is what keeps [`EventSubscription::recv`] and
+    /// [`EventSubscription::try_recv`] from disagreeing about a gap.
+    fn terminal_delivery(&self) -> Delivery {
+        EventSequence::new(self.first_missed.load(Ordering::Acquire))
+            .map_or(Delivery::Closed, |first_missed| Delivery::Lagged {
+                first_missed,
+            })
+    }
+}
+
 #[derive(Debug)]
 struct Subscriber {
     id: ConnectionId,
@@ -545,6 +580,12 @@ impl EventBus {
     /// connection whose authorization narrowed stops being *considered* for
     /// events it may no longer see, rather than being handed them and
     /// filtering afterwards.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "this is a mutation whose bool is an optional confirmation that a live \
+                  subscription was found; the connection loop reauthorizes unconditionally and \
+                  has nothing to do with the answer, exactly as for `HashMap::remove`"
+    )]
     pub fn reauthorize(&self, id: ConnectionId, role: Role, scopes: Vec<OperatorScope>) -> bool {
         let mut subscribers = self.subscribers();
         let Some(subscriber) = subscribers
@@ -575,6 +616,13 @@ impl EventBus {
     ///
     /// Fan-out never blocks: a subscriber whose bounded queue would overflow is
     /// recorded as lagging from this ordinal and its subscription is closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the process-wide ordinal counter wraps past `u64::MAX` back
+    /// to zero, which would make the ordinal stream non-monotonic and every
+    /// recorded gap meaningless. At one publication per nanosecond that is
+    /// roughly 585 years of uptime.
     pub fn publish(&self, draft: EventDraft) -> EventSequence {
         let ordinal = self.inner.ordinal.fetch_add(1, Ordering::AcqRel) + 1;
         let ordinal = EventSequence::new(ordinal).expect("bus ordinals start at one");
@@ -685,13 +733,7 @@ impl EventSubscription {
                     .fetch_sub(envelope.encoded_len(), Ordering::AcqRel);
                 Delivery::Event(envelope)
             }
-            None => match self.lag.first_missed.load(Ordering::Acquire) {
-                0 => Delivery::Closed,
-                missed => Delivery::Lagged {
-                    first_missed: EventSequence::new(missed)
-                        .expect("recorded ordinals are always positive"),
-                },
-            },
+            None => self.lag.terminal_delivery(),
         }
     }
 
@@ -709,15 +751,7 @@ impl EventSubscription {
                 Some(Delivery::Event(envelope))
             }
             Err(mpsc::error::TryRecvError::Empty) => None,
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                Some(match self.lag.first_missed.load(Ordering::Acquire) {
-                    0 => Delivery::Closed,
-                    missed => Delivery::Lagged {
-                        first_missed: EventSequence::new(missed)
-                            .expect("recorded ordinals are always positive"),
-                    },
-                })
-            }
+            Err(mpsc::error::TryRecvError::Disconnected) => Some(self.lag.terminal_delivery()),
         }
     }
 }

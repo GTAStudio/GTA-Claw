@@ -702,11 +702,11 @@ async fn broadcast_events_carry_strictly_consecutive_per_connection_sequences() 
     let mut names = Vec::new();
     let mut sequences = Vec::new();
     while sequences.len() < 3 {
-        let event = tokio::time::timeout(Duration::from_secs(5), first_events.recv())
+        let frame = tokio::time::timeout(Duration::from_secs(5), first_events.recv())
             .await
             .expect("events arrive promptly")
-            .expect("the event stream stays open");
-        let frame = event.into_frame();
+            .expect("the event stream stays open")
+            .into_frame();
         sequences.push(
             frame
                 .sequence()
@@ -721,17 +721,16 @@ async fn broadcast_events_carry_strictly_consecutive_per_connection_sequences() 
         "expected the session lifecycle events, saw {names:?}"
     );
 
-    let event = tokio::time::timeout(Duration::from_secs(5), second_events.recv())
+    let sequence = tokio::time::timeout(Duration::from_secs(5), second_events.recv())
         .await
         .expect("events arrive promptly")
-        .expect("the event stream stays open");
+        .expect("the event stream stays open")
+        .into_frame()
+        .sequence()
+        .expect("broadcast events carry a sequence")
+        .get();
     assert_eq!(
-        event
-            .frame()
-            .sequence()
-            .expect("broadcast events carry a sequence")
-            .get(),
-        1,
+        sequence, 1,
         "each connection numbers its own broadcast stream from one"
     );
 
@@ -996,8 +995,7 @@ async fn narrowing_a_grant_takes_the_lost_scope_away_from_an_open_connection() {
         .expect("the server answers");
     let before = response
         .error()
-        .map(|error| error.code.as_str().to_owned())
-        .unwrap_or_else(|| "OK".to_owned());
+        .map_or_else(|| "OK".to_owned(), |error| error.code.as_str().to_owned());
     assert_ne!(
         before, "UNAUTHORIZED",
         "the admin-classified method must be reachable before narrowing"

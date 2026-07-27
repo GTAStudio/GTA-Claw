@@ -43,6 +43,20 @@ impl fmt::Display for ChallengeError {
 impl std::error::Error for ChallengeError {}
 
 /// Issues a fresh `connect.challenge` payload.
+///
+/// # Errors
+///
+/// Returns [`ChallengeError`] when the operating-system random source refuses
+/// to fill the [`CHALLENGE_NONCE_BYTES`] nonce buffer. The handshake has no
+/// fallback for that: a predictable nonce would let a replayed device proof
+/// authenticate, so the connection is refused rather than served with weaker
+/// freshness.
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "the base64url encoding of a fixed 32-byte nonce is always 43 ASCII characters, \
+              which is non-empty and far inside the 64 KiB pre-authentication bound, so the \
+              only fallible construction here cannot fail at runtime"
+)]
 pub fn issue_challenge(clock: &dyn Clock) -> Result<ConnectChallenge, ChallengeError> {
     let mut bytes = [0_u8; CHALLENGE_NONCE_BYTES];
     SystemRandom::new()
@@ -115,7 +129,7 @@ impl Debug for StaticAuthenticator {
             .field("credential", &self.credential)
             .field("paired_devices", &self.devices.len())
             .field("max_signature_age_ms", &self.max_signature_age_ms)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -471,6 +485,7 @@ fn secret_eq(presented: &str, expected: &SecretString) -> bool {
 ///
 /// This is exposed so a pairing workflow can reuse the same strict verification
 /// the connect path uses without duplicating decoding rules.
+#[must_use]
 pub fn verify_pairing_proof(
     public_key: &DevicePublicKey,
     input: HandshakeSigningInput<'_>,

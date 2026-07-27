@@ -107,7 +107,7 @@ pub struct PendingInvocation {
 /// The complete persistence surface required by this Gateway server.
 pub trait GatewayStore: Debug + Send + Sync {
     /// Inserts a session, rejecting duplicate identities.
-    fn create_session<'a>(&'a self, draft: SessionDraft) -> StoreFuture<'a, SessionRecord>;
+    fn create_session(&self, draft: SessionDraft) -> StoreFuture<'_, SessionRecord>;
 
     /// Returns one session by exact identity.
     fn get_session<'a>(&'a self, id: &'a str) -> StoreFuture<'a, Option<SessionRecord>>;
@@ -169,8 +169,12 @@ struct NodeQueue {
 }
 
 impl NodeQueue {
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.pending.len() + self.awaiting_ack.len()
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.awaiting_ack.is_empty()
     }
 }
 
@@ -193,7 +197,7 @@ pub struct InMemoryGatewayStore {
 impl InMemoryGatewayStore {
     /// Creates an adapter with explicit collection bounds.
     #[must_use]
-    pub fn new(max_sessions: usize, max_pending_per_node: usize) -> Self {
+    pub const fn new(max_sessions: usize, max_pending_per_node: usize) -> Self {
         Self {
             state: Mutex::new(StoreState {
                 sessions: BTreeMap::new(),
@@ -213,24 +217,23 @@ impl InMemoryGatewayStore {
     }
 }
 
-fn ready<T>(value: Result<T, StoreError>) -> StoreFuture<'static, T>
-where
-    T: Send + 'static,
-{
-    Box::pin(std::future::ready(value))
-}
-
-impl GatewayStore for InMemoryGatewayStore {
-    fn create_session<'a>(&'a self, draft: SessionDraft) -> StoreFuture<'a, SessionRecord> {
+/// The synchronous half of every [`GatewayStore`] operation.
+///
+/// Each method below is the entire critical section, so the boxed future the
+/// port returns is allocated only after the guard has been released. Doing the
+/// allocation inside the lock would serialise every connection behind one
+/// process-wide allocator call for no benefit.
+impl InMemoryGatewayStore {
+    fn insert_session(&self, draft: SessionDraft) -> Result<SessionRecord, StoreError> {
         let mut state = self.lock();
         if state.sessions.contains_key(&draft.id) {
-            return ready(Err(StoreError::Conflict { id: draft.id }));
+            return Err(StoreError::Conflict { id: draft.id });
         }
         if state.sessions.len() >= self.max_sessions {
-            return ready(Err(StoreError::CapacityExceeded {
+            return Err(StoreError::CapacityExceeded {
                 collection: "sessions",
                 limit: self.max_sessions,
-            }));
+            });
         }
         let record = SessionRecord {
             id: draft.id.clone(),
@@ -242,26 +245,21 @@ impl GatewayStore for InMemoryGatewayStore {
             archived: false,
         };
         state.sessions.insert(draft.id, record.clone());
-        ready(Ok(record))
+        drop(state);
+        Ok(record)
     }
 
-    fn get_session<'a>(&'a self, id: &'a str) -> StoreFuture<'a, Option<SessionRecord>> {
-        ready(Ok(self.lock().sessions.get(id).cloned()))
+    fn read_session(&self, id: &str) -> Option<SessionRecord> {
+        self.lock().sessions.get(id).cloned()
     }
 
-    fn list_sessions(&self) -> StoreFuture<'_, Vec<SessionRecord>> {
-        ready(Ok(self.lock().sessions.values().cloned().collect()))
+    fn read_sessions(&self) -> Vec<SessionRecord> {
+        self.lock().sessions.values().cloned().collect()
     }
 
-    fn patch_session<'a>(
-        &'a self,
-        id: &'a str,
-        patch: SessionPatch,
-    ) -> StoreFuture<'a, Option<SessionRecord>> {
+    fn apply_patch(&self, id: &str, patch: SessionPatch) -> Option<SessionRecord> {
         let mut state = self.lock();
-        let Some(record) = state.sessions.get_mut(id) else {
-            return ready(Ok(None));
-        };
+        let record = state.sessions.get_mut(id)?;
         if let Some(title) = patch.title {
             record.title = title;
         }
@@ -270,48 +268,52 @@ impl GatewayStore for InMemoryGatewayStore {
         }
         record.updated_at_ms = patch.updated_at_ms;
         record.revision = record.revision.saturating_add(1);
-        ready(Ok(Some(record.clone())))
+        let patched = record.clone();
+        drop(state);
+        Some(patched)
     }
 
-    fn delete_session<'a>(&'a self, id: &'a str) -> StoreFuture<'a, bool> {
-        ready(Ok(self.lock().sessions.remove(id).is_some()))
+    fn remove_session(&self, id: &str) -> bool {
+        self.lock().sessions.remove(id).is_some()
     }
 
-    fn record_heartbeat(&self, record: HeartbeatRecord) -> StoreFuture<'_, ()> {
+    fn store_heartbeat(&self, record: HeartbeatRecord) {
         let mut state = self.lock();
         if state.heartbeats_enabled {
             state.heartbeat = Some(record);
         }
-        ready(Ok(()))
     }
 
-    fn last_heartbeat(&self) -> StoreFuture<'_, Option<HeartbeatRecord>> {
-        ready(Ok(self.lock().heartbeat.clone()))
+    fn read_heartbeat(&self) -> Option<HeartbeatRecord> {
+        self.lock().heartbeat.clone()
     }
 
-    fn set_heartbeats_enabled(&self, enabled: bool) -> StoreFuture<'_, bool> {
+    fn toggle_heartbeats(&self, enabled: bool) -> bool {
         let mut state = self.lock();
         let previous = state.heartbeats_enabled;
         state.heartbeats_enabled = enabled;
-        ready(Ok(previous))
+        drop(state);
+        previous
     }
 
-    fn heartbeats_enabled(&self) -> StoreFuture<'_, bool> {
-        ready(Ok(self.lock().heartbeats_enabled))
+    fn read_heartbeats_enabled(&self) -> bool {
+        self.lock().heartbeats_enabled
     }
 
-    fn enqueue_pending<'a>(
-        &'a self,
-        node_id: &'a str,
+    fn push_pending(
+        &self,
+        node_id: &str,
         invocation: PendingInvocation,
-    ) -> StoreFuture<'a, usize> {
+    ) -> Result<usize, StoreError> {
         let mut state = self.lock();
         let queue = state.nodes.entry(node_id.to_owned()).or_default();
         if queue.len() >= self.max_pending_per_node {
-            return ready(Err(StoreError::CapacityExceeded {
+            let limit = self.max_pending_per_node;
+            Self::forget_empty(&mut state, node_id);
+            return Err(StoreError::CapacityExceeded {
                 collection: "node.pending",
-                limit: self.max_pending_per_node,
-            }));
+                limit,
+            });
         }
         if queue
             .pending
@@ -319,11 +321,129 @@ impl GatewayStore for InMemoryGatewayStore {
             .chain(queue.awaiting_ack.iter())
             .any(|existing| existing.id == invocation.id)
         {
-            return ready(Err(StoreError::Conflict { id: invocation.id }));
+            let id = invocation.id;
+            Self::forget_empty(&mut state, node_id);
+            return Err(StoreError::Conflict { id });
         }
         queue.pending.push(invocation);
         let depth = queue.len();
-        ready(Ok(depth))
+        drop(state);
+        Ok(depth)
+    }
+
+    fn take_pending(&self, node_id: &str, max: usize) -> Vec<PendingInvocation> {
+        let mut state = self.lock();
+        let Some(queue) = state.nodes.get_mut(node_id) else {
+            return Vec::new();
+        };
+        let count = max.min(queue.pending.len());
+        let pulled: Vec<PendingInvocation> = queue.pending.drain(..count).collect();
+        queue.awaiting_ack.extend(pulled.iter().cloned());
+        Self::forget_empty(&mut state, node_id);
+        drop(state);
+        pulled
+    }
+
+    fn acknowledge_pending(&self, node_id: &str, invocation_id: &str) -> bool {
+        let mut state = self.lock();
+        let Some(queue) = state.nodes.get_mut(node_id) else {
+            return false;
+        };
+        let Some(index) = queue
+            .awaiting_ack
+            .iter()
+            .position(|invocation| invocation.id == invocation_id)
+        else {
+            Self::forget_empty(&mut state, node_id);
+            return false;
+        };
+        queue.awaiting_ack.remove(index);
+        Self::forget_empty(&mut state, node_id);
+        drop(state);
+        true
+    }
+
+    fn take_all_pending(&self, node_id: &str) -> Vec<PendingInvocation> {
+        let mut state = self.lock();
+        let Some(queue) = state.nodes.get_mut(node_id) else {
+            return Vec::new();
+        };
+        let mut drained = std::mem::take(&mut queue.pending);
+        drained.append(&mut queue.awaiting_ack);
+        Self::forget_empty(&mut state, node_id);
+        drop(state);
+        drained
+    }
+
+    /// Drops a node's queue once it holds nothing.
+    ///
+    /// Node identities are verified device identities, so they are attacker
+    /// influenced and unbounded over the process lifetime. Without this the map
+    /// would keep one empty entry per node that ever enqueued — including the
+    /// entry `entry().or_default()` creates for a call that is then refused —
+    /// and nothing would ever remove them.
+    fn forget_empty(state: &mut StoreState, node_id: &str) {
+        if state.nodes.get(node_id).is_some_and(NodeQueue::is_empty) {
+            state.nodes.remove(node_id);
+        }
+    }
+}
+
+fn ready<T>(value: Result<T, StoreError>) -> StoreFuture<'static, T>
+where
+    T: Send + 'static,
+{
+    Box::pin(std::future::ready(value))
+}
+
+impl GatewayStore for InMemoryGatewayStore {
+    fn create_session(&self, draft: SessionDraft) -> StoreFuture<'_, SessionRecord> {
+        ready(self.insert_session(draft))
+    }
+
+    fn get_session<'a>(&'a self, id: &'a str) -> StoreFuture<'a, Option<SessionRecord>> {
+        ready(Ok(self.read_session(id)))
+    }
+
+    fn list_sessions(&self) -> StoreFuture<'_, Vec<SessionRecord>> {
+        ready(Ok(self.read_sessions()))
+    }
+
+    fn patch_session<'a>(
+        &'a self,
+        id: &'a str,
+        patch: SessionPatch,
+    ) -> StoreFuture<'a, Option<SessionRecord>> {
+        ready(Ok(self.apply_patch(id, patch)))
+    }
+
+    fn delete_session<'a>(&'a self, id: &'a str) -> StoreFuture<'a, bool> {
+        ready(Ok(self.remove_session(id)))
+    }
+
+    fn record_heartbeat(&self, record: HeartbeatRecord) -> StoreFuture<'_, ()> {
+        self.store_heartbeat(record);
+        ready(Ok(()))
+    }
+
+    fn last_heartbeat(&self) -> StoreFuture<'_, Option<HeartbeatRecord>> {
+        ready(Ok(self.read_heartbeat()))
+    }
+
+    fn set_heartbeats_enabled(&self, enabled: bool) -> StoreFuture<'_, bool> {
+        ready(Ok(self.toggle_heartbeats(enabled)))
+    }
+
+    fn heartbeats_enabled(&self) -> StoreFuture<'_, bool> {
+        ready(Ok(self.read_heartbeats_enabled()))
+    }
+
+    fn enqueue_pending<'a>(
+        &'a self,
+        node_id: &'a str,
+        invocation: PendingInvocation,
+    ) -> StoreFuture<'a, usize> {
+        ready(self.push_pending(node_id, invocation))
     }
 
     fn pull_pending<'a>(
@@ -331,14 +451,7 @@ impl GatewayStore for InMemoryGatewayStore {
         node_id: &'a str,
         max: usize,
     ) -> StoreFuture<'a, Vec<PendingInvocation>> {
-        let mut state = self.lock();
-        let Some(queue) = state.nodes.get_mut(node_id) else {
-            return ready(Ok(Vec::new()));
-        };
-        let count = max.min(queue.pending.len());
-        let pulled: Vec<PendingInvocation> = queue.pending.drain(..count).collect();
-        queue.awaiting_ack.extend(pulled.iter().cloned());
-        ready(Ok(pulled))
+        ready(Ok(self.take_pending(node_id, max)))
     }
 
     fn ack_pending<'a>(
@@ -346,29 +459,11 @@ impl GatewayStore for InMemoryGatewayStore {
         node_id: &'a str,
         invocation_id: &'a str,
     ) -> StoreFuture<'a, bool> {
-        let mut state = self.lock();
-        let Some(queue) = state.nodes.get_mut(node_id) else {
-            return ready(Ok(false));
-        };
-        let Some(index) = queue
-            .awaiting_ack
-            .iter()
-            .position(|invocation| invocation.id == invocation_id)
-        else {
-            return ready(Ok(false));
-        };
-        queue.awaiting_ack.remove(index);
-        ready(Ok(true))
+        ready(Ok(self.acknowledge_pending(node_id, invocation_id)))
     }
 
     fn drain_pending<'a>(&'a self, node_id: &'a str) -> StoreFuture<'a, Vec<PendingInvocation>> {
-        let mut state = self.lock();
-        let Some(queue) = state.nodes.get_mut(node_id) else {
-            return ready(Ok(Vec::new()));
-        };
-        let mut drained = std::mem::take(&mut queue.pending);
-        drained.append(&mut queue.awaiting_ack);
-        ready(Ok(drained))
+        ready(Ok(self.take_all_pending(node_id)))
     }
 }
 

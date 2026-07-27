@@ -189,7 +189,7 @@ impl ConnectionClose {
 
     /// Returns the short close reason sent alongside the close code.
     #[must_use]
-    pub fn close_reason(&self) -> &str {
+    pub const fn close_reason(&self) -> &str {
         match self {
             Self::PeerClosed => "peer closed",
             Self::ServerShutdown => "server shutdown",

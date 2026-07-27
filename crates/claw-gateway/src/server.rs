@@ -245,13 +245,12 @@ impl BoundServer {
         });
 
         let accept_permits = Arc::clone(&permits);
-        let accept_shutdown = shutdown_rx.clone();
         let acceptor = tokio::spawn(accept_loop(
             listener,
             services,
             accept_permits,
             quiesce_rx,
-            accept_shutdown,
+            shutdown_rx,
             accepting_tx,
             timeouts.close,
         ));

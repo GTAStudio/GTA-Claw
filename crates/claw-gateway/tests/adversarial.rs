@@ -68,7 +68,7 @@ fn fast_config() -> GatewayServerConfig {
         limits: ServerLimits::default(),
         timeouts: ServerTimeouts {
             // Long enough that a healthy handshake never races the timer.
-            tick_interval: Duration::from_secs(3600),
+            tick_interval: Duration::from_hours(1),
             ..ServerTimeouts::default()
         },
         exposure: Exposure::LoopbackOnly,

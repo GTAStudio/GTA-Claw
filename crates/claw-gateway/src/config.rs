@@ -146,6 +146,16 @@ impl Default for GatewayServerConfig {
 
 impl GatewayServerConfig {
     /// Validates every bound and returns the checked, immutable configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigurationError::ZeroLimit`] naming the limit that was
+    /// zero, [`ConfigurationError::LimitAboveTransportCap`] when
+    /// `event_queue_bytes` exceeds the authenticated frame cap or
+    /// `max_http_upgrade_bytes` exceeds the pre-authentication frame cap,
+    /// [`ConfigurationError::ZeroTimeout`] naming the timeout that was zero, or
+    /// [`ConfigurationError::InvalidServerVersion`] when `server_version` is
+    /// empty or longer than [`MAX_SERVER_VERSION_BYTES`].
     pub fn validate(self) -> Result<ValidatedConfig, ConfigurationError> {
         self.limits.validate()?;
         self.timeouts.validate()?;
