@@ -337,7 +337,7 @@ fn inbound_is_delivered_only_to_the_account_that_owns_it() {
         router
             .route_inbound(&inbound("discord", "primary", "hello"))
             .err(),
-        Some(RoutingError::InboundUnsupported)
+        Some(RoutingError::UnroutedAccount)
     );
     assert_eq!(
         router
@@ -389,10 +389,22 @@ fn inbound_is_refused_for_every_frozen_channel_without_an_inbound_implementation
         }
     }
 
-    assert_eq!(inbound_capable, BTreeSet::from(["qa-channel"]));
+    assert_eq!(
+        inbound_capable,
+        BTreeSet::from(["discord", "msteams", "qa-channel", "telegram", "whatsapp"])
+    );
     assert_eq!(
         outbound_capable,
-        BTreeSet::from(["discord", "googlechat", "mattermost", "qa-channel", "slack"])
+        BTreeSet::from([
+            "discord",
+            "googlechat",
+            "mattermost",
+            "msteams",
+            "qa-channel",
+            "slack",
+            "telegram",
+            "whatsapp"
+        ])
     );
     assert_eq!(
         exchange_support("not-a-channel"),

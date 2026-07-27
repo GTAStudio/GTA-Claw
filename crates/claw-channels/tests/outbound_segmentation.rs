@@ -21,9 +21,9 @@ use claw_channels::{
 
 /// Every limit this repository can prove, and nothing else.
 ///
-/// `msteams`, `telegram` and `whatsapp` appear here as metadata only: the
-/// legacy program states their limits, so modelling them is honest, but this
-/// crate has no transport for them and they stay `RegistrationOnly`.
+/// `msteams`, `telegram` and `whatsapp` retain the same proven limits when
+/// compatibility transports are enabled; transport coverage and limit
+/// provenance remain independent registry facts.
 const PROVEN_LIMITS: [(&str, u32); 4] = [
     ("discord", 1900),
     ("msteams", 4000),
@@ -146,17 +146,26 @@ fn declared_limits_count_utf16_code_units_like_the_legacy_call_sites() {
 }
 
 #[test]
-fn a_declared_limit_does_not_promote_a_registration_only_channel() {
+fn proven_limits_survive_compatibility_transport_promotion() {
     for id in ["msteams", "telegram", "whatsapp"] {
         let entry = descriptor(id).expect("registered channel");
 
         assert!(entry.output_limit.is_some(), "{id}");
         assert_eq!(
             entry.implementation,
-            ImplementationStatus::RegistrationOnly,
+            ImplementationStatus::CompatibilityShim,
             "{id}"
         );
-        assert!(entry.capabilities.is_empty(), "{id}");
+        assert!(
+            entry.capabilities.contains(&ChannelCapability::InboundText),
+            "{id}"
+        );
+        assert!(
+            entry
+                .capabilities
+                .contains(&ChannelCapability::OutboundText),
+            "{id}"
+        );
     }
 }
 

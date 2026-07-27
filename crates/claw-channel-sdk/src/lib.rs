@@ -23,8 +23,8 @@ pub use commands::{
     MAX_COMMAND_MENTION_CHARS, MAX_COMMAND_NAME_CHARS, parse_command,
 };
 pub use lifecycle::{
-    ChannelSession, ConnectionState, ConnectionSupervisor, IllegalTransition, LifecycleEvent,
-    LifecycleObserver,
+    ChannelSession, ConnectionState, ConnectionStateMachine, ConnectionSupervisor,
+    IllegalTransition, LifecycleEvent, LifecycleObserver,
 };
 pub use segmentation::{LengthUnit, OutputLimit, SegmentationError, segment_text};
 
@@ -338,6 +338,8 @@ pub enum CredentialKind {
     Token,
     /// Incoming webhook URL, treated as a credential because it embeds a secret.
     WebhookUrl,
+    /// Secret used to verify an inbound webhook challenge or signature.
+    WebhookSecret,
     /// OAuth client secret.
     ClientSecret,
     /// Password or application password.
@@ -577,6 +579,24 @@ impl ApprovedOrigin {
     #[must_use]
     pub fn as_str(&self) -> String {
         self.origin.as_str()
+    }
+
+    /// Returns the exact channel identifier this origin was enrolled for.
+    #[must_use]
+    pub fn channel_id(&self) -> &str {
+        &self.channel_id
+    }
+
+    /// Returns the exact account identifier this origin was enrolled for.
+    #[must_use]
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    /// Returns the canonical network origin.
+    #[must_use]
+    pub const fn network_origin(&self) -> &NetworkOrigin {
+        &self.origin
     }
 }
 
@@ -1117,6 +1137,8 @@ pub enum ProtocolErrorKind {
     MissingField,
     /// Response field has an invalid value.
     InvalidField,
+    /// Response body exceeds the adapter's bounded parsing limit.
+    PayloadTooLarge,
 }
 
 /// Operation not supported by an adapter.

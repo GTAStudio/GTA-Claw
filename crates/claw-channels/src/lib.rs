@@ -22,18 +22,57 @@ use claw_channel_sdk::{
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 
+mod bounded;
 pub mod commands;
+pub mod diagnostics;
+pub mod discord;
 pub mod lifecycle;
+pub mod message_processor;
 pub mod routing;
+pub mod teams;
+pub mod telegram;
+pub mod transport;
+pub mod whatsapp;
 
 pub use commands::{
     InboundOutcome, classify_inbound, command_registry, command_surface, help_text,
 };
+pub use diagnostics::{DiagnosticCode, DiagnosticLevel, DiagnosticSink, OperatorDiagnostic};
+pub use discord::{
+    DISCORD_CLIENT_LABEL, DISCORD_RECONNECT_DELAY, DISCORD_SEND_REQUEST_TIMEOUT, DiscordChannel,
+    DiscordCreateMessageRequest, DiscordGatewayPhase, DiscordGatewayRequest, DiscordPacketOutcome,
+    DiscordTransport,
+};
 pub use lifecycle::SupervisedChannel;
+pub use message_processor::{
+    ALREADY_AUTHENTICATED_REPLY, AuthenticationPrompt, COMMAND_REJECTED_REPLY,
+    COMMON_DISPATCH_POLICY, COMMON_FAILURE_REPLY, COMMON_UNCONFIGURED_REPLY, ConversationService,
+    DispatchInput, DispatchOutcome, DispatchPolicy, ReplySource, TEAMS_DISPATCH_POLICY,
+    TEAMS_FAILURE_REPLY, TEAMS_UNCONFIGURED_REPLY, dispatch_incoming,
+};
 pub use routing::{ChannelRouter, ExchangeSupport, RouterError, RoutingError, exchange_support};
+pub use teams::{
+    TEAMS_GREETING, TeamsAction, TeamsActivityError, TeamsActivityHandler, TeamsActivityOutcome,
+};
+pub use telegram::{
+    TELEGRAM_LONG_POLL_TIMEOUT, TELEGRAM_POLL_REQUEST_TIMEOUT, TELEGRAM_SEND_REQUEST_TIMEOUT,
+    TelegramChannel, TelegramPollRequest, TelegramPollStats, TelegramSendRequest,
+    TelegramTransport,
+};
+pub use transport::{MAX_PROVIDER_RESPONSE_BYTES, ProviderResponse};
+pub use whatsapp::{
+    WHATSAPP_GRAPH_API_VERSION, WHATSAPP_SEND_REQUEST_TIMEOUT, WhatsAppChannel,
+    WhatsAppSendRequest, WhatsAppTransport, WhatsAppVerificationQuery,
+    WhatsAppVerificationResponse, WhatsAppWebhookHandling, WhatsAppWebhookResponse,
+    WhatsAppWebhookStats,
+};
 
 const CATALOG_PATH: &str = "scripts/lib/official-external-channel-catalog.json";
 const TEXT_OUT: &[ChannelCapability] = &[ChannelCapability::OutboundText];
+const TEXT_IO: &[ChannelCapability] = &[
+    ChannelCapability::InboundText,
+    ChannelCapability::OutboundText,
+];
 const QA_CAPABILITIES: &[ChannelCapability] = &[
     ChannelCapability::InboundText,
     ChannelCapability::OutboundText,
@@ -42,6 +81,7 @@ const NO_CAPABILITIES: &[ChannelCapability] = &[];
 const ACCESS_TOKEN: &[AuthMode] = &[AuthMode::AccessToken];
 const APP_CREDENTIALS: &[AuthMode] = &[AuthMode::AppCredentials];
 const BOT_TOKEN: &[AuthMode] = &[AuthMode::BotToken];
+const BOT_TOKEN_AND_WEBHOOK_URL: &[AuthMode] = &[AuthMode::BotToken, AuthMode::WebhookUrl];
 const BOT_TOKEN_AND_PASSWORD: &[AuthMode] = &[AuthMode::BotToken, AuthMode::Password];
 const BOT_TOKEN_AND_WEBHOOK: &[AuthMode] = &[AuthMode::BotToken, AuthMode::WebhookSecret];
 const EXTERNAL_PLUGIN: &[AuthMode] = &[AuthMode::ExternalPlugin];
@@ -51,6 +91,11 @@ const OAUTH2: &[AuthMode] = &[AuthMode::OAuth2];
 const OPTIONAL_PASSWORD: &[AuthMode] = &[AuthMode::OptionalPassword];
 const PASSWORD: &[AuthMode] = &[AuthMode::Password];
 const PLATFORM_SESSION: &[AuthMode] = &[AuthMode::PlatformSession];
+const WHATSAPP_AUTH: &[AuthMode] = &[
+    AuthMode::PlatformSession,
+    AuthMode::AccessToken,
+    AuthMode::WebhookSecret,
+];
 const PRIVATE_KEY: &[AuthMode] = &[AuthMode::PrivateKey];
 const PROFILE: &[AuthMode] = &[AuthMode::Profile];
 const TOKEN_AND_WEBHOOK: &[AuthMode] = &[AuthMode::AccessToken, AuthMode::WebhookSecret];
@@ -143,6 +188,9 @@ pub enum ImplementationStatus {
     /// Outbound text works through the generic webhook adapter; inbound and
     /// richer provider behavior remain unimplemented.
     OutboundWebhook,
+    /// Legacy production behavior is implemented behind daemon-owned transport
+    /// and HTTP composition ports.
+    CompatibilityShim,
     /// Identity, provenance, and auth metadata only.
     RegistrationOnly,
 }
@@ -265,8 +313,8 @@ static REGISTRY: [ChannelDescriptor; 29] = [
     source_channel!(
         "msteams",
         APP_CREDENTIALS,
-        NO_CAPABILITIES,
-        ImplementationStatus::RegistrationOnly,
+        TEXT_IO,
+        ImplementationStatus::CompatibilityShim,
         declared_limit(4000)
     ),
     source_channel!(
@@ -356,9 +404,9 @@ static REGISTRY: [ChannelDescriptor; 29] = [
     ),
     source_channel!(
         "discord",
-        WEBHOOK_URL,
-        TEXT_OUT,
-        ImplementationStatus::OutboundWebhook,
+        BOT_TOKEN_AND_WEBHOOK_URL,
+        TEXT_IO,
+        ImplementationStatus::CompatibilityShim,
         declared_limit(1900)
     ),
     source_channel!(
@@ -398,16 +446,16 @@ static REGISTRY: [ChannelDescriptor; 29] = [
     ),
     source_channel!(
         "whatsapp",
-        PLATFORM_SESSION,
-        NO_CAPABILITIES,
-        ImplementationStatus::RegistrationOnly,
+        WHATSAPP_AUTH,
+        TEXT_IO,
+        ImplementationStatus::CompatibilityShim,
         declared_limit(3500)
     ),
     source_only_channel!(
         "telegram",
         BOT_TOKEN,
-        NO_CAPABILITIES,
-        ImplementationStatus::RegistrationOnly,
+        TEXT_IO,
+        ImplementationStatus::CompatibilityShim,
         declared_limit(4000)
     ),
     source_channel!(
@@ -918,7 +966,7 @@ impl Serialize for WebhookPayload<'_> {
     }
 }
 
-fn invalid_routing_identifier(value: &str) -> bool {
+pub(crate) fn invalid_routing_identifier(value: &str) -> bool {
     value.is_empty()
         || value.len() > 256
         || value.trim() != value

@@ -167,9 +167,53 @@ impl LifecycleObserver for () {
 }
 
 /// Drives one channel session through connect, reconnect and shutdown.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectionStateMachine {
+    state: ConnectionState,
+}
+
+impl ConnectionStateMachine {
+    /// Creates a disconnected state machine.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            state: ConnectionState::Disconnected,
+        }
+    }
+
+    /// Returns the current connection state.
+    #[must_use]
+    pub const fn state(self) -> ConnectionState {
+        self.state
+    }
+
+    /// Applies one event and reports the accepted transition.
+    ///
+    /// Event-driven transports such as WebSocket gateways use this directly,
+    /// while blocking transports use [`ConnectionSupervisor`]. Both therefore
+    /// share one transition table and one observer contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Lifecycle`] when `event` is illegal in the
+    /// current state. The state and observer are left untouched.
+    pub fn apply(
+        &mut self,
+        event: LifecycleEvent,
+        observer: &mut impl LifecycleObserver,
+    ) -> Result<(), ChannelError> {
+        let from = self.state;
+        let to = from.apply(event).map_err(ChannelError::Lifecycle)?;
+        self.state = to;
+        observer.on_transition(from, event, to);
+        Ok(())
+    }
+}
+
+/// Drives one blocking channel session through connect, reconnect and shutdown.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectionSupervisor {
-    state: ConnectionState,
+    lifecycle: ConnectionStateMachine,
     policy: RetryPolicy,
 }
 
@@ -178,7 +222,7 @@ impl ConnectionSupervisor {
     #[must_use]
     pub const fn new(policy: RetryPolicy) -> Self {
         Self {
-            state: ConnectionState::Disconnected,
+            lifecycle: ConnectionStateMachine::new(),
             policy,
         }
     }
@@ -186,7 +230,7 @@ impl ConnectionSupervisor {
     /// Returns the current connection state.
     #[must_use]
     pub const fn state(&self) -> ConnectionState {
-        self.state
+        self.lifecycle.state()
     }
 
     /// Opens a session, retrying transient failures with bounded backoff.
@@ -297,11 +341,7 @@ impl ConnectionSupervisor {
         event: LifecycleEvent,
         observer: &mut impl LifecycleObserver,
     ) -> Result<(), ChannelError> {
-        let from = self.state;
-        let to = from.apply(event).map_err(ChannelError::Lifecycle)?;
-        self.state = to;
-        observer.on_transition(from, event, to);
-        Ok(())
+        self.lifecycle.apply(event, observer)
     }
 }
 

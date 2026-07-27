@@ -124,6 +124,16 @@ fn executable_capabilities_are_never_claimed_by_registration_only_entries() {
         ]
     );
     assert_eq!(qa.implementation, ImplementationStatus::Full);
+
+    let compatibility_shims = registry()
+        .iter()
+        .filter(|entry| entry.implementation == ImplementationStatus::CompatibilityShim)
+        .map(|entry| entry.id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        compatibility_shims,
+        BTreeSet::from(["discord", "msteams", "telegram", "whatsapp"])
+    );
 }
 
 #[test]
@@ -154,7 +164,7 @@ fn declared_auth_policy_covers_frozen_channel_ids_exactly() {
             vec![AuthMode::BotToken, AuthMode::Password],
         ),
         ("slack", vec![AuthMode::WebhookUrl]),
-        ("discord", vec![AuthMode::WebhookUrl]),
+        ("discord", vec![AuthMode::BotToken, AuthMode::WebhookUrl]),
         ("twitch", vec![AuthMode::OAuth2]),
         ("openclaw-zaloclawbot", vec![AuthMode::ExternalPlugin]),
         (
@@ -164,7 +174,14 @@ fn declared_auth_policy_covers_frozen_channel_ids_exactly() {
         ("raft", vec![AuthMode::Profile]),
         ("tlon", vec![AuthMode::Password]),
         ("nostr", vec![AuthMode::PrivateKey]),
-        ("whatsapp", vec![AuthMode::PlatformSession]),
+        (
+            "whatsapp",
+            vec![
+                AuthMode::PlatformSession,
+                AuthMode::AccessToken,
+                AuthMode::WebhookSecret,
+            ],
+        ),
         ("telegram", vec![AuthMode::BotToken]),
         ("qqbot", vec![AuthMode::AppCredentials]),
         ("irc", vec![AuthMode::OptionalPassword]),

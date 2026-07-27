@@ -246,7 +246,9 @@ fn webhook_authentication_failure_is_typed_and_body_free() {
 fn every_partial_webhook_adapter_completes_against_a_local_server() {
     let registered = registry()
         .iter()
-        .filter(|entry| entry.implementation == ImplementationStatus::OutboundWebhook)
+        .filter(|entry| {
+            entry.implementation == ImplementationStatus::OutboundWebhook || entry.id == "discord"
+        })
         .map(|entry| entry.id)
         .collect::<std::collections::BTreeSet<_>>();
     let exercised = FIXTURE_WEBHOOK_CASES
@@ -292,11 +294,10 @@ fn assert_retry_capability_matches_runtime(
 #[test]
 fn executable_channel_advertisements_match_runtime_controls() {
     let rendered = Rc::new(RefCell::new(Vec::new()));
-    for entry in registry()
-        .iter()
-        .filter(|entry| entry.implementation == ImplementationStatus::OutboundWebhook)
-    {
-        assert_eq!(entry.auth_modes, &[AuthMode::WebhookUrl]);
+    for entry in registry().iter().filter(|entry| {
+        entry.implementation == ImplementationStatus::OutboundWebhook || entry.id == "discord"
+    }) {
+        assert!(entry.auth_modes.contains(&AuthMode::WebhookUrl));
         let transport = InspectingTransport {
             rendered: Rc::clone(&rendered),
         };
@@ -355,10 +356,9 @@ fn executable_channel_advertisements_match_runtime_controls() {
 #[test]
 fn outbound_webhook_rejects_a_conversation_mismatch_before_transport() {
     let rendered = Rc::new(RefCell::new(Vec::new()));
-    for entry in registry()
-        .iter()
-        .filter(|entry| entry.implementation == ImplementationStatus::OutboundWebhook)
-    {
+    for entry in registry().iter().filter(|entry| {
+        entry.implementation == ImplementationStatus::OutboundWebhook || entry.id == "discord"
+    }) {
         let transport = InspectingTransport {
             rendered: Rc::clone(&rendered),
         };
@@ -398,10 +398,9 @@ fn outbound_webhooks_do_not_retry_ambiguous_failures() {
         NonZeroU32::new(2).expect("non-zero"),
     )
     .expect("valid retry policy");
-    for entry in registry()
-        .iter()
-        .filter(|entry| entry.implementation == ImplementationStatus::OutboundWebhook)
-    {
+    for entry in registry().iter().filter(|entry| {
+        entry.implementation == ImplementationStatus::OutboundWebhook || entry.id == "discord"
+    }) {
         let calls = Rc::new(Cell::new(0));
         let transport = FailingTransport {
             calls: Rc::clone(&calls),
