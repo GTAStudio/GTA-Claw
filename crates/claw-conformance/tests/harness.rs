@@ -335,6 +335,106 @@ fn mutate_json(path: &Path, mutate: impl FnOnce(&mut serde_json::Value)) {
     .expect("write JSON fixture");
 }
 
+/// Mutable ledger files carried by the frozen contract, in canonical order.
+const MUTABLE_LEDGERS: [&str; 3] = [
+    "gateway-core.json",
+    "official-integration.json",
+    "official-client-interop.json",
+];
+
+/// The frozen known difference every `unimplemented` row must carry.
+const BASELINE_KNOWN_DIFFERENCE: &str = "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StatusTotals {
+    unimplemented: usize,
+    partial: usize,
+    implemented: usize,
+}
+
+impl StatusTotals {
+    const fn rows(self) -> usize {
+        self.unimplemented + self.partial + self.implemented
+    }
+}
+
+fn read_json(path: &Path) -> serde_json::Value {
+    let source = fs::read_to_string(path).expect("read JSON fixture");
+    serde_json::from_str(source.trim_start_matches('\u{feff}')).expect("parse JSON fixture")
+}
+
+/// Status totals derived from the ledger rows the fixture actually carries.
+///
+/// The upstream ledgers are mutable, so fixtures must never hard-code a baseline
+/// distribution: doing so turns every legitimate ledger transition into an unrelated
+/// harness failure.
+fn ledger_status_totals(root: &Path) -> StatusTotals {
+    let mut totals = StatusTotals {
+        unimplemented: 0,
+        partial: 0,
+        implemented: 0,
+    };
+    for ledger in MUTABLE_LEDGERS {
+        let document = read_json(&root.join("ledgers").join(ledger));
+        for feature in document["features"].as_array().expect("ledger features") {
+            match feature["status"].as_str().expect("ledger feature status") {
+                "unimplemented" => totals.unimplemented += 1,
+                "partial" => totals.partial += 1,
+                "implemented" => totals.implemented += 1,
+                other => panic!("unexpected ledger status {other}"),
+            }
+        }
+    }
+    totals
+}
+
+fn set_manifest_status_totals(root: &Path, totals: StatusTotals) {
+    mutate_json(&root.join("manifest.json"), |manifest| {
+        manifest["evidence_policy"]["status_totals"] = serde_json::json!({
+            "unimplemented": totals.unimplemented,
+            "partial": totals.partial,
+            "implemented": totals.implemented
+        });
+    });
+}
+
+/// Guarantees the fixture holds a valid `unimplemented` row and returns its index and ID.
+///
+/// The first row already in that status is reused when one exists. When every row has
+/// transitioned away from the baseline, the first row is rewritten back into a frozen
+/// baseline row so the mutation under test still exercises the unimplemented rules on
+/// any ledger distribution.
+fn seed_unimplemented_feature(root: &Path, ledger: &str) -> (usize, String) {
+    let mut seeded = (0, String::new());
+    mutate_json(&root.join("ledgers").join(ledger), |document| {
+        let features = document["features"]
+            .as_array_mut()
+            .expect("ledger features array");
+        let index = features
+            .iter()
+            .position(|feature| feature["status"] == serde_json::json!("unimplemented"))
+            .unwrap_or(0);
+        let feature = &mut features[index];
+        feature["status"] = serde_json::json!("unimplemented");
+        feature["acceptance_evidence"]["status"] = serde_json::json!("missing");
+        feature["acceptance_evidence"]["artifacts"] = serde_json::json!([]);
+        feature["known_differences"] = serde_json::json!([BASELINE_KNOWN_DIFFERENCE]);
+        feature
+            .as_object_mut()
+            .expect("ledger feature object")
+            .remove("implementation_pointers");
+        seeded = (
+            index,
+            feature["feature_id"]
+                .as_str()
+                .expect("ledger feature id")
+                .to_owned(),
+        );
+    });
+    set_manifest_status_totals(root, ledger_status_totals(root));
+    seeded
+}
+
 fn enable_transition_policy(root: &Path, unimplemented: usize, partial: usize, implemented: usize) {
     let schema = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -354,6 +454,18 @@ fn enable_transition_policy(root: &Path, unimplemented: usize, partial: usize, i
             "implemented": implemented
         });
     });
+}
+
+/// Installs the transition policy with the status totals the fixture's rows actually carry.
+fn enable_transition_policy_for_fixture(root: &Path) -> StatusTotals {
+    let totals = ledger_status_totals(root);
+    enable_transition_policy(
+        root,
+        totals.unimplemented,
+        totals.partial,
+        totals.implemented,
+    );
+    totals
 }
 
 fn install_legacy_schema_and_policy(root: &Path) {
@@ -1476,22 +1588,15 @@ fn renamed_inventory_id_is_rejected_as_drift() {
 #[test]
 fn raised_ledger_status_without_evidence_is_rejected() {
     let fixture = Fixture::copy_upstream();
+    let (index, feature_id) = seed_unimplemented_feature(&fixture.root, "gateway-core.json");
     let path = fixture.root.join("ledgers").join("gateway-core.json");
-    let source = fs::read_to_string(&path).expect("read ledger");
-    assert_eq!(source.matches("\"status\":  \"unimplemented\"").count(), 16);
-    fs::write(
-        &path,
-        source.replacen(
-            "\"status\":  \"unimplemented\"",
-            "\"status\":  \"implemented\"",
-            1,
-        ),
-    )
-    .expect("mutate ledger");
+    mutate_json(&path, |ledger| {
+        ledger["features"][index]["status"] = serde_json::json!("implemented");
+    });
 
     let error = load_error(&fixture.root);
     assert_eq!(error.code(), ViolationCode::LedgerEvidence);
-    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.subject(), Some(feature_id.as_str()));
     assert_eq!(error.json_path(), None);
     assert_eq!(
         error.message(),
@@ -1502,7 +1607,6 @@ fn raised_ledger_status_without_evidence_is_rejected() {
 #[test]
 fn legitimate_ledger_transitions_do_not_require_frozen_hashes() {
     let fixture = Fixture::copy_upstream();
-    enable_transition_policy(&fixture.root, 37, 1, 9);
     let tests = fixture
         .root
         .join("crates")
@@ -1540,7 +1644,19 @@ fn legitimate_ledger_transitions_do_not_require_frozen_hashes() {
             "test": "accepts_node_v3"
         }]);
         features[1]["known_differences"] = serde_json::json!(["No known differences."]);
+        features[1]["implementation_pointers"] = serde_json::json!([{
+            "path": "crates/claw-gateway/src/protocol.rs",
+            "note": "Defines the Rust protocol version."
+        }]);
     });
+    // The transition policy has to be derived after the rows are rewritten so the declared
+    // totals always describe the mutated ledger instead of an assumed baseline.
+    let totals = enable_transition_policy_for_fixture(&fixture.root);
+    assert_eq!(totals.rows(), 47);
+    assert!(
+        totals.partial >= 1 && totals.implemented >= 1,
+        "the fixture must actually carry the transitioned rows under test"
+    );
     let validator = fixture.root.join("validate.ps1");
     let mut validator_source = fs::read_to_string(&validator).expect("read validator");
     validator_source.push_str("\n# Transition command fixture\n");
@@ -1599,7 +1715,8 @@ fn legacy_schema_cannot_authorize_a_ledger_transition() {
 #[test]
 fn transition_manifest_policy_and_status_totals_are_accepted() {
     let fixture = Fixture::copy_upstream();
-    enable_transition_policy(&fixture.root, 39, 0, 8);
+    let totals = enable_transition_policy_for_fixture(&fixture.root);
+    assert_eq!(totals.rows(), 47);
 
     let contract = Contract::load(&fixture.root).expect("load transition manifest");
     assert_eq!(contract.ledgers().len(), 3);
@@ -1616,7 +1733,13 @@ fn transition_manifest_policy_and_status_totals_are_accepted() {
 #[test]
 fn transition_manifest_status_totals_must_match_ledgers() {
     let fixture = Fixture::copy_upstream();
-    enable_transition_policy(&fixture.root, 38, 1, 8);
+    let totals = ledger_status_totals(&fixture.root);
+    enable_transition_policy(
+        &fixture.root,
+        totals.unimplemented + 1,
+        totals.partial,
+        totals.implemented,
+    );
 
     let error = load_error(&fixture.root);
     assert_eq!(error.code(), ViolationCode::ManifestDrift);
@@ -1809,10 +1932,11 @@ fn blank_ledger_evidence_requirement_is_rejected() {
 #[test]
 fn unimplemented_ledger_status_rejects_populated_evidence() {
     let fixture = Fixture::copy_upstream();
+    let (index, feature_id) = seed_unimplemented_feature(&fixture.root, "gateway-core.json");
     let path = fixture.root.join("ledgers").join("gateway-core.json");
     mutate_json(&path, |ledger| {
-        ledger["features"][0]["acceptance_evidence"]["status"] = serde_json::json!("partial");
-        ledger["features"][0]["acceptance_evidence"]["artifacts"] = serde_json::json!([{
+        ledger["features"][index]["acceptance_evidence"]["status"] = serde_json::json!("partial");
+        ledger["features"][index]["acceptance_evidence"]["artifacts"] = serde_json::json!([{
             "path": "crates/claw-gateway/tests/protocol.rs",
             "test": "negotiates_v4"
         }]);
@@ -1820,7 +1944,7 @@ fn unimplemented_ledger_status_rejects_populated_evidence() {
 
     let error = load_error(&fixture.root);
     assert_eq!(error.code(), ViolationCode::LedgerEvidence);
-    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.subject(), Some(feature_id.as_str()));
     assert_eq!(error.json_path(), None);
     assert_eq!(
         error.message(),
