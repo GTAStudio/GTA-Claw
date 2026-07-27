@@ -341,13 +341,21 @@ export component TextField {
     in property <InputType> input-type: InputType.text;
     in property <bool> enabled: true;
     in property <bool> read-only: false;
+    in property <bool> focus-on-init: false;
+    in property <bool> intercept-vertical-navigation: false;
     out property <bool> has-focus: field.has-focus;
     callback edited(string);
     callback accepted;
+    callback vertical-navigation-requested(int);
 
     min-width: 180px;
     min-height: field.min-height + (root.label == "" ? 0px : Metrics.line-caption + Metrics.space-1);
     forward-focus: field;
+    init => {
+        if (root.focus-on-init) {
+            field.focus();
+        }
+    }
 
     VerticalLayout {
         spacing: Metrics.space-1;
@@ -368,6 +376,17 @@ export component TextField {
             accessible-label: root.accessible-name;
             edited(value) => { root.edited(value); }
             accepted => { root.accepted(); }
+            key-pressed(event) => {
+                if (root.intercept-vertical-navigation && event.text == Key.UpArrow) {
+                    root.vertical-navigation-requested(-1);
+                    return accept;
+                }
+                if (root.intercept-vertical-navigation && event.text == Key.DownArrow) {
+                    root.vertical-navigation-requested(1);
+                    return accept;
+                }
+                return reject;
+            }
         }
     }
 }
@@ -853,6 +872,8 @@ export component EmptyStatePanel {
 export component ModalSheetShell {
     in property <string> title: "Dialog";
     in property <string> dismiss-label: "Close";
+    in property <bool> focus-close-on-init: true;
+    in property <bool> compact-content: false;
     callback dismiss-requested;
 
     forward-focus: dialog-focus;
@@ -861,7 +882,11 @@ export component ModalSheetShell {
 
     dialog-focus := FocusScope {
         focus-on-tab-navigation: false;
-        init => { close-button.focus(); }
+        init => {
+            if (root.focus-close-on-init) {
+                close-button.focus();
+            }
+        }
         key-pressed(event) => {
             if (event.text == Key.Escape) {
                 root.dismiss-requested();
@@ -896,8 +921,8 @@ export component ModalSheetShell {
         }
 
         VerticalLayout {
-            padding: Metrics.space-4;
-            spacing: Metrics.space-4;
+            padding: root.compact-content ? Metrics.space-2 : Metrics.space-4;
+            spacing: root.compact-content ? Metrics.space-2 : Metrics.space-4;
 
             HorizontalLayout {
                 cross-axis-alignment: center;

@@ -2,6 +2,7 @@ import { FirstRunSurface } from "@gta-ui/first-run.slint";
 import { GatewayOnboardingSurface } from "@gta-ui/gateway-onboarding.slint";
 import {
     ActivityItem,
+    CommandItem,
     DeliverableItem,
     DiffItem,
     ExtensionItem,
@@ -16,6 +17,7 @@ import { DesignTokens, StatusKind, ThemeMode, VisualPreferences } from "@gta-ui/
 export { DesignTokens, VisualPreferences }
 export {
     ActivityItem,
+    CommandItem,
     DeliverableItem,
     DiffItem,
     ExtensionItem,
@@ -67,6 +69,84 @@ export component AppWindow inherits Window {
     in property <int> selected-screen: 0;
     in property <int> selected-settings-section: 0;
     in property <bool> palette-open: false;
+    in-out property <string> palette-query: "";
+    in property <[CommandItem]> palette-commands;
+    in property <int> palette-selected-index: 0;
+    in property <int> palette-command-count: 0;
+    in property <int> palette-selected-action-id: -1;
+    in property <string> palette-selected-label: "";
+    out property <[CommandItem]> command-catalog: [
+        {
+            action-id: 0,
+            glyph: "F",
+            title: @tr("Go to Focus"),
+            detail: @tr("Ctrl/Cmd+1"),
+            keywords: @tr("focus home attention overview"),
+        },
+        {
+            action-id: 1,
+            glyph: "W",
+            title: @tr("Go to Workspaces"),
+            detail: @tr("Ctrl/Cmd+2"),
+            keywords: @tr("workspace repository local remote git"),
+        },
+        {
+            action-id: 2,
+            glyph: "R",
+            title: @tr("Open Run Monitor"),
+            detail: @tr("Ctrl/Cmd+3"),
+            keywords: @tr("runs sessions tasks monitor"),
+        },
+        {
+            action-id: 3,
+            glyph: "S",
+            title: @tr("Open Schedule Manager"),
+            detail: @tr("Ctrl/Cmd+4"),
+            keywords: @tr("schedules recurring cadence automation"),
+        },
+        {
+            action-id: 4,
+            glyph: "D",
+            title: @tr("Open Deliverables"),
+            detail: @tr("Ctrl/Cmd+5"),
+            keywords: @tr("deliverables files artifacts output"),
+        },
+        {
+            action-id: 5,
+            glyph: "E",
+            title: @tr("Open Extension Manager"),
+            detail: @tr("Ctrl/Cmd+6"),
+            keywords: @tr("extensions roles tools permissions"),
+        },
+        {
+            action-id: 6,
+            glyph: "G",
+            title: @tr("Open Settings"),
+            detail: @tr("Ctrl/Cmd+7"),
+            keywords: @tr("settings preferences appearance connection"),
+        },
+        {
+            action-id: 7,
+            glyph: "?",
+            title: @tr("Show keyboard shortcuts"),
+            detail: @tr("Settings"),
+            keywords: @tr("help keyboard shortcuts keys"),
+        },
+        {
+            action-id: 8,
+            glyph: "U",
+            title: @tr("Check for updates"),
+            detail: @tr("Settings"),
+            keywords: @tr("update upgrade release version"),
+        },
+        {
+            action-id: 9,
+            glyph: "H",
+            title: @tr("Open diagnostics"),
+            detail: @tr("Settings"),
+            keywords: @tr("diagnostics health renderer gateway accessibility"),
+        },
+    ];
     in property <int> diff-mode: 0;
     in property <[RunItem]> runs;
     in property <[WorkspaceItem]> workspaces;
@@ -112,6 +192,9 @@ export component AppWindow inherits Window {
     callback navigate-requested(int);
     callback palette-toggle-requested();
     callback palette-dismiss-requested();
+    callback palette-query-changed(string);
+    callback palette-selection-step-requested(int);
+    callback palette-command-requested(int);
     callback open-session-requested(int);
     callback open-workspace-requested(int);
     callback settings-section-requested(int);
@@ -216,6 +299,12 @@ export component AppWindow inherits Window {
         selected-screen: root.selected-screen;
         selected-settings-section: root.selected-settings-section;
         palette-open: root.palette-open;
+        palette-query <=> root.palette-query;
+        palette-commands: root.palette-commands;
+        palette-selected-index: root.palette-selected-index;
+        palette-command-count: root.palette-command-count;
+        palette-selected-action-id: root.palette-selected-action-id;
+        palette-selected-label: root.palette-selected-label;
         diff-mode: root.diff-mode;
         runs: root.runs;
         workspaces: root.workspaces;
@@ -250,6 +339,9 @@ export component AppWindow inherits Window {
         navigate-requested(index) => { root.navigate-requested(index); }
         palette-toggle-requested => { root.palette-toggle-requested(); }
         palette-dismiss-requested => { root.palette-dismiss-requested(); }
+        palette-query-changed(query) => { root.palette-query-changed(query); }
+        palette-selection-step-requested(step) => { root.palette-selection-step-requested(step); }
+        palette-command-requested(action-id) => { root.palette-command-requested(action-id); }
         open-session-requested(index) => { root.open-session-requested(index); }
         open-workspace-requested(index) => { root.open-workspace-requested(index); }
         settings-section-requested(index) => { root.settings-section-requested(index); }

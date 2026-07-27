@@ -13,8 +13,8 @@ use std::rc::Rc;
 use slint::{Model, VecModel};
 
 use crate::generated_ui::{
-    ActivityItem, AppWindow, DeliverableItem, DiffItem, ExtensionItem, FileItem, RunItem,
-    ScheduleItem, TranscriptItem, WorkspaceItem,
+    ActivityItem, AppWindow, CommandItem, DeliverableItem, DiffItem, ExtensionItem, FileItem,
+    RunItem, ScheduleItem, TranscriptItem, WorkspaceItem,
 };
 
 /// Brings `model` in line with `rows` using the narrowest notifications that
@@ -59,6 +59,7 @@ pub(crate) struct ProductModels {
     activity: Rc<VecModel<ActivityItem>>,
     session_files: Rc<VecModel<FileItem>>,
     diff_lines: Rc<VecModel<DiffItem>>,
+    palette_commands: Rc<VecModel<CommandItem>>,
 }
 
 impl ProductModels {
@@ -75,6 +76,7 @@ impl ProductModels {
             activity: Rc::new(VecModel::default()),
             session_files: Rc::new(VecModel::default()),
             diff_lines: Rc::new(VecModel::default()),
+            palette_commands: Rc::new(VecModel::default()),
         };
         window.set_runs(Rc::clone(&models.runs).into());
         window.set_workspaces(Rc::clone(&models.workspaces).into());
@@ -85,6 +87,7 @@ impl ProductModels {
         window.set_activity(Rc::clone(&models.activity).into());
         window.set_session_files(Rc::clone(&models.session_files).into());
         window.set_diff_lines(Rc::clone(&models.diff_lines).into());
+        window.set_palette_commands(Rc::clone(&models.palette_commands).into());
         models
     }
 
@@ -122,6 +125,10 @@ impl ProductModels {
 
     pub(crate) fn diff_lines(&self) -> &VecModel<DiffItem> {
         &self.diff_lines
+    }
+
+    pub(crate) fn palette_commands(&self) -> &VecModel<CommandItem> {
+        &self.palette_commands
     }
 }
 

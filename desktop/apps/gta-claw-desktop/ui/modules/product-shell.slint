@@ -46,6 +46,14 @@ export struct FileItem {
     status: string,
 }
 
+export struct CommandItem {
+    action-id: int,
+    glyph: string,
+    title: string,
+    detail: string,
+    keywords: string,
+}
+
 export struct DeliverableItem {
     name: string,
     kind: string,
@@ -1402,9 +1410,66 @@ component DiagnosticsScreen {
     }
 }
 
-component CommandPalette {
+component PaletteCommandItem inherits NavigationItem {
+    in property <int> item-index;
+    in property <int> item-count;
+
+    accessible-role: list-item;
+    accessible-label: root.text;
+    accessible-description: root.detail;
+    accessible-item-index: root.item-index;
+    accessible-item-count: root.item-count;
+}
+
+component CommandPalette inherits FocusScope {
+    in-out property <string> query;
+    in property <[CommandItem]> commands;
+    in property <int> selected-index;
+    in property <int> command-count;
+    in property <int> selected-action-id: -1;
+    in property <string> selected-label;
     callback dismiss-requested;
-    callback navigate-requested(int);
+    callback query-changed(string);
+    callback selection-step-requested(int);
+    callback command-requested(int);
+
+    private property <length> command-row-height: max(
+        Metrics.control-large,
+        Metrics.line-body + Metrics.line-caption + 2 * Metrics.space-2
+    );
+    private property <length> command-row-stride: root.command-row-height + Metrics.space-1;
+    private property <bool> compact-content: root.height < 640px
+        || VisualPreferences.density-scale > 1.25;
+
+    key-pressed(event) => {
+        if (event.text == Key.UpArrow) {
+            root.selection-step-requested(-1);
+            return accept;
+        }
+        if (event.text == Key.DownArrow) {
+            root.selection-step-requested(1);
+            return accept;
+        }
+        return reject;
+    }
+
+    changed query => {
+        commands-scroll.viewport-y = 0px;
+    }
+
+    changed selected-index => {
+        if (commands-scroll.visible-height > 0px) {
+            let selected-top = root.selected-index * root.command-row-stride;
+            let selected-bottom = selected-top + root.command-row-height;
+            let visible-top = -commands-scroll.viewport-y;
+            let visible-bottom = visible-top + commands-scroll.visible-height;
+            if (selected-top < visible-top) {
+                commands-scroll.viewport-y = -selected-top;
+            } else if (selected-bottom > visible-bottom) {
+                commands-scroll.viewport-y = -(selected-bottom - commands-scroll.visible-height);
+            }
+        }
+    }
 
     Rectangle {
         background: #00000066;
@@ -1412,32 +1477,117 @@ component CommandPalette {
 
         ModalSheetShell {
             x: max(Metrics.space-3, (parent.width - self.width) / 2);
-            y: Metrics.space-8;
-            width: min(620px, parent.width - 2 * Metrics.space-3);
-            height: min(520px, parent.height - 2 * Metrics.space-8);
-            title: "Command palette";
-            dismiss-label: "Close palette";
+            y: min(Metrics.space-8, Metrics.space-3 + (parent.height - self.height) / 8);
+            width: min(680px, parent.width - 2 * Metrics.space-3);
+            height: min(560px, parent.height - 2 * Metrics.space-3);
+            title: @tr("Command palette");
+            dismiss-label: @tr("Close palette");
+            focus-close-on-init: false;
+            compact-content: root.compact-content;
             dismiss-requested => { root.dismiss-requested(); }
 
-            ScrollView {
+            VerticalLayout {
+                accessible-role: search;
+                accessible-label: @tr("Command search");
+
+                palette-search := TextField {
+                    label: root.compact-content ? "" : @tr("Search commands");
+                    accessible-name: @tr("Search commands");
+                    placeholder: @tr("Type a destination or task");
+                    text <=> root.query;
+                    focus-on-init: true;
+                    intercept-vertical-navigation: true;
+                    edited(value) => { root.query-changed(value); }
+                    vertical-navigation-requested(step) => {
+                        root.selection-step-requested(step);
+                    }
+                    accepted => {
+                        if (root.selected-action-id >= 0) {
+                            root.command-requested(root.selected-action-id);
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
                 vertical-stretch: 1;
-                viewport-width: self.width;
-                viewport-height: commands.min-height;
+                min-height: root.compact-content ? Metrics.control-large : 120px;
 
-                commands := VerticalLayout {
-                    width: parent.width;
-                    spacing: Metrics.space-1;
-                    accessible-role: list;
-                    accessible-label: "Commands";
-                    accessible-item-count: 7;
+                commands-scroll := ScrollView {
+                    visible: root.command-count > 0;
+                    viewport-width: self.width;
+                    viewport-height: commands-layout.min-height;
 
-                    NavigationItem { glyph: "F"; text: "Go to Focus"; detail: "Ctrl+1"; clicked => { root.navigate-requested(0); } }
-                    NavigationItem { glyph: "W"; text: "Go to Workspaces"; detail: "Ctrl+2"; clicked => { root.navigate-requested(1); } }
-                    NavigationItem { glyph: "R"; text: "Open Run Monitor"; detail: "Ctrl+3"; clicked => { root.navigate-requested(2); } }
-                    NavigationItem { glyph: "S"; text: "Open Schedule Manager"; detail: "Ctrl+4"; clicked => { root.navigate-requested(3); } }
-                    NavigationItem { glyph: "D"; text: "Open Deliverables"; detail: "Ctrl+5"; clicked => { root.navigate-requested(4); } }
-                    NavigationItem { glyph: "E"; text: "Open Extension Manager"; detail: "Ctrl+6"; clicked => { root.navigate-requested(5); } }
-                    NavigationItem { glyph: "G"; text: "Open Settings"; detail: "Ctrl+7"; clicked => { root.navigate-requested(6); } }
+                    commands-layout := VerticalLayout {
+                        width: parent.width;
+                        spacing: Metrics.space-1;
+                        accessible-role: list;
+                        accessible-label: @tr("Matching commands");
+                        accessible-item-count: root.command-count;
+
+                        for command[index] in root.commands : PaletteCommandItem {
+                            height: root.command-row-height;
+                            glyph: command.glyph;
+                            text: command.title;
+                            detail: command.detail;
+                            selected: index == root.selected-index;
+                            item-index: index;
+                            item-count: root.command-count;
+                            clicked => { root.command-requested(command.action-id); }
+                        }
+                    }
+                }
+
+                if (root.command-count == 0) : Rectangle {
+                    background: DesignTokens.surface-subtle;
+                    border-width: 1px;
+                    border-color: DesignTokens.border-default;
+                    border-radius: Metrics.radius-medium;
+                    accessible-role: region;
+                    accessible-label: @tr("No commands match '{}'", root.query);
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: Metrics.space-2;
+
+                        Text {
+                            text: @tr("No matching commands");
+                            color: DesignTokens.text-primary;
+                            font-size: Metrics.type-small;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            accessible-role: none;
+                        }
+                        Text {
+                            text: @tr("Try a destination, task, or setting.");
+                            color: DesignTokens.text-muted;
+                            font-size: Metrics.type-caption;
+                            horizontal-alignment: center;
+                            accessible-role: none;
+                        }
+                    }
+                }
+            }
+
+            VerticalLayout {
+                spacing: Metrics.space-1;
+
+                Text {
+                    text: root.command-count == 0
+                        ? @tr("No commands available")
+                        : @tr("Selected: {}", root.selected-label);
+                    color: DesignTokens.text-secondary;
+                    font-size: Metrics.type-caption;
+                    wrap: word-wrap;
+                    accessible-role: text;
+                    accessible-live-region: polite;
+                }
+                if (!root.compact-content) : Text {
+                    text: @tr("Use Up/Down to choose, Enter to open, and Escape to close.");
+                    color: DesignTokens.text-muted;
+                    font-size: Metrics.type-caption;
+                    wrap: word-wrap;
+                    accessible-role: text;
                 }
             }
         }
@@ -1513,6 +1663,12 @@ export component ProductShell inherits FocusScope {
     in property <int> selected-screen: 0;
     in property <int> selected-settings-section: 0;
     in property <bool> palette-open: false;
+    in-out property <string> palette-query;
+    in property <[CommandItem]> palette-commands;
+    in property <int> palette-selected-index: 0;
+    in property <int> palette-command-count: 0;
+    in property <int> palette-selected-action-id: -1;
+    in property <string> palette-selected-label;
     in property <int> diff-mode: 0;
     in property <[RunItem]> runs;
     in property <[WorkspaceItem]> workspaces;
@@ -1549,6 +1705,9 @@ export component ProductShell inherits FocusScope {
     callback navigate-requested(int);
     callback palette-toggle-requested;
     callback palette-dismiss-requested;
+    callback palette-query-changed(string);
+    callback palette-selection-step-requested(int);
+    callback palette-command-requested(int);
     callback open-session-requested(int);
     callback open-workspace-requested(int);
     callback settings-section-requested(int);
@@ -1579,35 +1738,37 @@ export component ProductShell inherits FocusScope {
     vertical-stretch: 0;
 
     key-pressed(event) => {
-        if (event.text == Key.F1) {
+        if (event.text == Key.F1
+            || ((event.modifiers.control || event.modifiers.meta)
+                && (event.text == "k" || event.text == "K"))) {
             root.palette-toggle-requested();
             return accept;
         }
-        if (event.modifiers.control && event.text == "1") {
+        if ((event.modifiers.control || event.modifiers.meta) && event.text == "1") {
             root.navigate-requested(0);
             return accept;
         }
-        if (event.modifiers.control && event.text == "2") {
+        if ((event.modifiers.control || event.modifiers.meta) && event.text == "2") {
             root.navigate-requested(1);
             return accept;
         }
-        if (event.modifiers.control && event.text == "3") {
+        if ((event.modifiers.control || event.modifiers.meta) && event.text == "3") {
             root.navigate-requested(2);
             return accept;
         }
-        if (event.modifiers.control && event.text == "4") {
+        if ((event.modifiers.control || event.modifiers.meta) && event.text == "4") {
             root.navigate-requested(3);
             return accept;
         }
-        if (event.modifiers.control && event.text == "5") {
+        if ((event.modifiers.control || event.modifiers.meta) && event.text == "5") {
             root.navigate-requested(4);
             return accept;
         }
-        if (event.modifiers.control && event.text == "6") {
+        if ((event.modifiers.control || event.modifiers.meta) && event.text == "6") {
             root.navigate-requested(5);
             return accept;
         }
-        if (event.modifiers.control && event.text == "7") {
+        if ((event.modifiers.control || event.modifiers.meta) && event.text == "7") {
             root.navigate-requested(6);
             return accept;
         }
@@ -1621,8 +1782,13 @@ export component ProductShell inherits FocusScope {
     accessible-role: region;
     accessible-label: "GTA Claw desktop application";
 
-    // The shell is created on demand, so claim focus for F1 and Ctrl+1..7.
+    // The shell is created on demand, so claim focus for global shortcuts.
     init => { root.focus(); }
+    changed palette-open => {
+        if (!root.palette-open) {
+            root.focus();
+        }
+    }
 
     Rectangle { background: DesignTokens.surface-app; }
 
@@ -1684,7 +1850,7 @@ export component ProductShell inherits FocusScope {
                     Rectangle { horizontal-stretch: 1; }
                     ToolbarIconButton {
                         glyph: "P";
-                        accessible-name: "Open command palette, F1";
+                        accessible-name: @tr("Open command palette, F1 or Ctrl/Cmd+K");
                         checked: root.palette-open;
                         checkable: true;
                         clicked => { root.palette-toggle-requested(); }
@@ -1776,7 +1942,15 @@ export component ProductShell inherits FocusScope {
     }
 
     if (root.palette-open) : CommandPalette {
+        query <=> root.palette-query;
+        commands: root.palette-commands;
+        selected-index: root.palette-selected-index;
+        command-count: root.palette-command-count;
+        selected-action-id: root.palette-selected-action-id;
+        selected-label: root.palette-selected-label;
         dismiss-requested => { root.palette-dismiss-requested(); }
-        navigate-requested(index) => { root.navigate-requested(index); }
+        query-changed(query) => { root.palette-query-changed(query); }
+        selection-step-requested(step) => { root.palette-selection-step-requested(step); }
+        command-requested(action-id) => { root.palette-command-requested(action-id); }
     }
 }

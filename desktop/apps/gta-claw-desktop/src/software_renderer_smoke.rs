@@ -1,18 +1,20 @@
 //! Headless smoke coverage for the complete external Slint component tree.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crate::command_palette::CommandPaletteState;
 use crate::generated_ui::{
-    ActivityItem, AppWindow, DeliverableItem, DiffItem, ExtensionItem, FileItem, RunItem,
-    ScheduleItem, TranscriptItem, VisualPreferences, WorkspaceItem,
+    ActivityItem, AppWindow, CommandItem, DeliverableItem, DiffItem, ExtensionItem, FileItem,
+    RunItem, ScheduleItem, TranscriptItem, VisualPreferences, WorkspaceItem,
 };
-use slint::ComponentHandle as _;
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType, TargetPixel,
 };
 use slint::platform::{Platform, PlatformError, WindowAdapter};
+use slint::{ComponentHandle as _, Model as _};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RgbPixel {
@@ -66,6 +68,13 @@ fn model<T: Clone + 'static>(rows: Vec<T>) -> slint::ModelRc<T> {
     Rc::new(slint::VecModel::from(rows)).into()
 }
 
+fn dispatch_key(app: &AppWindow, text: slint::SharedString) {
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: text.clone() });
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::KeyReleased { text });
+}
+
 fn region(pixels: &[RgbPixel], width: usize, x: usize, y: usize) -> Vec<RgbPixel> {
     pixels
         .chunks_exact(width)
@@ -84,6 +93,9 @@ fn software_renderer_constructs_onboarding_and_every_product_screen() {
     .expect("install isolated software-renderer platform");
 
     let app = AppWindow::new().expect("construct the complete external Slint tree");
+    let palette = CommandPaletteState::new(app.get_command_catalog().iter())
+        .expect("translated command catalog");
+    assert_eq!(palette.visible_count(), 10);
     app.set_runs(model(vec![RunItem {
         id: "run-smoke".into(),
         title: "Renderer smoke run".into(),
@@ -262,4 +274,94 @@ fn software_renderer_constructs_onboarding_and_every_product_screen() {
         assert!(density_fingerprints.insert(fingerprint(&body)));
     }
     assert_eq!(density_fingerprints.len(), 2);
+
+    app.set_palette_query("run".into());
+    app.set_palette_commands(model(vec![CommandItem {
+        action_id: 2,
+        glyph: "R".into(),
+        title: "Open Run Monitor".into(),
+        detail: "Ctrl/Cmd+3".into(),
+        keywords: "runs sessions tasks monitor".into(),
+    }]));
+    app.set_palette_selected_index(0);
+    app.set_palette_command_count(1);
+    app.set_palette_selected_action_id(2);
+    app.set_palette_selected_label("Open Run Monitor".into());
+    let selection_step = Rc::new(Cell::new(0));
+    let observed_step = Rc::clone(&selection_step);
+    app.on_palette_selection_step_requested(move |step| {
+        observed_step.set(step);
+    });
+    let activated_action = Rc::new(Cell::new(-1));
+    let observed_action = Rc::clone(&activated_action);
+    app.on_palette_command_requested(move |action_id| {
+        observed_action.set(action_id);
+    });
+    let weak_app = app.as_weak();
+    app.on_palette_dismiss_requested(move || {
+        if let Some(app) = weak_app.upgrade() {
+            app.set_palette_open(false);
+        }
+    });
+    let weak_app = app.as_weak();
+    app.on_palette_toggle_requested(move || {
+        if let Some(app) = weak_app.upgrade() {
+            app.set_palette_open(!app.get_palette_open());
+        }
+    });
+    app.set_palette_open(true);
+    let mut palette_density_fingerprints = BTreeSet::new();
+    let mut populated_palette = Vec::new();
+    for density in [0.8, 2.0] {
+        app.global::<VisualPreferences>().set_density_scale(density);
+        software_window.request_redraw();
+        let mut pixels = vec![RgbPixel::default(); 720 * 520];
+        assert!(software_window.draw_if_needed(|renderer| {
+            renderer.render(&mut pixels, 720);
+        }));
+        assert!(
+            pixels
+                .iter()
+                .filter(|pixel| **pixel != RgbPixel::default())
+                .count()
+                > 10_000
+        );
+        assert!(palette_density_fingerprints.insert(fingerprint(&pixels)));
+        populated_palette = pixels;
+    }
+    assert_eq!(palette_density_fingerprints.len(), 2);
+    dispatch_key(&app, "x".into());
+    assert_ne!(app.get_palette_query(), "run");
+    dispatch_key(&app, slint::platform::Key::DownArrow.into());
+    assert_eq!(selection_step.get(), 1);
+    dispatch_key(&app, "\n".into());
+    assert_eq!(activated_action.get(), 2);
+
+    app.set_palette_query("missing".into());
+    app.set_palette_commands(model(Vec::<CommandItem>::new()));
+    app.set_palette_command_count(0);
+    app.set_palette_selected_action_id(-1);
+    app.set_palette_selected_label(slint::SharedString::default());
+    software_window.request_redraw();
+    let mut empty_palette = vec![RgbPixel::default(); 720 * 520];
+    assert!(software_window.draw_if_needed(|renderer| {
+        renderer.render(&mut empty_palette, 720);
+    }));
+    assert_ne!(fingerprint(&populated_palette), fingerprint(&empty_palette));
+    dispatch_key(&app, slint::platform::Key::Escape.into());
+    assert!(!app.get_palette_open());
+    dispatch_key(&app, slint::platform::Key::F1.into());
+    assert!(app.get_palette_open());
+    dispatch_key(&app, slint::platform::Key::F1.into());
+    assert!(!app.get_palette_open());
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+            text: slint::platform::Key::Control.into(),
+        });
+    dispatch_key(&app, "k".into());
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::KeyReleased {
+            text: slint::platform::Key::Control.into(),
+        });
+    assert!(app.get_palette_open());
 }
