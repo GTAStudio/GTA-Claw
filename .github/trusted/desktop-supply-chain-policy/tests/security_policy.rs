@@ -21,6 +21,7 @@ use desktop_supply_chain_policy::metadata::{
     MetadataTools, release_version_from_metadata_documents, validate_desktop_metadata,
     validate_desktop_metadata_document, validate_root_metadata,
 };
+use desktop_supply_chain_policy::mobile_workflow::validate_ios_packaging_workflow_skia_injection;
 use desktop_supply_chain_policy::ownership::{
     CODEOWNER, CODEOWNERS_PATH, canonical_codeowners, frozen_surfaces, validate_codeowners,
     validate_codeowners_text,
@@ -1888,6 +1889,173 @@ fn mobile_workflow_stub(name: &str, job_id: &str, job_name: &str) -> String {
     )
 }
 
+/// One "resolve, fetch, and verify" step for a single admitted iOS Skia target. The fetched
+/// archive's local filename is derived from the resolved URL via `basename` (never a hardcoded
+/// literal, per the fix for closed PR #145's target/key mismatch risk), and the verified path is
+/// published under `archive_var` as a visibly absolute path.
+fn ios_resolve_and_verify_step(step_name: &str, target: &str, archive_var: &str) -> String {
+    let mut step = String::new();
+    step.push_str(&format!("      - name: {step_name}\n"));
+    step.push_str("        run: |\n");
+    step.push_str("          set -euo pipefail\n");
+    step.push_str(&format!(
+        "          resolve-build-artifact-pin --package skia-bindings --version 0.99.0 --target {target} > pin.txt\n"
+    ));
+    step.push_str("          url=$(sed -n 's/.*url=\\([^ ]*\\).*/\\1/p' pin.txt)\n");
+    step.push_str("          archive_file=$(basename \"$url\")\n");
+    step.push_str("          curl -fL -sS -o \"$archive_file\" \"$url\"\n");
+    step.push_str(&format!(
+        "          resolve-build-artifact-pin --package skia-bindings --version 0.99.0 --target {target} --verify-local \"$archive_file\"\n"
+    ));
+    step.push_str(&format!(
+        "          echo \"{archive_var}=$(pwd)/$archive_file\" >> \"$GITHUB_ENV\"\n"
+    ));
+    step
+}
+
+/// One `cargo build` step for a single admitted iOS Skia target, injecting the verified local
+/// archive named by `archive_var` through the supported `SKIA_BINARIES_URL=file://...` override,
+/// requesting cargo's `-vv` build-script output (plain `-v` suppresses it on a successful build),
+/// disabling ANSI color at the source, capturing it through `tee` under a `pipefail`-protected
+/// shell (so a real `build.rs` failure cannot be masked by `tee`'s own exit status), stripping any
+/// residual ANSI escape codes before grepping, proving that capture-and-strip pipeline finds
+/// something with a verified-nonzero positive control, and asserting on that captured log that the
+/// forced Skia download actually ran rather than silently falling back to a source build. It also
+/// deletes any stale prior build-script output directory *scoped to this exact target's own
+/// output tree* before the build (the freshness-and-no-cross-target proof), then reads Cargo's own
+/// unconditionally-written output file from that same target-scoped root, confirms exactly one
+/// candidate was found, and asserts it names the exact injected pinned URL together with the
+/// unconditional `DOWNLOAD AND INSTALL SUCCEEDED` line — the definitive completion proof, not
+/// merely `UNPACKING ARCHIVE INTO`, which `download_and_unpack` prints *before* the unpack call
+/// even runs and therefore establishes only an attempt. This is the stronger, primary evidence
+/// this module's Round 5 correction requires on top of the piped console log above.
+fn ios_build_step(step_name: &str, target: &str, archive_var: &str) -> String {
+    let log_file = format!("build-{target}.log");
+    let plain_log_file = format!("build-{target}.plain.log");
+    let mut step = String::new();
+    step.push_str(&format!("      - name: {step_name}\n"));
+    step.push_str("        env:\n");
+    step.push_str(&format!(
+        "          SKIA_BINARIES_URL: \"file://${{{{ env.{archive_var} }}}}\"\n"
+    ));
+    step.push_str("          CARGO_TERM_COLOR: \"never\"\n");
+    step.push_str("        run: |\n");
+    step.push_str("          set -o pipefail\n");
+    step.push_str(&format!(
+        "          rm -rf target/{target}/*/build/skia-bindings-*\n"
+    ));
+    step.push_str(&format!(
+        "          cargo build --manifest-path ios/Cargo.toml --target {target} -vv --color never 2>&1 | tee {log_file}\n"
+    ));
+    step.push_str(&format!(
+        "          perl -pe 's/\\x1b\\[[0-9;]*[A-Za-z]//g' {log_file} > {plain_log_file}\n"
+    ));
+    step.push_str(&format!(
+        "          grep -c \"TRYING TO DOWNLOAD AND INSTALL SKIA BINARIES\" {plain_log_file} > control.count\n"
+    ));
+    step.push_str("          [ \"$(cat control.count)\" -gt 0 ]\n");
+    step.push_str(&format!(
+        "          grep -q \"TRYING TO DOWNLOAD AND INSTALL SKIA BINARIES\" {plain_log_file}\n"
+    ));
+    step.push_str(&format!(
+        "          grep -q \"UNPACKING ARCHIVE INTO\" {plain_log_file}\n"
+    ));
+    step.push_str(&format!(
+        "          ! grep -q \"DOWNLOAD AND INSTALL FAILED\" {plain_log_file}\n"
+    ));
+    step.push_str(&format!(
+        "          candidates=$(find \"target/{target}/\" -path \"*/build/skia-bindings-*/output\")\n"
+    ));
+    step.push_str("          candidate_count=$(printf '%s\\n' \"$candidates\" | grep -c .)\n");
+    step.push_str("          [ \"$candidate_count\" -eq 1 ]\n");
+    step.push_str("          output_file=\"$candidates\"\n");
+    step.push_str(&format!(
+        "          grep -q \"FROM: file://${{{{ env.{archive_var} }}}}\" \"$output_file\"\n"
+    ));
+    step.push_str("          grep -q \"UNPACKING ARCHIVE INTO\" \"$output_file\"\n");
+    step.push_str("          grep -q \"DOWNLOAD AND INSTALL SUCCEEDED\" \"$output_file\"\n");
+    step
+}
+
+fn ios_packaging_workflow_header(name: &str, job_id: &str, job_name: &str) -> String {
+    format!(
+        "name: \"{name}\"\n\
+         \n\
+         on:\n\
+         \x20 pull_request:\n\
+         \x20   branches:\n\
+         \x20     - main\n\
+         \n\
+         permissions:\n\
+         \x20 contents: read\n\
+         \n\
+         jobs:\n\
+         \x20 {job_id}:\n\
+         \x20   name: \"{job_name}\"\n\
+         \x20   runs-on: macos-14\n\
+         \x20   env:\n\
+         \x20     FORCE_SKIA_BINARIES_DOWNLOAD: \"1\"\n\
+         \x20   steps:\n"
+    )
+}
+
+/// A minimal but content-compliant `ios-packaging.yml` fixture: it resolves and verifies both
+/// reviewed Skia build-artifact pins through the trusted CLI, fetches each with a fail-closed
+/// `curl`, and injects each verified local archive into its matching `cargo build` through the
+/// supported `SKIA_BINARIES_URL=file://...` override with `FORCE_SKIA_BINARIES_DOWNLOAD` set —
+/// exactly what `mobile_workflow::validate_ios_packaging_workflow_skia_injection` requires of any
+/// admitted iOS packaging workflow. Used both to prove the admitted *path* is still accepted when
+/// its content actually satisfies the Skia trust chain, and, mutated one property at a time, as the
+/// baseline every dedicated `mobile_workflow` regression below diverges from.
+fn compliant_ios_packaging_workflow(name: &str, job_id: &str, job_name: &str) -> String {
+    let mut steps = ios_packaging_workflow_header(name, job_id, job_name);
+    steps.push_str(&ios_resolve_and_verify_step(
+        "Resolve and verify iOS device Skia pin",
+        "aarch64-apple-ios",
+        "SKIA_ARCHIVE_IOS_DEVICE",
+    ));
+    steps.push_str(&ios_resolve_and_verify_step(
+        "Resolve and verify iOS simulator Skia pin",
+        "aarch64-apple-ios-sim",
+        "SKIA_ARCHIVE_IOS_SIM",
+    ));
+    steps.push_str(&ios_build_step(
+        "Build iOS device target",
+        "aarch64-apple-ios",
+        "SKIA_ARCHIVE_IOS_DEVICE",
+    ));
+    steps.push_str(&ios_build_step(
+        "Build iOS simulator target",
+        "aarch64-apple-ios-sim",
+        "SKIA_ARCHIVE_IOS_SIM",
+    ));
+    steps
+}
+
+/// Returns the content-compliant iOS stub for the admitted iOS path, or the plain placeholder for
+/// every other workflow path (Task D's content policy applies only to `ios-packaging.yml`).
+fn mobile_workflow_fixture_for(path: &str, name: &str, job_id: &str, job_name: &str) -> String {
+    if path == ".github/workflows/ios-packaging.yml" {
+        compliant_ios_packaging_workflow(name, job_id, job_name)
+    } else {
+        mobile_workflow_stub(name, job_id, job_name)
+    }
+}
+
+/// Parses `text` as a workflow document and runs the iOS packaging Skia-injection content check
+/// directly, without the surrounding directory-inventory machinery `validate_inventory` also
+/// enforces — this module's tests are only about the one content policy `mobile_workflow` adds.
+fn validate_ios_skia_injection_text(text: &str) -> Result<(), String> {
+    let workflow: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(text).expect("parse iOS packaging workflow fixture");
+    validate_ios_packaging_workflow_skia_injection(
+        ".github/workflows/ios-packaging.yml",
+        text,
+        &workflow,
+    )
+    .map_err(|error| error.to_string())
+}
+
 #[test]
 fn mobile_packaging_workflows_are_admitted_but_the_inventory_stays_closed() {
     let base = copy_repo("mobile-inventory-baseline");
@@ -1910,7 +2078,8 @@ fn mobile_packaging_workflows_are_admitted_but_the_inventory_stays_closed() {
         for (index, path) in added.iter().enumerate() {
             fs::write(
                 tree.join(path),
-                mobile_workflow_stub(
+                mobile_workflow_fixture_for(
+                    path,
                     &format!("mobile packaging {index}"),
                     &format!("package{index}"),
                     &format!("Mobile package {index}"),
@@ -1955,7 +2124,7 @@ fn mobile_packaging_workflows_are_admitted_but_the_inventory_stays_closed() {
     let removed = copy_repo("mobile-inventory-missing-required");
     fs::write(
         removed.join(".github/workflows/ios-packaging.yml"),
-        mobile_workflow_stub("ios packaging", "package", "iOS package"),
+        compliant_ios_packaging_workflow("ios packaging", "package", "iOS package"),
     )
     .expect("write admitted iOS workflow");
     fs::remove_file(removed.join(".github/workflows/windows-packaging.yml"))
@@ -3792,6 +3961,18 @@ fn exact_desktop_binding_rejects_member_package_build_and_target_mutations() {
             "[lints]",
             "[target.'cfg(target_os = \"linux\")'.dependencies]\nslint = \"*\"\n\n[lints]",
         ),
+        (
+            "slint-renderer-skia-feature-add",
+            "desktop/apps/gta-claw-desktop/Cargo.toml",
+            "  \"renderer-software\",\n  \"std\",\n",
+            "  \"renderer-software\",\n  \"renderer-skia\",\n  \"std\",\n",
+        ),
+        (
+            "slint-default-features-enabled",
+            "desktop/apps/gta-claw-desktop/Cargo.toml",
+            "default-features = false",
+            "default-features = true",
+        ),
     ];
     for (label, file, from, to) in cases {
         let tree = final_tree(label);
@@ -4986,35 +5167,88 @@ fn admitted_lock_and_skia_target_sets_are_derived_from_the_platform_table() {
 #[test]
 fn reviewed_build_artifact_pin_table_shape_is_enforced() {
     const DIGEST: &str = "500ddee961ef415f36fce4fcd300aca7bfaf9a4f676cf2332f2e4048621fce37";
-    let url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-aarch64-apple-ios.tar.gz";
+    // `aarch64-apple-ios` is a proper prefix of `aarch64-apple-ios-sim`: the device URL never
+    // contains the sim target's name, but the sim URL always contains the device target's name.
+    // These two URLs are the fixture the prefix-collision regressions below rely on.
+    let device_url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-aarch64-apple-ios.tar.gz";
+    let sim_url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-aarch64-apple-ios-sim.tar.gz";
+    // The reviewed digests for `skia-bindings` 0.99.0, independently obtained from the release
+    // asset metadata for `aarch64-apple-ios` and `aarch64-apple-ios-sim`.
+    const DEVICE_DIGEST: &str = "15e20f3265dfddd658f9ef0d0e30d50a73afccb88787812f65fb5e6cf4ec55c8";
+    const SIM_DIGEST: &str = "ade5b153818d9b7b81240f106df148a9c4b92fb3aba566f942a713b93914e11e";
+
     validate_build_artifact_pin_table(&[(
         "skia-bindings",
         "0.99.0",
         "aarch64-apple-ios",
-        url,
+        device_url,
         DIGEST,
     )])
     .expect("a well formed reviewed pin is accepted");
     validate_build_artifact_pin_table(&[]).expect("an empty reviewed pin table is well formed");
 
+    // The exact two reviewed rows are accepted together, and only together: this is the shape
+    // `PINNED_BUILD_ARTIFACTS` takes now that it is filled for the iOS packaging workflow.
+    validate_build_artifact_pin_table(&[
+        (
+            "skia-bindings",
+            "0.99.0",
+            "aarch64-apple-ios",
+            device_url,
+            DEVICE_DIGEST,
+        ),
+        (
+            "skia-bindings",
+            "0.99.0",
+            "aarch64-apple-ios-sim",
+            sim_url,
+            SIM_DIGEST,
+        ),
+    ])
+    .expect("the exact two reviewed skia-bindings 0.99.0 pins are accepted together");
+
     for (label, pins) in [
         (
             "package that does not fetch at build time",
-            vec![("serde", "0.99.0", "aarch64-apple-ios", url, DIGEST)],
+            vec![("serde", "0.99.0", "aarch64-apple-ios", device_url, DIGEST)],
         ),
         (
             "release other than the admitted one",
-            vec![("skia-bindings", "0.98.0", "aarch64-apple-ios", url, DIGEST)],
+            vec![(
+                "skia-bindings",
+                "0.98.0",
+                "aarch64-apple-ios",
+                device_url,
+                DIGEST,
+            )],
         ),
         (
             "unadmitted target",
-            vec![("skia-bindings", "0.99.0", "x86_64-apple-ios", url, DIGEST)],
+            vec![(
+                "skia-bindings",
+                "0.99.0",
+                "x86_64-apple-ios",
+                device_url,
+                DIGEST,
+            )],
         ),
         (
             "duplicate package and target",
             vec![
-                ("skia-bindings", "0.99.0", "aarch64-apple-ios", url, DIGEST),
-                ("skia-bindings", "0.99.0", "aarch64-apple-ios", url, DIGEST),
+                (
+                    "skia-bindings",
+                    "0.99.0",
+                    "aarch64-apple-ios",
+                    device_url,
+                    DIGEST,
+                ),
+                (
+                    "skia-bindings",
+                    "0.99.0",
+                    "aarch64-apple-ios",
+                    device_url,
+                    DIGEST,
+                ),
             ],
         ),
         (
@@ -5023,7 +5257,7 @@ fn reviewed_build_artifact_pin_table_shape_is_enforced() {
                 "skia-bindings",
                 "0.99.0",
                 "aarch64-apple-ios",
-                url,
+                device_url,
                 "abc123",
             )],
         ),
@@ -5048,12 +5282,12 @@ fn reviewed_build_artifact_pin_table_shape_is_enforced() {
             )],
         ),
         (
-            "URL naming a different target",
+            "URL naming no admitted target at all",
             vec![(
                 "skia-bindings",
                 "0.99.0",
-                "aarch64-apple-ios-sim",
-                url,
+                "aarch64-apple-ios",
+                "https://example.invalid/skia-binaries.tar.gz",
                 DIGEST,
             )],
         ),
@@ -5063,6 +5297,681 @@ fn reviewed_build_artifact_pin_table_shape_is_enforced() {
             "reviewed build-artifact pin table must reject: {label}"
         );
     }
+
+    // The prefix-collision regressions: `aarch64-apple-ios` is a proper prefix of
+    // `aarch64-apple-ios-sim`, so a naive `url.contains(target)` lets a simulator archive satisfy
+    // the device row. Both mismatched directions must be rejected, and the error must name both
+    // the row's target and the target the URL actually names, so a reviewer can tell the two
+    // apart without re-deriving the match themselves.
+    let device_row_with_sim_url = validate_build_artifact_pin_table(&[(
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-apple-ios",
+        sim_url,
+        DEVICE_DIGEST,
+    )]);
+    let error = device_row_with_sim_url
+        .expect_err("the device row must reject the simulator archive's URL");
+    // Asserted with an exact message, not `contains`: `aarch64-apple-ios-sim` itself contains
+    // `aarch64-apple-ios`, so a substring check on both strings would pass even if the message
+    // named the sim target twice and never mentioned the device row's target at all.
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "reviewed build-artifact URL names target aarch64-apple-ios-sim, not the row's target aarch64-apple-ios: {sim_url}"
+        ),
+        "rejection must distinguish the row's declared target from the target the URL actually names"
+    );
+
+    let sim_row_with_device_url = validate_build_artifact_pin_table(&[(
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-apple-ios-sim",
+        device_url,
+        SIM_DIGEST,
+    )]);
+    let error = sim_row_with_device_url
+        .expect_err("the simulator row must reject the device archive's URL");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "reviewed build-artifact URL names target aarch64-apple-ios, not the row's target aarch64-apple-ios-sim: {device_url}"
+        ),
+        "rejection must distinguish the row's declared target from the target the URL actually names"
+    );
+
+    // `aarch64-linux-android` and `aarch64-apple-ios-sim` are both admitted and both 21 bytes
+    // long. A URL naming both is ambiguous at the longest-match length and must fail closed
+    // rather than arbitrarily picking one, even though the row's own target is present.
+    let ambiguous_tie = validate_build_artifact_pin_table(&[(
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-apple-ios-sim",
+        "https://example.invalid/aarch64-linux-android-aarch64-apple-ios-sim.tar.gz",
+        SIM_DIGEST,
+    )]);
+    ambiguous_tie
+        .expect_err("a URL naming two distinct same-length admitted targets must fail closed");
+}
+
+#[test]
+fn ios_packaging_workflow_skia_injection_accepts_the_compliant_fixture() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+    validate_ios_skia_injection_text(&workflow)
+        .expect("a workflow resolving, verifying, and injecting both reviewed pins is admitted");
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_a_literally_hardcoded_pin_url_or_digest() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // Only the device step's fetch is corrupted (`replacen(..., 1)`): both resolve-and-verify
+    // steps otherwise share the exact same `curl -fL -sS -o "$archive_file" "$url"` shell text, so
+    // an unqualified `replace` would hardcode the same literal URL into both.
+    let hardcoded_url = workflow.replacen(
+        "curl -fL -sS -o \"$archive_file\" \"$url\"",
+        "curl -fL -sS -o \"$archive_file\" \"https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-gl-jpegd-jpege-metal-pdf-textlayout.tar.gz\"",
+        1,
+    );
+    assert_ne!(
+        hardcoded_url, workflow,
+        "hardcoded-URL fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&hardcoded_url)
+        .expect_err("a literal Skia release download URL must be rejected");
+    assert!(
+        error.contains("embeds a Skia release download URL literally"),
+        "wrong rejection reason: {error}"
+    );
+
+    let hardcoded_digest = workflow.replace(
+        "echo \"SKIA_ARCHIVE_IOS_DEVICE=$(pwd)/$archive_file\" >> \"$GITHUB_ENV\"",
+        "echo \"SKIA_ARCHIVE_IOS_DEVICE=$(pwd)/$archive_file\" >> \"$GITHUB_ENV\"\n          # expect 15e20f3265dfddd658f9ef0d0e30d50a73afccb88787812f65fb5e6cf4ec55c8",
+    );
+    assert_ne!(
+        hardcoded_digest, workflow,
+        "hardcoded-digest fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&hardcoded_digest)
+        .expect_err("a literal SHA-256-shaped digest, even in a comment, must be rejected");
+    assert!(
+        error.contains("embeds what looks like a bare SHA-256 digest literally"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_missing_resolver_output() {
+    // The device build step still asks for `SKIA_ARCHIVE_IOS_DEVICE`, but nothing in the job ever
+    // resolves and verifies the device pin to produce it: "missing resolver output".
+    let mut steps = ios_packaging_workflow_header("iOS packaging", "package", "iOS packaging");
+    steps.push_str(&ios_resolve_and_verify_step(
+        "Resolve and verify iOS simulator Skia pin",
+        "aarch64-apple-ios-sim",
+        "SKIA_ARCHIVE_IOS_SIM",
+    ));
+    steps.push_str(&ios_build_step(
+        "Build iOS device target",
+        "aarch64-apple-ios",
+        "SKIA_ARCHIVE_IOS_DEVICE",
+    ));
+    steps.push_str(&ios_build_step(
+        "Build iOS simulator target",
+        "aarch64-apple-ios-sim",
+        "SKIA_ARCHIVE_IOS_SIM",
+    ));
+
+    let error = validate_ios_skia_injection_text(&steps)
+        .expect_err("building the device target without ever resolving its pin must be rejected");
+    assert!(
+        error.contains("no earlier step resolves and verifies a pin for aarch64-apple-ios"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_cross_target_substitution_in_both_directions() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // `env.SKIA_ARCHIVE_IOS_DEVICE }}` only ever appears once in the compliant fixture: inside the
+    // device build step's `SKIA_BINARIES_URL` expression (the resolve-and-verify steps publish the
+    // same variable name via plain `SKIA_ARCHIVE_IOS_DEVICE=`, with no `env.` prefix), so swapping
+    // just that reference is enough to feed the device build step the simulator archive instead.
+    let device_gets_sim_archive = workflow.replace(
+        "env.SKIA_ARCHIVE_IOS_DEVICE }}",
+        "env.SKIA_ARCHIVE_IOS_SIM }}",
+    );
+    assert_ne!(
+        device_gets_sim_archive, workflow,
+        "substitution fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&device_gets_sim_archive)
+        .expect_err("a device build fed the simulator archive must be rejected");
+    assert!(
+        error.contains(
+            "does not set SKIA_BINARIES_URL to the verified local archive for this step's target"
+        ),
+        "wrong rejection reason: {error}"
+    );
+
+    // The simulator build step is fed the *device* archive.
+    let sim_gets_device_archive = workflow.replace(
+        "env.SKIA_ARCHIVE_IOS_SIM }}",
+        "env.SKIA_ARCHIVE_IOS_DEVICE }}",
+    );
+    assert_ne!(
+        sim_gets_device_archive, workflow,
+        "substitution fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&sim_gets_device_archive)
+        .expect_err("a simulator build fed the device archive must be rejected");
+    assert!(
+        error.contains(
+            "does not set SKIA_BINARIES_URL to the verified local archive for this step's target"
+        ),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_missing_force_flag_and_missing_local_override() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    let without_force = workflow.replace("      FORCE_SKIA_BINARIES_DOWNLOAD: \"1\"\n", "");
+    assert_ne!(
+        without_force, workflow,
+        "force-removal fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&without_force).expect_err(
+        "a Skia-resolving cargo step without FORCE_SKIA_BINARIES_DOWNLOAD must be rejected",
+    );
+    assert!(
+        error.contains("without FORCE_SKIA_BINARIES_DOWNLOAD set to a truthy value"),
+        "wrong rejection reason: {error}"
+    );
+
+    let without_local_override = workflow.replace(
+        "        env:\n          SKIA_BINARIES_URL: \"file://${{ env.SKIA_ARCHIVE_IOS_DEVICE }}\"\n          CARGO_TERM_COLOR: \"never\"\n",
+        "",
+    );
+    assert_ne!(
+        without_local_override, workflow,
+        "override-removal fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&without_local_override)
+        .expect_err("a Skia-resolving cargo step without SKIA_BINARIES_URL must be rejected");
+    assert!(
+        error.contains("does not set SKIA_BINARIES_URL to the verified local archive"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_a_mutable_shared_archive_variable_name() {
+    // Both targets are resolved, but through one shared, non-fixed variable name instead of the
+    // two fixed names this policy requires: a later resolve silently overwrites the earlier
+    // target's path under the same name, exactly the "mutable name" fallback this check must
+    // reject by construction rather than by detecting the overwrite itself.
+    let mut steps = ios_packaging_workflow_header("iOS packaging", "package", "iOS packaging");
+    steps.push_str(&ios_resolve_and_verify_step(
+        "Resolve and verify iOS device Skia pin",
+        "aarch64-apple-ios",
+        "SKIA_ARCHIVE_PATH",
+    ));
+    steps.push_str(&ios_resolve_and_verify_step(
+        "Resolve and verify iOS simulator Skia pin",
+        "aarch64-apple-ios-sim",
+        "SKIA_ARCHIVE_PATH",
+    ));
+    steps.push_str(&ios_build_step(
+        "Build iOS device target",
+        "aarch64-apple-ios",
+        "SKIA_ARCHIVE_PATH",
+    ));
+    steps.push_str(&ios_build_step(
+        "Build iOS simulator target",
+        "aarch64-apple-ios-sim",
+        "SKIA_ARCHIVE_PATH",
+    ));
+
+    let error = validate_ios_skia_injection_text(&steps)
+        .expect_err("a shared mutable archive variable name for both targets must be rejected");
+    // The device resolve-and-verify step publishes the archive under the shared name instead of
+    // the fixed `SKIA_ARCHIVE_IOS_DEVICE`, so it is rejected exactly as if it had never published
+    // anything at all — the fixed-name requirement makes the "mutable name" fallback structurally
+    // unable to satisfy this check, without this module ever having to detect the overwrite.
+    assert!(
+        error.contains("verifies the aarch64-apple-ios archive but never publishes SKIA_ARCHIVE_IOS_DEVICE via $GITHUB_ENV"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_an_unverified_host_clippy_step() {
+    let mut workflow =
+        compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+    // A host-target clippy step (no `--target`, so it resolves Skia for whatever the runner's
+    // native triple is) added to the same job: it inherits the job's FORCE_SKIA_BINARIES_DOWNLOAD,
+    // but never points SKIA_BINARIES_URL at either verified local archive, so it must still be
+    // rejected — FORCE alone is not enough to admit an unverified step.
+    workflow.push_str(
+        "      - name: Host clippy\n        run: cargo clippy --manifest-path ios/Cargo.toml\n",
+    );
+    let error = validate_ios_skia_injection_text(&workflow)
+        .expect_err("an unverified host clippy step that could resolve Skia must be rejected");
+    assert!(
+        error.contains(
+            "does not set SKIA_BINARIES_URL to the verified local archive for this step's target"
+        ),
+        "wrong rejection reason: {error}"
+    );
+}
+
+/// A variant of [`ios_packaging_workflow_header`] whose `pull_request` trigger narrows itself with
+/// an explicit `paths:` allow list, for exercising [`validate_trigger_paths_include_trusted_root`]
+/// in isolation. Built the same way as [`ios_resolve_and_verify_step`]/[`ios_build_step`] — plain
+/// `push_str` calls, no backslash-continuation — so its exact indentation is never in question.
+fn ios_packaging_workflow_header_with_paths(
+    name: &str,
+    job_id: &str,
+    job_name: &str,
+    include_trusted_root: bool,
+) -> String {
+    let mut header = String::new();
+    header.push_str(&format!("name: \"{name}\"\n"));
+    header.push('\n');
+    header.push_str("on:\n");
+    header.push_str("  pull_request:\n");
+    header.push_str("    branches:\n");
+    header.push_str("      - main\n");
+    header.push_str("    paths:\n");
+    header.push_str("      - \".github/workflows/ios-packaging.yml\"\n");
+    if include_trusted_root {
+        header.push_str("      - \".github/trusted/**\"\n");
+    }
+    header.push('\n');
+    header.push_str("permissions:\n");
+    header.push_str("  contents: read\n");
+    header.push('\n');
+    header.push_str("jobs:\n");
+    header.push_str(&format!("  {job_id}:\n"));
+    header.push_str(&format!("    name: \"{job_name}\"\n"));
+    header.push_str("    runs-on: macos-14\n");
+    header.push_str("    env:\n");
+    header.push_str("      FORCE_SKIA_BINARIES_DOWNLOAD: \"1\"\n");
+    header.push_str("    steps:\n");
+    header
+}
+
+/// Appends both resolve-and-verify steps and both build steps to `header`, producing a full,
+/// otherwise-compliant iOS Skia trust chain — shared by the trigger-paths acceptance/rejection
+/// pair below so only the header's `paths:` allow list differs between the two fixtures.
+fn append_compliant_ios_skia_steps(header: &mut String) {
+    header.push_str(&ios_resolve_and_verify_step(
+        "Resolve and verify iOS device Skia pin",
+        "aarch64-apple-ios",
+        "SKIA_ARCHIVE_IOS_DEVICE",
+    ));
+    header.push_str(&ios_resolve_and_verify_step(
+        "Resolve and verify iOS simulator Skia pin",
+        "aarch64-apple-ios-sim",
+        "SKIA_ARCHIVE_IOS_SIM",
+    ));
+    header.push_str(&ios_build_step(
+        "Build iOS device target",
+        "aarch64-apple-ios",
+        "SKIA_ARCHIVE_IOS_DEVICE",
+    ));
+    header.push_str(&ios_build_step(
+        "Build iOS simulator target",
+        "aarch64-apple-ios-sim",
+        "SKIA_ARCHIVE_IOS_SIM",
+    ));
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_trigger_paths_that_omit_the_trusted_root() {
+    let mut workflow = ios_packaging_workflow_header_with_paths(
+        "iOS packaging",
+        "package",
+        "iOS packaging",
+        false,
+    );
+    append_compliant_ios_skia_steps(&mut workflow);
+
+    let error = validate_ios_skia_injection_text(&workflow).expect_err(
+        "a pull_request trigger narrowed to paths that omit the trusted root must be rejected \
+         once the workflow actually engages the iOS Skia trust chain",
+    );
+    assert!(
+        error.contains("narrows to a paths: allow list that omits"),
+        "wrong rejection reason: {error}"
+    );
+    assert!(
+        error.contains(".github/trusted/**"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_accepts_trigger_paths_that_include_the_trusted_root() {
+    let mut workflow =
+        ios_packaging_workflow_header_with_paths("iOS packaging", "package", "iOS packaging", true);
+    append_compliant_ios_skia_steps(&mut workflow);
+
+    validate_ios_skia_injection_text(&workflow).expect(
+        "a pull_request trigger narrowed to paths that include the trusted root must be accepted \
+         once the rest of the Skia trust chain is satisfied",
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_accepts_a_pr_138_shaped_skia_free_ios_app_workflow() {
+    // Live PR #138's real shape (confirmed against its own diff): a `cargo tree` assertion with a
+    // positive control proving zero Skia dependency, then `cargo build --locked --package
+    // gta-claw-ios --target ...` for both device and simulator targets — never `ios/`,
+    // `ios/Cargo.toml`, `ios/apps/gta-claw-ios-shell/Cargo.toml`, or the `gta-claw-ios-shell`
+    // package the admitted iOS Skia workspace uses. None of these steps target that workspace, so
+    // this trust chain has nothing here to protect and the file is accepted outright.
+    let mut workflow = ios_packaging_workflow_header("iOS packaging", "package", "iOS packaging");
+    workflow.push_str("      - name: Prove apps/gta-claw-ios resolves no Skia dependency\n");
+    workflow.push_str("        run: |\n");
+    workflow.push_str("          set -euo pipefail\n");
+    workflow.push_str(
+        "          cargo tree --manifest-path apps/gta-claw-ios/Cargo.toml --target aarch64-apple-ios -e normal > tree.txt\n",
+    );
+    workflow.push_str("          grep -q gta-claw-ios tree.txt\n");
+    workflow.push_str(
+        "          ! grep -qE 'skia-bindings|skia-safe|i-slint-renderer-skia' tree.txt\n",
+    );
+    workflow.push_str("      - name: Build gta-claw-ios device target\n");
+    workflow.push_str(
+        "        run: cargo build --locked --package gta-claw-ios --target aarch64-apple-ios\n",
+    );
+    workflow.push_str("      - name: Build gta-claw-ios simulator target\n");
+    workflow.push_str(
+        "        run: cargo build --locked --package gta-claw-ios --target aarch64-apple-ios-sim\n",
+    );
+
+    validate_ios_skia_injection_text(&workflow).expect(
+        "a workflow that only builds the unrelated, already-audited, Skia-free gta-claw-ios app \
+         must be accepted outright, exactly like live PR #138",
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_a_relative_archive_path() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    let relative_path = workflow.replace(
+        "echo \"SKIA_ARCHIVE_IOS_DEVICE=$(pwd)/$archive_file\" >> \"$GITHUB_ENV\"",
+        "echo \"SKIA_ARCHIVE_IOS_DEVICE=$archive_file\" >> \"$GITHUB_ENV\"",
+    );
+    assert_ne!(
+        relative_path, workflow,
+        "relative-path fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&relative_path)
+        .expect_err("publishing the verified archive as a relative path must be rejected");
+    assert!(
+        error.contains("is not visibly absolute"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_a_hardcoded_archive_filename() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // Only the device step's `-o` target is hardcoded (`replacen(..., 1)`): both resolve-and-verify
+    // steps otherwise share the exact same curl invocation text.
+    let hardcoded_filename = workflow.replacen(
+        "curl -fL -sS -o \"$archive_file\" \"$url\"",
+        "curl -fL -sS -o device.tar.gz \"$url\"",
+        1,
+    );
+    assert_ne!(
+        hardcoded_filename, workflow,
+        "hardcoded-filename fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&hardcoded_filename).expect_err(
+        "fetching the archive to a hardcoded filename instead of one derived from the resolved \
+         URL must be rejected",
+    );
+    assert!(
+        error.contains("hardcoded filename"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_missing_verbose_build_log_capture() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // A space immediately follows "ios" in this exact substring, so it cannot match a prefix of
+    // the simulator step's "...--target aarch64-apple-ios-sim -vv --color never 2>&1" line (which
+    // has "-sim" immediately after "ios", not a space) — only the device build step's line is
+    // affected.
+    let missing_verbose = workflow.replace(
+        "cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios -vv --color never 2>&1",
+        "cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios -v --color never 2>&1",
+    );
+    assert_ne!(
+        missing_verbose, workflow,
+        "missing-verbose fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&missing_verbose).expect_err(
+        "a Skia-resolving cargo step at plain -v, which suppresses a build script's own log \
+         output on success, must be rejected",
+    );
+    assert!(
+        error.contains("cargo's -vv verbosity through tee"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_missing_download_log_evidence() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // Removed from the *simulator* build step specifically: it is the last step in the fixture, so
+    // nothing after it can satisfy [`skia_download_path_is_verified_in_log`]'s forward scan the way
+    // a later step's own complete log-marker set otherwise could for an earlier step. Both the
+    // piped-console-log check and the output-file receipt check assert `UNPACKING ARCHIVE INTO`, so
+    // both of the simulator step's occurrences must be removed for this fixture to actually lack the
+    // evidence entirely, rather than merely lacking it in one of two independent places. The second
+    // pattern is identical text in both build steps, so this also strips the device step's
+    // output-file assertion as a side effect; that step still carries its own unaffected
+    // plain-log `UNPACKING ARCHIVE INTO` line, so it remains fully compliant on its own merits.
+    let missing_log_evidence = workflow
+        .replace(
+            "          grep -q \"UNPACKING ARCHIVE INTO\" build-aarch64-apple-ios-sim.plain.log\n",
+            "",
+        )
+        .replace(
+            "          grep -q \"UNPACKING ARCHIVE INTO\" \"$output_file\"\n",
+            "",
+        );
+    assert_ne!(
+        missing_log_evidence, workflow,
+        "missing-log-evidence fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&missing_log_evidence).expect_err(
+        "a build step that captures -vv output through tee but never checks it for the forced \
+         download's log evidence must be rejected",
+    );
+    assert!(
+        error.contains("never checks a captured build log for evidence"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_a_missing_download_succeeded_marker() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // `UNPACKING ARCHIVE INTO` is printed before `skia-bindings` ever calls `binaries::unpack`, so
+    // it is only ever an attempt marker. Stripping just the unconditional `DOWNLOAD AND INSTALL
+    // SUCCEEDED` line — the actual completion proof — from both build steps' output-file checks,
+    // while leaving every other check (including the piped-console-log UNPACKING checks) intact,
+    // isolates this fixture to Round 5's own new requirement.
+    let missing_succeeded = workflow.replace(
+        "          grep -q \"DOWNLOAD AND INSTALL SUCCEEDED\" \"$output_file\"\n",
+        "",
+    );
+    assert_ne!(
+        missing_succeeded, workflow,
+        "missing-succeeded fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&missing_succeeded).expect_err(
+        "an output-file check that never asserts the unconditional DOWNLOAD AND INSTALL \
+         SUCCEEDED line must be rejected — UNPACKING ARCHIVE INTO alone proves only an attempt, \
+         not a completed, successful download",
+    );
+    assert!(
+        error.contains("DOWNLOAD AND INSTALL SUCCEEDED"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_a_non_target_scoped_stale_output_clean() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // Reverting the device build step's stale-output clean back to the old, non-target-scoped
+    // glob (`rm -rf target/*/build/skia-bindings-*`) means it can no longer prove it did not leave
+    // the *simulator's* own stale output undisturbed, or that a hash change did not leave a stale
+    // leftover under some other target's tree unremoved — the cross-target freshness gap Round 5
+    // closes.
+    let unscoped_clean = workflow.replacen(
+        "rm -rf target/aarch64-apple-ios/*/build/skia-bindings-*",
+        "rm -rf target/*/build/skia-bindings-*",
+        1,
+    );
+    assert_ne!(
+        unscoped_clean, workflow,
+        "unscoped-clean fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&unscoped_clean).expect_err(
+        "a stale-output clean that is not scoped to this exact target's own output tree must be \
+         rejected",
+    );
+    assert!(
+        error.contains("scoped to this exact target's own output tree"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_missing_output_candidate_uniqueness_verification() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // Removing the exactly-one-candidate assertion from the device build step reverts to trusting
+    // an unverified `find` result: the "ambiguous multiple candidates" gap Round 5 closes. A stale
+    // leftover the clean step's scope missed, or two hash-suffixed variants coexisting, could
+    // otherwise be silently narrowed to an arbitrary result (a bare first line) and trusted
+    // anyway.
+    let missing_uniqueness_check = workflow.replacen(
+        "          candidate_count=$(printf '%s\\n' \"$candidates\" | grep -c .)\n          [ \"$candidate_count\" -eq 1 ]\n",
+        "",
+        1,
+    );
+    assert_ne!(
+        missing_uniqueness_check, workflow,
+        "missing-uniqueness-check fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&missing_uniqueness_check).expect_err(
+        "an output-file discovery that never confirms exactly one candidate was found must be \
+         rejected",
+    );
+    assert!(
+        error.contains("exactly one candidate"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_missing_color_never() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // `requests_color_never` accepts either signal alone (CARGO_TERM_COLOR=never or a --color
+    // never flag), so a true negative case must remove both from the same step. Strip
+    // CARGO_TERM_COLOR from every step's env (both build steps carry the identical line) and the
+    // --color never flag from the *device* step's cargo invocation specifically, so that one step
+    // loses every color-disabling signal while the simulator step (checked afterward) keeps its
+    // own flag — irrelevant here, since the device step is encountered, and therefore rejected,
+    // first.
+    let without_color_env = workflow.replace("          CARGO_TERM_COLOR: \"never\"\n", "");
+    assert_ne!(
+        without_color_env, workflow,
+        "color-env-removal fixture did not change anything"
+    );
+    let missing_color_never = without_color_env.replace(
+        "cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios -vv --color never 2>&1",
+        "cargo build --manifest-path ios/Cargo.toml --target aarch64-apple-ios -vv 2>&1",
+    );
+    assert_ne!(
+        missing_color_never, without_color_env,
+        "color-flag-removal fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&missing_color_never).expect_err(
+        "a Skia-resolving cargo step that never disables ANSI color output must be rejected",
+    );
+    assert!(
+        error.contains("disabling ANSI color output"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_missing_ansi_strip_evidence() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // Removed from the *simulator* build step specifically: it is the last step in the fixture, so
+    // nothing after it can satisfy skia_download_path_is_verified_in_log's forward scan the way an
+    // earlier step's own strip evidence otherwise could (the device step, checked first, still
+    // carries its own untouched strip line and would pass on its own forward scan, which also
+    // covers this later step).
+    let missing_ansi_strip = workflow.replace(
+        "          perl -pe 's/\\x1b\\[[0-9;]*[A-Za-z]//g' build-aarch64-apple-ios-sim.log > build-aarch64-apple-ios-sim.plain.log\n",
+        "",
+    );
+    assert_ne!(
+        missing_ansi_strip, workflow,
+        "ansi-strip-removal fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&missing_ansi_strip).expect_err(
+        "a Skia-resolving cargo step whose script never strips ANSI escape codes before \
+         grepping its captured log must be rejected",
+    );
+    assert!(
+        error.contains("never checks a captured build log for evidence"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_an_unverified_positive_control() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // The grep -c count is still computed into control.count by every step (untouched), but the
+    // check that it is actually nonzero is removed everywhere: exactly the "computed but ignored"
+    // gap a positive control exists to close, per this policy's own rule that a zero or unchecked
+    // count invalidates the whole measurement and must never be silently passed.
+    let missing_positive_control =
+        workflow.replace("          [ \"$(cat control.count)\" -gt 0 ]\n", "");
+    assert_ne!(
+        missing_positive_control, workflow,
+        "positive-control-removal fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&missing_positive_control).expect_err(
+        "a Skia-resolving cargo step that computes a grep count but never verifies it is nonzero \
+         must be rejected",
+    );
+    assert!(
+        error.contains("never checks a captured build log for evidence"),
+        "wrong rejection reason: {error}"
+    );
 }
 
 #[test]
@@ -5090,14 +5999,16 @@ fn case_aliased_mobile_directories_fail_on_every_host() {
 }
 
 #[test]
-fn ios_cannot_land_until_its_prebuilt_skia_archive_is_pinned() {
+fn ios_can_land_now_that_its_prebuilt_skia_archive_is_pinned() {
     let slint = {
         let probe = final_tree("mobile-ios-slint-probe");
         desktop_slint_version(&probe)
     };
 
-    // Everything except the reviewed archive digest is satisfied, so the reported failure proves
-    // the digest gate is the sole remaining blocker rather than a defect elsewhere in the fixture.
+    // The reviewed pin table now names an exact digest for both admitted iOS targets
+    // (`aarch64-apple-ios` / `aarch64-apple-ios-sim`), so a lock that is otherwise complete is
+    // admitted outright — proving the only thing that ever blocked iOS was the absence of a
+    // reviewed archive digest, not some other defect in the fixture.
     let pinned = final_tree("mobile-ios-pinned");
     retarget_root_exclude(&pinned);
     let lock = mobile_lock(
@@ -5109,13 +6020,9 @@ fn ios_cannot_land_until_its_prebuilt_skia_archive_is_pinned() {
         ),
     );
     write_mobile_workspace(&pinned, "ios", &lock);
-    let error = rejection(&pinned, "iOS without a reviewed Skia digest is rejected");
-    assert!(
-        error.contains("uses skia-bindings, which fetches at build time")
-            && error.contains("aarch64-apple-ios")
-            && error.contains("aarch64-apple-ios-sim"),
-        "iOS admission must require a reviewed digest for every admitted target, got: {error}"
-    );
+    let root = SafeRoot::new(&pinned.path).expect("open pinned iOS fixture");
+    validate_final_static(&root)
+        .expect("iOS with a reviewed Skia digest for every admitted target is admitted");
 
     let drifted = final_tree("mobile-ios-drift");
     retarget_root_exclude(&drifted);

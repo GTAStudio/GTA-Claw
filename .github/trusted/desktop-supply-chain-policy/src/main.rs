@@ -10,7 +10,8 @@ use desktop_supply_chain_policy::changes::{compute_manifest, write_manifest};
 use desktop_supply_chain_policy::input::SafeRoot;
 use desktop_supply_chain_policy::metadata::linux_tools;
 use desktop_supply_chain_policy::policy::{
-    bootstrap_archive_fingerprint, verified_bootstrap_root_fingerprint, write_bootstrap_snapshot,
+    MAX_BUILD_ARTIFACT_BYTES, bootstrap_archive_fingerprint, resolve_build_artifact_pin,
+    verified_bootstrap_root_fingerprint, verify_local_build_artifact, write_bootstrap_snapshot,
     write_final_dependency_fixtures,
 };
 use desktop_supply_chain_policy::validation::{ValidationRequest, validate_request};
@@ -169,6 +170,51 @@ fn validate(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
     Ok(())
 }
 
+fn resolve_build_artifact_pin_command(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
+    let mut options = parse_options(values)?;
+    let package = required_text(&mut options, "package")?;
+    let version = required_text(&mut options, "version")?;
+    let target = required_text(&mut options, "target")?;
+    let verify_local = options.remove("verify-local");
+    let max_bytes = match options.remove("max-bytes") {
+        Some(value) => {
+            let text = value
+                .into_os_string()
+                .into_string()
+                .map_err(|_| PolicyError::new("option --max-bytes is not UTF-8"))?;
+            text.parse::<u64>().map_err(|cause| {
+                PolicyError::new(format!(
+                    "option --max-bytes is not a valid byte count: {cause}"
+                ))
+            })?
+        }
+        None => MAX_BUILD_ARTIFACT_BYTES,
+    };
+    reject_unknown(&options)?;
+    let pin = resolve_build_artifact_pin(&package, &version, &target)?;
+    match verify_local {
+        Some(path) => {
+            let verified_bytes = verify_local_build_artifact(&pin, &path, max_bytes)?;
+            println!(
+                "resolved-build-artifact-pin package={} version={} target={} url={} sha256={} verified_local={} verified_bytes={verified_bytes}",
+                pin.package,
+                pin.version,
+                pin.target,
+                pin.url,
+                pin.sha256,
+                path.display()
+            );
+        }
+        None => {
+            println!(
+                "resolved-build-artifact-pin package={} version={} target={} url={} sha256={}",
+                pin.package, pin.version, pin.target, pin.url, pin.sha256
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run() -> PolicyResult<()> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
@@ -180,6 +226,7 @@ fn run() -> PolicyResult<()> {
         Some("bootstrap-fingerprint") => fingerprint(arguments),
         Some("write-bootstrap-snapshot") => snapshot(arguments),
         Some("write-final-dependency-fixtures") => final_dependency_fixtures(arguments),
+        Some("resolve-build-artifact-pin") => resolve_build_artifact_pin_command(arguments),
         Some("validate") => validate(arguments),
         Some(other) => Err(PolicyError::new(format!(
             "unknown validator command: {other}"

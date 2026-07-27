@@ -8,6 +8,7 @@ pub mod changes;
 pub mod identity;
 pub mod input;
 pub mod metadata;
+pub mod mobile_workflow;
 pub mod ownership;
 pub mod policy;
 pub mod process;

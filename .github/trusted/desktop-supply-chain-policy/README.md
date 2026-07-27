@@ -145,14 +145,28 @@ the software renderer instead, and is held to the identical discipline the momen
 
 `PINNED_BUILD_ARTIFACTS` records reviewed `(package, version, target, url, SHA-256)` pins for every package known to fetch at build time, listed in `BUILD_TIME_FETCHING_PACKAGES` — today exactly `skia-bindings`, so a second such package cannot appear silently. The archive key embeds
 the crate commit, target, and resolved feature set, so it cannot be computed before the mobile lock
-exists. The table is therefore empty, and the validator refuses to admit any mobile workspace that
-uses Skia while it stays empty. Filling it is a reviewed trust-root edit. Obtain each digest from
-the release asset metadata, which publishes a SHA-256 the build script ignores:
+exists, which is why the table started empty. It now carries the two reviewed `aarch64-apple-ios`
+and `aarch64-apple-ios-sim` rows for `skia-bindings` 0.99.0 — the only pair the shipped iOS platform
+can need, since `MOBILE_PLATFORMS` declares no other Skia target for it. The validator still refuses
+to admit any mobile workspace that uses Skia on a target whose pin is absent here, so a third target,
+or a second fetching package, cannot appear silently; a future platform (Android, if it ever selects
+Skia over FemtoVG or the software renderer) still fills its own rows the same reviewed way. Each
+digest was obtained from the release asset metadata, which publishes a SHA-256 the build script
+ignores:
 
 ```text
 gh api repos/rust-skia/skia-binaries/releases/tags/<version> \
   --jq '.assets[] | select(.name | test("aarch64-apple-ios")) | [.name, .digest] | @tsv'
 ```
+
+Matching a pin row's URL to its target is not a plain `url.contains(target)`: `aarch64-apple-ios` is
+a proper prefix of `aarch64-apple-ios-sim`, so a simulator archive's URL also contains the device
+target's name and would otherwise satisfy the device row. The validator instead extracts the
+**longest** admitted target that appears in the URL and requires it to equal the row's own target,
+and rejects the row outright if no admitted target appears or if two distinct admitted targets of
+the same longest length both appear. This resolves collisions between admitted targets; it does not
+parse the URL, so a target name reachable only through an unrelated path segment or query string is
+still out of scope for this check and depends on the digest to catch the wrong artifact.
 
 #### Why the lockfile does not already cover this
 
@@ -164,8 +178,9 @@ own manifest: its `include` list is `Cargo.toml`, `bindings_docs.rs`, `build.rs`
 `build_support/**/*.rs`, and `src/**`. The published `.crate` file cannot contain the artifact, so
 no checksum over it can cover the artifact.
 
-Three further facts, each verified against `rust-skia` at tag `0.99.0`, that a future session
-filling `PINNED_BUILD_ARTIFACTS` needs in order to fill it from the right source:
+Three further facts, each verified against `rust-skia` at tag `0.99.0`, that a session filling
+`PINNED_BUILD_ARTIFACTS` needs in order to fill it from the right source — used to obtain the two
+iOS rows above, and equally binding on any future platform's rows:
 
 - **The artifact host is a different repository from the crate source.** The crate declares
   `repository = "https://github.com/rust-skia/rust-skia"`; the archive is served from
@@ -231,7 +246,178 @@ versionless skips, source widening, advisory exceptions, graph target filtering,
 drift are rejected. The discovery transition pins only the reviewed older `getrandom`, `rand`,
 `core-foundation`, `syn`, and `sha3` lines that coexist with their newer ecosystem versions.
 
+### Admitted `ios-packaging.yml` content is bound to the trust chain, not its path
+
+A file at `.github/workflows/ios-packaging.yml` is an admitted path, not proof of Skia exposure.
+Live PR #138 already occupies this exact path while packaging `apps/gta-claw-ios` — a different,
+Skia-free application, proven so by that PR's own `cargo tree` assertion with a positive control —
+and never fetches a Skia archive at all. `mobile_workflow::validate_ios_packaging_workflow_skia_injection`
+therefore applies the checks below only to steps that actually target the iOS Skia workspace
+`MOBILE_PLATFORMS` declares: an exact `working-directory: ios`, or a `run:` invocation naming the
+exact workspace manifest (`ios/Cargo.toml`), exact app manifest
+(`ios/apps/gta-claw-ios-shell/Cargo.toml`), or exact app package (`gta-claw-ios-shell`) — always by
+exact match, never `contains`, since `gta-claw-ios` is a proper prefix of `gta-claw-ios-shell` and a
+substring check would let one satisfy a check meant for the other. A file with no such step, like PR
+#138's, has nothing here for this trust chain to protect and is accepted outright; the moment any
+step does target that workspace, every check below applies to the whole job.
+
+Once engaged, every prebuilt Skia archive a job could fetch must be resolved through the trusted CLI
+resolver (`resolve-build-artifact-pin`, backed by `PINNED_BUILD_ARTIFACTS`), never a URL or digest
+typed directly into the YAML — rejected even inside a comment. Given `--package`, `--version`, and
+`--target`, it prints one bounded, machine-consumable line naming the sole reviewed
+`(package, version, target, url, sha256)` fact for that exact input, and fails closed — loudly, with
+the real digest redacted from a mismatch error — on an unknown, duplicate, ambiguous, or cross-target
+input; matching is exact-string equality on all three fields, never substring or prefix, for the same
+reason a pin row's own URL-to-target match cannot be either. Passing `--verify-local <path>`
+additionally re-hashes that exact local file and checks its size against a bound
+(`MAX_BUILD_ARTIFACT_BYTES`, 128 MiB, overridable with `--max-bytes`), appending the verified path and
+byte count to the same line only on success; a digest mismatch, an oversized file, or a missing file
+is rejected before those fields ever print. A resolve-and-verify step must fetch with a fail-closed
+`curl` (`-f`/`--fail`) to a filename derived from the resolved URL's own `basename` — never a
+hardcoded literal, so a stale or mistyped local name can never silently pair with the wrong archive —
+`--verify-local` that exact fetched file, and publish the verified path under one of two fixed
+environment variable names (`SKIA_ARCHIVE_IOS_DEVICE` / `SKIA_ARCHIVE_IOS_SIM`) through
+`$GITHUB_ENV`, as a visibly absolute path (`/...`, `$(pwd)/...`, `$PWD/...`, `${PWD}/...`,
+`$GITHUB_WORKSPACE/...`, or `${GITHUB_WORKSPACE}/...`): `skia-bindings` reads everything after a
+`file://` prefix as a literal path with no further parsing, so a relative path would be silently
+working-directory-dependent. The two fixed variable names make cross-target substitution and
+"mutable name" fallbacks (reusing one name for both targets, so a later resolve silently overwrites
+an earlier target's path) structurally impossible to satisfy this check, rather than something this
+module has to detect after the fact.
+
+A Skia-resolving cargo step targeting that workspace (`cargo check`/`clippy`/`build`/`test`/`run`)
+must set `FORCE_SKIA_BINARIES_DOWNLOAD` to a truthy value — `skia-bindings` otherwise falls back
+silently to an unverified source build rather than failing — and point `SKIA_BINARIES_URL` at
+`file://` plus the verified archive matching its own `--target` (or either verified archive, for a
+step naming no explicit target). That alone only proves the workflow *asked* for the forced download
+path; the step must also request cargo's `-vv` build-script output (plain `-v`/`--verbose` alone
+suppresses it on a successful build) piped through `tee` to a captured log, and some step from that
+point on in the job must check the captured log for the literal lines
+`TRYING TO DOWNLOAD AND INSTALL SKIA BINARIES` and `UNPACKING ARCHIVE INTO`, and reject
+`DOWNLOAD AND INSTALL FAILED` — a successful `Compiling skia-bindings` line alone proves nothing,
+since a stale build cache or a silent fallback source build can print that too.
+
+Finally, once a workflow engages this trust chain, every `on:` trigger event that narrows itself with
+a `paths:` allow list must include `.github/trusted/**`, so a future change to the pin table or the
+resolver itself always re-runs the workflow that consumes them; an event with no `paths:` filter at
+all is already unrestricted and compliant. This requirement is scoped by the same engagement check as
+the rest of this section, for the same reason: PR #138's own trigger, which never touches Skia, is
+exempt exactly as its steps are.
+
+All of the above is a bounded, textual content check over the workflow YAML — whitespace-tokenized,
+per line, quote-trimming only, not a shell parser or a GitHub Actions expression evaluator. It proves
+the workflow *says* the right things in the right order; it cannot prove a 404, a digest mismatch, or
+a wrong local archive at runtime, which remain the resolver/verifier's own job and its own tests.
+
+### Colorized build logs cannot defeat the download-evidence check
+
+The build-log evidence check above is corroboration layered on top of the trust chain's actual proof
+(a trusted-table resolve, a fail-closed prefetch, a local SHA-256 verification, a `file://` injection
+of that exact verified path, `FORCE_SKIA_BINARIES_DOWNLOAD`, and the step's own process exit status),
+not the proof itself. Corroboration from a real GitHub Actions log is only meaningful once three
+further conditions hold, because such a log retains ANSI color escape codes interleaved with cargo's
+own text — for example, a `Compiling` token immediately followed by a color-reset escape code and only
+then `skia-bindings`. A raw, colorized log can split one of this policy's literal markers across an
+escape code, so a naive substring grep for it can silently find nothing even though the marker text is
+fully present, turning an absence-check meant to catch a real failure into a vacuous pass instead. An
+admitted workflow must therefore also: disable color at the source (`CARGO_TERM_COLOR=never` or
+`--color never`); show literal evidence it strips ANSI escape codes (a literal `\x1b\[` pattern) from
+the captured log before grepping it; and prove that capture-and-strip pipeline can find *something*
+with a verified-nonzero positive control — a `grep -c` count actually compared against zero (`-gt 0`,
+`-ne 0`, or `!= 0`), not merely computed and discarded. A zero or unchecked count invalidates the whole
+measurement and is treated as a failure, never silently passed. Like the rest of this section, this is
+a bounded textual-presence check, not a shell interpreter or a real log inspection: it raises the bar
+on what the workflow's own script must visibly do, it does not execute it.
+
+### A normal build's console output is not build-script evidence
+
+Measurement against the real `skia-bindings` 0.99.0 build script shows a plain `cargo build` never
+echoes its `println!` log lines — including `TRYING TO DOWNLOAD AND INSTALL SKIA BINARIES`,
+`  FROM: {url}`, and `UNPACKING ARCHIVE INTO: {dir}` — to the console at all, even on a fresh build
+with no cache. Only `cargo build -vv` (or reading Cargo's own unconditional capture file,
+`target/<profile>/build/skia-bindings-<hash>/output`, which every build always writes regardless of
+verbosity) surfaces them. A workflow step that runs a plain, non-`-vv` build and then greps its own
+console output for these markers is not proving anything: the grep finds nothing whether the download
+succeeded, failed silently into a fallback source build, or never ran at all, so this policy has never
+accepted that shape and continues to require the `-vv`-through-`tee` capture described above for any
+retained console-log check.
+
+### The step's own exit status is only trustworthy if nothing can mask it
+
+The strongest proof a forced Skia download actually happened is simpler than log parsing: with
+`FORCE_SKIA_BINARIES_DOWNLOAD=1` set, the build script itself `panic!`s when the forced download
+fails, which fails `cargo build` non-zero, which fails the step — no log inspection required. This is
+now the trust chain's primary enforcement; captured-log checks are corroboration layered on top of it,
+never a substitute for it. Two things can otherwise mask that exit status and are now rejected
+wherever a step resolves Skia: a `continue-on-error: true` step (GitHub Actions reports it as
+successful to the job regardless of the underlying command's real exit code), and a `-vv`-through-`tee`
+pipeline missing `set -o pipefail` (without it, a shell pipeline's exit status is its *last* command's
+— `tee`'s, which is nearly always zero — not cargo's, silently hiding a real build failure behind a
+log file that was still faithfully written).
+
+Because reading Cargo's own build-script output file requires no verbosity flag at all, this policy
+additionally requires a positive read of it. Three further conditions make that file trustworthy as
+*this* run's evidence, for *the exact target it was built for*, rather than some earlier or
+differently-targeted leftover:
+
+- Because Cargo reuses a fingerprinted build directory and will not rewrite `output` on a no-op
+  rebuild, the job must first remove any stale prior output before the build meant to recreate it, so
+  that file's presence afterward is proof of *this* run and not a leftover from a previous one.
+- When the Skia-resolving step names one specific `--target` (not the host-target, either-archive
+  case), both that removal and the later read must be scoped to that exact target's own output tree
+  (`target/<target>/*/build/skia-bindings-*`, not the unscoped `target/*/build/skia-bindings-*`) —
+  otherwise a device build's clean could leave the simulator's own leftover output undisturbed, and a
+  later read could pick up the wrong target's file even though *some* file exists.
+- Cargo's own hash-suffixed directory naming means more than one candidate file can exist under a
+  search root at once (an interrupted prior run, a hash change across a dependency bump, or the clean
+  step above having the wrong scope). The job must therefore also assert its discovery found *exactly
+  one* candidate (`-eq 1`, `== 1`, or `= 1`) before trusting it — silently narrowing an ambiguous
+  multi-match list to an arbitrary "first" result (a bare `head -n1` with no count check) is rejected
+  exactly like finding zero.
+
+Once discovered, that one file must assert it contains `FROM:` immediately followed by the exact
+injected pinned `file://` expression for that step's own archive variable (not merely `FROM:` in
+isolation, which the fallback source-build path could print for something else), together with the
+unconditional `DOWNLOAD AND INSTALL SUCCEEDED` line. That literal line is `skia-bindings` 0.99.0's own
+definitive completion proof: printed only from the same `Ok` branch as the rest of a successful
+`download_and_install`, i.e. only once the archive was both fully fetched *and* successfully unpacked.
+`UNPACKING ARCHIVE INTO` is still required alongside it as corroboration, but it is printed *before*
+`skia-bindings` calls its own unpack routine, so on its own it proves only that an unpack was
+attempted, never that it (or the whole download-and-install step) actually succeeded — a prior
+revision of this document incorrectly described `UNPACKING ARCHIVE INTO` itself as post-unpack,
+"complete, successful download" proof, which this revision corrects. A cached, stale `output` file
+left over from an earlier successful run, an output file from the wrong target, an ambiguous
+multi-candidate discovery, or one missing the unconditional success line is all treated as no evidence
+at all, exactly like a cached `Compiling skia-bindings` console line is.
+
+### Current desktop clippy is Skia-free by construction, and untouched by this trust chain
+
+`desktop/apps/gta-claw-desktop/Cargo.toml` depends on `slint` with `default-features = false` and an
+exact, byte-pinned feature list — `renderer-femtovg` and `renderer-software`, never `renderer-skia` —
+so `cargo clippy --manifest-path desktop/Cargo.toml --workspace --all-targets --locked -- -D warnings`
+in `.github/workflows/rust.yml` never resolves, builds, or lints `skia-bindings`/`skia-safe` today. A
+clean run of that clippy job is not a gap this trust chain leaves open; it is the expected, currently
+correct state of a workspace that does not consume Skia yet. Nothing in this module or
+`validate_final`/`require_desktop_dependencies` scopes, weakens, or otherwise touches `rust.yml`: the
+Skia-specific checks above (`validate_ios_packaging_workflow_skia_injection`) apply only to
+`.github/workflows/ios-packaging.yml`, and only once a step within it targets the iOS Skia workspace —
+never to the real desktop clippy job, and never contingent on live PR #138 (which itself resolves no
+Skia and ships no packaged artifact; see above).
+
+That non-Skia feature list is itself already under exact, redundant enforcement, so a future flip to
+`renderer-skia` or `default-features = true` cannot silently bypass the pinned Skia trust chain through
+the desktop app: `validate_final_static` byte-compares `desktop/apps/gta-claw-desktop/Cargo.toml`
+against `policy/final/desktop/apps/gta-claw-desktop/Cargo.toml.fixture`, and, independently,
+`require_desktop_dependencies` re-derives `cargo metadata` for the live tree and rejects any deviation
+from `DESKTOP_DEPENDENCIES`'s exact expected `slint` spec — including its full feature set and
+`default-features` — with `desktop metadata dependency controls changed: {name}`. Both run
+unconditionally as part of `validate_final`.
+`exact_desktop_binding_rejects_member_package_build_and_target_mutations` carries two dedicated
+regressions proving the byte-exact path alone already rejects both a `renderer-skia` feature addition
+and a `default-features = true` flip on this exact dependency entry.
+
 ## Legacy Node shrink-only ratchet
+
 
 For every Final protected base, the validator independently inventories both trees. The
 candidate legacy surface must be a subset of the base surface, and both must remain within the
