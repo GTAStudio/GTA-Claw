@@ -297,12 +297,12 @@ pub enum UpdateOutcome {
     Current(Version),
     /// The update was installed atomically.
     Installed(Version),
-    /// Windows kept the target locked. The verified replacement remains staged.
+    /// Windows kept the target locked, so no installation occurred. Close the application and
+    /// rerun; the rerun downloads or resumes as appropriate and re-verifies signed authorization,
+    /// exact size, and digest.
     RestartRequired {
         /// New version.
         version: Version,
-        /// Locally derived verified staging path.
-        staged_path: PathBuf,
     },
 }
 
@@ -737,7 +737,6 @@ impl Updater {
         )?;
         let prepared = match verified.kind {
             ArtifactKind::Executable => PreparedArtifact {
-                path: verified.path.clone(),
                 source_name: OsString::from(STAGED_VERIFIED),
                 handle: verified.file.try_clone().map_err(UpdateError::Io)?,
                 stage: Arc::clone(&verified.stage),
@@ -769,11 +768,8 @@ impl Updater {
                 let verified = self.download(&update, target).await?;
                 match self.install(verified, target).await? {
                     InstallOutcome::Installed => Ok(UpdateOutcome::Installed(version)),
-                    InstallOutcome::RestartRequired { staged_path } => {
-                        Ok(UpdateOutcome::RestartRequired {
-                            version,
-                            staged_path,
-                        })
+                    InstallOutcome::RestartRequired => {
+                        Ok(UpdateOutcome::RestartRequired { version })
                     }
                 }
             }
@@ -933,7 +929,6 @@ pub struct VerifiedArtifact {
 
 #[derive(Debug)]
 struct PreparedArtifact {
-    path: PathBuf,
     source_name: OsString,
     handle: File,
     stage: Arc<SecureStaging>,
@@ -944,7 +939,10 @@ struct PreparedArtifact {
 }
 
 impl VerifiedArtifact {
-    /// Returns the locally derived staging path.
+    /// Returns a diagnostic staging path.
+    ///
+    /// After a rename, this path may cease to name the retained verified object and must not be
+    /// treated as verification authority.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -956,11 +954,10 @@ impl VerifiedArtifact {
 pub enum InstallOutcome {
     /// Replacement completed.
     Installed,
-    /// A Windows lock prevented the swap; verified bytes remain staged.
-    RestartRequired {
-        /// Locally derived staging path.
-        staged_path: PathBuf,
-    },
+    /// Windows kept the target locked, so no installation occurred. Close the application and
+    /// rerun; the rerun downloads or resumes as appropriate and re-verifies signed authorization,
+    /// exact size, and digest.
+    RestartRequired,
 }
 
 /// Explicit updater failures.
@@ -2641,7 +2638,6 @@ async fn prepare_bundle(verified: &VerifiedArtifact) -> Result<PreparedArtifact,
     }
     prepared.sync().map_err(UpdateError::Io)?;
     Ok(PreparedArtifact {
-        path: prepared.path.clone(),
         source_name: prepared_name,
         handle: prepared.handle.try_clone().map_err(UpdateError::Io)?,
         stage: Arc::clone(&verified.stage),
@@ -2762,9 +2758,7 @@ fn atomic_swap_verified(
             .directory
             .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
         if windows_lock_behavior && is_windows_sharing_violation(&error) {
-            return Ok(InstallOutcome::RestartRequired {
-                staged_path: prepared.path.clone(),
-            });
+            return Ok(InstallOutcome::RestartRequired);
         }
         return Err(UpdateError::Io(error));
     }
@@ -2824,9 +2818,7 @@ fn atomic_swap_verified(
             .directory
             .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
         if windows_lock_behavior && is_windows_sharing_violation(&error) {
-            return Ok(InstallOutcome::RestartRequired {
-                staged_path: prepared.path.clone(),
-            });
+            return Ok(InstallOutcome::RestartRequired);
         }
         return Err(UpdateError::Io(error));
     }
@@ -2971,9 +2963,7 @@ fn atomic_swap(
     let had_target = operations.exists(target);
     if had_target && let Err(error) = operations.rename(target, &backup) {
         if windows_lock_behavior && is_windows_sharing_violation(&error) {
-            return Ok(InstallOutcome::RestartRequired {
-                staged_path: staged.to_owned(),
-            });
+            return Ok(InstallOutcome::RestartRequired);
         }
         return Err(UpdateError::Io(error));
     }
@@ -3305,7 +3295,6 @@ mod unit_tests {
             .expect("write staged executable");
         staged.sync_all().expect("sync staged executable");
         let prepared = PreparedArtifact {
-            path: stage.directory.path.join(STAGED_VERIFIED),
             source_name: OsString::from(STAGED_VERIFIED),
             handle: staged,
             stage: Arc::clone(&stage),
@@ -3458,7 +3447,7 @@ mod unit_tests {
 
     #[cfg(windows)]
     #[test]
-    fn real_windows_sharing_lock_keeps_verified_object_staged() {
+    fn real_windows_sharing_lock_returns_restart_required_without_installing() {
         use std::os::windows::fs::OpenOptionsExt as _;
 
         let directory = UnitTestDir::new("windows-lock");
@@ -3480,9 +3469,7 @@ mod unit_tests {
             .write_all(b"verified replacement")
             .expect("write staged executable");
         staged.sync_all().expect("sync staged executable");
-        let staged_path = stage.directory.path.join(STAGED_VERIFIED);
         let prepared = PreparedArtifact {
-            path: staged_path.clone(),
             source_name: OsString::from(STAGED_VERIFIED),
             handle: staged,
             stage,
@@ -3494,20 +3481,11 @@ mod unit_tests {
 
         let outcome =
             atomic_swap_verified(&prepared, true).expect("sharing lock is restart-required");
-        assert_eq!(
-            outcome,
-            InstallOutcome::RestartRequired {
-                staged_path: staged_path.clone(),
-            }
-        );
+        assert_eq!(outcome, InstallOutcome::RestartRequired);
         drop(lock);
         assert_eq!(
             fs::read(&target_path).expect("read locked executable"),
             b"running executable"
-        );
-        assert_eq!(
-            fs::read(staged_path).expect("read retained staged executable"),
-            b"verified replacement"
         );
     }
 
@@ -3636,6 +3614,105 @@ mod unit_tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_verified_handle_survives_rename_and_path_replacement_during_real_swap() {
+        let directory = UnitTestDir::new("windows-rename-replacement");
+        let target_path = directory.path.join("gta-claw.exe");
+        fs::write(&target_path, b"known good").expect("write existing target");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = Arc::new(SecureStaging::open(&target).expect("secure stage"));
+        let verified_bytes = b"verified replacement".to_vec();
+        let attacker_bytes = b"attacker-controlled replacement".to_vec();
+        let mut staged = stage
+            .directory
+            .open_regular(OsStr::new(STAGED_VERIFIED), true)
+            .expect("create staged replacement");
+        staged
+            .write_all(&verified_bytes)
+            .expect("write staged replacement");
+        staged.sync_all().expect("sync staged replacement");
+        let staged_path = stage.directory.path.join(STAGED_VERIFIED);
+        let prepared = PreparedArtifact {
+            source_name: OsString::from(STAGED_VERIFIED),
+            handle: staged,
+            stage: Arc::clone(&stage),
+            digest: Sha256::digest(&verified_bytes).into(),
+            size: u64::try_from(verified_bytes.len()).expect("small replacement"),
+        };
+
+        // This hardens an owner-only staging directory against a same-account concurrent process;
+        // it is not a remote or cross-user integrity boundary.
+        let moved_path = stage.directory.path.join("artifact.moved");
+        let start = Arc::new(Barrier::new(2));
+        let attacker_start = Arc::clone(&start);
+        let attacker_staged_path = staged_path.clone();
+        let attacker_moved_path = moved_path.clone();
+        let attacker_replacement = attacker_bytes.clone();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let attacker = std::thread::spawn(move || {
+            attacker_start.wait();
+            fs::rename(&attacker_staged_path, &attacker_moved_path)
+                .expect("FILE_SHARE_DELETE permits moving the verified pathname");
+            let moved_bytes = fs::read(&attacker_moved_path).expect("read renamed verified object");
+            let mut replacement = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&attacker_staged_path)
+                .expect("create replacement at original verified pathname");
+            replacement
+                .write_all(&attacker_replacement)
+                .expect("write attacker replacement");
+            replacement.sync_all().expect("sync attacker replacement");
+            drop(replacement);
+            let replacement_bytes =
+                fs::read(&attacker_staged_path).expect("read attacker replacement");
+            completed_tx
+                .send((moved_bytes, replacement_bytes))
+                .expect("report completed pathname replacement");
+        });
+
+        start.wait();
+        let (moved_bytes, replacement_bytes) = completed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pathname replacement completes before installation");
+        attacker.join().expect("attacker thread");
+        assert_eq!(
+            moved_bytes, verified_bytes,
+            "rename must move verified bytes"
+        );
+        assert_eq!(
+            replacement_bytes, attacker_bytes,
+            "replacement must be created and written at the original pathname"
+        );
+        assert!(moved_path.is_file(), "renamed verified pathname must exist");
+        assert_eq!(
+            fs::read(&staged_path).expect("read original verified pathname"),
+            attacker_bytes
+        );
+
+        let retained_bytes = {
+            let mut retained = prepared.handle.try_clone().expect("clone retained handle");
+            retained
+                .seek(SeekFrom::Start(0))
+                .expect("rewind retained handle");
+            let mut bytes = Vec::new();
+            retained
+                .read_to_end(&mut bytes)
+                .expect("read retained verified object");
+            bytes
+        };
+        assert_eq!(retained_bytes, verified_bytes);
+
+        let outcome = atomic_swap_verified(&prepared, true).expect("real swap");
+
+        assert_eq!(outcome, InstallOutcome::Installed);
+        let installed = fs::read(&target_path).expect("read installed object");
+        assert_eq!(installed, retained_bytes);
+        assert_ne!(installed, attacker_bytes);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_verified_handle_rejects_racing_writers_during_real_swaps() {
         for iteration in 0..32 {
             let directory = UnitTestDir::new("windows-writer-race");
@@ -3655,7 +3732,6 @@ mod unit_tests {
             staged.sync_all().expect("sync staged replacement");
             let staged_path = stage.directory.path.join(STAGED_VERIFIED);
             let prepared = PreparedArtifact {
-                path: staged_path.clone(),
                 source_name: OsString::from(STAGED_VERIFIED),
                 handle: staged,
                 stage: Arc::clone(&stage),
@@ -3822,7 +3898,7 @@ mod unit_tests {
     }
 
     #[test]
-    fn windows_locked_target_preserves_verified_staging() {
+    fn windows_locked_target_returns_restart_required_without_installing() {
         let target = PathBuf::from("app").join("gta-claw");
         let staged = PathBuf::from("app").join(".gta-claw.gta-claw.verified");
         let operations = MockOps::default();
@@ -3836,12 +3912,7 @@ mod unit_tests {
 
         let outcome =
             atomic_swap(&operations, &staged, &target, true).expect("lock is restart-required");
-        assert_eq!(
-            outcome,
-            InstallOutcome::RestartRequired {
-                staged_path: staged.clone(),
-            }
-        );
+        assert_eq!(outcome, InstallOutcome::RestartRequired);
         assert_eq!(
             operations.existing.lock().expect("existing lock").clone(),
             BTreeSet::from([target, staged])

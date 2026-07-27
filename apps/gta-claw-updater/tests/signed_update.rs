@@ -1,17 +1,21 @@
 //! Local-only adversarial updater integration coverage.
 
+#[cfg(windows)]
+use std::fs::OpenOptions;
+#[cfg(windows)]
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(windows)]
+use std::sync::{Barrier, mpsc};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signer as _, SigningKey};
-#[cfg(not(windows))]
-use gta_claw_updater::InstallOutcome;
 use gta_claw_updater::{
-    ArtifactKind, AvailableUpdate, InstallMode, InstallTarget, ReleaseArtifact, ReleaseManifest,
-    SignedManifest, UpdateDecision, UpdateOutcome, Updater,
+    ArtifactKind, AvailableUpdate, InstallMode, InstallOutcome, InstallTarget, ReleaseArtifact,
+    ReleaseManifest, SignedManifest, UpdateDecision, UpdateOutcome, Updater,
 };
 use semver::Version;
 #[cfg(not(windows))]
@@ -559,6 +563,173 @@ async fn interrupted_verified_upgrade_cannot_install_after_a_newer_persisted_flo
     assert_eq!(
         std::fs::read(target.path()).expect("read untouched target"),
         b"known good"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_restart_required_redownloads_after_verified_path_replacement() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    let directory = TestDir::new("windows-restart-rename-replacement");
+    let signed_artifact = b"signed executable replacement".to_vec();
+    let attacker_bytes = b"attacker-controlled replacement".to_vec();
+    let server_artifact = signed_artifact.clone();
+    let server = LocalServer::spawn(handler(move |request, _| {
+        assert_eq!(
+            request,
+            Request {
+                path: "/artifact".to_owned(),
+                range: None,
+            }
+        );
+        ResponsePlan {
+            status: "200 OK",
+            headers: Vec::new(),
+            write_bytes: server_artifact.len(),
+            body: server_artifact.clone(),
+        }
+    }))
+    .await;
+    let target = executable_target(&directory.path);
+    std::fs::write(target.path(), b"running executable").expect("write existing target");
+    let release = artifact(
+        server.url("artifact"),
+        &signed_artifact,
+        ArtifactKind::Executable,
+    );
+    let first_updater = updater(&directory.path);
+    let first_update = authorized_update(&first_updater, release.clone());
+    let verified = first_updater
+        .download(&first_update, &target)
+        .await
+        .expect("first signed download verifies");
+    assert_eq!(
+        server.requests.lock().expect("request log lock").as_slice(),
+        &[Request {
+            path: "/artifact".to_owned(),
+            range: None,
+        }]
+    );
+
+    // This is same-account concurrent-process hardening inside owner-only staging, not a remote or
+    // cross-user integrity boundary.
+    let staged_path = verified.path().to_owned();
+    let moved_path = staged_path.with_file_name("artifact.moved");
+    let start = Arc::new(Barrier::new(2));
+    let attacker_start = Arc::clone(&start);
+    let attacker_staged_path = staged_path.clone();
+    let attacker_moved_path = moved_path.clone();
+    let attacker_replacement = attacker_bytes.clone();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let attacker = std::thread::spawn(move || {
+        attacker_start.wait();
+        std::fs::rename(&attacker_staged_path, &attacker_moved_path)
+            .expect("FILE_SHARE_DELETE permits moving the verified pathname");
+        let moved_bytes =
+            std::fs::read(&attacker_moved_path).expect("read renamed verified object");
+        let mut replacement = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&attacker_staged_path)
+            .expect("create replacement at original verified pathname");
+        replacement
+            .write_all(&attacker_replacement)
+            .expect("write attacker replacement");
+        replacement.sync_all().expect("sync attacker replacement");
+        drop(replacement);
+        let replacement_bytes =
+            std::fs::read(&attacker_staged_path).expect("read attacker replacement");
+        completed_tx
+            .send((moved_bytes, replacement_bytes))
+            .expect("report completed pathname replacement");
+    });
+
+    start.wait();
+    let (moved_bytes, replacement_bytes) = completed_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("pathname replacement completes before installation");
+    attacker.join().expect("attacker thread");
+    assert_eq!(
+        moved_bytes, signed_artifact,
+        "rename must move verified bytes"
+    );
+    assert_eq!(
+        replacement_bytes, attacker_bytes,
+        "replacement must be created and written at the original pathname"
+    );
+    assert!(moved_path.is_file(), "renamed verified pathname must exist");
+    assert_eq!(
+        std::fs::read(&staged_path).expect("read original verified pathname"),
+        attacker_bytes
+    );
+
+    let mut target_lock = OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(target.path())
+        .expect("lock running executable");
+    let first_outcome = first_updater
+        .install(verified, &target)
+        .await
+        .expect("locked target is restart-required");
+    assert_eq!(first_outcome, InstallOutcome::RestartRequired);
+    target_lock
+        .seek(SeekFrom::Start(0))
+        .expect("rewind locked target");
+    let mut locked_target_bytes = Vec::new();
+    target_lock
+        .read_to_end(&mut locked_target_bytes)
+        .expect("read locked target handle");
+    assert_eq!(locked_target_bytes, b"running executable");
+    assert_eq!(
+        std::fs::read(&staged_path).expect("read attacker pathname after locked install"),
+        attacker_bytes
+    );
+
+    drop(target_lock);
+    drop(first_update);
+    drop(first_updater);
+    let second_updater = updater(&directory.path);
+    let second_update = authorized_update(&second_updater, release);
+    let second_verified = second_updater
+        .download(&second_update, &target)
+        .await
+        .expect("fresh signed download verifies");
+    assert_eq!(
+        server.requests.lock().expect("request log lock").as_slice(),
+        &[
+            Request {
+                path: "/artifact".to_owned(),
+                range: None,
+            },
+            Request {
+                path: "/artifact".to_owned(),
+                range: None,
+            },
+        ],
+        "rerun must issue an independent artifact request"
+    );
+    assert_eq!(
+        std::fs::read(second_verified.path()).expect("read freshly verified pathname"),
+        signed_artifact
+    );
+    assert_ne!(
+        std::fs::read(second_verified.path()).expect("reread freshly verified pathname"),
+        attacker_bytes
+    );
+
+    let second_outcome = second_updater
+        .install(second_verified, &target)
+        .await
+        .expect("unlocked target installs");
+    assert_eq!(second_outcome, InstallOutcome::Installed);
+    let installed = std::fs::read(target.path()).expect("read installed target");
+    assert_eq!(installed, signed_artifact);
+    assert_ne!(installed, attacker_bytes);
+    assert!(
+        !staged_path.exists(),
+        "successful rerun must remove the replaced staging pathname"
     );
 }
 
