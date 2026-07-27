@@ -1,0 +1,9 @@
+// Accepted fixture for pinned top-level domain `cloudWorkers`
+// (compat/upstream/inventories/config-domains.json).
+{
+  cloudWorkers: {
+    profiles: {
+      "fly-eu": { provider: "fly", install: "bundle" },
+    },
+  },
+}

@@ -1,0 +1,33 @@
+// Accepted fixture for pinned top-level domain `security`
+// (compat/upstream/inventories/config-domains.json).
+{
+  security: {
+    audit: {
+      suppressions: [
+        {
+          checkId: "gateway.tls",
+          titleIncludes: "self-signed",
+          detailIncludes: "lab",
+          reason: "internal lab host",
+        },
+      ],
+    },
+    installPolicy: {
+      enabled: true,
+      targets: ["skill", "plugin"],
+      exec: {
+        source: "exec",
+        command: "/usr/local/bin/claw-install-policy",
+        args: ["--strict"],
+        timeoutMs: 5000,
+        noOutputTimeoutMs: 2000,
+        maxOutputBytes: 65536,
+        env: { CLAW_POLICY: "strict" },
+        passEnv: ["PATH"],
+        trustedDirs: ["/usr/local/bin"],
+        allowInsecurePath: false,
+        allowSymlinkCommand: false,
+      },
+    },
+  },
+}

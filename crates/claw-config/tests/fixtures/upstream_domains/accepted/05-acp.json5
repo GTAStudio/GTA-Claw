@@ -1,0 +1,17 @@
+// Accepted fixture for pinned top-level domain `acp`
+// (compat/upstream/inventories/config-domains.json).
+{
+  acp: {
+    enabled: true,
+    dispatch: { enabled: true },
+    backend: "claude-code",
+    fallbacks: ["codex"],
+    defaultAgent: "main",
+    allowedAgents: ["main", "review"],
+    maxConcurrentSessions: 4,
+    stream: {
+      deliveryMode: "final_only",
+      hiddenBoundarySeparator: "newline",
+    },
+  },
+}

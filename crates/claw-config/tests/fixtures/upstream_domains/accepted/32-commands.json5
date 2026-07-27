@@ -1,0 +1,18 @@
+// Accepted fixture for pinned top-level domain `commands`
+// (compat/upstream/inventories/config-domains.json).
+{
+  commands: {
+    text: true,
+    bash: false,
+    bashForegroundMs: 5000,
+    config: true,
+    mcp: true,
+    plugins: true,
+    debug: false,
+    restart: false,
+    useAccessGroups: true,
+    ownerAllowFrom: ["10010", 10011],
+    ownerDisplay: "hash",
+    allowFrom: { discord: ["10010"] },
+  },
+}
