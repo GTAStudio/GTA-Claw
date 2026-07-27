@@ -200,6 +200,15 @@ pub enum BridgeEffect {
     },
 }
 
+/// Paired browser identity reported by CDP version discovery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserIdentity {
+    /// Chrome product version reported by the extension hello.
+    pub browser_version: String,
+    /// Browser user agent reported by the extension hello.
+    pub user_agent: String,
+}
+
 /// Policy-bounded CDP bridge for one extension profile.
 #[derive(Debug)]
 pub struct CdpBridge {
@@ -576,6 +585,33 @@ impl CdpBridge {
     #[must_use]
     pub fn targets(&self) -> Vec<TargetInfo> {
         self.targets.values().map(target_info).collect()
+    }
+
+    /// Returns whether a paired extension has completed its mandatory hello.
+    ///
+    /// CDP discovery stays unavailable until this holds, because before the
+    /// hello the relay knows neither the browser identity nor the shared tabs.
+    #[must_use]
+    pub const fn is_paired(&self) -> bool {
+        self.extension.is_some() && self.extension_hello_seen
+    }
+
+    /// Returns the paired browser identity, or `None` while unpaired.
+    #[must_use]
+    pub fn identity(&self) -> Option<BrowserIdentity> {
+        self.is_paired().then(|| BrowserIdentity {
+            browser_version: self.browser_version.clone(),
+            user_agent: self.user_agent.clone(),
+        })
+    }
+
+    /// Returns the explicitly shared tabs in stable tab order.
+    #[must_use]
+    pub fn shared_tabs(&self) -> Vec<RelayTab> {
+        self.targets
+            .values()
+            .map(|target| target.tab.clone())
+            .collect()
     }
 
     fn receive_session_cdp(
