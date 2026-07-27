@@ -156,6 +156,48 @@ impl Drop for Running {
 }
 
 #[test]
+fn telemetry_file_open_failure_is_fatal_before_readiness() {
+    let root = std::env::temp_dir().join(format!(
+        "gta-claw-telemetry-output-{}-{}",
+        std::process::id(),
+        NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("temporary root is created");
+    let config = root.join("config.json5");
+    let log_file = root.join("missing-parent/daemon.log");
+    write_config(&config, "gpt-4o");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"));
+    command.env_clear();
+    let output = command
+        .args([
+            "--smoke",
+            "--config",
+            config.to_str().expect("temporary path is UTF-8"),
+            "--state-dir",
+            root.to_str().expect("temporary path is UTF-8"),
+            "--log-file",
+            log_file.to_str().expect("temporary path is UTF-8"),
+        ])
+        .output()
+        .expect("daemon process runs");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    std::fs::remove_dir_all(&root).expect("temporary root is removed");
+
+    assert!(!output.status.success(), "daemon unexpectedly started");
+    assert!(!stdout.contains("ready protocol=1"), "{stdout}");
+    assert!(
+        stderr.contains("cannot open telemetry output"),
+        "missing typed telemetry diagnostic: {stderr}"
+    );
+    assert!(
+        stderr.contains("missing-parent/daemon.log"),
+        "missing telemetry path: {stderr}"
+    );
+}
+
+#[test]
 fn bound_http_is_ready_and_dispatches_to_the_composed_provider() {
     let daemon = Running::start("gpt-4o");
 

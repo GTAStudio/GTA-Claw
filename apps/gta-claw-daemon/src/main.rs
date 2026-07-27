@@ -68,7 +68,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         CommandMode::Serve => {
             let loaded = command.options.load_config()?;
-            let telemetry = init_telemetry(&loaded.snapshot)?;
+            let telemetry = init_telemetry(&loaded.snapshot, command.options.log_file.as_deref())?;
             // `stdout()`, not `stdout().lock()`: a lock taken here would be held
             // for the whole run, so any other thread that printed would block
             // until the daemon exited. Each `writeln!` takes the lock for the
@@ -76,7 +76,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let service =
                 serve_production(io::stdout(), tokio::io::stdin(), &command.options, loaded).await;
             let telemetry_shutdown = telemetry.shutdown();
-            let late_telemetry = telemetry.take_writer_error();
+            let late_telemetry = telemetry.take_writer_failure();
             let mut failures = Vec::new();
 
             match service {

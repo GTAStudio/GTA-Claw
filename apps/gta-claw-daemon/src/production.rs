@@ -27,7 +27,7 @@ use claw_http_api::{
     LegacyWhatsAppServices, PortError, PortErrorKind, PortFuture, ProviderLegacyRuntime,
     ProviderLegacyRuntimeConfig, ServingStateHandle,
 };
-use claw_observability::{LogFormat, TelemetryConfig, TelemetryHandle};
+use claw_observability::{LogFormat, TelemetryConfig, TelemetryHandle, TelemetryOutput};
 use claw_provider_sdk::clock::{PseudoRandomJitter, SystemClock as ProviderClock};
 use claw_provider_sdk::http::{
     HttpRequest, HttpTransport, Method, ProxyPolicy, TlsPolicy, TransportConfig,
@@ -63,7 +63,7 @@ const DEFAULT_MCP: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST),
 const USAGE: &str = "usage: gta-claw-daemon [--probe | --check-config] [--config PATH] \
                      [--listen ADDRESS] [--legacy-listen ADDRESS] \
                      [--gateway-listen ADDRESS] [--mcp-listen ADDRESS] [--state-dir PATH] \
-                     [--tls-terminated-by-frontend] [--smoke]";
+                     [--log-file PATH] [--tls-terminated-by-frontend] [--smoke]";
 
 /// Top-level command selected by the process arguments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +105,7 @@ impl CommandLine {
                 "--check-config" if mode == CommandMode::Serve => mode = CommandMode::CheckConfig,
                 "--config" => options.config_path = Some(required_path(&mut arguments, flag)?),
                 "--state-dir" => options.state_dir = Some(required_path(&mut arguments, flag)?),
+                "--log-file" => options.log_file = Some(required_path(&mut arguments, flag)?),
                 "--listen" => options.http_listen = Some(required_address(&mut arguments, flag)?),
                 "--legacy-listen" => {
                     options.legacy_listen = Some(required_address(&mut arguments, flag)?);
@@ -125,6 +126,7 @@ impl CommandLine {
                 || options.legacy_listen.is_some()
                 || options.gateway_listen.is_some()
                 || options.mcp_listen.is_some()
+                || options.log_file.is_some()
                 || options.smoke
                 || options.tls_terminated_by_frontend)
         {
@@ -186,6 +188,8 @@ pub struct ProductionOptions {
     pub mcp_listen: Option<SocketAddr>,
     /// Durable local state directory.
     pub state_dir: Option<PathBuf>,
+    /// Ordinary telemetry output file; stderr is used when absent.
+    pub log_file: Option<PathBuf>,
     /// Explicit assertion that a frontend terminates TLS for routable binds.
     pub tls_terminated_by_frontend: bool,
     /// Use the local install-diagnostic provider.
@@ -334,9 +338,12 @@ const fn config_layer_label(layer: ConfigLayerKind) -> &'static str {
 ///
 /// # Errors
 ///
-/// Returns a `logging`-stage error for an invalid format/filter or when another
-/// global tracing subscriber is already installed.
-pub fn init_telemetry(snapshot: &ConfigSnapshot) -> Result<TelemetryHandle, ProductionError> {
+/// Returns a `logging`-stage error for an invalid format/filter, a file-open
+/// failure, or when another global tracing subscriber is already installed.
+pub fn init_telemetry(
+    snapshot: &ConfigSnapshot,
+    log_file: Option<&Path>,
+) -> Result<TelemetryHandle, ProductionError> {
     let default_filter = match snapshot.core().logging().level() {
         LogLevel::Trace => "trace",
         LogLevel::Debug => "debug",
@@ -355,11 +362,15 @@ pub fn init_telemetry(snapshot: &ConfigSnapshot) -> Result<TelemetryHandle, Prod
         }
         Err(error) => return Err(ProductionError::new("logging", error)),
     };
-    claw_observability::init(&TelemetryConfig {
-        format,
-        default_filter: default_filter.to_owned(),
-        filter_env: "GTA_CLAW_LOG".to_owned(),
-    })
+    let output = log_file.map_or(TelemetryOutput::Stderr, TelemetryOutput::file);
+    claw_observability::init_with_output(
+        &TelemetryConfig {
+            format,
+            default_filter: default_filter.to_owned(),
+            filter_env: "GTA_CLAW_LOG".to_owned(),
+        },
+        output,
+    )
     .map_err(|error| ProductionError::new("logging", error))
 }
 
@@ -2017,6 +2028,7 @@ pub fn check_configuration(
 mod tests {
     use std::ffi::OsString;
     use std::io;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use claw_config::{ConfigLayerKind, MigrationDiagnostic, migrate_legacy_environment, to_json5};
@@ -2042,6 +2054,8 @@ mod tests {
                 "127.0.0.1:0",
                 "--state-dir",
                 "state",
+                "--log-file",
+                "logs/daemon.log",
                 "--smoke",
             ]
             .into_iter()
@@ -2052,6 +2066,10 @@ mod tests {
         assert_eq!(parsed.mode, CommandMode::Serve);
         assert!(parsed.options.smoke);
         assert_eq!(parsed.options.http_listen.expect("HTTP address").port(), 0);
+        assert_eq!(
+            parsed.options.log_file,
+            Some(PathBuf::from("logs/daemon.log"))
+        );
     }
 
     #[test]
