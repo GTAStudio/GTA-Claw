@@ -365,7 +365,7 @@ export component AppWindow inherits Window {
                         y: 12px;
                         width: parent.width - 28px;
                         height: parent.height - 24px;
-                        text: @tr("Platform limits: no Bonjour discovery, pairing, push, background refresh, or Keychain persistence. Local-network privacy still requires a physical-device test; the simulator cannot prove it.");
+                        text: @tr("Platform limits: no UIKit lifecycle or NWPathMonitor adapter, Bonjour discovery, pairing, push, background refresh, or Keychain persistence. The core remains fail-closed until lifecycle and path facts are attached.");
                         color: #566479;
                         font-size: 13px;
                         wrap: word-wrap;

@@ -3,9 +3,7 @@
 #[cfg(target_os = "android")]
 use std::error::Error;
 #[cfg(target_os = "android")]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "android")]
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, OnceLock};
 
 #[cfg(target_os = "android")]
 use gta_claw_android::controller::{
@@ -13,10 +11,16 @@ use gta_claw_android::controller::{
 };
 #[cfg(target_os = "android")]
 use gta_claw_android::controller::{CommandRejection, ControllerHandle, SnapshotSink};
-#[cfg(any(target_os = "android", test))]
-use gta_claw_android::onboarding::StatusKind;
 #[cfg(target_os = "android")]
 use gta_claw_android::onboarding::{ConnectRequest, ViewSnapshot};
+#[cfg(any(target_os = "android", test))]
+use gta_claw_android::onboarding::{ConnectionPhase, StatusKind};
+#[cfg(any(target_os = "android", test))]
+use gta_claw_android::platform::AppLifecycle;
+#[cfg(target_os = "android")]
+use gta_claw_android::platform::{
+    DiscoveryReadiness, NetworkStatus, PlatformFacilities, PortablePlatformFacilities,
+};
 #[cfg(target_os = "android")]
 use slint::ComponentHandle;
 
@@ -44,31 +48,90 @@ const fn status_tone(status: StatusKind) -> StatusTone {
     }
 }
 
+#[cfg(any(target_os = "android", test))]
+const fn phase_label(phase: ConnectionPhase) -> &'static str {
+    match phase {
+        ConnectionPhase::Idle => "Idle",
+        ConnectionPhase::Suspended => "Suspended",
+        ConnectionPhase::WaitingForNetwork => "Waiting for network",
+        ConnectionPhase::Connecting => "Connecting",
+        ConnectionPhase::Authenticating => "Authenticating",
+        ConnectionPhase::Ready => "Ready",
+        ConnectionPhase::Reconnecting => "Reconnecting",
+        ConnectionPhase::Failed => "Failed",
+        ConnectionPhase::Disconnected => "Disconnected",
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+const fn lifecycle_label(lifecycle: AppLifecycle) -> &'static str {
+    match lifecycle {
+        AppLifecycle::Foreground => "Foreground",
+        AppLifecycle::Background => "Background",
+    }
+}
+
 #[cfg(target_os = "android")]
 fn apply_snapshot(window: &AppWindow, snapshot: &ViewSnapshot) {
+    window.set_snapshot_revision(snapshot.revision().to_string().into());
+    window.set_phase_label(phase_label(snapshot.phase()).into());
     window.set_state_title(snapshot.title().into());
     window.set_state_detail(snapshot.detail().into());
     window.set_status_label(snapshot.status_label().into());
     window.set_status_tone(status_tone(snapshot.status_kind()));
+    window.set_lifecycle_label(lifecycle_label(snapshot.lifecycle()).into());
+    window.set_network_summary(snapshot.network_summary().into());
+    window.set_platform_notice(snapshot.platform_notice().into());
     window.set_endpoint_summary(snapshot.endpoint_summary().into());
     window.set_server_summary(snapshot.server_summary().into());
     window.set_protocol_summary(snapshot.protocol_summary().into());
     window.set_role_summary(snapshot.role_summary().into());
     window.set_scopes_summary(snapshot.scopes_summary().into());
+    window.set_connection_epoch(
+        snapshot
+            .connection_epoch()
+            .map_or_else(|| "-".to_owned(), |epoch| epoch.to_string())
+            .into(),
+    );
     window.set_identity_summary(snapshot.identity_summary().into());
     window.set_credential_notice(snapshot.credential_notice().into());
     window.set_transport_notice(snapshot.transport_notice().into());
+    window.set_pending_connection(snapshot.pending_connection());
     window.set_token_offered(snapshot.token_offered());
     window.set_busy(snapshot.busy());
     window.set_can_connect(snapshot.can_connect());
     window.set_can_disconnect(snapshot.can_disconnect());
+    window.set_can_retry(snapshot.can_retry());
+    if let Some(retry) = snapshot.retry() {
+        window.set_retry_summary(
+            format!(
+                "Attempt {} starts in {} ms.",
+                retry.attempt(),
+                retry.delay_millis()
+            )
+            .into(),
+        );
+        window.set_has_retry(true);
+    } else {
+        window.set_retry_summary("".into());
+        window.set_has_retry(false);
+    }
+    if let Some(remedy) = snapshot.remedy() {
+        window.set_diagnostic_code(format!("{:?}", remedy.diagnostic_code()).into());
+        window.set_remedy_kind(format!("{:?}", remedy.kind()).into());
+        window.set_error_action(remedy.action().into());
+        window.set_has_remedy(true);
+    } else {
+        window.set_diagnostic_code("".into());
+        window.set_remedy_kind("".into());
+        window.set_error_action("".into());
+        window.set_has_remedy(false);
+    }
     if let Some(error) = snapshot.error() {
         window.set_error_message(error.message().into());
-        window.set_error_action(error.action().into());
         window.set_has_error(true);
     } else {
         window.set_error_message("".into());
-        window.set_error_action("".into());
         window.set_has_error(false);
     }
 }
@@ -76,21 +139,7 @@ fn apply_snapshot(window: &AppWindow, snapshot: &ViewSnapshot) {
 #[cfg(target_os = "android")]
 fn snapshot_sink(window: &AppWindow) -> SnapshotSink {
     let weak_window = window.as_weak();
-    let latest = Arc::new(Mutex::new(None::<ViewSnapshot>));
     Arc::new(move |snapshot| {
-        let changed = {
-            let mut latest = latest.lock().unwrap_or_else(PoisonError::into_inner);
-            if latest.as_ref() == Some(&snapshot) {
-                false
-            } else {
-                *latest = Some(snapshot.clone());
-                true
-            }
-        };
-        if !changed {
-            return;
-        }
-
         let weak_window = weak_window.clone();
         if let Err(error) = slint::invoke_from_event_loop(move || {
             if let Some(window) = weak_window.upgrade() {
@@ -149,6 +198,21 @@ fn install_callbacks(window: &AppWindow, handle: &ControllerHandle) {
             show_command_error(&weak_window, error);
         }
     });
+
+    let retry_handle = handle.clone();
+    let weak_window = window.as_weak();
+    window.on_retry_requested(move || {
+        if let Err(error) = retry_handle.retry() {
+            show_command_error(&weak_window, error);
+        }
+    });
+}
+
+#[cfg(target_os = "android")]
+fn report_platform_command(result: Result<(), CommandRejection>, action: &str) {
+    if let Err(error) = result {
+        eprintln!("failed to report Android {action}: {error}");
+    }
 }
 
 #[cfg(target_os = "android")]
@@ -156,20 +220,21 @@ fn run_android(app: slint::android::AndroidApp) -> Result<(), Box<dyn Error>> {
     use slint::android::android_activity::{MainEvent, PollEvent};
 
     let lifecycle_handle = Arc::new(OnceLock::<ControllerHandle>::new());
-    let lifecycle_paused = Arc::new(AtomicBool::new(false));
     let event_handle = Arc::clone(&lifecycle_handle);
-    let event_paused = Arc::clone(&lifecycle_paused);
     slint::android::init_with_event_listener(app, move |event| match event {
-        PollEvent::Main(MainEvent::Resume { .. }) => {
-            event_paused.store(false, Ordering::Release);
+        PollEvent::Main(MainEvent::Start) => {
+            if let Some(handle) = event_handle.get() {
+                report_platform_command(handle.app_foregrounded(), "foreground state");
+            }
         }
-        PollEvent::Main(MainEvent::Pause | MainEvent::Destroy)
-            if !event_paused.swap(true, Ordering::AcqRel) =>
-        {
-            if let Some(handle) = event_handle.get()
-                && let Err(error) = handle.disconnect()
-            {
-                eprintln!("failed to queue lifecycle disconnect: {error}");
+        PollEvent::Main(MainEvent::Resume { .. }) => {
+            if let Some(handle) = event_handle.get() {
+                report_platform_command(handle.app_foregrounded(), "foreground state");
+            }
+        }
+        PollEvent::Main(MainEvent::Pause | MainEvent::Stop | MainEvent::Destroy) => {
+            if let Some(handle) = event_handle.get() {
+                report_platform_command(handle.app_backgrounded(), "background state");
             }
         }
         _ => {}
@@ -179,11 +244,21 @@ fn run_android(app: slint::android::AndroidApp) -> Result<(), Box<dyn Error>> {
     window.set_runtime_summary(native_runtime_summary().into());
     window.set_core_protocol(core_protocol_summary(claw_platform::NativeSystemProbe).into());
 
-    let controller = AndroidController::start(snapshot_sink(&window))?;
+    let platform: Arc<dyn PlatformFacilities> = Arc::new(PortablePlatformFacilities);
+    let controller = AndroidController::start_with_platform(snapshot_sink(&window), platform)?;
     let handle = controller.handle();
     lifecycle_handle
         .set(handle.clone())
         .map_err(|_| "Android lifecycle handle was initialized twice")?;
+    report_platform_command(handle.app_foregrounded(), "initial foreground state");
+    report_platform_command(
+        handle.network_changed(NetworkStatus::Unknown),
+        "initial network state",
+    );
+    report_platform_command(
+        handle.discovery_readiness_changed(DiscoveryReadiness::ManualAddressOnly),
+        "discovery readiness",
+    );
     install_callbacks(&window, &handle);
     window.run()?;
     drop(controller);
@@ -205,9 +280,10 @@ fn android_main(app: slint::android::AndroidApp) {
 
 #[cfg(test)]
 mod tests {
-    use gta_claw_android::onboarding::{ConnectRequest, ViewModel};
+    use gta_claw_android::onboarding::{ConnectRequest, ConnectionPhase, ViewModel};
+    use gta_claw_android::platform::AppLifecycle;
 
-    use super::status_tone;
+    use super::{lifecycle_label, phase_label, status_tone};
     use crate::generated_ui::StatusTone;
 
     #[test]
@@ -225,6 +301,8 @@ mod tests {
     fn initial_and_connecting_snapshots_drive_opposite_controls() {
         let mut model = ViewModel::new();
         let initial = model.snapshot();
+        assert_eq!(initial.revision(), 0);
+        assert_eq!(initial.phase(), ConnectionPhase::Idle);
         assert!(initial.can_connect());
         assert!(!initial.can_disconnect());
 
@@ -232,8 +310,22 @@ mod tests {
             .expect("secure bare host is valid");
         model.begin(&request);
         let connecting = model.snapshot();
+        assert_eq!(connecting.revision(), 1);
+        assert_eq!(connecting.phase(), ConnectionPhase::Connecting);
         assert!(!connecting.can_connect());
         assert!(connecting.can_disconnect());
         assert!(connecting.busy());
+    }
+
+    #[test]
+    fn structured_core_state_has_stable_shell_labels() {
+        assert_eq!(phase_label(ConnectionPhase::Suspended), "Suspended");
+        assert_eq!(
+            phase_label(ConnectionPhase::WaitingForNetwork),
+            "Waiting for network"
+        );
+        assert_eq!(phase_label(ConnectionPhase::Reconnecting), "Reconnecting");
+        assert_eq!(lifecycle_label(AppLifecycle::Foreground), "Foreground");
+        assert_eq!(lifecycle_label(AppLifecycle::Background), "Background");
     }
 }

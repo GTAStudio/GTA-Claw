@@ -121,20 +121,34 @@ component StatusCard inherits Rectangle {
     in property <string> state-detail;
     in property <string> status-label;
     in property <StatusTone> tone;
+    in property <string> phase-label;
+    in property <string> lifecycle-label;
+    in property <string> network-summary;
+    in property <string> platform-notice;
+    in property <string> snapshot-revision;
     in property <string> endpoint-summary;
     in property <string> server-summary;
     in property <string> protocol-summary;
     in property <string> role-summary;
     in property <string> scopes-summary;
+    in property <string> connection-epoch;
     in property <string> identity-summary;
     in property <string> transport-notice;
     in property <string> credential-notice;
+    in property <bool> pending-connection;
     in property <bool> token-offered;
     in property <bool> can-disconnect;
+    in property <bool> can-retry;
+    in property <bool> has-retry;
+    in property <string> retry-summary;
     in property <bool> has-error;
+    in property <bool> has-remedy;
     in property <string> error-message;
     in property <string> error-action;
+    in property <string> remedy-kind;
+    in property <string> diagnostic-code;
     callback disconnect();
+    callback retry();
 
     private property <color> tone-color:
         root.tone == StatusTone.success ? #17803d :
@@ -146,7 +160,7 @@ component StatusCard inherits Rectangle {
     border-color: #dce4ef;
     border-width: 1px;
     border-radius: 20px;
-    min-height: 430px;
+    min-height: 570px;
 
     VerticalLayout {
         padding: 22px;
@@ -185,52 +199,112 @@ component StatusCard inherits Rectangle {
             wrap: word-wrap;
         }
 
+        if root.pending-connection : Rectangle {
+            background: #edf5ff;
+            border-radius: 10px;
+            min-height: 34px;
+
+            Text {
+                x: 10px;
+                width: parent.width - 20px;
+                height: parent.height;
+                text: @tr("Connection intent retained");
+                color: #1769aa;
+                font-size: 13px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+        }
+
         if root.has-error : Rectangle {
             background: #fff1f0;
             border-color: #f5b7b1;
             border-width: 1px;
             border-radius: 12px;
-            min-height: 82px;
+            min-height: 58px;
+
+            Text {
+                x: 12px;
+                y: 10px;
+                width: parent.width - 24px;
+                height: parent.height - 20px;
+                text: root.error-message;
+                color: #9c2f27;
+                font-weight: 600;
+                wrap: word-wrap;
+                vertical-alignment: center;
+            }
+        }
+
+        if root.has-remedy : Rectangle {
+            background: #fff8e8;
+            border-color: #edcd85;
+            border-width: 1px;
+            border-radius: 12px;
+            min-height: 78px;
 
             VerticalLayout {
                 padding: 12px;
                 spacing: 4px;
 
                 Text {
-                    text: root.error-message;
-                    color: #9c2f27;
+                    text: root.error-action;
+                    color: #714b00;
                     font-weight: 600;
                     wrap: word-wrap;
                 }
                 Text {
-                    text: root.error-action;
-                    color: #75413c;
+                    text: @tr("Remedy: {}  Diagnostic: {}", root.remedy-kind, root.diagnostic-code);
+                    color: #836b3c;
+                    font-size: 12px;
                     wrap: word-wrap;
                 }
+            }
+        }
+
+        if root.has-retry : Rectangle {
+            background: #edf5ff;
+            border-radius: 10px;
+            min-height: 40px;
+
+            Text {
+                x: 10px;
+                width: parent.width - 20px;
+                height: parent.height;
+                text: root.retry-summary;
+                color: #1769aa;
+                font-weight: 600;
+                vertical-alignment: center;
             }
         }
 
         GridLayout {
             spacing: 8px;
 
-            Text { row: 0; col: 0; text: @tr("Gateway"); color: #6b7789; }
-            Text { row: 0; col: 1; text: root.endpoint-summary; color: #26364b; horizontal-alignment: right; }
-            Text { row: 1; col: 0; text: @tr("Server"); color: #6b7789; }
-            Text { row: 1; col: 1; text: root.server-summary; color: #26364b; horizontal-alignment: right; }
-            Text { row: 2; col: 0; text: @tr("Protocol"); color: #6b7789; }
-            Text { row: 2; col: 1; text: root.protocol-summary; color: #26364b; horizontal-alignment: right; }
-            Text { row: 3; col: 0; text: @tr("Role"); color: #6b7789; }
-            Text { row: 3; col: 1; text: root.role-summary; color: #26364b; horizontal-alignment: right; }
-            Text { row: 4; col: 0; text: @tr("Scopes"); color: #6b7789; }
-            Text { row: 4; col: 1; text: root.scopes-summary; color: #26364b; horizontal-alignment: right; overflow: elide; }
-            Text { row: 5; col: 0; text: @tr("Identity"); color: #6b7789; }
-            Text { row: 5; col: 1; text: root.identity-summary; color: #26364b; horizontal-alignment: right; overflow: elide; }
+            Text { row: 0; col: 0; text: @tr("Phase"); color: #6b7789; }
+            Text { row: 0; col: 1; text: root.phase-label; color: #26364b; horizontal-alignment: right; }
+            Text { row: 1; col: 0; text: @tr("Lifecycle"); color: #6b7789; }
+            Text { row: 1; col: 1; text: root.lifecycle-label; color: #26364b; horizontal-alignment: right; }
+            Text { row: 2; col: 0; text: @tr("Gateway"); color: #6b7789; }
+            Text { row: 2; col: 1; text: root.endpoint-summary; color: #26364b; horizontal-alignment: right; }
+            Text { row: 3; col: 0; text: @tr("Server"); color: #6b7789; }
+            Text { row: 3; col: 1; text: root.server-summary; color: #26364b; horizontal-alignment: right; }
+            Text { row: 4; col: 0; text: @tr("Protocol"); color: #6b7789; }
+            Text { row: 4; col: 1; text: root.protocol-summary; color: #26364b; horizontal-alignment: right; }
+            Text { row: 5; col: 0; text: @tr("Role"); color: #6b7789; }
+            Text { row: 5; col: 1; text: root.role-summary; color: #26364b; horizontal-alignment: right; }
+            Text { row: 6; col: 0; text: @tr("Scopes"); color: #6b7789; }
+            Text { row: 6; col: 1; text: root.scopes-summary; color: #26364b; horizontal-alignment: right; overflow: elide; }
+            Text { row: 7; col: 0; text: @tr("Identity"); color: #6b7789; }
+            Text { row: 7; col: 1; text: root.identity-summary; color: #26364b; horizontal-alignment: right; overflow: elide; }
+            Text { row: 8; col: 0; text: @tr("Epoch / revision"); color: #6b7789; }
+            Text { row: 8; col: 1; text: @tr("{} / {}", root.connection-epoch, root.snapshot-revision); color: #26364b; horizontal-alignment: right; }
         }
 
         Rectangle {
             background: #f3f7fb;
             border-radius: 12px;
-            min-height: 88px;
+            min-height: 138px;
 
             VerticalLayout {
                 padding: 12px;
@@ -239,6 +313,18 @@ component StatusCard inherits Rectangle {
                 Text {
                     text: root.transport-notice;
                     color: #314158;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.network-summary;
+                    color: #526176;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.platform-notice;
+                    color: #526176;
+                    font-size: 13px;
                     wrap: word-wrap;
                 }
                 Text {
@@ -252,12 +338,23 @@ component StatusCard inherits Rectangle {
 
         Rectangle { vertical-stretch: 1; }
 
-        Button {
-            text: @tr("Disconnect");
-            enabled: root.can-disconnect;
-            accessible-label: @tr("Disconnect from the Gateway");
-            min-height: 52px;
-            clicked => { root.disconnect(); }
+        HorizontalLayout {
+            spacing: 10px;
+
+            Button {
+                text: @tr("Retry");
+                enabled: root.can-retry;
+                accessible-label: @tr("Retry the retained Gateway connection");
+                min-height: 52px;
+                clicked => { root.retry(); }
+            }
+            Button {
+                text: @tr("Disconnect");
+                enabled: root.can-disconnect;
+                accessible-label: @tr("Disconnect from the Gateway");
+                min-height: 52px;
+                clicked => { root.disconnect(); }
+            }
         }
     }
 }
@@ -276,21 +373,34 @@ export component AppWindow inherits Window {
     in property <string> state-detail: @tr("Enter a Gateway address to begin.");
     in property <string> status-label: @tr("Idle");
     in property <StatusTone> status-tone: StatusTone.neutral;
+    in property <string> phase-label: @tr("Idle");
+    in property <string> lifecycle-label: @tr("Foreground");
+    in property <string> network-summary: @tr("Network monitoring is not attached.");
+    in property <string> platform-notice: "";
+    in property <string> snapshot-revision: "0";
     in property <string> endpoint-summary: @tr("No Gateway selected");
     in property <string> server-summary: "-";
     in property <string> protocol-summary: "-";
     in property <string> role-summary: "-";
     in property <string> scopes-summary: "-";
+    in property <string> connection-epoch: "-";
     in property <string> identity-summary: @tr("not generated");
     in property <string> credential-notice: "";
     in property <string> transport-notice: "";
+    in property <bool> pending-connection: false;
     in property <bool> token-offered: false;
     in property <bool> busy: false;
     in property <bool> can-connect: true;
     in property <bool> can-disconnect: false;
+    in property <bool> can-retry: false;
+    in property <bool> has-retry: false;
+    in property <string> retry-summary: "";
     in property <bool> has-error: false;
+    in property <bool> has-remedy: false;
     in property <string> error-message: "";
     in property <string> error-action: "";
+    in property <string> remedy-kind: "";
+    in property <string> diagnostic-code: "";
     in-out property <string> endpoint-input: "";
     in-out property <string> token-input: "";
     in-out property <bool> allow-insecure: false;
@@ -298,6 +408,7 @@ export component AppWindow inherits Window {
 
     callback connect-requested(string, string, bool);
     callback disconnect-requested();
+    callback retry-requested();
 
     safe := Rectangle {
         x: root.safe-area-insets.left;
@@ -359,20 +470,34 @@ export component AppWindow inherits Window {
                         state-detail: root.state-detail;
                         status-label: root.status-label;
                         tone: root.status-tone;
+                        phase-label: root.phase-label;
+                        lifecycle-label: root.lifecycle-label;
+                        network-summary: root.network-summary;
+                        platform-notice: root.platform-notice;
+                        snapshot-revision: root.snapshot-revision;
                         endpoint-summary: root.endpoint-summary;
                         server-summary: root.server-summary;
                         protocol-summary: root.protocol-summary;
                         role-summary: root.role-summary;
                         scopes-summary: root.scopes-summary;
+                        connection-epoch: root.connection-epoch;
                         identity-summary: root.identity-summary;
                         transport-notice: root.transport-notice;
                         credential-notice: root.credential-notice;
+                        pending-connection: root.pending-connection;
                         token-offered: root.token-offered;
                         can-disconnect: root.can-disconnect;
+                        can-retry: root.can-retry;
+                        has-retry: root.has-retry;
+                        retry-summary: root.retry-summary;
                         has-error: root.has-error;
+                        has-remedy: root.has-remedy;
                         error-message: root.error-message;
                         error-action: root.error-action;
+                        remedy-kind: root.remedy-kind;
+                        diagnostic-code: root.diagnostic-code;
                         disconnect => { root.disconnect-requested(); }
+                        retry => { root.retry-requested(); }
                     }
                 }
 
@@ -396,20 +521,34 @@ export component AppWindow inherits Window {
                         state-detail: root.state-detail;
                         status-label: root.status-label;
                         tone: root.status-tone;
+                        phase-label: root.phase-label;
+                        lifecycle-label: root.lifecycle-label;
+                        network-summary: root.network-summary;
+                        platform-notice: root.platform-notice;
+                        snapshot-revision: root.snapshot-revision;
                         endpoint-summary: root.endpoint-summary;
                         server-summary: root.server-summary;
                         protocol-summary: root.protocol-summary;
                         role-summary: root.role-summary;
                         scopes-summary: root.scopes-summary;
+                        connection-epoch: root.connection-epoch;
                         identity-summary: root.identity-summary;
                         transport-notice: root.transport-notice;
                         credential-notice: root.credential-notice;
+                        pending-connection: root.pending-connection;
                         token-offered: root.token-offered;
                         can-disconnect: root.can-disconnect;
+                        can-retry: root.can-retry;
+                        has-retry: root.has-retry;
+                        retry-summary: root.retry-summary;
                         has-error: root.has-error;
+                        has-remedy: root.has-remedy;
                         error-message: root.error-message;
                         error-action: root.error-action;
+                        remedy-kind: root.remedy-kind;
+                        diagnostic-code: root.diagnostic-code;
                         disconnect => { root.disconnect-requested(); }
+                        retry => { root.retry-requested(); }
                     }
                 }
 
@@ -423,7 +562,7 @@ export component AppWindow inherits Window {
                         y: 12px;
                         width: parent.width - 28px;
                         height: parent.height - 24px;
-                        text: @tr("Platform limits: no discovery, pairing, background reconnect, or Android Keystore persistence. Returning from the background requires a manual reconnect.");
+                        text: @tr("Platform limits: no discovery, default-network monitor, pairing, push delivery, or Android Keystore persistence. Lifecycle suspension is retained by the core and resumes on foreground; network state remains unknown until a JNI monitor is added.");
                         color: #54647a;
                         font-size: 13px;
                         wrap: word-wrap;

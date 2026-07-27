@@ -3,11 +3,28 @@
 This independent Cargo workspace adds the Slint 1.17.1 NativeActivity shell that
 the headless root workspace cannot contain. It uses the existing
 `gta-claw-android` controller, keeps all Gateway work on its bounded Tokio
-runtime, and sends deduplicated snapshots back to Slint's event loop.
+runtime, and binds each revisioned core snapshot directly to Slint's event loop.
 
 The UI responds to phone and tablet widths, keeps form fields inside a
 touch-pannable `ScrollView`, respects Slint safe-area insets, uses 48px-or-larger
 touch targets, and declares accessibility labels for every input and action.
+
+## Core lifecycle binding
+
+The shell translates NativeActivity events without owning another state machine:
+`Start`/`Resume` call `ControllerHandle::app_foregrounded`, while
+`Pause`/`Stop`/`Destroy` call `app_backgrounded`. The core cancels the socket,
+retains connection intent, and resumes it when foreground policy permits. Its
+structured phase, revision, pending intent, retry delay, remedy, network summary,
+platform notice, and ready epoch are rendered directly. The Retry control calls
+`ControllerHandle::retry`; it does not reconstruct retry policy.
+
+`AndroidController::start_with_platform` receives the core's truthful
+`PortablePlatformFacilities`, which reports a session-only identity and
+manual-address-only discovery. The shell reports `NetworkStatus::Unknown`
+because NativeActivity exposes no connectivity callback without JNI. Connections
+remain allowed, and the UI says monitoring is unattached rather than fabricating
+Wi-Fi or cellular state.
 
 ## Local checks
 
@@ -41,9 +58,9 @@ Play Store release artifact.
   digest-verified 0.99.0 release assets, with `no-compile` preventing fallback
   downloads. The release publishes no matching armv7 archive, so this shell
   does not claim armeabi-v7a support.
-- The app has no discovery, pairing, background reconnect, push delivery, or
-  Android Keystore persistence. Pausing the activity disconnects; reconnect is
-  manual after resume.
+- The app has no discovery, default-network monitor, pairing, push delivery, or
+  Android Keystore persistence. Lifecycle suspension/resume works through the
+  core; network-aware suspension awaits a JNI connectivity adapter.
 - `usesCleartextTraffic` is enabled only because the existing core supports an
   explicit remote `ws://` opt-in. The UI warns before that transport can be used.
 - CI can prove compilation and APK assembly. Radio changes, process death,

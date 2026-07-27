@@ -54,6 +54,10 @@ outside repository automation.
 
 ## Limits
 
+- The rebased iOS core now requires explicit UIKit lifecycle and `NWPathMonitor`
+  facts before it starts a socket. This Slint-only shell has no Apple-framework
+  adapter yet, so the core remains fail-closed instead of assuming foreground or
+  fabricating a usable route.
 - No Bonjour discovery, pairing, push notifications, background refresh,
   Keychain persistence, or Secure Enclave integration is implemented.
 - iOS may suspend the Tokio workers in the background; this shell does not claim

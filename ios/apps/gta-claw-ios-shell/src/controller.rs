@@ -371,9 +371,9 @@ async fn run(mut commands: mpsc::Receiver<Command>, sink: SnapshotSink) {
                             Ok(attempt) => attempt,
                             Err(error) => {
                                 sink(UiSnapshot::failure(
-                                    "Connection already starting",
+                                    "Connection unavailable",
                                     error.to_string(),
-                                    "Wait for the current attempt to finish.",
+                                    "The host lifecycle and network-path preconditions must be satisfied before retrying.",
                                 ));
                                 continue;
                             }
@@ -477,7 +477,10 @@ async fn run_connection(
     let mut states = client.subscribe_state();
     let mut device_tokens_drained = false;
 
-    model.observe(client.state());
+    let _observation = attempt
+        .as_ref()
+        .expect("the connection attempt is held until transport shutdown")
+        .observe(client.state());
     if updates
         .send((
             generation,
@@ -496,7 +499,9 @@ async fn run_connection(
             () = cancellation.cancelled() => {
                 match client.shutdown().await {
                     Ok(()) => {
-                        model.observe(ConnectionState::Stopped);
+                        if let Some(attempt) = attempt.as_ref() {
+                            let _observation = attempt.observe(ConnectionState::Stopped);
+                        }
                         drop(attempt.take());
                         let _ = updates.send((
                             generation,
@@ -544,17 +549,20 @@ async fn run_connection(
             }
         };
 
-        model.observe(state.clone());
-        if matches!(state, ConnectionState::Ready(_)) {
+        let _observation = attempt
+            .as_ref()
+            .expect("the connection attempt is held until a terminal state")
+            .observe(state.clone());
+        if matches!(state, ConnectionState::Ready(_)) && !device_tokens_drained {
+            drop(client.take_issued_device_tokens().await);
+            device_tokens_drained = true;
+        }
+        let terminal = terminal(&state);
+        if terminal {
             drop(attempt.take());
-            if !device_tokens_drained {
-                drop(client.take_issued_device_tokens().await);
-                device_tokens_drained = true;
-            }
         }
         let snapshot = UiSnapshot::from_core(&model.snapshot());
-        if terminal(&state) {
-            drop(attempt.take());
+        if terminal {
             let _ = updates
                 .send((generation, WorkerUpdate::Finished(snapshot)))
                 .await;
@@ -577,7 +585,10 @@ async fn run_connection(
 #[cfg(test)]
 mod tests {
     use claw_gateway_client::ConnectionState;
-    use gta_claw_ios::{GatewayEndpoint, IosSessionModel};
+    use gta_claw_ios::{
+        AppRunState, GatewayEndpoint, IosNetworkInterface, IosNetworkPath, IosNetworkRoute,
+        IosSessionModel,
+    };
 
     use super::{Tone, UiSnapshot, prepare_connection};
 
@@ -619,8 +630,13 @@ mod tests {
     fn core_progress_snapshot_enables_cancel_only() {
         let endpoint = GatewayEndpoint::parse("wss://gateway.example").expect("valid endpoint");
         let model = IosSessionModel::new(&endpoint);
-        let _attempt = model.begin_attempt().expect("first attempt starts");
-        model.observe(ConnectionState::Connecting);
+        let _directive = model.set_run_state(AppRunState::Foreground);
+        let _directive = model.set_network_path(IosNetworkPath::Satisfied(IosNetworkRoute::new(
+            1,
+            IosNetworkInterface::Other,
+        )));
+        let attempt = model.begin_attempt().expect("first attempt starts");
+        let _observation = attempt.observe(ConnectionState::Connecting);
         let snapshot = UiSnapshot::from_core(&model.snapshot());
 
         assert!(snapshot.busy);
@@ -628,5 +644,22 @@ mod tests {
         assert!(!snapshot.can_connect);
         assert!(!snapshot.can_disconnect);
         assert_eq!(snapshot.tone, Tone::Progress);
+    }
+
+    #[test]
+    fn terminal_snapshot_enables_reconnect_after_attempt_release() {
+        let endpoint = GatewayEndpoint::parse("wss://gateway.example").expect("valid endpoint");
+        let model = IosSessionModel::new(&endpoint);
+        let _directive = model.set_run_state(AppRunState::Foreground);
+        let _directive = model.set_network_path(IosNetworkPath::Satisfied(IosNetworkRoute::new(
+            1,
+            IosNetworkInterface::Other,
+        )));
+        let attempt = model.begin_attempt().expect("first attempt starts");
+        let _observation = attempt.observe(ConnectionState::ReconnectExhausted);
+        assert!(!model.snapshot().can_connect());
+
+        drop(attempt);
+        assert!(model.snapshot().can_connect());
     }
 }
