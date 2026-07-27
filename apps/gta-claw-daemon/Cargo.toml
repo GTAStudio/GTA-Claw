@@ -12,6 +12,7 @@ axum = { version = "=0.8.9", features = ["json", "tokio"] }
 claw-application = { workspace = true, features = ["composition"] }
 claw-channels.workspace = true
 claw-config.workspace = true
+claw-crestodian.workspace = true
 claw-domain.workspace = true
 claw-gateway.workspace = true
 claw-http-api.workspace = true

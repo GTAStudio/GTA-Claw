@@ -861,18 +861,6 @@ impl ConfigController {
             changed,
         })
     }
-
-    /// Reloads a configured file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O diagnostic when the file cannot be read, or any
-    /// transactional rejection from [`Self::apply_json5`].
-    pub fn reload_file(&self, path: &Path) -> Result<AppliedReload, String> {
-        let source = std::fs::read_to_string(path)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        self.apply_json5(&source, &path.display().to_string())
-    }
 }
 
 /// Reads the typed Copilot timeout through the crate's deterministic public
@@ -1065,6 +1053,33 @@ impl WebhookPort for UnavailableExternalPorts {
     }
 }
 
+/// Immutable configuration and capability inventory exposed to operators.
+#[derive(Debug)]
+pub struct OperatorInventory {
+    channels: Vec<Value>,
+    skill_count: usize,
+    updates_enabled: bool,
+    config_resolution: Value,
+}
+
+impl OperatorInventory {
+    /// Creates the immutable operator-facing inventory.
+    #[must_use]
+    pub const fn new(
+        channels: Vec<Value>,
+        skill_count: usize,
+        updates_enabled: bool,
+        config_resolution: Value,
+    ) -> Self {
+        Self {
+            channels,
+            skill_count,
+            updates_enabled,
+            config_resolution,
+        }
+    }
+}
+
 /// Useful subset of the frozen admin surface plus explicit unavailable errors.
 #[derive(Debug)]
 pub struct OperatorAdmin {
@@ -1072,9 +1087,7 @@ pub struct OperatorAdmin {
     provider: Arc<ProviderAdapter>,
     readiness: Arc<DependencyReadiness>,
     diagnostics: Arc<Diagnostics>,
-    channels: Vec<Value>,
-    skill_count: usize,
-    updates_enabled: bool,
+    inventory: OperatorInventory,
 }
 
 impl OperatorAdmin {
@@ -1085,18 +1098,14 @@ impl OperatorAdmin {
         provider: Arc<ProviderAdapter>,
         readiness: Arc<DependencyReadiness>,
         diagnostics: Arc<Diagnostics>,
-        channels: Vec<Value>,
-        skill_count: usize,
-        updates_enabled: bool,
+        inventory: OperatorInventory,
     ) -> Self {
         Self {
             config,
             provider,
             readiness,
             diagnostics,
-            channels,
-            skill_count,
-            updates_enabled,
+            inventory,
         }
     }
 
@@ -1110,9 +1119,10 @@ impl OperatorAdmin {
             "provider": self.provider.provider_name(),
             "model": model,
             "configGeneration": generation,
-            "channels": self.channels,
+            "configuration": self.inventory.config_resolution,
+            "channels": self.inventory.channels,
             "skills": {
-                "registered": self.skill_count,
+                "registered": self.inventory.skill_count,
                 "active": 0,
                 "state": "requires_native_ports",
             },
@@ -1137,11 +1147,14 @@ impl AdminPort for OperatorAdmin {
                 "models.authStatus" => {
                     json!({"ready": self.readiness.snapshot().map_err(admin_port_failure)?.ready})
                 }
-                "channels.status" => json!({"channels": self.channels}),
+                "channels.status" => json!({"channels": self.inventory.channels}),
                 "update.status" => json!({
-                    "configured": self.updates_enabled,
+                    "configured": self.inventory.updates_enabled,
                     "state": "external_updater_required",
                     "version": env!("CARGO_PKG_VERSION"),
+                    "retryOwner": "gta-claw-updater",
+                    "installCleanup": "updater_owned",
+                    "daemonMutation": false,
                 }),
                 "config.get" => {
                     let snapshot = self.config.snapshot().map_err(admin_unavailable)?;

@@ -4,15 +4,17 @@ use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use claw_channels::{ExchangeSupport, ImplementationStatus, descriptor, exchange_support};
 use claw_config::{
-    ConfigSnapshot, LogLevel, MigrationDiagnostic, SecretRef, load_file,
-    migrate_legacy_environment, to_json5,
+    ConfigLayerKind, ConfigLayers, ConfigSnapshot, LogLevel, MigrationDiagnostic, ResolvedConfig,
+    RoleDiagnostic, RoleDocumentOutcome, RoleFetchRequest, RoleResponse, RoleSourceFetcher,
+    SecretRef, load_role as load_role_document, migrate_legacy_environment, to_json5,
 };
+use claw_crestodian::{Crestodian, RecoveryGuidance};
 use claw_gateway::{
     CredentialPolicy, Exposure, GatewayServer, GatewayServerConfig, ServerHandle,
     StaticAuthenticator,
@@ -29,23 +31,23 @@ use claw_provider_sdk::{CancelToken, Operation, Provider, SecretString};
 use claw_providers::github_copilot::GitHubCopilotConfig;
 use claw_providers::{GitHubCopilot, ProviderRuntime};
 use claw_security::authorization::{Role, Scope, ScopeSet};
+use futures_util::StreamExt;
 use secrecy::SecretString as GatewaySecret;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::adapters::http_api::{
     AppliedReload, ConfigController, DependencyReadiness, Diagnostics, DurableSecurityAudit,
-    OperatorAdmin, ProviderAdapter, SmokeProvider, UnavailableExternalPorts, UnavailableTools,
-    copilot_request_timeout_ms, updates_enabled,
+    OperatorAdmin, OperatorInventory, ProviderAdapter, SmokeProvider, UnavailableExternalPorts,
+    UnavailableTools, copilot_request_timeout_ms, updates_enabled,
 };
 
 /// Whole-process shutdown ceiling.
 pub const PRODUCTION_STOP_DEADLINE: Duration = Duration::from_secs(10);
-const ROLE_RESPONSE_LIMIT: usize = 256 * 1024;
 const DEFAULT_GATEWAY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const DEFAULT_MCP: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const USAGE: &str = "usage: gta-claw-daemon [--probe | --check-config] [--config PATH] \
@@ -181,45 +183,53 @@ impl ProductionOptions {
     /// Returns a `config`-stage error when the file or migrated environment is
     /// not a complete valid typed configuration.
     pub fn load_config(&self) -> Result<LoadedConfig, ProductionError> {
+        let environment = process_environment();
         let configured_path = self
             .config_path
             .clone()
             .or_else(|| std::env::var_os("GTA_CLAW_CONFIG").map(PathBuf::from));
         if let Some(path) = configured_path {
-            let snapshot =
-                load_file(&path).map_err(|error| ProductionError::new("config", error))?;
+            let recovery_guidance = self.recovery_guidance(&path);
+            let resolved = resolve_file_config(&path, &environment).map_err(|error| {
+                ProductionError::message(
+                    "config",
+                    format!(
+                        "{error}; recovery_guidance={}",
+                        recovery_guidance.map_or("unavailable", recovery_guidance_label)
+                    ),
+                )
+            })?;
             return Ok(LoadedConfig {
-                snapshot,
+                snapshot: resolved.config,
                 path: Some(path),
-                source: "file",
-                diagnostics: Vec::new(),
+                source: "layered-file",
+                diagnostics: resolved.environment_diagnostics,
+                applied_layers: resolved.applied_layers,
+                recovery_guidance,
             });
         }
 
-        let environment = std::env::vars_os()
-            .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
-            .collect::<Vec<_>>();
         let migrated = migrate_legacy_environment(
             environment
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str())),
         )
         .map_err(|error| ProductionError::new("config", error))?;
-        let diagnostics = migrated
+        let mut applied_layers = vec![ConfigLayerKind::BuiltIn];
+        if migrated
             .diagnostics
-            .into_iter()
-            .map(|diagnostic| match diagnostic {
-                MigrationDiagnostic::ManualRequired(mapping) => format!(
-                    "{} requires manual migration to {}: {}",
-                    mapping.legacy_env, mapping.target, mapping.reason
-                ),
-            })
-            .collect();
+            .iter()
+            .any(|diagnostic| matches!(diagnostic, MigrationDiagnostic::Applied { .. }))
+        {
+            applied_layers.push(ConfigLayerKind::Environment);
+        }
         Ok(LoadedConfig {
             snapshot: migrated.config,
             path: None,
             source: "legacy-environment",
-            diagnostics,
+            diagnostics: migrated.diagnostics,
+            applied_layers,
+            recovery_guidance: None,
         })
     }
 
@@ -239,6 +249,15 @@ impl ProductionOptions {
         })?;
         Ok(PathBuf::from(home).join(".gta-claw"))
     }
+
+    fn recovery_guidance(&self, config_path: &Path) -> Option<RecoveryGuidance> {
+        let state_path = self.state_dir().ok()?.join("crestodian-state.json");
+        Some(
+            Crestodian::new(config_path.to_owned(), state_path)
+                .inspect()
+                .guidance(),
+        )
+    }
 }
 
 /// Loaded startup configuration and its reload source.
@@ -251,7 +270,47 @@ pub struct LoadedConfig {
     /// Stable source label.
     pub source: &'static str,
     /// Non-fatal migration diagnostics.
-    pub diagnostics: Vec<String>,
+    pub diagnostics: Vec<MigrationDiagnostic>,
+    /// Configuration layers that contributed values.
+    pub applied_layers: Vec<ConfigLayerKind>,
+    /// Machine-readable recovery guidance for file-backed startup.
+    pub recovery_guidance: Option<RecoveryGuidance>,
+}
+
+fn process_environment() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
+}
+
+fn resolve_file_config(
+    path: &Path,
+    environment: &[(String, String)],
+) -> Result<ResolvedConfig, claw_config::LayeredConfigError> {
+    ConfigLayers::new()
+        .with_workspace_file(path)?
+        .with_environment(environment.iter().cloned())
+        .resolve()
+}
+
+const fn recovery_guidance_label(guidance: RecoveryGuidance) -> &'static str {
+    match guidance {
+        RecoveryGuidance::NoAction => "no_action",
+        RecoveryGuidance::RunGuidedSetup => "run_guided_setup",
+        RecoveryGuidance::RecoverFromBaseline => "recover_from_baseline",
+        RecoveryGuidance::UseCompatibleBuild => "use_compatible_build",
+    }
+}
+
+const fn config_layer_label(layer: ConfigLayerKind) -> &'static str {
+    match layer {
+        ConfigLayerKind::BuiltIn => "built_in",
+        ConfigLayerKind::System => "system",
+        ConfigLayerKind::User => "user",
+        ConfigLayerKind::Workspace => "workspace",
+        ConfigLayerKind::Environment => "environment",
+        ConfigLayerKind::CommandLine => "command_line",
+    }
 }
 
 /// Initializes the shared redacting telemetry subscriber from typed logging config.
@@ -329,6 +388,8 @@ impl std::error::Error for ProductionError {}
 struct RoleProfile {
     prompt: String,
     model: Option<String>,
+    outcome: RoleDocumentOutcome,
+    diagnostics: Vec<RoleDiagnostic>,
 }
 
 /// Bound service addresses reported after readiness.
@@ -372,10 +433,77 @@ impl ProductionService {
         validate_exposure(options)?;
         let diagnostics = Arc::new(Diagnostics::new(256));
         diagnostics.record(format!("configuration loaded from {}", loaded.source));
+        diagnostics.record(format!("configuration layers: {:?}", loaded.applied_layers));
+        info!(
+            stage = "config",
+            layers = ?loaded.applied_layers,
+            "configuration layers resolved"
+        );
+        let mut applied = 0_usize;
+        let mut manual_required = 0_usize;
+        let mut ignored_unknown = 0_usize;
         for diagnostic in &loaded.diagnostics {
-            diagnostics.record(diagnostic.clone());
-            warn!(stage = "config", message = %diagnostic);
+            match diagnostic {
+                MigrationDiagnostic::ManualRequired(mapping) => {
+                    manual_required += 1;
+                    diagnostics.record(diagnostic.to_string());
+                    warn!(
+                        stage = "config",
+                        diagnostic = "manual_required",
+                        legacy_env = mapping.legacy_env,
+                        target = mapping.target,
+                        reason = mapping.reason,
+                    );
+                }
+                MigrationDiagnostic::Applied { legacy_env, target } => {
+                    applied += 1;
+                    diagnostics.record(diagnostic.to_string());
+                    info!(stage = "config", diagnostic = "applied", legacy_env, target,);
+                }
+                MigrationDiagnostic::IgnoredUnknown { name } => {
+                    ignored_unknown += 1;
+                    debug!(
+                        stage = "config",
+                        diagnostic = "ignored_unknown",
+                        environment_name = name,
+                    );
+                }
+                _ => {
+                    diagnostics.record("configuration emitted an unrecognized diagnostic");
+                    warn!(stage = "config", diagnostic = "unrecognized");
+                }
+            }
         }
+        if ignored_unknown > 0 {
+            diagnostics.record(format!(
+                "{ignored_unknown} non-configuration environment names ignored"
+            ));
+        }
+        if let Some(guidance) = loaded.recovery_guidance {
+            let guidance = recovery_guidance_label(guidance);
+            diagnostics.record(format!("recovery guidance: {guidance}"));
+            if guidance == "no_action" {
+                info!(stage = "recovery", guidance);
+            } else {
+                warn!(stage = "recovery", guidance);
+            }
+        }
+        let config_resolution = json!({
+            "source": loaded.source,
+            "layers": loaded
+                .applied_layers
+                .iter()
+                .map(|layer| config_layer_label(*layer))
+                .collect::<Vec<_>>(),
+            "diagnostics": {
+                "applied": applied,
+                "manualRequired": manual_required,
+                "ignoredUnknown": ignored_unknown,
+            },
+            "recoveryGuidance": loaded
+                .recovery_guidance
+                .map(recovery_guidance_label),
+        });
 
         let readiness = Arc::new(DependencyReadiness::new([
             "config", "audit", "role", "skills", "provider", "channels", "gateway", "http", "mcp",
@@ -401,21 +529,39 @@ impl ProductionService {
         info!(stage = "audit", path = %state_dir.join("security-audit.jsonl").display(), "durable audit opened");
 
         let proxy = proxy_policy(&loaded.snapshot)?;
-        diagnostics.record(proxy_diagnostic(&proxy));
+        let proxy_rules = proxy.rules();
+        diagnostics.record(format!("proxy policy: {proxy:?}"));
+        for diagnostic in proxy_rules.diagnostics() {
+            diagnostics.record(format!("proxy: {diagnostic}"));
+            warn!(stage = "proxy", diagnostic = %diagnostic);
+        }
+        if proxy_rules.fell_back_to_direct() {
+            warn!(
+                stage = "proxy",
+                "configured proxy is unusable; traffic will go direct"
+            );
+        }
         info!(stage = "proxy", policy = ?proxy, "shared provider transport policy selected");
         let role = if options.smoke {
             RoleProfile {
                 prompt: "You are running the GTA Claw install diagnostic.".to_owned(),
                 model: None,
+                outcome: RoleDocumentOutcome::LoadedPlainText,
+                diagnostics: Vec::new(),
             }
         } else {
             load_role(&loaded.snapshot, proxy.clone()).await?
         };
+        for diagnostic in &role.diagnostics {
+            diagnostics.record(format!("role: {diagnostic}"));
+            warn!(stage = "role", diagnostic = %diagnostic);
+        }
         readiness.set("role", true);
         info!(
             stage = "role",
             bytes = role.prompt.len(),
             model = role.model.as_deref().unwrap_or("configured-default"),
+            outcome = role_outcome_label(role.outcome),
             "role loaded"
         );
 
@@ -483,9 +629,7 @@ impl ProductionService {
             Arc::clone(&provider),
             Arc::clone(&readiness),
             Arc::clone(&diagnostics),
-            channels,
-            skill_count,
-            updates_enabled,
+            OperatorInventory::new(channels, skill_count, updates_enabled, config_resolution),
         ));
         let external = Arc::new(UnavailableExternalPorts);
         let services = ApiServices {
@@ -694,8 +838,23 @@ impl ProductionService {
                 "legacy-environment startup has no reloadable file; use --config",
             )
         })?;
+        let resolved = resolve_file_config(path, &process_environment())
+            .map_err(|error| ProductionError::new("reload", error))?;
+        for diagnostic in &resolved.environment_diagnostics {
+            match diagnostic {
+                MigrationDiagnostic::Applied { .. } | MigrationDiagnostic::ManualRequired(_) => {
+                    self.diagnostics.record(format!("reload: {diagnostic}"));
+                }
+                MigrationDiagnostic::IgnoredUnknown { .. } => {}
+                _ => self
+                    .diagnostics
+                    .record("reload emitted an unrecognized configuration diagnostic"),
+            }
+        }
+        let source =
+            to_json5(&resolved.config).map_err(|error| ProductionError::new("reload", error))?;
         self.config
-            .reload_file(path)
+            .apply_json5(&source, &path.display().to_string())
             .map_err(|error| ProductionError::message("reload", error))
     }
 
@@ -1075,16 +1234,15 @@ fn proxy_policy(snapshot: &ConfigSnapshot) -> Result<ProxyPolicy, ProductionErro
         })
 }
 
-fn proxy_diagnostic(policy: &ProxyPolicy) -> String {
-    match policy {
-        ProxyPolicy::FromEnvironment => {
-            "proxy: environment policy (ALL_PROXY, HTTPS_PROXY, HTTP_PROXY, NO_PROXY)".to_owned()
-        }
-        ProxyPolicy::Disabled => "proxy: disabled".to_owned(),
-        ProxyPolicy::Explicit { no_proxy, .. } => format!(
-            "proxy: explicit redacted URL, no_proxy={}",
-            no_proxy.is_some()
-        ),
+struct CompletedRoleFetcher(Option<Result<RoleResponse, ProductionError>>);
+
+impl RoleSourceFetcher for CompletedRoleFetcher {
+    type Error = ProductionError;
+
+    fn fetch(&mut self, _request: RoleFetchRequest<'_>) -> Result<RoleResponse, Self::Error> {
+        self.0.take().ok_or_else(|| {
+            ProductionError::message("role-fetch", "role response was already consumed")
+        })?
     }
 }
 
@@ -1092,8 +1250,26 @@ async fn load_role(
     snapshot: &ConfigSnapshot,
     proxy: ProxyPolicy,
 ) -> Result<RoleProfile, ProductionError> {
-    let url = Url::parse(snapshot.core().role().source_url())
+    let role_config = snapshot.core().role();
+    let request = RoleFetchRequest::new(role_config.source_url());
+    let response = fetch_role_response(request, proxy).await;
+    let mut fetcher = CompletedRoleFetcher(Some(response));
+    let document = load_role_document(&mut fetcher, role_config)
         .map_err(|error| ProductionError::new("role", error))?;
+    Ok(RoleProfile {
+        prompt: document.content().to_owned(),
+        model: document.model().map(str::to_owned),
+        outcome: document.outcome(),
+        diagnostics: document.diagnostics().to_vec(),
+    })
+}
+
+async fn fetch_role_response(
+    request: RoleFetchRequest<'_>,
+    proxy: ProxyPolicy,
+) -> Result<RoleResponse, ProductionError> {
+    let url =
+        Url::parse(request.url()).map_err(|error| ProductionError::new("role-fetch", error))?;
     let tls_policy = if url.scheme() == "http"
         && url
             .host_str()
@@ -1103,63 +1279,96 @@ async fn load_role(
     } else {
         TlsPolicy::RequireHttps
     };
+    let timeout = Duration::from_millis(request.timeout_ms());
     let transport = HttpTransport::with_config(&TransportConfig {
         tls_policy,
         proxy_policy: proxy,
-        request_timeout: Duration::from_secs(15),
+        request_timeout: timeout,
         ..TransportConfig::default()
     })
     .map_err(|error| ProductionError::new("role-transport", error))?;
     let cancellation = CancelToken::new();
-    let response = transport
-        .send(
-            "role-loader",
-            Operation::Transport,
-            HttpRequest::new(Method::Get, url)
-                .header("accept", "application/json, text/plain")
-                .timeout(Duration::from_secs(15)),
-            &cancellation,
-        )
-        .await
-        .map_err(|error| ProductionError::new("role-fetch", error))?;
-    if !response.is_success() {
-        return Err(ProductionError::message(
+    let timeout_cancellation = cancellation.clone();
+    let outcome = tokio::time::timeout(timeout, async move {
+        let response = transport
+            .send_streaming(
+                "role-loader",
+                Operation::Transport,
+                HttpRequest::new(Method::Get, url)
+                    .header("accept", request.accept())
+                    .timeout(timeout),
+                &cancellation,
+            )
+            .await
+            .map_err(|error| ProductionError::new("role-fetch", error))?;
+        let status = response.status();
+        let content_type = response.header("content-type").map(str::to_owned);
+        let declared_length = response
+            .header("content-length")
+            .and_then(|length| length.parse::<u64>().ok());
+        if !(200..300).contains(&status)
+            || declared_length.is_some_and(|length| {
+                usize::try_from(length).map_or(true, |length| length > request.max_bytes())
+            })
+        {
+            return Ok(role_response(
+                status,
+                content_type,
+                declared_length,
+                Vec::new(),
+            ));
+        }
+
+        let mut body = Vec::with_capacity(
+            declared_length
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or_default()
+                .min(request.max_bytes()),
+        );
+        let mut chunks = response.into_chunks();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.map_err(|error| ProductionError::new("role-fetch", error))?;
+            if body.len().saturating_add(chunk.len()) > request.max_bytes() {
+                return Err(ProductionError::message(
+                    "role-fetch",
+                    format!("role response exceeds {} bytes", request.max_bytes()),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(role_response(status, content_type, declared_length, body))
+    })
+    .await;
+    outcome.unwrap_or_else(|_| {
+        timeout_cancellation.cancel();
+        Err(ProductionError::message(
             "role-fetch",
-            format!("role source returned HTTP {}", response.status()),
-        ));
+            format!("role fetch exceeded {} ms", request.timeout_ms()),
+        ))
+    })
+}
+
+fn role_response(
+    status: u16,
+    content_type: Option<String>,
+    declared_length: Option<u64>,
+    body: Vec<u8>,
+) -> RoleResponse {
+    let mut response = RoleResponse::new(status, body);
+    if let Some(content_type) = content_type {
+        response = response.with_content_type(content_type);
     }
-    if response.body().len() > ROLE_RESPONSE_LIMIT {
-        return Err(ProductionError::message(
-            "role-fetch",
-            format!("role response exceeds {ROLE_RESPONSE_LIMIT} bytes"),
-        ));
+    if let Some(declared_length) = declared_length {
+        response = response.with_declared_length(declared_length);
     }
-    let source = std::str::from_utf8(response.body())
-        .map_err(|error| ProductionError::new("role-decode", error))?;
-    let parsed = serde_json::from_str::<Value>(source).ok();
-    let prompt = parsed
-        .as_ref()
-        .and_then(Value::as_object)
-        .and_then(|object| {
-            object
-                .get("content")
-                .and_then(Value::as_str)
-                .or_else(|| object.get("prompt").and_then(Value::as_str))
-        })
-        .map_or_else(|| source.to_owned(), str::to_owned);
-    if prompt.trim().is_empty() {
-        return Err(ProductionError::message(
-            "role-decode",
-            "role prompt is empty",
-        ));
+    response
+}
+
+const fn role_outcome_label(outcome: RoleDocumentOutcome) -> &'static str {
+    match outcome {
+        RoleDocumentOutcome::LoadedJson => "loaded_json",
+        RoleDocumentOutcome::LoadedPlainText => "loaded_plain_text",
     }
-    let model = parsed
-        .as_ref()
-        .and_then(Value::as_object)
-        .and_then(|object| object.get("model"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    Ok(RoleProfile { prompt, model })
 }
 
 fn build_copilot(
@@ -1239,8 +1448,14 @@ pub fn check_configuration(
 mod tests {
     use std::ffi::OsString;
     use std::io;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{CommandLine, CommandMode};
+    use claw_config::{ConfigLayerKind, MigrationDiagnostic, migrate_legacy_environment, to_json5};
+    use claw_crestodian::RecoveryGuidance;
+
+    use super::{CommandLine, CommandMode, ProductionOptions, resolve_file_config};
+
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn the_full_command_line_is_parsed_without_a_framework() {
@@ -1274,5 +1489,70 @@ mod tests {
             .expect_err("mixed mode must fail");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn file_resolution_preserves_machine_diagnostics_and_recovery_guidance() {
+        let root = std::env::temp_dir().join(format!(
+            "gta-claw-config-resolution-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let path = root.join("config.json5");
+        let snapshot = migrate_legacy_environment([
+            ("GITHUB_TOKEN", "test"),
+            ("ENABLE_TEAMS", "false"),
+            ("AGENT_ROLE_URL", "https://example.test/role"),
+        ])
+        .expect("base configuration migrates")
+        .config;
+        std::fs::write(
+            &path,
+            to_json5(&snapshot).expect("configuration serializes"),
+        )
+        .expect("configuration is written");
+
+        let resolved = resolve_file_config(
+            &path,
+            &[
+                ("COPILOT_MODEL".to_owned(), "gpt-4.1".to_owned()),
+                ("TYPO_PORT".to_owned(), "1234".to_owned()),
+            ],
+        )
+        .expect("layers resolve");
+        assert_eq!(
+            resolved.applied_layers,
+            vec![
+                ConfigLayerKind::BuiltIn,
+                ConfigLayerKind::Workspace,
+                ConfigLayerKind::Environment,
+            ]
+        );
+        assert!(resolved.environment_diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic,
+                MigrationDiagnostic::Applied {
+                    legacy_env: "COPILOT_MODEL",
+                    target: "copilot.default_model",
+                }
+            )
+        }));
+        assert!(resolved.environment_diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic,
+                MigrationDiagnostic::IgnoredUnknown { name } if name == "TYPO_PORT"
+            )
+        }));
+
+        let options = ProductionOptions {
+            state_dir: Some(root.clone()),
+            ..ProductionOptions::default()
+        };
+        assert_eq!(
+            options.recovery_guidance(&path),
+            Some(RecoveryGuidance::RecoverFromBaseline)
+        );
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
     }
 }

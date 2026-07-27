@@ -153,6 +153,41 @@ fn bound_http_is_ready_and_dispatches_to_the_composed_provider() {
     assert!(models.starts_with("HTTP/1.1 200"), "{models}");
     assert!(models.contains(r#""id":"openclaw""#), "{models}");
 
+    let status = request(
+        daemon.http,
+        "POST",
+        "/api/v1/admin/rpc",
+        Some("operator-token"),
+        Some(r#"{"method":"status"}"#),
+    );
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    assert!(
+        status.contains(r#""recoveryGuidance":"recover_from_baseline""#),
+        "{status}"
+    );
+    assert!(
+        status.contains(r#""layers":["built_in","workspace","environment"]"#),
+        "{status}"
+    );
+
+    let update = request(
+        daemon.http,
+        "POST",
+        "/api/v1/admin/rpc",
+        Some("operator-token"),
+        Some(r#"{"method":"update.status"}"#),
+    );
+    assert!(update.starts_with("HTTP/1.1 200"), "{update}");
+    assert!(
+        update.contains(r#""retryOwner":"gta-claw-updater""#),
+        "{update}"
+    );
+    assert!(
+        update.contains(r#""installCleanup":"updater_owned""#),
+        "{update}"
+    );
+    assert!(update.contains(r#""daemonMutation":false"#), "{update}");
+
     let chat = request(
         daemon.http,
         "POST",
