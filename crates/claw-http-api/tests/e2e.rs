@@ -2417,3 +2417,280 @@ async fn generation_ports_receive_validated_parameters_media_and_strict_response
         }})
     );
 }
+
+/// Field names every item of the frozen HTTP/SSE inventory publishes, sorted.
+///
+/// `serde` silently drops fields a struct does not declare, so without an
+/// explicit key-set assertion an upstream schema change is invisible here.
+const FROZEN_ENDPOINT_ITEM_FIELDS: [&str; 7] = [
+    "classification",
+    "id",
+    "method",
+    "path",
+    "record_id",
+    "source_path",
+    "streaming",
+];
+
+/// Field names the frozen HTTP/SSE inventory publishes inside `counts`, sorted.
+const FROZEN_ENDPOINT_COUNT_FIELDS: [&str; 4] =
+    ["long_poll", "optional_sse", "streamable_http", "total"];
+
+/// Streaming modes the frozen HTTP/SSE inventory assigns to endpoints, sorted.
+const FROZEN_STREAMING_MODES: [&str; 4] = ["long_poll", "none", "optional_sse", "streamable_http"];
+
+/// Content type this crate emits for buffered JSON responses.
+const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
+
+/// Content type this crate emits for server-sent event streams.
+const SSE_CONTENT_TYPE: &str = "text/event-stream; charset=utf-8";
+
+fn frozen_endpoint_inventory() -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("compat")
+        .join("upstream")
+        .join("inventories")
+        .join("http-sse-endpoints.json");
+    let source = fs::read_to_string(&path).expect("read frozen HTTP endpoint inventory");
+    let source = source.strip_prefix('\u{feff}').unwrap_or(&source);
+    serde_json::from_str::<Value>(source).expect("parse frozen HTTP endpoint inventory")
+}
+
+#[test]
+fn frozen_endpoint_inventory_publishes_exactly_the_field_set_this_crate_reads() {
+    let inventory = frozen_endpoint_inventory();
+    let items = inventory["items"]
+        .as_array()
+        .expect("frozen HTTP endpoint inventory items");
+
+    for item in items {
+        let record = item["record_id"]
+            .as_str()
+            .expect("frozen HTTP endpoint record identity");
+        let mut published = item
+            .as_object()
+            .expect("frozen HTTP endpoint item object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        published.sort_unstable();
+        assert_eq!(
+            published, FROZEN_ENDPOINT_ITEM_FIELDS,
+            "{record} publishes a field set this crate does not read"
+        );
+    }
+
+    let counts = inventory["counts"]
+        .as_object()
+        .expect("frozen HTTP endpoint counts object");
+    let mut published_counts = counts.keys().map(String::as_str).collect::<Vec<_>>();
+    published_counts.sort_unstable();
+    assert_eq!(
+        published_counts, FROZEN_ENDPOINT_COUNT_FIELDS,
+        "the frozen counts object publishes a field set this crate does not read"
+    );
+
+    let mut endpoints_by_mode = BTreeMap::new();
+    for item in items {
+        let mode = item["streaming"]
+            .as_str()
+            .expect("frozen HTTP endpoint streaming mode");
+        *endpoints_by_mode.entry(mode).or_insert(0_u64) += 1;
+    }
+    let observed_modes = endpoints_by_mode.keys().copied().collect::<Vec<_>>();
+    assert_eq!(
+        observed_modes, FROZEN_STREAMING_MODES,
+        "the frozen inventory uses a streaming vocabulary this crate does not handle"
+    );
+
+    let total = counts["total"]
+        .as_u64()
+        .expect("frozen HTTP endpoint total count");
+    assert_eq!(
+        total,
+        u64::try_from(items.len()).expect("frozen item count fits in u64"),
+        "the frozen total disagrees with the number of frozen items"
+    );
+
+    let mut declared_streaming = 0;
+    for mode in ["long_poll", "optional_sse", "streamable_http"] {
+        let declared = counts[mode]
+            .as_u64()
+            .unwrap_or_else(|| panic!("frozen count for {mode}"));
+        assert_eq!(
+            endpoints_by_mode[mode], declared,
+            "{mode} endpoints disagree with the frozen {mode} count"
+        );
+        declared_streaming += declared;
+    }
+    assert_eq!(
+        endpoints_by_mode["none"],
+        total - declared_streaming,
+        "non-streaming endpoints disagree with the frozen counts"
+    );
+}
+
+fn streaming_probe_body(method: &str, route: &str) -> Vec<u8> {
+    match (method, route) {
+        ("GET", _) => Vec::new(),
+        ("POST", "/v1/chat/completions") => json_body(json!({
+            "model":"openclaw",
+            "stream":true,
+            "messages":[{"role":"user","content":"hello"}]
+        })),
+        ("POST", "/v1/responses") => json_body(json!({
+            "model":"openclaw",
+            "input":"hello",
+            "stream":true
+        })),
+        ("POST", "/mcp") => json_body(json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2024-11-05"}
+        })),
+        ("POST", _) => json_body(json!({"stream":true})),
+        (method, route) => {
+            panic!("frozen inventory gained method {method} on {route} without a probe body")
+        }
+    }
+}
+
+fn buffered_probe_body(route: &str) -> Vec<u8> {
+    match route {
+        "/v1/chat/completions" => json_body(json!({
+            "model":"openclaw",
+            "messages":[{"role":"user","content":"hello"}]
+        })),
+        "/v1/responses" => json_body(json!({"model":"openclaw","input":"hello"})),
+        route => panic!("frozen inventory marks {route} optional_sse without a buffered probe"),
+    }
+}
+
+fn answered_with_event_stream(response: &HttpResponse) -> bool {
+    response
+        .headers
+        .get("content-type")
+        .is_some_and(|value| value.starts_with("text/event-stream"))
+}
+
+/// Proves the response framing the server produces agrees with the streaming
+/// mode the frozen inventory assigns to each route.
+///
+/// `streamable_http` is checked only for a buffered JSON-RPC call: the MCP
+/// transport may negotiate an event stream on other verbs, and the frozen
+/// inventory pins only the POST row.
+#[tokio::test]
+async fn observed_response_framing_matches_the_frozen_streaming_modes() {
+    let inventory = frozen_endpoint_inventory();
+    let items = inventory["items"]
+        .as_array()
+        .expect("frozen HTTP endpoint inventory items")
+        .clone();
+
+    let runtime = DeterministicRuntime::new();
+    let server = spawn_with(config(), runtime).await;
+
+    let mut frozen_as_sse = BTreeSet::new();
+    let mut answered_as_sse = BTreeSet::new();
+
+    for item in &items {
+        let method = item["method"]
+            .as_str()
+            .expect("frozen HTTP endpoint method");
+        let route = item["path"].as_str().expect("frozen HTTP endpoint path");
+        let mode = item["streaming"]
+            .as_str()
+            .expect("frozen HTTP endpoint streaming mode");
+        let identity = format!("{method} {route}");
+        if mode == "optional_sse" {
+            frozen_as_sse.insert(identity.clone());
+        }
+
+        let path = route
+            .replace("{id}", "openclaw")
+            .replace("{routeId}", "zapier");
+        let (address, token) = if route == "/mcp" {
+            (server.mcp_address, "mcp-owner")
+        } else {
+            (server.address, "operator-token")
+        };
+        let headers: &[(&str, &str)] = if method == "GET" {
+            &[]
+        } else {
+            &[("Content-Type", "application/json")]
+        };
+
+        let response = request_at(
+            address,
+            method,
+            &path,
+            Some(token),
+            headers,
+            &streaming_probe_body(method, route),
+        )
+        .await;
+        if answered_with_event_stream(&response) {
+            answered_as_sse.insert(identity.clone());
+        }
+
+        match mode {
+            "optional_sse" => {
+                assert_eq!(
+                    response.status, 200,
+                    "{identity} rejected the streaming probe"
+                );
+                assert_eq!(
+                    response.headers.get("content-type").map(String::as_str),
+                    Some(SSE_CONTENT_TYPE),
+                    "{identity} is frozen as optional_sse but did not answer with SSE framing"
+                );
+                let buffered = request_at(
+                    address,
+                    method,
+                    &path,
+                    Some(token),
+                    headers,
+                    &buffered_probe_body(route),
+                )
+                .await;
+                assert_eq!(
+                    buffered.status, 200,
+                    "{identity} rejected the buffered probe"
+                );
+                assert_eq!(
+                    buffered.headers.get("content-type").map(String::as_str),
+                    Some(JSON_CONTENT_TYPE),
+                    "{identity} is frozen as optional_sse but cannot answer without streaming"
+                );
+            }
+            "streamable_http" => {
+                assert_eq!(
+                    response.status, 200,
+                    "{identity} rejected a buffered JSON-RPC call"
+                );
+                assert_eq!(
+                    response.headers.get("content-type").map(String::as_str),
+                    Some(JSON_CONTENT_TYPE),
+                    "{identity} did not answer a buffered JSON-RPC call with JSON framing"
+                );
+            }
+            "none" | "long_poll" => {
+                assert!(
+                    !answered_with_event_stream(&response),
+                    "{identity} is frozen as {mode} but answered with SSE framing"
+                );
+            }
+            mode => panic!("frozen inventory gained streaming mode {mode} on {identity}"),
+        }
+    }
+
+    assert_eq!(
+        answered_as_sse, frozen_as_sse,
+        "the routes that answered with an event stream are not the routes frozen as optional_sse"
+    );
+    assert!(
+        !answered_as_sse.is_empty(),
+        "no route streamed, so the probe bodies never reached the streaming path"
+    );
+}
