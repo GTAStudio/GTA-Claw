@@ -27,8 +27,8 @@ pub use tracing;
 
 pub use audit::{AuditEvent, AuditOutcome, AuditSink, DurableFileAuditSink, InMemoryAuditSink};
 pub use metrics::{
-    InMemoryMetricsExporter, Label, MetricError, MetricEvent, Metrics, MetricsExporter,
-    MetricsSnapshot,
+    InMemoryMetricsExporter, Label, MetricError, MetricEvent, Metrics, MetricsCardinality,
+    MetricsExporter, MetricsLimits, MetricsSnapshot,
 };
 pub use redaction::{REDACTED, RedactingLayer, Secret, is_sensitive_field};
 pub use telemetry::{LogFormat, TelemetryConfig, TelemetryError, TelemetryHandle, init};

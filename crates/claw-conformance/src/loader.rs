@@ -1,7 +1,8 @@
 //! Contract loading, schema checks, and drift detection.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -13,9 +14,9 @@ use crate::model::{
     ChannelCounts, ChannelItem, Classification, ClientCounts, ClientItem, ConfigDomainCounts,
     ConfigDomainItem, EvidenceStatus, FeatureLedger, GatewayProtocolCounts, GatewayProtocolItem,
     HttpEndpointCounts, HttpEndpointItem, IntoInventoryRecord, Inventory, InventoryCounts,
-    InventoryHeader, InventoryRecord, LedgerStatus, Manifest, MigrationCounts, MigrationItem,
-    PluginCounts, PluginItem, ProviderCounts, ProviderItem, ReleaseDeploymentCounts,
-    ReleaseDeploymentItem, SkillCounts, SkillItem,
+    InventoryRecord, LedgerStatus, Manifest, MigrationCounts, MigrationItem, PluginCounts,
+    PluginItem, ProviderCounts, ProviderItem, ReleaseDeploymentCounts, ReleaseDeploymentItem,
+    SkillCounts, SkillItem,
 };
 
 const BASELINE_SHA: &str = "b43e832fcc8000ed7287c7accc54e381db607f85";
@@ -25,6 +26,7 @@ const LEGACY_FEATURE_SCHEMA_HASH: &str =
 const TRANSITION_FEATURE_SCHEMA_HASH: &str =
     "15a7a366313e5c23dac7abdc5105f6eb630082c334dc0d0dfcd263acddeffcfe";
 const BASELINE_KNOWN_DIFFERENCE: &str = "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline.";
+const MAX_CONTRACT_ARTIFACT_BYTES: u64 = 1024 * 1024;
 
 const LEDGER_SPECS: [(&str, &str, Classification, usize); 3] = [
     (
@@ -749,14 +751,6 @@ fn parse_inventory(
     expected_id: &str,
     expected_rows: usize,
 ) -> Result<Vec<InventoryRecord>, ConformanceError> {
-    let header: InventoryHeader = parse_bytes(path, bytes)?;
-    if header.inventory_id != expected_id {
-        return Err(ConformanceError::new(
-            ViolationCode::InventoryDrift,
-            Some(expected_id.to_owned()),
-            format!("{path} inventory_id changed to '{}'", header.inventory_id),
-        ));
-    }
     match expected_id {
         "plugins" => parse_typed_inventory::<PluginCounts, PluginItem>(
             path,
@@ -898,13 +892,54 @@ where
 }
 
 fn read_file(root: &Path, relative: &str) -> Result<Vec<u8>, ConformanceError> {
-    fs::read(root.join(relative)).map_err(|error| {
+    let path = root.join(relative);
+    let file = File::open(&path).map_err(|error| {
         ConformanceError::new(
             ViolationCode::Io,
             Some(relative.to_owned()),
             error.to_string(),
         )
-    })
+    })?;
+    let reported_size = file.metadata().map_err(|error| {
+        ConformanceError::new(
+            ViolationCode::Io,
+            Some(relative.to_owned()),
+            format!("cannot inspect artifact size: {error}"),
+        )
+    })?;
+    if reported_size.len() > MAX_CONTRACT_ARTIFACT_BYTES {
+        return Err(ConformanceError::new(
+            ViolationCode::Io,
+            Some(relative.to_owned()),
+            format!(
+                "artifact is {} bytes and exceeds the {MAX_CONTRACT_ARTIFACT_BYTES}-byte limit",
+                reported_size.len()
+            ),
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(reported_size.len())
+            .unwrap_or(usize::MAX)
+            .min(usize::try_from(MAX_CONTRACT_ARTIFACT_BYTES).unwrap_or(usize::MAX)),
+    );
+    file.take(MAX_CONTRACT_ARTIFACT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ConformanceError::new(
+                ViolationCode::Io,
+                Some(relative.to_owned()),
+                format!("cannot read artifact: {error}"),
+            )
+        })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CONTRACT_ARTIFACT_BYTES {
+        return Err(ConformanceError::new(
+            ViolationCode::Io,
+            Some(relative.to_owned()),
+            format!("artifact exceeds the {MAX_CONTRACT_ARTIFACT_BYTES}-byte limit"),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn repository_root_for_contract(contract_root: &Path) -> PathBuf {
@@ -915,11 +950,16 @@ fn repository_root_for_contract(contract_root: &Path) -> PathBuf {
             .and_then(|name| name.to_str())
             == Some("compat")
     {
-        contract_root
+        let repository_root = contract_root
             .parent()
             .and_then(Path::parent)
             .unwrap_or(contract_root)
-            .to_path_buf()
+            .to_path_buf();
+        if repository_root.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            repository_root
+        }
     } else {
         contract_root.to_path_buf()
     }
@@ -975,7 +1015,21 @@ fn verify_hashes<'a>(
 /// endings.
 fn normalized_digest(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest = Sha256::digest(normalize_line_endings(bytes));
+    let mut hasher = Sha256::new();
+    let mut chunk_start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes.get(index..index + 2) == Some(b"\r\n") {
+            hasher.update(&bytes[chunk_start..index]);
+            hasher.update(b"\n");
+            index += 2;
+            chunk_start = index;
+        } else {
+            index += 1;
+        }
+    }
+    hasher.update(&bytes[chunk_start..]);
+    let digest = hasher.finalize();
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
         encoded.push(HEX[usize::from(byte >> 4)] as char);
@@ -984,17 +1038,59 @@ fn normalized_digest(bytes: &[u8]) -> String {
     encoded
 }
 
-fn normalize_line_endings(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes.get(index..index + 2) == Some(b"\r\n") {
-            normalized.push(b'\n');
-            index += 2;
-        } else {
-            normalized.push(bytes[index]);
-            index += 1;
-        }
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{
+        MAX_CONTRACT_ARTIFACT_BYTES, normalized_digest, read_file, repository_root_for_contract,
+    };
+    use crate::ViolationCode;
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_root() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "claw-conformance-loader-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ))
     }
-    normalized
+
+    #[test]
+    fn contract_artifact_reads_are_hard_bounded() {
+        let root = temporary_root();
+        fs::create_dir_all(&root).expect("create fixture");
+        let oversized =
+            vec![b'x'; usize::try_from(MAX_CONTRACT_ARTIFACT_BYTES + 1).expect("test size")];
+        fs::write(root.join("oversized.json"), oversized).expect("write oversized artifact");
+
+        let error = read_file(&root, "oversized.json").expect_err("oversized artifact must fail");
+        assert_eq!(error.code(), ViolationCode::Io);
+        assert_eq!(error.subject(), Some("oversized.json"));
+        assert!(
+            error.message().contains("exceeds the 1048576-byte limit"),
+            "{}",
+            error.message()
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn normalized_digest_streams_crlf_without_changing_identity() {
+        assert_eq!(
+            normalized_digest(b"first\r\nsecond\r\n"),
+            normalized_digest(b"first\nsecond\n")
+        );
+    }
+
+    #[test]
+    fn default_relative_contract_root_resolves_to_current_repository() {
+        assert_eq!(
+            repository_root_for_contract(Path::new("compat/upstream")),
+            PathBuf::from(".")
+        );
+    }
 }

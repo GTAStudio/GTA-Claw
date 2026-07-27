@@ -25,6 +25,24 @@ pub enum ViolationCode {
     ClaimEvidence,
 }
 
+impl ViolationCode {
+    /// Returns the stable machine-friendly violation name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Io => "io",
+            Self::JsonSchema => "json_schema",
+            Self::ManifestDrift => "manifest_drift",
+            Self::InventoryDrift => "inventory_drift",
+            Self::LedgerDrift => "ledger_drift",
+            Self::LedgerEvidence => "ledger_evidence",
+            Self::UnknownClaim => "unknown_claim",
+            Self::DuplicateClaim => "duplicate_claim",
+            Self::ClaimEvidence => "claim_evidence",
+        }
+    }
+}
+
 /// One precise conformance failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConformanceError {

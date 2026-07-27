@@ -239,6 +239,8 @@ impl Visit for FieldVisitor<'_> {
 struct WriterState<W> {
     writer: W,
     last_error: Option<String>,
+    shutdown_error: Option<String>,
+    is_shutdown: bool,
 }
 
 /// A tracing subscriber layer that redacts sensitive structured fields.
@@ -272,6 +274,8 @@ where
             state: Arc::new(Mutex::new(WriterState {
                 writer,
                 last_error: None,
+                shutdown_error: None,
+                is_shutdown: false,
             })),
         }
     }
@@ -283,12 +287,56 @@ where
     /// Returns the message `telemetry writer lock poisoned` when a previous
     /// caller panicked while holding the writer mutex. Poisoning is reported
     /// rather than silently ignored because it means log records were lost.
+    /// An attempted event after shutdown is reported here without changing the
+    /// already-established shutdown result.
     pub fn take_error(&self) -> Result<Option<String>, String> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| "telemetry writer lock poisoned".to_owned())?;
         Ok(state.last_error.take())
+    }
+
+    /// Flushes the writer and prevents subsequent records from being accepted.
+    ///
+    /// The result is stable across repeated calls. All clones share the same
+    /// shutdown state, so a clean return establishes one deterministic flush
+    /// boundary for the layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a pending write failure, a final flush failure, or `telemetry
+    /// writer lock poisoned`.
+    pub fn shutdown(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "telemetry writer lock poisoned".to_owned())?;
+        if state.is_shutdown {
+            return state.shutdown_error.clone().map_or(Ok(()), Err);
+        }
+
+        let pending_error = state.last_error.clone();
+        let flush_error = state
+            .writer
+            .flush()
+            .err()
+            .map(|error| format!("telemetry flush failed: {error}"));
+        let shutdown_error = match (pending_error, flush_error) {
+            (Some(write_error), Some(flush_error)) => Some(format!(
+                "telemetry write failed: {write_error}; {flush_error}"
+            )),
+            (Some(write_error), None) => Some(format!("telemetry write failed: {write_error}")),
+            (None, flush_error) => flush_error,
+        };
+        state.is_shutdown = true;
+        state.shutdown_error.clone_from(&shutdown_error);
+        let result = shutdown_error.map_or(Ok(()), |error| {
+            state.last_error = Some(error.clone());
+            Err(error)
+        });
+        drop(state);
+        result
     }
 
     /// Writes one already newline-terminated record.
@@ -301,6 +349,12 @@ where
             eprintln!("claw-observability: telemetry writer lock poisoned");
             return;
         };
+        if state.is_shutdown {
+            let error = "telemetry event emitted after shutdown".to_owned();
+            state.last_error = Some(error.clone());
+            eprintln!("claw-observability: {error}");
+            return;
+        }
         if let Err(error) = state
             .writer
             .write_all(record.as_bytes())
@@ -445,6 +499,40 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FlushState {
+        bytes: Vec<u8>,
+        flushes: usize,
+        fail_flush: bool,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct FlushWriter(Arc<Mutex<FlushState>>);
+
+    impl std::io::Write for FlushWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("test writer lock poisoned"))?
+                .bytes
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            let mut state = self
+                .0
+                .lock()
+                .map_err(|_| std::io::Error::other("test writer lock poisoned"))?;
+            state.flushes += 1;
+            if state.fail_flush {
+                Err(std::io::Error::other("forced flush failure"))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -596,6 +684,71 @@ mod tests {
                 .filter(|field| field.as_str() == Some("span-secret"))
                 .count(),
             0
+        );
+    }
+
+    #[test]
+    fn shutdown_is_idempotent_and_rejects_late_events() {
+        let writer = FlushWriter::default();
+        let captured = Arc::clone(&writer.0);
+        let layer = RedactingLayer::new(LogFormat::Json, writer);
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(session_id = "s-1", "before shutdown");
+        });
+
+        assert_eq!(captured.lock().expect("capture lock").flushes, 1);
+        layer.shutdown().expect("first shutdown");
+        layer.shutdown().expect("idempotent shutdown");
+        let bytes_after_shutdown = {
+            let state = captured.lock().expect("capture lock");
+            assert_eq!(state.flushes, 2);
+            state.bytes.len()
+        };
+
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(session_id = "s-2", "after shutdown");
+        });
+        assert_eq!(
+            captured.lock().expect("capture lock").bytes.len(),
+            bytes_after_shutdown
+        );
+        assert_eq!(
+            layer.take_error().expect("writer error"),
+            Some("telemetry event emitted after shutdown".to_owned())
+        );
+        layer
+            .shutdown()
+            .expect("late event does not rewrite the completed flush result");
+    }
+
+    #[test]
+    fn shutdown_preserves_the_first_flush_result() {
+        let writer = FlushWriter::default();
+        writer.0.lock().expect("writer lock").fail_flush = true;
+        let layer = RedactingLayer::new(LogFormat::Json, writer.clone());
+
+        let first = layer.shutdown().expect_err("flush must fail");
+        assert_eq!(first, "telemetry flush failed: forced flush failure");
+        assert_eq!(writer.0.lock().expect("writer lock").flushes, 1);
+        assert_eq!(layer.shutdown().expect_err("result remains stable"), first);
+        assert_eq!(writer.0.lock().expect("writer lock").flushes, 1);
+        assert_eq!(layer.take_error().expect("take error"), Some(first.clone()));
+
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("after failed shutdown");
+        });
+        assert_eq!(
+            layer.take_error().expect("late event error"),
+            Some("telemetry event emitted after shutdown".to_owned())
+        );
+        assert_eq!(
+            layer
+                .shutdown()
+                .expect_err("late events do not rewrite shutdown history"),
+            first
         );
     }
 
