@@ -1,0 +1,27 @@
+[package]
+name = "claw-gateway-http"
+description = "Draining-aware Gateway HTTP probe surface and bounded watch-node long-poll transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+axum = { version = "=0.8.9", features = ["json", "tokio"] }
+base64 = "=0.22.1"
+ring = "=0.17.14"
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "=1.52.3", features = ["macros", "net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+http-body-util = "=0.1.4"
+hyper = { version = "=1.11.0", features = ["client", "http1"] }
+hyper-util = { version = "=0.1.20", features = ["client-legacy", "http1", "tokio"] }
+tokio = { version = "=1.52.3", features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
+tower = { version = "=0.5.3", features = ["util"] }
+
+[lints]
+workspace = true

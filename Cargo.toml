@@ -17,6 +17,7 @@ members = [
   "crates/claw-domain",
   "crates/claw-gateway",
   "crates/claw-gateway-client",
+  "crates/claw-gateway-http",
   "crates/claw-http-api",
   "crates/claw-mcp",
   "crates/claw-memory",
