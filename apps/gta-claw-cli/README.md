@@ -96,3 +96,30 @@ This command implements diagnostic health only. It is not a full OpenClaw CLI,
 admin/chat/provider surface, durable keyring identity, GUI, Gateway server, or
 feature-ledger status claim. Existing local `health`, unsupported `send`, and
 `--version` foundation behavior remain separate.
+
+`-v`/`--verbose` and `-vv` add opt-in diagnostics for the connection path
+itself: endpoint resolution, credential source, identity generation, client
+start, the negotiated protocol, the granted role and scopes, the health RPC
+round trip, and shutdown. `-vv` adds the connection epoch, the negotiated
+payload bound, and per-request correlation identifiers. Every record is a
+`tracing` event written as a JSON line on standard error by the shared
+`claw-observability` subscriber, so standard output — including the `--json`
+schema-version-2 object — is byte for byte what a quiet run produces, and a
+machine consumer reading standard output sees no difference. Field values are
+redacted by `claw-observability` whenever the field name names a secret, and
+peer text is stripped of control and bidirectional characters and bounded before
+it is written; nothing is ever formatted into a message, because message text
+does not pass through the redaction layer. Neither flag ever prints the token,
+and neither changes an exit code. `GTA_CLAW_LOG` overrides the filter, which
+otherwise scopes to this binary so a dependency's `log` records cannot land on
+the same stream.
+
+`--log-file <path>` sends those records to a file instead of standard error,
+which is useful when standard error is already carrying something else. The file
+is appended to, so a run adds to it rather than replacing it, and its directory
+must already exist — the CLI never creates one. If the file cannot be opened the
+command stops with the `log_file_unusable` status in the `usage_config` category
+(exit code 2) instead of quietly logging to standard error, because a diagnostic
+that silently went somewhere other than where it was asked to go is worse than
+no diagnostic at all. Without the flag the destination is unchanged: standard
+error.

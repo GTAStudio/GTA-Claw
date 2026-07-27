@@ -2,7 +2,8 @@
 
 use std::ffi::OsString;
 use std::fmt::{self, Formatter};
-use std::io;
+use std::io::{self, IsTerminal as _};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +12,9 @@ use crossterm::terminal as crossterm_terminal;
 use tokio::sync::mpsc;
 use url::Url;
 
+/// Redaction-safe diagnostics and the destination rules that keep them off the
+/// drawn terminal.
+pub mod diagnostics;
 /// Asynchronous Gateway adapter and bounded UI channels.
 pub mod gateway;
 /// TUI state and the complete run-state vocabulary.
@@ -20,6 +24,7 @@ pub mod render;
 /// Panic-safe terminal lifecycle and background input pump.
 pub mod terminal;
 
+use diagnostics::Verbosity;
 use gateway::{GatewayOptions, UiCommand, WorkerEvent, endpoint_label, spawn_gateway_worker};
 use model::{AppModel, Prompt, Screen};
 use terminal::{CrosstermControl, InputThread, TerminalSession};
@@ -48,6 +53,10 @@ pub struct Options {
     pub no_color: bool,
     /// Force a single non-interactive snapshot.
     pub plain: bool,
+    /// How much of the Gateway path to report.
+    pub verbosity: Verbosity,
+    /// Append diagnostics to this file instead of standard error.
+    pub log_file: Option<PathBuf>,
 }
 
 /// Formats without the token. A derived `Debug` would put the shared secret into
@@ -67,6 +76,8 @@ impl fmt::Debug for Options {
             )
             .field("no_color", &self.no_color)
             .field("plain", &self.plain)
+            .field("verbosity", &self.verbosity)
+            .field("log_file", &self.log_file)
             .finish()
     }
 }
@@ -93,6 +104,8 @@ impl Options {
             .map(|value| value.to_string_lossy().into_owned());
         let mut no_color = std::env::var_os("NO_COLOR").is_some();
         let mut plain = false;
+        let mut verbosity = Verbosity::Off;
+        let mut log_file = None;
         let mut values = arguments.into_iter();
         let _program = values.next();
         while let Some(argument) = values.next() {
@@ -106,6 +119,15 @@ impl Options {
                 }
                 "--no-color" => no_color = true,
                 "--plain" => plain = true,
+                "-v" | "--verbose" => verbosity = verbosity.max(Verbosity::Basic),
+                "-vv" => verbosity = Verbosity::Detailed,
+                "--log-file" => {
+                    log_file = Some(PathBuf::from(
+                        values
+                            .next()
+                            .ok_or_else(|| "--log-file requires a path".to_owned())?,
+                    ));
+                }
                 "--help" | "-h" => return Err(help_text().to_owned()),
                 unknown => return Err(format!("unknown argument: {unknown}\n{}", help_text())),
             }
@@ -123,6 +145,8 @@ impl Options {
             token,
             no_color,
             plain,
+            verbosity,
+            log_file,
         })
     }
 }
@@ -131,20 +155,36 @@ impl Options {
 ///
 /// # Errors
 ///
-/// Returns the message to show the user when the terminal cannot be entered,
-/// restored, or written to. Gateway failures are not errors here: they are
-/// surfaced in the interface as a notice so the session stays usable.
+/// Returns the message to show the user when a requested `--log-file` cannot be
+/// opened, or when the terminal cannot be entered, restored, or written to.
+/// Gateway failures are not errors here: they are surfaced in the interface as a
+/// notice so the session stays usable.
 pub async fn run(options: Options) -> Result<(), String> {
+    let full_screen = !options.plain && terminal::is_interactive();
+    // Resolved and installed here, before any alternate screen exists, so the
+    // subscriber can never be pointed at the terminal being drawn and the notice
+    // can never land inside the interface or survive into the restored shell.
+    // An unusable `--log-file` also stops the run before the terminal is touched.
+    let choice = diagnostics::choose_sink(
+        options.verbosity,
+        options.log_file.as_deref(),
+        full_screen,
+        io::stderr().is_terminal(),
+    );
+    let endpoint = endpoint_label(&options.gateway_url);
+    if let Some(notice) = diagnostics::install(options.verbosity, &choice, &endpoint)? {
+        eprintln!("gta-claw-tui: {notice}");
+    }
     let worker_options = GatewayOptions {
         url: options.gateway_url,
         token: options.token,
     };
-    if options.plain || !terminal::is_interactive() {
-        return run_plain(worker_options).await;
+    if full_screen {
+        return run_interactive(worker_options, options.no_color)
+            .await
+            .map_err(|error| error.to_string());
     }
-    run_interactive(worker_options, options.no_color)
-        .await
-        .map_err(|error| error.to_string())
+    run_plain(worker_options).await
 }
 
 async fn run_plain(options: GatewayOptions) -> Result<(), String> {
@@ -595,6 +635,16 @@ const fn help_text() -> &'static str {
      \x20 --no-color       monochrome rendering. Default: on when NO_COLOR is set\n\
      \x20 --plain          print one snapshot and exit instead of taking over the\n\
      \x20                  terminal. Default: on when stdin or stdout is not a TTY\n\
+     \x20 -v, --verbose    write structured diagnostics to standard error as JSON\n\
+     \x20                  lines. In full-screen mode they are written only when\n\
+     \x20                  standard error is not the terminal being drawn, so\n\
+     \x20                  redirect it (2>run.jsonl), pass --log-file, or add\n\
+     \x20                  --plain to keep them. Default: none\n\
+     \x20 -vv              as --verbose, plus correlation identifiers\n\
+     \x20 --log-file <p>   append diagnostics to <p> instead of standard error.\n\
+     \x20                  Always safe in full-screen mode. The directory must\n\
+     \x20                  already exist; a file that cannot be opened stops the\n\
+     \x20                  run instead of falling back to standard error\n\
      \x20 --help, -h       print this text and exit 0\n\
      \n\
      Environment:\n\
@@ -602,6 +652,8 @@ const fn help_text() -> &'static str {
      \x20 GTA_CLAW_GATEWAY_TOKEN  shared token. There is no token flag, so the\n\
      \x20                         secret never appears in argv. It is never echoed\n\
      \x20                         or printed back\n\
+     \x20 GTA_CLAW_LOG            tracing filter directives, honored when -v or\n\
+     \x20                         -vv installs the shared subscriber\n\
      \x20 NO_COLOR                any value turns off color\n\
      \n\
      Keys: Tab screens  arrows or j/k navigate  Enter open  y/n approve\n\

@@ -4,6 +4,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::future::Future;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -17,6 +18,7 @@ use claw_gateway_client::{
     GatewayClientConfig, GatewayClientError, GatewayCredential, ProtocolFailure, ReconnectPolicy,
     TransportFailure,
 };
+use claw_observability::tracing;
 use claw_platform::NativeSystemProbe;
 use claw_protocol::gateway::{
     AUTHENTICATED_MAX_FRAME_BYTES, ClientId, ClientMode, Codec, ConnectErrorDetailCode,
@@ -33,6 +35,10 @@ use tokio::io::AsyncReadExt as _;
 use tokio::sync::watch;
 use url::{Host, Url};
 use zeroize::Zeroizing;
+
+mod diagnostics;
+
+use diagnostics::{Diagnostics, LOG_FILE_UNUSABLE, Verbosity, bool_field, sanitize};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const MIN_TIMEOUT_MS: u64 = 250;
@@ -153,12 +159,31 @@ async fn dispatch(arguments: Vec<OsString>) -> RenderedResult {
         }
         Ok(Invocation::Help) => RenderedResult::success(format!("{USAGE}\n\n{HELP_DETAIL}\n")),
         Ok(Invocation::Foundation) => run_foundation(arguments),
-        Ok(Invocation::Gateway(options)) => {
-            let interrupt = async { tokio::signal::ctrl_c().await.map_err(|_| ()) };
-            run_gateway(options, interrupt).await
-        }
+        Ok(Invocation::Gateway(options)) => run_gateway_command(options).await,
         Err(failure) => render_parse_failure(failure),
     }
+}
+
+/// Installs diagnostics for one `gateway health` run, then executes it.
+///
+/// A `--log-file` that cannot be opened stops the command here: the destination
+/// is a flag value like any other, so it is rendered through the same summary,
+/// honors `--json`, and the Gateway path never starts.
+async fn run_gateway_command(options: GatewayOptions) -> RenderedResult {
+    let diagnostics = Diagnostics::for_verbosity(options.verbosity);
+    if let Err(failure) = diagnostics.install(options.log_file.as_deref()) {
+        let endpoint = sanitized_origin(&options.endpoint);
+        if let Some(origin) = endpoint.as_deref() {
+            diagnostics.set_endpoint(origin);
+        }
+        return render_diagnostic(
+            &options,
+            &diagnostics,
+            &DiagnosticSummary::failure(endpoint, Duration::ZERO, failure),
+        );
+    }
+    let interrupt = async { tokio::signal::ctrl_c().await.map_err(|_| ()) };
+    run_gateway(options, interrupt, &diagnostics).await
 }
 
 const USAGE: &str = "\
@@ -197,6 +222,18 @@ commands:
                               Default: refused
   --json                      print one schema_version 2 summary object on
                               standard output. Default: human-readable text
+  -v, --verbose               write structured diagnostic records for each
+                              connection stage to standard error as JSON lines.
+                              Standard output is unchanged, and no record ever
+                              carries a secret-named field. Default: none
+  -vv                         as --verbose, plus correlation identifiers and
+                              per-stage bounds
+  --log-file <path>           append those records to <path> instead of standard
+                              error. The directory must already exist; a file
+                              that cannot be opened fails the command with
+                              usage_config rather than falling back to standard
+                              error. Ignored without -v or -vv.
+                              Default: standard error
 
 exit codes:
   0  success                 the health RPC returned a positive typed result
@@ -233,6 +270,8 @@ struct GatewayOptions {
     timeout: Duration,
     allow_insecure_remote_ws: bool,
     json: bool,
+    verbosity: Verbosity,
+    log_file: Option<PathBuf>,
 }
 
 struct ParseFailure {
@@ -271,6 +310,8 @@ fn parse_gateway(arguments: &[OsString]) -> Result<Invocation, ParseFailure> {
     let mut timeout_seen = false;
     let mut allow_insecure_remote_ws = false;
     let mut json = false;
+    let mut verbosity = Verbosity::Off;
+    let mut log_file = None;
     let mut index = 2;
 
     while index < arguments.len() {
@@ -314,6 +355,13 @@ fn parse_gateway(arguments: &[OsString]) -> Result<Invocation, ParseFailure> {
                 allow_insecure_remote_ws = true;
             }
             "--json" if !json => json = true,
+            "-v" | "--verbose" if verbosity == Verbosity::Off => verbosity = Verbosity::Basic,
+            "-vv" if verbosity == Verbosity::Off => verbosity = Verbosity::Detailed,
+            "--log-file" if log_file.is_none() => {
+                index += 1;
+                let value = option_value(arguments, index, "missing log file path")?;
+                log_file = Some(PathBuf::from(value));
+            }
             _ => {
                 return Err(parse_failure(
                     "unknown or repeated gateway option",
@@ -339,6 +387,8 @@ fn parse_gateway(arguments: &[OsString]) -> Result<Invocation, ParseFailure> {
         timeout,
         allow_insecure_remote_ws,
         json,
+        verbosity,
+        log_file,
     }))
 }
 
@@ -579,18 +629,37 @@ const fn safe_protocol_error(error: &ProtocolError) -> &'static str {
 async fn run_gateway(
     options: GatewayOptions,
     interrupt: impl Future<Output = Result<(), ()>>,
+    diagnostics: &Diagnostics,
 ) -> RenderedResult {
     let started = Instant::now();
     let validated = match validate_endpoint(&options.endpoint, options.allow_insecure_remote_ws) {
-        Ok(validated) => validated,
+        Ok(validated) => {
+            diagnostics.set_endpoint(&validated.origin);
+            tracing::debug!(
+                action = "endpoint.resolve",
+                outcome = "success",
+                endpoint = diagnostics.endpoint(),
+                endpoint.scheme = validated.url.scheme(),
+                endpoint.host_class = if is_loopback_host(&validated.url) {
+                    "loopback"
+                } else {
+                    "remote"
+                },
+                transport.tls = bool_field(validated.url.scheme() == "wss"),
+                transport.insecure_remote_ws_allowed = bool_field(options.allow_insecure_remote_ws),
+            );
+            validated
+        }
         Err(failure) => {
+            let origin = sanitized_origin(&options.endpoint);
+            if let Some(origin) = origin.as_deref() {
+                diagnostics.set_endpoint(origin);
+            }
+            record_failure(diagnostics, "endpoint.resolve", "denied", &failure);
             return render_diagnostic(
                 &options,
-                &DiagnosticSummary::failure(
-                    sanitized_origin(&options.endpoint),
-                    started.elapsed(),
-                    failure,
-                ),
+                diagnostics,
+                &DiagnosticSummary::failure(origin, started.elapsed(), failure),
             );
         }
     };
@@ -598,12 +667,31 @@ async fn run_gateway(
     tokio::pin!(interrupt);
     let deadline = tokio::time::sleep(options.timeout);
     tokio::pin!(deadline);
+    tracing::trace!(
+        action = "command.bounds",
+        outcome = "success",
+        endpoint = diagnostics.endpoint(),
+        timeout.command_ms = bounded_millis(options.timeout),
+        output.mode = if options.json { "json" } else { "text" },
+    );
     let credential = tokio::select! {
         credential = read_credential(&options) => match credential {
-            Ok(credential) => credential,
+            Ok(credential) => {
+                // The secret itself is never a field, and never text in a
+                // message: only where it came from is reportable.
+                tracing::debug!(
+                    action = "credential.read",
+                    outcome = "success",
+                    endpoint = diagnostics.endpoint(),
+                    auth.source = secret_source_label(options.secret_source),
+                );
+                credential
+            }
             Err(failure) => {
+                record_failure(diagnostics, "credential.read", "denied", &failure);
                 return render_diagnostic(
                     &options,
+                    diagnostics,
                     &DiagnosticSummary::failure(endpoint, started.elapsed(), failure),
                 );
             }
@@ -619,30 +707,41 @@ async fn run_gateway(
                     "interrupt handler failed",
                 ),
             };
+            record_failure(diagnostics, "credential.read", "failure", &failure);
             return render_diagnostic(
                 &options,
+                diagnostics,
                 &DiagnosticSummary::failure(endpoint, started.elapsed(), failure),
             );
         }
         () = &mut deadline => {
+            let failure = DiagnosticFailure::timeout("timeout", "Gateway diagnostic timed out");
+            record_failure(diagnostics, "credential.read", "failure", &failure);
             return render_diagnostic(
                 &options,
-                &DiagnosticSummary::failure(
-                    endpoint,
-                    started.elapsed(),
-                    DiagnosticFailure::timeout(
-                        "timeout",
-                        "Gateway diagnostic timed out",
-                    ),
-                ),
+                diagnostics,
+                &DiagnosticSummary::failure(endpoint, started.elapsed(), failure),
             );
         }
     };
     let identity = match generate_ephemeral_identity() {
-        Ok(identity) => Arc::new(identity),
+        Ok(identity) => {
+            // No part of the generated key material is reportable, so only the
+            // mode and the fact that nothing was written to disk are recorded.
+            tracing::debug!(
+                action = "identity.generate",
+                outcome = "success",
+                endpoint = diagnostics.endpoint(),
+                identity.mode = "ephemeral",
+                identity.persisted = bool_field(false),
+            );
+            Arc::new(identity)
+        }
         Err(failure) => {
+            record_failure(diagnostics, "identity.generate", "failure", &failure);
             return render_diagnostic(
                 &options,
+                diagnostics,
                 &DiagnosticSummary::failure(endpoint, started.elapsed(), failure),
             );
         }
@@ -672,16 +771,29 @@ async fn run_gateway(
     };
 
     let (client, _events) = match GatewayClient::start(config) {
-        Ok(client) => client,
+        Ok(client) => {
+            tracing::debug!(
+                action = "client.start",
+                outcome = "success",
+                endpoint = diagnostics.endpoint(),
+                reconnect.policy = "never",
+                protocol.requested = 4,
+                client.mode = "probe",
+            );
+            client
+        }
         Err(error) => {
+            let failure = map_client_error(&error);
+            record_failure(diagnostics, "client.start", "failure", &failure);
             return render_diagnostic(
                 &options,
-                &DiagnosticSummary::failure(endpoint, started.elapsed(), map_client_error(&error)),
+                diagnostics,
+                &DiagnosticSummary::failure(endpoint, started.elapsed(), failure),
             );
         }
     };
 
-    let attempt = execute_health(&client);
+    let attempt = execute_health(&client, diagnostics);
     tokio::pin!(attempt);
     let (mut attempt, control_finished) = tokio::select! {
         result = &mut attempt => (result, false),
@@ -708,14 +820,39 @@ async fn run_gateway(
         // The command result is already fixed by timeout, Ctrl-C, or a signal
         // handler failure. Give the client a small independent cleanup window,
         // but never let cleanup replace that primary result or hold process exit.
-        let _ = tokio::time::timeout(CANCELLED_SHUTDOWN_GRACE, client.shutdown()).await;
+        // The outcome is observed only; `attempt.failure` is deliberately untouched.
+        let cleanup = tokio::time::timeout(CANCELLED_SHUTDOWN_GRACE, client.shutdown()).await;
+        tracing::debug!(
+            action = "client.shutdown",
+            outcome = match cleanup {
+                Ok(Ok(())) => "cleanup",
+                Ok(Err(_)) => "cleanup_error",
+                Err(_) => "cleanup_timeout",
+            },
+            endpoint = diagnostics.endpoint(),
+        );
     } else {
         let shutdown = client.shutdown();
         tokio::pin!(shutdown);
         tokio::select! {
             result = &mut shutdown => {
-                if let Err(error) = result {
-                    attempt.record_shutdown_error(&error);
+                match result {
+                    Ok(()) => tracing::debug!(
+                        action = "client.shutdown",
+                        outcome = "success",
+                        endpoint = diagnostics.endpoint(),
+                    ),
+                    Err(error) => {
+                        // Emit first, then defer to `record_shutdown_error`, which owns
+                        // whether this failure may replace an earlier one.
+                        record_failure(
+                            diagnostics,
+                            "client.shutdown",
+                            "failure",
+                            &map_client_error(&error),
+                        );
+                        attempt.record_shutdown_error(&error);
+                    }
                 }
             }
             signal = &mut interrupt => {
@@ -739,17 +876,101 @@ async fn run_gateway(
         }
     }
     let summary = attempt.into_summary(endpoint, started.elapsed());
-    render_diagnostic(&options, &summary)
+    render_diagnostic(&options, diagnostics, &summary)
 }
 
-async fn execute_health(client: &GatewayClient) -> DiagnosticAttempt {
+const fn secret_source_label(source: SecretSourceKind) -> &'static str {
+    match source {
+        SecretSourceKind::None => "none",
+        SecretSourceKind::Stdin => "stdin",
+        SecretSourceKind::UnsupportedFile => "unsupported_file",
+    }
+}
+
+/// Records one failed stage using the same stable status the summary reports.
+///
+/// The status and category are the diagnostic's existing typed vocabulary, so a
+/// diagnostic record and the rendered verdict can never disagree about where the
+/// run stopped. None of these values is peer text, so none needs sanitizing.
+fn record_failure(
+    diagnostics: &Diagnostics,
+    action: &'static str,
+    outcome: &'static str,
+    failure: &DiagnosticFailure,
+) {
+    tracing::debug!(
+        action = action,
+        outcome = outcome,
+        endpoint = diagnostics.endpoint(),
+        failure.status = failure.status,
+        failure.category = failure.category.as_str(),
+        failure.exit_code = failure.category.code(),
+    );
+}
+
+async fn execute_health(client: &GatewayClient, diagnostics: &Diagnostics) -> DiagnosticAttempt {
     let (epoch, info) = match client.wait_ready().await {
-        Ok(ready) => match SafeConnectionInfo::try_from(ready.info) {
-            Ok(info) => (ready.epoch, info),
-            Err(failure) => return DiagnosticAttempt::failure(failure),
-        },
+        Ok(ready) => {
+            // Cloning the peer's claims is only worth it when something will
+            // read them: the default path renders the verdict, not the grant.
+            let (granted_role, granted_scopes) = if diagnostics.is_enabled() {
+                (
+                    sanitize(&ready.info.role),
+                    sanitize(&ready.info.scopes.join(",")),
+                )
+            } else {
+                (String::new(), String::new())
+            };
+            let epoch = ready.epoch;
+            tracing::debug!(
+                action = "connection.ready",
+                outcome = "success",
+                endpoint = diagnostics.endpoint(),
+                protocol.negotiated = ready.info.protocol.get(),
+            );
+            tracing::trace!(
+                action = "connection.epoch",
+                outcome = "success",
+                endpoint = diagnostics.endpoint(),
+                connection.epoch = epoch.get(),
+                connection.max_payload_bytes = ready.info.max_payload_bytes,
+            );
+            match SafeConnectionInfo::try_from(ready.info) {
+                Ok(info) => {
+                    tracing::debug!(
+                        action = "authorization.grant",
+                        outcome = "success",
+                        endpoint = diagnostics.endpoint(),
+                        role.granted = sanitize(&info.role),
+                        scopes.granted = sanitize(&info.scopes.join(",")),
+                        scopes.requested = "operator.read",
+                        expectation.mode = "exact_requested",
+                    );
+                    (epoch, info)
+                }
+                Err(failure) => {
+                    // The granted claims are peer text, so they are sanitized and
+                    // bounded on the way out. They are worth showing: this is the
+                    // one failure whose cause is a mismatch the user cannot see
+                    // from the rendered verdict alone.
+                    tracing::debug!(
+                        action = "authorization.grant",
+                        outcome = "denied",
+                        endpoint = diagnostics.endpoint(),
+                        role.granted = granted_role,
+                        scopes.granted = granted_scopes,
+                        role.expected = "operator",
+                        scopes.requested = "operator.read",
+                        failure.status = failure.status,
+                    );
+                    return DiagnosticAttempt::failure(failure);
+                }
+            }
+        }
         Err(error) => {
-            return DiagnosticAttempt::failure(classify_request_error(client, &error).await);
+            let failure = classify_request_error(client, &error).await;
+            record_failure(diagnostics, "connection.ready", "failure", &failure);
+            return DiagnosticAttempt::failure(failure);
         }
     };
     let request_id = RequestId::new("gta-claw-cli-health-1", AUTHENTICATED_MAX_FRAME_BYTES)
@@ -757,11 +978,28 @@ async fn execute_health(client: &GatewayClient) -> DiagnosticAttempt {
     let method = GatewayMethodName::Core(
         resolve_core_method("health").expect("P02a registry contains health"),
     );
+    tracing::trace!(
+        action = "rpc.request",
+        outcome = "success",
+        endpoint = diagnostics.endpoint(),
+        rpc.method = "health",
+        rpc.request_id = request_id.as_str(),
+    );
     let response = match request_health(client, epoch, request_id, method).await {
         Ok(response) => response,
-        Err(failure) => return DiagnosticAttempt::with_info(failure, info),
+        Err(failure) => {
+            record_failure(diagnostics, "rpc.response", "failure", &failure);
+            return DiagnosticAttempt::with_info(failure, info);
+        }
     };
     if !response.ok() {
+        tracing::debug!(
+            action = "rpc.response",
+            outcome = "failure",
+            endpoint = diagnostics.endpoint(),
+            rpc.method = "health",
+            rpc.ok = bool_field(false),
+        );
         return DiagnosticAttempt {
             info: Some(info),
             health: Some(HealthSummary {
@@ -773,28 +1011,31 @@ async fn execute_health(client: &GatewayClient) -> DiagnosticAttempt {
         };
     }
     let Some(payload) = response.payload().value() else {
-        return DiagnosticAttempt::with_info(
-            DiagnosticFailure::protocol("malformed_health", "Gateway health payload is missing"),
-            info,
-        );
+        let failure =
+            DiagnosticFailure::protocol("malformed_health", "Gateway health payload is missing");
+        record_failure(diagnostics, "rpc.response", "failure", &failure);
+        return DiagnosticAttempt::with_info(failure, info);
     };
-    let payload: HealthPayload = match Codec::authenticated().decode_opaque(payload) {
-        Ok(payload) => payload,
-        Err(_) => {
-            return DiagnosticAttempt::with_info(
-                DiagnosticFailure::protocol(
-                    "malformed_health",
-                    "Gateway health payload is malformed",
-                ),
-                info,
-            );
-        }
+    let Ok(payload) = Codec::authenticated().decode_opaque::<HealthPayload>(payload) else {
+        let failure =
+            DiagnosticFailure::protocol("malformed_health", "Gateway health payload is malformed");
+        record_failure(diagnostics, "rpc.response", "failure", &failure);
+        return DiagnosticAttempt::with_info(failure, info);
     };
     let health = HealthSummary {
         ok: payload.ok,
         timestamp_ms: Some(payload.ts),
         duration_ms: Some(payload.duration_ms),
     };
+    tracing::debug!(
+        action = "rpc.response",
+        outcome = if payload.ok { "success" } else { "failure" },
+        endpoint = diagnostics.endpoint(),
+        rpc.method = "health",
+        rpc.ok = bool_field(true),
+        health.ok = bool_field(payload.ok),
+        health.duration_ms = payload.duration_ms,
+    );
     if !payload.ok {
         return DiagnosticAttempt {
             info: Some(info),
@@ -1413,8 +1654,25 @@ fn render_parse_failure(failure: ParseFailure) -> RenderedResult {
     }
 }
 
-fn render_diagnostic(options: &GatewayOptions, summary: &DiagnosticSummary) -> RenderedResult {
+fn render_diagnostic(
+    options: &GatewayOptions,
+    diagnostics: &Diagnostics,
+    summary: &DiagnosticSummary,
+) -> RenderedResult {
     debug_assert!(options.ephemeral_device);
+    tracing::debug!(
+        action = "diagnostic.complete",
+        outcome = if summary.exit_code == 0 {
+            "success"
+        } else {
+            "failure"
+        },
+        endpoint = diagnostics.endpoint(),
+        failure.status = summary.status,
+        failure.category = summary.category,
+        failure.exit_code = summary.exit_code,
+        elapsed_ms = summary.elapsed_ms,
+    );
     if options.json {
         render_json(summary)
     } else if summary.exit_code == 0 {
@@ -1490,6 +1748,10 @@ fn next_step(status: &str) -> &'static str {
              standard input"
         }
         "invalid_input" => "check the flag spelling above; each option may be given only once",
+        LOG_FILE_UNUSABLE => {
+            "point --log-file at a writable path inside a directory that already exists; the file \
+             is appended to, and no directory is ever created for it"
+        }
         "transport_failure" => {
             "nothing answered the Gateway handshake at that endpoint. Check that a Gateway is \
              running and reachable there, and that the scheme and port are right"

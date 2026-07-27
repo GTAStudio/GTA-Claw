@@ -7,6 +7,7 @@ use claw_gateway_client::{
     AuthorizationExpectation, ClientMetadata, ClientTimeouts, ConnectionState, GatewayClient,
     GatewayClientConfig, GatewayCredential, ReconnectPolicy,
 };
+use claw_observability::tracing;
 use claw_protocol::gateway::{
     AUTHENTICATED_MAX_FRAME_BYTES, ClientId, ClientMode, Codec, GatewayMethodName, Name, RequestId,
     resolve_core_method,
@@ -21,6 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use url::Url;
 
+use crate::diagnostics::{bool_field, sanitize};
 use crate::model::{Prompt, RunState, SessionSummary, ToolActivity, TranscriptEntry};
 
 const MAX_SESSIONS: usize = 1_000;
@@ -30,6 +32,9 @@ const MAX_PREVIEW_LINES: usize = 2_000;
 const MAX_EVENT_TEXT_BYTES: usize = 16 * 1024;
 const MAX_LABEL_BYTES: usize = 1_024;
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+
+/// Scopes this client asks the Gateway to grant, in request order.
+const REQUESTED_SCOPES: &str = "operator.read,operator.write,operator.approvals";
 
 /// Runtime configuration for the Gateway worker.
 #[derive(Clone)]
@@ -126,6 +131,10 @@ pub enum WorkerEvent {
 }
 
 /// Starts Gateway work on the active Tokio runtime over bounded channels.
+///
+/// Whether the connection path is reported is decided by the process-wide
+/// subscriber [`crate::diagnostics::install`] sets up, so this signature stays
+/// free of a diagnostic channel and callers cannot route records anywhere else.
 #[must_use]
 pub fn spawn_gateway_worker(options: GatewayOptions) -> GatewayWorker {
     let (command_sender, command_receiver) = mpsc::channel(32);
@@ -187,6 +196,20 @@ async fn run_worker(
     mut shutdown: oneshot::Receiver<()>,
     endpoint: String,
 ) {
+    tracing::debug!(
+        action = "endpoint.resolve",
+        outcome = "success",
+        endpoint = sanitize(&endpoint),
+        endpoint.scheme = options.url.scheme(),
+        transport.tls = bool_field(options.url.scheme() == "wss"),
+        // Only where the token came from is reportable; the token itself never
+        // leaves `GatewayOptions`.
+        auth.source = if options.token.is_some() {
+            "environment"
+        } else {
+            "none"
+        },
+    );
     loop {
         if sender
             .send(WorkerEvent::Connection(
@@ -197,7 +220,15 @@ async fn run_worker(
         {
             return;
         }
-        match run_connection(options.clone(), &mut commands, &sender, &mut shutdown).await {
+        match run_connection(
+            options.clone(),
+            &mut commands,
+            &sender,
+            &mut shutdown,
+            &endpoint,
+        )
+        .await
+        {
             Ok(ConnectionExit::Shutdown) => return,
             Ok(ConnectionExit::Disconnected) => {
                 if !report_unavailable(&sender, &endpoint, "connection closed by the Gateway").await
@@ -268,8 +299,30 @@ async fn run_connection(
     commands: &mut mpsc::Receiver<UiCommand>,
     sender: &mpsc::Sender<WorkerEvent>,
     shutdown: &mut oneshot::Receiver<()>,
+    endpoint: &str,
 ) -> Result<ConnectionExit, WorkerError> {
-    let identity = Arc::new(generate_identity()?);
+    let identity = match generate_identity() {
+        Ok(identity) => {
+            // No part of the generated key material is reportable, so only the
+            // mode is recorded.
+            tracing::debug!(
+                action = "identity.generate",
+                outcome = "success",
+                endpoint = sanitize(endpoint),
+                identity.mode = "ephemeral",
+            );
+            Arc::new(identity)
+        }
+        Err(error) => {
+            tracing::debug!(
+                action = "identity.generate",
+                outcome = "failure",
+                endpoint = sanitize(endpoint),
+                failure.reason = sanitize(&error.to_string()),
+            );
+            return Err(error);
+        }
+    };
     let mut config = GatewayClientConfig::new(options.url, identity);
     config.credential = options.token.map_or(GatewayCredential::None, |token| {
         GatewayCredential::Token(SecretString::from(token))
@@ -304,8 +357,29 @@ async fn run_connection(
         shutdown: Duration::from_secs(3),
     };
 
-    let (client, mut gateway_events) =
-        GatewayClient::start(config).map_err(|error| WorkerError(error.to_string()))?;
+    let (client, mut gateway_events) = match GatewayClient::start(config) {
+        Ok(started) => {
+            tracing::debug!(
+                action = "client.start",
+                outcome = "success",
+                endpoint = sanitize(endpoint),
+                client.mode = "ui",
+                scopes.requested = REQUESTED_SCOPES,
+                expectation.mode = "exact_requested",
+            );
+            started
+        }
+        Err(error) => {
+            let error = WorkerError(error.to_string());
+            tracing::debug!(
+                action = "client.start",
+                outcome = "failure",
+                endpoint = sanitize(endpoint),
+                failure.reason = sanitize(&error.to_string()),
+            );
+            return Err(error);
+        }
+    };
     let ready_result = tokio::select! {
         biased;
         _ = &mut *shutdown => {
@@ -313,6 +387,7 @@ async fn run_connection(
                 .shutdown()
                 .await
                 .map_err(|error| WorkerError(error.to_string()));
+            record_client_shutdown(endpoint, &teardown);
             return connection_exit_after_teardown(ConnectionExit::Shutdown, teardown);
         }
         ready = client.wait_ready() => ready,
@@ -321,10 +396,39 @@ async fn run_connection(
         Ok(ready) => ready,
         Err(error) => {
             let state = connection_label(&client.state());
+            tracing::debug!(
+                action = "connection.ready",
+                outcome = "failure",
+                endpoint = sanitize(endpoint),
+                connection.state = state,
+                failure.reason = sanitize(&error.to_string()),
+            );
             let _ = client.shutdown().await;
             return Err(WorkerError(format!("{error} while {state}")));
         }
     };
+    tracing::debug!(
+        action = "connection.ready",
+        outcome = "success",
+        endpoint = sanitize(endpoint),
+        protocol.negotiated = ready.info.protocol.get(),
+    );
+    tracing::debug!(
+        action = "authorization.grant",
+        outcome = "success",
+        endpoint = sanitize(endpoint),
+        role.granted = sanitize(&ready.info.role),
+        scopes.granted = sanitize(&ready.info.scopes.join(",")),
+        scopes.requested = REQUESTED_SCOPES,
+        expectation.mode = "exact_requested",
+    );
+    tracing::trace!(
+        action = "connection.epoch",
+        outcome = "success",
+        endpoint = sanitize(endpoint),
+        connection.epoch = ready.epoch.get(),
+        connection.max_payload_bytes = ready.info.max_payload_bytes,
+    );
     if sender
         .send(WorkerEvent::Connection(format!(
             "Gateway: ready (protocol {}, epoch {})",
@@ -339,7 +443,7 @@ async fn run_connection(
     }
 
     let mut request_sequence = 1_u64;
-    if let Err(error) = send_sessions(&client, sender, &mut request_sequence).await {
+    if let Err(error) = send_sessions(&client, sender, &mut request_sequence, endpoint).await {
         let _ = client.shutdown().await;
         return Err(error);
     }
@@ -359,6 +463,7 @@ async fn run_connection(
                     sender,
                     &mut request_sequence,
                     command,
+                    endpoint,
                 ).await {
                     let _ = sender.send(WorkerEvent::Notice(error.to_string())).await;
                 }
@@ -380,7 +485,28 @@ async fn run_connection(
         .shutdown()
         .await
         .map_err(|error| WorkerError(error.to_string()));
+    record_client_shutdown(endpoint, &teardown);
     connection_exit_after_teardown(outcome, teardown)
+}
+
+/// Reports one graceful client teardown without taking part in it.
+///
+/// The teardown result is borrowed, so which error wins stays a decision of
+/// [`connection_exit_after_teardown`] alone.
+fn record_client_shutdown(endpoint: &str, teardown: &Result<(), WorkerError>) {
+    match teardown {
+        Ok(()) => tracing::debug!(
+            action = "client.shutdown",
+            outcome = "success",
+            endpoint = sanitize(endpoint),
+        ),
+        Err(error) => tracing::debug!(
+            action = "client.shutdown",
+            outcome = "failure",
+            endpoint = sanitize(endpoint),
+            failure.reason = sanitize(&error.to_string()),
+        ),
+    }
 }
 
 fn connection_exit_after_teardown(
@@ -399,13 +525,21 @@ async fn handle_command(
     sender: &mpsc::Sender<WorkerEvent>,
     sequence: &mut u64,
     command: UiCommand,
+    endpoint: &str,
 ) -> Result<(), WorkerError> {
     match command {
-        UiCommand::Refresh => send_sessions(client, sender, sequence).await,
+        UiCommand::Refresh => send_sessions(client, sender, sequence, endpoint).await,
         UiCommand::SelectSession(session_id) => {
             let params = json!({"sessionId": session_id});
-            let _ = request_json(client, sequence, "sessions.subscribe", &params).await?;
-            let _ = request_json(client, sequence, "sessions.messages.subscribe", &params).await?;
+            let _ = request_json(client, sequence, "sessions.subscribe", &params, endpoint).await?;
+            let _ = request_json(
+                client,
+                sequence,
+                "sessions.messages.subscribe",
+                &params,
+                endpoint,
+            )
+            .await?;
             Ok(())
         }
         UiCommand::LoadDiff(session_id) => {
@@ -414,6 +548,7 @@ async fn handle_command(
                 sequence,
                 "sessions.diff",
                 &json!({"sessionId": session_id}),
+                endpoint,
             )
             .await?;
             let lines = value
@@ -435,6 +570,7 @@ async fn handle_command(
                 sequence,
                 "artifacts.list",
                 &json!({"sessionId": session_id}),
+                endpoint,
             )
             .await?;
             let entries = value
@@ -470,6 +606,7 @@ async fn handle_command(
                     sequence,
                     "artifacts.get",
                     &json!({"sessionId": session_id, "artifactId": artifact_id}),
+                    endpoint,
                 )
                 .await?;
                 sender
@@ -488,6 +625,7 @@ async fn handle_command(
                     "id": id,
                     "decision": if approved { "approve" } else { "deny" }
                 }),
+                endpoint,
             )
             .await?;
             sender
@@ -513,6 +651,7 @@ async fn handle_command(
                     "questionId": question_id,
                     "message": text
                 }),
+                endpoint,
             )
             .await?;
             Ok(())
@@ -525,8 +664,9 @@ async fn send_sessions(
     client: &GatewayClient,
     sender: &mpsc::Sender<WorkerEvent>,
     sequence: &mut u64,
+    endpoint: &str,
 ) -> Result<(), WorkerError> {
-    let value = request_json(client, sequence, "sessions.list", &json!({})).await?;
+    let value = request_json(client, sequence, "sessions.list", &json!({}), endpoint).await?;
     sender
         .send(WorkerEvent::Sessions(parse_sessions(&value)))
         .await
@@ -538,25 +678,58 @@ async fn request_json(
     sequence: &mut u64,
     method: &'static str,
     params: &Value,
+    endpoint: &str,
 ) -> Result<Value, WorkerError> {
     let core = resolve_core_method(method)
         .ok_or_else(|| WorkerError(format!("frozen Gateway method missing: {method}")))?;
-    let request_id = RequestId::new(
-        format!("gta-claw-tui-{}", *sequence),
-        AUTHENTICATED_MAX_FRAME_BYTES,
-    )
-    .map_err(|error| WorkerError(error.to_string()))?;
+    let correlation = format!("gta-claw-tui-{}", *sequence);
+    let request_id = RequestId::new(correlation.clone(), AUTHENTICATED_MAX_FRAME_BYTES)
+        .map_err(|error| WorkerError(error.to_string()))?;
     *sequence = sequence.saturating_add(1);
-    let response = client
+    tracing::trace!(
+        action = "rpc.request",
+        outcome = "success",
+        endpoint = sanitize(endpoint),
+        rpc.method = method,
+        rpc.request_id = correlation.as_str(),
+    );
+    let response = match client
         .request(request_id, GatewayMethodName::Core(core), params)
         .await
-        .map_err(|error| WorkerError(error.to_string()))?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let error = WorkerError(error.to_string());
+            tracing::debug!(
+                action = "rpc.response",
+                outcome = "failure",
+                endpoint = sanitize(endpoint),
+                rpc.method = method,
+                failure.reason = sanitize(&error.to_string()),
+            );
+            return Err(error);
+        }
+    };
     if !response.ok() {
         let failure = response
             .error()
             .map_or("unknown", |error| error.code.as_str());
+        tracing::debug!(
+            action = "rpc.response",
+            outcome = "failure",
+            endpoint = sanitize(endpoint),
+            rpc.method = method,
+            rpc.error_code = sanitize(failure),
+        );
         return Err(WorkerError(format!("{method} failed ({failure})")));
     }
+    tracing::debug!(
+        action = "rpc.response",
+        outcome = "success",
+        endpoint = sanitize(endpoint),
+        rpc.method = method,
+        rpc.ok = bool_field(true),
+    );
     let Some(payload) = response.payload().value() else {
         return Ok(Value::Null);
     };

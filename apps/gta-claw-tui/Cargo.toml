@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 claw-gateway-client.workspace = true
+claw-observability.workspace = true
 claw-protocol.workspace = true
 claw-security.workspace = true
 crossterm = "=0.29.0"

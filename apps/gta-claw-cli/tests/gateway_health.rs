@@ -9,6 +9,8 @@
 mod support;
 
 use std::ffi::OsString;
+use std::fs;
+use std::path::PathBuf;
 use std::process::{Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -335,6 +337,7 @@ async fn run_cli(arguments: Vec<OsString>, stdin: Option<&str>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_gta-claw-cli"));
     command
         .args(arguments)
+        .env_remove("GTA_CLAW_LOG")
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -960,4 +963,404 @@ async fn sigint_cancels_and_joins_the_gateway_task() {
     assert_eq!(summary["status"], "cancelled");
     gateway.shutdown().await;
     assert_eq!(request_count.load(Ordering::SeqCst), 1);
+}
+
+/// Runs `gateway health` against one healthy Gateway once per argument set.
+async fn run_healthy(runs: &[&[&str]]) -> Vec<Output> {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let gateway = spawn_gateway(
+        GatewayBehavior::Healthy {
+            server_version: "diag-v1",
+            expected_token: Some(TOKEN),
+        },
+        Arc::clone(&request_count),
+    )
+    .await;
+    let mut outputs = Vec::with_capacity(runs.len());
+    for extra in runs {
+        let mut arguments = gateway_arguments(gateway.url.as_str());
+        arguments.extend(extra.iter().copied().map(OsString::from));
+        let output = run_cli(arguments, Some(&format!("{TOKEN}\n"))).await;
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        outputs.push(output);
+    }
+    gateway.shutdown().await;
+    outputs
+}
+
+/// Parses the summary without the "stderr is empty" precondition `parse_json` enforces.
+fn summary_of(output: &Output) -> Value {
+    serde_json::from_slice(&output.stdout).expect("one JSON summary")
+}
+
+/// Replaces the one non-deterministic field so two runs can be compared byte for byte.
+fn normalize(output: &Output) -> Value {
+    let mut summary = summary_of(output);
+    summary["elapsed_ms"] = json!(0);
+    summary
+}
+
+/// Parses the `claw-observability` JSON records the subscriber writes.
+///
+/// The shape is the shared layer's, not this binary's: `level`, `target`, and a
+/// redacted `fields` map. Asserting on it here proves the diagnostics really do
+/// travel through the installed subscriber rather than a private writer.
+fn diagnostic_lines(output: &Output) -> Vec<Value> {
+    records(&String::from_utf8(output.stderr.clone()).expect("diagnostics are UTF-8"))
+}
+
+/// Parses the JSON records the installed subscriber wrote, from either sink.
+fn records(text: &str) -> Vec<Value> {
+    text.lines()
+        .map(|line| {
+            let record: Value = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("diagnostics are JSON lines: {error}: {line}"));
+            assert!(
+                record["fields"]["action"].is_string(),
+                "every diagnostic line is one of this binary's events: {line}"
+            );
+            assert!(
+                record["target"]
+                    .as_str()
+                    .expect("target")
+                    .starts_with("gta_claw_cli"),
+                "no dependency may share this stream: {line}"
+            );
+            record
+        })
+        .collect()
+}
+
+/// A path under Cargo's per-target temporary directory, cleared of any leftover.
+///
+/// The file is opened in append mode, so a stale run must not be able to add
+/// records to the ones this test asserts on.
+fn log_path(name: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = fs::remove_file(&path);
+    path
+}
+
+fn fields(record: &Value) -> &Value {
+    &record["fields"]
+}
+
+fn find<'a>(records: &'a [Value], action: &str) -> Option<&'a Value> {
+    records
+        .iter()
+        .find(|record| record["fields"]["action"] == action)
+}
+
+fn actions(records: &[Value]) -> Vec<String> {
+    records
+        .iter()
+        .map(|record| {
+            record["fields"]["action"]
+                .as_str()
+                .expect("action")
+                .to_owned()
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn verbose_diagnostics_are_additive_and_leave_the_json_contract_untouched() {
+    let outputs = run_healthy(&[&[], &["--verbose"]]).await;
+    let (quiet, verbose) = (&outputs[0], &outputs[1]);
+    assert!(
+        quiet.stderr.is_empty(),
+        "the default run must stay silent: {}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    assert_eq!(
+        normalize(quiet),
+        normalize(verbose),
+        "verbosity must not alter the schema-version-2 object"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&quiet.stdout)
+            .split("\"elapsed_ms\"")
+            .next(),
+        String::from_utf8_lossy(&verbose.stdout)
+            .split("\"elapsed_ms\"")
+            .next(),
+        "key order must be byte-identical up to the elapsed measurement"
+    );
+
+    let records = diagnostic_lines(verbose);
+    let observed = actions(&records);
+    for expected in [
+        "endpoint.resolve",
+        "credential.read",
+        "identity.generate",
+        "client.start",
+        "connection.ready",
+        "authorization.grant",
+        "rpc.response",
+        "client.shutdown",
+        "diagnostic.complete",
+    ] {
+        assert!(
+            observed.iter().any(|action| action == expected),
+            "missing {expected} in {observed:?}"
+        );
+    }
+    assert!(
+        !observed.iter().any(|action| action == "rpc.request"),
+        "correlation detail belongs to -vv only: {observed:?}"
+    );
+    for record in &records {
+        assert_eq!(record["level"], "DEBUG", "stage events are the -v level");
+        if fields(record)["action"] != "telemetry.install" {
+            assert_eq!(
+                fields(record)["endpoint"],
+                summary_of(verbose)["endpoint"],
+                "every event after resolution names the endpoint the verdict names"
+            );
+        }
+        for (key, value) in fields(record).as_object().expect("field map") {
+            // Nothing here is a secret, so a redacted value means a field was
+            // named badly and silently lost its content.
+            assert_ne!(
+                value, "[REDACTED]",
+                "{key} is redacted by its own name; rename it"
+            );
+        }
+    }
+    let ready = find(&records, "connection.ready").expect("connection.ready");
+    assert_eq!(fields(ready)["protocol.negotiated"], 4);
+    let grant = find(&records, "authorization.grant").expect("authorization.grant");
+    assert_eq!(fields(grant)["outcome"], "success");
+    assert_eq!(fields(grant)["role.granted"], "operator");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn diagnostics_never_carry_the_token_and_detail_is_opt_in() {
+    let outputs = run_healthy(&[&["-vv"]]).await;
+    let verbose = &outputs[0];
+    let stderr = String::from_utf8(verbose.stderr.clone()).expect("diagnostics are UTF-8");
+    assert!(
+        !stderr.contains(TOKEN),
+        "the stdin token must never reach the diagnostic stream"
+    );
+    assert!(
+        !stderr.contains(TOKEN_WRAPPED),
+        "no substring form of the token may appear either"
+    );
+    let records = diagnostic_lines(verbose);
+    let observed = actions(&records);
+    for expected in ["rpc.request", "connection.epoch", "command.bounds"] {
+        assert!(
+            observed.iter().any(|action| action == expected),
+            "missing {expected} in {observed:?}"
+        );
+    }
+    let install = find(&records, "telemetry.install").expect("telemetry.install");
+    assert_eq!(
+        fields(install)["telemetry.default_filter"],
+        "gta_claw_cli=trace",
+        "a bare level would put bridged dependency `log` records on this stream"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record["level"] == "TRACE" && record["level"] != "DEBUG"),
+        "-vv opens the trace level: {observed:?}"
+    );
+    let credential = find(&records, "credential.read").expect("credential.read");
+    assert_eq!(fields(credential)["auth.source"], "stdin");
+    assert!(
+        fields(credential)
+            .as_object()
+            .expect("field map")
+            .values()
+            .all(|value| value != TOKEN),
+        "no field may carry the secret verbatim"
+    );
+    assert!(
+        fields(credential)["message"].as_str().unwrap_or_default() != TOKEN,
+        "message text bypasses redaction, so it must never carry the secret"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&verbose.stdout)
+            .matches('\n')
+            .count(),
+        1,
+        "diagnostics must never be written to stdout"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_hello_names_the_stage_that_failed() {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let gateway = spawn_gateway(
+        GatewayBehavior::HelloClaims {
+            role: "node",
+            scopes: &["operator.read"],
+        },
+        Arc::clone(&request_count),
+    )
+    .await;
+    let mut arguments = gateway_arguments(gateway.url.as_str());
+    arguments.push(OsString::from("--verbose"));
+    let output = run_cli(arguments, Some(&format!("{TOKEN}\n"))).await;
+    gateway.shutdown().await;
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(request_count.load(Ordering::SeqCst), 0);
+
+    let records = diagnostic_lines(&output);
+    let observed = actions(&records);
+    assert!(
+        !observed.iter().any(|action| action == "rpc.response"),
+        "the RPC never ran, so it must not be reported: {observed:?}"
+    );
+    let ready = find(&records, "connection.ready")
+        .unwrap_or_else(|| panic!("connection.ready in {observed:?}"));
+    assert_eq!(
+        fields(ready)["outcome"],
+        "failure",
+        "the stage that failed must say so"
+    );
+    assert_eq!(fields(ready)["failure.category"], "protocol");
+    assert_eq!(fields(ready)["failure.exit_code"], 5);
+    let complete = find(&records, "diagnostic.complete").expect("diagnostic.complete");
+    assert_eq!(fields(complete)["failure.category"], "protocol");
+    assert_eq!(fields(complete)["failure.exit_code"], 5);
+    assert_eq!(
+        fields(complete)["failure.status"],
+        summary_of(&output)["status"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_log_file_takes_every_record_and_leaves_standard_error_clean() {
+    let path = log_path("cli-diagnostics.jsonl");
+    let flag = path.to_str().expect("UTF-8 path").to_owned();
+    let outputs = run_healthy(&[&[], &["--verbose"], &["--verbose", "--log-file", &flag]]).await;
+    let (quiet, to_stderr, to_file) = (&outputs[0], &outputs[1], &outputs[2]);
+
+    // The default is unchanged: without the flag the records are still on
+    // standard error, and the flag is the only thing that moves them.
+    let on_stderr = diagnostic_lines(to_stderr);
+    assert!(
+        !on_stderr.is_empty(),
+        "-v alone still writes to standard error"
+    );
+    assert!(
+        to_file.stderr.is_empty(),
+        "the file is the destination, so standard error stays a clean stream: {}",
+        String::from_utf8_lossy(&to_file.stderr)
+    );
+    assert_eq!(
+        normalize(quiet),
+        normalize(to_file),
+        "a destination must not alter the schema-version-2 object"
+    );
+
+    let text = fs::read_to_string(&path).expect("the requested log file was written");
+    let written = records(&text);
+    assert_eq!(
+        actions(&written),
+        actions(&on_stderr),
+        "the same records, only somewhere else"
+    );
+    let install = find(&written, "telemetry.install").expect("telemetry.install");
+    assert_eq!(
+        fields(install)["telemetry.output"],
+        Value::from(path.display().to_string()),
+        "the installed destination is reported as the file, not stderr"
+    );
+    assert!(
+        !text.contains(TOKEN),
+        "the stdin token must never reach the diagnostic file either"
+    );
+    fs::remove_file(&path).expect("remove the log file");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unopenable_log_file_fails_the_command_without_falling_back_to_stderr() {
+    let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no-such-cli-directory");
+    let path = directory.join("run.jsonl");
+    let flag = path.to_str().expect("UTF-8 path");
+    // Nothing is contacted and standard input is never read: the destination is
+    // resolved before the Gateway path starts, so this endpoint never answers.
+    let mut json_arguments = gateway_arguments("ws://127.0.0.1:1");
+    json_arguments.extend(
+        ["--verbose", "--log-file", flag]
+            .into_iter()
+            .map(OsString::from),
+    );
+    let json_run = run_cli(json_arguments, None).await;
+
+    assert_eq!(
+        json_run.status.code(),
+        Some(2),
+        "an unusable destination is a usage failure, not a silent redirect"
+    );
+    let summary = parse_json(&json_run);
+    assert_eq!(summary["schema_version"], 2);
+    assert_eq!(summary["status"], "log_file_unusable");
+    assert_eq!(summary["category"], "usage_config");
+    assert_eq!(
+        summary["message"],
+        "diagnostic log file directory does not exist"
+    );
+    assert_eq!(summary["endpoint"], "ws://127.0.0.1:1");
+
+    let mut text_arguments: Vec<OsString> = [
+        "gateway",
+        "health",
+        "--endpoint",
+        "ws://127.0.0.1:1",
+        "--ephemeral-device",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    text_arguments.extend(["-vv", "--log-file", flag].into_iter().map(OsString::from));
+    let text_run = run_cli(text_arguments, None).await;
+
+    assert_eq!(text_run.status.code(), Some(2));
+    assert!(text_run.stdout.is_empty());
+    let text = String::from_utf8(text_run.stderr).expect("UTF-8 failure text");
+    assert!(
+        text.starts_with(
+            "Gateway health failed: diagnostic log file directory does not exist (usage_config)\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("\nnext: point --log-file at a writable path"),
+        "{text}"
+    );
+    assert!(text.contains("\nexit code: 2 (usage_config)\n"), "{text}");
+    assert!(
+        !text.contains("gta_claw_cli"),
+        "not one diagnostic record may fall back to standard error: {text}"
+    );
+    assert!(!path.exists(), "a failed open creates nothing");
+    assert!(!directory.exists(), "and never creates the directory");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_log_file_without_verbosity_stays_silent_and_opens_nothing() {
+    let path = log_path("cli-quiet.jsonl");
+    let flag = path.to_str().expect("UTF-8 path").to_owned();
+    let outputs = run_healthy(&[&[], &["--log-file", &flag]]).await;
+
+    assert_eq!(
+        normalize(&outputs[0]),
+        normalize(&outputs[1]),
+        "a destination without -v changes nothing"
+    );
+    assert!(outputs[1].stderr.is_empty());
+    assert!(
+        !path.exists(),
+        "no verbosity means no destination, so the file is never opened"
+    );
 }

@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 claw-application.workspace = true
 claw-gateway-client.workspace = true
+claw-observability.workspace = true
 claw-platform.workspace = true
 claw-protocol.workspace = true
 claw-security.workspace = true

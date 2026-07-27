@@ -1315,6 +1315,7 @@ dependencies = [
  "base64",
  "claw-application",
  "claw-gateway-client",
+ "claw-observability",
  "claw-platform",
  "claw-protocol",
  "claw-security",
@@ -1369,6 +1370,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "claw-gateway-client",
+ "claw-observability",
  "claw-protocol",
  "claw-security",
  "crossterm",
