@@ -7,7 +7,7 @@ use claw_plugin_host::services::HostEvent;
 use claw_plugin_host::{
     EventOutcome, GuestFailure, HostError, LifecycleState, PluginHost, TerminationCause,
 };
-use support::{PROBE_ID, PROBE_VERSION, install_probe, unsigned_core_policy};
+use support::{PROBE_ID, PROBE_VERSION, install_probe, install_probe_named, unsigned_core_policy};
 
 fn event(kind: EventKind, sequence: u64) -> HostEvent {
     HostEvent {
@@ -271,4 +271,31 @@ fn unloading_forgets_everything_about_a_plugin() {
     let again = host.load(&dir).expect("load again");
     assert_eq!(again, PROBE_ID);
     assert_eq!(host.state(&again), Some(LifecycleState::Loaded));
+}
+
+#[test]
+fn shutdown_disposes_every_plugin_in_reverse_activation_order() {
+    let root = support::tempdir();
+    let first = install_probe(root.path(), "first", Vec::new());
+    let other_id = "gta-claw-fixture-other";
+    let second = install_probe_named(root.path(), "second", other_id, Vec::new());
+    let mut host = PluginHost::builder()
+        .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from_all(&[&first, &second]))
+        .build()
+        .expect("host");
+    let first_id = host.load(&first).expect("load first");
+    let second_id = host.load(&second).expect("load second");
+    host.activate(&first_id).expect("activate first");
+    host.activate(&second_id).expect("activate second");
+
+    let report = host.shutdown();
+    assert!(report.is_clean());
+    let disposed: Vec<&str> = report
+        .outcomes()
+        .iter()
+        .map(|outcome| outcome.plugin_id.as_str())
+        .collect();
+    assert_eq!(disposed, [other_id, PROBE_ID]);
+    assert!(host.loaded_ids().is_empty());
 }

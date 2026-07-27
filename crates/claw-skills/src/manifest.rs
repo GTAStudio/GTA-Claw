@@ -1,7 +1,8 @@
 //! Modern skill manifest parsing.
 
 use std::collections::BTreeMap;
-use std::fmt::{self, Debug, Formatter};
+use std::error::Error;
+use std::fmt::{self, Debug, Display, Formatter};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -10,6 +11,7 @@ use crate::schema::{SchemaError, validate_schema};
 
 /// A validated modern skill manifest.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SkillManifest {
     id: String,
     description: String,
@@ -56,7 +58,7 @@ impl SkillManifest {
 
 /// Closed executable forms. JavaScript is deliberately not representable.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SkillExecution {
     /// Rust-native handler registered in the process.
     Native {
@@ -72,7 +74,7 @@ pub enum SkillExecution {
     Wasm {
         /// Installed plugin identifier.
         plugin_id: String,
-        /// Exported function name.
+        /// Plugin-local tool name passed to the component's `invoke-tool` export.
         export: String,
     },
 }
@@ -96,6 +98,7 @@ impl SkillExecution {
 
 /// Declarative HTTP request with no executable source code.
 #[derive(Clone, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct HttpSkillDefinition {
     /// HTTP method.
     pub method: HttpMethod,
@@ -206,7 +209,14 @@ pub enum HttpResponseMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManifestError {
     /// JSON cannot be decoded into the closed modern manifest model.
-    MalformedJson,
+    MalformedJson {
+        /// One-based source line.
+        line: usize,
+        /// One-based source column.
+        column: usize,
+        /// Serde diagnostic, including unknown-field and type information.
+        message: String,
+    },
     /// Identifier is empty or contains unsafe characters.
     InvalidId,
     /// Description is empty.
@@ -255,10 +265,47 @@ pub enum ManifestError {
 /// export name.
 pub fn load_manifest(json: &str) -> Result<SkillManifest, ManifestError> {
     let manifest: SkillManifest =
-        serde_json::from_str(json).map_err(|_| ManifestError::MalformedJson)?;
+        serde_json::from_str(json).map_err(|error| ManifestError::MalformedJson {
+            line: error.line(),
+            column: error.column(),
+            message: error.to_string(),
+        })?;
     manifest.validate()?;
     Ok(manifest)
 }
+
+impl Display for ManifestError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MalformedJson {
+                line,
+                column,
+                message,
+            } => write!(
+                formatter,
+                "skill manifest JSON is invalid at line {line}, column {column}: {message}"
+            ),
+            Self::InvalidId => formatter.write_str("skill id is invalid"),
+            Self::EmptyDescription => formatter.write_str("skill description must not be blank"),
+            Self::InvalidParameterSchema(error) => write!(
+                formatter,
+                "skill parameter schema at `{}` is invalid: {:?}",
+                error.path, error.kind
+            ),
+            Self::InvalidNativeHandler => formatter.write_str("native skill handler id is invalid"),
+            Self::InvalidHttpUrl => formatter.write_str("skill HTTP URL is invalid"),
+            Self::InvalidHttpHeader => formatter.write_str("skill HTTP header is invalid"),
+            Self::InvalidHttpParameterEncoding => {
+                formatter.write_str("skill HTTP parameter encoding is invalid")
+            }
+            Self::InvalidWasmTarget => {
+                formatter.write_str("skill plugin id or tool name is invalid")
+            }
+        }
+    }
+}
+
+impl Error for ManifestError {}
 
 fn valid_skill_id(value: &str) -> bool {
     !value.is_empty()

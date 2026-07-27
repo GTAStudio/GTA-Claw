@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use claw_plugin_api::abi::{ABI_VERSION, Version, check_compatibility};
+use claw_plugin_api::cancellation::CancellationToken;
 use claw_plugin_api::capability::{Capability, CapabilityDenial, CapabilitySet};
 use claw_plugin_api::limits::ResourceLimits;
 use claw_plugin_api::manifest::PluginManifest;
@@ -19,7 +20,7 @@ use wasmtime::component::Component;
 
 use crate::bindings::Plugin;
 use crate::bindings::exports::gta_claw::plugin::guest::EventResponse as WitEventResponse;
-use crate::engine::{PluginEngine, epoch_ticks_for};
+use crate::engine::{CANCELLATION_POLL_MS, PluginEngine, epoch_ticks_for};
 use crate::error::{GuestFailure, HostError, TerminationCause};
 use crate::host_impl::wit_event;
 use crate::limiter::HostCallGate;
@@ -137,6 +138,157 @@ pub struct Discovered {
     pub manifest: Result<PluginManifest, HostError>,
 }
 
+/// Stage at which discovery failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiscoveryStage {
+    /// The trusted root could not be enumerated.
+    Root,
+    /// A plugin manifest could not be read or parsed.
+    Manifest,
+}
+
+/// One deterministic discovery result.
+#[derive(Debug)]
+pub enum DiscoveryRecord {
+    /// A validated manifest is ready for load-time trust checks.
+    Candidate {
+        /// Plugin directory.
+        directory: PathBuf,
+        /// Parsed manifest.
+        manifest: Box<PluginManifest>,
+    },
+    /// One root or manifest failed without aborting the rest of the scan.
+    Failed {
+        /// Root or plugin directory that failed.
+        path: PathBuf,
+        /// Discovery stage that failed.
+        stage: DiscoveryStage,
+        /// Actionable failure.
+        error: HostError,
+    },
+}
+
+/// Stage at which automatic activation failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationStage {
+    /// A trusted root could not be scanned.
+    Discovery,
+    /// A manifest could not be read or validated.
+    Manifest,
+    /// Trust, signature, component validation, or instantiation failed.
+    Load,
+    /// The guest rejected or failed activation.
+    Activate,
+}
+
+/// One component that automatic activation made ready for dispatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivatedPlugin {
+    /// Plugin directory.
+    pub directory: PathBuf,
+    /// Manifest identity.
+    pub id: String,
+    /// Digest computed from the bytes that were instantiated.
+    pub component_sha256: String,
+    /// Trusted key id, absent only when policy explicitly allowed unsigned input.
+    pub signing_key_id: Option<String>,
+}
+
+/// One activation failure, retained alongside successful siblings.
+#[derive(Debug)]
+pub struct ActivationFailure {
+    /// Root or plugin directory that failed.
+    pub path: PathBuf,
+    /// Manifest identity when parsing got far enough to establish it.
+    pub plugin_id: Option<String>,
+    /// Stage that refused the plugin.
+    pub stage: ActivationStage,
+    /// Primary operator-facing failure.
+    pub error: HostError,
+    /// Cleanup failure after an activation error, if cleanup itself failed.
+    pub cleanup_error: Option<HostError>,
+}
+
+/// Ordered result for one discovered entry.
+#[derive(Debug)]
+pub enum ActivationOutcome {
+    /// A signed or explicitly allowed unsigned component is active.
+    Activated(ActivatedPlugin),
+    /// This entry failed while later entries were still attempted.
+    Failed(ActivationFailure),
+}
+
+/// Deterministic, partial-success result of discovery and activation.
+#[derive(Debug, Default)]
+pub struct ActivationReport {
+    outcomes: Vec<ActivationOutcome>,
+}
+
+impl ActivationReport {
+    /// Every outcome in trusted-root order, then lexical directory order.
+    #[must_use]
+    pub fn outcomes(&self) -> &[ActivationOutcome] {
+        &self.outcomes
+    }
+
+    /// Number of plugins that reached the active state.
+    #[must_use]
+    pub fn activated_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ActivationOutcome::Activated(_)))
+            .count()
+    }
+
+    /// Number of entries that failed without stopping the pass.
+    #[must_use]
+    pub fn failure_count(&self) -> usize {
+        self.outcomes.len().saturating_sub(self.activated_count())
+    }
+}
+
+/// Typed JSON invocation routed to one active plugin tool.
+#[derive(Clone, Copy, Debug)]
+pub struct PluginToolInvocation<'a> {
+    /// Installed plugin identity.
+    pub plugin_id: &'a str,
+    /// Plugin-local tool name.
+    pub tool: &'a str,
+    /// Already typed JSON parameters.
+    pub parameters: &'a serde_json::Value,
+    /// Optional cooperative cancellation signal.
+    pub cancellation: Option<&'a CancellationToken>,
+}
+
+/// Result of disposing one plugin during a host shutdown.
+#[derive(Debug)]
+pub struct DisposalOutcome {
+    /// Plugin identity.
+    pub plugin_id: String,
+    /// Deactivation result. The plugin is forgotten even when this is an error.
+    pub result: Result<(), HostError>,
+}
+
+/// Reverse-activation-order shutdown report.
+#[derive(Debug, Default)]
+pub struct DisposalReport {
+    outcomes: Vec<DisposalOutcome>,
+}
+
+impl DisposalReport {
+    /// Every disposal outcome in the order attempted.
+    #[must_use]
+    pub fn outcomes(&self) -> &[DisposalOutcome] {
+        &self.outcomes
+    }
+
+    /// Whether every plugin deactivated cleanly.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.outcomes.iter().all(|outcome| outcome.result.is_ok())
+    }
+}
+
 /// A guest's answer to an event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventOutcome {
@@ -192,6 +344,7 @@ struct Loaded {
     directory: PathBuf,
     component_path: PathBuf,
     digest: String,
+    signing_key_id: Option<String>,
     state: LifecycleState,
     withheld: Vec<Withheld>,
     narrowed: Vec<Capability>,
@@ -326,6 +479,7 @@ impl PluginHostBuilder {
             policy: self.policy,
             gate,
             plugins: BTreeMap::new(),
+            activation_order: Vec::new(),
         })
     }
 }
@@ -340,6 +494,7 @@ pub struct PluginHost {
     policy: ViolationPolicy,
     gate: HostCallGate,
     plugins: BTreeMap<String, Loaded>,
+    activation_order: Vec<String>,
 }
 
 impl core::fmt::Debug for PluginHost {
@@ -441,6 +596,14 @@ impl PluginHost {
         self.plugins.get(id).map(|plugin| plugin.digest.as_str())
     }
 
+    /// Trusted signing key id established at load time.
+    #[must_use]
+    pub fn signing_key_id(&self, id: &str) -> Option<&str> {
+        self.plugins
+            .get(id)
+            .and_then(|plugin| plugin.signing_key_id.as_deref())
+    }
+
     /// Every host call this plugin's live instance has had refused.
     ///
     /// After a fault or an unload the instance is gone; the denials recorded
@@ -476,26 +639,186 @@ impl PluginHost {
     /// scan, so one broken plugin cannot hide the rest.
     #[must_use]
     pub fn discover(&self) -> Vec<Discovered> {
-        let mut found = Vec::new();
-        for root in self.trust.roots() {
-            let Ok(entries) = std::fs::read_dir(root) else {
-                continue;
-            };
-            let mut directories: Vec<PathBuf> = entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .filter(|path| path.join(MANIFEST_FILE_NAME).is_file())
-                .collect();
-            directories.sort();
-            for directory in directories {
-                let manifest = read_manifest(&directory);
-                found.push(Discovered {
+        self.discover_detailed()
+            .into_iter()
+            .filter_map(|record| match record {
+                DiscoveryRecord::Candidate {
                     directory,
                     manifest,
-                });
+                } => Some(Discovered {
+                    directory,
+                    manifest: Ok(*manifest),
+                }),
+                DiscoveryRecord::Failed {
+                    path,
+                    stage: DiscoveryStage::Manifest,
+                    error,
+                } => Some(Discovered {
+                    directory: path,
+                    manifest: Err(error),
+                }),
+                DiscoveryRecord::Failed {
+                    stage: DiscoveryStage::Root,
+                    ..
+                } => None,
+            })
+            .collect()
+    }
+
+    /// Scans trusted roots without hiding root or directory-read failures.
+    ///
+    /// Records are ordered by configured root order and lexical plugin
+    /// directory order. A bad root or manifest becomes one failure record and
+    /// does not prevent later roots or directories from being examined.
+    #[must_use]
+    pub fn discover_detailed(&self) -> Vec<DiscoveryRecord> {
+        let mut found = Vec::new();
+        for root in self.trust.roots() {
+            let entries = match std::fs::read_dir(root) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    found.push(DiscoveryRecord::Failed {
+                        path: root.clone(),
+                        stage: DiscoveryStage::Root,
+                        error: HostError::io(root, &error),
+                    });
+                    continue;
+                }
+            };
+            let mut directories: Vec<(PathBuf, Option<HostError>)> = Vec::new();
+            let mut entry_failures = Vec::new();
+            for entry in entries {
+                match entry {
+                    Ok(entry) => {
+                        let path = entry.path();
+                        match std::fs::metadata(&path) {
+                            Ok(metadata) if metadata.is_dir() => {
+                                let manifest_path = path.join(MANIFEST_FILE_NAME);
+                                match std::fs::symlink_metadata(&manifest_path) {
+                                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(error) => directories
+                                        .push((path, Some(HostError::io(&manifest_path, &error)))),
+                                    Ok(_) => match std::fs::metadata(&manifest_path) {
+                                        Ok(_) => directories.push((path, None)),
+                                        Err(error) => directories.push((
+                                            path,
+                                            Some(HostError::io(&manifest_path, &error)),
+                                        )),
+                                    },
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                directories.push((path.clone(), Some(HostError::io(path, &error))));
+                            }
+                        }
+                    }
+                    Err(error) => entry_failures.push(DiscoveryRecord::Failed {
+                        path: root.clone(),
+                        stage: DiscoveryStage::Root,
+                        error: HostError::io(root, &error),
+                    }),
+                }
+            }
+            found.extend(entry_failures);
+            directories.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (directory, metadata_error) in directories {
+                if let Some(error) = metadata_error {
+                    found.push(DiscoveryRecord::Failed {
+                        path: directory,
+                        stage: DiscoveryStage::Manifest,
+                        error,
+                    });
+                    continue;
+                }
+                match read_manifest(&directory) {
+                    Ok(manifest) => found.push(DiscoveryRecord::Candidate {
+                        directory,
+                        manifest: Box::new(manifest),
+                    }),
+                    Err(error) => found.push(DiscoveryRecord::Failed {
+                        path: directory,
+                        stage: DiscoveryStage::Manifest,
+                        error,
+                    }),
+                }
             }
         }
         found
+    }
+
+    /// Discovers, loads, and activates every candidate with partial success.
+    ///
+    /// The report preserves discovery order. A failed activation is unloaded
+    /// before the next candidate is attempted, so no half-activated instance or
+    /// stale tool registration survives in the host.
+    #[must_use]
+    pub fn activate_discovered(&mut self) -> ActivationReport {
+        let records = self.discover_detailed();
+        let mut outcomes = Vec::with_capacity(records.len());
+        for record in records {
+            match record {
+                DiscoveryRecord::Failed { path, stage, error } => {
+                    outcomes.push(ActivationOutcome::Failed(ActivationFailure {
+                        path,
+                        plugin_id: None,
+                        stage: match stage {
+                            DiscoveryStage::Root => ActivationStage::Discovery,
+                            DiscoveryStage::Manifest => ActivationStage::Manifest,
+                        },
+                        error,
+                        cleanup_error: None,
+                    }));
+                }
+                DiscoveryRecord::Candidate {
+                    directory,
+                    manifest,
+                } => {
+                    let plugin_id = manifest.id.clone();
+                    let id = match self.load_manifest(&directory, *manifest) {
+                        Ok(id) => id,
+                        Err(error) => {
+                            outcomes.push(ActivationOutcome::Failed(ActivationFailure {
+                                path: directory,
+                                plugin_id: Some(plugin_id),
+                                stage: ActivationStage::Load,
+                                error,
+                                cleanup_error: None,
+                            }));
+                            continue;
+                        }
+                    };
+                    if let Err(error) = self.activate(&id) {
+                        let cleanup_error = self.unload(&id).err();
+                        outcomes.push(ActivationOutcome::Failed(ActivationFailure {
+                            path: directory,
+                            plugin_id: Some(id),
+                            stage: ActivationStage::Activate,
+                            error,
+                            cleanup_error,
+                        }));
+                        continue;
+                    }
+                    let Some(plugin) = self.plugins.get(&id) else {
+                        outcomes.push(ActivationOutcome::Failed(ActivationFailure {
+                            path: directory,
+                            plugin_id: Some(id.clone()),
+                            stage: ActivationStage::Activate,
+                            error: HostError::UnknownPlugin(id),
+                            cleanup_error: None,
+                        }));
+                        continue;
+                    };
+                    outcomes.push(ActivationOutcome::Activated(ActivatedPlugin {
+                        directory,
+                        component_sha256: plugin.digest.clone(),
+                        signing_key_id: plugin.signing_key_id.clone(),
+                        id,
+                    }));
+                }
+            }
+        }
+        ActivationReport { outcomes }
     }
 
     /// Loads, validates and instantiates the plugin in `directory`.
@@ -570,6 +893,7 @@ impl PluginHost {
         let narrowed = effective.narrowed().to_vec();
 
         let decision: TrustDecision = self.trust.authorize(directory, &manifest)?;
+        let signing_key_id = decision.signing_key_id().map(str::to_owned);
 
         let metadata = std::fs::metadata(decision.component_path())
             .map_err(|error| HostError::io(decision.component_path(), &error))?;
@@ -617,24 +941,26 @@ impl PluginHost {
             write_roots,
         });
         let mut store = self.engine.new_store(state)?;
-        arm_call(&mut store, &manifest.limits);
-        let bindings = Plugin::instantiate(&mut store, &component, self.engine.linker())
-            .map_err(|error| HostError::Instantiate(format!("{error:#}")))?;
+        arm_call(&mut store, &manifest.limits, None);
+        let raw = Plugin::instantiate(&mut store, &component, self.engine.linker());
+        let raw = observe_interruption(&mut store, raw);
+        let bindings = raw.map_err(|error| classify_instantiation(&error, store.data()));
         disarm_call(&mut store);
+        let bindings = bindings?;
 
         // Instantiation ran the component's start function and `describe` is
         // about to run, both before the host has established that this really
         // is the plugin the manifest names. The store is still in
         // `LifecyclePhase::Starting`, so neither can reach a host effect.
         debug_assert_eq!(store.data().phase(), LifecyclePhase::Starting);
-        arm_call(&mut store, &manifest.limits);
-        let info = bindings
-            .gta_claw_plugin_guest()
-            .call_describe(&mut store)
-            .map_err(|error| classify(&error, store.data()));
+        arm_call(&mut store, &manifest.limits, None);
+        let info = bindings.gta_claw_plugin_guest().call_describe(&mut store);
+        let info =
+            observe_interruption(&mut store, info).map_err(|error| classify(&error, store.data()));
         disarm_call(&mut store);
         let info = info?;
 
+        check_payload("component identity", info.id.as_bytes(), &manifest.limits)?;
         if info.id != manifest.id {
             return Err(HostError::IdentityMismatch {
                 field: "id",
@@ -677,6 +1003,7 @@ impl PluginHost {
                 directory: directory.to_path_buf(),
                 component_path: decision.component_path().to_path_buf(),
                 digest,
+                signing_key_id,
                 withheld,
                 narrowed,
                 state: LifecycleState::Loaded,
@@ -781,8 +1108,9 @@ impl PluginHost {
                 })?;
             let previous_phase = instance.store.data().phase();
             instance.store.data_mut().set_phase(transition.during);
-            arm_call(&mut instance.store, &limits);
+            arm_call(&mut instance.store, &limits, None);
             let raw = call(&instance.bindings, &mut instance.store);
+            let raw = observe_interruption(&mut instance.store, raw);
             disarm_call(&mut instance.store);
             (
                 raw.map_err(|error| classify(&error, instance.store.data())),
@@ -817,9 +1145,13 @@ impl PluginHost {
                 if let Some(plugin) = self.plugins.get_mut(id) {
                     plugin.state = transition.next;
                 }
+                self.activation_order.retain(|active| active != id);
+                if transition.next == LifecycleState::Active {
+                    self.activation_order.push(id.to_owned());
+                }
                 Ok(())
             }
-            Ok(Err(error)) => Err(HostError::Guest(guest_failure(&error))),
+            Ok(Err(error)) => Err(guest_error(&error, &limits)),
             Err(error) => {
                 self.fault(id, &error);
                 Err(error)
@@ -844,6 +1176,8 @@ impl PluginHost {
     ///   the plugin is left faulted.
     pub fn handle_event(&mut self, id: &str, event: &HostEvent) -> Result<EventOutcome, HostError> {
         let limits = self.require_active(id, "handle-event")?;
+        check_payload("event source", event.source.as_bytes(), &limits)?;
+        check_payload("event payload", event.payload.as_bytes(), &limits)?;
         let wit = wit_event(event);
         let outcome = {
             let plugin = self
@@ -858,17 +1192,23 @@ impl PluginHost {
                     actual: "unloaded",
                     expected: "handle-event",
                 })?;
-            arm_call(&mut instance.store, &limits);
+            arm_call(&mut instance.store, &limits, None);
             let raw = instance
                 .bindings
                 .gta_claw_plugin_guest()
                 .call_handle_event(&mut instance.store, &wit);
+            let raw = observe_interruption(&mut instance.store, raw);
             disarm_call(&mut instance.store);
             raw.map_err(|error| classify(&error, instance.store.data()))
         };
         match outcome {
-            Ok(Ok(response)) => Ok(EventOutcome::from(response)),
-            Ok(Err(error)) => Err(HostError::Guest(guest_failure(&error))),
+            Ok(Ok(response)) => {
+                if let Some(note) = &response.note {
+                    check_payload("event response note", note.as_bytes(), &limits)?;
+                }
+                Ok(EventOutcome::from(response))
+            }
+            Ok(Err(error)) => Err(guest_error(&error, &limits)),
             Err(error) => {
                 self.fault(id, &error);
                 Err(error)
@@ -893,7 +1233,80 @@ impl PluginHost {
     ///   [`ViolationPolicy::Trap`] is in force. The instance is destroyed and
     ///   the plugin is left faulted.
     pub fn invoke_tool(&mut self, id: &str, name: &str, input: &str) -> Result<String, HostError> {
+        self.invoke_tool_inner(id, name, input, None)
+    }
+
+    /// Invokes a plugin tool while observing caller cancellation.
+    ///
+    /// Cancellation requested before dispatch returns without touching the
+    /// plugin. Cancellation observed in-flight interrupts Wasm and faults only
+    /// this plugin because unwound guest state cannot be resumed safely.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`PluginHost::invoke_tool`], plus
+    /// [`HostError::Cancelled`] before dispatch or
+    /// [`TerminationCause::Cancelled`] for an in-flight interruption.
+    pub fn invoke_tool_cancellable(
+        &mut self,
+        id: &str,
+        name: &str,
+        input: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<String, HostError> {
+        self.invoke_tool_inner(id, name, input, Some(cancellation))
+    }
+
+    /// Serializes typed parameters, invokes the component, and decodes typed
+    /// JSON output.
+    ///
+    /// This is the bridge expected by `claw-skills`: callers never need to
+    /// construct or parse the string representation used by the WIT ABI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::InvalidToolInput`] if JSON encoding fails,
+    /// [`HostError::InvalidGuestResponse`] if the guest returns non-JSON, or any
+    /// dispatch error documented by [`PluginHost::invoke_tool_cancellable`].
+    pub fn invoke_json_tool(
+        &mut self,
+        invocation: PluginToolInvocation<'_>,
+    ) -> Result<serde_json::Value, HostError> {
+        let input = serde_json::to_string(invocation.parameters).map_err(|error| {
+            HostError::InvalidToolInput {
+                plugin_id: invocation.plugin_id.to_owned(),
+                tool: invocation.tool.to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+        let output = self.invoke_tool_inner(
+            invocation.plugin_id,
+            invocation.tool,
+            &input,
+            invocation.cancellation,
+        )?;
+        serde_json::from_str(&output).map_err(|error| HostError::InvalidGuestResponse {
+            plugin_id: invocation.plugin_id.to_owned(),
+            tool: invocation.tool.to_owned(),
+            message: error.to_string(),
+        })
+    }
+
+    fn invoke_tool_inner(
+        &mut self,
+        id: &str,
+        name: &str,
+        input: &str,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<String, HostError> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(HostError::Cancelled {
+                operation: "tool invocation",
+            });
+        }
         let limits = self.require_active(id, "invoke-tool")?;
+        check_payload("tool name", name.as_bytes(), &limits)?;
+        check_payload("tool input", input.as_bytes(), &limits)?;
         let outcome = {
             let plugin = self
                 .plugins
@@ -907,18 +1320,22 @@ impl PluginHost {
                     actual: "unloaded",
                     expected: "invoke-tool",
                 })?;
-            arm_call(&mut instance.store, &limits);
+            arm_call(&mut instance.store, &limits, cancellation);
             let raw = instance.bindings.gta_claw_plugin_guest().call_invoke_tool(
                 &mut instance.store,
                 name,
                 input,
             );
+            let raw = observe_interruption(&mut instance.store, raw);
             disarm_call(&mut instance.store);
             raw.map_err(|error| classify(&error, instance.store.data()))
         };
         match outcome {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => Err(HostError::Guest(guest_failure(&error))),
+            Ok(Ok(value)) => {
+                check_payload("tool output", value.as_bytes(), &limits)?;
+                Ok(value)
+            }
+            Ok(Err(error)) => Err(guest_error(&error, &limits)),
             Err(error) => {
                 self.fault(id, &error);
                 Err(error)
@@ -959,6 +1376,7 @@ impl PluginHost {
     /// cannot leave callable entry points behind it.
     fn fault(&mut self, id: &str, error: &HostError) {
         self.purge_tools(id);
+        self.activation_order.retain(|active| active != id);
         let cause = error.termination().unwrap_or(TerminationCause::Trap);
         if let Some(plugin) = self.plugins.get_mut(id) {
             if let Some(instance) = plugin.instance.take() {
@@ -993,17 +1411,22 @@ impl PluginHost {
     ///
     /// # Errors
     ///
-    /// Returns [`HostError::UnknownPlugin`] when no such plugin is loaded.
+    /// Returns [`HostError::UnknownPlugin`] when no such plugin is loaded, or
+    /// the guest's deactivation failure after the instance has still been
+    /// removed and all of its tools withdrawn.
     pub fn unload(&mut self, id: &str) -> Result<(), HostError> {
         if !self.plugins.contains_key(id) {
             return Err(HostError::UnknownPlugin(id.to_owned()));
         }
-        if self.state(id) == Some(LifecycleState::Active) {
-            let _ = self.deactivate(id);
-        }
+        let deactivation_error = if self.state(id) == Some(LifecycleState::Active) {
+            self.deactivate(id).err()
+        } else {
+            None
+        };
         self.purge_tools(id);
         self.plugins.remove(id);
-        Ok(())
+        self.activation_order.retain(|active| active != id);
+        deactivation_error.map_or(Ok(()), Err)
     }
 
     /// Unloads a plugin and loads it again from the directory it came from.
@@ -1029,12 +1452,44 @@ impl PluginHost {
         self.load(&directory)
     }
 
+    /// Deactivates and forgets every plugin in reverse activation order.
+    ///
+    /// Every plugin is attempted even when an earlier guest refuses to
+    /// deactivate. Each failed plugin is still removed and its tools are
+    /// withdrawn, and the returned report retains the original error.
+    #[must_use]
+    pub fn shutdown(&mut self) -> DisposalReport {
+        let mut ids: Vec<String> = self.activation_order.iter().rev().cloned().collect();
+        for id in self.plugins.keys() {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        let outcomes = ids
+            .into_iter()
+            .map(|plugin_id| {
+                let result = self.unload(&plugin_id);
+                DisposalOutcome { plugin_id, result }
+            })
+            .collect();
+        DisposalReport { outcomes }
+    }
+
     /// The path the component was loaded from.
     #[must_use]
     pub fn component_path(&self, id: &str) -> Option<&Path> {
         self.plugins
             .get(id)
             .map(|plugin| plugin.component_path.as_path())
+    }
+}
+
+impl Drop for PluginHost {
+    fn drop(&mut self) {
+        let ids: Vec<String> = self.plugins.keys().cloned().collect();
+        for id in ids {
+            self.purge_tools(&id);
+        }
     }
 }
 
@@ -1084,7 +1539,11 @@ fn reject_foreign_imports(
 /// `activate`, `deactivate`, `handle-event` and `invoke-tool` - is armed
 /// immediately before it runs, so a budget is per call rather than per
 /// instance and a plugin cannot bank the fuel it did not spend last time.
-fn arm_call(store: &mut Store<PluginState>, limits: &ResourceLimits) {
+fn arm_call(
+    store: &mut Store<PluginState>,
+    limits: &ResourceLimits,
+    cancellation: Option<&CancellationToken>,
+) {
     // Every store this host runs came from `PluginEngine::new_store`, whose
     // engine always has fuel metering enabled, so this cannot fail. Even if it
     // somehow did, the two lines below still bound the call in wall-clock time:
@@ -1094,21 +1553,58 @@ fn arm_call(store: &mut Store<PluginState>, limits: &ResourceLimits) {
         armed.is_ok(),
         "a store from `PluginEngine::new_store` always meters fuel"
     );
-    store.set_epoch_deadline(epoch_ticks_for(limits.wall_clock_timeout_ms));
     // `ResourceLimits::validate` caps `wall_clock_timeout_ms` at ten minutes
     // and `load` runs it before any instance exists, so this addition cannot
     // overflow even for a manifest written by a hostile author.
     store
         .data_mut()
-        .set_deadline(Some(Instant::now() + limits.timeout()));
+        .arm_call(Instant::now() + limits.timeout(), cancellation.cloned());
+    let first_check = store.data().next_interrupt_check_ms(CANCELLATION_POLL_MS);
+    store.set_epoch_deadline(epoch_ticks_for(first_check));
 }
 
 fn disarm_call(store: &mut Store<PluginState>) {
-    store.data_mut().set_deadline(None);
+    store.data_mut().disarm_call();
 }
 
-fn guest_failure(error: &crate::bindings::gta_claw::plugin::types::Error) -> GuestFailure {
+fn observe_interruption<T>(
+    store: &mut Store<PluginState>,
+    outcome: wasmtime::Result<T>,
+) -> wasmtime::Result<T> {
+    if outcome.is_ok()
+        && let Some(cause) = store.data_mut().poll_interruption()
+    {
+        return Err(wasmtime::Error::msg(format!(
+            "plugin invocation interrupted ({cause})"
+        )));
+    }
+    outcome
+}
+
+fn check_payload(
+    field: &'static str,
+    bytes: &[u8],
+    limits: &ResourceLimits,
+) -> Result<(), HostError> {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > u64::from(limits.max_payload_bytes) {
+        return Err(HostError::PayloadTooLarge {
+            field,
+            actual: bytes.len(),
+            limit: limits.max_payload_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn guest_error(
+    error: &crate::bindings::gta_claw::plugin::types::Error,
+    limits: &ResourceLimits,
+) -> HostError {
     use crate::bindings::gta_claw::plugin::types::ErrorCode;
+
+    if let Err(error) = check_payload("guest error message", error.message.as_bytes(), limits) {
+        return error;
+    }
     let code = match error.code {
         ErrorCode::InvalidInput => "invalid-input",
         ErrorCode::PermissionDenied => "permission-denied",
@@ -1118,28 +1614,42 @@ fn guest_failure(error: &crate::bindings::gta_claw::plugin::types::Error) -> Gue
         ErrorCode::Unsupported => "unsupported",
         ErrorCode::Internal => "internal",
     };
-    GuestFailure {
+    HostError::Guest(GuestFailure {
         code,
         message: error.message.clone(),
-    }
+    })
 }
 
 /// Turns a Wasmtime error into a host error, naming why the guest stopped.
 fn classify(error: &wasmtime::Error, state: &PluginState) -> HostError {
     let detail = format!("{error:#}");
-    let cause = match error.downcast_ref::<wasmtime::Trap>() {
-        Some(wasmtime::Trap::Interrupt) => TerminationCause::Timeout,
-        Some(wasmtime::Trap::OutOfFuel) => TerminationCause::FuelExhausted,
-        Some(wasmtime::Trap::StackOverflow) => TerminationCause::StackOverflow,
-        Some(_) | None => {
-            if state.hit_memory_ceiling() || state.hit_table_ceiling() {
-                TerminationCause::ResourceLimit
-            } else {
-                TerminationCause::Trap
-            }
-        }
-    };
+    let cause =
+        state
+            .interruption()
+            .unwrap_or_else(|| match error.downcast_ref::<wasmtime::Trap>() {
+                Some(wasmtime::Trap::Interrupt) => TerminationCause::Timeout,
+                Some(wasmtime::Trap::OutOfFuel) => TerminationCause::FuelExhausted,
+                Some(wasmtime::Trap::StackOverflow) => TerminationCause::StackOverflow,
+                Some(_) | None => {
+                    if state.hit_resource_ceiling_during_call() {
+                        TerminationCause::ResourceLimit
+                    } else {
+                        TerminationCause::Trap
+                    }
+                }
+            });
     HostError::Terminated { cause, detail }
+}
+
+fn classify_instantiation(error: &wasmtime::Error, state: &PluginState) -> HostError {
+    if error.downcast_ref::<wasmtime::Trap>().is_some()
+        || state.interruption().is_some()
+        || state.hit_resource_ceiling_during_call()
+    {
+        classify(error, state)
+    } else {
+        HostError::Instantiate(format!("{error:#}"))
+    }
 }
 
 #[cfg(test)]

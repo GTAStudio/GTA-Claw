@@ -9,8 +9,13 @@ mod support;
 
 use claw_plugin_api::capability::{CapabilityGrant, ClockGrant};
 use claw_plugin_api::limits::ResourceLimits;
-use claw_plugin_host::{HostError, LifecycleState, PluginHost, TerminationCause};
-use support::{PROBE_ID, install_probe_named, install_probe_with, unsigned_core_policy};
+use claw_plugin_host::{
+    CancellationToken, HostError, LifecycleState, PluginHost, TerminationCause,
+};
+use support::{
+    PROBE_ID, install, install_probe_named, install_probe_with, manifest_for,
+    probe_component_with_oversized_error, unsigned_core_policy,
+};
 
 fn host_for(root: &std::path::Path) -> PluginHost {
     PluginHost::builder()
@@ -84,6 +89,148 @@ fn an_infinite_loop_runs_out_of_wall_clock_time() {
         host.state(&id),
         Some(LifecycleState::Faulted(TerminationCause::Timeout))
     );
+}
+
+#[test]
+fn caller_cancellation_interrupts_an_in_flight_guest_deterministically() {
+    let root = support::tempdir();
+    let limits = ResourceLimits {
+        fuel: u64::MAX,
+        wall_clock_timeout_ms: 30_000,
+        ..ResourceLimits::default()
+    };
+    let dir = install_probe_with(root.path(), "probe", Vec::new(), limits);
+    let mut host = host_for(root.path());
+    let id = host.load(&dir).expect("load");
+    host.activate(&id).expect("activate");
+
+    let cancellation = CancellationToken::new();
+    let canceller = cancellation.clone();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        canceller.cancel();
+    });
+    let started = std::time::Instant::now();
+    let error = host
+        .invoke_tool_cancellable(&id, "s", "{}", &cancellation)
+        .expect_err("the spin loop must be cancelled");
+    handle.join().expect("canceller");
+
+    assert_eq!(error.termination(), Some(TerminationCause::Cancelled));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "cancellation should be observed well before the 30 second timeout"
+    );
+    assert_eq!(
+        host.state(&id),
+        Some(LifecycleState::Faulted(TerminationCause::Cancelled))
+    );
+}
+
+#[test]
+fn pre_cancelled_dispatch_does_not_fault_or_enter_the_guest() {
+    let root = support::tempdir();
+    let dir = install_probe_with(root.path(), "probe", Vec::new(), ResourceLimits::default());
+    let mut host = host_for(root.path());
+    let id = host.load(&dir).expect("load");
+    host.activate(&id).expect("activate");
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    assert!(matches!(
+        host.invoke_tool_cancellable(&id, "x", "{}", &cancellation),
+        Err(HostError::Cancelled { .. })
+    ));
+    assert_eq!(host.state(&id), Some(LifecycleState::Active));
+    assert_eq!(
+        host.invoke_tool(&id, "x", "{}").expect("still usable"),
+        "ok"
+    );
+}
+
+#[test]
+fn guest_export_payloads_obey_the_manifest_ceiling() {
+    let root = support::tempdir();
+    let ceiling = u32::try_from(PROBE_ID.len()).expect("fixture id length fits u32");
+    let limits = ResourceLimits {
+        max_payload_bytes: ceiling,
+        ..ResourceLimits::default()
+    };
+    let dir = install_probe_with(root.path(), "probe", Vec::new(), limits);
+    let mut host = host_for(root.path());
+    let id = host.load(&dir).expect("load");
+    host.activate(&id).expect("activate");
+
+    let oversized = "x".repeat(PROBE_ID.len() + 1);
+    let error = host
+        .invoke_tool(&id, "x", &oversized)
+        .expect_err("input exceeds the payload ceiling");
+    assert!(matches!(
+        error,
+        HostError::PayloadTooLarge {
+            field: "tool input",
+            actual,
+            limit,
+        } if actual == PROBE_ID.len() + 1 && limit == ceiling
+    ));
+    assert_eq!(host.state(&id), Some(LifecycleState::Active));
+    let at_ceiling = "x".repeat(PROBE_ID.len());
+    assert_eq!(
+        host.invoke_tool(&id, "x", &at_ceiling)
+            .expect("at the ceiling"),
+        "ok"
+    );
+}
+
+#[test]
+fn component_identity_obeys_the_manifest_payload_ceiling() {
+    let root = support::tempdir();
+    let ceiling = u32::try_from(PROBE_ID.len() - 1).expect("fixture id length fits u32");
+    let limits = ResourceLimits {
+        max_payload_bytes: ceiling,
+        ..ResourceLimits::default()
+    };
+    let dir = install_probe_with(root.path(), "probe", Vec::new(), limits);
+    let mut host = host_for(root.path());
+
+    let error = host
+        .load(&dir)
+        .expect_err("the component identity exceeds its own payload ceiling");
+    assert!(matches!(
+        error,
+        HostError::PayloadTooLarge {
+            field: "component identity",
+            actual,
+            limit,
+        } if actual == PROBE_ID.len() && limit == ceiling
+    ));
+    assert!(host.loaded_ids().is_empty());
+}
+
+#[test]
+fn guest_error_messages_obey_the_manifest_payload_ceiling() {
+    let root = support::tempdir();
+    let component = probe_component_with_oversized_error();
+    let mut manifest = manifest_for(&component);
+    manifest.limits.max_payload_bytes =
+        u32::try_from(PROBE_ID.len()).expect("fixture id length fits u32");
+    let dir = install(root.path(), "probe", &component, &manifest);
+    let mut host = host_for(root.path());
+    let id = host.load(&dir).expect("load");
+    host.activate(&id).expect("activate");
+
+    let error = host
+        .invoke_tool(&id, "unknown", "{}")
+        .expect_err("guest error message exceeds the payload ceiling");
+    assert!(matches!(
+        error,
+        HostError::PayloadTooLarge {
+            field: "guest error message",
+            actual: 30,
+            limit,
+        } if limit == u32::try_from(PROBE_ID.len()).expect("fixture id length fits u32")
+    ));
+    assert_eq!(host.state(&id), Some(LifecycleState::Active));
 }
 
 #[test]

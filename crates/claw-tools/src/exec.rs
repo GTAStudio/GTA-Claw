@@ -695,15 +695,27 @@ impl CancellationToken {
         Self::default()
     }
 
+    /// Reuses a flag shared with another runtime boundary.
+    #[must_use]
+    pub const fn from_shared_flag(cancelled: Arc<AtomicBool>) -> Self {
+        Self { cancelled }
+    }
+
+    /// Returns the shared flag backing this token.
+    #[must_use]
+    pub fn shared_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
     /// Requests cancellation of every process observing this token.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.cancelled.store(true, Ordering::Release);
     }
 
     /// Reports whether cancellation was requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -1438,8 +1450,10 @@ mod tests {
     fn cancellation_tokens_share_state() {
         let token = CancellationToken::new();
         let clone = token.clone();
+        let bridged = CancellationToken::from_shared_flag(token.shared_flag());
         assert!(!clone.is_cancelled());
-        token.cancel();
+        bridged.cancel();
+        assert!(token.is_cancelled());
         assert!(clone.is_cancelled());
     }
 

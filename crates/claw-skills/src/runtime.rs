@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
 
@@ -164,43 +166,139 @@ pub enum NativeRegistryError {
     DuplicateId,
 }
 
+/// Cooperative cancellation shared with a skill caller.
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    /// Creates an uncancelled token.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reuses the flag supplied by another runtime boundary.
+    #[must_use]
+    pub const fn from_shared_flag(cancelled: Arc<AtomicBool>) -> Self {
+        Self { cancelled }
+    }
+
+    /// Returns the flag a plugin-host adapter should observe.
+    #[must_use]
+    pub fn shared_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    /// Requests cancellation.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Reports whether cancellation was requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+/// Typed invocation passed to the sandboxed component host.
+#[derive(Clone, Debug)]
+pub struct WasmSkillInvocation<'a> {
+    /// Installed plugin identity.
+    pub plugin_id: &'a str,
+    /// Plugin-local tool name.
+    pub tool: &'a str,
+    /// Parameters already validated against the skill schema.
+    pub parameters: Value,
+    /// Optional signal that the host must observe during guest execution.
+    pub cancellation: Option<&'a CancellationToken>,
+}
+
 /// Port supplied by the separately owned sandboxed Wasm plugin host.
 pub trait WasmSkillHost {
     /// Invokes one installed component export with validated parameters.
     ///
     /// # Errors
     ///
-    /// Returns [`WasmHostError::PluginNotFound`] when `plugin_id` is not
-    /// installed, [`WasmHostError::ExportNotFound`] when the component does not
-    /// export `export`, [`WasmHostError::PolicyDenied`] when the sandbox policy
-    /// refuses the invocation, and [`WasmHostError::Trap`] when the component
-    /// traps or exhausts its limits.
-    fn invoke(
-        &self,
-        plugin_id: &str,
-        export: &str,
-        parameters: Value,
-    ) -> Result<Value, WasmHostError>;
+    /// Returns a [`WasmHostError`] whose [`WasmHostError::kind`] distinguishes
+    /// an absent or inactive plugin, an unknown tool, policy refusal, payload or
+    /// resource exhaustion, cancellation, timeout, trap, invalid response, and
+    /// an uncategorized host failure.
+    fn invoke(&mut self, invocation: WasmSkillInvocation<'_>) -> Result<Value, WasmHostError>;
 }
 
 /// Stable Wasm host failure category.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WasmHostError {
+pub enum WasmHostErrorKind {
     /// Plugin is not installed.
     PluginNotFound,
-    /// Export is absent.
-    ExportNotFound,
+    /// Plugin is installed but not active.
+    PluginUnavailable,
+    /// Plugin-local tool is absent.
+    ToolNotFound,
     /// Sandbox policy denied the invocation.
     PolicyDenied,
-    /// Component trapped.
+    /// A request or response crossed its payload ceiling.
+    PayloadTooLarge,
+    /// Caller cancellation stopped the component.
+    Cancelled,
+    /// Fuel, memory, table, instance, or host-call quota was exhausted.
+    ResourceExhausted,
+    /// Wall-clock deadline expired.
+    Timeout,
+    /// Component trapped for another reason.
     Trap,
+    /// Component returned a response outside the typed JSON contract.
+    InvalidResponse,
+    /// Host failed outside a category the caller can act on.
+    Internal,
 }
+
+/// Actionable Wasm host failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WasmHostError {
+    kind: WasmHostErrorKind,
+    detail: String,
+}
+
+impl WasmHostError {
+    /// Builds a categorized host failure.
+    #[must_use]
+    pub fn new(kind: WasmHostErrorKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+
+    /// Stable category for programmatic handling.
+    #[must_use]
+    pub const fn kind(&self) -> WasmHostErrorKind {
+        self.kind
+    }
+
+    /// Operator-facing detail supplied by the sandbox host.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl Display for WasmHostError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}: {}", self.kind, self.detail)
+    }
+}
+
+impl Error for WasmHostError {}
 
 /// Runtime dispatcher with explicit backend ports.
 pub struct SkillRuntime<'a> {
     native: &'a NativeSkillRegistry,
     http: &'a dyn HttpBridge,
-    wasm: &'a dyn WasmSkillHost,
+    wasm: &'a mut dyn WasmSkillHost,
 }
 
 impl<'a> SkillRuntime<'a> {
@@ -209,7 +307,7 @@ impl<'a> SkillRuntime<'a> {
     pub const fn new(
         native: &'a NativeSkillRegistry,
         http: &'a dyn HttpBridge,
-        wasm: &'a dyn WasmSkillHost,
+        wasm: &'a mut dyn WasmSkillHost,
     ) -> Self {
         Self { native, http, wasm }
     }
@@ -241,10 +339,42 @@ impl<'a> SkillRuntime<'a> {
     /// A Wasm skill returns [`SkillExecutionError::WasmHost`] carrying the
     /// sandboxed host's own refusal.
     pub fn execute(
-        &self,
+        &mut self,
         manifest: &SkillManifest,
         parameters: Value,
     ) -> Result<Value, SkillExecutionError> {
+        self.execute_inner(manifest, parameters, None)
+    }
+
+    /// Executes a skill while propagating cancellation to its Wasm host.
+    ///
+    /// Native and declarative HTTP backends are checked before dispatch. The
+    /// Wasm backend additionally receives the token so it can interrupt an
+    /// already-running guest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkillExecutionError::Cancelled`] before touching any backend
+    /// when cancellation was already requested, plus every error documented by
+    /// [`SkillRuntime::execute`].
+    pub fn execute_cancellable(
+        &mut self,
+        manifest: &SkillManifest,
+        parameters: Value,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, SkillExecutionError> {
+        self.execute_inner(manifest, parameters, Some(cancellation))
+    }
+
+    fn execute_inner(
+        &mut self,
+        manifest: &SkillManifest,
+        parameters: Value,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<Value, SkillExecutionError> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(SkillExecutionError::Cancelled);
+        }
         manifest
             .validate()
             .map_err(SkillExecutionError::InvalidManifest)?;
@@ -283,7 +413,12 @@ impl<'a> SkillRuntime<'a> {
             }
             SkillExecution::Wasm { plugin_id, export } => self
                 .wasm
-                .invoke(plugin_id, export, parameters)
+                .invoke(WasmSkillInvocation {
+                    plugin_id,
+                    tool: export,
+                    parameters,
+                    cancellation,
+                })
                 .map_err(SkillExecutionError::WasmHost),
         }
     }
@@ -359,6 +494,8 @@ pub enum SkillExecutionError {
     InvalidHttpResponse,
     /// Wasm host failed.
     WasmHost(WasmHostError),
+    /// Caller cancelled the skill before backend dispatch.
+    Cancelled,
     /// A native handler rejected or failed its operation.
     NativeFailure,
 }
@@ -374,7 +511,8 @@ impl Display for SkillExecutionError {
             Self::HttpStatus(status) => write!(formatter, "skill HTTP endpoint returned {status}"),
             Self::HttpResponseTooLarge => formatter.write_str("skill HTTP response is too large"),
             Self::InvalidHttpResponse => formatter.write_str("skill HTTP response decoding failed"),
-            Self::WasmHost(error) => write!(formatter, "skill Wasm host failed: {error:?}"),
+            Self::WasmHost(error) => write!(formatter, "skill Wasm host failed: {error}"),
+            Self::Cancelled => formatter.write_str("skill execution was cancelled"),
             Self::NativeFailure => formatter.write_str("native skill handler failed"),
         }
     }

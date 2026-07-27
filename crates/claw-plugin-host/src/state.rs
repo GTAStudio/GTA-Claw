@@ -4,10 +4,12 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use claw_plugin_api::cancellation::CancellationToken;
 use claw_plugin_api::capability::{Capability, CapabilityDenial, CapabilitySet};
 use claw_plugin_api::limits::ResourceLimits;
 
 use crate::bindings::gta_claw::plugin::types::{Error as WitError, ErrorCode};
+use crate::error::TerminationCause;
 use crate::limiter::{HostCallGate, HostCallPermits, InstanceLimiter};
 use crate::services::HostServices;
 
@@ -106,6 +108,8 @@ pub struct PluginState {
     dropped_denials: u64,
     sequence: u64,
     deadline: Option<Instant>,
+    cancellation: Option<CancellationToken>,
+    interruption: Option<TerminationCause>,
 }
 
 impl core::fmt::Debug for PluginState {
@@ -174,6 +178,8 @@ impl PluginState {
             dropped_denials: 0,
             sequence: 0,
             deadline: None,
+            cancellation: None,
+            interruption: None,
         }
     }
 
@@ -272,8 +278,68 @@ impl PluginState {
         &self.write_roots
     }
 
-    pub(crate) const fn set_deadline(&mut self, deadline: Option<Instant>) {
-        self.deadline = deadline;
+    pub(crate) fn arm_call(&mut self, deadline: Instant, cancellation: Option<CancellationToken>) {
+        self.deadline = Some(deadline);
+        self.cancellation = cancellation;
+        self.interruption = None;
+        self.limiter.begin_call();
+    }
+
+    pub(crate) fn disarm_call(&mut self) {
+        self.deadline = None;
+        self.cancellation = None;
+    }
+
+    pub(crate) fn poll_interruption(&mut self) -> Option<TerminationCause> {
+        // Deadline wins when both conditions are first observed together. This
+        // makes the boundary deterministic even when an epoch callback runs
+        // slightly after the absolute deadline.
+        let cause = if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            Some(TerminationCause::Timeout)
+        } else if self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            Some(TerminationCause::Cancelled)
+        } else {
+            None
+        };
+        if cause.is_some() {
+            self.interruption = cause;
+        }
+        cause
+    }
+
+    pub(crate) const fn interruption(&self) -> Option<TerminationCause> {
+        self.interruption
+    }
+
+    pub(crate) const fn hit_resource_ceiling_during_call(&self) -> bool {
+        self.limiter.hit_resource_ceiling_during_call()
+    }
+
+    pub(crate) fn next_interrupt_check_ms(&self, cancellation_poll_ms: u64) -> u64 {
+        let Some(deadline) = self.deadline else {
+            return 1;
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let millis = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+        let until_deadline = millis.max(1);
+        if self.cancellation.is_some() {
+            until_deadline.min(cancellation_poll_ms)
+        } else {
+            until_deadline
+        }
+    }
+
+    pub(crate) fn cancellation_requested(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
     }
 
     pub(crate) const fn next_sequence(&mut self) -> u64 {
@@ -319,6 +385,13 @@ impl PluginState {
                 "the wall-clock budget for this call is already exhausted",
             ));
         }
+        if self.cancellation_requested() {
+            return Err(CapabilityDenial::quota_exceeded(
+                capability,
+                operation,
+                "the caller cancelled this plugin invocation",
+            ));
+        }
         let shared = self.shared_gate.try_acquire().ok_or_else(|| {
             CapabilityDenial::quota_exceeded(
                 capability,
@@ -358,6 +431,11 @@ impl PluginState {
     ) -> wasmtime::Result<Result<T, WitError>> {
         let message = denial.to_string();
         self.record(denial);
+        if let Some(cause) = self.poll_interruption() {
+            return Err(wasmtime::Error::msg(format!(
+                "plugin invocation interrupted ({cause})"
+            )));
+        }
         match self.policy {
             ViolationPolicy::ReturnError => Ok(Err(WitError {
                 code: ErrorCode::PermissionDenied,
@@ -380,6 +458,7 @@ pub(crate) fn wit_error(code: ErrorCode, message: impl Into<String>) -> WitError
 mod tests {
     use std::collections::BTreeSet;
 
+    use claw_plugin_api::cancellation::CancellationToken;
     use claw_plugin_api::capability::{
         Capability, CapabilityGrant, CapabilitySet, DenialReason, EventKind, EventsGrant, LogGrant,
         LogLevel,
@@ -390,6 +469,7 @@ mod tests {
         LifecyclePhase, MAX_AUDIT_ENTRIES, PluginState, PluginStateConfig, ViolationPolicy,
     };
     use crate::bindings::gta_claw::plugin::types::ErrorCode;
+    use crate::error::TerminationCause;
     use crate::limiter::HostCallGate;
     use crate::services::HostServices;
 
@@ -664,11 +744,12 @@ mod tests {
     #[test]
     fn an_expired_deadline_refuses_even_a_granted_capability() {
         let mut state = state(ViolationPolicy::ReturnError, HostCallGate::new(2));
-        state.set_deadline(Some(
+        state.arm_call(
             std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_millis(1))
                 .expect("the process start instant is more than a millisecond ago"),
-        ));
+            None,
+        );
         let denial = state.enter(Capability::Log, "log").expect_err("expired");
         assert_eq!(denial.capability(), Capability::Log);
         assert_eq!(
@@ -677,5 +758,37 @@ mod tests {
                 "the wall-clock budget for this call is already exhausted".to_owned()
             )
         );
+    }
+
+    #[test]
+    fn a_cancelled_host_call_traps_independently_of_violation_policy() {
+        let mut state = state(ViolationPolicy::ReturnError, HostCallGate::new(2));
+        let cancellation = CancellationToken::new();
+        state.arm_call(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            Some(cancellation.clone()),
+        );
+        cancellation.cancel();
+        let denial = state.enter(Capability::Log, "log").expect_err("cancelled");
+        let outcome: wasmtime::Result<Result<(), _>> = state.deny(denial);
+        assert!(
+            outcome.is_err(),
+            "cancellation cannot be caught by the guest"
+        );
+        assert_eq!(state.interruption(), Some(TerminationCause::Cancelled));
+    }
+
+    #[test]
+    fn an_expired_deadline_wins_when_cancellation_is_also_pending() {
+        let mut state = state(ViolationPolicy::ReturnError, HostCallGate::new(2));
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        state.arm_call(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(1))
+                .expect("the process start instant is more than a millisecond ago"),
+            Some(cancellation),
+        );
+        assert_eq!(state.poll_interruption(), Some(TerminationCause::Timeout));
     }
 }

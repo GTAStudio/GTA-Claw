@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use wasmtime::component::{HasSelf, Linker};
-use wasmtime::{Config, Engine, OptLevel, Store};
+use wasmtime::{Config, Engine, OptLevel, Store, UpdateDeadline};
 
 use crate::bindings::Plugin;
 use crate::error::HostError;
@@ -19,6 +19,9 @@ use crate::state::PluginState;
 /// millisecond budget is converted into ticks without ever narrowing the
 /// [`Duration::as_millis`] `u128`.
 const EPOCH_TICK_MS: u64 = 1;
+
+/// Maximum time a cancellable call runs before checking its cancellation flag.
+pub(crate) const CANCELLATION_POLL_MS: u64 = 5;
 
 /// How often the background thread advances the engine epoch.
 ///
@@ -148,7 +151,14 @@ impl PluginEngine {
         store
             .set_fuel(fuel)
             .map_err(|error| HostError::Instantiate(error.to_string()))?;
-        store.epoch_deadline_trap();
+        store.epoch_deadline_callback(|mut context| {
+            if context.data_mut().poll_interruption().is_some() {
+                Ok(UpdateDeadline::Interrupt)
+            } else {
+                let next = context.data().next_interrupt_check_ms(CANCELLATION_POLL_MS);
+                Ok(UpdateDeadline::Continue(epoch_ticks_for(next)))
+            }
+        });
         store.set_epoch_deadline(epoch_ticks_for(timeout_ms));
         Ok(store)
     }

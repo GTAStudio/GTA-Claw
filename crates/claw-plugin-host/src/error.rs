@@ -12,6 +12,8 @@ use claw_plugin_api::trust::{TrustError, VerificationError};
 /// Why a guest call ended early.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminationCause {
+    /// The caller cancelled the in-flight guest call.
+    Cancelled,
     /// The guest exhausted its fuel budget.
     FuelExhausted,
     /// The guest ran past its wall-clock budget and was interrupted.
@@ -29,6 +31,7 @@ impl TerminationCause {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Cancelled => "cancelled",
             Self::FuelExhausted => "fuel-exhausted",
             Self::Timeout => "timeout",
             Self::ResourceLimit => "resource-limit",
@@ -94,6 +97,33 @@ pub enum HostError {
         /// Digest of the bytes on disk.
         actual: String,
     },
+    /// A value crossing the guest boundary exceeded the manifest's payload cap.
+    PayloadTooLarge {
+        /// Which boundary value exceeded the limit.
+        field: &'static str,
+        /// Encoded size in bytes.
+        actual: usize,
+        /// Maximum accepted size in bytes.
+        limit: u32,
+    },
+    /// A typed JSON tool call received a non-JSON guest response.
+    InvalidGuestResponse {
+        /// Plugin that returned the response.
+        plugin_id: String,
+        /// Tool that was invoked.
+        tool: String,
+        /// JSON decoder diagnostic.
+        message: String,
+    },
+    /// Typed input could not be encoded for the string-based component ABI.
+    InvalidToolInput {
+        /// Plugin that would have received the request.
+        plugin_id: String,
+        /// Tool that would have been invoked.
+        tool: String,
+        /// JSON encoder diagnostic.
+        message: String,
+    },
     /// The manifest declared an ABI version this host cannot run.
     Abi(AbiIncompatibility),
     /// A version string in the manifest was malformed.
@@ -121,6 +151,11 @@ pub enum HostError {
     },
     /// The guest returned an error through the ABI.
     Guest(GuestFailure),
+    /// Cancellation was already requested before the guest call began.
+    Cancelled {
+        /// Operation that was not started.
+        operation: &'static str,
+    },
     /// A host call was refused by capability enforcement.
     Denied(CapabilityDenial),
     /// No plugin with this id is loaded.
@@ -180,6 +215,30 @@ impl fmt::Display for HostError {
                 f,
                 "component digest mismatch: manifest pins {expected}, bytes hash to {actual}"
             ),
+            Self::PayloadTooLarge {
+                field,
+                actual,
+                limit,
+            } => write!(
+                f,
+                "plugin {field} is {actual} bytes, which exceeds the {limit} byte payload limit"
+            ),
+            Self::InvalidGuestResponse {
+                plugin_id,
+                tool,
+                message,
+            } => write!(
+                f,
+                "plugin `{plugin_id}` tool `{tool}` returned invalid JSON: {message}"
+            ),
+            Self::InvalidToolInput {
+                plugin_id,
+                tool,
+                message,
+            } => write!(
+                f,
+                "plugin `{plugin_id}` tool `{tool}` input could not be encoded as JSON: {message}"
+            ),
             Self::Abi(error) => write!(f, "incompatible plugin ABI: {error}"),
             Self::Version(error) => write!(f, "malformed version: {error}"),
             Self::IdentityMismatch {
@@ -203,6 +262,9 @@ impl fmt::Display for HostError {
                 write!(f, "guest call terminated ({cause}): {detail}")
             }
             Self::Guest(failure) => fmt::Display::fmt(failure, f),
+            Self::Cancelled { operation } => {
+                write!(f, "plugin {operation} was cancelled before it started")
+            }
             Self::Denied(denial) => fmt::Display::fmt(denial, f),
             Self::UnknownPlugin(id) => write!(f, "no plugin `{id}` is loaded"),
             Self::DuplicatePlugin(id) => write!(f, "plugin `{id}` is already loaded"),

@@ -48,6 +48,7 @@ pub mod limiter;
 pub mod services;
 pub mod state;
 
+pub use claw_plugin_api::cancellation::CancellationToken;
 pub use engine::{EPOCH_TICK, PluginEngine};
 pub use error::{GuestFailure, HostError, TerminationCause};
 pub use inventory::{
@@ -55,8 +56,10 @@ pub use inventory::{
     describe_registry,
 };
 pub use lifecycle::{
-    ALLOWED_IMPORTS, Discovered, EventOutcome, LifecycleState, MANIFEST_FILE_NAME, PluginHost,
-    PluginHostBuilder, ResourceUsage,
+    ALLOWED_IMPORTS, ActivatedPlugin, ActivationFailure, ActivationOutcome, ActivationReport,
+    ActivationStage, Discovered, DiscoveryRecord, DiscoveryStage, DisposalOutcome, DisposalReport,
+    EventOutcome, LifecycleState, MANIFEST_FILE_NAME, PluginHost, PluginHostBuilder,
+    PluginToolInvocation, ResourceUsage,
 };
 pub use limiter::{HostCallGate, HostCallPermit, HostCallPermits};
 pub use services::{
