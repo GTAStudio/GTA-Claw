@@ -37,7 +37,7 @@ pub(crate) struct ReplayStream<S> {
 }
 
 impl<S> ReplayStream<S> {
-    fn new(inner: S, prefix: Vec<u8>) -> Self {
+    const fn new(inner: S, prefix: Vec<u8>) -> Self {
         Self {
             prefix,
             offset: 0,
@@ -259,7 +259,7 @@ impl MessageReader {
             let frame = socket
                 .read_frame()
                 .await
-                .map_err(|error| map_read_error(error, limit))?;
+                .map_err(|error| map_read_error(&error, limit))?;
             if let Some(inbound) = self.consume(frame, limit)? {
                 match inbound {
                     Inbound::Text(bytes) => return Ok(bytes),
@@ -284,7 +284,7 @@ impl MessageReader {
             let frame = socket
                 .read_frame(&mut |_| async { Ok::<(), std::io::Error>(()) })
                 .await
-                .map_err(|error| map_read_error(error, limit))?;
+                .map_err(|error| map_read_error(&error, limit))?;
             if let Some(inbound) = self.consume(frame, limit)? {
                 return Ok(inbound);
             }
@@ -346,7 +346,7 @@ impl MessageReader {
     }
 }
 
-fn validate_control_payload(payload_bytes: usize) -> Result<(), WireFailure> {
+const fn validate_control_payload(payload_bytes: usize) -> Result<(), WireFailure> {
     if payload_bytes <= MAX_CONTROL_PAYLOAD_BYTES {
         Ok(())
     } else {
@@ -388,7 +388,7 @@ fn valid_close_code(code: u16) -> bool {
     ) || (3000..=4999).contains(&code)
 }
 
-fn map_read_error(error: WebSocketError, limit: usize) -> WireFailure {
+const fn map_read_error(error: &WebSocketError, limit: usize) -> WireFailure {
     match error {
         WebSocketError::FrameTooLarge => {
             WireFailure::Protocol(ProtocolFailure::InboundMessageTooLarge { limit })
@@ -535,7 +535,7 @@ impl PeerCloseFrame {
         self.code
     }
 
-    pub(crate) fn is_transient(&self) -> bool {
+    pub(crate) const fn is_transient(&self) -> bool {
         matches!(self.code, Some(1001 | 1011 | 1012 | 1013))
     }
 

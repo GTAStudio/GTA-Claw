@@ -333,8 +333,11 @@ async fn finish_gateway_scenario(
     match outcome {
         Ok(Ok(())) => {}
         Ok(Err(error)) => panic!("{name} failed: {error}; {diagnostics}"),
-        Err(_) => {
-            panic!("{name} exceeded its {GATEWAY_SCENARIO_DEADLINE:?} hard deadline; {diagnostics}")
+        Err(elapsed) => {
+            panic!(
+                "{name} exceeded its {GATEWAY_SCENARIO_DEADLINE:?} hard deadline ({elapsed}); \
+                 {diagnostics}"
+            )
         }
     }
     if let Err(error) = shutdown {
@@ -344,7 +347,7 @@ async fn finish_gateway_scenario(
 
 async fn wait_for_state(
     client: &GatewayClient,
-    predicate: impl Fn(&ConnectionState) -> bool,
+    predicate: impl Fn(&ConnectionState) -> bool + Send + Sync,
 ) -> ConnectionState {
     let mut states = client.subscribe_state();
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -443,6 +446,8 @@ async fn authenticates_correlates_concurrent_requests_handles_fragments_and_shut
     let event = events.recv().await.expect("fragmented event");
     assert_eq!(event.frame().event().as_str(), "tick");
     assert_eq!(event.frame().sequence().expect("sequence").get(), 1);
+    // Release the event's queue byte permit before the bounded shutdown.
+    drop(event);
 
     client.shutdown().await.expect("clean shutdown");
     gateway.shutdown().await;
@@ -548,7 +553,8 @@ async fn exact_requested_authorization_is_enforced_before_ready_or_rpc() {
         let mut states = client.subscribe_state();
         let ready_observer = tokio::spawn(async move {
             loop {
-                match states.borrow().clone() {
+                let state = states.borrow().clone();
+                match state {
                     ConnectionState::Ready(_) => return true,
                     ConnectionState::ProtocolFailed { .. } => return false,
                     ConnectionState::AuthenticationFailed(_)
@@ -1238,6 +1244,8 @@ async fn max_controls_remain_legal_near_fragmented_data_cap() {
         .expect("event timeout")
         .expect("event");
     assert_eq!(event.frame().sequence().expect("sequence").get(), 1);
+    // Release the event's queue byte permit before the bounded shutdown.
+    drop(event);
     client.shutdown().await.expect("shutdown");
     gateway.shutdown().await;
 }
@@ -1556,7 +1564,8 @@ async fn bounds_in_flight_requests_and_cancels_pending_on_shutdown() {
         async move {
             complete_handshake(&mut socket, AUTHENTICATED_MAX_FRAME_BYTES).await;
             let _ = receive_request(&mut socket).await;
-            if let Some(sender) = received_tx.lock().await.take() {
+            let sender = received_tx.lock().await.take();
+            if let Some(sender) = sender {
                 let _ = sender.send(());
             }
             wait_for_close(&mut socket).await;
@@ -1778,7 +1787,8 @@ async fn expired_queued_side_effect_is_never_transmitted_and_releases_budgets() 
 
             let after = receive_request(&mut socket).await;
             assert_eq!(after.id().as_str(), "after-expired");
-            if let Some(sender) = after_received_tx.lock().await.take() {
+            let sender = after_received_tx.lock().await.take();
+            if let Some(sender) = sender {
                 let _ = sender.send(());
             }
 
@@ -1984,7 +1994,8 @@ async fn stale_epoch_is_rejected_after_reconnect_before_enqueue_without_writing_
                 1 => {
                     let request = receive_request(&mut socket).await;
                     b_writes.fetch_add(1, Ordering::SeqCst);
-                    if let Some(sender) = b_request_tx.lock().await.take() {
+                    let sender = b_request_tx.lock().await.take();
+                    if let Some(sender) = sender {
                         let _ = sender.send(request.id().as_str().to_owned());
                     }
                     send_response(&mut socket, request.id().as_str(), 2).await;
@@ -2027,14 +2038,13 @@ async fn stale_epoch_is_rejected_after_reconnect_before_enqueue_without_writing_
     runtime.wait_until_blocked().await;
     assert_eq!(runtime.enqueue_entries(), 1, "enqueue barrier entry");
     close_a.notify_one();
-    let ready_b = match wait_for_state(
+    let state_b = wait_for_state(
         &client,
         |state| matches!(state, ConnectionState::Ready(ready) if ready.epoch != epoch_a),
     )
-    .await
-    {
-        ConnectionState::Ready(ready) => ready,
-        _ => unreachable!("predicate only accepts Ready"),
+    .await;
+    let ConnectionState::Ready(ready_b) = state_b else {
+        unreachable!("predicate only accepts Ready")
     };
     assert_ne!(ready_b.epoch, epoch_a);
     assert_eq!(ready_b.info.connection_id, "same-server-conn-id");
@@ -2118,7 +2128,8 @@ async fn pending_a_response_cannot_complete_as_b_success_or_replay() {
                 1 => {
                     let request = receive_request(&mut socket).await;
                     b_writes.fetch_add(1, Ordering::SeqCst);
-                    if let Some(sender) = b_request_tx.lock().await.take() {
+                    let sender = b_request_tx.lock().await.take();
+                    if let Some(sender) = sender {
                         let _ = sender.send(request.id().as_str().to_owned());
                     }
                     send_response(&mut socket, request.id().as_str(), 7).await;
@@ -2158,14 +2169,13 @@ async fn pending_a_response_cannot_complete_as_b_success_or_replay() {
         .await
         .expect("A response gate entered");
     disconnect_a.notify_one();
-    let ready_b = match wait_for_state(
+    let state_b = wait_for_state(
         &client,
         |state| matches!(state, ConnectionState::Ready(ready) if ready.epoch != epoch_a),
     )
-    .await
-    {
-        ConnectionState::Ready(ready) => ready,
-        _ => unreachable!("predicate only accepts Ready"),
+    .await;
+    let ConnectionState::Ready(ready_b) = state_b else {
+        unreachable!("predicate only accepts Ready")
     };
     response_gate_release.notify_one();
     tokio::time::timeout(Duration::from_secs(2), response_gate_consumed.notified())
@@ -2260,7 +2270,8 @@ async fn invalid_authorization_on_b_never_publishes_ready_or_accepts_rpc() {
     let mut states = client.subscribe_state();
     let b_ready_observer = tokio::spawn(async move {
         loop {
-            match states.borrow().clone() {
+            let state = states.borrow().clone();
+            match state {
                 ConnectionState::Ready(ready) if ready.epoch != epoch_a => return true,
                 ConnectionState::ProtocolFailed { .. } => return false,
                 ConnectionState::AuthenticationFailed(_)
@@ -2343,7 +2354,8 @@ async fn reconnect_storm_allocates_distinct_epochs_and_only_fresh_binds_write() 
             } else {
                 let request = receive_request(&mut socket).await;
                 final_writes.fetch_add(1, Ordering::SeqCst);
-                if let Some(sender) = final_request_tx.lock().await.take() {
+                let sender = final_request_tx.lock().await.take();
+                if let Some(sender) = sender {
                     let _ = sender.send(request.id().as_str().to_owned());
                 }
                 send_response(&mut socket, request.id().as_str(), 11).await;
@@ -2376,9 +2388,8 @@ async fn reconnect_storm_allocates_distinct_epochs_and_only_fresh_binds_write() 
             )
         })
         .await;
-        let ready = match state {
-            ConnectionState::Ready(ready) => ready,
-            _ => unreachable!("predicate only accepts Ready"),
+        let ConnectionState::Ready(ready) = state else {
+            unreachable!("predicate only accepts Ready")
         };
         assert_eq!(ready.info.connection_id, "storm-reused-server-id");
         for (old_index, old_epoch) in epochs.iter().copied().enumerate() {

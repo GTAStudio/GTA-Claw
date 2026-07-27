@@ -1,4 +1,4 @@
-//! Bounded pure-Rust OpenClaw Gateway WebSocket/WSS client.
+//! Bounded pure-Rust `OpenClaw` Gateway WebSocket/WSS client.
 //!
 //! This crate implements transport and lifecycle only. It deliberately provides
 //! no Gateway server, RPC handlers, provider session, or GUI integration.

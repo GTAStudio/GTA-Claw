@@ -8,7 +8,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use claw_protocol::gateway::{
-    Codec, ConnectParams, Frame as GatewayFrame, RequestFrame, RequestId,
+    Codec, ConnectParams, Frame as GatewayFrame, Name, RequestFrame, RequestId,
 };
 use claw_security::authorization::{Role, Scope, ScopeSet};
 use claw_security::identity::{DevicePublicKey, DeviceSignature, GatewayDeviceSigningInput};
@@ -274,9 +274,8 @@ pub(crate) async fn send_challenge(socket: &mut TestSocket) {
 pub(crate) async fn receive_connect(socket: &mut TestSocket) -> (RequestFrame, ConnectParams) {
     let bytes = receive_text(socket).await;
     let codec = Codec::preauthentication();
-    let request = match codec.decode(&bytes).expect("strict connect frame") {
-        GatewayFrame::Request(request) => request,
-        _ => panic!("expected request"),
+    let GatewayFrame::Request(request) = codec.decode(&bytes).expect("strict connect frame") else {
+        panic!("expected request")
     };
     let params = codec.decode_connect(&request).expect("connect params");
     (request, params)
@@ -330,11 +329,7 @@ pub(crate) fn verify_connect_proof(params: &ConnectParams) {
                 token: token.as_ref(),
                 nonce: proof.nonce.as_str(),
                 platform: params.client.platform.as_str(),
-                device_family: params
-                    .client
-                    .device_family
-                    .as_ref()
-                    .map(|name| name.as_str()),
+                device_family: params.client.device_family.as_ref().map(Name::as_str),
             },
             &signature,
         )
@@ -435,26 +430,25 @@ async fn send_hello_with_policy(
         .as_ref()
         .map_or("operator", |role| role.as_str());
     let scopes = params.scopes.as_ref().map_or_else(Vec::new, |scopes| {
-        scopes
-            .iter()
-            .map(|scope| scope.as_str())
-            .collect::<Vec<_>>()
+        scopes.iter().map(Name::as_str).collect::<Vec<_>>()
     });
-    let auth = match device_token {
-        Some(device_token) => json!({
-            "role": role,
-            "scopes": scopes,
-            "deviceToken": device_token,
-            "issuedAtMs": 1_700_000_000_001_u64,
-            "deviceTokens": [{
-                "deviceToken": "secondary-device-token",
-                "role": "node",
-                "scopes": [],
-                "issuedAtMs": 1_700_000_000_002_u64
-            }]
-        }),
-        None => json!({"role": role, "scopes": scopes}),
-    };
+    let auth = device_token.map_or_else(
+        || json!({"role": role, "scopes": scopes}),
+        |device_token| {
+            json!({
+                "role": role,
+                "scopes": scopes,
+                "deviceToken": device_token,
+                "issuedAtMs": 1_700_000_000_001_u64,
+                "deviceTokens": [{
+                    "deviceToken": "secondary-device-token",
+                    "role": "node",
+                    "scopes": [],
+                    "issuedAtMs": 1_700_000_000_002_u64
+                }]
+            })
+        },
+    );
     send_json(
         socket,
         json!({
