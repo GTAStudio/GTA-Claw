@@ -1,0 +1,238 @@
+name: iOS target compile
+
+# Compiles the shipped iOS client for the two admitted Apple mobile targets.
+#
+# This deliberately does NOT package: there is no signing, no .ipa, no simulator
+# run. It answers one question that nothing in this repository has answered yet —
+# whether `apps/gta-claw-ios` actually compiles for `aarch64-apple-ios`. Every
+# green result on this crate so far has been a host-target result (x86_64-pc-
+# windows-msvc and x86_64-apple-darwin), which is evidence about the host and not
+# about iOS.
+#
+# It runs `cargo build`, not `cargo check`. `check` stops after type and borrow
+# checking and emits only `.rmeta`: it never runs codegen, so it cannot produce a
+# Mach-O object and cannot fail on a codegen or target-ABI problem. Claiming an
+# iOS compile on the strength of `cargo check` would overstate the evidence, so
+# codegen is forced and the emitted objects are then inspected.
+#
+# It needs no reviewed Skia pin because the shipped crate is UI-independent and
+# pulls in no `skia-bindings`. That invariant is asserted below rather than
+# assumed, because it is the property that keeps this workflow runnable while
+# `PINNED_BUILD_ARTIFACTS` is empty.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/ios-packaging.yml"
+      - "apps/gta-claw-ios/**"
+      - "crates/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+  pull_request:
+    paths:
+      - ".github/workflows/ios-packaging.yml"
+      - "apps/gta-claw-ios/**"
+      - "crates/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-target-compile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    # The declared name is deliberately static. A matrix job must declare an
+    # explicit audited name, and a name containing a bare `${{ matrix.* }}`
+    # expression is refused because it could render a reserved check identity
+    # (workflows.rs: "dynamic workflow job name can render a reserved identity").
+    # GitHub still appends the matrix values to the rendered check name, so the
+    # two legs stay distinguishable without an expression here.
+    name: iOS cross compile
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-ios
+            sdk: iphoneos
+          - target: aarch64-apple-ios-sim
+            sdk: iphonesimulator
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Record the toolchain and SDK actually used
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add "${{ matrix.target }}"
+          rustc --version --verbose
+          cargo --version
+          echo "sdk path: $(xcrun --show-sdk-path --sdk '${{ matrix.sdk }}')"
+          echo "sdk version: $(xcrun --show-sdk-version --sdk '${{ matrix.sdk }}')"
+
+      - name: Assert the shipped crate pulls in no build-time-fetching package
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree="$(cargo tree --locked --package gta-claw-ios \
+            --target '${{ matrix.target }}' --prefix none)"
+
+          total="$(printf '%s\n' "$tree" | grep -c . || true)"
+          echo "dependency lines resolved for ${{ matrix.target }}: ${total}"
+
+          # Positive control. An absence assertion over an empty or failed tree
+          # would pass while proving nothing, so first prove the tree is real by
+          # requiring a dependency the crate certainly has.
+          if ! printf '%s\n' "$tree" | grep -qE '^claw-gateway-client v'; then
+            echo "positive control failed: claw-gateway-client absent from the" \
+                 "resolved tree, so this check cannot distinguish 'no Skia' from" \
+                 "'no tree'. Resolved ${total} lines:"
+            printf '%s\n' "$tree" | head -n 40
+            exit 1
+          fi
+
+          # The absence assertion itself, reported with the offending lines.
+          offenders="$(printf '%s\n' "$tree" \
+            | grep -E '^(skia-bindings|skia-safe|i-slint-renderer-skia) v' || true)"
+          if [ -n "${offenders}" ]; then
+            echo "the shipped iOS crate resolved a build-time-fetching package," \
+                 "which requires a reviewed PINNED_BUILD_ARTIFACTS entry before" \
+                 "it may build. Offending dependencies:"
+            printf '%s\n' "${offenders}"
+            exit 1
+          fi
+          echo "no skia-bindings/skia-safe/i-slint-renderer-skia in ${total} resolved lines"
+
+      - name: Compile gta-claw-ios with codegen for the matrix target
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --package gta-claw-ios --target '${{ matrix.target }}'
+
+      - name: Prove the emitted objects are Mach-O arm64 for this exact platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          outdir="target/${{ matrix.target }}/debug"
+          rlib="$(find "${outdir}" -maxdepth 1 -name 'libgta_claw_ios*.rlib' \
+            | head -n 1 || true)"
+          if [ -z "${rlib}" ]; then
+            echo "cargo build emitted no rlib for ${{ matrix.target }}, so there is"
+            echo "no object to inspect and no compile to claim. Contents of ${outdir}:"
+            ls -la "${outdir}" || echo "(directory absent)"
+            exit 1
+          fi
+          rlib="$(cd "$(dirname "${rlib}")" && pwd)/$(basename "${rlib}")"
+          echo "artifact: ${rlib}"
+
+          workdir="$(mktemp -d)"
+          cd "${workdir}"
+          ar x "${rlib}"
+
+          # Positive control. An architecture assertion over zero object files
+          # would pass while proving nothing, so require that codegen actually
+          # emitted members before asserting anything about them.
+          obj="$(find . -name '*.o' | head -n 1 || true)"
+          if [ -z "${obj}" ]; then
+            echo "the rlib contains no object members, so this check cannot tell"
+            echo "'wrong architecture' from 'nothing was compiled'. Members were:"
+            ar t "${rlib}" | head -n 20
+            exit 1
+          fi
+          echo "object members: $(find . -name '*.o' | wc -l | tr -d ' ')"
+
+          kind="$(file -b "${obj}")"
+          echo "file: ${kind}"
+          case "${kind}" in
+            *'Mach-O 64-bit object arm64'*) ;;
+            *)
+              echo "expected a Mach-O 64-bit arm64 object for ${{ matrix.target }},"
+              echo "but file reported: ${kind}"
+              exit 1
+              ;;
+          esac
+
+          # arm64 alone cannot separate device from simulator: both are arm64, and
+          # the platform lives in LC_BUILD_VERSION rather than in the cpu type.
+          # Compare the platform token by equality, not by prefix or substring:
+          # `IOS` is a strict prefix of `IOSSIMULATOR`, so a substring test would
+          # accept a simulator object as a device build. That is the same
+          # confusion class as a pin-table URL match accepting the wrong target.
+          # Apple encodes the platform in one of two mutually exclusive ways, and
+          # which one appears is itself a device/simulator discriminator:
+          #   * LC_BUILD_VERSION carries an explicit `platform` token. The
+          #     simulator has no other encoding, so a simulator object always
+          #     uses this one.
+          #   * LC_VERSION_MIN_IPHONEOS is the legacy, device-only command,
+          #     emitted when the deployment target predates LC_BUILD_VERSION
+          #     (rustc targets iOS 10.0 here). It has no way to express
+          #     "simulator", so its presence is positive evidence of a device
+          #     build. Measured: the device leg emits this and no platform token.
+          vt="$(vtool -show-build-version "${obj}" 2>&1 || true)"
+          lc="$(otool -l "${obj}" 2>&1 || true)"
+          token="$(printf '%s\n%s\n' "${vt}" "${lc}" \
+            | awk '$1 == "platform" { print $2; exit }')"
+
+          case "${token}" in
+            IOS)          actual="IOS";          encoding="LC_BUILD_VERSION" ;;
+            IOSSIMULATOR) actual="IOSSIMULATOR"; encoding="LC_BUILD_VERSION" ;;
+            2)            actual="IOS";          encoding="LC_BUILD_VERSION(2)" ;;
+            7)            actual="IOSSIMULATOR"; encoding="LC_BUILD_VERSION(7)" ;;
+            "")
+              if printf '%s\n' "${lc}" | grep -q 'LC_VERSION_MIN_IPHONEOS'; then
+                actual="IOS"
+                encoding="LC_VERSION_MIN_IPHONEOS (legacy, device-only)"
+              else
+                actual=""
+                encoding="none"
+              fi
+              ;;
+            *) actual="UNKNOWN(${token})"; encoding="LC_BUILD_VERSION" ;;
+          esac
+
+          case "${{ matrix.sdk }}" in
+            iphoneos)        expected="IOS" ;;
+            iphonesimulator) expected="IOSSIMULATOR" ;;
+            *)
+              echo "unmapped sdk '${{ matrix.sdk }}': refusing to guess a platform"
+              exit 1
+              ;;
+          esac
+          if [ -z "${actual}" ]; then
+            echo "the object carries neither an LC_BUILD_VERSION platform token nor"
+            echo "LC_VERSION_MIN_IPHONEOS, so the platform cannot be verified and"
+            echo "this check must not report success. Load commands were:"
+            printf '%s\n' "${lc}" | grep -E '^\s+cmd ' | head -n 40
+            exit 1
+          fi
+          if [ "${actual}" != "${expected}" ]; then
+            echo "platform mismatch for ${{ matrix.target }}:"
+            echo "  expected exactly: ${expected}"
+            echo "  actually built  : ${actual}"
+            echo "  encoding        : ${encoding}"
+            exit 1
+          fi
+
+          # Belt and braces on the direction that actually matters. A simulator
+          # object satisfying the device leg is the harmful confusion; assert the
+          # simulator marker is absent outright rather than relying on the token
+          # comparison alone.
+          if [ "${expected}" = "IOS" ] \
+            && printf '%s\n' "${vt}" "${lc}" | grep -q 'IOSSIMULATOR'; then
+            echo "the device leg found a simulator marker in the object:"
+            printf '%s\n' "${vt}" "${lc}" | grep -n 'IOSSIMULATOR' | head -n 10
+            exit 1
+          fi
+
+          echo "verified: Mach-O 64-bit arm64 object, platform ${actual} via" \
+               "${encoding}, matching ${{ matrix.target }} exactly"
