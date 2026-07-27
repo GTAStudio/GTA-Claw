@@ -82,7 +82,7 @@ pub(crate) async fn rpc(
     let limits = &state.inner.config.limits;
     let value = read_json_value(request, limits.admin_body_bytes, limits.body_timeout)
         .await
-        .map_err(map_body_error)?;
+        .map_err(|error| map_body_error(&error))?;
     let object = value.as_object().ok_or_else(|| {
         admin_error(
             StatusCode::BAD_REQUEST,
@@ -112,7 +112,7 @@ pub(crate) async fn rpc(
     if !ADMIN_HTTP_RPC_METHODS.contains(&method.as_str()) {
         return Ok(admin_response(
             StatusCode::BAD_REQUEST,
-            json!({
+            &json!({
                 "id":id,
                 "ok":false,
                 "error":{
@@ -144,12 +144,18 @@ pub(crate) async fn rpc(
     if method == "commands.list" {
         return Ok(admin_response(
             StatusCode::OK,
-            json!({"id":id,"ok":true,"payload":{"methods":ADMIN_HTTP_RPC_METHODS}}),
+            &json!({"id":id,"ok":true,"payload":{"methods":ADMIN_HTTP_RPC_METHODS}}),
         ));
     }
     let params = object.get("params").cloned();
     let cancellation = CancellationToken::new();
     let _cancel_on_drop = CancelOnDrop::new(&cancellation);
+    // `AdminFailure` is part of the frozen port surface, so the `Err` payload
+    // cannot be boxed without changing the public API.
+    #[expect(
+        clippy::result_large_err,
+        reason = "`AdminFailure` is a frozen public port type; boxing it here would change `AdminPort::dispatch`'s signature and the wire contract it feeds"
+    )]
     let result = timeout(
         limits.operation_timeout,
         state
@@ -169,20 +175,20 @@ pub(crate) async fn rpc(
         })
     });
     match result {
-        Ok(success) => Ok(admin_success_response(id, success)),
-        Err(failure) => Ok(admin_failure_response(id, failure)),
+        Ok(success) => Ok(admin_success_response(&id, success)),
+        Err(failure) => Ok(admin_failure_response(&id, failure)),
     }
 }
 
-fn admin_success_response(id: String, success: AdminSuccess) -> Response {
+fn admin_success_response(id: &str, success: AdminSuccess) -> Response {
     let mut body = json!({"id":id,"ok":true,"payload":success.payload});
     if let Some(meta) = success.meta {
         body["meta"] = meta;
     }
-    admin_response(StatusCode::OK, body)
+    admin_response(StatusCode::OK, &body)
 }
 
-fn admin_failure_response(id: String, failure: AdminFailure) -> Response {
+fn admin_failure_response(id: &str, failure: AdminFailure) -> Response {
     let status = match failure.code.as_str() {
         "INVALID_REQUEST" => StatusCode::BAD_REQUEST,
         "APPROVAL_NOT_FOUND" => StatusCode::NOT_FOUND,
@@ -201,10 +207,10 @@ fn admin_failure_response(id: String, failure: AdminFailure) -> Response {
     if let Some(retry_after_ms) = failure.retry_after_ms {
         error["retryAfterMs"] = json!(retry_after_ms);
     }
-    admin_response(status, json!({"id":id,"ok":false,"error":error}))
+    admin_response(status, &json!({"id":id,"ok":false,"error":error}))
 }
 
-fn map_body_error(error: ApiError) -> ApiError {
+fn map_body_error(error: &ApiError) -> ApiError {
     let message = match error.status {
         StatusCode::PAYLOAD_TOO_LARGE => "Payload too large",
         StatusCode::REQUEST_TIMEOUT => "request body timed out",
@@ -221,7 +227,7 @@ fn admin_error(status: StatusCode, kind: &str, message: &str) -> ApiError {
     }
 }
 
-fn admin_response(status: StatusCode, body: Value) -> Response {
+fn admin_response(status: StatusCode, body: &Value) -> Response {
     let mut response = json_response(status, body);
     response
         .headers_mut()

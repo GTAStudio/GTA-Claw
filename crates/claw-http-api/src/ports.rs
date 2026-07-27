@@ -31,6 +31,15 @@ pub struct ReadinessSnapshot {
 /// Supplies real dependency health rather than a constant probe response.
 pub trait ReadinessPort: Send + Sync {
     /// Returns the current readiness snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortError`] when the adapter cannot determine dependency
+    /// health at all — for example its own state is poisoned or unreachable.
+    /// An implementation must not report an error merely because a dependency
+    /// is down; that is a `ready: false` snapshot instead. `GET /ready` renders
+    /// an error as `503` with `{"ready":false}`, and for an authenticated
+    /// caller lists `internal` in `failing`.
     fn snapshot(&self) -> Result<ReadinessSnapshot, PortError>;
 }
 
@@ -53,7 +62,7 @@ pub struct Usage {
 }
 
 /// One client-provided function tool.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ClientTool {
     /// Function name.
     pub name: String,
@@ -117,7 +126,7 @@ pub enum ToolChoice {
 /// Provider-neutral generation request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerationRequest {
-    /// OpenClaw routing model identifier.
+    /// `OpenClaw` routing model identifier.
     pub model: String,
     /// Flattened conversation prompt.
     pub prompt: String,
@@ -145,7 +154,7 @@ pub struct GenerationRequest {
     pub seed: Option<i64>,
     /// Optional stop sequences.
     pub stop: Option<Vec<String>>,
-    /// Optional OpenAI response-format object.
+    /// Optional `OpenAI` response-format object.
     pub response_format: Option<Value>,
     /// Stable request identifier.
     pub request_id: String,
@@ -187,7 +196,7 @@ pub enum GenerationEvent {
 /// Embedding provider request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EmbeddingRequest {
-    /// OpenClaw routing model identifier.
+    /// `OpenClaw` routing model identifier.
     pub model: String,
     /// Input texts.
     pub input: Vec<String>,
@@ -197,7 +206,7 @@ pub struct EmbeddingRequest {
 
 /// Calls the provider SDK without depending on a concrete provider crate.
 pub trait ProviderPort: Send + Sync {
-    /// Lists configured OpenClaw model aliases.
+    /// Lists configured `OpenClaw` model aliases.
     fn models(&self) -> PortFuture<'_, Result<Vec<Model>, PortError>>;
 
     /// Runs a non-streaming generation.
@@ -224,7 +233,7 @@ pub trait ProviderPort: Send + Sync {
 }
 
 /// Result of an HTTP tool invocation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolOutcome {
     /// HTTP status selected by tool policy.
     pub status: u16,
@@ -264,7 +273,7 @@ pub struct ToolInvocationContext {
 }
 
 /// One fully contextualized tool invocation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolInvocation {
     /// Tool name.
     pub name: String,
@@ -277,7 +286,7 @@ pub struct ToolInvocation {
 }
 
 /// Tool schema exposed to MCP.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ToolDefinition {
     /// Tool name.
     pub name: String,
@@ -303,7 +312,7 @@ pub trait ToolPort: Send + Sync {
 }
 
 /// Successful admin Gateway dispatch.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminSuccess {
     /// Gateway response payload.
     pub payload: Value,
@@ -312,7 +321,7 @@ pub struct AdminSuccess {
 }
 
 /// Gateway-shaped admin dispatch error.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminFailure {
     /// Stable Gateway error code.
     pub code: String,
@@ -368,7 +377,7 @@ pub trait WatchResultPort: Send + Sync {
 }
 
 /// Result selected by the task-flow webhook runtime.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WebhookOutcome {
     /// HTTP status.
     pub status: u16,
@@ -394,6 +403,15 @@ pub trait WebhookPort: Send + Sync {
 /// Persists security decisions before protected dispatch.
 pub trait AuditPort: Send + Sync {
     /// Durably persists one redacted event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortError`] when the event could not be made durable. The
+    /// authorization decision that produced the event is then *not* taken: an
+    /// OpenAI-style route answers `503` with
+    /// `{"error":{"message":"internal error","type":"api_error"}}`, and
+    /// `POST /api/v1/admin/rpc` answers `503` with
+    /// `{"ok":false,"error":{"type":"unavailable",...}}`.
     fn persist(&self, event: &AuditEvent) -> Result<(), PortError>;
 }
 

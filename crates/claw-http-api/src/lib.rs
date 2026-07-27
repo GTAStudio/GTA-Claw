@@ -1,6 +1,6 @@
 //! Complete bounded HTTP/SSE surface for GTA Claw.
 //!
-//! The adapter implements the frozen 18-route OpenClaw inventory while keeping
+//! The adapter implements the frozen 18-route `OpenClaw` inventory while keeping
 //! provider, Gateway, persistence, pairing, and task-flow behavior behind narrow
 //! ports. Streaming routes use bounded channels and propagate disconnect
 //! cancellation to their provider operations.
@@ -181,10 +181,10 @@ impl HttpApi {
                 HeaderName::from_static("x-openclaw-message-to"),
                 HeaderName::from_static("x-openclaw-thread-id"),
             ]);
-        let cors = if !cors_origins.is_empty() {
-            cors.allow_origin(cors_origins)
-        } else {
+        let cors = if cors_origins.is_empty() {
             cors
+        } else {
+            cors.allow_origin(cors_origins)
         };
         let router = router
             .merge(protected)
@@ -236,6 +236,12 @@ impl HttpApi {
     }
 
     /// Serves the API on an already-bound listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`io::Error`] reported by the accept loop. Nothing is written
+    /// to any client: the call only resolves once the listener itself fails, so
+    /// in-flight requests are unaffected and no HTTP status is produced.
     pub async fn serve(self, listener: TcpListener) -> io::Result<()> {
         axum::serve(
             listener,
@@ -246,6 +252,13 @@ impl HttpApi {
     }
 
     /// Serves the MCP surface on an already-bound loopback listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] before accepting anything when
+    /// `listener` is not bound to a loopback address, so no client ever reaches
+    /// the MCP surface; otherwise returns the [`io::Error`] reported by the
+    /// accept loop.
     pub async fn serve_mcp(self, listener: TcpListener) -> io::Result<()> {
         if !listener.local_addr()?.ip().is_loopback() {
             return Err(io::Error::new(

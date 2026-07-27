@@ -59,7 +59,7 @@ pub(crate) async fn handle(
     };
     match *request.method() {
         Method::GET => Ok(mcp_sse(&state)),
-        Method::DELETE => Ok(json_response(StatusCode::OK, json!({"ok":true}))),
+        Method::DELETE => Ok(json_response(StatusCode::OK, &json!({"ok":true}))),
         Method::POST => post(state, request, sender_is_owner).await,
         _ => Err(ApiError::method("GET, POST, DELETE")),
     }
@@ -127,7 +127,7 @@ async fn post(
             state.inner.config.limits.body_timeout,
             json_response(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                json!({"error":"unsupported_media_type"}),
+                &json!({"error":"unsupported_media_type"}),
             ),
         )
         .await);
@@ -138,19 +138,19 @@ async fn post(
         Err(error) if error.status == StatusCode::PAYLOAD_TOO_LARGE => {
             return Ok(json_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                json!({"error":"payload_too_large"}),
+                &json!({"error":"payload_too_large"}),
             ));
         }
         Err(error) if error.status == StatusCode::REQUEST_TIMEOUT => {
             return Ok(json_response(
                 StatusCode::REQUEST_TIMEOUT,
-                json!({"error":"request_body_timeout"}),
+                &json!({"error":"request_body_timeout"}),
             ));
         }
         Err(_) => {
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
-                json_rpc_error(Value::Null, -32700, "Parse error"),
+                &json_rpc_error(Value::Null, -32700, "Parse error"),
             ));
         }
     };
@@ -167,16 +167,14 @@ async fn post(
         }
     }
     if responses.is_empty() {
-        return Ok(json_response(StatusCode::ACCEPTED, Value::Null));
+        return Ok(json_response(StatusCode::ACCEPTED, &Value::Null));
     }
-    Ok(json_response(
-        StatusCode::OK,
-        if is_batch {
-            Value::Array(responses)
-        } else {
-            responses.into_iter().next().unwrap_or(Value::Null)
-        },
-    ))
+    let body = if is_batch {
+        Value::Array(responses)
+    } else {
+        responses.into_iter().next().unwrap_or(Value::Null)
+    };
+    Ok(json_response(StatusCode::OK, &body))
 }
 
 async fn handle_message(state: &ApiState, message: Value, sender_is_owner: bool) -> Option<Value> {
@@ -207,8 +205,8 @@ async fn handle_message(state: &ApiState, message: Value, sender_is_owner: bool)
                 .find(|protocol| *protocol == requested)
                 .unwrap_or(SUPPORTED_PROTOCOLS[0]);
             Some(rpc_result(
-                id,
-                json!({
+                &id,
+                &json!({
                     "protocolVersion":protocol,
                     "capabilities":{"tools":{}},
                     "serverInfo":{"name":"openclaw","version":"0.1.0"}
@@ -222,15 +220,14 @@ async fn handle_message(state: &ApiState, message: Value, sender_is_owner: bool)
         )
         .await
         {
-            Ok(Ok(tools)) => Some(rpc_result(id, json!({"tools":tools}))),
+            Ok(Ok(tools)) => Some(rpc_result(&id, &json!({"tools":tools}))),
             _ => Some(json_rpc_error(id, -32603, "Internal error")),
         },
         "tools/call" => {
             let name = params
                 .and_then(|params| params.get("name"))
                 .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or("");
+                .map_or("", str::trim);
             let arguments = params
                 .and_then(|params| params.get("arguments"))
                 .cloned()
@@ -244,8 +241,8 @@ async fn handle_message(state: &ApiState, message: Value, sender_is_owner: bool)
             }
             if name.is_empty() {
                 return Some(rpc_result(
-                    id,
-                    tool_call_error("Tool not available: unknown"),
+                    &id,
+                    &tool_call_error("Tool not available: unknown"),
                 ));
             }
             let cancellation = CancellationToken::new();
@@ -274,9 +271,12 @@ async fn handle_message(state: &ApiState, message: Value, sender_is_owner: bool)
             )
             .await
             {
-                Ok(Ok(outcome)) => Some(rpc_result(id, mcp_tool_result(outcome))),
-                Ok(Err(error)) => Some(rpc_result(id, tool_call_error(&error.message))),
-                Err(_) => Some(rpc_result(id, tool_call_error("tool execution timed out"))),
+                Ok(Ok(outcome)) => Some(rpc_result(&id, &mcp_tool_result(outcome))),
+                Ok(Err(error)) => Some(rpc_result(&id, &tool_call_error(&error.message))),
+                Err(_) => Some(rpc_result(
+                    &id,
+                    &tool_call_error("tool execution timed out"),
+                )),
             }
         }
         _ => Some(json_rpc_error(
@@ -287,7 +287,7 @@ async fn handle_message(state: &ApiState, message: Value, sender_is_owner: bool)
     }
 }
 
-fn rpc_result(id: Value, result: Value) -> Value {
+fn rpc_result(id: &Value, result: &Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"result":result})
 }
 

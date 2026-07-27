@@ -30,7 +30,7 @@ pub enum AdminRpcEnvelope {
 }
 
 /// Every distinct Admin HTTP RPC failure class.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdminRpcError {
     /// No verified admin caller was produced for the request.
     Unauthenticated,
@@ -162,7 +162,7 @@ impl AdminRpcError {
                 json!({"id":id,"ok":false,"error":self.rpc_error_object()})
             }
         };
-        let mut response = admin_rpc_response(self.status(), body);
+        let mut response = admin_rpc_response(self.status(), &body);
         if matches!(self, Self::Unauthenticated) {
             response.headers_mut().insert(
                 header::WWW_AUTHENTICATE,
@@ -213,7 +213,7 @@ pub fn dispatch_status(code: &str) -> StatusCode {
 }
 
 /// Renders an Admin HTTP RPC body with the headers the surface always sets.
-pub(crate) fn admin_rpc_response(status: StatusCode, body: Value) -> Response {
+pub(crate) fn admin_rpc_response(status: StatusCode, body: &Value) -> Response {
     let mut response = json_response(status, body);
     response
         .headers_mut()

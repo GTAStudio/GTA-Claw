@@ -76,7 +76,7 @@ impl Default for HttpLimits {
             mcp_body_bytes: 1024 * 1024,
             webhook_body_bytes: 256 * 1024,
             body_timeout: Duration::from_secs(30),
-            operation_timeout: Duration::from_secs(120),
+            operation_timeout: Duration::from_mins(2),
             stream_buffer: 16,
             heartbeat_interval: Duration::from_secs(15),
             watch_poll_timeout: Duration::from_secs(20),
@@ -91,7 +91,7 @@ impl Default for HttpLimits {
 /// Complete HTTP adapter configuration.
 #[derive(Clone, Debug)]
 pub struct ApiConfig {
-    /// Bearer credentials for OpenAI, tools, models, and admin surfaces.
+    /// Bearer credentials for `OpenAI`, tools, models, and admin surfaces.
     pub authenticator: BearerAuthenticator,
     /// MCP owner bearer token authenticator.
     pub mcp_owner_authenticator: BearerAuthenticator,

@@ -28,7 +28,19 @@ use crate::ports::{
     GenerationRequest, InputMedia, InputMediaKind, InputMediaSource, PortError, PortErrorKind,
     ToolCall, ToolChoice, Usage,
 };
-use crate::state::ApiState;
+use crate::state::{ApiState, unix_seconds};
+
+/// Largest embedding width `POST /v1/embeddings` will ask a provider to build.
+///
+/// Nothing upstream bounds this: the route has no configured maximum, and the
+/// routing identifiers it exposes (`openclaw`, `openclaw/<agentId>`) declare no
+/// dimensionality to derive one from, so the ceiling is pinned here. 8192 is the
+/// widest vector `claw-memory` will store, and matches the per-input character
+/// cap this module already enforces; it is also far above the widest embedding
+/// any current model emits (3072). Without it a single request can ask for
+/// `usize::MAX` floats per input, and the provider allocating them takes down
+/// every other request sharing the host.
+const MAX_EMBEDDING_DIMENSIONS: u16 = 8_192;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -109,12 +121,13 @@ pub(crate) async fn models(
     .map_err(|_| provider_api_error(PortError::new(PortErrorKind::Timeout, "request timed out")))?
     .map_err(provider_api_error)?;
     let data = model_ids(&state)
-        .into_iter()
+        .iter()
+        .map(String::as_str)
         .map(model_object)
         .collect::<Vec<_>>();
     Ok(json_response(
         StatusCode::OK,
-        json!({"object": "list", "data": data}),
+        &json!({"object": "list", "data": data}),
     ))
 }
 
@@ -151,7 +164,7 @@ pub(crate) async fn model(
             "invalid_request_error",
         ));
     }
-    Ok(json_response(StatusCode::OK, model_object(id)))
+    Ok(json_response(StatusCode::OK, &model_object(&id)))
 }
 
 fn model_ids(state: &ApiState) -> Vec<String> {
@@ -175,7 +188,7 @@ fn model_ids(state: &ApiState) -> Vec<String> {
     ids
 }
 
-fn model_object(id: String) -> Value {
+fn model_object(id: &str) -> Value {
     json!({
         "id": id,
         "object": "model",
@@ -220,11 +233,7 @@ pub(crate) async fn embeddings(
     validate_model(&state, &model)?;
     let input = embedding_inputs(body.input)?;
     validate_embedding_inputs(&input)?;
-    let dimensions = body
-        .dimensions
-        .and_then(|value| value.as_f64())
-        .filter(|value| value.is_finite() && *value > 0.0 && *value <= usize::MAX as f64)
-        .map(|value| value.floor() as usize);
+    let dimensions = embedding_dimensions(body.dimensions.as_ref())?;
     let base64 = matches!(
         body.encoding_format.as_ref().and_then(Value::as_str),
         Some("base64")
@@ -263,7 +272,7 @@ pub(crate) async fn embeddings(
         .collect::<Vec<_>>();
     Ok(json_response(
         StatusCode::OK,
-        json!({
+        &json!({
             "object": "list",
             "data": data,
             "model": model,
@@ -344,7 +353,7 @@ pub(crate) async fn chat(
             .unwrap_or(false);
     let _user = body.user;
     if stream {
-        return Ok(chat_stream(state, generation, include_usage));
+        return Ok(chat_stream(&state, generation, include_usage));
     }
     let cancellation = CancellationToken::new();
     let _cancel_on_drop = CancelOnDrop::new(&cancellation);
@@ -363,7 +372,7 @@ pub(crate) async fn chat(
     enforce_output_constraints(&generation, &mut output)?;
     Ok(json_response(
         StatusCode::OK,
-        chat_completion(&generation, output, state.unix_seconds()),
+        &chat_completion(&generation, &output, unix_seconds()),
     ))
 }
 
@@ -454,7 +463,7 @@ pub(crate) async fn responses(
     );
     if body.stream.unwrap_or(false) {
         return Ok(responses_stream(
-            state,
+            &state,
             generation,
             response_id,
             output_item_id,
@@ -478,7 +487,7 @@ pub(crate) async fn responses(
                 &response_id,
                 &generation.model,
                 error,
-                state.unix_seconds(),
+                unix_seconds(),
             ));
         }
         Err(_) => {
@@ -486,13 +495,12 @@ pub(crate) async fn responses(
                 &response_id,
                 &generation.model,
                 PortError::new(PortErrorKind::Timeout, "request timed out"),
-                state.unix_seconds(),
+                unix_seconds(),
             ));
         }
     };
     if let Err(error) = enforce_tool_choice(&tool_choice, &generation.tools, &output.tool_calls) {
         return Ok(constrained_response_failure(
-            &state,
             &response_id,
             &generation.model,
             output.usage,
@@ -501,7 +509,6 @@ pub(crate) async fn responses(
     }
     if let Err(error) = enforce_output_constraints(&generation, &mut output) {
         return Ok(constrained_response_failure(
-            &state,
             &response_id,
             &generation.model,
             output.usage,
@@ -516,19 +523,19 @@ pub(crate) async fn responses(
     };
     Ok(json_response(
         StatusCode::OK,
-        response_resource(
+        &response_resource(
             &response_id,
             &generation.model,
             status,
-            items,
+            &items,
             output.usage,
             None,
-            state.unix_seconds(),
+            unix_seconds(),
         ),
     ))
 }
 
-fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool) -> Response {
+fn chat_stream(state: &ApiState, request: GenerationRequest, include_usage: bool) -> Response {
     let capacity = state.inner.config.limits.stream_buffer.max(1);
     let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, Infallible>>(capacity);
     let (provider_tx, mut provider_rx) = mpsc::channel::<GenerationEvent>(capacity);
@@ -536,7 +543,7 @@ fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool)
     let provider_cancellation = cancellation.clone();
     let provider = state.inner.services.provider.clone();
     let operation_timeout = state.inner.config.limits.operation_timeout;
-    let created = state.unix_seconds();
+    let created = unix_seconds();
     let stream_request = request.clone();
     let coordinator_cancellation = cancellation.clone();
     tokio::spawn(async move {
@@ -553,8 +560,8 @@ fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool)
             json_event(chat_chunk(
                 &request,
                 created,
-                json!({"role": "assistant"}),
-                Value::Null,
+                &json!({"role": "assistant"}),
+                &Value::Null,
             )),
             &cancellation,
         )
@@ -572,7 +579,7 @@ fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool)
                         buffered_text.push(text);
                         continue;
                     }
-                    chat_chunk(&request, created, json!({"content": text}), Value::Null)
+                    chat_chunk(&request, created, &json!({"content": text}), &Value::Null)
                 }
                 GenerationEvent::ToolCall(call) => {
                     if let Err(error) = enforce_tool_choice(
@@ -637,8 +644,8 @@ fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool)
                             json_event(chat_chunk(
                                 &request,
                                 created,
-                                json!({"content":output.text}),
-                                Value::Null,
+                                &json!({"content":output.text}),
+                                &Value::Null,
                             )),
                             &cancellation,
                         )
@@ -668,7 +675,7 @@ fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool)
                 };
                 if !send_event(
                     &sse_tx,
-                    json_event(chat_chunk(&request, created, json!({}), json!(finish))),
+                    json_event(chat_chunk(&request, created, &json!({}), &json!(finish))),
                     &cancellation,
                 )
                 .await
@@ -711,7 +718,7 @@ fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool)
 }
 
 fn responses_stream(
-    state: ApiState,
+    state: &ApiState,
     request: GenerationRequest,
     response_id: String,
     item_id: String,
@@ -723,7 +730,7 @@ fn responses_stream(
     let provider_cancellation = cancellation.clone();
     let provider = state.inner.services.provider.clone();
     let operation_timeout = state.inner.config.limits.operation_timeout;
-    let created = state.unix_seconds();
+    let created = unix_seconds();
     let stream_request = request.clone();
     let state_for_ids = state.clone();
     let coordinator_cancellation = cancellation.clone();
@@ -733,7 +740,7 @@ fn responses_stream(
             &response_id,
             &request.model,
             "in_progress",
-            Vec::new(),
+            &[],
             Usage::default(),
             None,
             created,
@@ -991,7 +998,7 @@ fn responses_stream(
             &response_id,
             &request.model,
             status,
-            output,
+            &output,
             usage,
             None,
             created,
@@ -1037,13 +1044,13 @@ async fn send_chat_tool_call(
         json_event(chat_chunk(
             request,
             created,
-            json!({"tool_calls":[{
+            &json!({"tool_calls":[{
                 "index":index,
                 "id":call.id,
                 "type":"function",
                 "function":{"name":call.name,"arguments":""}
             }]}),
-            Value::Null,
+            &Value::Null,
         )),
         cancellation,
     )
@@ -1058,11 +1065,11 @@ async fn send_chat_tool_call(
             json_event(chat_chunk(
                 request,
                 created,
-                json!({"tool_calls":[{
+                &json!({"tool_calls":[{
                     "index":index,
                     "function":{"arguments":delta}
                 }]}),
-                Value::Null,
+                &Value::Null,
             )),
             cancellation,
         )
@@ -1113,7 +1120,7 @@ async fn send_response_failure(
         response_id,
         model,
         "failed",
-        Vec::new(),
+        &[],
         usage,
         Some((code, message)),
         created,
@@ -1184,7 +1191,7 @@ fn named_event(name: &'static str, value: Value) -> Event {
         .expect("JSON value is serializable")
 }
 
-fn chat_completion(request: &GenerationRequest, output: GenerationOutput, created: u64) -> Value {
+fn chat_completion(request: &GenerationRequest, output: &GenerationOutput, created: u64) -> Value {
     let (message, finish_reason) = if output.tool_calls.is_empty() {
         (json!({"role": "assistant", "content": output.text}), "stop")
     } else {
@@ -1227,11 +1234,11 @@ fn response_failure(response_id: &str, model: &str, error: PortError, created: u
         .unwrap_or("internal error");
     json_response(
         api.status,
-        response_resource(
+        &response_resource(
             response_id,
             model,
             "failed",
-            Vec::new(),
+            &[],
             Usage::default(),
             Some((code, message)),
             created,
@@ -1242,8 +1249,8 @@ fn response_failure(response_id: &str, model: &str, error: PortError, created: u
 fn chat_chunk(
     request: &GenerationRequest,
     created: u64,
-    delta: Value,
-    finish_reason: Value,
+    delta: &Value,
+    finish_reason: &Value,
 ) -> Value {
     json!({
         "id": request.request_id,
@@ -1315,7 +1322,7 @@ fn response_resource(
     id: &str,
     model: &str,
     status: &str,
-    output: Vec<Value>,
+    output: &[Value],
     usage: Usage,
     error: Option<(&str, &str)>,
     created: u64,
@@ -1348,6 +1355,47 @@ fn embedding_inputs(input: Option<Value>) -> Result<Vec<String>, ApiError> {
             "invalid_request_error",
         )),
     }
+}
+
+/// Resolves the optional `dimensions` request field into a provider width.
+///
+/// A value that cannot be a width at all — absent, `null`, non-numeric,
+/// negative, or below one — keeps its long-standing meaning of "let the provider
+/// choose", so `0` and `0.5` now take the same path instead of `0.5` flooring
+/// into a zero-width vector. A well-formed width above
+/// [`MAX_EMBEDDING_DIMENSIONS`] is the only shape that is refused, because it is
+/// the only one that can exhaust the host.
+///
+/// # Errors
+///
+/// Returns a `400` [`ApiError::openai`] with type `invalid_request_error` when
+/// the requested width exceeds [`MAX_EMBEDDING_DIMENSIONS`], matching how the
+/// route already refuses an oversized `input`.
+fn embedding_dimensions(dimensions: Option<&Value>) -> Result<Option<usize>, ApiError> {
+    let Some(requested) = dimensions.and_then(Value::as_f64) else {
+        return Ok(None);
+    };
+    if !requested.is_finite() || requested < 1.0 {
+        return Ok(None);
+    }
+    // `MAX_EMBEDDING_DIMENSIONS` converts to `f64` exactly, so this comparison
+    // is exact and rejects every larger value — including infinities-adjacent
+    // magnitudes like `1e300` — before anything is converted to an integer.
+    let width = requested.floor();
+    if width > f64::from(MAX_EMBEDDING_DIMENSIONS) {
+        return Err(ApiError::openai(
+            StatusCode::BAD_REQUEST,
+            format!("Dimensions too large (max {MAX_EMBEDDING_DIMENSIONS})."),
+            "invalid_request_error",
+        ));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the checks above prove `width` is an integral `f64` in `1..=MAX_EMBEDDING_DIMENSIONS`, which every `usize` represents exactly, so neither truncation nor a sign change is reachable"
+    )]
+    let width = width as usize;
+    Ok(Some(width))
 }
 
 fn validate_embedding_inputs(input: &[String]) -> Result<(), ApiError> {
@@ -1449,7 +1497,7 @@ fn chat_prompt(messages: Option<&Value>) -> Result<ParsedPrompt, ApiError> {
         if active_user_index == Some((index, "user")) {
             let active_media = chat_media(object.get("content"))?;
             if content.is_empty() && !active_media.is_empty() {
-                content = "User sent image(s) with no text.".to_owned();
+                "User sent image(s) with no text.".clone_into(&mut content);
             }
             media = active_media;
         }
@@ -1506,9 +1554,9 @@ fn responses_prompt(input: &Value) -> Result<ParsedPrompt, ApiError> {
                             .iter()
                             .any(|input| input.kind == InputMediaKind::Image)
                         {
-                            text = "User sent image(s) with no text.".to_owned();
+                            "User sent image(s) with no text.".clone_into(&mut text);
                         } else if !item_media.is_empty() {
-                            text = "User sent file(s) with no text.".to_owned();
+                            "User sent file(s) with no text.".clone_into(&mut text);
                         }
                     }
                     media.extend(item_media);
@@ -2149,8 +2197,7 @@ fn enforce_tool_choice(
         ));
     }
     let satisfied = match choice {
-        ToolChoice::Auto => true,
-        ToolChoice::None => true,
+        ToolChoice::Auto | ToolChoice::None => true,
         ToolChoice::Required => !calls.is_empty(),
         ToolChoice::Function(name) => calls.iter().any(|call| call.name == *name),
     };
@@ -2168,11 +2215,11 @@ fn enforce_tool_choice(
     }
 }
 
-fn tool_choice_requires_validation(choice: &ToolChoice) -> bool {
+const fn tool_choice_requires_validation(choice: &ToolChoice) -> bool {
     !matches!(choice, ToolChoice::Auto)
 }
 
-fn generation_requires_output_validation(request: &GenerationRequest) -> bool {
+const fn generation_requires_output_validation(request: &GenerationRequest) -> bool {
     tool_choice_requires_validation(&request.tool_choice)
         || request.max_tokens.is_some()
         || request.max_tool_calls.is_some()
@@ -2239,7 +2286,6 @@ fn constraint_error_message(error: &ApiError) -> &str {
 }
 
 fn constrained_response_failure(
-    state: &ApiState,
     response_id: &str,
     model: &str,
     usage: Usage,
@@ -2247,14 +2293,14 @@ fn constrained_response_failure(
 ) -> Response {
     json_response(
         StatusCode::BAD_GATEWAY,
-        response_resource(
+        &response_resource(
             response_id,
             model,
             "failed",
-            Vec::new(),
+            &[],
             usage,
             Some(("api_error", constraint_error_message(error))),
-            state.unix_seconds(),
+            unix_seconds(),
         ),
     )
 }

@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 /// Ledger row this file is evidence for.
 const FEATURE: &str = "interop.openai.chat-completions";
 
-/// A buffered completion matches the pinned OpenAI envelope and usage block.
+/// A buffered completion matches the pinned `OpenAI` envelope and usage block.
 #[tokio::test]
 async fn chat_completion_json_matches_the_pinned_contract() {
     let run = run_fixture(FEATURE, "chat/json_completion.json").await;
@@ -336,7 +336,7 @@ async fn chat_errors_stay_classified_per_failure_class() {
 ///
 /// This one is deliberately outside the classified-error table above: the
 /// router answers with an empty body and an `Allow` header rather than with an
-/// OpenAI error envelope, and pinning that difference is the point.
+/// `OpenAI` error envelope, and pinning that difference is the point.
 #[tokio::test]
 async fn chat_rejects_the_wrong_method_at_the_router() {
     let run = run_fixture(FEATURE, "chat/error_wrong_method.json").await;

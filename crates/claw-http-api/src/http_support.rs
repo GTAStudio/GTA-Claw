@@ -139,8 +139,8 @@ pub(crate) fn json_body(value: &Value) -> Body {
     Body::from(serde_json::to_vec(value).expect("JSON value is serializable"))
 }
 
-pub(crate) fn json_response(status: StatusCode, value: Value) -> Response {
-    let mut response = (status, json_body(&value)).into_response();
+pub(crate) fn json_response(status: StatusCode, value: &Value) -> Response {
+    let mut response = (status, json_body(value)).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json; charset=utf-8"),

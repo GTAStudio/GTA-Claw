@@ -1,4 +1,4 @@
-//! OpenClaw `/tools/invoke` HTTP adapter.
+//! `OpenClaw` `/tools/invoke` HTTP adapter.
 
 use axum::extract::{Extension, Request, State};
 use axum::http::StatusCode;
@@ -122,7 +122,7 @@ fn tool_response(outcome: ToolOutcome) -> Response {
     if outcome.ok {
         return json_response(
             status,
-            json!({"ok":true,"result":outcome.result.unwrap_or(Value::Null)}),
+            &json!({"ok":true,"result":outcome.result.unwrap_or(Value::Null)}),
         );
     }
     let mut error = Map::new();
@@ -148,5 +148,5 @@ fn tool_response(outcome: ToolOutcome) -> Response {
             Value::Bool(requires_approval),
         );
     }
-    json_response(status, json!({"ok":false,"error":error}))
+    json_response(status, &json!({"ok":false,"error":error}))
 }

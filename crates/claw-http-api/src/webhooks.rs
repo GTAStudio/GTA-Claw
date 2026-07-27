@@ -125,7 +125,7 @@ pub(crate) async fn invoke(
             "result":outcome.result
         })
     };
-    Ok(json_response(status, body))
+    Ok(json_response(status, &body))
 }
 
 fn validate_action(action: &str, value: &Value) -> Result<(), ApiError> {

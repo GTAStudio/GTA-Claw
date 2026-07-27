@@ -153,14 +153,14 @@ struct RecordingAudit {
 }
 
 impl RecordingAudit {
-    fn online() -> Self {
+    const fn online() -> Self {
         Self {
             events: Mutex::new(Vec::new()),
             offline: false,
         }
     }
 
-    fn offline() -> Self {
+    const fn offline() -> Self {
         Self {
             events: Mutex::new(Vec::new()),
             offline: true,
@@ -310,7 +310,9 @@ async fn send(
         declared_length.unwrap_or(body.len())
     );
     if let Some(token) = token {
-        head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        head.push_str("Authorization: Bearer ");
+        head.push_str(token);
+        head.push_str("\r\n");
     }
     head.push_str("\r\n");
     stream
@@ -365,7 +367,7 @@ fn parse_response(raw: &[u8]) -> HttpResponse {
 /// The `match` is deliberately not wildcarded: adding a variant to
 /// `AdminRpcError` fails compilation here until the fixture gains a reviewed
 /// row for the new class.
-fn class_name(error: &AdminRpcError) -> &'static str {
+const fn class_name(error: &AdminRpcError) -> &'static str {
     match error {
         AdminRpcError::Unauthenticated => "unauthenticated",
         AdminRpcError::Forbidden(_) => "forbidden",
@@ -533,13 +535,9 @@ fn assert_policy_case(policy: &AdminMethodPolicy, case: &MethodPolicyCase) {
                 case.method
             );
         }
-        ("not_allowlisted", Err(AdminRpcError::MethodNotAllowlisted { method })) => {
-            assert_eq!(method, case.method);
-        }
-        ("not_registered", Err(AdminRpcError::MethodNotRegistered { method })) => {
-            assert_eq!(method, case.method);
-        }
-        ("not_operator_surface", Err(AdminRpcError::MethodNotOperatorSurface { method })) => {
+        ("not_allowlisted", Err(AdminRpcError::MethodNotAllowlisted { method }))
+        | ("not_registered", Err(AdminRpcError::MethodNotRegistered { method }))
+        | ("not_operator_surface", Err(AdminRpcError::MethodNotOperatorSurface { method })) => {
             assert_eq!(method, case.method);
         }
         (expected, actual) => panic!(

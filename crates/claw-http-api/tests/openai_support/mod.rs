@@ -3,7 +3,10 @@
 //! Five test binaries (`openai_chat`, `openai_responses`, `openai_models`,
 //! `openai_embeddings`, `openai_tools_invoke`) include this module, so any single
 //! binary uses only a subset of it.
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "shared fixture harness compiled into five test binaries; each one exercises only the subset of the helpers its own feature needs"
+)]
 
 use std::collections::BTreeMap;
 use std::env;
@@ -198,7 +201,7 @@ pub(crate) enum EmbedScript {
 }
 
 /// Dimensions the scripted embedding provider uses when the request omits them.
-fn default_dimensions() -> usize {
+const fn default_dimensions() -> usize {
     3
 }
 
@@ -306,6 +309,10 @@ impl ToolCallSpec {
 /// Usage accounting a scripted provider reports.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the field names are the fixture JSON keys, and `deny_unknown_fields` makes renaming them a breaking change to every golden fixture"
+)]
 pub(crate) struct UsageSpec {
     /// Input token count.
     input_tokens: u64,
@@ -644,7 +651,11 @@ fn dimensioned_vectors(request: &EmbeddingRequest, fallback: usize) -> Vec<Vec<f
         .enumerate()
         .map(|(index, _)| {
             (0..width)
-                .map(|dimension| (index * 8 + dimension) as f32 / 4.0)
+                .map(|dimension| {
+                    let component = u16::try_from(index * 8 + dimension)
+                        .expect("fixture embedding widths stay inside `u16`");
+                    f32::from(component) / 4.0
+                })
                 .collect()
         })
         .collect()
@@ -817,7 +828,7 @@ fn config(agents: Vec<String>) -> ApiConfig {
     ]));
     config.agents = agents;
     // Long enough that no keep-alive comment can land inside a pinned stream.
-    config.limits.heartbeat_interval = Duration::from_secs(600);
+    config.limits.heartbeat_interval = Duration::from_mins(10);
     config
 }
 
@@ -887,7 +898,9 @@ impl TestServer {
             body.len()
         );
         if let Some(token) = &request.token {
-            head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+            head.push_str("Authorization: Bearer ");
+            head.push_str(token);
+            head.push_str("\r\n");
         }
         let declares_content_type = request
             .headers
@@ -897,7 +910,10 @@ impl TestServer {
             head.push_str("Content-Type: application/json\r\n");
         }
         for (name, value) in &request.headers {
-            head.push_str(&format!("{name}: {value}\r\n"));
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(value);
+            head.push_str("\r\n");
         }
         head.push_str("\r\n");
 

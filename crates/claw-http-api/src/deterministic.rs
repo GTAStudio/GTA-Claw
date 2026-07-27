@@ -82,6 +82,11 @@ impl DeterministicRuntime {
     }
 
     /// Replaces the provider result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortErrorKind::Internal`] when the output mutex is poisoned,
+    /// which only happens after an earlier test panicked while holding it.
     pub fn set_output(&self, output: GenerationOutput) -> Result<(), PortError> {
         *self
             .output
@@ -105,6 +110,11 @@ impl DeterministicRuntime {
     }
 
     /// Returns the last generation request observed by the test double.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortErrorKind::Internal`] when the recording mutex is poisoned,
+    /// which only happens after an earlier test panicked while holding it.
     pub fn last_generation_request(&self) -> Result<Option<GenerationRequest>, PortError> {
         self.last_generation_request
             .lock()
@@ -113,6 +123,11 @@ impl DeterministicRuntime {
     }
 
     /// Returns the last tool invocation observed by the test double.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortErrorKind::Internal`] when the recording mutex is poisoned,
+    /// which only happens after an earlier test panicked while holding it.
     pub fn last_tool_invocation(&self) -> Result<Option<ToolInvocation>, PortError> {
         self.last_tool_invocation
             .lock()
@@ -121,6 +136,11 @@ impl DeterministicRuntime {
     }
 
     /// Returns persisted security audit events.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortErrorKind::Internal`] when the audit mutex is poisoned,
+    /// which only happens after an earlier test panicked while holding it.
     pub fn audit_events(&self) -> Result<Vec<AuditEvent>, PortError> {
         self.audits
             .lock()
@@ -256,7 +276,11 @@ impl ProviderPort for DeterministicRuntime {
         Box::pin(async move {
             self.delay(&cancellation).await?;
             let dimensions = request.dimensions.unwrap_or(3);
-            Ok(request
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "the double derives each component from small input indices; an `f32` embedding is inherently approximate and callers only assert the fixed vectors these sizes produce"
+            )]
+            let vectors: Vec<Vec<f32>> = request
                 .input
                 .iter()
                 .enumerate()
@@ -267,7 +291,8 @@ impl ProviderPort for DeterministicRuntime {
                         })
                         .collect()
                 })
-                .collect())
+                .collect();
+            Ok(vectors)
         })
     }
 }
