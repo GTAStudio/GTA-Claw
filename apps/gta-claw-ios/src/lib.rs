@@ -31,7 +31,7 @@
 //!
 //! * [`GatewayEndpoint`] — user-entered endpoint intake that rejects
 //!   credential-bearing URLs, unsupported schemes, and remote plaintext
-//!   WebSockets before any network operation.
+//!   WebSocket endpoints before any network operation.
 //! * [`IosCredential`] — bounded credential intake with a redacting `Debug`.
 //! * [`IosClientIdentity`] — Gateway v4 client metadata for
 //!   [`ClientId::Ios`](claw_protocol::gateway::ClientId::Ios), built from an
@@ -57,7 +57,7 @@
 //!   and `NSBonjourServices` in the host application bundle. This crate cannot
 //!   read the bundle, so [`HostAppDeclarations`] treats an unconfirmed
 //!   declaration exactly as strictly as a missing one.
-//! * **Tailscale** needs an app-accessible LocalAPI Unix socket or a loopback
+//! * **Tailscale** needs an app-accessible `LocalAPI` Unix socket or a loopback
 //!   proxy, which a stock sandboxed iOS deployment may expose neither of. No
 //!   alternative transport is offered in its place.
 //! * **SSH** needs caller-provisioned sandbox paths for key material and
@@ -74,7 +74,7 @@
 //!
 //! # What has and has not been executed
 //!
-//! Everything here was built and tested on **Windows x86_64 only**. No part of
+//! Everything here was built and tested on **Windows `x86_64` only**. No part of
 //! this crate has ever run on an Apple platform, in a simulator, or on a
 //! device, and none of it has ever completed a Gateway handshake against a real
 //! server. `aarch64-apple-ios` cannot even be type-checked from a Windows host,

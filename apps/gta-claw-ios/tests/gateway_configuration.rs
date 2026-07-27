@@ -1,7 +1,7 @@
 //! Proves the configuration this crate builds is one `claw-gateway-client`
 //! actually accepts, rather than one that merely looks plausible.
 //!
-//! Platform note: these tests have only ever been executed on Windows x86_64.
+//! Platform note: these tests have only ever been executed on Windows `x86_64`.
 //! They exercise no Apple-specific code path, because this crate contains none.
 
 use std::sync::Arc;

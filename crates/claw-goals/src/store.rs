@@ -530,9 +530,7 @@ impl FileGoalStore {
         let mut held = self.usage(&record.session_id)?;
         if !is_new {
             // A replacement is charged its new size, not its old size as well.
-            let existing_bytes = fs::metadata(&path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
+            let existing_bytes = fs::metadata(&path).map_or(0, |metadata| metadata.len());
             held.bytes = held.bytes.saturating_sub(existing_bytes);
         }
         self.budget

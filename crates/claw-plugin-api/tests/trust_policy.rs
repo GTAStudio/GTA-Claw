@@ -2,6 +2,7 @@
 
 mod support;
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -250,7 +251,7 @@ fn sign(manifest: &PluginManifest, key: &SigningKey, key_id: &str) -> PluginMani
     let signature = key.sign(&payload);
     let mut hex = String::with_capacity(128);
     for byte in signature.to_bytes() {
-        hex.push_str(&format!("{byte:02x}"));
+        write!(hex, "{byte:02x}").expect("writing hex into a String cannot fail");
     }
     let mut signed = unsigned;
     signed.signature = Some(ManifestSignature {
@@ -283,7 +284,7 @@ fn a_signature_does_not_survive_a_capability_escalation() {
     let manifest = parse(&manifest_value("core"));
     let signed = sign(&manifest, &key, "release-2026");
 
-    let mut escalated = signed.clone();
+    let mut escalated = signed;
     escalated.capabilities.push(
         serde_json::from_value(json!({
             "capability": "filesystem-read",
@@ -311,7 +312,7 @@ fn a_signature_does_not_survive_a_component_repin() {
     let manifest = parse(&manifest_value("core"));
     let signed = sign(&manifest, &key, "release-2026");
 
-    let mut repinned = signed.clone();
+    let mut repinned = signed;
     repinned.component.sha256 = component_sha256(b"a different component");
 
     let verifier = Ed25519Verifier::new().with_key("release-2026", key.verifying_key().to_bytes());
@@ -348,13 +349,13 @@ fn bytes_that_do_not_match_the_pinned_digest_are_refused() {
 
 #[test]
 fn a_signature_from_another_key_is_refused() {
-    let signer = SigningKey::from_bytes(&[7_u8; 32]);
-    let other = SigningKey::from_bytes(&[9_u8; 32]);
+    let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+    let unrelated_key = SigningKey::from_bytes(&[9_u8; 32]);
     let manifest = parse(&manifest_value("core"));
-    let signed = sign(&manifest, &signer, "release-2026");
+    let signed = sign(&manifest, &signing_key, "release-2026");
 
     let verifier =
-        Ed25519Verifier::new().with_key("release-2026", other.verifying_key().to_bytes());
+        Ed25519Verifier::new().with_key("release-2026", unrelated_key.verifying_key().to_bytes());
     assert_eq!(
         verifier.verify(&VerificationRequest {
             manifest: &signed,

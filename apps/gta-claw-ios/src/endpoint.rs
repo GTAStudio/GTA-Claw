@@ -96,10 +96,10 @@ impl GatewayEndpoint {
     pub fn summary(&self) -> EndpointSummary {
         let scheme = self.url.scheme();
         let host = self.url.host_str().unwrap_or("<unknown>");
-        let text = match self.url.port() {
-            Some(port) => format!("{scheme}://{host}:{port}"),
-            None => format!("{scheme}://{host}"),
-        };
+        let text = self.url.port().map_or_else(
+            || format!("{scheme}://{host}"),
+            |port| format!("{scheme}://{host}:{port}"),
+        );
         EndpointSummary(text)
     }
 

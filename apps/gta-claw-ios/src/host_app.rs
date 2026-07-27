@@ -397,16 +397,14 @@ impl BonjourServiceType {
                 limit: MAX_SERVICE_TYPE_BYTES,
             });
         }
-        let name = match trimmed
+        let Some(name) = trimmed
             .strip_suffix("._tcp")
             .or_else(|| trimmed.strip_suffix("._udp"))
-        {
-            Some(name) => name,
-            None => return Err(ServiceTypeError::MissingTransportSuffix),
+        else {
+            return Err(ServiceTypeError::MissingTransportSuffix);
         };
-        let name = match name.strip_prefix('_') {
-            Some(name) => name,
-            None => return Err(ServiceTypeError::MissingLeadingUnderscore),
+        let Some(name) = name.strip_prefix('_') else {
+            return Err(ServiceTypeError::MissingLeadingUnderscore);
         };
         if name.is_empty() {
             return Err(ServiceTypeError::EmptyName);
@@ -767,6 +765,12 @@ pub trait LocalDiscoveryBackend {
         let Some(remainder) = Self::DNS_SD_SERVICE_TYPE.strip_suffix(DOMAIN) else {
             return Err(ServiceTypeError::NotFullyQualifiedLocal);
         };
+        #[expect(
+            clippy::case_sensitive_file_extension_comparisons,
+            reason = "`.local` here is the mDNS domain of a DNS-SD service type, not a file \
+                      extension; DNS-SD types are lowercase by construction and a \
+                      case-insensitive match would accept a type this backend never browses"
+        )]
         if remainder.is_empty() || remainder.ends_with(".local") {
             return Err(ServiceTypeError::NotFullyQualifiedLocal);
         }

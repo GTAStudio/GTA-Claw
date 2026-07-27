@@ -93,16 +93,39 @@ pub struct ControllerHandle {
 
 impl ControllerHandle {
     /// Queues a validated connection request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRejection::QueueFull`] when the Gateway task already
+    /// has [`COMMAND_QUEUE_CAPACITY`] commands waiting, and
+    /// [`CommandRejection::Stopped`] when the control loop has ended and the
+    /// command channel is closed. Nothing is ever blocked on or dropped
+    /// silently: this is called from the UI thread, which must not wait.
     pub fn connect(&self, request: ConnectRequest) -> Result<(), CommandRejection> {
         self.send(ControllerCommand::Connect(request))
     }
 
     /// Queues a rejected submission so the failure is rendered on the same path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRejection::QueueFull`] when the Gateway task already
+    /// has [`COMMAND_QUEUE_CAPACITY`] commands waiting, and
+    /// [`CommandRejection::Stopped`] when the control loop has ended and the
+    /// command channel is closed.
     pub fn reject(&self, rejection: SubmissionRejection) -> Result<(), CommandRejection> {
         self.send(ControllerCommand::Reject(rejection))
     }
 
     /// Queues a disconnect.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRejection::QueueFull`] when the Gateway task already
+    /// has [`COMMAND_QUEUE_CAPACITY`] commands waiting, and
+    /// [`CommandRejection::Stopped`] when the control loop has ended and the
+    /// command channel is closed. A `Stopped` disconnect needs no retry: the
+    /// loop cancels and joins any live attempt as it ends.
     pub fn disconnect(&self) -> Result<(), CommandRejection> {
         self.send(ControllerCommand::Disconnect)
     }
@@ -121,10 +144,17 @@ impl ControllerHandle {
 ///
 /// Dropping this closes the command channel, which ends the control loop, which
 /// cancels and joins any live attempt before the runtime itself is torn down.
+///
+/// That sequence is load-bearing on a phone: an attempt abandoned by runtime
+/// teardown instead of by cancellation gets no chance to close its socket, so
+/// the field order below is part of the contract. Rust drops fields in
+/// declaration order, so `handle` — the controller's own command sender — must
+/// stay ahead of `runtime`. Reversing them would tear the runtime down first
+/// and make the documented shutdown unreachable.
 #[derive(Debug)]
 pub struct AndroidController {
-    runtime: Runtime,
     handle: ControllerHandle,
+    runtime: Runtime,
 }
 
 impl AndroidController {
@@ -142,10 +172,10 @@ impl AndroidController {
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         runtime.spawn(run(commands_rx, sink));
         Ok(Self {
-            runtime,
             handle: ControllerHandle {
                 commands: commands_tx,
             },
+            runtime,
         })
     }
 
@@ -157,7 +187,7 @@ impl AndroidController {
 
     /// Returns the Tokio runtime handle for adapters that need to spawn work.
     #[must_use]
-    pub fn runtime(&self) -> &Runtime {
+    pub const fn runtime(&self) -> &Runtime {
         &self.runtime
     }
 }
@@ -215,28 +245,27 @@ async fn run(mut commands: mpsc::Receiver<ControllerCommand>, sink: SnapshotSink
                         }
                         stop_attempt(active.take()).await;
                         let generation = model.begin(&request);
-                        let device = match &identity {
-                            Some(existing) => Arc::clone(existing),
-                            None => match generate_session_identity() {
-                                Ok(fresh) => Arc::clone(identity.insert(Arc::new(fresh))),
-                                Err(_) => {
-                                    // Connecting anyway would mean signing with
-                                    // key material we could not prove was random.
-                                    // `RandomnessUnavailable` is a unit type, so
-                                    // there is no further detail to carry.
-                                    model.apply(
-                                        generation,
-                                        AttemptUpdate::Failed(UserError::new(
-                                            "This device could not generate a secure identity.",
-                                            "Restart the app. If it keeps failing, the device's \
-                                             random number generator is unavailable and it cannot \
-                                             connect safely.",
-                                        )),
-                                    );
-                                    sink(model.snapshot());
-                                    continue;
-                                }
-                            },
+                        let device = if let Some(existing) = &identity {
+                            Arc::clone(existing)
+                        } else {
+                            let Ok(fresh) = generate_session_identity() else {
+                                // Connecting anyway would mean signing with
+                                // key material we could not prove was random.
+                                // `RandomnessUnavailable` is a unit type, so
+                                // there is no further detail to carry.
+                                model.apply(
+                                    generation,
+                                    AttemptUpdate::Failed(UserError::new(
+                                        "This device could not generate a secure identity.",
+                                        "Restart the app. If it keeps failing, the device's \
+                                         random number generator is unavailable and it cannot \
+                                         connect safely.",
+                                    )),
+                                );
+                                sink(model.snapshot());
+                                continue;
+                            };
+                            Arc::clone(identity.insert(Arc::new(fresh)))
                         };
                         model.apply(
                             generation,
@@ -386,13 +415,17 @@ async fn drive_attempt(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
     use claw_application::SystemProbe;
     use claw_platform::NativeSystemProbe;
     use claw_protocol::RuntimeDescriptor;
+    use tokio::sync::mpsc;
 
     use super::{
-        CommandRejection, ControllerCommand, core_protocol_summary, native_runtime_summary,
-        runtime_summary,
+        COMMAND_QUEUE_CAPACITY, CommandRejection, ControllerCommand, ControllerHandle,
+        SnapshotSink, core_protocol_summary, native_runtime_summary, run, runtime_summary,
     };
     use crate::onboarding::{ConnectRequest, SubmissionRejection};
 
@@ -478,5 +511,64 @@ mod tests {
                 "{rejection:?} must tell the operator what to do, got {error:?}"
             );
         }
+    }
+
+    /// `AndroidController` documents that dropping it closes the command channel
+    /// and *that* is what ends the control loop, ahead of runtime teardown. The
+    /// promise is only worth anything if a closed channel actually ends the
+    /// loop, so that half is pinned here; the field order in `AndroidController`
+    /// is what puts the channel close first.
+    #[test]
+    fn closing_the_command_channel_ends_the_control_loop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+        let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let renders = Arc::new(Mutex::new(0_usize));
+        let counted = Arc::clone(&renders);
+        let sink: SnapshotSink = Arc::new(move |_| {
+            *counted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        });
+
+        runtime.block_on(async move {
+            let control_loop = tokio::spawn(run(commands_rx, sink));
+            drop(commands_tx);
+            // Without the `break` on a closed channel this waits out the timeout
+            // instead, which on a phone is a task that outlives its owner.
+            tokio::time::timeout(Duration::from_secs(5), control_loop)
+                .await
+                .expect("dropping the last handle must end the control loop")
+                .expect("the control loop must end without panicking");
+        });
+
+        let rendered = *renders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            rendered, 1,
+            "the loop must render exactly its initial snapshot and then stop, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_handle_outliving_the_loop_refuses_commands_instead_of_queueing_them() {
+        let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let handle = ControllerHandle {
+            commands: commands_tx,
+        };
+        drop(commands_rx);
+
+        let rejection = handle
+            .disconnect()
+            .expect_err("a disconnect must not be accepted by a loop that has ended");
+
+        assert_eq!(
+            rejection,
+            CommandRejection::Stopped,
+            "a closed channel is a stopped controller, not a full queue, got {rejection:?}"
+        );
     }
 }

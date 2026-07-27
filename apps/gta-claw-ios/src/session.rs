@@ -157,7 +157,7 @@ impl ObservedAuthorization {
 
     /// Returns whether the confirmed scopes permit an action.
     #[must_use]
-    pub fn grants(&self, action: IosAction) -> bool {
+    pub const fn grants(&self, action: IosAction) -> bool {
         self.scopes.contains(action.required_scope())
     }
 
@@ -279,7 +279,7 @@ fn classify(state: ConnectionState) -> Observed {
     }
 }
 
-fn is_in_progress(observed: Option<&Observed>) -> bool {
+const fn is_in_progress(observed: Option<&Observed>) -> bool {
     matches!(
         observed,
         Some(Observed::Lifecycle(
@@ -447,6 +447,13 @@ impl Drop for ConnectionAttempt {
 
 /// A complete, redaction-safe view of the connection for one render pass.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "these four are independent control enablements a front end binds directly, not \
+              a state that could be one enum: an in-flight attempt is busy and cancellable \
+              with neither connect nor disconnect available, an authenticated connection \
+              enables disconnect only, and an abandoned one enables connect only"
+)]
 pub struct IosViewSnapshot {
     endpoint: EndpointSummary,
     status: IosStatusKind,

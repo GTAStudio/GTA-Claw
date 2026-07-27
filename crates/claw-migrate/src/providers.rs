@@ -13,7 +13,7 @@ use crate::platform::{HostPlatform, PlatformPaths};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ClaudeMigrationProvider;
 
-/// OpenAI Codex desktop and CLI migration provider.
+/// `OpenAI` Codex desktop and CLI migration provider.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CodexMigrationProvider;
 
@@ -31,9 +31,7 @@ impl MigrationProvider for ClaudeMigrationProvider {
         paths: &dyn PlatformPaths,
         source: Option<&Path>,
     ) -> Result<Detection, MigrationError> {
-        let root = source
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| paths.home_dir().join(".claude"));
+        let root = source.map_or_else(|| paths.home_dir().join(".claude"), Path::to_path_buf);
         let primary = [
             root.join("settings.json"),
             root.join("CLAUDE.md"),
@@ -199,9 +197,7 @@ impl MigrationProvider for HermesMigrationProvider {
         paths: &dyn PlatformPaths,
         source: Option<&Path>,
     ) -> Result<Detection, MigrationError> {
-        let root = source
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| paths.home_dir().join(".hermes"));
+        let root = source.map_or_else(|| paths.home_dir().join(".hermes"), Path::to_path_buf);
         let high = root.join("config.yaml").is_file()
             || root.join(".env").is_file()
             || root.join("auth.json").is_file();
@@ -298,7 +294,7 @@ fn finalize_plan(
         .join("config")
         .join("migrations")
         .join(format!("{provider_id}.json5"));
-    if manifest.exists() && !context.overwrite {
+    if path_is_occupied(&manifest) && !context.overwrite {
         return rejected_plan(
             provider_id,
             source_root,
@@ -741,9 +737,10 @@ fn build_hermes_operations(
 }
 
 fn claude_desktop_config(paths: &dyn PlatformPaths) -> PathBuf {
+    // Claude Desktop uses the same directory name on all three hosts; only the
+    // configuration root that contains it differs.
     let application = match paths.platform() {
-        HostPlatform::Windows | HostPlatform::MacOs => "Claude",
-        HostPlatform::Linux => "Claude",
+        HostPlatform::Windows | HostPlatform::MacOs | HostPlatform::Linux => "Claude",
     };
     paths
         .config_dir()
@@ -984,13 +981,20 @@ fn first_conflict(operations: &[MigrationOperation], overwrite: bool) -> Option<
         {
             return Some(operation.target());
         }
-        if operation.target().exists()
+        if path_is_occupied(operation.target())
             && !matches!(operation, MigrationOperation::AppendFile { .. })
         {
             return Some(operation.target());
         }
     }
     None
+}
+
+/// Reports whether anything at all occupies `path`, without following symbolic
+/// links, so that a link whose destination is missing still counts as an
+/// existing target rather than free space.
+fn path_is_occupied(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
 }
 
 fn validate_json(path: &Path) -> Result<(), MigrationError> {

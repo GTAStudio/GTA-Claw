@@ -16,7 +16,7 @@
 //!
 //! Every record reports [`IosTransportRecord::confirmed_on_ios`] as `false`,
 //! and a test in this module asserts that. This workspace has only ever been
-//! built and run on Windows x86_64; `aarch64-apple-ios` cannot be type-checked
+//! built and run on Windows `x86_64`; `aarch64-apple-ios` cannot be type-checked
 //! from that host because `ring` requires `xcrun` and the iOS SDK. A status
 //! below is a reasoned position, not a measurement.
 

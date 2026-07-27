@@ -169,6 +169,20 @@ pub struct MigrationResult {
 
 impl MigrationResult {
     /// Validates all cross-field rules from the frozen JSON schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns the precise [`ContractViolation`] that the result breaks:
+    /// [`ContractVersion`](ContractViolation::ContractVersion) when the result
+    /// was produced against a contract version this build does not support,
+    /// [`InvalidSha256`](ContractViolation::InvalidSha256) or
+    /// [`EmptyInputSource`](ContractViolation::EmptyInputSource) when the source
+    /// identity is unusable, [`ExitCode`](ContractViolation::ExitCode) when the
+    /// status and the process exit code disagree, and the
+    /// artifact/bridge/JavaScript/diagnostic variants when the evidence attached
+    /// to the result contradicts its own status or input kind. Every variant
+    /// means the emitting code is wrong, so a caller should refuse the result
+    /// rather than repair it.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         if self.contract_version != MIGRATION_CONTRACT_VERSION {
             return Err(ContractViolation::ContractVersion);
@@ -521,6 +535,14 @@ impl Display for RoleError {
 impl Error for RoleError {}
 
 /// Loads a role from its legacy JSON representation.
+///
+/// # Errors
+///
+/// Returns [`RoleError::InvalidJson`] when `input` is not a JSON object,
+/// [`RoleError::MissingContent`] when neither a string `content` nor a string
+/// `prompt` member is present, and [`RoleError::EmptyContent`] when the selected
+/// content is an empty string. All three mean the exported role file is not the
+/// legacy role shape; re-export it from the source tool instead of editing it.
 pub fn load_role_json(input: &str) -> Result<LoadedRole, RoleError> {
     let value: Value = serde_json::from_str(input).map_err(|_| RoleError::InvalidJson)?;
     load_role_value(&value)
@@ -548,6 +570,15 @@ fn load_role_value(value: &Value) -> Result<LoadedRole, RoleError> {
 }
 
 /// Loads a role response according to its content type.
+///
+/// # Errors
+///
+/// Returns [`RoleError::InvalidSourceBody`] when `body` is neither a JSON object
+/// nor a JSON string, because no other shape can carry a role. When
+/// `content_type` explicitly names JSON, a body that parses but is not a legal
+/// role is reported as [`RoleError::MissingContent`] or
+/// [`RoleError::EmptyContent`] rather than being silently downgraded to plain
+/// text; correct the exported role or send it with a non-JSON content type.
 pub fn load_role_source(
     content_type: &str,
     body: &Value,
@@ -582,7 +613,7 @@ pub fn load_role_source(
 }
 
 /// Validated inert legacy skill definition.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LegacySkill {
     /// Safe identifier.
     pub name: String,
@@ -630,6 +661,17 @@ impl Display for LegacySkillError {
 impl Error for LegacySkillError {}
 
 /// Parses a legacy skill without evaluating its JavaScript.
+///
+/// # Errors
+///
+/// Returns [`LegacySkillError::InvalidJson`] when `input` is not a JSON object,
+/// [`LegacySkillError::InvalidName`] when `name` is absent or is not an
+/// identifier safe to use as a file and skill name,
+/// [`LegacySkillError::InvalidDescription`] when `description` is absent or
+/// empty, [`LegacySkillError::InvalidParameters`] when `parameters` is not an
+/// object or array schema, and [`LegacySkillError::MissingExecuteCode`] when
+/// `executeCode` is absent or empty. Each names the exact member of the exported
+/// skill that has to be repaired before it can be ported.
 pub fn parse_legacy_skill(input: &str) -> Result<LegacySkill, LegacySkillError> {
     let value: Value = serde_json::from_str(input).map_err(|_| LegacySkillError::InvalidJson)?;
     let object = value.as_object().ok_or(LegacySkillError::InvalidJson)?;

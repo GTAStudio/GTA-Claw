@@ -310,8 +310,10 @@ impl ActiveWorkCounts {
 
 /// Reads the host counters a suspension decision depends on.
 ///
-/// Implementations are called while the scheduler is paused, so they must not
-/// block: a slow inspector holds the whole host still.
+/// Implementations are called while the scheduler is paused and while the
+/// coordinator holds its own lock, so they must not block and must not call
+/// back into `SuspendCoordinator`: a slow inspector holds the whole host
+/// still, and a re-entrant one deadlocks.
 pub trait ActiveWorkInspector: Debug + Send + Sync {
     /// Returns the current counters.
     fn counts(&self) -> ActiveWorkCounts;

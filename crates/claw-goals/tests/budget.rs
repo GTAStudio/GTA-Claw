@@ -14,7 +14,7 @@ use claw_goals::testing::{TempRoot, block_on, open_durable, open_durable_with, s
 use claw_goals::{BudgetUsage, GoalBudget};
 use claw_runtime::{GoalConfig, GoalError};
 
-fn tight_store_budget(max_goals: usize, max_record: usize, max_session: u64) -> GoalBudget {
+const fn tight_store_budget(max_goals: usize, max_record: usize, max_session: u64) -> GoalBudget {
     GoalBudget {
         max_goals_per_session: max_goals,
         max_record_bytes: max_record,

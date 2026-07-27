@@ -46,6 +46,9 @@ impl AttemptSlot {
             return None;
         }
         *active = Some(generation);
+        // Released before the `Arc` clone: a refused caller must never wait on
+        // an allocation, and the slot is already committed at this point.
+        drop(active);
         Some(AttemptLease {
             slot: Arc::clone(self),
             generation,
@@ -98,7 +101,30 @@ impl Drop for AttemptLease {
 /// `ClientId::Android` is the wire identity `openclaw-android`, and this is the
 /// first in-tree client to declare it.
 #[must_use]
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "both `expect`s take compile-time constants that the const blocks below have \
+              already proved non-empty and within MAX_METADATA_BYTES, so no build that \
+              compiles can reach either panic and there is no runtime condition to document"
+)]
 pub fn android_client_metadata() -> ClientMetadata {
+    // `Name::new` only rejects an empty value or one over the byte budget.
+    // Both inputs are constants, so the rejection is settled at compile time
+    // rather than left as a runtime panic on a device.
+    const {
+        assert!(
+            !env!("CARGO_PKG_VERSION").is_empty()
+                && env!("CARGO_PKG_VERSION").len() <= MAX_METADATA_BYTES,
+            "the package version must fit the Gateway metadata budget"
+        );
+    }
+    const {
+        assert!(
+            !std::env::consts::OS.is_empty() && std::env::consts::OS.len() <= MAX_METADATA_BYTES,
+            "the target OS name must fit the Gateway metadata budget"
+        );
+    }
+
     ClientMetadata {
         id: ClientId::Android,
         display_name: Name::new("GTA Claw Android", MAX_METADATA_BYTES).ok(),
@@ -196,7 +222,7 @@ mod tests {
             .iter()
             .map(|scope| {
                 OperatorScope::from_identity(scope.as_str()).unwrap_or_else(|| {
-                    panic!("requested scope {:?} has no frozen wire identity", scope)
+                    panic!("requested scope {scope:?} has no frozen wire identity")
                 })
             })
             .collect()
@@ -527,11 +553,7 @@ mod tests {
         let requested = requested_operator_scopes(&config);
         let ceiling = android_ui_contract_scopes();
 
-        let unrequested: Vec<OperatorScope> = ceiling
-            .iter()
-            .copied()
-            .filter(|scope| !requested.contains(scope))
-            .collect();
+        let leaves_something_ungranted = ceiling.iter().any(|scope| !requested.contains(scope));
 
         assert!(
             requested.iter().all(|scope| ceiling.contains(scope)),
@@ -539,7 +561,7 @@ mod tests {
              requested {requested:?}"
         );
         assert!(
-            !unrequested.is_empty(),
+            leaves_something_ungranted,
             "this client deliberately requests less than the contract allows; if it now \
              requests all of {ceiling:?} that is an over-grant to justify, requested {requested:?}"
         );

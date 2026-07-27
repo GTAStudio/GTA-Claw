@@ -15,7 +15,7 @@
 //! | [`store`] | [`FileGoalStore`]: crash-safe, revision-checked, on-disk goal records |
 //! | [`wire`] | The versioned JSON encoding those records are written in |
 //! | [`budget`] | Per-session ceilings on goal count and stored bytes |
-//! | [`transition`] | The goal status state machine and its typed refusals |
+//! | [`mod@transition`] | The goal status state machine and its typed refusals |
 //! | [`command`] | `/goal`, `/goal-done` and `/goal-drop` lowered onto a durable goal |
 //! | [`tool`] | The `update_goal` model-tool call lowered onto a durable goal |
 //! | [`anchor`] | The goal statement that context compaction may never drop |
@@ -28,7 +28,7 @@
 //! * **Refusals leave nothing behind.** Revision conflicts and budget refusals are decided before
 //!   any byte is written, so a rejected save cannot change what a restart would recover.
 //! * **Recovery is explicit, never silent.** [`FileGoalStore::open`] reports what it repaired in a
-//!   [`RecoveryReport`](store::RecoveryReport) instead of quietly rewriting history.
+//!   [`RecoveryReport`] instead of quietly rewriting history.
 //! * **The goal outlives the context.** Compaction is free to discard conversation, but
 //!   [`anchor::AnchoredContext`] structurally cannot discard the goal statement.
 //!

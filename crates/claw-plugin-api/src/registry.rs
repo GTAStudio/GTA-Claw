@@ -2,7 +2,7 @@
 //!
 //! `compat/upstream/inventories/plugins.json` is a frozen contract artifact
 //! holding 137 plugin descriptors (64 core, 70 official external, 3 source-only
-//! QA). It is projected into [`registry_data`](crate::registry_data) by
+//! QA). It is projected into the private `registry_data` module by
 //! `scripts/generate-plugin-registry.ps1` and re-checked against the frozen
 //! JSON by `tests/registry_matches_inventory.rs`.
 //!

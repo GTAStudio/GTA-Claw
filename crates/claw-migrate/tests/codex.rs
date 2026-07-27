@@ -5,7 +5,6 @@
 //! and sidecars. Discovery is always driven through injected platform paths, so
 //! no test here reads a real `~/.codex`, a real `CODEX_HOME` or a real desktop
 //! configuration directory.
-#![allow(missing_docs)]
 
 use std::fs;
 

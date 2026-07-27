@@ -138,6 +138,24 @@ impl ConnectRequest {
     /// carried through to [`Self::allow_insecure_remote_ws`] and is the single
     /// value the Gateway configuration is built from, so the checkbox in the UI
     /// and the transport decision can never disagree.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`SubmissionRejection`] naming the first policy the input
+    /// broke, checked in this order: a blank endpoint
+    /// ([`EmptyEndpoint`](SubmissionRejection::EmptyEndpoint)), an endpoint
+    /// over [`MAX_ENDPOINT_BYTES`]
+    /// ([`EndpointTooLong`](SubmissionRejection::EndpointTooLong)), a token
+    /// over [`MAX_TOKEN_BYTES`]
+    /// ([`TokenTooLong`](SubmissionRejection::TokenTooLong)), text `url::Url`
+    /// cannot parse ([`MalformedEndpoint`](SubmissionRejection::MalformedEndpoint)),
+    /// a scheme other than `ws` or `wss`
+    /// ([`UnsupportedScheme`](SubmissionRejection::UnsupportedScheme)), a URL
+    /// with no host ([`MissingHost`](SubmissionRejection::MissingHost)), a URL
+    /// carrying userinfo, a password, a query string or a fragment
+    /// ([`CredentialBearingEndpoint`](SubmissionRejection::CredentialBearingEndpoint)),
+    /// and plaintext `ws://` to a non-loopback host without the opt-in
+    /// ([`InsecureRemoteEndpoint`](SubmissionRejection::InsecureRemoteEndpoint)).
     pub fn prepare(
         endpoint: &str,
         token: &str,
@@ -175,7 +193,7 @@ impl ConnectRequest {
         {
             return Err(SubmissionRejection::CredentialBearingEndpoint);
         }
-        if url.scheme() == "ws" && !allow_insecure_remote_ws && !is_loopback(url.host()) {
+        if url.scheme() == "ws" && !allow_insecure_remote_ws && !is_loopback(&url) {
             return Err(SubmissionRejection::InsecureRemoteEndpoint);
         }
 
@@ -218,7 +236,7 @@ impl ConnectRequest {
     pub fn transport_posture(&self) -> TransportPosture {
         if self.url.scheme() == "wss" {
             TransportPosture::Encrypted
-        } else if is_loopback(self.url.host()) {
+        } else if is_loopback(&self.url) {
             TransportPosture::PlaintextLoopback
         } else {
             TransportPosture::PlaintextRemote
@@ -253,15 +271,16 @@ impl Debug for ConnectRequest {
 }
 
 fn endpoint_authority(url: &Url) -> String {
+    let scheme = url.scheme();
     let host = url.host_str().unwrap_or("<unknown>");
-    match url.port() {
-        Some(port) => format!("{}://{host}:{port}", url.scheme()),
-        None => format!("{}://{host}", url.scheme()),
-    }
+    url.port().map_or_else(
+        || format!("{scheme}://{host}"),
+        |port| format!("{scheme}://{host}:{port}"),
+    )
 }
 
-fn is_loopback(host: Option<Host<&str>>) -> bool {
-    match host {
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
         Some(Host::Domain("localhost")) => true,
         Some(Host::Ipv4(address)) => address.is_loopback(),
         Some(Host::Ipv6(address)) => address.is_loopback(),
@@ -715,7 +734,8 @@ impl ViewModel {
         }
     }
 
-    /// Returns whether a new attempt may start now.    #[must_use]
+    /// Returns whether a new attempt may start now.
+    #[must_use]
     pub const fn can_start_connection(&self) -> bool {
         matches!(self.phase, Phase::Idle | Phase::Failed(_) | Phase::Stopped)
     }
@@ -889,6 +909,13 @@ pub const CREDENTIAL_NOTICE: &str = "Session only. No token or device key is wri
 
 /// An immutable projection of [`ViewModel`] for the UI layer.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "these four are independent facts a toolkit binds directly to a checkbox and \
+              three control enablements, not a state that could be one enum: a connecting \
+              attempt is busy with neither control enabled, a ready one enables disconnect \
+              only, and `token_offered` is orthogonal to all three"
+)]
 pub struct ViewSnapshot {
     title: String,
     detail: String,
@@ -1060,8 +1087,7 @@ mod tests {
         assert_eq!(
             request.endpoint_display(),
             "wss://gateway.example.com:8443",
-            "bare hosts must default to wss, got {:?}",
-            request
+            "bare hosts must default to wss, got {request:?}"
         );
     }
 

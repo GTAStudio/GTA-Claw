@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::schema::{SchemaError, validate_schema};
 
 /// A validated modern skill manifest.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct SkillManifest {
     id: String,
     description: String,
@@ -55,7 +55,7 @@ impl SkillManifest {
 }
 
 /// Closed executable forms. JavaScript is deliberately not representable.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SkillExecution {
     /// Rust-native handler registered in the process.
@@ -95,7 +95,7 @@ impl SkillExecution {
 }
 
 /// Declarative HTTP request with no executable source code.
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, Deserialize, Eq, PartialEq)]
 pub struct HttpSkillDefinition {
     /// HTTP method.
     pub method: HttpMethod,
@@ -226,6 +226,33 @@ pub enum ManifestError {
 }
 
 /// Parses and validates a modern manifest.
+///
+/// # Errors
+///
+/// Returns [`ManifestError::MalformedJson`] when `json` is not JSON or does not
+/// decode into the closed model, which includes any `execution.kind` other than
+/// `native`, `http` or `wasm`: JavaScript is not representable, so it is
+/// rejected by the parser rather than by a later check.
+///
+/// Returns [`ManifestError::InvalidId`] when the identifier is empty, longer
+/// than 128 bytes, or uses a byte outside `[A-Za-z0-9]` plus `-`, `_` and `.`
+/// after the first, and [`ManifestError::EmptyDescription`] when the
+/// description is blank. [`ManifestError::InvalidParameterSchema`] carries the
+/// exact path and reason the parameter schema left the supported JSON Schema
+/// subset.
+///
+/// The remaining variants name what the selected backend rejected:
+/// [`ManifestError::InvalidNativeHandler`] for a handler identifier outside the
+/// identifier alphabet; [`ManifestError::InvalidHttpUrl`] for a URL that is not
+/// `http(s)://`, carries no authority, embeds user information before an `@`,
+/// or contains a control character; [`ManifestError::InvalidHttpHeader`] for a
+/// header whose name is malformed, whose value would inject `CR`, `LF` or `NUL`,
+/// or that is one of the credential-bearing names (`authorization`, `cookie`,
+/// `proxy-authorization`, `x-api-key`);
+/// [`ManifestError::InvalidHttpParameterEncoding`] for a JSON body on `GET` or
+/// `DELETE` or a malformed query parameter name; and
+/// [`ManifestError::InvalidWasmTarget`] for an invalid plugin identifier or
+/// export name.
 pub fn load_manifest(json: &str) -> Result<SkillManifest, ManifestError> {
     let manifest: SkillManifest =
         serde_json::from_str(json).map_err(|_| ManifestError::MalformedJson)?;

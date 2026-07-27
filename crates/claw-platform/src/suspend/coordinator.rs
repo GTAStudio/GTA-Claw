@@ -72,6 +72,10 @@ impl std::error::Error for SchedulerError {}
 ///
 /// Closing the admission fence stops new *inbound* work; pausing the scheduler
 /// stops the host starting work by itself. A suspension needs both.
+///
+/// Both methods are called while the coordinator holds its own lock, so an
+/// implementation must not block and must not call back into
+/// [`SuspendCoordinator`]. Re-entering would deadlock on a non-reentrant lock.
 pub trait Scheduler: Debug + Send + Sync {
     /// Stops scheduling new runs.
     ///
@@ -413,7 +417,7 @@ impl SuspendCoordinator {
 
     /// Returns the admission fence this coordinator closes.
     #[must_use]
-    pub fn admission(&self) -> &Arc<WorkAdmission> {
+    pub const fn admission(&self) -> &Arc<WorkAdmission> {
         &self.admission
     }
 
@@ -455,11 +459,11 @@ impl SuspendCoordinator {
         }
 
         let Some(lease) = self.admission.try_begin_suspend() else {
-            return self.busy(BusyReason::GatewayDraining, self.capture());
+            return busy(BusyReason::GatewayDraining, self.capture());
         };
 
         if self.scheduler.pause().is_err() {
-            lease.rollback();
+            let _ = lease.rollback();
             return PrepareOutcome::Recovering {
                 retry_after_ms: SCHEDULER_RECOVERY_RETRY_MS,
             };
@@ -475,14 +479,14 @@ impl SuspendCoordinator {
                     retry_after_ms: SCHEDULER_RECOVERY_RETRY_MS,
                 };
             }
-            lease.rollback();
-            return self.busy(BusyReason::ActiveWork, snapshot);
+            let _ = lease.rollback();
+            return busy(BusyReason::ActiveWork, snapshot);
         }
 
         if !lease.commit() {
             // Only a restart drain can supersede a lease mid-preparation, and
             // a host being shut down must not have its scheduler restarted.
-            return self.busy(BusyReason::GatewayDraining, snapshot);
+            return busy(BusyReason::GatewayDraining, snapshot);
         }
 
         let suspension_id = self.ids.next_id();
@@ -537,16 +541,13 @@ impl SuspendCoordinator {
 
         match std::mem::take(&mut *state) {
             CoordinatorState::Held(held) if held.suspension_id == suspension_id => {
-                match self.scheduler.resume() {
-                    Ok(()) => {
-                        held.lease.release();
-                        ResumeOutcome::Resumed
-                    }
-                    Err(_) => {
-                        *state = self.enter_recovery(held.lease);
-                        ResumeOutcome::Recovering {
-                            retry_after_ms: SCHEDULER_RECOVERY_RETRY_MS,
-                        }
+                if self.scheduler.resume().is_ok() {
+                    let _ = held.lease.release();
+                    ResumeOutcome::Resumed
+                } else {
+                    *state = self.enter_recovery(held.lease);
+                    ResumeOutcome::Recovering {
+                        retry_after_ms: SCHEDULER_RECOVERY_RETRY_MS,
                     }
                 }
             }
@@ -598,15 +599,6 @@ impl SuspendCoordinator {
         ActiveWorkSnapshot::capture(self.inspector.as_ref())
     }
 
-    fn busy(&self, reason: BusyReason, snapshot: ActiveWorkSnapshot) -> PrepareOutcome {
-        PrepareOutcome::Busy {
-            reason,
-            retry_after_ms: SUSPEND_RETRY_AFTER_MS,
-            active_count: snapshot.active_count(),
-            blockers: snapshot.into_blockers(),
-        }
-    }
-
     /// Retires an expired or superseded lease and retries pending recovery.
     ///
     /// Returns `false` when the coordinator is still recovering, which is the
@@ -615,14 +607,23 @@ impl SuspendCoordinator {
         let (next, usable) = match std::mem::take(state) {
             CoordinatorState::Idle => (CoordinatorState::Idle, true),
             CoordinatorState::Recovering { lease, retry_at_ms } => {
-                if self.clock.now_ms() < retry_at_ms {
+                if !lease.is_active() {
+                    // A restart drain took the fence while recovery was
+                    // pending. The host is going away, so its scheduler is
+                    // deliberately left paused — the same rule the `Held` arm
+                    // below applies — and the retry stops instead of poking a
+                    // wedged scheduler for the rest of the process lifetime.
+                    (CoordinatorState::Idle, true)
+                } else if self.clock.now_ms() < retry_at_ms {
                     // Back off exactly as long as the caller was told to, so a
                     // polling controller cannot hammer a wedged scheduler.
                     (CoordinatorState::Recovering { lease, retry_at_ms }, false)
                 } else {
                     match self.scheduler.resume() {
                         Ok(()) => {
-                            lease.release();
+                            // A lease that never reached `Prepared` reopens the
+                            // fence from `Preparing` through its own `Drop`.
+                            let _ = lease.release();
                             (CoordinatorState::Idle, true)
                         }
                         Err(_) => (self.enter_recovery(lease), false),
@@ -637,7 +638,7 @@ impl SuspendCoordinator {
                 } else if self.clock.now_ms() >= held.expires_at_ms {
                     match self.scheduler.resume() {
                         Ok(()) => {
-                            held.lease.release();
+                            let _ = held.lease.release();
                             (CoordinatorState::Idle, true)
                         }
                         Err(_) => (self.enter_recovery(held.lease), false),
@@ -649,6 +650,16 @@ impl SuspendCoordinator {
         };
         *state = next;
         usable
+    }
+}
+
+/// Renders a refused preparation, consuming the snapshot that refused it.
+fn busy(reason: BusyReason, snapshot: ActiveWorkSnapshot) -> PrepareOutcome {
+    PrepareOutcome::Busy {
+        reason,
+        retry_after_ms: SUSPEND_RETRY_AFTER_MS,
+        active_count: snapshot.active_count(),
+        blockers: snapshot.into_blockers(),
     }
 }
 

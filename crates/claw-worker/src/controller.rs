@@ -57,7 +57,7 @@ pub struct AdmittedSession {
 }
 
 /// A worker RPC call.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkerCall {
     /// Identity of this call, unique within the session.
     pub call_id: CallId,
@@ -70,7 +70,7 @@ pub struct WorkerCall {
 /// The wire form of a worker RPC call.
 ///
 /// Unknown fields are refused rather than ignored.
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerCallFrame {
     /// Identity of this call, unique within the session.
@@ -102,7 +102,7 @@ impl From<WorkerCall> for WorkerCallFrame {
 }
 
 /// A call that passed every control and may be dispatched.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CallAccepted {
     /// The session that made the call.
     pub session: SessionId,
@@ -192,6 +192,14 @@ impl AdmissionController {
     /// Returns [`IssueError`] when the time-to-live is zero, the expiry instant
     /// overflows, the generation counter is exhausted, the randomness source
     /// fails, or the generated ticket identity collides with a known one.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the only `expect` here cannot fire: `encode_hex` of a fixed TICKET_ID_BYTES \
+                  buffer is always 32 lowercase hex digits, which is inside the identifier \
+                  alphabet, so no `SecretSource` implementation can make `TicketId::new` reject \
+                  it, and advertising a `# Panics` section would name a failure callers cannot \
+                  reach"
+    )]
     pub fn issue(
         &mut self,
         worker: &WorkerId,
@@ -284,6 +292,15 @@ impl AdmissionController {
     /// Returns [`AdmissionRejection`] naming the control that refused the
     /// request. There is no path that admits a worker without passing all of
     /// them.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if this controller has already handed out [`u64::MAX`]
+    /// session handles, which exhausts the counter that makes a handle unique;
+    /// reusing one would let a new session inherit a closed session's identity.
+    /// The ticket lookup that follows the checks cannot fail: the controller is
+    /// borrowed exclusively for the whole admission, so nothing can remove the
+    /// ticket between the check and the redemption.
     pub fn admit(
         &mut self,
         request: &AdmissionRequest,
@@ -410,7 +427,7 @@ impl AdmissionController {
         let now_ms = self.clock.unix_millis();
         let state = self
             .sessions
-            .get(&session)
+            .get_mut(&session)
             .ok_or(CallRejection::UnknownSession { session })?;
         if state.closed {
             return Err(CallRejection::SessionClosed { session });
@@ -434,10 +451,6 @@ impl AdmissionController {
             });
         }
 
-        let state = self
-            .sessions
-            .get_mut(&session)
-            .expect("the session was present for the whole call check");
         state.accepted_calls.insert(call.call_id.clone());
         Ok(CallAccepted {
             session,

@@ -1,7 +1,7 @@
 //! A separate process that mutates a durable goal and exits.
 //!
 //! The restart test needs a restart, not a re-binding. Constructing a second
-//! [`FileGoalStore`](claw_goals::FileGoalStore) in the same process proves the store holds no
+//! [`FileGoalStore`] in the same process proves the store holds no
 //! cache, but it cannot prove that what reached the disk is enough to reconstruct a goal, because
 //! anything the first store leaked into process memory is still there. This binary closes that
 //! gap: it opens the store, applies one mutation, and exits, so the reading test observes nothing

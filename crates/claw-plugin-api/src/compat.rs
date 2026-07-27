@@ -15,7 +15,7 @@
 //! # Why this is not a second inventory
 //!
 //! Nothing here lists a plugin by name. Every decision is computed from a
-//! [`PluginDescriptor`](crate::registry::PluginDescriptor) that came out of the
+//! [`PluginDescriptor`] that came out of the
 //! frozen inventory, and [`decide`] answers `None` for an id the frozen
 //! inventory does not contain. A decision therefore cannot exist for a plugin
 //! upstream does not have, and cannot go missing for one it does.
@@ -90,6 +90,12 @@ impl InstallDecision {
     /// exhaustive match rather than a bare `false`: a fourth variant that did
     /// acquire something would not compile until somebody answered for it.
     #[must_use]
+    #[expect(
+        clippy::match_same_arms,
+        reason = "the arms are identical on purpose: one arm per variant forces a future variant \
+                  that does acquire an artifact to be answered for here instead of inheriting a \
+                  wildcard `false`"
+    )]
     pub const fn acquires_artifact(self) -> bool {
         match self {
             Self::BundledUpstreamNotPorted => false,

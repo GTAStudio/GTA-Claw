@@ -1,4 +1,8 @@
-#![allow(missing_docs)]
+#![expect(
+    missing_docs,
+    reason = "an integration-test binary publishes no API and has no downstream consumers; \
+what each fixture pins is stated by its test name and inline comments"
+)]
 
 use claw_migrate::{
     Artifact, ArtifactKind, ArtifactSignature, Bridge, ContractViolation, Diagnostic,

@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 
 use claw_skills::{
     BUNDLED_BASELINE_SHA, BUNDLED_MANIFEST_FILE_NAME, BUNDLED_SCHEMA_VERSION,
-    BundledDiscoveryError, BundledManifestError, SkillClassification, SkillPortStatus,
-    discover_bundled_skills, embedded_bundled_directories, embedded_bundled_skills,
-    load_bundled_skills, load_embedded_bundled_skills, parse_bundled_manifest, registry,
+    BundledDiscoveryError, BundledManifestError, BundledSkillManifest, SkillClassification,
+    SkillPortStatus, discover_bundled_skills, embedded_bundled_directories,
+    embedded_bundled_skills, load_bundled_skills, load_embedded_bundled_skills,
+    parse_bundled_manifest, registry,
 };
 use serde::Deserialize;
 
@@ -68,7 +69,7 @@ fn read_contract_json<T: for<'de> Deserialize<'de>>(relative: &str) -> T {
         .unwrap_or_else(|error| panic!("decode {}: {error}", path.display()))
 }
 
-fn classification_token(classification: SkillClassification) -> &'static str {
+const fn classification_token(classification: SkillClassification) -> &'static str {
     match classification {
         SkillClassification::OfficialIntegration => "official_integration",
     }
@@ -220,7 +221,7 @@ fn discovery_loads_a_standalone_root() {
     assert_eq!(catalog.len(), 1);
     assert_eq!(catalog.ids().collect::<Vec<_>>(), vec!["weather"]);
     assert_eq!(
-        catalog.get("weather").map(|manifest| manifest.license()),
+        catalog.get("weather").map(BundledSkillManifest::license),
         Some("MIT")
     );
 }

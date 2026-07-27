@@ -53,6 +53,16 @@ pub struct HttpResponse {
 /// Declarative HTTP bridge port.
 pub trait HttpBridge {
     /// Executes one validated request without logging its body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpBridgeError::Connection`] when the endpoint cannot be
+    /// reached, [`HttpBridgeError::Timeout`] when the implementation's deadline
+    /// expires, [`HttpBridgeError::Tls`] when certificate or hostname
+    /// validation fails, and [`HttpBridgeError::Protocol`] when the response
+    /// framing is malformed. The category carries no detail on purpose: the
+    /// request body and headers may hold caller data, and an error is the most
+    /// likely value to be logged.
     fn send(&self, request: HttpRequest) -> Result<HttpResponse, HttpBridgeError>;
 }
 
@@ -72,6 +82,13 @@ pub enum HttpBridgeError {
 /// A native Rust skill implementation.
 pub trait NativeSkillHandler: Send + Sync {
     /// Executes validated parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkillExecutionError::NativeFailure`] when the handler cannot
+    /// complete its operation. `parameters` has already been validated against
+    /// the manifest's schema before this is called, so a handler does not have
+    /// to re-report shape problems the schema already covers.
     fn execute(&self, parameters: Value) -> Result<Value, SkillExecutionError>;
 }
 
@@ -91,6 +108,14 @@ impl NativeSkillRegistry {
     }
 
     /// Registers a handler exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRegistryError::InvalidId`] when `id` is empty or uses a
+    /// byte outside `[A-Za-z0-9]` plus `-`, `_` and `.` after the first, and
+    /// [`NativeRegistryError::DuplicateId`] when the identifier is already
+    /// registered. A duplicate never replaces the handler already in place, so
+    /// a late registration cannot silently take over a reviewed skill.
     pub fn register(
         &mut self,
         id: impl Into<String>,
@@ -142,6 +167,14 @@ pub enum NativeRegistryError {
 /// Port supplied by the separately owned sandboxed Wasm plugin host.
 pub trait WasmSkillHost {
     /// Invokes one installed component export with validated parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmHostError::PluginNotFound`] when `plugin_id` is not
+    /// installed, [`WasmHostError::ExportNotFound`] when the component does not
+    /// export `export`, [`WasmHostError::PolicyDenied`] when the sandbox policy
+    /// refuses the invocation, and [`WasmHostError::Trap`] when the component
+    /// traps or exhausts its limits.
     fn invoke(
         &self,
         plugin_id: &str,
@@ -182,6 +215,31 @@ impl<'a> SkillRuntime<'a> {
     }
 
     /// Validates parameters and dispatches the manifest's closed execution form.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkillExecutionError::InvalidManifest`] when the manifest no
+    /// longer satisfies its own invariants — it is re-validated here, so a
+    /// manifest mutated after construction cannot reach a backend — and
+    /// [`SkillExecutionError::InvalidParameters`] when `parameters` does not
+    /// match the declared schema. Both are decided before any backend is
+    /// touched.
+    ///
+    /// A native skill returns [`SkillExecutionError::NativeHandlerNotFound`]
+    /// when the manifest names a handler this registry does not hold, or
+    /// whatever the handler itself reports.
+    ///
+    /// An HTTP skill returns [`SkillExecutionError::ParameterEncoding`] when the
+    /// validated parameters cannot be encoded for the declared placement,
+    /// [`SkillExecutionError::HttpBridge`] when the injected bridge fails,
+    /// [`SkillExecutionError::HttpResponseTooLarge`] when the response body
+    /// exceeds one MiB, [`SkillExecutionError::HttpStatus`] for any status
+    /// outside 200-299 (the body is deliberately dropped), and
+    /// [`SkillExecutionError::InvalidHttpResponse`] when the body does not
+    /// decode as the declared JSON or UTF-8 text.
+    ///
+    /// A Wasm skill returns [`SkillExecutionError::WasmHost`] carrying the
+    /// sandboxed host's own refusal.
     pub fn execute(
         &self,
         manifest: &SkillManifest,
@@ -241,8 +299,9 @@ fn append_query_parameter(url: &str, name: &str, value: &str) -> String {
 }
 
 fn percent_encode(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             encoded.push(char::from(byte));

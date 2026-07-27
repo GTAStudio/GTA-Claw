@@ -118,7 +118,7 @@ impl EffectiveCapabilities {
 
     /// Whether the manifest got exactly what it asked for.
     #[must_use]
-    pub fn is_unrestricted(&self) -> bool {
+    pub const fn is_unrestricted(&self) -> bool {
         self.withheld.is_empty() && self.narrowed.is_empty()
     }
 

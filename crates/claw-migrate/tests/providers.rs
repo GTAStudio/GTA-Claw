@@ -1,4 +1,8 @@
-#![allow(missing_docs)]
+#![expect(
+    missing_docs,
+    reason = "an integration-test binary publishes no API and has no downstream consumers; \
+what each fixture pins is stated by its test name and inline comments"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -941,4 +945,59 @@ fn rollback_restores_preexisting_secret_value() {
         secrets.values.get(secret_id).expect("restored").expose(),
         b"original-secret"
     );
+}
+
+/// A symbolic link whose destination does not exist is reported as absent by
+/// `Path::exists`, so a target guard that followed links would treat the path as
+/// free space and let `fs::write` create the file wherever the link points.
+#[cfg(unix)]
+#[test]
+fn apply_refuses_a_dangling_symlink_planted_at_a_target() {
+    let root = TestDir::new("symlink-escape");
+    let source = root.join("codex-home");
+    let target = root.join("target");
+    let escape = root.join("outside").join("stolen.toml");
+    write(&source.join("config.toml"), "model = \"gpt-5\"\n");
+    fs::create_dir_all(escape.parent().expect("escape parent")).expect("create escape parent");
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+    let plan = CodexMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&source),
+            target_root: &target,
+            overwrite: true,
+            signer: &signer,
+        })
+        .expect("plan migration");
+
+    let planted = target
+        .join("config")
+        .join("migrations")
+        .join("codex")
+        .join("config.toml");
+    fs::create_dir_all(planted.parent().expect("planted parent")).expect("create planted parent");
+    std::os::unix::fs::symlink(&escape, &planted).expect("plant dangling symlink");
+    assert!(!planted.exists(), "a dangling link must look absent");
+
+    let mut secrets = MemorySecretStore::default();
+    let mut apply = ApplyContext {
+        target_root: &target,
+        backup_root: &root.join("backup"),
+        overwrite: true,
+        secret_store: &mut secrets,
+    };
+    let error = CodexMigrationProvider
+        .apply(&mut apply, &plan)
+        .expect_err("a symbolic link at a migration target must be refused");
+    assert_eq!(
+        error.to_string(),
+        format!("migration refuses symbolic link: {}", planted.display())
+    );
+    assert!(
+        !escape.exists(),
+        "apply followed the planted link and wrote outside the migration root"
+    );
+    assert!(!root.join("backup").exists());
+    assert_eq!(secrets.values, BTreeMap::new());
 }

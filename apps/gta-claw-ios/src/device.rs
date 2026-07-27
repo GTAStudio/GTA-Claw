@@ -44,7 +44,7 @@ impl IosDeviceProbe for UnobservedDeviceProbe {
 
 /// A probe whose facts were supplied by the embedder rather than observed here.
 ///
-/// An iOS application target that *can* read UIKit — for example a future Slint
+/// An iOS application target that *can* read `UIKit` — for example a future Slint
 /// shell, or a thin Swift launcher — passes what it read through this type. The
 /// name says where the values came from, so that a reader of
 /// [`IosClientIdentity`](crate::IosClientIdentity) is never misled into
