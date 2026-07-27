@@ -1,0 +1,436 @@
+import { Button, CheckBox, LineEdit, ScrollView } from "std-widgets.slint";
+
+export enum StatusTone {
+    neutral,
+    progress,
+    success,
+    warning,
+    danger,
+}
+
+component ConnectionCard inherits Rectangle {
+    in-out property <string> endpoint;
+    in-out property <string> token;
+    in-out property <bool> allow-insecure;
+    in property <bool> can-connect;
+    in property <bool> busy;
+    in property <string> form-error;
+    callback submit(string, string, bool);
+
+    background: #ffffff;
+    border-color: #dce4ef;
+    border-width: 1px;
+    border-radius: 20px;
+    min-height: 430px;
+
+    VerticalLayout {
+        padding: 22px;
+        spacing: 12px;
+
+        Text {
+            text: @tr("Connect this device");
+            color: #152033;
+            font-size: 23px;
+            font-weight: 700;
+        }
+
+        Text {
+            text: @tr("Use a secure WebSocket address. A bare host defaults to wss://.");
+            color: #54647a;
+            wrap: word-wrap;
+        }
+
+        Text {
+            text: @tr("Gateway address");
+            color: #314158;
+            font-weight: 600;
+        }
+
+        endpoint-field := LineEdit {
+            text <=> root.endpoint;
+            placeholder-text: @tr("gateway.example.com:8443");
+            accessible-label: @tr("Gateway address");
+            enabled: !root.busy;
+            height: 52px;
+        }
+
+        Text {
+            text: @tr("Gateway token (optional)");
+            color: #314158;
+            font-weight: 600;
+        }
+
+        token-field := LineEdit {
+            text <=> root.token;
+            placeholder-text: @tr("Session-only token");
+            input-type: InputType.password;
+            accessible-label: @tr("Gateway token");
+            enabled: !root.busy;
+            height: 52px;
+        }
+
+        CheckBox {
+            text: @tr("Allow plaintext ws:// to a remote host");
+            checked <=> root.allow-insecure;
+            accessible-label: @tr("Allow unencrypted remote traffic");
+            enabled: !root.busy;
+            min-height: 48px;
+        }
+
+        if root.allow-insecure : Text {
+            text: @tr("Warning: traffic and the token will not be encrypted.");
+            color: #b42318;
+            wrap: word-wrap;
+        }
+
+        if root.form-error != "" : Rectangle {
+            background: #fff1f0;
+            border-color: #f5b7b1;
+            border-width: 1px;
+            border-radius: 12px;
+            min-height: 54px;
+
+            Text {
+                x: 12px;
+                y: 10px;
+                width: parent.width - 24px;
+                height: parent.height - 20px;
+                text: root.form-error;
+                color: #9c2f27;
+                wrap: word-wrap;
+                vertical-alignment: center;
+            }
+        }
+
+        Rectangle { vertical-stretch: 1; }
+
+        Button {
+            text: root.busy ? @tr("Connecting...") : @tr("Connect");
+            enabled: root.can-connect && !root.busy;
+            accessible-label: @tr("Connect to the Gateway");
+            min-height: 52px;
+            clicked => {
+                root.submit(root.endpoint, root.token, root.allow-insecure);
+            }
+        }
+    }
+}
+
+component StatusCard inherits Rectangle {
+    in property <string> state-title;
+    in property <string> state-detail;
+    in property <string> status-label;
+    in property <StatusTone> tone;
+    in property <string> endpoint-summary;
+    in property <string> server-summary;
+    in property <string> protocol-summary;
+    in property <string> role-summary;
+    in property <string> scopes-summary;
+    in property <string> identity-summary;
+    in property <string> transport-notice;
+    in property <string> credential-notice;
+    in property <bool> token-offered;
+    in property <bool> can-disconnect;
+    in property <bool> has-error;
+    in property <string> error-message;
+    in property <string> error-action;
+    callback disconnect();
+
+    private property <color> tone-color:
+        root.tone == StatusTone.success ? #17803d :
+        root.tone == StatusTone.warning ? #a15c00 :
+        root.tone == StatusTone.danger ? #b42318 :
+        root.tone == StatusTone.progress ? #1769aa : #637083;
+
+    background: #ffffff;
+    border-color: #dce4ef;
+    border-width: 1px;
+    border-radius: 20px;
+    min-height: 430px;
+
+    VerticalLayout {
+        padding: 22px;
+        spacing: 12px;
+
+        HorizontalLayout {
+            spacing: 10px;
+
+            Rectangle {
+                width: 12px;
+                height: 12px;
+                border-radius: 6px;
+                background: root.tone-color;
+            }
+
+            Text {
+                text: root.status-label;
+                color: root.tone-color;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+        }
+
+        Text {
+            text: root.state-title;
+            color: #152033;
+            font-size: 23px;
+            font-weight: 700;
+        }
+
+        Text {
+            text: root.state-detail;
+            color: #54647a;
+            wrap: word-wrap;
+        }
+
+        if root.has-error : Rectangle {
+            background: #fff1f0;
+            border-color: #f5b7b1;
+            border-width: 1px;
+            border-radius: 12px;
+            min-height: 82px;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 4px;
+
+                Text {
+                    text: root.error-message;
+                    color: #9c2f27;
+                    font-weight: 600;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.error-action;
+                    color: #75413c;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        GridLayout {
+            spacing: 8px;
+
+            Text { row: 0; col: 0; text: @tr("Gateway"); color: #6b7789; }
+            Text { row: 0; col: 1; text: root.endpoint-summary; color: #26364b; horizontal-alignment: right; }
+            Text { row: 1; col: 0; text: @tr("Server"); color: #6b7789; }
+            Text { row: 1; col: 1; text: root.server-summary; color: #26364b; horizontal-alignment: right; }
+            Text { row: 2; col: 0; text: @tr("Protocol"); color: #6b7789; }
+            Text { row: 2; col: 1; text: root.protocol-summary; color: #26364b; horizontal-alignment: right; }
+            Text { row: 3; col: 0; text: @tr("Role"); color: #6b7789; }
+            Text { row: 3; col: 1; text: root.role-summary; color: #26364b; horizontal-alignment: right; }
+            Text { row: 4; col: 0; text: @tr("Scopes"); color: #6b7789; }
+            Text { row: 4; col: 1; text: root.scopes-summary; color: #26364b; horizontal-alignment: right; overflow: elide; }
+            Text { row: 5; col: 0; text: @tr("Identity"); color: #6b7789; }
+            Text { row: 5; col: 1; text: root.identity-summary; color: #26364b; horizontal-alignment: right; overflow: elide; }
+        }
+
+        Rectangle {
+            background: #f3f7fb;
+            border-radius: 12px;
+            min-height: 88px;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 5px;
+
+                Text {
+                    text: root.transport-notice;
+                    color: #314158;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.credential-notice;
+                    color: #637083;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        Rectangle { vertical-stretch: 1; }
+
+        Button {
+            text: @tr("Disconnect");
+            enabled: root.can-disconnect;
+            accessible-label: @tr("Disconnect from the Gateway");
+            min-height: 52px;
+            clicked => { root.disconnect(); }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: @tr("GTA Claw");
+    preferred-width: 430px;
+    preferred-height: 820px;
+    min-width: 320px;
+    min-height: 560px;
+    background: #f3f6fa;
+
+    in property <string> runtime-summary: "";
+    in property <string> core-protocol: "";
+    in property <string> state-title: @tr("Not connected");
+    in property <string> state-detail: @tr("Enter a Gateway address to begin.");
+    in property <string> status-label: @tr("Idle");
+    in property <StatusTone> status-tone: StatusTone.neutral;
+    in property <string> endpoint-summary: @tr("No Gateway selected");
+    in property <string> server-summary: "-";
+    in property <string> protocol-summary: "-";
+    in property <string> role-summary: "-";
+    in property <string> scopes-summary: "-";
+    in property <string> identity-summary: @tr("not generated");
+    in property <string> credential-notice: "";
+    in property <string> transport-notice: "";
+    in property <bool> token-offered: false;
+    in property <bool> busy: false;
+    in property <bool> can-connect: true;
+    in property <bool> can-disconnect: false;
+    in property <bool> has-error: false;
+    in property <string> error-message: "";
+    in property <string> error-action: "";
+    in-out property <string> endpoint-input: "";
+    in-out property <string> token-input: "";
+    in-out property <bool> allow-insecure: false;
+    in-out property <string> form-error: "";
+
+    callback connect-requested(string, string, bool);
+    callback disconnect-requested();
+
+    safe := Rectangle {
+        x: root.safe-area-insets.left;
+        y: root.safe-area-insets.top;
+        width: root.width - root.safe-area-insets.left - root.safe-area-insets.right;
+        height: root.height - root.safe-area-insets.top - root.safe-area-insets.bottom;
+        background: #f3f6fa;
+
+        ScrollView {
+            width: parent.width;
+            height: parent.height;
+            mouse-drag-pan-enabled: true;
+
+            VerticalLayout {
+                padding: 18px;
+                spacing: 16px;
+
+                VerticalLayout {
+                    spacing: 4px;
+
+                    Text {
+                        text: @tr("GTA CLAW / ANDROID");
+                        color: #167052;
+                        font-size: 13px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: @tr("Private Gateway, pocket-sized.");
+                        color: #152033;
+                        font-size: 28px;
+                        font-weight: 700;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: @tr("Runtime: {}  Core: {}", root.runtime-summary, root.core-protocol);
+                        color: #637083;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+                }
+
+                if root.width >= 760px : HorizontalLayout {
+                    spacing: 16px;
+
+                    ConnectionCard {
+                        endpoint <=> root.endpoint-input;
+                        token <=> root.token-input;
+                        allow-insecure <=> root.allow-insecure;
+                        can-connect: root.can-connect;
+                        busy: root.busy;
+                        form-error: root.form-error;
+                        submit(endpoint, token, allow-insecure) => {
+                            root.connect-requested(endpoint, token, allow-insecure);
+                        }
+                    }
+
+                    StatusCard {
+                        state-title: root.state-title;
+                        state-detail: root.state-detail;
+                        status-label: root.status-label;
+                        tone: root.status-tone;
+                        endpoint-summary: root.endpoint-summary;
+                        server-summary: root.server-summary;
+                        protocol-summary: root.protocol-summary;
+                        role-summary: root.role-summary;
+                        scopes-summary: root.scopes-summary;
+                        identity-summary: root.identity-summary;
+                        transport-notice: root.transport-notice;
+                        credential-notice: root.credential-notice;
+                        token-offered: root.token-offered;
+                        can-disconnect: root.can-disconnect;
+                        has-error: root.has-error;
+                        error-message: root.error-message;
+                        error-action: root.error-action;
+                        disconnect => { root.disconnect-requested(); }
+                    }
+                }
+
+                if root.width < 760px : VerticalLayout {
+                    spacing: 16px;
+
+                    ConnectionCard {
+                        endpoint <=> root.endpoint-input;
+                        token <=> root.token-input;
+                        allow-insecure <=> root.allow-insecure;
+                        can-connect: root.can-connect;
+                        busy: root.busy;
+                        form-error: root.form-error;
+                        submit(endpoint, token, allow-insecure) => {
+                            root.connect-requested(endpoint, token, allow-insecure);
+                        }
+                    }
+
+                    StatusCard {
+                        state-title: root.state-title;
+                        state-detail: root.state-detail;
+                        status-label: root.status-label;
+                        tone: root.status-tone;
+                        endpoint-summary: root.endpoint-summary;
+                        server-summary: root.server-summary;
+                        protocol-summary: root.protocol-summary;
+                        role-summary: root.role-summary;
+                        scopes-summary: root.scopes-summary;
+                        identity-summary: root.identity-summary;
+                        transport-notice: root.transport-notice;
+                        credential-notice: root.credential-notice;
+                        token-offered: root.token-offered;
+                        can-disconnect: root.can-disconnect;
+                        has-error: root.has-error;
+                        error-message: root.error-message;
+                        error-action: root.error-action;
+                        disconnect => { root.disconnect-requested(); }
+                    }
+                }
+
+                Rectangle {
+                    background: #e8eef5;
+                    border-radius: 14px;
+                    min-height: 96px;
+
+                    Text {
+                        x: 14px;
+                        y: 12px;
+                        width: parent.width - 28px;
+                        height: parent.height - 24px;
+                        text: @tr("Platform limits: no discovery, pairing, background reconnect, or Android Keystore persistence. Returning from the background requires a manual reconnect.");
+                        color: #54647a;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}

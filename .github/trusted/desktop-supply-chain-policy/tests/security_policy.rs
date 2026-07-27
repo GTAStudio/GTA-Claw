@@ -1339,7 +1339,7 @@ fn live_tree_is_a_valid_bootstrap_or_final_policy_state() {
     let tree = copy_repo("live-policy-state");
     let root = SafeRoot::new(&tree.path).expect("open copied live repository");
     let identities = validate_inventory(&root).expect("validate live workflow inventory");
-    assert_eq!(identities.len(), 8);
+    assert_eq!(identities.len(), 10);
     assert!(identities.iter().any(|identity| {
         identity.path == AUTHORITATIVE_PATH
             && identity.workflow_name == AUTHORITATIVE_WORKFLOW_NAME
@@ -1892,36 +1892,33 @@ fn mobile_workflow_stub(name: &str, job_id: &str, job_name: &str) -> String {
 fn mobile_packaging_workflows_are_admitted_but_the_inventory_stays_closed() {
     let base = copy_repo("mobile-inventory-baseline");
     let identities = validate_inventory(&SafeRoot::new(&base.path).expect("open baseline tree"))
-        .expect("the eight required workflows are a valid inventory");
-    assert_eq!(identities.len(), 8);
+        .expect("the required and shipped mobile workflows are a valid inventory");
+    assert_eq!(identities.len(), 10);
 
-    for (label, added) in [
-        ("ios", &[".github/workflows/ios-packaging.yml"][..]),
-        ("android", &[".github/workflows/android-packaging.yml"][..]),
-        (
-            "both",
-            &[
-                ".github/workflows/android-packaging.yml",
-                ".github/workflows/ios-packaging.yml",
-            ][..],
-        ),
+    for (label, path) in [
+        ("ios", ".github/workflows/ios-packaging.yml"),
+        ("android", ".github/workflows/android-packaging.yml"),
     ] {
         let tree = copy_repo(&format!("mobile-inventory-{label}"));
-        for (index, path) in added.iter().enumerate() {
-            fs::write(
-                tree.join(path),
-                mobile_workflow_stub(
-                    &format!("mobile packaging {index}"),
-                    &format!("package{index}"),
-                    &format!("Mobile package {index}"),
-                ),
-            )
-            .expect("write admitted mobile workflow");
-        }
+        fs::write(
+            tree.join(path),
+            mobile_workflow_stub(
+                &format!("{label} packaging replacement"),
+                "package",
+                &format!("{label} package"),
+            ),
+        )
+        .expect("write admitted mobile workflow");
+        let root = SafeRoot::new(&tree.path).expect("open admitted mobile tree");
         let identities =
-            validate_inventory(&SafeRoot::new(&tree.path).expect("open admitted mobile tree"))
-                .expect("admitted mobile workflows pass the inventory");
-        assert_eq!(identities.len(), 8 + added.len(), "{label}");
+            validate_inventory(&root).expect("admitted mobile workflow path passes the inventory");
+        assert_eq!(identities.len(), 10, "{label}");
+        let error = validate_final_workflows(&root)
+            .expect_err("noncanonical mobile workflow unexpectedly passed final policy");
+        assert!(
+            error.to_string().contains(path),
+            "{label} exact workflow failure did not name {path}: {error}"
+        );
     }
 
     for (label, path) in [
@@ -1953,11 +1950,6 @@ fn mobile_packaging_workflows_are_admitted_but_the_inventory_stays_closed() {
     }
 
     let removed = copy_repo("mobile-inventory-missing-required");
-    fs::write(
-        removed.join(".github/workflows/ios-packaging.yml"),
-        mobile_workflow_stub("ios packaging", "package", "iOS package"),
-    )
-    .expect("write admitted iOS workflow");
     fs::remove_file(removed.join(".github/workflows/windows-packaging.yml"))
         .expect("remove required workflow");
     let error = validate_inventory(&SafeRoot::new(&removed.path).expect("open reduced tree"))
@@ -4582,24 +4574,28 @@ fn write_mobile_file(tree: &TempTree, relative: &str, contents: &str) {
 
 /// Writes one complete, compliant mobile workspace unit.
 ///
-/// A dependency policy is deliberately absent: nothing executes a mobile `deny.toml` yet, so the
-/// validator rejects one outright. `a_mobile_dependency_policy_is_rejected_until_ci_executes_it`
-/// pins that.
+/// The reviewed policy and exact workflow already come from the copied live tree.
 fn write_mobile_workspace(tree: &TempTree, platform: &str, lock: &str) {
-    write_mobile_file(
-        tree,
-        &format!("{platform}/Cargo.toml"),
-        &MOBILE_WORKSPACE_MANIFEST.replace("PLATFORM", platform),
-    );
+    let (workspace_manifest, app_manifest) = if matches!(platform, "android" | "ios") {
+        (
+            fs::read_to_string(repo_root().join(format!("{platform}/Cargo.toml")))
+                .expect("read reviewed mobile workspace manifest"),
+            fs::read_to_string(repo_root().join(format!(
+                "{platform}/apps/gta-claw-{platform}-shell/Cargo.toml"
+            )))
+            .expect("read reviewed mobile app manifest"),
+        )
+    } else {
+        (
+            MOBILE_WORKSPACE_MANIFEST.replace("PLATFORM", platform),
+            MOBILE_APP_MANIFEST.replace("PLATFORM", platform),
+        )
+    };
+    write_mobile_file(tree, &format!("{platform}/Cargo.toml"), &workspace_manifest);
     write_mobile_file(
         tree,
         &format!("{platform}/apps/gta-claw-{platform}-shell/Cargo.toml"),
-        &MOBILE_APP_MANIFEST.replace("PLATFORM", platform),
-    );
-    write_mobile_file(
-        tree,
-        &format!("{platform}/apps/gta-claw-{platform}-shell/src/lib.rs"),
-        "",
+        &app_manifest,
     );
     write_mobile_file(tree, &format!("{platform}/Cargo.lock"), lock);
 }
@@ -4616,7 +4612,19 @@ fn retarget_root_exclude(tree: &TempTree) {
 fn accepted_android_tree(label: &str) -> TempTree {
     let tree = final_tree(label);
     retarget_root_exclude(&tree);
-    write_mobile_workspace(&tree, "android", &mobile_lock("android", ""));
+    let slint = desktop_slint_version(&tree);
+    write_mobile_workspace(
+        &tree,
+        "android",
+        &mobile_lock(
+            "android",
+            &format!(
+                "{}{}",
+                registry_lock_entry("skia-bindings", "0.99.0"),
+                registry_lock_entry("slint", &slint)
+            ),
+        ),
+    );
     let root = SafeRoot::new(&tree.path).expect("open android baseline");
     validate_final_static(&root).expect("compliant android workspace is admitted");
     tree
@@ -4628,16 +4636,27 @@ fn rejection(tree: &TempTree, label: &str) -> String {
 }
 
 #[test]
-fn live_tree_admits_mobile_paths_without_requiring_them() {
-    let tree = final_tree("mobile-absent");
-    let root = SafeRoot::new(&tree.path).expect("open mobile-free tree");
+fn live_tree_requires_complete_mobile_units() {
+    let tree = final_tree("mobile-present");
+    let root = SafeRoot::new(&tree.path).expect("open mobile tree");
     for platform in ["android", "ios"] {
         assert!(
-            !tree.join(platform).exists(),
-            "baseline must contain no {platform} workspace"
+            tree.join(platform).join("deny.toml").is_file()
+                && tree
+                    .join(format!(".github/workflows/{platform}-packaging.yml"))
+                    .is_file(),
+            "baseline must contain the complete {platform} policy unit"
         );
     }
-    validate_final_static(&root).expect("mobile paths are admitted, never required");
+    validate_final_static(&root).expect("complete mobile units pass final policy");
+
+    let missing = final_tree("mobile-required");
+    fs::remove_dir_all(missing.join("android")).expect("remove Android workspace");
+    assert!(
+        rejection(&missing, "a shipped mobile unit is required")
+            .contains("android workspace is incomplete"),
+        "removing a shipped workspace while its workflow remains must fail as a partial unit"
+    );
 }
 
 #[test]
@@ -4663,6 +4682,9 @@ fn compliant_mobile_workspace_is_admitted_and_partial_units_are_rejected() {
         "android/Cargo.toml",
         "android/apps/gta-claw-android-shell/Cargo.toml",
         "android/Cargo.lock",
+        "android/deny.toml",
+        ".github/workflows/android-packaging.yml",
+        "android/scripts/fetch-skia.sh",
     ] {
         let tree = accepted_android_tree("mobile-partial");
         fs::remove_file(tree.join(omitted)).expect("remove one unit member");
@@ -4827,43 +4849,37 @@ fn mobile_manifest_dependencies_cannot_escape_the_repository_or_use_forbidden_so
         );
     }
 
-    // Slint itself must remain permitted, or the admission would be pointless.
+    // The exact shipped manifest itself carries Slint, so an accepted baseline proves the GUI
+    // exception remains reachable rather than only syntactically admitted.
     let slint = accepted_android_tree("mobile-dependency-slint");
-    let manifest = MOBILE_WORKSPACE_MANIFEST
-        .replace("PLATFORM", "android")
-        .replace(
-            "claw-protocol = { path = \"../crates/claw-protocol\", version = \"0.1.0\" }",
-            "slint = { version = \"=1.17.1\", default-features = false }",
-        );
-    write_mobile_file(&slint, "android/Cargo.toml", &manifest);
-    let root = SafeRoot::new(&slint.path).expect("open mobile Slint fixture");
-    validate_final_static(&root).expect("a mobile workspace may depend on Slint");
+    let manifest =
+        fs::read_to_string(slint.join("android/Cargo.toml")).expect("read Android manifest");
+    assert!(
+        manifest.contains("slint = { version = \"=1.17.1\""),
+        "accepted Android baseline must contain the pinned Slint dependency"
+    );
 }
 
 #[test]
-fn a_mobile_dependency_policy_is_rejected_until_ci_executes_it() {
-    // `android-packaging.yml` and `ios-packaging.yml` are admitted workflow paths but do not
-    // exist, so nothing runs cargo-deny against a mobile policy file. A policy file that nothing
-    // executes is worse than none, because it reads as protection. Admitting one belongs in the
-    // change that also lands the workflow executing it, so today it fails closed.
+fn mobile_dependency_policies_are_exact_and_workflow_bound() {
     for platform in ["android", "ios"] {
         assert!(
-            !Path::new(&repo_root())
+            Path::new(&repo_root())
                 .join(format!(".github/workflows/{platform}-packaging.yml"))
                 .exists(),
-            "this rule is only correct while no {platform} packaging workflow exists"
+            "{platform} dependency policy must have an executing workflow"
         );
     }
 
-    let tree = accepted_android_tree("mobile-deny-unexecuted");
+    let tree = accepted_android_tree("mobile-deny-drift");
     write_mobile_file(&tree, "android/deny.toml", MOBILE_DENY);
-    let error = rejection(&tree, "an unexecuted mobile dependency policy is rejected");
+    let error = rejection(&tree, "a drifted mobile dependency policy is rejected");
     assert!(
-        error.contains("unexpected deny/audit policy file") && error.contains("android/deny.toml"),
-        "a mobile deny.toml must fail closed until a workflow runs it, got: {error}"
+        error.contains("dependency policy does not match") && error.contains("android/deny.toml"),
+        "a mobile deny.toml must retain reviewed bytes, got: {error}"
     );
 
-    let audit = accepted_android_tree("mobile-audit-unexecuted");
+    let audit = accepted_android_tree("mobile-audit-unadmitted");
     write_mobile_file(&audit, "android/audit.toml", "[advisories]\nignore = []\n");
     assert!(
         rejection(&audit, "an unexecuted mobile audit policy is rejected")
@@ -4871,6 +4887,66 @@ fn a_mobile_dependency_policy_is_rejected_until_ci_executes_it() {
         "the same rule must cover audit configuration"
     );
 }
+
+#[test]
+fn workflow_executed_mobile_packaging_inputs_are_exact() {
+    let tree = final_tree("mobile-packaging-inputs");
+    let paths = [
+        "android/scripts/check-targets.sh",
+        "android/scripts/check.sh",
+        "android/scripts/fetch-skia.sh",
+        "android/scripts/package.sh",
+        "android/scripts/workflow-self-test.sh",
+        "ios/project.yml",
+        "ios/apps/gta-claw-ios-shell/Info.plist",
+        "ios/scripts/build-for-ios.sh",
+        "ios/scripts/check-targets.sh",
+        "ios/scripts/check.sh",
+        "ios/scripts/fetch-skia.sh",
+        "ios/scripts/package.sh",
+        "ios/scripts/workflow-self-test.sh",
+    ];
+
+    for relative in paths {
+        let path = tree.join(relative);
+        let original = fs::read(&path).expect("read reviewed mobile packaging input");
+        let mut mutated = original.clone();
+        mutated.extend_from_slice(b"\n# candidate drift\n");
+        fs::write(&path, mutated).expect("mutate mobile packaging input");
+
+        let error = rejection(&tree, "mobile packaging input drift is rejected");
+        assert!(
+            error.contains("mobile packaging input does not match") && error.contains(relative),
+            "packaging input mutation failed for the wrong reason: {error}"
+        );
+        fs::write(&path, original).expect("restore reviewed mobile packaging input");
+    }
+}
+
+#[test]
+fn mobile_renderer_feature_manifests_are_exact() {
+    let tree = final_tree("mobile-renderer-manifests");
+    for relative in [
+        "android/Cargo.toml",
+        "android/apps/gta-claw-android-shell/Cargo.toml",
+        "ios/Cargo.toml",
+        "ios/apps/gta-claw-ios-shell/Cargo.toml",
+    ] {
+        let path = tree.join(relative);
+        let original = fs::read(&path).expect("read reviewed mobile manifest");
+        let mut mutated = original.clone();
+        mutated.extend_from_slice(b"\n# renderer feature drift\n");
+        fs::write(&path, mutated).expect("mutate mobile manifest");
+
+        let error = rejection(&tree, "mobile manifest drift is rejected");
+        assert!(
+            error.contains("mobile manifest does not match") && error.contains(relative),
+            "manifest mutation failed for the wrong reason: {error}"
+        );
+        fs::write(&path, original).expect("restore reviewed mobile manifest");
+    }
+}
+
 #[test]
 fn an_admitted_mobile_workspace_cannot_impersonate_or_reach_outside_itself() {
     // What can ios/Cargo.toml declare that would let it claim to be something trusted, or reach
@@ -4972,6 +5048,7 @@ fn admitted_lock_and_skia_target_sets_are_derived_from_the_platform_table() {
     for platform in ["android", "ios"] {
         let tree = final_tree("mobile-derived-inventory");
         retarget_root_exclude(&tree);
+        fs::remove_dir_all(tree.join(platform)).expect("remove complete platform workspace");
         write_mobile_file(
             &tree,
             &format!("{platform}/Cargo.lock"),
@@ -5100,14 +5177,13 @@ fn case_aliased_mobile_directories_fail_on_every_host() {
 }
 
 #[test]
-fn ios_cannot_land_until_its_prebuilt_skia_archive_is_pinned() {
+fn mobile_skia_locks_require_the_reviewed_release_and_archive_pins() {
     let slint = {
         let probe = final_tree("mobile-ios-slint-probe");
         desktop_slint_version(&probe)
     };
 
-    // Everything except the reviewed archive digest is satisfied, so the reported failure proves
-    // the digest gate is the sole remaining blocker rather than a defect elsewhere in the fixture.
+    // The production table now carries both reviewed iOS release-asset digests.
     let pinned = final_tree("mobile-ios-pinned");
     retarget_root_exclude(&pinned);
     let lock = mobile_lock(
@@ -5119,13 +5195,8 @@ fn ios_cannot_land_until_its_prebuilt_skia_archive_is_pinned() {
         ),
     );
     write_mobile_workspace(&pinned, "ios", &lock);
-    let error = rejection(&pinned, "iOS without a reviewed Skia digest is rejected");
-    assert!(
-        error.contains("uses skia-bindings, which fetches at build time")
-            && error.contains("aarch64-apple-ios")
-            && error.contains("aarch64-apple-ios-sim"),
-        "iOS admission must require a reviewed digest for every admitted target, got: {error}"
-    );
+    let root = SafeRoot::new(&pinned.path).expect("open pinned iOS tree");
+    validate_final_static(&root).expect("iOS is admitted with both reviewed Skia digests");
 
     let drifted = final_tree("mobile-ios-drift");
     retarget_root_exclude(&drifted);
@@ -5153,8 +5224,8 @@ fn ios_cannot_land_until_its_prebuilt_skia_archive_is_pinned() {
         "an iOS Slint build cannot avoid Skia, so its absence signals an unresolved lock"
     );
 
-    // Android can select femtovg or the software renderer, so Skia is optional there — but the
-    // moment its lock contains skia-bindings the same version pin and digest gate apply.
+    // Slint 1.17.1's Android backend also resolves Skia, and both published Android targets are
+    // pinned by the same table.
     let android_skia = final_tree("mobile-android-skia");
     retarget_root_exclude(&android_skia);
     write_mobile_workspace(
@@ -5162,12 +5233,8 @@ fn ios_cannot_land_until_its_prebuilt_skia_archive_is_pinned() {
         "android",
         &mobile_lock("android", &registry_lock_entry("skia-bindings", "0.99.0")),
     );
-    let error = rejection(&android_skia, "Android Skia without digests is rejected");
-    assert!(
-        error.contains("uses skia-bindings, which fetches at build time")
-            && error.contains("aarch64-linux-android"),
-        "Android must not be able to consume an unverified Skia archive, got: {error}"
-    );
+    let root = SafeRoot::new(&android_skia.path).expect("open pinned Android tree");
+    validate_final_static(&root).expect("Android is admitted with both reviewed Skia digests");
 
     let android_drift = final_tree("mobile-android-skia-drift");
     retarget_root_exclude(&android_drift);
@@ -5195,7 +5262,14 @@ fn mobile_slint_release_cannot_diverge_from_the_protected_desktop_release() {
     write_mobile_workspace(
         &tree,
         "android",
-        &mobile_lock("android", &registry_lock_entry("slint", "0.0.1")),
+        &mobile_lock(
+            "android",
+            &format!(
+                "{}{}",
+                registry_lock_entry("skia-bindings", "0.99.0"),
+                registry_lock_entry("slint", "0.0.1")
+            ),
+        ),
     );
     let error = rejection(&tree, "divergent Slint release is rejected");
     assert!(
@@ -5209,7 +5283,14 @@ fn mobile_slint_release_cannot_diverge_from_the_protected_desktop_release() {
     write_mobile_workspace(
         &agreed,
         "android",
-        &mobile_lock("android", &registry_lock_entry("slint", &desktop)),
+        &mobile_lock(
+            "android",
+            &format!(
+                "{}{}",
+                registry_lock_entry("skia-bindings", "0.99.0"),
+                registry_lock_entry("slint", &desktop)
+            ),
+        ),
     );
     let root = SafeRoot::new(&agreed.path).expect("open agreed Slint fixture");
     validate_final_static(&root).expect("a matching Slint release is admitted");

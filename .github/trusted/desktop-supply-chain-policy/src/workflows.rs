@@ -34,9 +34,13 @@ pub const BOOTSTRAP_JOB_ID: &str = "candidate-validator-bootstrap";
 const WORKFLOW_DIRECTORY: &str = ".github/workflows";
 const RUST_WORKFLOW: &str = ".github/workflows/rust.yml";
 const MACOS_WORKFLOW: &str = ".github/workflows/macos-packaging.yml";
+const ANDROID_WORKFLOW: &str = ".github/workflows/android-packaging.yml";
+const IOS_WORKFLOW: &str = ".github/workflows/ios-packaging.yml";
 const CANONICAL_RUST: &[u8] = include_bytes!("../policy/final/.github/workflows/rust.yml");
 const CANONICAL_MACOS: &[u8] =
     include_bytes!("../policy/final/.github/workflows/macos-packaging.yml");
+const CANONICAL_ANDROID: &[u8] = include_bytes!("../../../workflows/android-packaging.yml");
+const CANONICAL_IOS: &[u8] = include_bytes!("../../../workflows/ios-packaging.yml");
 const MAX_WORKFLOW_BYTES: u64 = 512 * 1024;
 const MAX_WORKFLOW_TREE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ACTIONLINT_BYTES: u64 = 64 * 1024 * 1024;
@@ -511,11 +515,13 @@ pub fn validate_protected_files(trusted: &SafeRoot, candidate: &SafeRoot) -> Pol
     Ok(())
 }
 
-/// Requires the candidate Rust and macOS workflows to be the trusted final P04f bytes.
+/// Requires every final-state product workflow to retain its reviewed bytes.
 pub fn validate_final_workflows(candidate: &SafeRoot) -> PolicyResult<()> {
     for (path, expected) in [
         (RUST_WORKFLOW, CANONICAL_RUST),
         (MACOS_WORKFLOW, CANONICAL_MACOS),
+        (ANDROID_WORKFLOW, CANONICAL_ANDROID),
+        (IOS_WORKFLOW, CANONICAL_IOS),
     ] {
         let actual = candidate.read_bytes(path, MAX_WORKFLOW_BYTES)?;
         if actual != expected {

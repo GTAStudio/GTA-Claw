@@ -1,0 +1,31 @@
+name: GTAClaw
+options:
+  bundleIdPrefix: com.gtastudio
+  deploymentTarget:
+    iOS: "15.0"
+settings:
+  base:
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    MARKETING_VERSION: "0.1.0"
+    SWIFT_VERSION: "6.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+targets:
+  GTAClaw:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources: []
+    postCompileScripts:
+      - name: Build Rust shell
+        script: |
+          "$SRCROOT/scripts/build-for-ios.sh" gta-claw-ios-shell
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - "$(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)"
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: apps/gta-claw-ios-shell/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.gtastudio.gtaclaw
+        PRODUCT_NAME: GTA Claw

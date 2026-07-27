@@ -28,9 +28,13 @@ const TRUSTED_LOCK: &str = ".github/trusted/desktop-supply-chain-policy/Cargo.lo
 const ANDROID_MANIFEST: &str = "android/Cargo.toml";
 const ANDROID_APP_MANIFEST: &str = "android/apps/gta-claw-android-shell/Cargo.toml";
 const ANDROID_LOCK: &str = "android/Cargo.lock";
+const ANDROID_DENY: &str = "android/deny.toml";
+const ANDROID_WORKFLOW: &str = ".github/workflows/android-packaging.yml";
 const IOS_MANIFEST: &str = "ios/Cargo.toml";
 const IOS_APP_MANIFEST: &str = "ios/apps/gta-claw-ios-shell/Cargo.toml";
 const IOS_LOCK: &str = "ios/Cargo.lock";
+const IOS_DENY: &str = "ios/deny.toml";
+const IOS_WORKFLOW: &str = ".github/workflows/ios-packaging.yml";
 const LEGACY_VALIDATOR: &str = "crates/claw-security/tests/desktop_supply_chain_policy.rs";
 const LEGACY_FIXTURES: &str = "crates/claw-security/tests/fixtures/desktop_supply_chain_policy";
 const SQLITE_FILE_CONTROL_MEMBER: &str = "crates/claw-sqlite-file-control";
@@ -41,6 +45,71 @@ const FINAL_DESKTOP_MANIFEST: &[u8] = include_bytes!("../policy/final/desktop/Ca
 const FINAL_APP_MANIFEST: &[u8] =
     include_bytes!("../policy/final/desktop/apps/gta-claw-desktop/Cargo.toml.fixture");
 const FINAL_DESKTOP_DENY: &[u8] = include_bytes!("../policy/final/desktop/deny.toml.fixture");
+const FINAL_ANDROID_MANIFEST: &[u8] = include_bytes!("../../../../android/Cargo.toml");
+const FINAL_ANDROID_APP_MANIFEST: &[u8] =
+    include_bytes!("../../../../android/apps/gta-claw-android-shell/Cargo.toml");
+const FINAL_ANDROID_DENY: &[u8] = include_bytes!("../../../../android/deny.toml");
+const FINAL_IOS_MANIFEST: &[u8] = include_bytes!("../../../../ios/Cargo.toml");
+const FINAL_IOS_APP_MANIFEST: &[u8] =
+    include_bytes!("../../../../ios/apps/gta-claw-ios-shell/Cargo.toml");
+const FINAL_IOS_DENY: &[u8] = include_bytes!("../../../../ios/deny.toml");
+type ExactFile = (&'static str, &'static [u8]);
+const FINAL_ANDROID_PACKAGING_INPUTS: [ExactFile; 5] = [
+    (
+        "android/scripts/check-targets.sh",
+        include_bytes!("../../../../android/scripts/check-targets.sh"),
+    ),
+    (
+        "android/scripts/check.sh",
+        include_bytes!("../../../../android/scripts/check.sh"),
+    ),
+    (
+        "android/scripts/fetch-skia.sh",
+        include_bytes!("../../../../android/scripts/fetch-skia.sh"),
+    ),
+    (
+        "android/scripts/package.sh",
+        include_bytes!("../../../../android/scripts/package.sh"),
+    ),
+    (
+        "android/scripts/workflow-self-test.sh",
+        include_bytes!("../../../../android/scripts/workflow-self-test.sh"),
+    ),
+];
+const FINAL_IOS_PACKAGING_INPUTS: [ExactFile; 8] = [
+    (
+        "ios/project.yml",
+        include_bytes!("../../../../ios/project.yml"),
+    ),
+    (
+        "ios/apps/gta-claw-ios-shell/Info.plist",
+        include_bytes!("../../../../ios/apps/gta-claw-ios-shell/Info.plist"),
+    ),
+    (
+        "ios/scripts/build-for-ios.sh",
+        include_bytes!("../../../../ios/scripts/build-for-ios.sh"),
+    ),
+    (
+        "ios/scripts/check-targets.sh",
+        include_bytes!("../../../../ios/scripts/check-targets.sh"),
+    ),
+    (
+        "ios/scripts/check.sh",
+        include_bytes!("../../../../ios/scripts/check.sh"),
+    ),
+    (
+        "ios/scripts/fetch-skia.sh",
+        include_bytes!("../../../../ios/scripts/fetch-skia.sh"),
+    ),
+    (
+        "ios/scripts/package.sh",
+        include_bytes!("../../../../ios/scripts/package.sh"),
+    ),
+    (
+        "ios/scripts/workflow-self-test.sh",
+        include_bytes!("../../../../ios/scripts/workflow-self-test.sh"),
+    ),
+];
 const FINAL_DESKTOP_LOCK: &[u8] = include_bytes!("../policy/final/desktop/Cargo.lock.fixture");
 const FINAL_SMOKE_TEST: &[u8] =
     include_bytes!("../policy/final/desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs");
@@ -429,12 +498,40 @@ const BUILD_TIME_FETCHING_PACKAGES: [(&str, &str); 1] = [("skia-bindings", "0.99
 /// fetch never happens. For `skia-bindings` the cache is populated through `SKIA_BINARIES_URL`,
 /// which accepts a `file://` URL.
 ///
-/// The archive key embeds the crate commit, the target, and the sorted resolved feature set, so it
-/// cannot be computed before the mobile lock exists. This table is therefore **empty by default**,
-/// and `validate_mobile_lock` refuses to admit any workspace whose lock contains a fetching package
-/// while the corresponding pins are absent. That makes the pin impossible to skip, keeps filling it
-/// a reviewed trust-root edit, and stops a second fetching package appearing silently.
-const PINNED_BUILD_ARTIFACTS: [(&str, &str, &str, &str, &str); 0] = [];
+/// The archive key embeds the crate commit, the target, and the sorted resolved feature set. These
+/// four entries were selected from the 0.99.0 release metadata after both mobile locks resolved;
+/// `validate_mobile_lock` refuses any fetching package whose platform targets are not all covered.
+/// Changing the package, feature key, target, URL, or digest remains a reviewed trust-root edit.
+const PINNED_BUILD_ARTIFACTS: [(&str, &str, &str, &str, &str); 4] = [
+    (
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-linux-android",
+        "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-linux-android-gl-jpegd-jpege-pdf-textlayout-vulkan.tar.gz",
+        "46f267b4754ca3af59b4ef30d273425c9585f2cc5fd20481bac4125c1e6f8217",
+    ),
+    (
+        "skia-bindings",
+        "0.99.0",
+        "x86_64-linux-android",
+        "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-x86_64-linux-android-gl-jpegd-jpege-pdf-textlayout-vulkan.tar.gz",
+        "d691c9891d153466d5b99c0003fc6891482b97fb900b72c27b460b648f4e9534",
+    ),
+    (
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-apple-ios",
+        "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-gl-jpegd-jpege-metal-pdf-textlayout.tar.gz",
+        "15e20f3265dfddd658f9ef0d0e30d50a73afccb88787812f65fb5e6cf4ec55c8",
+    ),
+    (
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-apple-ios-sim",
+        "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-sim-gl-jpegd-jpege-metal-pdf-textlayout.tar.gz",
+        "ade5b153818d9b7b81240f106df148a9c4b92fb3aba566f942a713b93914e11e",
+    ),
+];
 
 const FORBIDDEN_GUI_NAMES: [&str; 11] = [
     "dioxus-desktop",
@@ -1426,6 +1523,18 @@ struct MobilePlatform {
     app_manifest: &'static str,
     /// Workspace lock path.
     lock: &'static str,
+    /// Dependency policy executed by this platform's workflow.
+    deny: &'static str,
+    /// Exact packaging workflow path.
+    workflow: &'static str,
+    /// Reviewed dependency-policy bytes.
+    deny_policy: &'static [u8],
+    /// Reviewed workspace manifest bytes that bind renderer features.
+    manifest_policy: &'static [u8],
+    /// Reviewed app manifest bytes that bind target-specific dependencies.
+    app_manifest_policy: &'static [u8],
+    /// Every workflow-executed packaging input that enforces the artifact handoff.
+    packaging_inputs: &'static [ExactFile],
     /// Sole declared member directory, relative to the workspace root.
     member: &'static str,
     /// Sole declared package name.
@@ -1442,22 +1551,30 @@ const MOBILE_PLATFORMS: [MobilePlatform; 2] = [
         manifest: ANDROID_MANIFEST,
         app_manifest: ANDROID_APP_MANIFEST,
         lock: ANDROID_LOCK,
+        deny: ANDROID_DENY,
+        workflow: ANDROID_WORKFLOW,
+        deny_policy: FINAL_ANDROID_DENY,
+        manifest_policy: FINAL_ANDROID_MANIFEST,
+        app_manifest_policy: FINAL_ANDROID_APP_MANIFEST,
+        packaging_inputs: &FINAL_ANDROID_PACKAGING_INPUTS,
         member: "apps/gta-claw-android-shell",
         package: "gta-claw-android-shell",
-        // The Android backend can select femtovg or the software renderer, so Skia is optional
-        // here; if it is selected anyway, these ABIs must be pinned.
-        skia_targets: &[
-            "aarch64-linux-android",
-            "armv7-linux-androideabi",
-            "x86_64-linux-android",
-        ],
-        skia_is_unavoidable: false,
+        // Slint 1.17.1's Android backend depends on Skia directly. The 0.99.0 release publishes
+        // matching archives for arm64 devices and x86_64 emulators, but no armv7 archive.
+        skia_targets: &["aarch64-linux-android", "x86_64-linux-android"],
+        skia_is_unavoidable: true,
     },
     MobilePlatform {
         directory: "ios",
         manifest: IOS_MANIFEST,
         app_manifest: IOS_APP_MANIFEST,
         lock: IOS_LOCK,
+        deny: IOS_DENY,
+        workflow: IOS_WORKFLOW,
+        deny_policy: FINAL_IOS_DENY,
+        manifest_policy: FINAL_IOS_MANIFEST,
+        app_manifest_policy: FINAL_IOS_APP_MANIFEST,
+        packaging_inputs: &FINAL_IOS_PACKAGING_INPUTS,
         member: "apps/gta-claw-ios-shell",
         package: "gta-claw-ios-shell",
         // `i-slint-renderer-skia` is non-optional for Apple non-macOS targets, so Skia is
@@ -1469,14 +1586,16 @@ const MOBILE_PLATFORMS: [MobilePlatform; 2] = [
 
 impl MobilePlatform {
     /// Returns the complete unit that must be present or absent together.
-    ///
-    /// A dependency policy is deliberately **not** part of this unit. No workflow executes a
-    /// mobile `deny.toml` yet — `android-packaging.yml` and `ios-packaging.yml` are admitted
-    /// paths but do not exist — and a policy file that nothing runs is worse than none, because
-    /// it reads as protection. Admitting one belongs in the change that also lands the workflow
-    /// executing it. Until then `validate_manifest_and_lock_inventory` rejects the file outright.
-    const fn unit(&self) -> [&'static str; 3] {
-        [self.manifest, self.app_manifest, self.lock]
+    fn unit(&self) -> Vec<&'static str> {
+        let mut unit = vec![
+            self.manifest,
+            self.app_manifest,
+            self.lock,
+            self.deny,
+            self.workflow,
+        ];
+        unit.extend(self.packaging_inputs.iter().map(|(path, _)| *path));
+        unit
     }
 }
 
@@ -1554,6 +1673,21 @@ fn validate_mobile_workspace(
     platform: &MobilePlatform,
     root_workspace: &RootWorkspace,
 ) -> PolicyResult<()> {
+    let deny = root.read_bytes(platform.deny, DEFAULT_FILE_LIMIT)?;
+    if deny != platform.deny_policy {
+        return Err(PolicyError::new(format!(
+            "{} dependency policy does not match the reviewed mobile policy",
+            platform.deny
+        )));
+    }
+    for (path, expected) in platform.packaging_inputs {
+        let actual = root.read_bytes(path, DEFAULT_FILE_LIMIT)?;
+        if actual != *expected {
+            return Err(PolicyError::new(format!(
+                "mobile packaging input does not match the reviewed policy: {path}"
+            )));
+        }
+    }
     let manifest = parse_toml(root, platform.manifest, DEFAULT_FILE_LIMIT)?;
     let manifest_table = manifest
         .as_table()
@@ -1647,7 +1781,19 @@ fn validate_mobile_workspace(
         validate_dependency(name, value, platform.directory, &declared, true)?;
     }
     validate_mobile_member_manifest(root, platform, &declared)?;
-    validate_mobile_lock(root, platform, root_workspace)
+    validate_mobile_lock(root, platform, root_workspace)?;
+    for (path, expected) in [
+        (platform.manifest, platform.manifest_policy),
+        (platform.app_manifest, platform.app_manifest_policy),
+    ] {
+        let actual = root.read_bytes(path, DEFAULT_FILE_LIMIT)?;
+        if actual != expected {
+            return Err(PolicyError::new(format!(
+                "mobile manifest does not match the reviewed shell policy: {path}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Requires a mobile workspace to keep an unsafe-code policy at least as strict as the desktop one.
@@ -2003,12 +2149,13 @@ fn validate_manifest_and_lock_inventory(
         )));
     }
 
-    let allowed_policy_files = BTreeSet::from([
+    let mut allowed_policy_files = BTreeSet::from([
         ".cargo/audit.toml",
         ".github/trusted/desktop-supply-chain-policy/deny.toml",
         "deny.toml",
         "desktop/deny.toml",
     ]);
+    allowed_policy_files.extend(MOBILE_PLATFORMS.iter().map(|platform| platform.deny));
     for path in &inventory {
         let file_name = path.rsplit('/').next().unwrap_or(path);
         let cargo_config = (path.starts_with(".cargo/") || path.contains("/.cargo/"))

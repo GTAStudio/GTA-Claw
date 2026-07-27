@@ -1,0 +1,46 @@
+[workspace]
+members = ["apps/gta-claw-ios-shell"]
+resolver = "3"
+
+[workspace.dependencies]
+claw-gateway-client = { path = "../crates/claw-gateway-client", version = "0.1.0" }
+claw-platform = { path = "../crates/claw-platform", version = "0.1.0" }
+claw-security = { path = "../crates/claw-security", version = "0.1.0" }
+getrandom = { version = "=0.4.3", features = ["sys_rng"] }
+gta-claw-ios = { path = "../apps/gta-claw-ios", version = "0.1.0" }
+skia-safe = { version = "=0.99.0", default-features = false, features = ["no-compile"] }
+slint = { version = "=1.17.1", default-features = false }
+slint-build = "=1.17.1"
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "=0.7.19", features = ["rt"] }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+license = "MIT"
+repository = "https://github.com/GTAStudio/GTA-Claw"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+invalid_html_tags = "warn"
+private_intra_doc_links = "warn"
+unescaped_backticks = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+redundant_pub_crate = "allow"
+too_many_lines = "allow"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = false

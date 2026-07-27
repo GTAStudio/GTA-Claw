@@ -90,19 +90,20 @@ workspaces are therefore admitted alongside `desktop`, mirroring it: `android` a
 
 Admission is bounded and conditional, never a prefix rule and never a bypass:
 
-- the lock and manifest inventories became `required ⊆ actual ⊆ admitted`. The admitted set adds
+- the lock and manifest inventories remain `required ⊆ actual ⊆ admitted`. The admitted set adds
   exactly `android/Cargo.toml`, `android/apps/gta-claw-android-shell/Cargo.toml`,
   `android/Cargo.lock` and their `ios` counterparts, derived from the platform table so a second
   list cannot disagree with it. Any other sibling workspace still fails closed;
-- **a mobile `deny.toml` is not admitted.** `android-packaging.yml` and `ios-packaging.yml` are
-  admitted workflow paths but do not exist, so nothing executes a mobile dependency policy. A
-  policy file that nothing runs is worse than none because it reads as protection, so one is
-  rejected outright as an unexpected deny/audit file. Admitting it belongs in the change that also
-  lands the workflow executing it;
+- each shipped platform is one complete policy unit: workspace manifest, sole app manifest, lock,
+  exact `deny.toml`, exact packaging workflow, and every workflow-executed packaging input. The
+  deny files are admitted only at `android/deny.toml` and `ios/deny.toml`; the dependency policies,
+  renderer-feature manifests, shell scripts, iOS project specification, and iOS plist are
+  byte-checked against the base-compiled reviewed policy, and both workflows execute cargo-deny
+  0.20.2;
 - the historical Bootstrap lock inventory is a separate frozen constant, so widening what a Final
   state admits can never rewrite what the pre-P04f snapshot contained;
-- a platform is a complete unit. Its manifest, sole app manifest, and lock are present together or
-  absent together; partial presence is rejected and names both sides;
+- a platform is a complete unit. Its manifests, lock, dependency policy, workflow, and packaging
+  inputs are present together; partial presence is rejected and names both sides;
 - a present platform is validated, not merely admitted: exact top-level and workspace schemas with
   no `exclude` key, `resolver = "3"`, exactly one canonical app member, release version agreement
   with the root workspace, a lint policy no weaker than the desktop one, exact member lint
@@ -119,7 +120,7 @@ The two mobile app members are `gta-claw-android-shell` and `gta-claw-ios-shell`
 distinct from the root `gta-claw-android` client core, so a shell can path-depend on its core
 without a package-name collision.
 
-### Skia is pinned before the iOS lock exists
+### Mobile Skia archives are pinned outside Cargo.lock
 
 `i-slint-renderer-skia` is a non-optional dependency of `i-slint-backend-winit` under
 `cfg(all(target_vendor = "apple", not(target_os = "macos")))`, so an iOS Slint build cannot avoid
@@ -139,15 +140,25 @@ unverified fetch rather than removing it, at ten to forty-five minutes and rough
 The rules are driven by lock contents rather than by platform, because the exposure follows Skia
 and not Apple. Whenever **any** mobile lock contains `skia-bindings` it must be the pinned release,
 cross-checked against the protected desktop lock so the two can never drift, and every Skia target
-that platform declares must carry a reviewed digest. iOS additionally treats the *absence* of
-`skia-bindings` as an unresolved lock, because it cannot avoid Skia; Android can select FemtoVG or
-the software renderer instead, and is held to the identical discipline the moment it does not.
+that platform declares must carry a reviewed digest. iOS treats the *absence* of `skia-bindings` as
+an unresolved lock because it cannot avoid Skia. Slint 1.17.1's Android activity backend also
+depends directly on Skia. The Skia 0.99.0 release publishes matching Android archives for arm64
+devices and x86_64 emulators but none for armv7, so the Android shell does not claim armeabi-v7a.
 
-`PINNED_BUILD_ARTIFACTS` records reviewed `(package, version, target, url, SHA-256)` pins for every package known to fetch at build time, listed in `BUILD_TIME_FETCHING_PACKAGES` — today exactly `skia-bindings`, so a second such package cannot appear silently. The archive key embeds
-the crate commit, target, and resolved feature set, so it cannot be computed before the mobile lock
-exists. The table is therefore empty, and the validator refuses to admit any mobile workspace that
-uses Skia while it stays empty. Filling it is a reviewed trust-root edit. Obtain each digest from
-the release asset metadata, which publishes a SHA-256 the build script ignores:
+`PINNED_BUILD_ARTIFACTS` records reviewed `(package, version, target, url, SHA-256)` pins for every
+package known to fetch at build time, listed in `BUILD_TIME_FETCHING_PACKAGES` — today exactly
+`skia-bindings`, so a second such package cannot appear silently. The archive key embeds the crate
+commit, target, and resolved feature set, so the pins were selected only after both mobile locks
+resolved. Four official 0.99.0 release assets are pinned:
+
+| Target | Resolved feature key | SHA-256 |
+| --- | --- | --- |
+| `aarch64-linux-android` | `gl-jpegd-jpege-pdf-textlayout-vulkan` | `46f267b4754ca3af59b4ef30d273425c9585f2cc5fd20481bac4125c1e6f8217` |
+| `x86_64-linux-android` | `gl-jpegd-jpege-pdf-textlayout-vulkan` | `d691c9891d153466d5b99c0003fc6891482b97fb900b72c27b460b648f4e9534` |
+| `aarch64-apple-ios` | `gl-jpegd-jpege-metal-pdf-textlayout` | `15e20f3265dfddd658f9ef0d0e30d50a73afccb88787812f65fb5e6cf4ec55c8` |
+| `aarch64-apple-ios-sim` | `gl-jpegd-jpege-metal-pdf-textlayout` | `ade5b153818d9b7b81240f106df148a9c4b92fb3aba566f942a713b93914e11e` |
+
+Each digest came from release asset metadata, which publishes a SHA-256 the build script ignores:
 
 ```text
 gh api repos/rust-skia/skia-binaries/releases/tags/<version> \
@@ -164,8 +175,8 @@ own manifest: its `include` list is `Cargo.toml`, `bindings_docs.rs`, `build.rs`
 `build_support/**/*.rs`, and `src/**`. The published `.crate` file cannot contain the artifact, so
 no checksum over it can cover the artifact.
 
-Three further facts, each verified against `rust-skia` at tag `0.99.0`, that a future session
-filling `PINNED_BUILD_ARTIFACTS` needs in order to fill it from the right source:
+Three further facts, each verified against `rust-skia` at tag `0.99.0`, underpin the reviewed
+`PINNED_BUILD_ARTIFACTS` entries:
 
 - **The artifact host is a different repository from the crate source.** The crate declares
   `repository = "https://github.com/rust-skia/rust-skia"`; the archive is served from
@@ -189,26 +200,33 @@ GN binary from `chrome-infra-packages.appspot.com` are each themselves unverifie
 These findings come from reading the pinned source rather than executing it; no Windows host can run
 a `skia-bindings` build for an Apple target, so the first real iOS build remains the proof.
 
-### Mobile CI is not yet reachable
+### Mobile CI and packaging boundary
 
-`android-packaging.yml` and `ios-packaging.yml` are admitted workflow paths, but neither file
-exists, so nothing yet builds or `cargo deny`-checks a mobile workspace. That is the outstanding
-gap, and it is why a mobile `deny.toml` is rejected rather than admitted: the policy file and the
-workflow that executes it belong in the same change.
+`android-packaging.yml` checks both published Android targets, runs the exact Android dependency
+policy, and assembles an arm64 cargo-apk prototype. `ios-packaging.yml` checks device and simulator
+targets, runs the exact iOS dependency policy, and produces an unsigned Xcode archive. Both
+workflows prefetch their target-specific Skia archive through hardened TLS, verify the reviewed
+digest, and pass only the verified `file://` URL through `SKIA_BINARIES_URL`; the direct
+`skia-safe/no-compile` feature prevents a source-build fallback.
+
+Android's artifact uses cargo-apk's local signing behavior and is not a Play Store release. iOS
+distribution signing, provisioning, export, and upload remain outside CI because they require Apple
+credentials. Neither workflow claims device execution.
 
 `rust.yml` is unchanged and is not the place for this: it is byte-frozen, and the authoritative
 policy workflow carries no path filter, so every rule above already runs on every pull request
 regardless of which paths a change touches. A tree containing `android/` can never classify as
 Bootstrap, so it fails closed into Final validation.
 
-The `.github/workflows` directory is a closed inventory. Eight workflow files are
-**required** and must be present in every checkout. Two further exact paths,
+The `.github/workflows` directory is a closed inventory. Eight historical workflow files are
+**required** in both Bootstrap and Final states. Two further exact paths,
 `.github/workflows/ios-packaging.yml` and `.github/workflows/android-packaging.yml`,
-are **admitted** for the shipped mobile platforms: each may be absent or present, and
-a present file is subjected to the same tagged-YAML, ASCII-identity, reserved-identity
-anti-spoofing, duplicate-name, and isolated-actionlint checks as a required one. No
-other path may appear at any depth, and no required path may be removed. Admitting a
-further workflow still requires an audited trust-root update.
+remain **admitted** at inventory level so the immutable historical Bootstrap snapshot can still be
+classified. Complete Final policy requires both through the mobile platform units and exact-checks
+their base-compiled bytes in addition to tagged-YAML, ASCII-identity, reserved-identity
+anti-spoofing, duplicate-name, and isolated-actionlint validation. No other path may appear at any
+depth, and no historical required path may be removed. Admitting a further workflow still requires
+an audited trust-root update.
 
 The root headless workspace remains extensible. A new canonical `crates/<name>` or
 `apps/<name>` member can pass without changing this trust root when it is explicitly

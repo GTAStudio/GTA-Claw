@@ -1,0 +1,46 @@
+[workspace]
+members = ["apps/gta-claw-android-shell"]
+resolver = "3"
+
+[workspace.dependencies]
+claw-platform = { path = "../crates/claw-platform", version = "0.1.0" }
+gta-claw-android = { path = "../apps/gta-claw-android", version = "0.1.0" }
+skia-safe = { version = "=0.99.0", default-features = false, features = ["no-compile"] }
+slint = { version = "=1.17.1", default-features = false, features = [
+  "accessibility",
+  "backend-android-activity-06",
+  "compat-1-2",
+  "std",
+] }
+slint-build = "=1.17.1"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+license = "MIT"
+repository = "https://github.com/GTAStudio/GTA-Claw"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+invalid_html_tags = "warn"
+private_intra_doc_links = "warn"
+unescaped_backticks = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+redundant_pub_crate = "allow"
+too_many_lines = "allow"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
