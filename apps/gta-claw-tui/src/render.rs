@@ -103,7 +103,7 @@ impl Grid {
             .enumerate()
         {
             self.put(
-                x + u16::try_from(offset).unwrap_or(u16::MAX),
+                x.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX)),
                 y,
                 symbol,
                 style,
@@ -157,20 +157,20 @@ pub fn render(model: &AppModel, width: u16, height: u16, no_color: bool) -> Grid
     grid
 }
 
-/// Flushes a grid to a Crossterm output without blocking on network work.
+/// Flushes a complete grid to a Crossterm output without blocking on network work.
+///
+/// # Errors
+///
+/// Returns the first write error reported by `writer`, including the final
+/// flush. A partially written frame is left on screen; the caller is expected to
+/// treat the error as fatal and restore the terminal.
 pub fn flush<W: Write>(writer: &mut W, grid: &Grid, no_color: bool) -> io::Result<()> {
     for y in 0..grid.height() {
         queue!(writer, MoveTo(0, y))?;
         let mut active = None;
         for x in 0..grid.width() {
             let cell = grid.cell(x, y).unwrap_or_default();
-            if !no_color && cell.style.foreground != active {
-                match cell.style.foreground {
-                    Some(value) => queue!(writer, SetForegroundColor(Color::AnsiValue(value)))?,
-                    None => queue!(writer, ResetColor)?,
-                }
-                active = cell.style.foreground;
-            }
+            active = queue_style(writer, cell, active, no_color)?;
             queue!(writer, Print(cell.symbol))?;
         }
         queue!(writer, ResetColor)?;
@@ -178,12 +178,74 @@ pub fn flush<W: Write>(writer: &mut W, grid: &Grid, no_color: bool) -> io::Resul
     writer.flush()
 }
 
+/// Flushes only the cells that differ from the previously drawn grid.
+///
+/// A full-screen repaint of every cell on every keystroke is what makes a TUI
+/// flicker and what makes it unusable over a slow link. When `previous` is
+/// `None`, or when the terminal was resized so the two grids no longer describe
+/// the same screen, this falls back to [`flush`].
+///
+/// # Errors
+///
+/// Returns the first write error reported by `writer`, including the final
+/// flush.
+pub fn flush_changes<W: Write>(
+    writer: &mut W,
+    previous: Option<&Grid>,
+    grid: &Grid,
+    no_color: bool,
+) -> io::Result<()> {
+    let Some(previous) = previous
+        .filter(|previous| previous.width() == grid.width() && previous.height() == grid.height())
+    else {
+        return flush(writer, grid, no_color);
+    };
+    let mut active = None;
+    let mut cursor = None;
+    for y in 0..grid.height() {
+        for x in 0..grid.width() {
+            let cell = grid.cell(x, y).unwrap_or_default();
+            if previous.cell(x, y) == Some(cell) {
+                continue;
+            }
+            if cursor != Some((x, y)) {
+                queue!(writer, MoveTo(x, y))?;
+            }
+            active = queue_style(writer, cell, active, no_color)?;
+            queue!(writer, Print(cell.symbol))?;
+            cursor = Some((x.saturating_add(1), y));
+        }
+    }
+    if active.is_some() {
+        queue!(writer, ResetColor)?;
+    }
+    writer.flush()
+}
+
+/// Emits a foreground change only when it differs from the active color and
+/// returns the color now in effect.
+fn queue_style<W: Write>(
+    writer: &mut W,
+    cell: Cell,
+    active: Option<u8>,
+    no_color: bool,
+) -> io::Result<Option<u8>> {
+    if no_color || cell.style.foreground == active {
+        return Ok(active);
+    }
+    match cell.style.foreground {
+        Some(value) => queue!(writer, SetForegroundColor(Color::AnsiValue(value)))?,
+        None => queue!(writer, ResetColor)?,
+    }
+    Ok(cell.style.foreground)
+}
+
 fn draw_sessions(grid: &mut Grid, model: &AppModel, no_color: bool) {
     grid.write(2, 4, "SESSION", colored(45, no_color));
     grid.write(28, 4, "STATE", colored(45, no_color));
     grid.write(55, 4, "WORKSPACE", colored(45, no_color));
     for (row, session) in model.sessions.iter().skip(model.scroll).enumerate() {
-        let y = 5 + u16::try_from(row).unwrap_or(u16::MAX);
+        let y = 5_u16.saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
         if y >= grid.height().saturating_sub(2) {
             break;
         }
@@ -218,7 +280,12 @@ fn draw_workspace(grid: &mut Grid, model: &AppModel, no_color: bool) {
         &format!("Transcript - {title}"),
         colored(45, no_color),
     );
-    grid.write(split + 1, 4, "Tool activity", colored(45, no_color));
+    grid.write(
+        split.saturating_add(1),
+        4,
+        "Tool activity",
+        colored(45, no_color),
+    );
     for y in 4..grid.height().saturating_sub(2) {
         grid.put(split, y, '|', colored(238, no_color));
     }
@@ -226,7 +293,7 @@ fn draw_workspace(grid: &mut Grid, model: &AppModel, no_color: bool) {
     let start = model
         .transcript
         .len()
-        .saturating_sub(body_height + model.scroll);
+        .saturating_sub(body_height.saturating_add(model.scroll));
     for (row, entry) in model
         .transcript
         .iter()
@@ -234,7 +301,7 @@ fn draw_workspace(grid: &mut Grid, model: &AppModel, no_color: bool) {
         .take(body_height)
         .enumerate()
     {
-        let y = 6 + u16::try_from(row).unwrap_or(u16::MAX);
+        let y = 6_u16.saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
         grid.write(
             1,
             y,
@@ -243,9 +310,9 @@ fn draw_workspace(grid: &mut Grid, model: &AppModel, no_color: bool) {
         );
     }
     for (row, tool) in model.tools.iter().rev().take(body_height).rev().enumerate() {
-        let y = 6 + u16::try_from(row).unwrap_or(u16::MAX);
+        let y = 6_u16.saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
         grid.write(
-            split + 1,
+            split.saturating_add(1),
             y,
             &format!("{} [{}] {}", tool.name, tool.status, tool.summary),
             CellStyle::default(),
@@ -262,7 +329,7 @@ fn draw_workspace(grid: &mut Grid, model: &AppModel, no_color: bool) {
         if matches!(prompt, Prompt::Question { .. }) {
             grid.write(
                 1,
-                y + 1,
+                y.saturating_add(1),
                 &format!("> {}", model.answer),
                 colored(231, no_color),
             );
@@ -273,7 +340,7 @@ fn draw_workspace(grid: &mut Grid, model: &AppModel, no_color: bool) {
 fn draw_runs(grid: &mut Grid, model: &AppModel, no_color: bool) {
     grid.write(2, 4, "Run monitor", colored(45, no_color));
     for (row, session) in model.sessions.iter().enumerate() {
-        let y = 6 + u16::try_from(row).unwrap_or(u16::MAX);
+        let y = 6_u16.saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
         if y >= grid.height().saturating_sub(2) {
             break;
         }
@@ -286,7 +353,7 @@ fn draw_runs(grid: &mut Grid, model: &AppModel, no_color: bool) {
     }
     if model.sessions.is_empty() {
         for (row, state) in RunState::ALL.iter().enumerate() {
-            let y = 6 + u16::try_from(row).unwrap_or(u16::MAX);
+            let y = 6_u16.saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
             if y >= grid.height().saturating_sub(2) {
                 break;
             }
@@ -298,7 +365,7 @@ fn draw_runs(grid: &mut Grid, model: &AppModel, no_color: bool) {
 fn draw_diff(grid: &mut Grid, model: &AppModel, no_color: bool) {
     grid.write(2, 4, "Workspace diff", colored(45, no_color));
     for (row, line) in model.diff.iter().skip(model.scroll).enumerate() {
-        let y = 6 + u16::try_from(row).unwrap_or(u16::MAX);
+        let y = 6_u16.saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
         if y >= grid.height().saturating_sub(2) {
             break;
         }
@@ -326,23 +393,23 @@ fn draw_diff(grid: &mut Grid, model: &AppModel, no_color: bool) {
 fn draw_artifacts(grid: &mut Grid, model: &AppModel) {
     let split = grid.width().saturating_mul(2) / 5;
     grid.write(2, 4, "Artifacts", CellStyle::default());
-    grid.write(split + 1, 4, "Preview", CellStyle::default());
+    grid.write(split.saturating_add(1), 4, "Preview", CellStyle::default());
     for y in 4..grid.height().saturating_sub(2) {
         grid.put(split, y, '|', CellStyle::default());
     }
     for (row, artifact) in model.artifacts.iter().skip(model.scroll).enumerate() {
-        let y = 6 + u16::try_from(row).unwrap_or(u16::MAX);
+        let y = 6_u16.saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
         if y >= grid.height().saturating_sub(2) {
             break;
         }
         grid.write(2, y, &format!("* {artifact}"), CellStyle::default());
     }
     for (row, line) in model.artifact_content.iter().enumerate() {
-        let y = 6 + u16::try_from(row).unwrap_or(u16::MAX);
+        let y = 6_u16.saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
         if y >= grid.height().saturating_sub(2) {
             break;
         }
-        grid.write(split + 1, y, line, CellStyle::default());
+        grid.write(split.saturating_add(1), y, line, CellStyle::default());
     }
     if model.artifacts.is_empty() {
         grid.write(
@@ -353,7 +420,7 @@ fn draw_artifacts(grid: &mut Grid, model: &AppModel) {
         );
     } else if model.artifact_content.is_empty() {
         grid.write(
-            split + 1,
+            split.saturating_add(1),
             6,
             "No textual preview available.",
             CellStyle::default(),
@@ -378,7 +445,7 @@ fn draw_help(grid: &mut Grid) {
     for (row, text) in HELP.iter().enumerate() {
         grid.write(
             2,
-            6 + u16::try_from(row).unwrap_or(u16::MAX),
+            6_u16.saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
             text,
             CellStyle::default(),
         );
@@ -403,16 +470,21 @@ fn draw_palette(grid: &mut Grid, model: &AppModel, no_color: bool) {
             grid.put(column, row, ' ', colored(236, no_color));
         }
     }
-    grid.write(x + 2, y, "Command palette", colored(45, no_color));
     grid.write(
-        x + 2,
-        y + 2,
+        x.saturating_add(2),
+        y,
+        "Command palette",
+        colored(45, no_color),
+    );
+    grid.write(
+        x.saturating_add(2),
+        y.saturating_add(2),
         &format!(":{}", model.palette),
         colored(231, no_color),
     );
     grid.write(
-        x + 2,
-        y + 3,
+        x.saturating_add(2),
+        y.saturating_add(3),
         "sessions | workspace | runs | diff | artifacts | refresh | quit",
         colored(245, no_color),
     );

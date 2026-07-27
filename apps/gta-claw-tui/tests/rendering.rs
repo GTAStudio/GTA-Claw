@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use gta_claw_tui::model::{
     AppModel, Prompt, RunState, Screen, SessionSummary, ToolActivity, TranscriptEntry,
 };
-use gta_claw_tui::render::render;
+use gta_claw_tui::render::{flush, flush_changes, render};
 use gta_claw_tui::terminal::{TerminalControl, TerminalSession};
 
 #[test]
@@ -219,5 +219,230 @@ fn monochrome_render_retains_distinct_state_markers() {
             })
             .collect::<Vec<_>>(),
         vec![None; 12]
+    );
+}
+
+/// Builds a model with every optional area populated so the tiny-terminal sweep
+/// exercises each drawing path, not just the empty-state fallbacks.
+fn populated_model(screen: Screen, scroll: usize) -> AppModel {
+    let mut model = AppModel {
+        screen,
+        connection: "Gateway: ready (protocol 4, epoch 1)".to_owned(),
+        sessions: vec![SessionSummary {
+            id: "s-1".to_owned(),
+            title: "Shipping fix".to_owned(),
+            workspace: "D:\\repo".to_owned(),
+            state: RunState::Running,
+            progress: Some(60),
+        }],
+        prompt: Some(Prompt::Question {
+            id: "question-1".to_owned(),
+            text: "Which branch?".to_owned(),
+        }),
+        palette_open: true,
+        palette: "diff".to_owned(),
+        answer: "main".to_owned(),
+        notice: Some("Refreshing sessions...".to_owned()),
+        diff: vec!["@@ -1 +1 @@".to_owned(), "+added".to_owned()],
+        artifacts: vec!["report.txt".to_owned()],
+        artifact_content: vec!["line one".to_owned()],
+        ..AppModel::default()
+    };
+    model.scroll = scroll;
+    model.transcript.push_back(TranscriptEntry {
+        role: "assistant".to_owned(),
+        text: "I prepared the patch".to_owned(),
+    });
+    model.tools.push_back(ToolActivity {
+        name: "powershell".to_owned(),
+        status: "completed".to_owned(),
+        summary: "tests passed".to_owned(),
+    });
+    model
+}
+
+#[test]
+fn degenerate_terminal_sizes_render_and_flush_without_panicking() {
+    let screens = [
+        Screen::Sessions,
+        Screen::Workspace,
+        Screen::Runs,
+        Screen::Diff,
+        Screen::Artifacts,
+        Screen::Help,
+    ];
+    for screen in screens {
+        for scroll in [0, 1, usize::MAX] {
+            let model = populated_model(screen, scroll);
+            for width in 0..=12_u16 {
+                for height in 0..=12_u16 {
+                    let grid = render(&model, width, height, false);
+                    assert!(grid.width() >= 1 && grid.height() >= 1);
+                    let mut out = Vec::new();
+                    flush(&mut out, &grid, false).expect("flush a degenerate frame");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unchanged_frames_write_nothing_and_a_changed_line_writes_far_less_than_a_repaint() {
+    let quiet = AppModel {
+        connection: "Gateway: ready".to_owned(),
+        ..AppModel::default()
+    };
+    let noticed = AppModel {
+        connection: "Gateway: ready".to_owned(),
+        notice: Some("Refreshing sessions...".to_owned()),
+        ..AppModel::default()
+    };
+    let first = render(&quiet, 80, 24, true);
+    let second = render(&noticed, 80, 24, true);
+
+    let mut repaint = Vec::new();
+    flush_changes(&mut repaint, None, &first, true).expect("first paint");
+    assert!(!repaint.is_empty());
+
+    let mut idle = Vec::new();
+    flush_changes(&mut idle, Some(&first), &first, true).expect("idle frame");
+    assert!(
+        idle.is_empty(),
+        "an unchanged frame must not redraw the terminal"
+    );
+
+    let mut partial = Vec::new();
+    flush_changes(&mut partial, Some(&first), &second, true).expect("partial frame");
+    assert!(!partial.is_empty());
+    assert!(
+        partial.len() * 4 < repaint.len(),
+        "a one-line change wrote {} bytes against a {}-byte full repaint",
+        partial.len(),
+        repaint.len()
+    );
+}
+
+#[test]
+fn a_resize_falls_back_to_a_full_repaint() {
+    let model = populated_model(Screen::Sessions, 0);
+    let small = render(&model, 60, 20, false);
+    let large = render(&model, 100, 30, false);
+
+    let mut resized = Vec::new();
+    flush_changes(&mut resized, Some(&small), &large, false).expect("resized frame");
+    let mut full = Vec::new();
+    flush(&mut full, &large, false).expect("full frame");
+    assert_eq!(resized, full);
+}
+
+/// A minimal ANSI screen that understands exactly the sequences the renderer
+/// emits: absolute cursor moves, 256-color foreground, reset, and printable
+/// scalars. It exists so an incremental repaint can be proven to land on the
+/// same visible screen as a full one.
+#[derive(Clone)]
+struct FakeScreen {
+    width: u16,
+    height: u16,
+    cells: Vec<(char, Option<u8>)>,
+}
+
+impl FakeScreen {
+    fn new(width: u16, height: u16) -> Self {
+        Self {
+            width,
+            height,
+            cells: vec![(' ', None); usize::from(width) * usize::from(height)],
+        }
+    }
+
+    fn apply(&mut self, bytes: &[u8]) {
+        let text = String::from_utf8(bytes.to_vec()).expect("renderer emits UTF-8");
+        let mut characters = text.chars();
+        let (mut x, mut y) = (0_u16, 0_u16);
+        let mut foreground = None;
+        while let Some(character) = characters.next() {
+            if character != '\u{1b}' {
+                if x < self.width && y < self.height {
+                    let index = usize::from(y) * usize::from(self.width) + usize::from(x);
+                    self.cells[index] = (character, foreground);
+                }
+                x = x.saturating_add(1);
+                continue;
+            }
+            assert_eq!(characters.next(), Some('['), "only CSI sequences are used");
+            let mut body = String::new();
+            let final_byte = loop {
+                let next = characters.next().expect("terminated CSI sequence");
+                if next.is_ascii_alphabetic() {
+                    break next;
+                }
+                body.push(next);
+            };
+            let parameters = body
+                .split(';')
+                .filter(|part| !part.is_empty())
+                .map(|part| part.parse::<u32>().expect("numeric CSI parameter"))
+                .collect::<Vec<_>>();
+            match final_byte {
+                'H' => {
+                    y = u16::try_from(parameters.first().copied().unwrap_or(1).saturating_sub(1))
+                        .expect("row fits a terminal");
+                    x = u16::try_from(parameters.get(1).copied().unwrap_or(1).saturating_sub(1))
+                        .expect("column fits a terminal");
+                }
+                'm' => {
+                    foreground = match parameters.as_slice() {
+                        [38, 5, value] => {
+                            Some(u8::try_from(*value).expect("256-color palette index"))
+                        }
+                        _ => None,
+                    };
+                }
+                other => panic!("unexpected CSI final byte {other}"),
+            }
+        }
+    }
+
+    fn matches(&self, grid: &gta_claw_tui::render::Grid) -> bool {
+        (0..self.height).all(|y| {
+            (0..self.width).all(|x| {
+                let cell = grid.cell(x, y).expect("rendered cell");
+                let index = usize::from(y) * usize::from(self.width) + usize::from(x);
+                self.cells[index] == (cell.symbol, cell.style.foreground)
+            })
+        })
+    }
+}
+
+#[test]
+fn an_incremental_repaint_lands_on_the_same_screen_as_a_full_one() {
+    let frames = [
+        populated_model(Screen::Runs, 0),
+        populated_model(Screen::Diff, 0),
+        populated_model(Screen::Workspace, 0),
+        populated_model(Screen::Artifacts, 0),
+    ];
+    let mut screen = FakeScreen::new(90, 24);
+    let mut previous: Option<gta_claw_tui::render::Grid> = None;
+    let mut incremental = 0_usize;
+    let mut repaints = 0_usize;
+    for model in &frames {
+        let grid = render(model, 90, 24, false);
+        let mut bytes = Vec::new();
+        flush_changes(&mut bytes, previous.as_ref(), &grid, false).expect("incremental frame");
+        incremental += bytes.len();
+        screen.apply(&bytes);
+        assert!(
+            screen.matches(&grid),
+            "incremental repaint diverged from the rendered frame"
+        );
+        let mut full = Vec::new();
+        flush(&mut full, &grid, false).expect("full frame");
+        repaints += full.len();
+        previous = Some(grid);
+    }
+    assert!(
+        incremental < repaints,
+        "incremental repaints wrote {incremental} bytes against {repaints} for full ones"
     );
 }

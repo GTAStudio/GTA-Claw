@@ -29,9 +29,8 @@ unset GTA_CLAW_TOKEN
 This POSIX `sh` sequence disables terminal echo, restores it on normal exit or
 signals, and uses shell-managed standard input without putting the token in an
 external process argv. It works with `dash`, other POSIX shells, and the default
-macOS shell. PowerShell can likewise prompt securely and write only to the CLI standard
-PowerShell can likewise prompt securely and write only to the CLI standard
-input:
+macOS shell. PowerShell can likewise prompt securely and write only to the CLI
+standard input:
 
 ```powershell
 $secret = Read-Host "Gateway token" -AsSecureString
@@ -75,7 +74,11 @@ Durable Windows/macOS secure-storage identity is deferred.
 | 5 | protocol | Version, framing, or typed payload validation failed |
 | 6 | health-negative | Health response or health payload was negative |
 | 7 | timeout/cancel | Command timed out, was interrupted, or could not shut down in time |
-| 8 | internal | Local runtime/client state failure |
+| 8 | internal | Local runtime/client state failure, or an unsupported local command such as `send` |
+
+`gta-claw-cli --help` prints the same table together with every flag, its
+default, and one complete example. Human-readable failures name the endpoint
+that was tried and the next action to take; `--json` output is unaffected.
 
 `--json` schema version 2 emits one deterministic object containing only the sanitized
 endpoint origin, negotiated protocol, role, sorted unique effective scopes,

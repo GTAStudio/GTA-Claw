@@ -1,6 +1,10 @@
 //! Process-level Gateway health diagnostic coverage over a real WebSocket.
 
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "the Gateway test double is shared with claw-gateway-client, which owns the file; \
+              this binary exercises only the subset the CLI diagnostic needs"
+)]
 #[path = "../../../crates/claw-gateway-client/tests/support/mod.rs"]
 mod support;
 
@@ -219,7 +223,7 @@ fn connect_matches(params: &ConnectParams, expected_token: Option<&str>) -> bool
             .client
             .display_name
             .as_ref()
-            .map(|name| name.as_str())
+            .map(claw_protocol::gateway::Name::as_str)
             == Some("GTA Claw Gateway diagnostic")
         && params.client.version.as_str() == env!("CARGO_PKG_VERSION")
         && params.client.platform.as_str() == std::env::consts::OS
@@ -231,7 +235,11 @@ fn connect_matches(params: &ConnectParams, expected_token: Option<&str>) -> bool
         && params.commands.is_none()
         && params.permissions.is_none()
         && params.path_env.is_none()
-        && params.role.as_ref().map(|role| role.as_str()) == Some("operator")
+        && params
+            .role
+            .as_ref()
+            .map(claw_protocol::gateway::Name::as_str)
+            == Some("operator")
         && params
             .scopes
             .as_ref()
@@ -377,23 +385,21 @@ async fn collect_child_output(mut child: Child, limit: Duration, label: &str) ->
         stderr.read_to_end(&mut bytes).await.expect("read stderr");
         bytes
     });
-    let status = match tokio::time::timeout(limit, child.wait()).await {
-        Ok(status) => status.expect("CLI process status"),
-        Err(_) => {
-            child.start_kill().expect("terminate timed-out CLI");
-            let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
-                .await
-                .expect("reap timed-out CLI")
-                .expect("timed-out CLI status");
-            let stdout = stdout_task.await.expect("stdout task");
-            let stderr = stderr_task.await.expect("stderr task");
-            panic!(
-                "{label} exceeded {limit:?}: status={status} stdout={} stderr={}",
-                String::from_utf8_lossy(&stdout),
-                String::from_utf8_lossy(&stderr)
-            );
-        }
+    let Ok(status) = tokio::time::timeout(limit, child.wait()).await else {
+        child.start_kill().expect("terminate timed-out CLI");
+        let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .expect("reap timed-out CLI")
+            .expect("timed-out CLI status");
+        let stdout = stdout_task.await.expect("stdout task");
+        let stderr = stderr_task.await.expect("stderr task");
+        panic!(
+            "{label} exceeded {limit:?}: status={status} stdout={} stderr={}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
     };
+    let status = status.expect("CLI process status");
     Output {
         status,
         stdout: stdout_task.await.expect("stdout task"),
@@ -829,7 +835,7 @@ async fn non_resolving_dns_cannot_hold_the_process_past_its_bound() {
     let started = Instant::now();
     let output = run_cli(arguments, Some(&format!("{TOKEN}\n"))).await;
     assert!(
-        matches!(output.status.code(), Some(3) | Some(7)),
+        matches!(output.status.code(), Some(3 | 7)),
         "stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)

@@ -71,14 +71,11 @@ fn run_process_with_builder(
     initialize: impl FnOnce(&tokio::runtime::Runtime),
     build_runtime: impl FnOnce() -> io::Result<tokio::runtime::Runtime>,
 ) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(runtime) => runtime,
-        Err(_) => {
-            return write_rendered_result(RenderedResult::failure(
-                ExitCategory::Internal,
-                "error: could not initialize the async runtime\n".to_owned(),
-            ));
-        }
+    let Ok(runtime) = build_runtime() else {
+        return write_rendered_result(RenderedResult::failure(
+            ExitCategory::Internal,
+            "error: could not initialize the async runtime\n".to_owned(),
+        ));
     };
     initialize(&runtime);
     let result = runtime.block_on(dispatch(arguments.into_iter().collect()));
@@ -136,7 +133,7 @@ async fn dispatch(arguments: Vec<OsString>) -> RenderedResult {
         Ok(Invocation::Version) => {
             RenderedResult::success(format!("gta-claw-cli {}\n", env!("CARGO_PKG_VERSION")))
         }
-        Ok(Invocation::Help) => RenderedResult::success(format!("{USAGE}\n")),
+        Ok(Invocation::Help) => RenderedResult::success(format!("{USAGE}\n\n{HELP_DETAIL}\n")),
         Ok(Invocation::Foundation) => run_foundation(arguments),
         Ok(Invocation::Gateway(options)) => {
             let interrupt = async { tokio::signal::ctrl_c().await.map_err(|_| ()) };
@@ -154,6 +151,48 @@ usage:
   gta-claw-cli gateway health --endpoint <ws-or-wss-url> --ephemeral-device
       [--token-stdin] [--timeout-ms <250..120000>]
       [--allow-insecure-remote-ws] [--json]";
+
+const HELP_POINTER: &str = "run `gta-claw-cli --help` for defaults, exit codes, and an example.";
+
+const HELP_DETAIL: &str = "\
+commands:
+  --version                   print `gta-claw-cli <version>` and exit 0
+  --help, -h                  print this text and exit 0
+  health                      report local runtime health; contacts nothing
+  send <session-id> <message> always fails: message transport is not configured
+  gateway health              run one authenticated Gateway v4 health probe
+
+`gateway health` options (each may be given at most once):
+  --endpoint <url>            required. Canonical ws:// or wss:// URL with no
+                              credentials, query string, or fragment
+  --ephemeral-device          required. Generates a one-shot in-memory identity
+                              that is never written to disk. The Gateway may
+                              still record a pairing or device entry
+  --token-stdin               read the shared token as one non-empty UTF-8 line
+                              (at most 4096 bytes) from standard input. A token
+                              is never read from argv or the environment, and is
+                              never echoed or printed. Default: no token
+  --token-file <path>         accepted but always fails closed: portable
+                              ownership and permission proof is not implemented
+  --timeout-ms <250..120000>  whole-command bound. Default: 10000
+  --allow-insecure-remote-ws  permit plaintext ws:// to a non-loopback host.
+                              Default: refused
+  --json                      print one schema_version 2 summary object on
+                              standard output. Default: human-readable text
+
+exit codes:
+  0  success                 the health RPC returned a positive typed result
+  2  usage_config            invalid arguments, endpoint, or token input
+  3  transport_transient     connection or transient transport failure
+  4  authentication_pairing  the credential was rejected, or pairing is required
+  5  protocol                version, framing, or typed payload validation failed
+  6  health_negative         the Gateway reported itself unhealthy
+  7  timeout_cancel          timed out, interrupted, or shutdown overran
+  8  internal                local runtime failure, or an unsupported command
+
+example:
+  gta-claw-cli gateway health --endpoint ws://127.0.0.1:18789 \\
+      --ephemeral-device --json";
 
 enum Invocation {
     Version,
@@ -382,7 +421,7 @@ fn validate_endpoint(
             "Gateway endpoint spelling is not canonical",
         ));
     }
-    if expected_scheme == "ws" && !allow_insecure_remote_ws && !is_loopback_host(url.host()) {
+    if expected_scheme == "ws" && !allow_insecure_remote_ws && !is_loopback_host(&url) {
         return Err(DiagnosticFailure::usage(
             "insecure_remote_ws",
             "remote plaintext ws requires explicit diagnostic opt-in",
@@ -436,8 +475,8 @@ fn is_canonical_dns_name(domain: &str) -> bool {
         })
 }
 
-fn is_loopback_host(host: Option<Host<&str>>) -> bool {
-    match host {
+fn is_loopback_host(url: &Url) -> bool {
+    match url.host() {
         Some(Host::Domain("localhost")) => true,
         Some(Host::Ipv4(address)) => address.is_loopback(),
         Some(Host::Ipv6(address)) => address.is_loopback(),
@@ -473,18 +512,15 @@ fn contains_forbidden_endpoint_char(value: &str) -> bool {
 }
 
 fn run_foundation(arguments: Vec<OsString>) -> RenderedResult {
-    let strings = match arguments
+    let Ok(strings) = arguments
         .into_iter()
         .map(OsString::into_string)
         .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(strings) => strings,
-        Err(_) => {
-            return RenderedResult::failure(
-                ExitCategory::UsageConfig,
-                "error: command arguments must be valid UTF-8\n".to_owned(),
-            );
-        }
+    else {
+        return RenderedResult::failure(
+            ExitCategory::UsageConfig,
+            "error: command arguments must be valid UTF-8\n".to_owned(),
+        );
     };
     let command = match parse_command(strings) {
         Ok(command) => command,
@@ -498,11 +534,21 @@ fn run_foundation(arguments: Vec<OsString>) -> RenderedResult {
     let application = Application::new(NativeSystemProbe);
     match application.handle(command) {
         Ok(event) => RenderedResult::success(format!("{event}\n")),
-        Err(error) => RenderedResult::failure(ExitCategory::Internal, format!("error: {error}\n")),
+        Err(error) => RenderedResult::failure(
+            ExitCategory::Internal,
+            format!(
+                "error: {error}\n\
+                 next: this binary has no message transport, and retrying will not change that. \
+                 Use a Gateway-connected client, or run `gateway health` to check the Gateway.\n\
+                 exit code: {} ({})\n",
+                ExitCategory::Internal.code(),
+                ExitCategory::Internal.as_str()
+            ),
+        ),
     }
 }
 
-fn safe_protocol_error(error: &ProtocolError) -> &'static str {
+const fn safe_protocol_error(error: &ProtocolError) -> &'static str {
     match error {
         ProtocolError::MissingCommand => "missing command",
         ProtocolError::MissingArgument(_) => "missing command argument",
@@ -522,7 +568,7 @@ async fn run_gateway(
         Err(failure) => {
             return render_diagnostic(
                 &options,
-                DiagnosticSummary::failure(
+                &DiagnosticSummary::failure(
                     sanitized_origin(&options.endpoint),
                     started.elapsed(),
                     failure,
@@ -540,7 +586,7 @@ async fn run_gateway(
             Err(failure) => {
                 return render_diagnostic(
                     &options,
-                    DiagnosticSummary::failure(endpoint, started.elapsed(), failure),
+                    &DiagnosticSummary::failure(endpoint, started.elapsed(), failure),
                 );
             }
         },
@@ -557,13 +603,13 @@ async fn run_gateway(
             };
             return render_diagnostic(
                 &options,
-                DiagnosticSummary::failure(endpoint, started.elapsed(), failure),
+                &DiagnosticSummary::failure(endpoint, started.elapsed(), failure),
             );
         }
         () = &mut deadline => {
             return render_diagnostic(
                 &options,
-                DiagnosticSummary::failure(
+                &DiagnosticSummary::failure(
                     endpoint,
                     started.elapsed(),
                     DiagnosticFailure::timeout(
@@ -579,7 +625,7 @@ async fn run_gateway(
         Err(failure) => {
             return render_diagnostic(
                 &options,
-                DiagnosticSummary::failure(endpoint, started.elapsed(), failure),
+                &DiagnosticSummary::failure(endpoint, started.elapsed(), failure),
             );
         }
     };
@@ -612,7 +658,7 @@ async fn run_gateway(
         Err(error) => {
             return render_diagnostic(
                 &options,
-                DiagnosticSummary::failure(endpoint, started.elapsed(), map_client_error(&error)),
+                &DiagnosticSummary::failure(endpoint, started.elapsed(), map_client_error(&error)),
             );
         }
     };
@@ -640,7 +686,7 @@ async fn run_gateway(
         attempt.failure = Some(map_client_error(&error));
     }
     let summary = attempt.into_summary(endpoint, started.elapsed());
-    render_diagnostic(&options, summary)
+    render_diagnostic(&options, &summary)
 }
 
 async fn execute_health(client: &GatewayClient) -> DiagnosticAttempt {
@@ -737,7 +783,7 @@ where
     MakeOperation: FnOnce() -> Operation,
     Operation: Future<Output = Result<T, DiagnosticFailure>>,
 {
-    if let Some(failure) = terminal_state_failure(states.borrow().clone()) {
+    if let Some(failure) = observed_terminal_failure(&states) {
         return Err(failure);
     }
     let operation = make_operation();
@@ -750,12 +796,22 @@ where
                 if changed.is_err() {
                     return Err(transport_failure());
                 }
-                if let Some(failure) = terminal_state_failure(states.borrow().clone()) {
+                if let Some(failure) = observed_terminal_failure(&states) {
                     return Err(failure);
                 }
             }
         }
     }
+}
+
+/// Classifies the currently published state while holding the watch borrow for
+/// the classification only: the guard must never span an `.await`, and never
+/// spans the `if let` body that consumes the result.
+fn observed_terminal_failure(
+    states: &watch::Receiver<ConnectionState>,
+) -> Option<DiagnosticFailure> {
+    let state = states.borrow();
+    terminal_state_failure(&state)
 }
 
 async fn classify_request_error(
@@ -775,7 +831,7 @@ async fn classify_request_error(
     let mut states = client.subscribe_state();
     loop {
         let state = states.borrow().clone();
-        if let Some(failure) = terminal_state_failure(state.clone()) {
+        if let Some(failure) = terminal_state_failure(&state) {
             return failure;
         }
         match state {
@@ -796,13 +852,13 @@ async fn classify_request_error(
     }
 }
 
-fn terminal_state_failure(state: ConnectionState) -> Option<DiagnosticFailure> {
+const fn terminal_state_failure(state: &ConnectionState) -> Option<DiagnosticFailure> {
     match state {
         ConnectionState::ProtocolFailed { .. } | ConnectionState::ResyncRequired(_) => Some(
             DiagnosticFailure::protocol("protocol_error", "Gateway protocol validation failed"),
         ),
         ConnectionState::AuthenticationFailed(authentication) => {
-            Some(map_authentication_error(authentication))
+            Some(map_authentication_error(*authentication))
         }
         ConnectionState::ReconnectExhausted | ConnectionState::Stopped => Some(transport_failure()),
         ConnectionState::Starting
@@ -1000,7 +1056,7 @@ struct DiagnosticAttempt {
 }
 
 impl DiagnosticAttempt {
-    fn failure(failure: DiagnosticFailure) -> Self {
+    const fn failure(failure: DiagnosticFailure) -> Self {
         Self {
             info: None,
             health: None,
@@ -1008,7 +1064,7 @@ impl DiagnosticAttempt {
         }
     }
 
-    fn with_info(failure: DiagnosticFailure, info: SafeConnectionInfo) -> Self {
+    const fn with_info(failure: DiagnosticFailure, info: SafeConnectionInfo) -> Self {
         Self {
             info: Some(info),
             health: None,
@@ -1191,7 +1247,7 @@ impl DiagnosticFailure {
     }
 }
 
-fn map_client_error(error: &GatewayClientError) -> DiagnosticFailure {
+const fn map_client_error(error: &GatewayClientError) -> DiagnosticFailure {
     match error {
         GatewayClientError::Configuration(configuration) => map_configuration_error(*configuration),
         GatewayClientError::Transport(TransportFailure::TimedOut)
@@ -1218,7 +1274,7 @@ fn map_client_error(error: &GatewayClientError) -> DiagnosticFailure {
     }
 }
 
-fn map_configuration_error(error: ConfigurationError) -> DiagnosticFailure {
+const fn map_configuration_error(error: ConfigurationError) -> DiagnosticFailure {
     let (status, message) = match error {
         ConfigurationError::UnsupportedScheme => {
             ("unsupported_scheme", "Gateway endpoint must use ws or wss")
@@ -1243,12 +1299,12 @@ fn map_configuration_error(error: ConfigurationError) -> DiagnosticFailure {
     DiagnosticFailure::usage(status, message)
 }
 
-fn map_authentication_error(error: AuthenticationFailure) -> DiagnosticFailure {
+const fn map_authentication_error(error: AuthenticationFailure) -> DiagnosticFailure {
     match error.detail_code() {
-        Some(ConnectErrorDetailCode::ProtocolMismatch)
-        | Some(ConnectErrorDetailCode::ClientVersionMismatch) => {
-            DiagnosticFailure::protocol("version_mismatch", "Gateway version is incompatible")
-        }
+        Some(
+            ConnectErrorDetailCode::ProtocolMismatch
+            | ConnectErrorDetailCode::ClientVersionMismatch,
+        ) => DiagnosticFailure::protocol("version_mismatch", "Gateway version is incompatible"),
         Some(ConnectErrorDetailCode::PairingRequired) => DiagnosticFailure {
             category: ExitCategory::AuthenticationPairing,
             status: "pairing_required",
@@ -1262,7 +1318,7 @@ fn map_authentication_error(error: AuthenticationFailure) -> DiagnosticFailure {
     }
 }
 
-fn map_protocol_error(error: &ProtocolFailure) -> DiagnosticFailure {
+const fn map_protocol_error(error: &ProtocolFailure) -> DiagnosticFailure {
     match error {
         ProtocolFailure::HelloProtocol { .. }
         | ProtocolFailure::HandshakeRejected(ConnectErrorDetailCode::ProtocolMismatch) => {
@@ -1282,16 +1338,16 @@ fn render_parse_failure(failure: ParseFailure) -> RenderedResult {
             Duration::ZERO,
             DiagnosticFailure::usage("invalid_input", failure.message),
         );
-        render_json(summary)
+        render_json(&summary)
     } else {
         RenderedResult::failure(
             ExitCategory::UsageConfig,
-            format!("error: {}\n{USAGE}\n", failure.message),
+            format!("error: {}\n{USAGE}\n{HELP_POINTER}\n", failure.message),
         )
     }
 }
 
-fn render_diagnostic(options: &GatewayOptions, summary: DiagnosticSummary) -> RenderedResult {
+fn render_diagnostic(options: &GatewayOptions, summary: &DiagnosticSummary) -> RenderedResult {
     debug_assert!(options.ephemeral_device);
     if options.json {
         render_json(summary)
@@ -1323,27 +1379,103 @@ fn render_diagnostic(options: &GatewayOptions, summary: DiagnosticSummary) -> Re
         RenderedResult {
             stdout: String::new(),
             stderr: format!(
-                "Gateway health failed: {} ({})\n",
-                summary.message, summary.category
+                "Gateway health failed: {} ({})\n\
+                 endpoint: {}\n\
+                 next: {}\n\
+                 exit code: {} ({})\n",
+                summary.message,
+                summary.category,
+                summary
+                    .endpoint
+                    .as_deref()
+                    .unwrap_or("<not a usable endpoint>"),
+                next_step(summary.status),
+                summary.exit_code,
+                summary.category,
             ),
             exit_code: summary.exit_code,
         }
     }
 }
 
-fn render_json(summary: DiagnosticSummary) -> RenderedResult {
+/// Maps a stable failure status onto the one action that most often resolves it.
+///
+/// The text is deliberately local knowledge only: it never repeats peer-supplied
+/// text, a credential, or anything read from standard input.
+fn next_step(status: &str) -> &'static str {
+    match status {
+        "insecure_remote_ws" => {
+            "this is a plaintext ws:// endpoint that is not loopback. Use wss://, or add \
+             --allow-insecure-remote-ws if you trust the network path"
+        }
+        "credential_bearing_endpoint" => {
+            "remove the credentials, query string, or fragment from --endpoint and pass any \
+             shared token on standard input with --token-stdin"
+        }
+        "unsupported_scheme" | "invalid_endpoint" | "invalid_endpoint_spelling" => {
+            "pass one canonical endpoint, for example --endpoint ws://127.0.0.1:18789 \
+             (lowercase ASCII host, no default port, no trailing slash)"
+        }
+        "token_file_unsupported" => {
+            "pipe the token to --token-stdin instead; --token-file fails closed on every platform"
+        }
+        "secret_invalid" | "secret_too_large" | "secret_stdin_error" => {
+            "write exactly one non-empty UTF-8 line with no whitespace (at most 4096 bytes) to \
+             standard input"
+        }
+        "invalid_input" => "check the flag spelling above; each option may be given only once",
+        "transport_failure" => {
+            "nothing answered the Gateway handshake at that endpoint. Check that a Gateway is \
+             running and reachable there, and that the scheme and port are right"
+        }
+        "timeout" => {
+            "the Gateway did not finish the health RPC in time. Raise --timeout-ms (250..120000) \
+             or check that the Gateway is healthy"
+        }
+        "cancelled" => "the diagnostic was interrupted before the health RPC finished",
+        "authentication_failed" => {
+            "the Gateway rejected the credential. Supply the shared token on standard input with \
+             --token-stdin, or drop it if the Gateway expects none"
+        }
+        "pairing_required" => {
+            "this ephemeral device needs approval. Pair or approve it on the Gateway, then re-run"
+        }
+        "version_mismatch" => {
+            "this build speaks Gateway protocol 4. Upgrade the Gateway or the CLI so both agree"
+        }
+        "hello_authorization_mismatch" => {
+            "the Gateway granted a different role or scope set than the requested operator.read. \
+             Check the Gateway authorization policy for this client"
+        }
+        "unhealthy" => {
+            "the Gateway answered but reported itself unhealthy. Its own logs hold the reason"
+        }
+        "randomness_error" => {
+            "the operating system secure random source is unavailable, so no ephemeral device \
+             identity could be generated"
+        }
+        _ => {
+            "re-run with --json for the full machine-readable summary, and see \
+             `gta-claw-cli --help` for every exit code"
+        }
+    }
+}
+
+fn render_json(summary: &DiagnosticSummary) -> RenderedResult {
     let exit_code = summary.exit_code;
-    match serde_json::to_string(&summary) {
-        Ok(json) => RenderedResult {
+    serde_json::to_string(summary).map_or_else(
+        |_| {
+            RenderedResult::failure(
+                ExitCategory::Internal,
+                "error: could not serialize diagnostic summary\n".to_owned(),
+            )
+        },
+        |json| RenderedResult {
             stdout: format!("{json}\n"),
             stderr: String::new(),
             exit_code,
         },
-        Err(_) => RenderedResult::failure(
-            ExitCategory::Internal,
-            "error: could not serialize diagnostic summary\n".to_owned(),
-        ),
-    }
+    )
 }
 
 struct RenderedResult {
@@ -1353,7 +1485,7 @@ struct RenderedResult {
 }
 
 impl RenderedResult {
-    fn success(stdout: String) -> Self {
+    const fn success(stdout: String) -> Self {
         Self {
             stdout,
             stderr: String::new(),
@@ -1361,7 +1493,7 @@ impl RenderedResult {
         }
     }
 
-    fn failure(category: ExitCategory, stderr: String) -> Self {
+    const fn failure(category: ExitCategory, stderr: String) -> Self {
         Self {
             stdout: String::new(),
             stderr,
@@ -1720,9 +1852,8 @@ mod tests {
         let source = DeterministicFill {
             calls: Cell::new(0),
         };
-        let identity = match generate_ephemeral_identity_with(&source) {
-            Ok(identity) => identity,
-            Err(_) => panic!("deterministic fill must succeed"),
+        let Ok(identity) = generate_ephemeral_identity_with(&source) else {
+            panic!("deterministic fill must succeed")
         };
         assert_eq!(source.calls.get(), 1);
         assert_ne!(identity.device_id().as_bytes(), &[0_u8; 32]);

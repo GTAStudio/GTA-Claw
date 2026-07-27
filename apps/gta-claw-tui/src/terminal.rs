@@ -1,6 +1,6 @@
 use std::io::{self, IsTerminal, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -15,8 +15,20 @@ use tokio::sync::mpsc;
 /// Abstract terminal lifecycle operations, injectable for panic-path tests.
 pub trait TerminalControl: Send + Sync + 'static {
     /// Enters interactive terminal mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying terminal error when raw mode or the alternate
+    /// screen cannot be entered. Implementations must leave the terminal in its
+    /// original state when they report an error.
     fn enter(&self) -> io::Result<()>;
     /// Restores the process terminal. Implementations must be idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying terminal error when the alternate screen or raw
+    /// mode cannot be left. Callers on a panic or shutdown path should ignore
+    /// it: there is nothing left to fall back to.
     fn restore(&self) -> io::Result<()>;
 }
 
@@ -60,6 +72,11 @@ pub struct TerminalSession<C: TerminalControl> {
 
 impl<C: TerminalControl> TerminalSession<C> {
     /// Enters terminal mode and returns its restoration guard.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the [`TerminalControl::enter`] error. No guard is created in
+    /// that case, so nothing needs to be restored.
     pub fn enter(control: Arc<C>) -> io::Result<Self> {
         control.enter()?;
         Ok(Self { control })
@@ -128,6 +145,29 @@ pub fn is_interactive() -> bool {
         && std::env::var_os("TERM").is_none_or(|term| term != "dumb")
 }
 
+static PANIC_HOOK: Once = Once::new();
+
+/// Restores the terminal on panic before the default hook prints.
+///
+/// Without this the panic message is written *inside* the alternate screen and
+/// scrolls away with it, and the shell is handed back in raw mode: the user
+/// sees no error and has to run `reset` blind. Installing is idempotent and the
+/// previously installed hook still runs, so the usual message and backtrace are
+/// preserved.
+pub fn install_panic_hook() {
+    install_panic_hook_with(best_effort_restore);
+}
+
+fn install_panic_hook_with(restore: fn()) {
+    PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore();
+            previous(info);
+        }));
+    });
+}
+
 /// Writes an emergency restoration sequence before process-level error output.
 pub fn best_effort_restore() {
     let _ = execute!(
@@ -138,4 +178,29 @@ pub fn best_effort_restore() {
     );
     let _ = disable_raw_mode();
     let _ = io::stdout().flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::install_panic_hook_with;
+
+    static RESTORED: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_restore() {
+        RESTORED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn panic_hook_restores_the_terminal_once_per_panic_and_installs_once() {
+        install_panic_hook_with(count_restore);
+        install_panic_hook_with(count_restore);
+
+        assert!(std::panic::catch_unwind(|| panic!("simulated render panic")).is_err());
+        assert_eq!(RESTORED.load(Ordering::SeqCst), 1);
+
+        assert!(std::panic::catch_unwind(|| panic!("second simulated panic")).is_err());
+        assert_eq!(RESTORED.load(Ordering::SeqCst), 2);
+    }
 }

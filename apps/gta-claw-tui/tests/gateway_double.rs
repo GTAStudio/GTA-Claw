@@ -1,6 +1,10 @@
 //! End-to-end TUI worker coverage over a real local WebSocket double.
 
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "the Gateway test double is shared with claw-gateway-client, which owns the file; \
+              this binary exercises only the subset the TUI worker needs"
+)]
 #[path = "../../../crates/claw-gateway-client/tests/support/mod.rs"]
 mod support;
 
@@ -23,7 +27,7 @@ async fn gateway_worker_loads_sessions_and_streams_transcript() {
                 .scopes
                 .expect("TUI requests scopes")
                 .iter()
-                .map(|scope| scope.as_str())
+                .map(claw_protocol::gateway::Name::as_str)
                 .collect::<Vec<_>>(),
             vec!["operator.read", "operator.write", "operator.approvals"]
         );

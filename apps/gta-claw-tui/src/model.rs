@@ -107,6 +107,10 @@ impl RunState {
 }
 
 impl RunState {
+    /// Fail-safe state for a run state this build does not know about: an
+    /// unknown state must never look like progress or success.
+    const UNKNOWN: Self = Self::Blocked;
+
     pub(crate) fn parse(value: &str) -> Self {
         match value.to_ascii_lowercase().replace([' ', '-'], "_").as_str() {
             "draft" => Self::Draft,
@@ -121,7 +125,7 @@ impl RunState {
             "cancelled" | "canceled" => Self::Cancelled,
             "completed_with_changes" | "completedwithchanges" => Self::CompletedWithChanges,
             "completed" => Self::Completed,
-            _ => Self::Blocked,
+            _ => Self::UNKNOWN,
         }
     }
 }
@@ -298,7 +302,114 @@ impl AppModel {
         }
     }
 
-    pub(crate) fn select_previous(&mut self) {
+    pub(crate) const fn select_previous(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// Rows the active screen can scroll through.
+    fn scrollable_rows(&self) -> usize {
+        match self.screen {
+            Screen::Sessions | Screen::Runs => self.sessions.len(),
+            Screen::Workspace => self.transcript.len(),
+            Screen::Diff => self.diff.len(),
+            Screen::Artifacts => self.artifacts.len().max(self.artifact_content.len()),
+            Screen::Help => 0,
+        }
+    }
+
+    /// Moves the viewport toward the end of the content.
+    ///
+    /// The transcript is anchored to its newest line, so there `scroll` counts
+    /// rows of scrollback and moving forward means scrolling *less* far back.
+    /// Every other screen indexes from the top. Scrolling is clamped so the
+    /// viewport can never run past the content into a blank screen.
+    pub(crate) fn scroll_forward(&mut self) {
+        self.scroll = if self.screen == Screen::Workspace {
+            self.scroll.saturating_sub(1)
+        } else {
+            self.scroll
+                .saturating_add(1)
+                .min(self.scrollable_rows().saturating_sub(1))
+        };
+    }
+
+    /// Moves the viewport toward the start of the content.
+    pub(crate) fn scroll_back(&mut self) {
+        self.scroll = if self.screen == Screen::Workspace {
+            self.scroll
+                .saturating_add(1)
+                .min(self.scrollable_rows().saturating_sub(1))
+        } else {
+            self.scroll.saturating_sub(1)
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppModel, Screen, TranscriptEntry};
+
+    fn model_with(screen: Screen, rows: usize) -> AppModel {
+        let mut model = AppModel {
+            screen,
+            ..AppModel::default()
+        };
+        model.diff = (0..rows).map(|row| format!("line {row}")).collect();
+        for row in 0..rows {
+            model.transcript.push_back(TranscriptEntry {
+                role: "agent".to_owned(),
+                text: format!("line {row}"),
+            });
+        }
+        model
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_end_of_the_content() {
+        let mut model = model_with(Screen::Diff, 3);
+        for _ in 0..100 {
+            model.scroll_forward();
+        }
+        assert_eq!(model.scroll, 2);
+        for _ in 0..100 {
+            model.scroll_back();
+        }
+        assert_eq!(model.scroll, 0);
+    }
+
+    #[test]
+    fn an_empty_screen_never_scrolls_into_blank_space() {
+        let mut model = model_with(Screen::Diff, 0);
+        model.scroll_forward();
+        assert_eq!(model.scroll, 0);
+
+        let mut help = model_with(Screen::Help, 5);
+        help.scroll_forward();
+        assert_eq!(help.scroll, 0);
+    }
+
+    #[test]
+    fn the_transcript_scrolls_back_into_history_and_forward_to_the_newest_line() {
+        let mut model = model_with(Screen::Workspace, 4);
+        model.scroll_back();
+        model.scroll_back();
+        assert_eq!(model.scroll, 2, "scrolling back moves into older output");
+        model.scroll_forward();
+        assert_eq!(
+            model.scroll, 1,
+            "scrolling forward returns toward the newest"
+        );
+        for _ in 0..10 {
+            model.scroll_back();
+        }
+        assert_eq!(model.scroll, 3, "scrollback stops at the oldest line");
+    }
+
+    #[test]
+    fn an_unknown_run_state_is_never_reported_as_progress() {
+        assert_eq!(
+            super::RunState::parse("nonsense-from-a-newer-gateway"),
+            super::RunState::UNKNOWN
+        );
     }
 }

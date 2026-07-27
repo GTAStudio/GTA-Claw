@@ -1,6 +1,7 @@
 //! Headless-first terminal application for GTA Claw.
 
 use std::ffi::OsString;
+use std::fmt::{self, Formatter};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,12 +20,15 @@ pub mod render;
 /// Panic-safe terminal lifecycle and background input pump.
 pub mod terminal;
 
-use gateway::{GatewayOptions, UiCommand, WorkerEvent, spawn_gateway_worker};
-use model::{AppModel, Prompt, Screen, TranscriptEntry};
+use gateway::{GatewayOptions, UiCommand, WorkerEvent, endpoint_label, spawn_gateway_worker};
+use model::{AppModel, Prompt, Screen};
 use terminal::{CrosstermControl, InputThread, TerminalSession};
 
+/// Endpoint used when `--gateway` and `GTA_CLAW_GATEWAY_URL` are both absent.
+const DEFAULT_GATEWAY_URL: &str = "ws://127.0.0.1:18789";
+
 /// Process options accepted by the TUI executable.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Options {
     /// Gateway WebSocket endpoint.
     pub gateway_url: Url,
@@ -36,15 +40,45 @@ pub struct Options {
     pub plain: bool,
 }
 
+/// Formats without the token. A derived `Debug` would put the shared secret into
+/// any log line, panic message, or bug report that formats the options.
+impl fmt::Debug for Options {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Options")
+            .field("gateway_url", &endpoint_label(&self.gateway_url))
+            .field(
+                "token",
+                &if self.token.is_some() {
+                    "<redacted>"
+                } else {
+                    "<none>"
+                },
+            )
+            .field("no_color", &self.no_color)
+            .field("plain", &self.plain)
+            .finish()
+    }
+}
+
 impl Options {
     /// Parses OS-native arguments without assuming they contain UTF-8.
+    ///
+    /// # Errors
+    ///
+    /// Returns the text to show the user when an argument is unknown, a value is
+    /// missing, or the Gateway URL is not a usable `ws://` or `wss://` endpoint.
+    /// `--help` and `-h` also return here, carrying the help text. The message
+    /// never contains the token, and never contains the raw URL, which can carry
+    /// credentials in its userinfo or query.
     pub fn parse<I>(arguments: I) -> Result<Self, String>
     where
         I: IntoIterator<Item = OsString>,
     {
-        let mut gateway = std::env::var_os("GTA_CLAW_GATEWAY_URL")
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "ws://127.0.0.1:18789".to_owned());
+        let mut gateway = std::env::var_os("GTA_CLAW_GATEWAY_URL").map_or_else(
+            || DEFAULT_GATEWAY_URL.to_owned(),
+            |value| value.to_string_lossy().into_owned(),
+        );
         let token = std::env::var_os("GTA_CLAW_GATEWAY_TOKEN")
             .map(|value| value.to_string_lossy().into_owned());
         let mut no_color = std::env::var_os("NO_COLOR").is_some();
@@ -68,6 +102,12 @@ impl Options {
         }
         let gateway_url =
             Url::parse(&gateway).map_err(|error| format!("invalid Gateway URL: {error}"))?;
+        if !matches!(gateway_url.scheme(), "ws" | "wss") {
+            return Err(format!(
+                "invalid Gateway URL: expected a ws:// or wss:// endpoint, got {}://",
+                gateway_url.scheme()
+            ));
+        }
         Ok(Self {
             gateway_url,
             token,
@@ -78,6 +118,12 @@ impl Options {
 }
 
 /// Runs the TUI or its non-TTY snapshot fallback.
+///
+/// # Errors
+///
+/// Returns the message to show the user when the terminal cannot be entered,
+/// restored, or written to. Gateway failures are not errors here: they are
+/// surfaced in the interface as a notice so the session stays usable.
 pub async fn run(options: Options) -> Result<(), String> {
     let worker_options = GatewayOptions {
         url: options.gateway_url,
@@ -92,6 +138,7 @@ pub async fn run(options: Options) -> Result<(), String> {
 }
 
 async fn run_plain(options: GatewayOptions) -> Result<(), String> {
+    let endpoint = endpoint_label(&options.url);
     let (commands, mut events) = spawn_gateway_worker(options);
     let mut model = AppModel::default();
     let deadline = tokio::time::sleep(Duration::from_secs(5));
@@ -109,7 +156,10 @@ async fn run_plain(options: GatewayOptions) -> Result<(), String> {
                 }
             }
             () = &mut deadline => {
-                model.notice = Some("Gateway snapshot timed out".to_owned());
+                model.notice = Some(format!(
+                    "Gateway snapshot timed out after 5s (tried {endpoint}; \
+                     check the gateway is running and reachable)"
+                ));
                 break;
             }
         }
@@ -120,6 +170,7 @@ async fn run_plain(options: GatewayOptions) -> Result<(), String> {
 }
 
 async fn run_interactive(options: GatewayOptions, no_color: bool) -> io::Result<()> {
+    terminal::install_panic_hook();
     let control = Arc::new(CrosstermControl::default());
     let _terminal = TerminalSession::enter(control)?;
     let (_input_thread, mut inputs) = InputThread::spawn(64);
@@ -127,6 +178,7 @@ async fn run_interactive(options: GatewayOptions, no_color: bool) -> io::Result<
     let mut model = AppModel::default();
     let mut stdout = io::stdout();
     let mut redraw = true;
+    let mut painted: Option<render::Grid> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut signal = Box::pin(shutdown_signal());
 
@@ -134,7 +186,8 @@ async fn run_interactive(options: GatewayOptions, no_color: bool) -> io::Result<
         if redraw {
             let (width, height) = crossterm_terminal::size().unwrap_or((100, 30));
             let grid = render::render(&model, width, height, no_color);
-            render::flush(&mut stdout, &grid, no_color)?;
+            render::flush_changes(&mut stdout, painted.as_ref(), &grid, no_color)?;
+            painted = Some(grid);
             redraw = false;
         }
         tokio::select! {
@@ -142,6 +195,9 @@ async fn run_interactive(options: GatewayOptions, no_color: bool) -> io::Result<
                 let Some(input) = input else {
                     break;
                 };
+                if matches!(input, Event::Resize(_, _)) {
+                    painted = None;
+                }
                 if handle_input(&mut model, input, &commands).await {
                     break;
                 }
@@ -216,14 +272,14 @@ async fn handle_input(
             if model.screen == Screen::Sessions {
                 model.select_previous();
             } else {
-                model.scroll = model.scroll.saturating_sub(1);
+                model.scroll_back();
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if model.screen == Screen::Sessions {
                 model.select_next();
             } else {
-                model.scroll = model.scroll.saturating_add(1);
+                model.scroll_forward();
             }
         }
         KeyCode::Enter if model.screen == Screen::Sessions => {
@@ -339,10 +395,7 @@ fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
         }
         WorkerEvent::Message(message) => {
             const MAX_TRANSCRIPT: usize = 2_000;
-            model.transcript.push_back(TranscriptEntry {
-                role: message.role,
-                text: message.text,
-            });
+            model.transcript.push_back(message);
             while model.transcript.len() > MAX_TRANSCRIPT {
                 model.transcript.pop_front();
             }
@@ -406,6 +459,27 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-fn help_text() -> &'static str {
-    "Usage: gta-claw-tui [--gateway ws://HOST:PORT] [--no-color] [--plain]\nSet GTA_CLAW_GATEWAY_TOKEN for authenticated Gateways."
+const fn help_text() -> &'static str {
+    "Usage: gta-claw-tui [--gateway ws://HOST:PORT] [--no-color] [--plain]\n\
+     Set GTA_CLAW_GATEWAY_TOKEN for authenticated Gateways.\n\
+     \n\
+     Options:\n\
+     \x20 --gateway <url>  ws:// or wss:// Gateway endpoint.\n\
+     \x20                  Default: GTA_CLAW_GATEWAY_URL, else ws://127.0.0.1:18789\n\
+     \x20 --no-color       monochrome rendering. Default: on when NO_COLOR is set\n\
+     \x20 --plain          print one snapshot and exit instead of taking over the\n\
+     \x20                  terminal. Default: on when stdin or stdout is not a TTY\n\
+     \x20 --help, -h       print this text and exit 0\n\
+     \n\
+     Environment:\n\
+     \x20 GTA_CLAW_GATEWAY_URL    default endpoint, overridden by --gateway\n\
+     \x20 GTA_CLAW_GATEWAY_TOKEN  shared token. There is no token flag, so the\n\
+     \x20                         secret never appears in argv. It is never echoed\n\
+     \x20                         or printed back\n\
+     \x20 NO_COLOR                any value turns off color\n\
+     \n\
+     Keys: Tab screens  arrows or j/k navigate  Enter open  y/n approve\n\
+     \x20     r refresh  : or Ctrl-P palette  1..6 jump  ? help  q quit\n\
+     \n\
+     Exit codes: 0 success, 2 usage, 1 terminal or runtime failure."
 }

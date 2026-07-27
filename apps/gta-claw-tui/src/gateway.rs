@@ -23,12 +23,43 @@ use url::Url;
 use crate::model::{Prompt, RunState, SessionSummary, ToolActivity, TranscriptEntry};
 
 /// Runtime configuration for the Gateway worker.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GatewayOptions {
     /// Gateway WebSocket endpoint.
     pub url: Url,
     /// Optional shared token.
     pub token: Option<String>,
+}
+
+/// Formats without the token. A derived `Debug` would put the shared secret into
+/// any log line, panic message, or bug report that formats these options.
+impl fmt::Debug for GatewayOptions {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayOptions")
+            .field("url", &endpoint_label(&self.url))
+            .field(
+                "token",
+                &if self.token.is_some() {
+                    "<redacted>"
+                } else {
+                    "<none>"
+                },
+            )
+            .finish()
+    }
+}
+
+/// Renders an endpoint for humans without its userinfo, query, or fragment,
+/// any of which can carry a credential.
+#[must_use]
+pub fn endpoint_label(url: &Url) -> String {
+    let origin = url.origin();
+    if origin.is_tuple() {
+        origin.ascii_serialization()
+    } else {
+        url.scheme().to_owned()
+    }
 }
 
 /// Commands sent from the render loop to background Gateway work.
@@ -92,10 +123,14 @@ pub fn spawn_gateway_worker(
 ) -> (mpsc::Sender<UiCommand>, mpsc::Receiver<WorkerEvent>) {
     let (command_sender, command_receiver) = mpsc::channel(32);
     let (event_sender, event_receiver) = mpsc::channel(256);
+    let endpoint = endpoint_label(&options.url);
     tokio::spawn(async move {
         if let Err(error) = run_worker(options, command_receiver, event_sender.clone()).await {
             let _ = event_sender
-                .send(WorkerEvent::Notice(format!("Gateway: {error}")))
+                .send(WorkerEvent::Notice(format!(
+                    "Gateway: {error} (tried {endpoint}; \
+                     start the gateway or pass --gateway, then press r to retry)"
+                )))
                 .await;
         }
     });
@@ -139,10 +174,12 @@ async fn run_worker(
 
     let (client, mut gateway_events) =
         GatewayClient::start(config).map_err(|error| WorkerError(error.to_string()))?;
-    let ready = client
-        .wait_ready()
-        .await
-        .map_err(|error| WorkerError(error.to_string()))?;
+    let ready = client.wait_ready().await.map_err(|error| {
+        WorkerError(format!(
+            "{error} while {}",
+            connection_label(&client.state())
+        ))
+    })?;
     sender
         .send(WorkerEvent::Connection(format!(
             "Gateway: ready (protocol {}, epoch {})",
@@ -176,7 +213,8 @@ async fn run_worker(
                 let Some(event) = event else {
                     break;
                 };
-                if let Some(mapped) = map_gateway_event(event.into_frame())
+                let frame = event.into_frame();
+                if let Some(mapped) = map_gateway_event(&frame)
                     && sender.send(mapped).await.is_err()
                 {
                     break;
@@ -347,10 +385,10 @@ async fn request_json(
         .await
         .map_err(|error| WorkerError(error.to_string()))?;
     if !response.ok() {
-        let code = response
+        let failure = response
             .error()
             .map_or("unknown", |error| error.code.as_str());
-        return Err(WorkerError(format!("{method} failed ({code})")));
+        return Err(WorkerError(format!("{method} failed ({failure})")));
     }
     let Some(payload) = response.payload().value() else {
         return Ok(Value::Null);
@@ -391,7 +429,7 @@ fn parse_sessions(value: &Value) -> Vec<SessionSummary> {
         .collect()
 }
 
-fn map_gateway_event(frame: claw_protocol::gateway::EventFrame) -> Option<WorkerEvent> {
+fn map_gateway_event(frame: &claw_protocol::gateway::EventFrame) -> Option<WorkerEvent> {
     let event_name = frame.event().as_str().to_owned();
     if event_name == "sessions.changed" {
         return Some(WorkerEvent::Notice(
@@ -510,8 +548,8 @@ impl Display for WorkerError {
 
 impl Error for WorkerError {}
 
-#[allow(dead_code)]
-fn connection_label(state: &ConnectionState) -> &'static str {
+/// Names a connection state for a user-facing notice.
+const fn connection_label(state: &ConnectionState) -> &'static str {
     match state {
         ConnectionState::Starting => "starting",
         ConnectionState::Connecting => "connecting",
