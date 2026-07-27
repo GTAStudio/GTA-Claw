@@ -1,6 +1,9 @@
 //! Exhaustive precedence and nested merge tests.
 
-use claw_config::{ConfigLayerKind, ConfigLayers, LayeredConfigError, MigrationError, to_json5};
+use claw_config::{
+    ConfigLayerKind, ConfigLayers, LayeredConfigError, MigrationDiagnostic, MigrationError,
+    to_json5,
+};
 use serde_json::Value;
 
 #[test]
@@ -190,6 +193,45 @@ fn invalid_lower_layer_shape_is_not_misattributed_to_environment_conversion() {
         }
         other => panic!("expected lower-layer decode error, got {other}"),
     }
+}
+
+#[test]
+fn environment_layer_reports_exact_mappings_and_ignores_non_contributors() {
+    let resolved = ConfigLayers::new()
+        .with_system_json5(system_layer(None))
+        .with_environment([("PORT", "8080"), ("TYPO_PORT", "8081")])
+        .resolve()
+        .expect("environment diagnostics");
+    assert!(
+        resolved
+            .applied_layers
+            .contains(&ConfigLayerKind::Environment)
+    );
+    assert!(matches!(
+        resolved.environment_diagnostics.as_slice(),
+        [
+            MigrationDiagnostic::Applied {
+                legacy_env: "PORT",
+                target: "server.port"
+            },
+            MigrationDiagnostic::IgnoredUnknown { name }
+        ] if name == "TYPO_PORT"
+    ));
+
+    let ignored = ConfigLayers::new()
+        .with_system_json5(system_layer(None))
+        .with_environment([("TYPO_PORT", "8081")])
+        .resolve()
+        .expect("unknown-only environment");
+    assert!(
+        !ignored
+            .applied_layers
+            .contains(&ConfigLayerKind::Environment)
+    );
+    assert!(matches!(
+        ignored.environment_diagnostics.as_slice(),
+        [MigrationDiagnostic::IgnoredUnknown { name }] if name == "TYPO_PORT"
+    ));
 }
 
 fn system_layer(port: Option<u16>) -> String {

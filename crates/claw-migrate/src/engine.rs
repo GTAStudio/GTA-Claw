@@ -115,6 +115,38 @@ impl MigrationPlan {
     pub const fn operation_count(&self) -> usize {
         self.operations.len()
     }
+
+    /// Builds a non-frozen summary for guided dry-run output.
+    #[must_use]
+    pub fn report(&self) -> MigrationReport<'_> {
+        let mut operation_kinds = BTreeMap::new();
+        for operation in &self.operations {
+            *operation_kinds.entry(operation.kind()).or_insert(0) += 1;
+        }
+        MigrationReport {
+            provider_id: self.provider_id,
+            operation_count: self.operations.len(),
+            operation_kinds,
+            result: &self.result,
+        }
+    }
+}
+
+/// Diagnostics-oriented migration plan summary.
+///
+/// This report is additive and intentionally separate from the frozen
+/// [`MigrationResult`] serialization emitted by [`MigrationPlan`].
+#[derive(Debug, Serialize)]
+pub struct MigrationReport<'a> {
+    /// Provider that produced the plan.
+    pub provider_id: &'static str,
+    /// Total planned mutations.
+    pub operation_count: usize,
+    /// Planned mutation counts grouped by stable kind label.
+    pub operation_kinds: BTreeMap<&'static str, usize>,
+    /// Frozen migration result and its diagnostics.
+    #[serde(flatten)]
+    pub result: &'a MigrationResult,
 }
 
 /// Secret bytes whose formatters are always redacted.
@@ -524,10 +556,15 @@ pub enum MigrationError {
     Signing(String),
     /// Apply failed and attempted rollback.
     ApplyFailed {
-        /// Secret-free failure reason.
-        reason: String,
-        /// Rollback failure, if restoration was incomplete.
-        rollback_error: Option<String>,
+        /// Original typed apply failure.
+        cause: Box<Self>,
+        /// Every rollback failure encountered while restoring independent entries.
+        rollback_errors: Vec<String>,
+    },
+    /// Rollback attempted every independent entry but some restorations failed.
+    RollbackFailed {
+        /// Secret-free failures in rollback order.
+        errors: Vec<String>,
     },
     /// Receipt or plan belongs to a different provider.
     ProviderMismatch,
@@ -585,15 +622,25 @@ impl Display for MigrationError {
             Self::SecretStore(error) => write!(formatter, "secret store failed: {error}"),
             Self::Signing(reason) => write!(formatter, "artifact signing failed: {reason}"),
             Self::ApplyFailed {
-                reason,
-                rollback_error,
+                cause,
+                rollback_errors,
             } => {
-                write!(formatter, "migration apply failed: {reason}")?;
-                if let Some(rollback_error) = rollback_error {
-                    write!(formatter, "; rollback failed: {rollback_error}")?;
+                write!(formatter, "migration apply failed: {cause}")?;
+                if !rollback_errors.is_empty() {
+                    write!(
+                        formatter,
+                        "; rollback failed: {}",
+                        rollback_errors.join("; ")
+                    )?;
                 }
                 Ok(())
             }
+            Self::RollbackFailed { errors } => write!(
+                formatter,
+                "rollback completed with {} failure(s): {}",
+                errors.len(),
+                errors.join("; ")
+            ),
             Self::ProviderMismatch => formatter.write_str("migration provider mismatch"),
             Self::PlanNotApplicable => {
                 formatter.write_str("only a validated migrated plan may be applied")
@@ -615,6 +662,7 @@ impl Error for MigrationError {
             Self::Io { source, .. } => Some(source),
             Self::Contract(error) => Some(error),
             Self::SecretStore(error) => Some(error),
+            Self::ApplyFailed { cause, .. } => Some(cause.as_ref()),
             _ => None,
         }
     }
@@ -799,13 +847,12 @@ fn apply_plan(
     let apply_result = apply_operations(context, &plan.operations, &mut receipt)
         .and_then(|()| verify_source_digests(plan));
     if let Err(error) = apply_result {
-        let reason = error.to_string();
-        let rollback_error = rollback_receipt(context, &receipt)
+        let rollback_errors = rollback_receipt(context, &receipt)
             .err()
-            .map(|rollback| rollback.to_string());
+            .map_or_else(Vec::new, rollback_failure_messages);
         return Err(MigrationError::ApplyFailed {
-            reason,
-            rollback_error,
+            cause: Box::new(error),
+            rollback_errors,
         });
     }
     Ok(receipt)
@@ -945,7 +992,7 @@ fn rollback_receipt(
     receipt: &ApplyReceipt,
 ) -> Result<(), MigrationError> {
     verify_rollback_state(receipt)?;
-    let mut first_error = None;
+    let mut errors = Vec::new();
     for undo in receipt.secrets.iter().rev() {
         let result = if let Some(previous) = &undo.previous {
             context
@@ -955,10 +1002,8 @@ fn rollback_receipt(
         } else {
             context.secret_store.remove(&undo.id)
         };
-        if let Err(error) = result
-            && first_error.is_none()
-        {
-            first_error = Some(MigrationError::SecretStore(error));
+        if let Err(error) = result {
+            errors.push(format!("secret {}: {error}", undo.id));
         }
     }
     for backup in receipt.backups.iter().rev() {
@@ -966,17 +1011,26 @@ fn rollback_receipt(
             continue;
         }
         let result = restore_backup(backup);
-        if let Err(error) = result
-            && first_error.is_none()
-        {
-            first_error = Some(error);
+        if let Err(error) = result {
+            errors.push(error.to_string());
         }
 
         if backup.backup.is_none() {
             cleanup_empty_parents(&backup.target, context.target_root);
         }
     }
-    first_error.map_or(Ok(()), Err)
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(MigrationError::RollbackFailed { errors })
+    }
+}
+
+fn rollback_failure_messages(error: MigrationError) -> Vec<String> {
+    match error {
+        MigrationError::RollbackFailed { errors } => errors,
+        other => vec![other.to_string()],
+    }
 }
 
 fn verify_rollback_state(receipt: &ApplyReceipt) -> Result<(), MigrationError> {

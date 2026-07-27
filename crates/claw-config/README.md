@@ -45,11 +45,16 @@ legacy environment, then command-line precedence. Nested objects merge
 recursively while arrays and scalars replace lower layers. File migrations keep
 exact durable backups and expose rollback. `ConfigHub` and `ConfigFileWatcher`
 publish complete immutable snapshots and ordered typed notifications.
+`ResolvedConfig::environment_diagnostics` records each exact legacy mapping that
+contributed and each unknown input that was ignored, while `applied_layers`
+includes the environment layer only when a runtime mapping actually applied.
 
 Legacy conversion supports the runtime rows in
 `compat/legacy/config/env-mapping.json`, except `COPILOT_CLI_PATH`, because the
 production Rust runtime does not execute Copilot CLI. Present deployer, build,
-CI, and Copilot CLI rows produce ordered `ManualRequired` diagnostics:
+CI, and Copilot CLI rows produce ordered `ManualRequired` diagnostics. Runtime
+rows produce `Applied` diagnostics and unknown supplied names produce
+`IgnoredUnknown`, allowing a caller to render a complete deterministic report:
 
 - `COPILOT_CLI_PATH`
 - `DOCKER_IMAGE`

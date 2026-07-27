@@ -1,8 +1,10 @@
 //! Transactional, npm-free migration providers for supported agent clients.
 //!
 //! Plans are side-effect free and serialize as the frozen legacy migration
-//! result contract. Apply creates and verifies backups before writing, while
-//! rollback restores files and secret-store entries.
+//! result contract. [`MigrationPlan::report`] adds a diagnostics-oriented
+//! operation summary without changing that frozen shape. Apply creates and
+//! verifies backups before writing, while rollback restores files and
+//! secret-store entries and reports every independent restoration failure.
 
 mod contract;
 mod engine;
@@ -17,8 +19,8 @@ pub use contract::{
 };
 pub use engine::{
     ApplyContext, ApplyReceipt, ArtifactSigner, Detection, DetectionConfidence,
-    Ed25519ArtifactSigner, MigrationError, MigrationPlan, MigrationProvider, PlanContext,
-    SecretStore, SecretStoreError, SecretValue,
+    Ed25519ArtifactSigner, MigrationError, MigrationPlan, MigrationProvider, MigrationReport,
+    PlanContext, SecretStore, SecretStoreError, SecretValue,
 };
 pub use platform::{HostPlatform, PlatformPaths, SystemPlatformPaths};
 pub use providers::{ClaudeMigrationProvider, CodexMigrationProvider, HermesMigrationProvider};

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 
 use crate::io::atomic_write_bytes;
-use crate::{CONFIG_SCHEMA_VERSION, ConfigError, load_file, parse_json5, write_file};
+use crate::{CONFIG_SCHEMA_VERSION, ConfigError, parse_json5, write_file};
 
 static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -61,6 +61,8 @@ pub enum ConfigMigrationError {
         migration: ConfigError,
         /// Backup restoration failure.
         restore: io::Error,
+        /// Exact original bytes retained for manual recovery.
+        backup_path: PathBuf,
     },
 }
 
@@ -80,9 +82,15 @@ impl Display for ConfigMigrationError {
                     path.display()
                 )
             }
-            Self::Restore { migration, restore } => write!(
+            Self::Restore {
+                migration,
+                restore,
+                backup_path,
+            } => write!(
                 formatter,
-                "migration failed: {migration}; restoring the exact backup also failed: {restore}"
+                "migration failed: {migration}; restoring the exact backup also failed: \
+                 {restore}; backup remains at {}",
+                backup_path.display()
             ),
         }
     }
@@ -151,7 +159,7 @@ pub fn migrate_config_file(
         .and_then(|version| u32::try_from(version).ok())
         .ok_or(ConfigMigrationError::MissingVersion)?;
     if version == CONFIG_SCHEMA_VERSION {
-        load_file(path)?;
+        parse_json5(text, &path.display().to_string())?;
         return Ok(ConfigMigrationOutcome::Current);
     }
     if version != 0 || CONFIG_SCHEMA_VERSION != 1 {
@@ -175,7 +183,11 @@ pub fn migrate_config_file(
     let backup_path = create_backup(path, &source)?;
     if let Err(migration) = write_file(path, &candidate) {
         if let Err(restore) = atomic_write_bytes(path, &source, || Ok(())) {
-            return Err(ConfigMigrationError::Restore { migration, restore });
+            return Err(ConfigMigrationError::Restore {
+                migration,
+                restore,
+                backup_path,
+            });
         }
         return Err(ConfigMigrationError::Config(migration));
     }

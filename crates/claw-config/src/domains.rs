@@ -1018,10 +1018,13 @@ impl OpenClawConfigLayers {
             merge_layer(&mut merged, source, ConfigLayerKind::CommandLine)?;
             applied_layers.push(ConfigLayerKind::CommandLine);
         }
-        let source = serde_json::to_string(&merged)
-            .map_err(ConfigError::from_serialize)
+        validate_source_shape(&merged, "<layered-openclaw-config>")
             .map_err(LayeredConfigError::Result)?;
-        let config = parse_openclaw_json5(&source, "<layered-openclaw-config>")
+        let config = decode_openclaw_value(&merged, "<layered-openclaw-config>")
+            .and_then(|config| {
+                config.validate()?;
+                Ok(config)
+            })
             .map_err(LayeredConfigError::Result)?;
         Ok(ResolvedOpenClawConfig {
             config,
@@ -1402,6 +1405,16 @@ pub fn parse_openclaw_json5(
     )?;
     config.validate()?;
     Ok(config)
+}
+
+fn decode_openclaw_value(raw: &Value, source_name: &str) -> Result<OpenClawConfig, ConfigError> {
+    let bytes = serde_json::to_vec(raw).map_err(ConfigError::from_serialize)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    serde_path_to_error::deserialize(&mut deserializer).map_err(|error| ConfigError::Decode {
+        source_name: source_name.to_owned(),
+        path: nonempty_path(error.path().to_string()),
+        message: error.inner().to_string(),
+    })
 }
 
 fn validate_source_shape(raw: &Value, source_name: &str) -> Result<(), ConfigError> {

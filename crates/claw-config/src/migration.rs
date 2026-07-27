@@ -36,10 +36,44 @@ pub struct ManualMapping {
 }
 
 /// A non-fatal migration diagnostic.
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MigrationDiagnostic {
     /// A present value belongs to deploy, build, CI, or an intentionally absent runtime.
     ManualRequired(ManualMapping),
+    /// A recognized runtime variable was applied to the typed configuration.
+    Applied {
+        /// Exact canonical or alias name selected from the supplied environment.
+        legacy_env: &'static str,
+        /// Frozen destination key updated by the mapping.
+        target: &'static str,
+    },
+    /// A supplied name is outside the frozen mapping and was ignored.
+    IgnoredUnknown {
+        /// Exact caller-supplied name.
+        name: String,
+    },
+}
+
+impl Display for MigrationDiagnostic {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ManualRequired(mapping) => write!(
+                formatter,
+                "{} -> {}: manual action required ({})",
+                mapping.legacy_env, mapping.target, mapping.reason
+            ),
+            Self::Applied { legacy_env, target } => {
+                write!(formatter, "{legacy_env} -> {target}: applied")
+            }
+            Self::IgnoredUnknown { name } => {
+                write!(
+                    formatter,
+                    "{name}: ignored because it is not in the frozen mapping"
+                )
+            }
+        }
+    }
 }
 
 /// Result of converting supplied audited environment entries.
@@ -310,11 +344,16 @@ fn apply_mappings(
             | MappingId::DockerhubToken
             | MappingId::DockerhubImage => unreachable!("handled as manual mapping"),
         }
+        diagnostics.push(MigrationDiagnostic::Applied {
+            legacy_env: name,
+            target: mapping.target,
+        });
     }
 
     if !explicit_device_flow && (infer_device_from_existing_client || explicit_device_client_id) {
         wire.core.auth.github.device.enabled = wire.core.auth.github.device.client_id.is_some();
     }
+    append_unknown_diagnostics(variables, &mut diagnostics);
 
     Ok((wire, diagnostics))
 }
@@ -322,9 +361,28 @@ fn apply_mappings(
 pub(crate) fn apply_legacy_environment_layer<'a>(
     base: EnvelopeWire,
     variables: impl IntoIterator<Item = (&'a str, &'a str)>,
-) -> Result<EnvelopeWire, MigrationError> {
+) -> Result<(EnvelopeWire, Vec<MigrationDiagnostic>), MigrationError> {
     let variables = collect_variables(variables)?;
-    apply_mappings(&variables, base, false).map(|(wire, _)| wire)
+    apply_mappings(&variables, base, false)
+}
+
+fn append_unknown_diagnostics(
+    variables: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<MigrationDiagnostic>,
+) {
+    let known_names: BTreeSet<_> = LEGACY_MAPPINGS
+        .iter()
+        .flat_map(|mapping| {
+            std::iter::once(mapping.legacy_env).chain(mapping.aliases.iter().copied())
+        })
+        .collect();
+    diagnostics.extend(
+        variables
+            .keys()
+            .filter(|name| !known_names.contains(name.as_str()))
+            .cloned()
+            .map(|name| MigrationDiagnostic::IgnoredUnknown { name }),
+    );
 }
 
 fn collect_variables<'a>(

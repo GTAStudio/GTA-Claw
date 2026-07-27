@@ -27,6 +27,28 @@ pub enum SetupField {
     TeamsPasswordEnvironment,
 }
 
+/// Machine-readable validation guidance for one setup answer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupConstraint {
+    /// The answer must exactly match this frozen value.
+    Exact(&'static str),
+    /// The answer must be an absolute HTTP(S) URL.
+    AbsoluteHttpUrl,
+    /// The answer is an optional filesystem path.
+    OptionalPath,
+    /// The answer is a boolean choice.
+    Boolean,
+    /// The answer is required when another boolean field is enabled.
+    RequiredWhen(SetupField),
+    /// The answer must match a frozen value when another field is enabled.
+    ExactWhen {
+        /// Required value.
+        value: &'static str,
+        /// Enabling field.
+        field: SetupField,
+    },
+}
+
 /// One deterministic guided setup prompt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SetupQuestion {
@@ -38,6 +60,8 @@ pub struct SetupQuestion {
     pub required: bool,
     /// Whether the answer itself contains secret bytes.
     pub secret: bool,
+    /// Constraint a UI can enforce before submitting the complete answer set.
+    pub constraint: SetupConstraint,
 }
 
 /// Typed answers accepted by first-run setup.
@@ -94,36 +118,45 @@ impl GuidedSetup {
                 prompt: "GitHub token environment variable",
                 required: true,
                 secret: false,
+                constraint: SetupConstraint::Exact("GITHUB_TOKEN"),
             },
             SetupQuestion {
                 field: SetupField::RoleSourceUrl,
                 prompt: "Role source URL",
                 required: true,
                 secret: false,
+                constraint: SetupConstraint::AbsoluteHttpUrl,
             },
             SetupQuestion {
                 field: SetupField::Workspace,
                 prompt: "Initial workspace",
                 required: false,
                 secret: false,
+                constraint: SetupConstraint::OptionalPath,
             },
             SetupQuestion {
                 field: SetupField::EnableTeams,
                 prompt: "Enable Microsoft Teams",
                 required: true,
                 secret: false,
+                constraint: SetupConstraint::Boolean,
             },
             SetupQuestion {
                 field: SetupField::TeamsAppId,
                 prompt: "Microsoft Teams application ID",
                 required: false,
                 secret: false,
+                constraint: SetupConstraint::RequiredWhen(SetupField::EnableTeams),
             },
             SetupQuestion {
                 field: SetupField::TeamsPasswordEnvironment,
                 prompt: "Microsoft Teams password environment variable",
                 required: false,
                 secret: false,
+                constraint: SetupConstraint::ExactWhen {
+                    value: "MicrosoftAppPassword",
+                    field: SetupField::EnableTeams,
+                },
             },
         ]
     }
@@ -216,10 +249,10 @@ impl GuidedSetup {
             ("AGENT_ROLE_URL", answers.role_source_url.as_str()),
             ("ENABLE_TEAMS", teams),
         ];
-        if let Some(app_id) = &answers.teams_app_id {
-            environment.push(("MicrosoftAppId", app_id.as_str()));
-        }
-        if answers.teams_password_environment.is_some() {
+        if answers.enable_teams {
+            if let Some(app_id) = answers.teams_app_id.as_deref() {
+                environment.push(("MicrosoftAppId", app_id));
+            }
             environment.push((
                 "MicrosoftAppPassword",
                 "__present_in_platform_environment__",
