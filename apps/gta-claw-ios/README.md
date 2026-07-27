@@ -6,7 +6,8 @@ UI-independent iOS client core for GTA Claw.
 
 The part of an iOS client that sits underneath a user interface: endpoint
 intake, credential intake, Gateway v4 client identity, transport configuration
-assembly, and a connection-lifecycle model that renders to a snapshot a view
+assembly, bounded mobile connection policy, host lifecycle and network-path
+coordination, and a connection model that renders a revisioned snapshot a view
 layer can bind to.
 
 ## What this is not
@@ -41,25 +42,65 @@ Case 5 is this crate. Landing a Slint UI needs three changes inside
    for exactly this reason and says so in its manifest);
 3. a workflow-allowlist entry for iOS packaging.
 
+## Host-shell integration contract
+
+The future application target owns UIKit/SwiftUI lifecycle callbacks,
+`NWPathMonitor`, Keychain, DNS-SD, and async task cancellation. This crate owns
+the rules those facilities must follow:
+
+1. Create an `IosSessionModel`; it starts fail-closed as `AppRunState::Inactive`
+   with `IosNetworkPath::Unknown`.
+2. Feed semantic lifecycle and path changes through `set_run_state` and
+   `set_network_path`. Keep an `IosNetworkRoute::id` stable for cost-only
+   updates and advance it for a real route change, including Wi-Fi-to-Wi-Fi.
+3. Process `TransportDirective::Stop` by stopping the named task and dropping
+   its `ConnectionAttempt`; call `reconcile` afterward. Process
+   `TransportDirective::Resume` by reserving a new `ConnectionAttempt`.
+4. Deliver transport state through `ConnectionAttempt::observe`, never through
+   an unscoped callback. Once backgrounding, a network transition, or a user
+   disconnect invalidates that generation, late observations return
+   `ObservationResult::Stale` and cannot restore authorization.
+5. Bind UI state to the shared `Arc<IosViewSnapshot>` from `snapshot`.
+   `snapshot_if_changed` compares revisions, and duplicate lifecycle, path, and
+   transport observations reuse the existing allocation.
+
+`IosGatewayProfile` applies `IosConnectionPolicy::MOBILE_DEFAULT`: 8-second
+connect and authentication timeouts, a 20-second request timeout, a 2-second
+shutdown timeout, and four foreground retries whose cumulative sleep is capped
+at 8.5 seconds including maximum jitter. Backgrounding or losing the network
+stops that budget immediately.
+
+Platform facilities remain host-provided:
+
+- `HostCredentialStore` is the future Keychain boundary. Account keys redact
+  their `Debug`, secret values remain in `SecretString`, loaded values pass
+  normal credential validation again, and one-time bootstrap tokens cannot be
+  persisted through the helper API.
+- `HostDiscoveryProvider<B>` starts only an owned `DiscoveryRequest<B>` carrying
+  a backend-specific `DiscoveryPermit`, an active local route generation, a
+  timeout of at most 15 seconds, and a result cap of at most 64. The host must
+  cancel the returned `HostDiscoverySession` on backgrounding or route change.
+- These are ports, not Apple-framework implementations. No Keychain, DNS-SD,
+  Network.framework, UIKit, or Slint code is added here.
+
 ## What has actually been executed
 
-**Locally: Windows x86_64 (`x86_64-pc-windows-msvc`), rustc 1.97.0. Nothing else.**
-
-Repository CI additionally *executes* this crate's tests — not merely compiles
-them — on macOS arm64 (`macos-latest`), Linux and Windows, because the crate is
-a root workspace member and the headless matrix runs `--workspace`. All 84 pass
-on all three. That is the only non-Windows evidence about this code that exists,
-and it says nothing about an Apple *target* build: those runners build for the
-host, not for `aarch64-apple-ios`.
+**Locally: macOS arm64 (`aarch64-apple-darwin`), rustc 1.97.1.**
 
 | Check | Result |
 | --- | --- |
-| `cargo test -p gta-claw-ios --all-targets` | 84 passed, 0 failed |
+| `cargo test -p gta-claw-ios --all-targets` | 111 passed, 0 failed |
 | `cargo clippy -p gta-claw-ios --all-targets -- -D warnings` | clean |
 | `cargo fmt -p gta-claw-ios -- --check` | clean |
 | `RUSTDOCFLAGS=-D warnings cargo doc -p gta-claw-ios --no-deps` | clean |
-| `cargo deny check bans` | `bans ok` |
-| `cargo check -p gta-claw-ios --target aarch64-apple-ios` | **fails** |
+| `cargo check -p gta-claw-ios --target aarch64-apple-ios` | blocked in `ring`: iPhoneOS SDK unavailable |
+| `cargo check -p gta-claw-ios --target aarch64-apple-ios-sim` | blocked in `ring`: iPhoneSimulator SDK unavailable |
+
+The host has Apple Command Line Tools but not full Xcode. Both Rust targets are
+installed, but `xcrun --sdk iphoneos` and `xcrun --sdk iphonesimulator` cannot
+locate an SDK. The two target checks therefore stop in `ring 0.17.14` before
+this crate is type-checked for iOS. Host execution is evidence for the pure Rust
+state and policy logic, not an iOS build, simulator run, or device run.
 
 ### Most of these tests compare this crate against itself
 
@@ -74,8 +115,7 @@ the repository, not reconstructed in Rust, and byte-frozen so nothing in this
 crate contributes to it. It asserts that the scope registry this build can name
 is exactly the frozen six, and that each `IosAction`'s required scope equals the
 scope upstream records for a method that performs it (`sessions.list`,
-`talk.client.create`, `exec.approval.resolve`, `device.pair.approve`,
-`config.set`).
+`talk.client.create`, `exec.approval.resolve`, `config.set`).
 
 The file opens with a control test, because every other assertion there is a
 lookup and a lookup against an empty or mis-parsed document passes vacuously.
@@ -144,10 +184,10 @@ Consequences, each asserted:
 - `operator.talk.secrets` is granted but modelled by no action here, because no
   Talk surface is built yet. That gap is asserted so it cannot change unnoticed.
 
-Mutation-checked, on Windows x86_64 with rustc 1.97.0: stubbing `grants()` to
-return `true` unconditionally fails the discrimination control with the observed
-set spelled out — `must refuse SendMessage (needs OperatorWrite) … from the
-observed set ["operator.read"]` — rather than `ScopeSet(47)`.
+Mutation-checking `grants()` by stubbing it to return `true` unconditionally
+fails the discrimination control with the observed set spelled out — `must
+refuse SendMessage (needs OperatorWrite) … from the observed set
+["operator.read"]` — rather than `ScopeSet(47)`.
 
 ### The Gateway is more permissive than this client, deliberately
 
@@ -169,35 +209,21 @@ server never stated, which is the fabricated permission summary
 This does **not** prove upstream's Swift client requests these scopes. That
 source is not vendored here and cannot be read from this repository.
 
-The iOS target check fails in `ring 0.17.14`, a mandatory transitive dependency
-of `claw-gateway-client`, before it reaches any code in this crate:
+Both iOS target checks fail in `ring 0.17.14`, a mandatory transitive dependency
+of `claw-gateway-client`, before they reach any code in this crate:
 
 ```
-error occurred in cc-rs: failed to find tool "xcrun": program not found
+xcrun: error: SDK "iphoneos" cannot be located
 ```
 
-`ring` compiles C and assembly and needs `xcrun` and the iOS SDK, so no
-`aarch64-apple-ios` or `aarch64-apple-ios-sim` build of this crate is possible
-from a Windows host. The pure-Rust part of the dependency graph *does* check
-cleanly for `aarch64-apple-ios` from Windows:
-
-```
-cargo check --target aarch64-apple-ios \
-  -p claw-application -p claw-domain -p claw-platform -p claw-protocol -p claw-security
-Finished `dev` profile
-```
-
-That narrows the remaining unknown to the `ring`/`rustls`/`tokio` layer, but it
-is **not** a proof that this crate compiles for iOS, and it must not be reported
-as one. It is a `rustc`-only check performed with no Apple toolchain present at
-all: no `xcrun`, no iOS SDK, no target `clang`, no linker. Any crate in the
-graph that compiles C, assembly or Objective-C is untested by it, and linking is
-untested entirely. Someone on a macOS runner with Xcode must run the iOS target
-check before any iOS build claim is made.
+`ring` compiles C and assembly and needs the target SDK, compiler, and linker.
+Someone on a macOS runner with full Xcode must rerun both checks before any iOS
+build claim is made.
 
 ## Known limitations
 
-* Never run on an Apple platform, a simulator, or a device.
+* Never built or run for an iOS target, simulator, or device. The Rust core has
+  run only as a macOS arm64 host binary in this revision.
 * Never completed a Gateway handshake against a real server. The integration
   tests prove the transport client *accepts* the configuration this crate
   builds and shuts down deterministically; they connect to `ws://127.0.0.1:1`,
@@ -208,14 +234,21 @@ check before any iOS build claim is made.
   them passes them in through `DeclaredDeviceProbe`; the type name records that
   this crate did not measure them.
 * `IosClientIdentity` reports `std::env::consts::OS` as the client platform, so
-  a build on a workstation truthfully says `windows` while still presenting
+  a build on a workstation truthfully says `macos` while still presenting
   `ClientId::Ios`. Use `IosClientIdentity::targets_ios()` to tell the two apart.
 * `ConnectionState::Ready` carries a `ConnectionEpoch` that only
   `claw-gateway-client` may allocate, so the conversion from a live `Ready`
   state into an authenticated snapshot has no test that starts from a real
   `Ready` value. Everything downstream of that conversion is tested.
-* No push notifications, no background refresh, no Keychain persistence, no
-  device-token storage. `claw-security` provides no persistence either.
+* `AuthenticationFailure` likewise has no public or test constructor, so this
+  crate cannot instantiate `ConnectionState::AuthenticationFailed`; the
+  lifecycle renderer's match is exhaustive, but that one formatted detail path
+  cannot be exercised here without changing the owning crate.
+* No push notifications or background refresh. Background state deliberately
+  invalidates connection authorization and asks the host to stop the transport.
+* No Keychain or DNS-SD implementation. `HostCredentialStore` and
+  `HostDiscoveryProvider` define validated host boundaries, but a future shell
+  still has to implement them with Apple frameworks.
 
 ## Platform surfaces recorded as gaps rather than substituted
 
@@ -241,13 +274,25 @@ service type when it will not.
 
 Declaring `NSBonjourServices` with some *other* service is the case most likely
 to be mistaken for an empty network, because the key is present and looks
-correct, so `ServiceTypeNotDeclared` names the type that was requested.
+correct, so `ServiceTypeNotDeclared` names the type that was requested. An input
+above the bounded 16-entry inventory is also rejected explicitly instead of
+silently truncating away the required type.
 
-**This crate does not own the service type.** Both gates take it as an argument.
-The Gateway's DNS-SD service type belongs to the discovery contract and its
-owning crate; declaring a copy here would let the two drift apart with nothing
-able to notice. Note also that the plist entry and the browsed name are
-different strings — `NSBonjourServices` carries the application-label form
+`discovery_precondition` remains a fail-fast gate. A diagnostics view should call
+`discovery_diagnostics::<B>()`, which reports every independent plist and
+signing problem in one pass. Each `DiscoveryDiagnostic` carries a concise title,
+an explanation, and a typed `DiscoveryRemediation`: add or verify the exact
+plist key, declare the exact service type, inspect the signed entitlement, or
+open Apple's restricted-entitlement request URL. It does not invent a private
+iOS Settings URL.
+
+**The discovery backend owns the service type.** The gate reads it from
+`LocalDiscoveryBackend::DNS_SD_SERVICE_TYPE`, so a caller cannot pair a backend
+with a different plist check. `GatewayMdnsBackend` records the
+`_openclaw-gw._tcp.local.` value used throughout `claw-discovery`'s executable
+DNS-SD fixtures; that crate exports no canonical constant and deliberately
+contains no network runtime. Note also that the plist entry and the browsed name
+are different strings — `NSBonjourServices` carries the application-label form
 (`_example._tcp`), while the fully qualified `_example._tcp.local.` belongs
 inside the discovery implementation. Tests assert that the fully qualified form
 and the subtype form are both **rejected** by `BonjourServiceType`, so neither
@@ -264,8 +309,10 @@ characters of `[A-Za-z0-9-]`, no dots, colons, slashes, at-signs or whitespace)
 specifically so that it cannot hold credential-shaped text. Narrowing the domain
 was preferred to redacting a `Debug`.
 
-Discovery itself is not implemented in this crate and is not this crate's to
-implement; only the precondition is.
+Discovery itself is not implemented in this crate. `HostDiscoveryProvider`
+defines the callback/session port a future system DNS-SD adapter implements, and
+`DiscoveryRequest` adds foreground, local-route, timeout, and result-count gates
+before that adapter can start.
 
 #### The plist keys are not the whole gate: multicast is an Apple-granted entitlement
 
@@ -294,32 +341,30 @@ that backend's own descriptor:
 | `SystemDnsSd` — system DNS-SD, declared service types only | both plist keys, and the backend's service type among the declared entries |
 | `InProcessMulticast` — any pure-Rust mDNS stack, `mdns-sd` included | the above, **and** a confirmed multicast entitlement |
 
-The returned `DiscoveryPermit<'_, B>` is parameterised by the backend it was
+The returned owned `DiscoveryPermit<B>` is parameterised by the backend it was
 issued for, so a permit obtained for a system-DNS-SD adapter **cannot be spent**
 starting a raw-socket browser. A mode field would have left that to a reviewer
 to notice; a type parameter makes it unsayable. The permit's field is private
-and it has no public constructor, so the gate is its only source.
+and it has no public constructor, so the gate is its only source. It owns the
+matched service type so a host scan may outlive the declaration object that
+produced it.
 
-`LocalDiscoveryBackend` mirrors the backend contract agreed with the `claw-nodes`
-owner and is documented as a mirror: that crate exports `GATEWAY_SERVICE_TYPE`
-and a `MdnsBrowser` but no descriptor trait, so a re-export would be a cross-PR
-dependency. `GatewayMdnsBackend` carries
-`"_openclaw-gw._tcp.local."` and `InProcessMulticast`, and the `NSBonjourServices`
-form is **derived** from the browsed form rather than written down a second time
-— with a test asserting the derivation round-trips, because two hand-written
-copies of one name can disagree silently.
+`LocalDiscoveryBackend` is the host-boundary descriptor missing from
+`claw-discovery`, whose crate-level contract explicitly says it has no network
+runtime. `GatewayMdnsBackend` carries `"_openclaw-gw._tcp.local."` and
+`InProcessMulticast`, and the `NSBonjourServices` form is **derived** from the
+browsed form rather than written down a second time — with a test asserting the
+derivation round-trips, because two hand-written copies of one name can disagree
+silently.
 
-**`GatewayMdnsBackend` is a descriptor, not a shipped capability.** In
-`claw-nodes`, `mdns-sd`, the Hickory system resolver and `MdnsBrowser` itself sit
-behind a `cfg` limited to Windows, macOS and Linux, so the raw-multicast browser
-is *compiled out* on iOS rather than merely unentitled. Satisfying this gate
-therefore authorises nothing that exists in an iOS build today; it records what a
-future audited adapter would have to hold. `ClientTransport::BonjourDiscovery`
-remains `NeedsHostAppFacilities`, is not `usable_today()`, and is not
+**`GatewayMdnsBackend` is a descriptor, not a shipped capability.**
+`claw-discovery` supplies pure packet and resolution logic only; no socket-owning
+browser exists for this descriptor to construct. Satisfying the gate therefore
+authorises nothing that exists in an iOS build today; it records what a future
+audited adapter would have to hold. `ClientTransport::BonjourDiscovery` remains
+`NeedsHostAppFacilities`, is not `usable_today()`, and is not
 `confirmed_on_ios()` — and a test asserts that a fully satisfied permit does not
-change any of those. Note that `GATEWAY_SERVICE_TYPE` is *not* `cfg`-gated, so
-when that PR merges the constant can be imported on iOS even though the backend
-cannot.
+change any of those.
 
 Entitlement state is tracked by its own `EntitlementStatus` (`Granted` /
 `NotGranted` / `Unknown`, fail-closed on `Unknown`) rather than by
@@ -341,9 +386,10 @@ are C, reaching them needs FFI, and the workspace sets `unsafe_code = "forbid"`.
 Recording `SystemDnsSd` is a statement about what iOS permits, not a claim that
 this crate can use it.
 
-`DiscoveryUnavailable::awaits_apple_approval` separates the conditions a
-developer can fix from the one that waits on Apple, because a user should not be
-told to check a setting that does not exist on their machine.
+`DiscoveryUnavailable::awaits_apple_approval` is true only when the shipped build
+is confirmed not to have an Apple-restricted entitlement. `Unknown` instead
+produces a "verify the signed app" remediation; it does not claim an Apple
+request is pending before the signature has been inspected.
 
 #### Two conditions deliberately left ungated
 
@@ -359,15 +405,19 @@ truthful answer is "we were not allowed to look".
 | --- | --- | --- |
 | granted | either | `NoResponders` — the only case that may be reported as an empty network |
 | undetermined | foreground | `AwaitingConsentPrompt` — the browse itself raises the alert |
+| undetermined | inactive | `DeferredWhileInactive` — finish the prompt/interruption, then retry |
 | undetermined | background | `SilentlyDeniedInBackground` |
 | denied | either | `DeniedByUser` |
 
 The background case is called out separately because TN3179 records that iOS
 then denies the operation **without showing an alert and without recording a
 decision** — so the user has not refused anything, and a foreground retry is the
-correct next step. Only `NoResponders` returns `means_nothing_was_there()`, and
-the default privilege state is `Undetermined`, so the fail-closed reading is the
-one you get by not thinking about it.
+correct next step. Each diagnosis also yields a typed user remediation: answer
+the prompt, return to the foreground, use the host's supported app-settings API,
+or check the Gateway and local network. Only `NoResponders` returns
+`means_nothing_was_there()`, and the default privilege and lifecycle states are
+`Undetermined` and `Inactive`, so the fail-closed reading is the one obtained by
+omitting host observations.
 
 *The simulator.* TN3179 states that the simulator does not support local network
 privacy and that this behaviour must be tested on a real device.
@@ -396,28 +446,29 @@ proven, because confirming it requires a device.
 gap can be planned around; an invented analogue cannot afterwards be told apart
 from the real thing.
 
-### SSH — no Keychain integration, and that is a known regression
+### SSH — no Keychain implementation, and no plaintext fallback
 
 `integration.discovery.ssh` in the same ledger. An SSH tunnel needs
 caller-provisioned sandbox paths for the private key and `known_hosts`.
 
-**Keychain and Secure Enclave integration is explicitly out of scope for this
-crate**, for a stated reason rather than by omission: the Keychain API is
-Objective-C/C and reaching it needs FFI, which `unsafe_code = "forbid"` rules
-out for a root workspace member. Without it, key material would sit in ordinary
-application-container files on a platform that provides a hardware-backed store.
-That is a regression against the platform's own norm, and it is why the SSH
-transport is recorded as unusable rather than shipped in a weakened form.
+The Keychain API needs Apple-framework interop that this `unsafe_code = "forbid"`
+crate cannot supply. `HostCredentialStore` now defines the protected-storage
+port for a future host app, but no implementation is shipped. The helper API
+revalidates loaded material, keeps secrets in `SecretString`, redacts account
+keys, and refuses to persist bootstrap tokens.
 
-The same reasoning applies to `IosCredential`, which holds a secret in memory
-for the lifetime of a process and persists nothing.
+Without a host implementation, SSH key material would still sit in ordinary
+application-container files on a platform that provides protected storage. The
+SSH transport therefore remains unusable rather than falling back to that
+weaker design. `IosCredential` itself holds a secret only in memory unless the
+host explicitly persists an eligible kind through the port.
 
-## Cross-crate observation, not fixed here
+## Client contract anchors
 
-The brief said `crates/claw-clients` records `ClientId::Ios` as
-`ContractOnlyThirdPartyClient`. No such crate or symbol exists in this
-repository. `ClientId::Ios` is defined in
-`crates/claw-protocol/src/gateway/frame.rs` with wire identity
-`openclaw-ios`, and `compat/upstream/inventories/clients.json` already
-classifies `client:ios` as `official_client_interop`. Nothing needed changing,
-and nothing outside this crate was changed.
+`crates/claw-clients` records `SurfaceId::Ios` as a native
+`ContractOnlyThirdPartyClient` with both UI/operator and node profiles.
+`tests/upstream_ios_grant_set.rs` reads that public contract directly.
+`ClientId::Ios` is defined in `crates/claw-protocol` with wire identity
+`openclaw-ios`, while `compat/upstream/inventories/clients.json` classifies
+`client:ios` as `official_client_interop`. This crate changes none of those
+owners; it consumes and tests their contract.

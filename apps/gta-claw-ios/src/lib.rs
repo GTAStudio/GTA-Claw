@@ -38,13 +38,19 @@
 //!   observation port rather than from guesses.
 //! * [`IosGatewayProfile`] — assembles a
 //!   [`GatewayClientConfig`](claw_gateway_client::GatewayClientConfig) that
-//!   `claw-gateway-client` accepts.
-//! * [`IosSessionModel`] — the connection lifecycle rendered as an
+//!   `claw-gateway-client` accepts, with explicit bounded mobile timeouts and
+//!   retries from [`IosConnectionPolicy`].
+//! * [`IosSessionModel`] — foreground/background and network-path coordination,
+//!   generation-scoped transport observations, and a cached revisioned
 //!   [`IosViewSnapshot`] a UI can bind to, with authorization reported *only*
 //!   from what the server actually confirmed.
 //! * [`HostAppDeclarations`] — the `Info.plist` declarations local-network
-//!   discovery depends on, so that a missing declaration is a reported
-//!   condition rather than an empty result set.
+//!   discovery depends on, plus structured [`DiscoveryDiagnostic`] recovery
+//!   actions, so a missing declaration is reported rather than rendered as an
+//!   empty result set.
+//! * [`HostCredentialStore`] and [`HostDiscoveryProvider`] — validated ports a
+//!   future host application can implement with Keychain and system DNS-SD
+//!   without putting Apple-framework or unsafe code in this crate.
 //! * [`ClientTransport`] — a written record of which Gateway transports iOS can
 //!   carry and, for those it cannot, why.
 //!
@@ -56,12 +62,14 @@
 //! * **Bonjour and DNS-SD discovery** needs `NSLocalNetworkUsageDescription`
 //!   and `NSBonjourServices` in the host application bundle. This crate cannot
 //!   read the bundle, so [`HostAppDeclarations`] treats an unconfirmed
-//!   declaration exactly as strictly as a missing one.
+//!   declaration exactly as strictly as a missing one. The provider port exists;
+//!   no DNS-SD implementation does.
 //! * **Tailscale** needs an app-accessible `LocalAPI` Unix socket or a loopback
 //!   proxy, which a stock sandboxed iOS deployment may expose neither of. No
 //!   alternative transport is offered in its place.
 //! * **SSH** needs caller-provisioned sandbox paths for key material and
-//!   `known_hosts`. There is no Keychain or Secure Enclave integration here.
+//!   `known_hosts`. The protected-storage port exists, but there is no Keychain
+//!   or Secure Enclave implementation here and no plaintext fallback.
 //!
 //! # Composition
 //!
@@ -74,35 +82,50 @@
 //!
 //! # What has and has not been executed
 //!
-//! Everything here was built and tested on **Windows `x86_64` only**. No part of
-//! this crate has ever run on an Apple platform, in a simulator, or on a
-//! device, and none of it has ever completed a Gateway handshake against a real
-//! server. `aarch64-apple-ios` cannot even be type-checked from a Windows host,
-//! because `ring` — a mandatory transitive dependency of `claw-gateway-client` —
-//! compiles C and assembly and requires `xcrun` and the iOS SDK.
+//! The Rust core has been built and tested as a macOS arm64 host binary. It has
+//! never built or run for an iOS target, simulator, or device, and it has never
+//! completed a Gateway handshake against a real server. Device and simulator
+//! target checks stop in `ring` — a mandatory transitive dependency of
+//! `claw-gateway-client` — because the available Command Line Tools installation
+//! has no iPhoneOS or iPhoneSimulator SDK. See the crate README for exact checks.
 
+mod connection_policy;
 mod credential;
 mod device;
 mod endpoint;
 mod host_app;
+mod host_facilities;
 mod identity;
 mod profile;
 mod session;
 mod transport;
 
+pub use connection_policy::{
+    ConnectionPolicyError, IosConnectionPolicy, IosRetryPolicy, IosTimeoutPolicy,
+};
 pub use credential::{CredentialError, IosCredential, IosCredentialKind};
 pub use device::{DeclaredDeviceProbe, IosDeviceProbe, UnobservedDeviceProbe};
 pub use endpoint::{EndpointError, EndpointSummary, GatewayEndpoint};
 pub use host_app::{
-    AppRunState, BonjourServiceType, DeclarationStatus, DiscoveryMechanism, DiscoveryPermit,
-    DiscoveryUnavailable, EmptyResultDiagnosis, EntitlementStatus, GatewayMdnsBackend,
-    HostAppDeclaration, HostAppDeclarations, HostAppEntitlement, LocalDiscoveryBackend,
-    LocalNetworkPrivacy, ServiceTypeError, diagnose_empty_result,
+    AppRunState, BonjourServiceType, DeclarationStatus, DiscoveryDiagnostic, DiscoveryMechanism,
+    DiscoveryPermit, DiscoveryRemediation, DiscoveryUnavailable, EmptyResultDiagnosis,
+    EntitlementStatus, GatewayMdnsBackend, HostAppDeclaration, HostAppDeclarations,
+    HostAppEntitlement, LocalDiscoveryBackend, LocalNetworkPrivacy, ServiceTypeError,
+    diagnose_empty_result,
+};
+pub use host_facilities::{
+    CredentialKey, CredentialKeyError, DiscoveredGateway, DiscoveryCompletion, DiscoveryEvent,
+    DiscoveryEventSink, DiscoveryRequest, DiscoveryScanPolicy, DiscoveryScanPolicyError,
+    DiscoveryStartBlocked, HostCredentialError, HostCredentialStore, HostDiscoveryProvider,
+    HostDiscoverySession, PersistedCredentialKind, delete_host_credential, load_host_credential,
+    save_host_credential,
 };
 pub use identity::{IdentityError, IosClientIdentity};
 pub use profile::{IosClientCore, IosGatewayProfile};
 pub use session::{
     AttemptRejected, AuthorizationDenied, AuthorizedAction, ConnectionAttempt, IosAction,
-    IosSessionModel, IosStatusKind, IosViewSnapshot, ObservedAuthorization,
+    IosNetworkInterface, IosNetworkPath, IosNetworkRoute, IosSessionModel, IosStatusKind,
+    IosViewSnapshot, ObservationResult, ObservedAuthorization, TransportDirective,
+    TransportResumeReason, TransportStopReason,
 };
 pub use transport::{ClientTransport, IosTransportRecord, IosTransportStatus};
