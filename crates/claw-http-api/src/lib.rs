@@ -11,6 +11,7 @@ mod config;
 mod deterministic;
 mod error;
 mod http_support;
+mod lifecycle;
 mod mcp;
 mod openai;
 mod ports;
@@ -22,6 +23,7 @@ mod webhooks;
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::Router;
 use axum::http::{HeaderName, HeaderValue, Method, header};
@@ -35,6 +37,10 @@ pub use admin::ADMIN_HTTP_RPC_METHODS;
 pub use auth::{BearerAuthenticator, BearerCredential, Principal};
 pub use config::{ApiConfig, HttpLimits, WebhookRoute};
 pub use deterministic::DeterministicRuntime;
+pub use lifecycle::{
+    PHASE_DRAINING, PHASE_RUNNING, PHASE_STARTING, ServingState, ServingStateHandle,
+    ServingStatePort,
+};
 pub use ports::{
     AdminFailure, AdminPort, AdminSuccess, ApiServices, AuditPort, ClientTool, EmbeddingRequest,
     GenerationEvent, GenerationOutput, GenerationRequest, InputMedia, InputMediaKind,
@@ -134,14 +140,31 @@ pub struct HttpApi {
 
 impl HttpApi {
     /// Builds all 18 frozen HTTP/SSE routes.
+    ///
+    /// The host is assumed to be serving. Callers with a real lifecycle should
+    /// use [`HttpApi::with_serving_state`] so that readiness reflects a drain.
     #[must_use]
     pub fn new(config: ApiConfig, services: ApiServices) -> Self {
+        Self::with_serving_state(config, services, Arc::new(ServingStateHandle::serving()))
+    }
+
+    /// Builds all 18 frozen HTTP/SSE routes against a caller-supplied serving state.
+    ///
+    /// This is the seam through which a graceful shutdown becomes observable over
+    /// HTTP: once the supplied port reports that work is no longer accepted,
+    /// `/ready` and `/readyz` fail while `/health` and `/healthz` keep succeeding.
+    #[must_use]
+    pub fn with_serving_state(
+        config: ApiConfig,
+        services: ApiServices,
+        serving: Arc<dyn ServingStatePort>,
+    ) -> Self {
         let auth_state = AuthMiddlewareState {
             authenticator: config.authenticator.clone(),
             limits: config.limits.clone(),
         };
         let cors_origins = config.cors_origins.clone();
-        let state = ApiState::new(config, services);
+        let state = ApiState::with_serving_state(config, services, serving);
         let (router, protected, mcp_router) = http_api_endpoints!(build_route_groups);
         let protected = protected.layer(middleware::from_fn_with_state(auth_state, require_bearer));
         let cors = CorsLayer::new()
