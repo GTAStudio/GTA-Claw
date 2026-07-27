@@ -383,6 +383,36 @@ fn unknown_host_is_refused_rather_than_defaulted() {
 }
 
 #[test]
+fn rejection_diagnostics_include_safe_actionable_remediation() {
+    let hosts = KnownHosts::parse(&fixture()).expect("parse");
+    let unknown = hosts.verify("brand-new.other.example", 22, &key(1));
+    assert_eq!(
+        unknown.remediation(),
+        Some(RejectionCause::Unknown.remediation())
+    );
+    assert!(
+        unknown
+            .remediation()
+            .expect("unknown-host remediation")
+            .contains("trusted channel")
+    );
+
+    for cause in [
+        RejectionCause::Revoked,
+        RejectionCause::Mismatch,
+        RejectionCause::Unknown,
+        RejectionCause::CertificateAuthorityOnly,
+    ] {
+        let guidance = cause.remediation();
+        assert!(!guidance.is_empty());
+        assert!(
+            !guidance.contains("SHA256:"),
+            "remediation must not repeat host-specific fingerprint material"
+        );
+    }
+}
+
+#[test]
 fn malformed_lines_are_errors_rather_than_silently_skipped() {
     // Silently skipping a bad line is how a revocation stops taking effect, so
     // every one of these must surface.

@@ -40,6 +40,11 @@ pub const TYPE_ANY: u16 = 255;
 
 const POINTER_MASK: u8 = 0xc0;
 const MAX_POINTER_OFFSET: usize = 0x3fff;
+const MIN_QUESTION_WIRE_BYTES: usize = 5;
+const MIN_RECORD_WIRE_BYTES: usize = 11;
+
+/// Maximum raw DNS message size representable by DNS-over-TCP's length field.
+pub const MAX_MESSAGE_BYTES: usize = 65_535;
 
 /// The record payloads this codec understands.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,11 +161,15 @@ impl Message {
     /// Returns every record in answer, authority and additional order.
     #[must_use]
     pub fn records(&self) -> Vec<&ResourceRecord> {
+        self.iter_records().collect()
+    }
+
+    /// Iterates over every record without allocating an intermediate collection.
+    pub fn iter_records(&self) -> impl Iterator<Item = &ResourceRecord> {
         self.answers
             .iter()
             .chain(self.authorities.iter())
             .chain(self.additionals.iter())
-            .collect()
     }
 
     /// Encodes the message, compressing every name suffix seen before.
@@ -189,6 +198,7 @@ impl Message {
                     0
                 };
             out.extend_from_slice(&class.to_be_bytes());
+            ensure_message_size(out.len())?;
         }
         for record in self
             .answers
@@ -197,6 +207,7 @@ impl Message {
             .chain(self.additionals.iter())
         {
             encode_record(&mut out, record, &mut offsets)?;
+            ensure_message_size(out.len())?;
         }
         Ok(out)
     }
@@ -206,11 +217,15 @@ impl Message {
     /// # Errors
     ///
     /// Returns [`DnsSdError::Truncated`] for a short buffer,
-    /// [`DnsSdError::BadPointer`] for a compression pointer that does not point
-    /// strictly backwards, [`DnsSdError::NameTooLong`] when an expansion runs
-    /// past 255 bytes and [`DnsSdError::TrailingBytes`] when bytes remain after
-    /// the declared sections.
+    /// [`DnsSdError::MessageTooLarge`] when the wire message exceeds the
+    /// transport ceiling, [`DnsSdError::ImpossibleSectionCounts`] when the
+    /// declared entries cannot fit in the body, [`DnsSdError::BadPointer`] for a
+    /// compression pointer that does not point strictly backwards,
+    /// [`DnsSdError::NameTooLong`] when an expansion runs past 255 bytes and
+    /// [`DnsSdError::TrailingBytes`] when bytes remain after the declared
+    /// sections.
     pub fn decode(bytes: &[u8]) -> Result<Self, DnsSdError> {
+        ensure_message_size(bytes.len())?;
         if bytes.len() < 12 {
             return Err(DnsSdError::Truncated);
         }
@@ -222,6 +237,7 @@ impl Message {
             usize::from(u16::from_be_bytes([bytes[8], bytes[9]])),
             usize::from(u16::from_be_bytes([bytes[10], bytes[11]])),
         ];
+        validate_declared_counts(counts, bytes.len() - 12)?;
         let mut cursor = 12usize;
         let mut questions = Vec::with_capacity(counts[0].min(64));
         for _ in 0..counts[0] {
@@ -254,6 +270,40 @@ impl Message {
 
 fn section_count(value: usize) -> Result<u16, DnsSdError> {
     u16::try_from(value).map_err(|_| DnsSdError::SectionTooLarge(value))
+}
+
+const fn ensure_message_size(length: usize) -> Result<(), DnsSdError> {
+    if length > MAX_MESSAGE_BYTES {
+        return Err(DnsSdError::MessageTooLarge {
+            actual: length,
+            limit: MAX_MESSAGE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_declared_counts(counts: [usize; 4], available: usize) -> Result<(), DnsSdError> {
+    let questions = counts[0];
+    let records = counts[1]
+        .checked_add(counts[2])
+        .and_then(|count| count.checked_add(counts[3]))
+        .ok_or(DnsSdError::SectionTooLarge(usize::MAX))?;
+    let minimum = questions
+        .checked_mul(MIN_QUESTION_WIRE_BYTES)
+        .and_then(|size| {
+            records
+                .checked_mul(MIN_RECORD_WIRE_BYTES)
+                .and_then(|record_size| size.checked_add(record_size))
+        })
+        .ok_or(DnsSdError::SectionTooLarge(usize::MAX))?;
+    if minimum > available {
+        return Err(DnsSdError::ImpossibleSectionCounts {
+            questions,
+            records,
+            available,
+        });
+    }
+    Ok(())
 }
 
 fn encode_name(out: &mut Vec<u8>, name: &Name, offsets: &mut BTreeMap<Vec<u8>, u16>) {

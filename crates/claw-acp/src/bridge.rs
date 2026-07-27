@@ -275,7 +275,7 @@ impl AcpBridge {
                 });
             }
         };
-        peer.mark_disconnected();
+        peer.begin_disconnect();
         if !reader.is_finished() {
             reader.abort();
         }
@@ -289,6 +289,7 @@ impl AcpBridge {
             tasks.abort_all();
             while tasks.join_next().await.is_some() {}
         }
+        peer.finish_disconnect();
         terminal_error.map_or_else(|| Ok(()), |error| Err(error.into()))
     }
 }

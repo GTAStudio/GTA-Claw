@@ -1,10 +1,8 @@
 use std::{
     collections::HashMap,
     fmt,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -17,6 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
+const MAX_PENDING_REQUESTS: usize = 256;
+const WRITER_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 type PendingResponse = oneshot::Sender<std::result::Result<Value, ProtocolError>>;
 
@@ -143,6 +143,7 @@ impl std::error::Error for ProtocolError {}
 struct PeerState {
     connected: bool,
     pending: HashMap<u64, PendingResponse>,
+    next_id: u64,
 }
 
 /// Correlation entry for one outstanding request.
@@ -158,21 +159,39 @@ struct PendingRequest {
 impl PendingRequest {
     fn register(
         state: &Arc<Mutex<PeerState>>,
-        id: u64,
         sender: PendingResponse,
-    ) -> std::result::Result<Self, ProtocolError> {
+    ) -> std::result::Result<(Self, u64), ProtocolError> {
         let mut locked = state
             .lock()
             .map_err(|_| ProtocolError::internal_error().data("ACP pending map poisoned"))?;
         if !locked.connected {
             return Err(ProtocolError::disconnected());
         }
-        locked.pending.insert(id, sender);
+        if locked.pending.len() >= MAX_PENDING_REQUESTS {
+            return Err(ProtocolError::internal_error().data(format!(
+                "ACP pending request limit of {MAX_PENDING_REQUESTS} reached"
+            )));
+        }
+
+        let mut id = locked.next_id.max(1);
+        for _ in 0..=locked.pending.len() {
+            locked.next_id = id.checked_add(1).unwrap_or(1);
+            if let std::collections::hash_map::Entry::Vacant(entry) = locked.pending.entry(id) {
+                entry.insert(sender);
+                drop(locked);
+                return Ok((
+                    Self {
+                        state: Arc::clone(state),
+                        id,
+                    },
+                    id,
+                ));
+            }
+            id = locked.next_id;
+        }
+
         drop(locked);
-        Ok(Self {
-            state: Arc::clone(state),
-            id,
-        })
+        Err(ProtocolError::internal_error().data("ACP request ID space is temporarily exhausted"))
     }
 }
 
@@ -193,8 +212,8 @@ struct Outbound {
 pub(crate) struct RpcPeer {
     outgoing: mpsc::Sender<Outbound>,
     state: Arc<Mutex<PeerState>>,
-    next_id: Arc<AtomicU64>,
     disconnected: CancellationToken,
+    writer_abort: tokio::task::AbortHandle,
 }
 
 impl RpcPeer {
@@ -203,19 +222,22 @@ impl RpcPeer {
         let state = Arc::new(Mutex::new(PeerState {
             connected: true,
             pending: HashMap::new(),
+            next_id: 1,
         }));
         let disconnected = CancellationToken::new();
-        tokio::spawn(writer_loop(
+        let writer = tokio::spawn(writer_loop(
             writer,
             receiver,
             Arc::clone(&state),
             disconnected.clone(),
         ));
+        let writer_abort = writer.abort_handle();
+        drop(writer);
         Self {
             outgoing,
             state,
-            next_id: Arc::new(AtomicU64::new(1)),
             disconnected,
+            writer_abort,
         }
     }
 
@@ -228,11 +250,10 @@ impl RpcPeer {
         P: Serialize,
         R: DeserializeOwned,
     {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let params = serde_json::to_value(params)
             .map_err(|error| ProtocolError::internal_error().data(error.to_string()))?;
         let (sender, receiver) = oneshot::channel();
-        let pending = PendingRequest::register(&self.state, id, sender)?;
+        let (pending, id) = PendingRequest::register(&self.state, sender)?;
         self.write(json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -326,8 +347,21 @@ impl RpcPeer {
     }
 
     pub(crate) fn mark_disconnected(&self) {
+        self.begin_disconnect();
+        self.finish_disconnect();
+    }
+
+    pub(crate) fn begin_disconnect(&self) {
         disconnect_state(&self.state, &ProtocolError::disconnected());
         self.disconnected.cancel();
+    }
+
+    pub(crate) fn finish_disconnect(&self) {
+        let writer_abort = self.writer_abort.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(WRITER_DRAIN_GRACE).await;
+            writer_abort.abort();
+        });
     }
 
     pub(crate) async fn disconnected(&self) {
@@ -510,6 +544,7 @@ pub(crate) fn decode<T: DeserializeOwned>(params: Value) -> std::result::Result<
 #[cfg(test)]
 mod tests {
     use tokio::io::{AsyncWriteExt, BufReader, duplex};
+    use tokio::time::{Duration, timeout};
 
     use super::*;
 
@@ -636,5 +671,80 @@ mod tests {
             peer.resolve_response(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn request_ids_wrap_without_reusing_a_pending_correlation() {
+        let state = Arc::new(Mutex::new(PeerState {
+            connected: true,
+            pending: HashMap::new(),
+            next_id: u64::MAX,
+        }));
+        let (first_sender, _first_receiver) = oneshot::channel();
+        let (first, first_id) =
+            PendingRequest::register(&state, first_sender).expect("reserve maximum ID");
+        let (second_sender, _second_receiver) = oneshot::channel();
+        let (second, second_id) =
+            PendingRequest::register(&state, second_sender).expect("reserve wrapped ID");
+
+        assert_eq!(first_id, u64::MAX);
+        assert_eq!(second_id, 1);
+        assert_ne!(first_id, second_id);
+        drop((first, second));
+        assert_eq!(state.lock().expect("pending map").pending.len(), 0);
+    }
+
+    #[test]
+    fn pending_correlations_have_a_hard_connection_wide_ceiling() {
+        let state = Arc::new(Mutex::new(PeerState {
+            connected: true,
+            pending: HashMap::new(),
+            next_id: 1,
+        }));
+        let mut pending = Vec::with_capacity(MAX_PENDING_REQUESTS);
+        for _ in 0..MAX_PENDING_REQUESTS {
+            let (sender, _receiver) = oneshot::channel();
+            pending.push(
+                PendingRequest::register(&state, sender)
+                    .expect("request below limit")
+                    .0,
+            );
+        }
+
+        let (sender, _receiver) = oneshot::channel();
+        let Err(error) = PendingRequest::register(&state, sender) else {
+            panic!("request above limit must fail");
+        };
+        assert_eq!(error.code, -32603);
+        assert_eq!(
+            error.data,
+            Some(json!(format!(
+                "ACP pending request limit of {MAX_PENDING_REQUESTS} reached"
+            )))
+        );
+        drop(pending);
+        assert_eq!(state.lock().expect("pending map").pending.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn disconnect_cancels_a_writer_blocked_by_an_unread_peer() {
+        let (writer, _unread_peer) = duplex(1);
+        let peer = RpcPeer::new(writer);
+        let notify_peer = peer.clone();
+        let notification = tokio::spawn(async move {
+            notify_peer
+                .notify("session/update", json!({ "padding": "x".repeat(4096) }))
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        peer.mark_disconnected();
+
+        let error = timeout(Duration::from_secs(1), notification)
+            .await
+            .expect("blocked writer must be cancelled")
+            .expect("notification task")
+            .expect_err("disconnected notification must fail");
+        assert_eq!(error.code, -32603);
     }
 }

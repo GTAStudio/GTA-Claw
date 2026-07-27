@@ -249,6 +249,27 @@ impl fmt::Display for DenialCause {
     }
 }
 
+impl DenialCause {
+    /// Returns non-secret operator guidance for resolving this denial.
+    #[must_use]
+    pub const fn remediation(self) -> &'static str {
+        match self {
+            Self::UnknownNode => "refresh tailnet status and select a node present in policy",
+            Self::NodeKeyExpired => "renew the node key before creating an exposure",
+            Self::MachineAuthPending => "approve the machine in the tailnet admin console",
+            Self::HttpsDisabled => "enable tailnet HTTPS certificates before using Funnel",
+            Self::MissingFunnelAttribute => {
+                "grant the funnel node attribute in tailnet policy before publishing"
+            }
+            Self::PublicPortNotAllowed => {
+                "use Serve or select a Tailscale-supported Funnel public port"
+            }
+            Self::BackendNotLoopback => "bind the backend to a loopback address before publishing",
+            Self::InvalidPath => "use an absolute path without parent traversal",
+        }
+    }
+}
+
 /// A refusal, carrying both its machine-readable cause and an operator message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyDenial {
@@ -256,6 +277,14 @@ pub struct PolicyDenial {
     pub cause: DenialCause,
     /// Human-readable detail.
     pub detail: String,
+}
+
+impl PolicyDenial {
+    /// Returns safe operator guidance for the machine-readable denial cause.
+    #[must_use]
+    pub const fn remediation(&self) -> &'static str {
+        self.cause.remediation()
+    }
 }
 
 impl fmt::Display for PolicyDenial {

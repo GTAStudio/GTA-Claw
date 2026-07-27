@@ -180,7 +180,7 @@ pub enum BridgeEffect {
         /// Event frame.
         event: CdpEvent,
     },
-    /// Close the extension transport because safe debugger cleanup is impossible.
+    /// Close an extension transport after replacement or failed debugger cleanup.
     CloseExtension {
         /// Destination extension connection.
         connection: ConnectionId,
@@ -288,7 +288,21 @@ impl CdpBridge {
     /// Any previous extension lifecycle is terminated before the new
     /// connection may send its mandatory hello.
     pub fn connect_extension(&mut self, connection: ConnectionId) -> Vec<BridgeEffect> {
-        let effects = self.disconnect_extension();
+        if self.extension == Some(connection) {
+            return Vec::new();
+        }
+        let previous = self.extension;
+        let mut effects = self.disconnect_current_extension();
+        if let Some(previous) = previous {
+            effects.insert(
+                0,
+                BridgeEffect::CloseExtension {
+                    connection: previous,
+                    code: 1012,
+                    reason: "Chrome extension replaced by a newer connection",
+                },
+            );
+        }
         self.extension = Some(connection);
         self.extension_hello_seen = false;
         effects
@@ -447,7 +461,17 @@ impl CdpBridge {
     }
 
     /// Handles abrupt extension/browser death and announces every detached page.
-    pub fn disconnect_extension(&mut self) -> Vec<BridgeEffect> {
+    ///
+    /// A stale close callback from a replaced connection is ignored so it cannot
+    /// tear down the newer extension lifecycle.
+    pub fn disconnect_extension(&mut self, connection: ConnectionId) -> Vec<BridgeEffect> {
+        if self.extension != Some(connection) {
+            return Vec::new();
+        }
+        self.disconnect_current_extension()
+    }
+
+    fn disconnect_current_extension(&mut self) -> Vec<BridgeEffect> {
         if self.extension.take().is_none() {
             return Vec::new();
         }
@@ -1564,7 +1588,7 @@ impl CdpBridge {
 
     fn fail_closed_extension(&mut self, reason: &'static str) -> Vec<BridgeEffect> {
         let connection = self.extension;
-        let mut effects = self.disconnect_extension();
+        let mut effects = self.disconnect_current_extension();
         if let Some(connection) = connection {
             effects.insert(
                 0,

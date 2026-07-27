@@ -328,3 +328,25 @@ fn every_denial_names_its_cause_in_the_operator_message() {
     assert_eq!(ExposureMode::Funnel.to_string(), "funnel");
     assert_eq!(ExposureMode::Serve.to_string(), "serve");
 }
+
+#[test]
+fn every_denial_cause_has_static_non_secret_remediation() {
+    for cause in [
+        DenialCause::UnknownNode,
+        DenialCause::NodeKeyExpired,
+        DenialCause::MachineAuthPending,
+        DenialCause::HttpsDisabled,
+        DenialCause::MissingFunnelAttribute,
+        DenialCause::PublicPortNotAllowed,
+        DenialCause::BackendNotLoopback,
+        DenialCause::InvalidPath,
+    ] {
+        let guidance = cause.remediation();
+        assert!(!guidance.is_empty());
+        assert!(!guidance.contains(NODE));
+    }
+
+    let denial = policy().evaluate(&funnel(9443)).expect_err("bad port");
+    assert_eq!(denial.remediation(), denial.cause.remediation());
+    assert!(denial.remediation().contains("Funnel"));
+}

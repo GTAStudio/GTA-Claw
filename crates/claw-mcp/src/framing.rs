@@ -303,14 +303,22 @@ where
             let mut decoder = JsonLineDecoder::new(max_frame_bytes);
             let mut bytes = [0_u8; 16 * 1024];
             loop {
-                let count = tokio::select! {
+                let read = tokio::select! {
                     biased;
-                    result = input.read(&mut bytes) => result?,
+                    result = input.read(&mut bytes) => result,
                     () = reader_disconnected.cancelled() => return Ok(()),
+                };
+                let count = match read {
+                    Ok(count) => count,
+                    Err(error) => {
+                        reader_disconnected.cancel();
+                        return Err(error);
+                    }
                 };
                 if count == 0 {
                     if let Err(error) = decoder.finish() {
                         reader_diagnostics.record(&error);
+                        reader_disconnected.cancel();
                         return Err(protocol_io_error(error));
                     }
                     return Ok(());
@@ -319,6 +327,7 @@ where
                     Ok(values) => values,
                     Err(error) => {
                         reader_diagnostics.record(&error);
+                        reader_disconnected.cancel();
                         return Err(protocol_io_error(error));
                     }
                 };
@@ -333,6 +342,7 @@ where
                         Ok(message) => message,
                         Err(error) => {
                             reader_diagnostics.record_invalid_message(&error);
+                            reader_disconnected.cancel();
                             return Err(invalid_data_io_error(error));
                         }
                     };
@@ -351,28 +361,47 @@ where
         let writer_task = tokio::spawn(async move {
             let writer_disconnected = disconnected.clone();
             let _disconnect_on_exit = disconnected.drop_guard();
-            while let Some((message, acknowledgement)) = write_rx.recv().await {
-                let result = async {
-                    let value = serde_json::to_value(message).map_err(invalid_data_io_error)?;
-                    output
-                        .write_all(&encode(&value).map_err(protocol_io_error)?)
-                        .await?;
-                    output.flush().await
-                }
-                .await;
+            loop {
+                let request = tokio::select! {
+                    biased;
+                    () = writer_disconnected.cancelled() => {
+                        fail_queued_writes::<R>(&mut write_rx);
+                        return Ok(());
+                    }
+                    request = write_rx.recv() => request,
+                };
+                let Some((message, acknowledgement)) = request else {
+                    return Ok(());
+                };
+                let result = tokio::select! {
+                    biased;
+                    () = writer_disconnected.cancelled() => {
+                        let _ = acknowledgement.send(Err(disconnected_io_error()));
+                        fail_queued_writes::<R>(&mut write_rx);
+                        return Ok(());
+                    }
+                    result = async {
+                        let value =
+                            serde_json::to_value(message).map_err(invalid_data_io_error)?;
+                        output
+                            .write_all(&encode(&value).map_err(protocol_io_error)?)
+                            .await?;
+                        output.flush().await
+                    } => result,
+                };
                 let failed = result.is_err();
                 if failed {
                     writer_disconnected.cancel();
                 }
                 let _ = acknowledgement.send(result);
                 if failed {
+                    fail_queued_writes::<R>(&mut write_rx);
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "bounded stdio writer failed",
                     ));
                 }
             }
-            Ok(())
         });
 
         Self {
@@ -394,6 +423,7 @@ where
     R: rmcp::service::ServiceRole,
 {
     fn drop(&mut self) {
+        self.diagnostics.transport_disconnected.cancel();
         if let Some(reader) = self.reader.take() {
             reader.abort();
         }
@@ -413,20 +443,34 @@ macro_rules! impl_bounded_transport {
                 item: TxJsonRpcMessage<$role>,
             ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send + 'static {
                 let writes = self.writes.clone();
+                let disconnected = self.diagnostics.transport_disconnected.clone();
                 async move {
                     let writes = writes.ok_or_else(|| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "stdio transport is closed")
                     })?;
                     let (acknowledge, result) = oneshot::channel();
-                    writes.send((item, acknowledge)).await.map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "stdio writer task stopped")
-                    })?;
-                    result.await.map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "stdio writer acknowledgement dropped",
-                        )
-                    })?
+                    tokio::select! {
+                        biased;
+                        () = disconnected.cancelled() => return Err(disconnected_io_error()),
+                        sent = writes.send((item, acknowledge)) => {
+                            sent.map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    "stdio writer task stopped",
+                                )
+                            })?;
+                        }
+                    }
+                    tokio::select! {
+                        biased;
+                        completed = result => completed.map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "stdio writer acknowledgement dropped",
+                            )
+                        })?,
+                        () = disconnected.cancelled() => Err(disconnected_io_error()),
+                    }
                 }
             }
 
@@ -440,16 +484,16 @@ macro_rules! impl_bounded_transport {
                 self.writes.take();
                 let reader = self.reader.take();
                 let writer = self.writer.take();
+                let disconnected = self.diagnostics.transport_disconnected.clone();
                 async move {
+                    disconnected.cancel();
                     let writer_result = match writer {
                         Some(writer) => writer.await.map_err(join_io_error)?,
                         None => Ok(()),
                     };
                     if let Some(reader) = reader {
-                        reader.abort();
                         match reader.await {
                             Ok(result) => result?,
-                            Err(error) if error.is_cancelled() => {}
                             Err(error) => return Err(join_io_error(error)),
                         }
                     }
@@ -462,6 +506,19 @@ macro_rules! impl_bounded_transport {
 
 impl_bounded_transport!(RoleClient);
 impl_bounded_transport!(RoleServer);
+
+fn disconnected_io_error() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "stdio transport disconnected")
+}
+
+fn fail_queued_writes<R>(write_rx: &mut mpsc::Receiver<WriteRequest<R>>)
+where
+    R: rmcp::service::ServiceRole,
+{
+    while let Ok((_, acknowledgement)) = write_rx.try_recv() {
+        let _ = acknowledgement.send(Err(disconnected_io_error()));
+    }
+}
 
 fn protocol_io_error(error: McpError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
@@ -484,7 +541,7 @@ mod tests {
     };
     use serde_json::json;
     use tokio::{
-        io::{AsyncWriteExt, duplex},
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex},
         time::{Duration, timeout},
     };
 
@@ -785,5 +842,77 @@ mod tests {
         )
         .await
         .expect("aborted reader must report completion");
+    }
+
+    #[tokio::test]
+    async fn close_cancels_a_writer_blocked_by_an_unread_peer() {
+        let (_peer_input, transport_input) = duplex(64);
+        let (transport_output, _unread_peer_output) = duplex(1);
+        let mut transport =
+            BoundedIoTransport::<RoleServer>::new(transport_input, transport_output);
+        let response: TxJsonRpcMessage<RoleServer> = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32603,
+                "message": "x".repeat(4096)
+            }
+        }))
+        .expect("valid oversized error response");
+        let sending = tokio::spawn(transport.send(response));
+        tokio::task::yield_now().await;
+
+        timeout(Duration::from_secs(1), transport.close())
+            .await
+            .expect("close must cancel blocked output")
+            .expect("cancelled transport closes cleanly");
+        let error = timeout(Duration::from_secs(1), sending)
+            .await
+            .expect("pending send must finish")
+            .expect("send task")
+            .expect_err("closed transport rejects pending send");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn clean_input_eof_still_allows_an_accepted_response_to_drain() {
+        let (mut peer_input, transport_input) = duplex(1024);
+        let (transport_output, peer_output) = duplex(1024);
+        let mut peer_output = BufReader::new(peer_output);
+        let mut transport =
+            BoundedIoTransport::<RoleServer>::new(transport_input, transport_output);
+        peer_input
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n")
+            .await
+            .expect("write request");
+        peer_input.shutdown().await.expect("close request half");
+
+        let request: Option<RxJsonRpcMessage<RoleServer>> = transport.receive().await;
+        assert!(request.is_some(), "accepted request must reach the service");
+        assert!(
+            transport.receive().await.is_none(),
+            "clean EOF must close only the receive half"
+        );
+        let response: TxJsonRpcMessage<RoleServer> = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": []}
+        }))
+        .expect("valid response");
+        transport
+            .send(response)
+            .await
+            .expect("accepted response must drain after input EOF");
+
+        let mut line = String::new();
+        timeout(Duration::from_secs(1), peer_output.read_line(&mut line))
+            .await
+            .expect("response must arrive")
+            .expect("read response");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).expect("response JSON"),
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}})
+        );
+        transport.close().await.expect("close transport");
     }
 }
