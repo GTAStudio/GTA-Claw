@@ -239,6 +239,14 @@ impl HttpApi {
     }
 }
 
+mod admin_rpc;
+
+pub use admin_rpc::{
+    ADMIN_RPC_PATH, AdminMethodPolicy, AdminRpcAuthRejection, AdminRpcAuthenticator,
+    AdminRpcCaller, AdminRpcEnvelope, AdminRpcError, AdminRpcLimits, AdminRpcService,
+    DenyAllAuthenticator, FnAuthenticator, dispatch_status, operator_scope_to_security,
+};
+
 #[path = "webhooks/guard.rs"]
 mod webhook_guard;
 

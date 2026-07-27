@@ -1,0 +1,55 @@
+{
+  "description": "Invocation context supplied through OpenClaw headers is pinned, including the rule that a body field wins over the matching header.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "args": {},
+      "name": "echo",
+      "sessionKey": "session-from-body"
+    },
+    "headers": [
+      [
+        "x-openclaw-session-key",
+        "session-from-header"
+      ],
+      [
+        "x-openclaw-agent-id",
+        "agent-from-header"
+      ],
+      [
+        "x-openclaw-message-channel",
+        "channel-1"
+      ],
+      [
+        "x-openclaw-account-id",
+        "account-1"
+      ],
+      [
+        "x-openclaw-message-to",
+        "recipient-1"
+      ],
+      [
+        "x-openclaw-thread-id",
+        "thread-1"
+      ]
+    ],
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "ok": true,
+      "result": {}
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "tool": {
+      "kind": "echo"
+    }
+  }
+}

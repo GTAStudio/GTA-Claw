@@ -4,6 +4,8 @@ use std::fmt::{self, Debug, Display, Formatter};
 
 use subtle::ConstantTimeEq;
 
+use crate::pairing::{RELAY_SUBPROTOCOL, RELAY_TOKEN_SUBPROTOCOL_PREFIX};
+
 /// Exact Chrome extension identity admitted by a relay endpoint.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ExtensionId(String);
@@ -116,6 +118,20 @@ impl ConnectionId {
     }
 }
 
+/// Result of one accepted and fully negotiated WebSocket upgrade.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcceptedUpgrade {
+    /// Authenticated connection identity.
+    pub connection: ConnectionId,
+    /// Authenticated peer kind.
+    pub peer: PeerKind,
+    /// Subprotocol the relay selects in its handshake response.
+    ///
+    /// The secret-bearing token subprotocol is never selected, so the relay
+    /// response never echoes the relay secret back into a response header.
+    pub subprotocol: Option<&'static str>,
+}
+
 /// Deny-by-default WebSocket upgrade endpoint.
 #[derive(Debug)]
 pub struct RelayEndpoint {
@@ -154,20 +170,34 @@ impl RelayEndpoint {
 
     /// Authenticates and admits one upgrade.
     pub fn accept(&mut self, request: &UpgradeRequest) -> Result<ConnectionId, EndpointError> {
-        if !is_loopback_host_header(&request.host) {
+        self.negotiate(request).map(|accepted| accepted.connection)
+    }
+
+    /// Authenticates one upgrade and negotiates its WebSocket subprotocol.
+    ///
+    /// Subprotocol negotiation is deny-by-default on both paths: the extension
+    /// path requires the relay subprotocol plus exactly one token subprotocol
+    /// and nothing else, and the CDP path — which Playwright dials with no
+    /// subprotocol at all — refuses every offer. Selection never returns the
+    /// token subprotocol.
+    pub fn negotiate(
+        &mut self,
+        request: &UpgradeRequest,
+    ) -> Result<AcceptedUpgrade, EndpointError> {
+        if !is_loopback_authority(&request.host) {
             return Err(EndpointError::NonLoopbackHost);
         }
         if self.connections.len() == self.max_connections {
             return Err(EndpointError::ConnectionLimit);
         }
-        let peer = match request.path.as_str() {
+        let (peer, subprotocol) = match request.path.as_str() {
             "/extension" => {
                 self.authorize_extension(request)?;
-                PeerKind::Extension
+                (PeerKind::Extension, Some(RELAY_SUBPROTOCOL))
             }
             "/cdp" => {
                 self.authorize_cdp(request)?;
-                PeerKind::Cdp
+                (PeerKind::Cdp, None)
             }
             _ => return Err(EndpointError::UnknownPath),
         };
@@ -177,7 +207,11 @@ impl RelayEndpoint {
             .checked_add(1)
             .ok_or(EndpointError::ConnectionIdExhausted)?;
         self.connections.insert(id, peer);
-        Ok(id)
+        Ok(AcceptedUpgrade {
+            connection: id,
+            peer,
+            subprotocol,
+        })
     }
 
     /// Returns the authenticated peer kind for an active connection.
@@ -206,6 +240,12 @@ impl RelayEndpoint {
         self.connections.len()
     }
 
+    /// Compares a candidate secret against the relay token in constant time.
+    #[must_use]
+    pub fn token_matches(&self, candidate: &str) -> bool {
+        self.token.matches_hex(candidate)
+    }
+
     fn authorize_extension(&self, request: &UpgradeRequest) -> Result<(), EndpointError> {
         let origin = request
             .origin
@@ -215,18 +255,7 @@ impl RelayEndpoint {
         if !self.allowed_extensions.contains(&extension_id) {
             return Err(EndpointError::UnknownExtension);
         }
-        if !request
-            .subprotocols
-            .iter()
-            .any(|protocol| protocol == "openclaw-extension-relay")
-        {
-            return Err(EndpointError::MissingRelaySubprotocol);
-        }
-        let candidate = request
-            .subprotocols
-            .iter()
-            .find_map(|protocol| protocol.strip_prefix("openclaw-extension-token."))
-            .ok_or(EndpointError::AuthenticationFailed)?;
+        let candidate = select_extension_token(&request.subprotocols)?;
         if self.token.matches_hex(candidate) {
             Ok(())
         } else {
@@ -237,6 +266,9 @@ impl RelayEndpoint {
     fn authorize_cdp(&self, request: &UpgradeRequest) -> Result<(), EndpointError> {
         if request.origin.is_some() {
             return Err(EndpointError::CdpOriginForbidden);
+        }
+        if !request.subprotocols.is_empty() {
+            return Err(EndpointError::UnsupportedSubprotocol);
         }
         let candidate = request
             .authorization_token
@@ -250,6 +282,94 @@ impl RelayEndpoint {
     }
 }
 
+/// Selects the relay secret carried by an extension subprotocol offer.
+///
+/// The offer must be exactly the relay subprotocol plus one token subprotocol.
+/// A missing relay subprotocol, a duplicated token subprotocol and any
+/// unrecognised subprotocol are each refused with their own reason rather than
+/// silently ignored, because a relay that tolerates unknown subprotocols lets a
+/// hostile page negotiate a transport the relay never audited.
+fn select_extension_token(subprotocols: &[String]) -> Result<&str, EndpointError> {
+    let relay_offers = subprotocols
+        .iter()
+        .filter(|protocol| *protocol == RELAY_SUBPROTOCOL)
+        .count();
+    if relay_offers == 0 {
+        return Err(EndpointError::MissingRelaySubprotocol);
+    }
+    if relay_offers > 1 {
+        return Err(EndpointError::UnsupportedSubprotocol);
+    }
+    let mut token = None;
+    for protocol in subprotocols {
+        if protocol == RELAY_SUBPROTOCOL {
+            continue;
+        }
+        let Some(candidate) = protocol.strip_prefix(RELAY_TOKEN_SUBPROTOCOL_PREFIX) else {
+            return Err(EndpointError::UnsupportedSubprotocol);
+        };
+        if token.is_some() {
+            return Err(EndpointError::DuplicateTokenSubprotocol);
+        }
+        token = Some(candidate);
+    }
+    token.ok_or(EndpointError::AuthenticationFailed)
+}
+
+/// Extracts the relay credential from one `Authorization` header value.
+///
+/// Upstream accepts the relay secret as `Bearer <token>` or as the password
+/// half of `Basic` credentials, which is how a CDP client's `cdpUrl` userinfo
+/// reaches the relay. A malformed, unsupported or empty credential yields
+/// `None`, and the caller then fails the upgrade with
+/// [`EndpointError::AuthenticationFailed`].
+#[must_use]
+pub fn credential_from_authorization(header: &str) -> Option<String> {
+    if let Some(token) = header.strip_prefix("Bearer ") {
+        let token = token.trim();
+        return (!token.is_empty()).then(|| token.to_owned());
+    }
+    let encoded = header.strip_prefix("Basic ")?.trim();
+    let decoded = decode_base64(encoded)?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let password = match decoded.split_once(':') {
+        Some((_, password)) => password,
+        None => decoded.as_str(),
+    };
+    (!password.is_empty()).then(|| password.to_owned())
+}
+
+fn decode_base64(value: &str) -> Option<Vec<u8>> {
+    let body = value.trim_end_matches('=');
+    if value.len() - body.len() > 2 {
+        return None;
+    }
+    let mut accumulator = 0_u32;
+    let mut bits = 0_u32;
+    let mut decoded = Vec::with_capacity(body.len() * 3 / 4);
+    for byte in body.bytes() {
+        let sextet = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        accumulator = (accumulator << 6) | u32::from(sextet);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            decoded.push(u8::try_from((accumulator >> bits) & 0xff).ok()?);
+        }
+    }
+    if accumulator & ((1 << bits) - 1) == 0 {
+        Some(decoded)
+    } else {
+        None
+    }
+}
+
 fn parse_extension_origin(origin: &str) -> Result<ExtensionId, EndpointError> {
     let id = origin
         .strip_prefix("chrome-extension://")
@@ -260,7 +380,8 @@ fn parse_extension_origin(origin: &str) -> Result<ExtensionId, EndpointError> {
     ExtensionId::new(id.to_owned()).map_err(|_| EndpointError::ForgedOrigin)
 }
 
-fn is_loopback_host_header(host: &str) -> bool {
+/// Returns whether an HTTP authority names loopback with a usable port.
+pub(crate) fn is_loopback_authority(host: &str) -> bool {
     let host = host.trim();
     if host.eq_ignore_ascii_case("localhost") {
         return true;
@@ -307,6 +428,10 @@ pub enum EndpointError {
     UnknownExtension,
     /// Required relay protocol was absent.
     MissingRelaySubprotocol,
+    /// Offered subprotocol is not one the relay speaks.
+    UnsupportedSubprotocol,
+    /// More than one token subprotocol was offered.
+    DuplicateTokenSubprotocol,
     /// Pairing token did not match.
     AuthenticationFailed,
     /// Browser origins may not connect to the CDP endpoint.
@@ -332,6 +457,8 @@ impl Display for EndpointError {
             Self::ForgedOrigin => "extension Origin header is invalid",
             Self::UnknownExtension => "Chrome extension ID is not allowed",
             Self::MissingRelaySubprotocol => "relay WebSocket subprotocol is required",
+            Self::UnsupportedSubprotocol => "relay WebSocket subprotocol is not supported",
+            Self::DuplicateTokenSubprotocol => "relay token subprotocol was offered twice",
             Self::AuthenticationFailed => "relay authentication failed",
             Self::CdpOriginForbidden => "browser origins cannot connect to CDP",
             Self::ConnectionLimit => "relay connection limit reached",

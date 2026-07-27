@@ -1,0 +1,34 @@
+{
+  "description": "A provider deadline is a gateway timeout, distinct from an outage.",
+  "feature_id": "interop.openai.embeddings",
+  "request": {
+    "body": {
+      "input": "Berlin",
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/embeddings",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "embedding deadline exceeded",
+        "type": "api_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 504
+  },
+  "runtime": {
+    "embed": {
+      "error": {
+        "kind": "timeout",
+        "message": "embedding deadline exceeded"
+      },
+      "kind": "error"
+    }
+  }
+}

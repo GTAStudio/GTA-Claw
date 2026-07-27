@@ -1,0 +1,19 @@
+// Accepted fixture for pinned top-level domain `channels`
+// (compat/upstream/inventories/config-domains.json).
+{
+  channels: {
+    defaults: {
+      groupPolicy: "allowlist",
+      contextVisibility: "allowlist_quote",
+    },
+    modelByChannel: {
+      discord: { default: "openai/gpt-5" },
+    },
+    discord: {
+      name: "Discord",
+      enabled: true,
+      capabilities: ["text"],
+    },
+    "plugin.matrix": { enabled: false },
+  },
+}

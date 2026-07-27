@@ -1,0 +1,19 @@
+// Accepted fixture for pinned top-level domain `bindings`
+// (compat/upstream/inventories/config-domains.json).
+{
+  bindings: [
+    {
+      type: "route",
+      agentId: "main",
+      comment: "default discord route",
+      match: { channel: "discord", guildId: "900001" },
+      session: { dmScope: "per-peer" },
+    },
+    {
+      type: "acp",
+      agentId: "review",
+      match: { channel: "slack", peer: { kind: "direct", id: "U01" } },
+      acp: { mode: "persistent", label: "review" },
+    },
+  ],
+}

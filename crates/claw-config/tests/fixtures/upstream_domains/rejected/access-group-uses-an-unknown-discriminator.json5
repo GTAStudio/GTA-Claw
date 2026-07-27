@@ -1,0 +1,6 @@
+// reject: decode accessGroups.audience.type
+{
+  accessGroups: {
+    audience: { type: "discord.unknownAudience", guildId: "1" },
+  },
+}

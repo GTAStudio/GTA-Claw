@@ -1,0 +1,16 @@
+// Accepted fixture for pinned top-level domain `cron`
+// (compat/upstream/inventories/config-domains.json).
+{
+  cron: {
+    enabled: true,
+    store: "sqlite",
+    maxConcurrentRuns: 3,
+    triggers: { enabled: true, minIntervalMs: 60000 },
+    retry: {
+      maxAttempts: 3,
+      backoffMs: [1000, 5000],
+      retryOn: ["rate_limit", "network"],
+    },
+    webhook: "https://hooks.example.test/cron",
+  },
+}

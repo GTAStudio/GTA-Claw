@@ -741,6 +741,26 @@ impl CapabilitySet {
         self.0 & capability.bit() != 0
     }
 
+    /// Returns `true` when every capability of `required` is present.
+    ///
+    /// An empty `required` set is satisfied by every set, including the empty
+    /// one, so callers that route on capabilities must reject an empty
+    /// requirement themselves rather than treating this as a filter.
+    #[must_use]
+    pub const fn contains_all(self, required: Self) -> bool {
+        self.0 & required.0 == required.0
+    }
+
+    /// Returns the capabilities of `required` that this set lacks, in
+    /// [`Capability::ALL`] order.
+    #[must_use]
+    pub fn missing_from(self, required: Self) -> Vec<Capability> {
+        Capability::ALL
+            .into_iter()
+            .filter(|capability| required.contains(*capability) && !self.contains(*capability))
+            .collect()
+    }
+
     /// Returns the number of capabilities in the set.
     #[must_use]
     pub const fn len(self) -> u32 {
@@ -785,6 +805,21 @@ pub enum AuthMode {
 }
 
 impl AuthMode {
+    /// Every authentication mode, in declaration order.
+    ///
+    /// Adding a variant without extending this constant fails to compile, so
+    /// exhaustive tests over authentication cannot silently skip a new mode.
+    pub const ALL: [Self; 8] = [
+        Self::None,
+        Self::ApiKey,
+        Self::BearerToken,
+        Self::OAuthDeviceCode,
+        Self::OAuthAuthorizationCode,
+        Self::AwsSigV4,
+        Self::GoogleServiceAccount,
+        Self::AzureIdentity,
+    ];
+
     /// Returns the stable identifier of this authentication mode.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -1054,6 +1089,42 @@ mod tests {
             auth_ids.push(mode.as_str());
         }
         assert_eq!(auth_ids.len(), 8);
+        // `AuthMode::ALL` is what exhaustive tests elsewhere iterate, so it is
+        // pinned here against the hand-written list above rather than against
+        // itself. A ninth variant that is not added to `ALL` fails to compile;
+        // one that is added but forgotten here fails this assertion.
+        assert_eq!(AuthMode::ALL, auth_modes);
+    }
+
+    #[test]
+    fn a_capability_set_reports_exactly_the_requirements_it_cannot_satisfy() {
+        let served = CapabilitySet::from_slice(&[
+            Capability::Completion,
+            Capability::Streaming,
+            Capability::ToolCalling,
+        ]);
+
+        assert!(served.contains_all(CapabilitySet::EMPTY));
+        assert!(CapabilitySet::EMPTY.contains_all(CapabilitySet::EMPTY));
+        assert!(served.contains_all(CapabilitySet::from_slice(&[Capability::Streaming])));
+        assert!(served.contains_all(served));
+        assert!(!CapabilitySet::EMPTY.contains_all(served));
+
+        let wanted = CapabilitySet::from_slice(&[
+            Capability::Streaming,
+            Capability::Embeddings,
+            Capability::Vision,
+        ]);
+        assert!(!served.contains_all(wanted));
+        assert_eq!(
+            served.missing_from(wanted),
+            vec![Capability::Embeddings, Capability::Vision],
+        );
+        assert_eq!(served.missing_from(served), Vec::new());
+        assert_eq!(
+            CapabilitySet::EMPTY.missing_from(CapabilitySet::from_slice(&Capability::ALL)),
+            Capability::ALL.to_vec(),
+        );
     }
 
     #[test]

@@ -1,0 +1,16 @@
+{
+  "description": "A completion requested with the wrong method is refused by the router with an Allow header.",
+  "feature_id": "interop.openai.chat-completions",
+  "request": {
+    "method": "GET",
+    "path": "/v1/chat/completions",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": null,
+    "headers": {
+      "allow": "POST"
+    },
+    "status": 405
+  }
+}

@@ -1,0 +1,5 @@
+// reject: decode gatewayCore
+{
+  logging: { level: "info" },
+  gatewayCore: { port: 8787 },
+}

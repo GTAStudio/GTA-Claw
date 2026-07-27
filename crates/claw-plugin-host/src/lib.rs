@@ -34,7 +34,8 @@
 //! [`claw_plugin_api::registry`], where every descriptor is honestly reported
 //! as [`claw_plugin_api::registry::ImplementationStatus::RegistrationOnly`].
 //! [`describe_registry`] renders that state so an operator can see it without
-//! reading the source.
+//! reading the source, and [`describe_compatibility`] renders the per-contract
+//! install and compatibility decisions behind it.
 
 pub(crate) mod bindings;
 pub mod convert;
@@ -49,7 +50,10 @@ pub mod state;
 
 pub use engine::{EPOCH_TICK, PluginEngine};
 pub use error::{GuestFailure, HostError, TerminationCause};
-pub use inventory::{RegistryReport, describe_registry};
+pub use inventory::{
+    CompatibilityReport, DeliveryClassSummary, RegistryReport, describe_compatibility,
+    describe_registry,
+};
 pub use lifecycle::{
     ALLOWED_IMPORTS, Discovered, EventOutcome, LifecycleState, MANIFEST_FILE_NAME, PluginHost,
     PluginHostBuilder, ResourceUsage,

@@ -1,0 +1,14 @@
+// Accepted fixture for pinned top-level domain `update`
+// (compat/upstream/inventories/config-domains.json).
+{
+  update: {
+    channel: "extended-stable",
+    checkOnStart: true,
+    auto: {
+      enabled: true,
+      stableDelayHours: 24,
+      stableJitterHours: 2,
+      betaCheckIntervalHours: 6,
+    },
+  },
+}

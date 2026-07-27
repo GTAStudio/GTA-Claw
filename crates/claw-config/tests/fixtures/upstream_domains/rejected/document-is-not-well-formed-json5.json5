@@ -1,0 +1,3 @@
+// reject: syntax -
+{
+  logging: { level: "info",

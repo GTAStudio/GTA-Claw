@@ -1,0 +1,34 @@
+{
+  "description": "A provider-side input rejection stays a request error rather than being reported as a server fault.",
+  "feature_id": "interop.openai.embeddings",
+  "request": {
+    "body": {
+      "input": "Berlin",
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/embeddings",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "input contains unsupported control characters",
+        "type": "invalid_request_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 400
+  },
+  "runtime": {
+    "embed": {
+      "error": {
+        "kind": "invalid_request",
+        "message": "input contains unsupported control characters"
+      },
+      "kind": "error"
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "description": "A tool that succeeds without a result pins an explicit null rather than an absent field, so clients can rely on the key existing.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "args": {},
+      "name": "noop"
+    },
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "ok": true,
+      "result": null
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "tool": {
+      "kind": "outcome",
+      "ok": true,
+      "status": 200
+    }
+  }
+}

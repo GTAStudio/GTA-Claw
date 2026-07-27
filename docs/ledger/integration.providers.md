@@ -88,6 +88,27 @@ wire codecs.
   concurrency limit) shared by every client.
 * `openai_compatible.rs`, `anthropic.rs`, `github_copilot.rs` — the three real
   dialects.
+* `alias.rs` — name normalisation (trim + ASCII lowercase, *no* separator folding)
+  and a validated `AliasTable` that refuses an alias which shadows a frozen id,
+  repeats an earlier alias, points at an unregistered target, or is not in
+  normalised form. Ships 35 built-in aliases.
+* `config.rs` — `ProviderConfig` deserialisation with `deny_unknown_fields`,
+  base-URL scheme/host rules, reserved-header refusal, and stable error codes.
+* `auth.rs` — `AuthConfig`, an internally tagged sum over all eight `AuthMode`
+  spellings, a redacting `SecretField`, and `authorize()` which refuses a mode a
+  provider does not declare and a credential that is blank once trimmed.
+* `routing.rs` — `RoutingTable` over resolved configurations: capability
+  candidates in frozen inventory order, ordered preferences, and an explicit
+  `NoProviderAvailable` rather than a silent fallback.
+
+### Why separator folding is not performed
+
+`novita-ai` / `novitaai` and `gmi-cloud` / `gmicloud` are four *distinct* rows in
+the frozen inventory. Stripping `-` during normalisation would map each pair onto
+one string and silently send a request to whichever row won the collision. The
+test `separator_folding_would_merge_distinct_frozen_rows` derives that collision
+set from the inventory JSON rather than asserting it from memory, so the rule
+stays justified by the data instead of by a comment.
 
 ## Provider status — the honest list
 
@@ -253,19 +274,52 @@ Proving tests: `secret.rs::debug_and_display_never_reveal_a_secret`,
 
 ## Tests
 
-248 tests, none of which touch a third-party network. Every HTTP test runs against a
+376 tests, none of which touch a third-party network. Every HTTP test runs against a
 loopback `tokio` HTTP/1.1 server in `tests/support/mod.rs` that records the exact
 request line, headers and body it received, and that can be told to close the
 connection early, stall, or emit a specific chunk sequence.
 
 | Suite | Tests |
 | --- | ---: |
-| `claw-provider-sdk` unit | 123 |
-| `claw-provider-sdk` `tests/transport.rs` | 8 |
-| `claw-providers` unit | 88 |
+| `claw-provider-sdk` unit | 140 |
+| `claw-provider-sdk` `tests/secret_transactions.rs` | 27 |
+| `claw-provider-sdk` `tests/transport.rs` | 20 |
+| `claw-providers` unit | 134 |
 | `claw-providers` `tests/frozen_inventory.rs` | 6 |
+| `claw-providers` `tests/registry_contract.rs` | 12 |
+| `claw-providers` `tests/security.rs` | 14 |
 | `claw-providers` `tests/wire.rs` | 23 |
-| **total** | **248** |
+| **total** | **376** |
+
+One `#[ignore]` remains, in `tests/secret_transactions.rs`; it predates this row and
+is not part of its evidence. Nothing added for this row is ignored.
+
+### The five required dimensions
+
+Each of these reads `compat/upstream/inventories/providers.json` at run time and
+iterates it item by item, so a missing row and a surplus row both fail.
+
+| Dimension | Test in `crates/claw-providers/tests/registry_contract.rs` |
+| --- | --- |
+| IDs | `every_frozen_identifier_resolves_canonically_and_near_misses_do_not` |
+| aliases | `no_frozen_identifier_may_be_registered_as_an_alias`, `the_builtin_alias_table_only_names_frozen_identifiers`, `separator_folding_would_merge_distinct_frozen_rows` |
+| configuration | `every_frozen_provider_is_configurable_exactly_as_its_status_allows`, `every_frozen_provider_configuration_rejects_an_unknown_field`, `the_configuration_fixture_corpus_is_classified_exactly` |
+| auth | `every_frozen_provider_accepts_exactly_its_declared_auth_modes`, `every_frozen_provider_rejects_a_blank_credential_in_every_secret_bearing_mode` |
+| capability routing | `capability_routing_serves_every_client_bearing_frozen_provider`, `capability_routing_finds_nothing_when_no_configured_provider_qualifies`, `the_capability_catalogue_covers_the_frozen_inventory_exactly` |
+
+`tests/fixtures/provider-configs.json` holds the 34-case configuration and
+credential corpus. Each case names a stable machine-readable error code rather
+than a message, so a wording change cannot silently turn a refusal into an
+acceptance, and `the_configuration_fixture_corpus_is_classified_exactly`
+additionally asserts set equality between the codes the corpus exercises and
+`ConfigError::ALL_CODES` — which the unit test `every_refusal_code_appears_in_all_codes`
+holds equal to an exhaustive `match` over both error enums. Adding a refusal path
+therefore fails a test until a fixture case pins its behaviour.
+
+The suite was mutation-checked rather than merely run. Folding `-` in
+`alias::normalize` turns 8 of the 12 red; deleting `deny_unknown_fields` from
+`ProviderConfig` turns 2 red; inserting one fabricated row into the descriptor
+table turns 3 of the 12 and 5 of the 6 `frozen_inventory.rs` tests red.
 
 The specific classes the brief called for:
 
@@ -344,3 +398,13 @@ by calling the production function under test.
     level (`SecretString`, the manual `Debug` impls); there is no log sink to
     intercept, so a caller that calls `.expose()` and logs the result can still leak.
     That is deliberate — `expose()` is the single audited chokepoint.
+14. **Auth stops at credential admissibility.** `auth.rs` decides whether a credential
+    shape is one the provider declares and whether the secret is present; it does not
+    perform an OAuth device-code or authorization-code exchange, sign an AWS SigV4
+    request, mint a Google service-account assertion, or acquire an Azure identity
+    token. Those flows are live-network work and are out of scope for this row, which
+    is why the `auth` dimension is recorded as `implemented_partial`.
+15. **The 35 built-in aliases are GTA-Claw's, not upstream's.** The frozen inventory
+    publishes identifiers only; it declares no aliases. The built-in table is a
+    convenience layer, and the tests prove only that it is internally consistent with
+    the inventory — never that upstream would accept the same spellings.

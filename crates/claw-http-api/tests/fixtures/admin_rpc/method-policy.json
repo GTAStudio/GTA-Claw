@@ -1,0 +1,46 @@
+{
+  "description": "Admin HTTP RPC method policy cases. The policy is fail-closed: 'not_allowlisted' is the default outcome for any name that is not listed verbatim, including a correctly registered Gateway method, a differently cased name and a name with extra segments.",
+  "frozen_policy": [
+    { "method": "status", "outcome": "allowed", "required_scope": "operator.read" },
+    { "method": "health", "outcome": "allowed", "required_scope": "operator.read" },
+    {
+      "method": "commands.list",
+      "outcome": "allowed",
+      "required_scope": "operator.read"
+    },
+    {
+      "method": "config.set",
+      "outcome": "allowed",
+      "required_scope": "operator.admin"
+    },
+    {
+      "method": "device.pair.approve",
+      "outcome": "allowed",
+      "required_scope": "operator.pairing"
+    },
+    { "method": "chat.send", "outcome": "not_allowlisted" },
+    { "method": "sessions.create", "outcome": "not_allowlisted" },
+    { "method": "node.event", "outcome": "not_allowlisted" },
+    { "method": "totally.unknown.method", "outcome": "not_allowlisted" },
+    { "method": "Status", "outcome": "not_allowlisted" },
+    { "method": "STATUS", "outcome": "not_allowlisted" },
+    { "method": "status.extra", "outcome": "not_allowlisted" },
+    { "method": "config", "outcome": "not_allowlisted" },
+    { "method": "", "outcome": "not_allowlisted" }
+  ],
+  "widened_policy": {
+    "methods": [
+      "status",
+      "node.event",
+      "sessions.create",
+      "not.a.registry.method"
+    ],
+    "cases": [
+      { "method": "status", "outcome": "allowed", "required_scope": "operator.read" },
+      { "method": "node.event", "outcome": "not_operator_surface" },
+      { "method": "sessions.create", "outcome": "not_operator_surface" },
+      { "method": "not.a.registry.method", "outcome": "not_registered" },
+      { "method": "config.set", "outcome": "not_allowlisted" }
+    ]
+  }
+}

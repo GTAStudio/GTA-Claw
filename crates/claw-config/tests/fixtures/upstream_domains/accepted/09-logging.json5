@@ -1,0 +1,13 @@
+// Accepted fixture for pinned top-level domain `logging`
+// (compat/upstream/inventories/config-domains.json).
+{
+  logging: {
+    level: "info",
+    file: "logs/claw.log",
+    maxFileBytes: 10485760,
+    consoleLevel: "warn",
+    consoleStyle: "pretty",
+    redactSensitive: "tools",
+    redactPatterns: ["(?i)token"],
+  },
+}

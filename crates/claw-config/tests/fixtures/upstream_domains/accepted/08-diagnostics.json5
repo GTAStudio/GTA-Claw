@@ -1,0 +1,11 @@
+// Accepted fixture for pinned top-level domain `diagnostics`
+// (compat/upstream/inventories/config-domains.json).
+{
+  diagnostics: {
+    enabled: true,
+    flags: ["gateway", "tools"],
+    stuckSessionWarnMs: 60000,
+    stuckSessionAbortMs: 300000,
+    memoryPressureSnapshot: true,
+  },
+}

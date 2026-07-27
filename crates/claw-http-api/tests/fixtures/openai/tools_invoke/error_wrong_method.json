@@ -1,0 +1,16 @@
+{
+  "description": "An invocation with the wrong method is refused by the router with an Allow header.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "method": "GET",
+    "path": "/tools/invoke",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": null,
+    "headers": {
+      "allow": "POST"
+    },
+    "status": 405
+  }
+}

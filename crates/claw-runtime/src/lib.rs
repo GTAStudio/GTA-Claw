@@ -13,6 +13,7 @@
 pub mod approval;
 pub mod command;
 pub mod context;
+pub mod context_engine;
 pub mod goal;
 pub mod goal_tool;
 pub mod runtime;
@@ -30,6 +31,10 @@ pub use command::{
     TurnOptions,
 };
 pub use context::{ConformanceCheck, ConformanceReport, verify_context_engine};
+pub use context_engine::{
+    CONFORMANCE_TOKEN_BUDGET, LifecyclePhase, ReferenceContextEngine, SpiReport, SpiRequirement,
+    SpiViolation, verify_spi_conformance,
+};
 pub use goal::{GoalConfig, GoalError, GoalService};
 pub use goal_tool::{
     GOAL_TOOL_NAME, GoalAction, GoalToolError, goal_tool_descriptor, parse_goal_action,

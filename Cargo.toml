@@ -14,9 +14,11 @@ members = [
   "crates/claw-config",
   "crates/claw-conformance",
   "crates/claw-crestodian",
+  "crates/claw-discovery",
   "crates/claw-domain",
   "crates/claw-gateway",
   "crates/claw-gateway-client",
+  "crates/claw-goals",
   "crates/claw-http-api",
   "crates/claw-mcp",
   "crates/claw-memory",
@@ -34,6 +36,7 @@ members = [
   "crates/claw-security",
   "crates/claw-skills",
   "crates/claw-tools",
+  "crates/claw-worker",
 ]
 exclude = ["android", "desktop", "ios"]
 resolver = "3"
@@ -47,9 +50,11 @@ claw-clients = { path = "crates/claw-clients", version = "0.1.0" }
 claw-config = { path = "crates/claw-config", version = "0.1.0" }
 claw-conformance = { path = "crates/claw-conformance", version = "0.1.0" }
 claw-crestodian = { path = "crates/claw-crestodian", version = "0.1.0" }
+claw-discovery = { path = "crates/claw-discovery", version = "0.1.0" }
 claw-domain = { path = "crates/claw-domain", version = "0.1.0" }
 claw-gateway = { path = "crates/claw-gateway", version = "0.1.0" }
 claw-gateway-client = { path = "crates/claw-gateway-client", version = "0.1.0" }
+claw-goals = { path = "crates/claw-goals", version = "0.1.0" }
 claw-http-api = { path = "crates/claw-http-api", version = "0.1.0" }
 claw-mcp = { path = "crates/claw-mcp", version = "0.1.0" }
 claw-memory = { path = "crates/claw-memory", version = "0.1.0" }

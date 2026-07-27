@@ -18,6 +18,9 @@
 //!   which plugin identity, plus manifest signature verification.
 //! * [`registry`] - all 137 descriptors from the frozen upstream inventory,
 //!   with an explicit and deliberately conservative implementation status.
+//! * [`compat`] - the per-contract install and compatibility decision for each
+//!   of those 137 descriptors, so a reader can see which are implemented and
+//!   which are explicit stubs without inferring it.
 //!
 //! The WIT world itself lives in `wit/gta-claw-plugin/world.wit` and is
 //! re-exported here as [`WIT_WORLD`] so tools can embed it without guessing a
@@ -26,6 +29,7 @@
 
 pub mod abi;
 pub mod capability;
+pub mod compat;
 pub mod limits;
 pub mod manifest;
 pub mod policy;

@@ -1,0 +1,22 @@
+{
+  "description": "A node-role credential carrying operator.admin is still refused, and the refusal leaks no distinction between the role gate and the scope gate.",
+  "feature_id": "interop.openai.models",
+  "request": {
+    "method": "GET",
+    "path": "/v1/models",
+    "token": "node-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "missing scope: operator.read",
+        "type": "forbidden"
+      },
+      "ok": false
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 403
+  }
+}

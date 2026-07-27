@@ -1,0 +1,22 @@
+{
+  "description": "A body that is not JSON is a request error, distinct from a well-formed body with invalid values.",
+  "feature_id": "interop.openai.chat-completions",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "raw_body": "{\"model\":\"openclaw\",}",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "Invalid JSON: trailing comma at line 1 column 21",
+        "type": "invalid_request_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 400
+  }
+}

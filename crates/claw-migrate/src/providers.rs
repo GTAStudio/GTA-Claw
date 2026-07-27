@@ -38,6 +38,7 @@ impl MigrationProvider for ClaudeMigrationProvider {
             root.join("settings.json"),
             root.join("CLAUDE.md"),
             root.join(".mcp.json"),
+            root.join(".credentials.json"),
             root.join(".claude").join("settings.json"),
             root.join(".claude").join("CLAUDE.md"),
         ];
@@ -343,6 +344,14 @@ fn build_claude_operations(
         return Ok(operations);
     }
     let global = root.file_name().is_some_and(|name| name == ".claude");
+    add_claude_exclusion_diagnostic(
+        &if global {
+            root.to_path_buf()
+        } else {
+            root.join(".claude")
+        },
+        diagnostics,
+    );
     if global {
         add_append(
             &mut operations,
@@ -389,6 +398,16 @@ fn build_claude_operations(
                 .join("desktop.json"),
             "claude-desktop",
         )?;
+        add_secret_document(
+            &mut operations,
+            &root.join(".credentials.json"),
+            &target
+                .join("config")
+                .join("migrations")
+                .join("claude")
+                .join("credentials.json"),
+            "claude-credentials",
+        );
         collect_skill_directories(
             &root.join("skills"),
             &target.join("workspace").join("skills"),
@@ -732,6 +751,37 @@ fn claude_desktop_config(paths: &dyn PlatformPaths) -> PathBuf {
         .join("claude_desktop_config.json")
 }
 
+/// Claude runtime state that is deliberately never carried into the target.
+///
+/// These entries hold executable plugin code, recorded shell snapshots, IDE
+/// handshake state and telemetry. Copying them would move untrusted executables
+/// and opaque machine state into the migration target, so the plan reports the
+/// exclusion instead of moving them silently.
+const CLAUDE_EXCLUDED_STATE: [&str; 5] = ["ide", "plugins", "shell-snapshots", "statsig", "todos"];
+
+/// Claude settings whose value names an external command.
+const CLAUDE_COMMAND_SETTINGS: [&str; 3] =
+    ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport"];
+
+fn add_claude_exclusion_diagnostic(root: &Path, diagnostics: &mut Vec<Diagnostic>) {
+    let excluded = CLAUDE_EXCLUDED_STATE
+        .iter()
+        .filter(|name| root.join(name).exists())
+        .copied()
+        .collect::<Vec<_>>();
+    if excluded.is_empty() {
+        return;
+    }
+    diagnostics.push(diagnostic(
+        "CLAUDE_UNSAFE_STATE_EXCLUDED",
+        DiagnosticSeverity::Warning,
+        &format!(
+            "Claude runtime state was detected and excluded from the migration: {}.",
+            excluded.join(", ")
+        ),
+    ));
+}
+
 fn add_claude_manual_diagnostic(
     path: &Path,
     diagnostics: &mut Vec<Diagnostic>,
@@ -768,6 +818,16 @@ fn add_claude_manual_diagnostic(
         if object.contains_key(key) {
             diagnostics.push(diagnostic(code, DiagnosticSeverity::Warning, message));
         }
+    }
+    if CLAUDE_COMMAND_SETTINGS
+        .iter()
+        .any(|key| object.contains_key(*key))
+    {
+        diagnostics.push(diagnostic(
+            "CLAUDE_COMMAND_SETTING_MANUAL_REVIEW",
+            DiagnosticSeverity::Warning,
+            "A Claude setting names an external credential command; it was preserved for review and is never executed.",
+        ));
     }
     Ok(())
 }
