@@ -6,6 +6,7 @@
 
 pub mod audit;
 pub mod authorization;
+pub mod gateway_authz;
 pub mod identity;
 pub mod pairing;
 pub mod secret;
