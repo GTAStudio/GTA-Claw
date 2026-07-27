@@ -1,0 +1,259 @@
+# Golden table for inline directive parsing.
+#
+# Source: openclaw/openclaw@b43e832fcc8000ed7287c7accc54e381db607f85
+#   src/auto-reply/reply/directives.ts
+#   src/auto-reply/thinking.shared.ts
+#
+# `cleaned` is the message text the model receives once the directive is
+# removed. `raw_level` is the token the sender typed; `level` is its normalized
+# form and is absent when the token is not a known level.
+#
+# `authorized` defaults to true. Unauthorized senders see directives as plain
+# text (docs/tools/slash-commands.md).
+
+name: a directive alone leaves an empty message
+directive: think
+input: "/think high"
+present: true
+cleaned: ""
+raw_level: high
+level: high
+
+name: the separating space is consumed with the directive
+directive: think
+input: "please /think high answer me"
+present: true
+cleaned: "please answer me"
+raw_level: high
+level: high
+
+name: a trailing directive is removed from the middle of the text
+directive: think
+input: "answer me /think high"
+present: true
+cleaned: "answer me"
+raw_level: high
+level: high
+
+name: directive names are matched case-insensitively
+directive: think
+input: "/THINK HIGH"
+present: true
+cleaned: ""
+raw_level: HIGH
+level: high
+
+name: a colon separator is accepted
+directive: think
+input: "/thinking: max and then some"
+present: true
+cleaned: "and then some"
+raw_level: max
+level: max
+
+name: any Unicode whitespace opens the boundary
+directive: think
+input: "a\u{00a0}/think high"
+present: true
+cleaned: a
+raw_level: high
+level: high
+
+name: a directive glued to the previous character is plain text
+directive: think
+input: "x/think high"
+present: false
+cleaned: "x/think high"
+
+name: a path segment inside a URL is not a directive
+directive: think
+input: "see https://example.com/think about it"
+present: false
+cleaned: "see https://example.com/think about it"
+
+name: a longer word starting with the directive name is not a directive
+directive: status
+input: "email the /statusbot instead"
+present: false
+cleaned: "email the /statusbot instead"
+
+name: a partial directive name does not match
+directive: think
+input: "/thin high"
+present: false
+cleaned: "/thin high"
+
+name: a hyphen immediately after the name breaks the boundary
+directive: think
+input: "/think-hard"
+present: false
+cleaned: "/think-hard"
+
+name: the shortest alias still needs a boundary
+directive: think
+input: "/t"
+present: true
+cleaned: ""
+
+name: a bare directive carries no level
+directive: verbose
+input: "/v tell me more"
+present: true
+cleaned: "tell me more"
+
+name: an unknown level followed by more text stays in the message
+directive: think
+input: "/think banana about it"
+present: true
+cleaned: "banana about it"
+
+name: an unknown level at the end is captured but does not normalize
+directive: think
+input: "/think banana"
+present: true
+cleaned: ""
+raw_level: banana
+
+name: level tokens may contain hyphens
+directive: think
+input: "/think think-hard"
+present: true
+cleaned: ""
+raw_level: think-hard
+level: low
+
+name: separators inside a level are collapsed before matching
+directive: think
+input: "/think extra-high"
+present: true
+cleaned: ""
+raw_level: extra-high
+level: xhigh
+
+name: the first of several directives is removed and the rest survives
+directive: think
+input: "/think high /verbose full go"
+present: true
+cleaned: "/verbose full go"
+raw_level: high
+level: high
+
+name: the second directive is removed by its own pass
+directive: verbose
+input: "/verbose full go"
+present: true
+cleaned: go
+raw_level: full
+level: full
+
+name: verbose off
+directive: verbose
+input: "/verbose off now"
+present: true
+cleaned: now
+raw_level: off
+level: off
+
+name: trace raw
+directive: trace
+input: "/trace raw"
+present: true
+cleaned: ""
+raw_level: raw
+level: raw
+
+name: trace numeric truthy
+directive: trace
+input: "/trace 1"
+present: true
+cleaned: "1"
+
+name: fast auto
+directive: fast
+input: "/fast auto build it"
+present: true
+cleaned: "build it"
+raw_level: auto
+level: auto
+
+name: fast disabled
+directive: fast
+input: "/fast disabled"
+present: true
+cleaned: ""
+raw_level: disabled
+level: off
+
+name: elevated short alias
+directive: elevated
+input: "/elev ask"
+present: true
+cleaned: ""
+raw_level: ask
+level: ask
+
+name: elevated auto approves fully
+directive: elevated
+input: "/elevated auto-approve run it"
+present: true
+cleaned: "run it"
+raw_level: auto-approve
+level: full
+
+name: reasoning short alias
+directive: reasoning
+input: "/reason stream"
+present: true
+cleaned: ""
+raw_level: stream
+level: stream
+
+name: reasoning with an unknown level keeps the token as text
+directive: reasoning
+input: "/reasoning: nonsense here"
+present: true
+cleaned: "nonsense here"
+
+name: status takes no level
+directive: status
+input: "/status"
+present: true
+cleaned: ""
+
+name: status is removed from the middle of the text
+directive: status
+input: "hey /status please"
+present: true
+cleaned: "hey please"
+
+name: status accepts a trailing colon
+directive: status
+input: "/status:"
+present: true
+cleaned: ""
+
+name: status leaves following words in the message
+directive: status
+input: "/status plugins"
+present: true
+cleaned: plugins
+
+name: an unauthorized sender sees a directive as plain text
+directive: think
+authorized: false
+input: "  /think high answer me  "
+present: false
+cleaned: "/think high answer me"
+
+name: an unauthorized sender sees status as plain text
+directive: status
+authorized: false
+input: "hey /status please"
+present: false
+cleaned: "hey /status please"
+
+name: an absent directive trims the body and reports nothing
+directive: think
+input: "   just a message   "
+present: false
+cleaned: "just a message"
