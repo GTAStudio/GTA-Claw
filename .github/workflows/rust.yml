@@ -75,8 +75,21 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # NOTE: this line is pinned by the trust root. `repository_policy.rs:663`
+      # requires a line equal to
+      #   run: cargo test --workspace --all-targets --locked
+      # so --no-fail-fast cannot be added here without a coordinated change to
+      # .github/trusted/, which this branch does not own. See the PR body.
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
+
+      # --all-targets does not collect doctests, so before this step no doc
+      # example in the workspace was ever executed by CI. Additive: it changes
+      # no existing command. Runs even when the step above failed, because a
+      # test failure is not a reason to leave another category unevaluated.
+      - name: Run doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --doc --locked --no-fail-fast
 
       - name: Assert root metadata excludes Slint
         if: runner.os == 'Linux'
@@ -156,8 +169,11 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --manifest-path desktop/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
+      # Same reasoning as the root workspace job. No --doc step here: the
+      # desktop workspace's only member is a bin crate with no lib target, so
+      # `--doc` would collect zero tests and report success.
       - name: Run tests
-        run: cargo test --manifest-path desktop/Cargo.toml --workspace --all-targets --locked
+        run: cargo test --manifest-path desktop/Cargo.toml --workspace --all-targets --locked --no-fail-fast
 
       - name: Build desktop application
         run: cargo build --manifest-path desktop/Cargo.toml --workspace --locked
