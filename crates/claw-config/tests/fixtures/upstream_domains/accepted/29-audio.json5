@@ -1,0 +1,10 @@
+// Accepted fixture for pinned top-level domain `audio`
+// (compat/upstream/inventories/config-domains.json).
+{
+  audio: {
+    transcription: {
+      command: ["whisper", "--model", "base"],
+      timeoutSeconds: 120,
+    },
+  },
+}

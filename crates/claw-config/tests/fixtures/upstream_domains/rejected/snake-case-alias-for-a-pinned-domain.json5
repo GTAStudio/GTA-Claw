@@ -1,0 +1,4 @@
+// reject: decode access_groups
+{
+  access_groups: {},
+}

@@ -1,0 +1,15 @@
+// Accepted fixture for pinned top-level domain `mcp`
+// (compat/upstream/inventories/config-domains.json).
+{
+  mcp: {
+    servers: {
+      docs: { enabled: true, command: "claw-mcp", args: ["--stdio"] },
+    },
+    apps: {
+      enabled: true,
+      sandboxOrigin: "https://apps.example.test",
+      sandboxPort: 7777,
+    },
+    sessionIdleTtlMs: 900000,
+  },
+}

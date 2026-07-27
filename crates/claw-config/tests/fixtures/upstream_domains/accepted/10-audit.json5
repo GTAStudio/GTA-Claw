@@ -1,0 +1,8 @@
+// Accepted fixture for pinned top-level domain `audit`
+// (compat/upstream/inventories/config-domains.json).
+{
+  audit: {
+    enabled: true,
+    messages: "direct",
+  },
+}

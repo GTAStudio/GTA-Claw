@@ -1,0 +1,11 @@
+// Accepted fixture for pinned top-level domain `ui`
+// (compat/upstream/inventories/config-domains.json).
+{
+  ui: {
+    seamColor: "#12aBc9",
+    assistant: {
+      name: "Claw",
+      avatar: "https://example.test/avatar.png",
+    },
+  },
+}

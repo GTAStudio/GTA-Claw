@@ -1,0 +1,4 @@
+// reject: decode gateway.portNumber
+{
+  gateway: { portNumber: 8787 },
+}

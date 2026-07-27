@@ -1,0 +1,16 @@
+// Accepted fixture for pinned top-level domain `gateway`
+// (compat/upstream/inventories/config-domains.json).
+{
+  gateway: {
+    port: 8787,
+    mode: "local",
+    bind: "loopback",
+    auth: { mode: "token", allowTailscale: true },
+    trustedProxies: ["10.0.0.0/8"],
+    allowRealIpFallback: false,
+    handshakeTimeoutMs: 15000,
+    channelHealthCheckMinutes: 5,
+    channelStaleEventThresholdMinutes: 30,
+    channelMaxRestartsPerHour: 6,
+  },
+}

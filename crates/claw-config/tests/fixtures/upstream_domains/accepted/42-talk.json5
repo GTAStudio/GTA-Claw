@@ -1,0 +1,15 @@
+// Accepted fixture for pinned top-level domain `talk`
+// (compat/upstream/inventories/config-domains.json).
+{
+  talk: {
+    provider: "openai",
+    providers: {
+      openai: { model: "gpt-realtime" },
+    },
+    consultThinkingLevel: "medium",
+    consultFastMode: true,
+    speechLocale: "en-US",
+    interruptOnSpeech: true,
+    silenceTimeoutMs: 2000,
+  },
+}

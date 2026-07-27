@@ -1,0 +1,4 @@
+// reject: validation ui.seamColor
+{
+  ui: { seamColor: "blue" },
+}

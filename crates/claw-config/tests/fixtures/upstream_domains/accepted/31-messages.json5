@@ -1,0 +1,13 @@
+// Accepted fixture for pinned top-level domain `messages`
+// (compat/upstream/inventories/config-domains.json).
+{
+  messages: {
+    messagePrefix: "[claw] ",
+    visibleReplies: "message_tool",
+    responsePrefix: "> ",
+    ackReaction: "eyes",
+    ackReactionScope: "group-mentions",
+    removeAckAfterReply: true,
+    suppressToolErrors: false,
+  },
+}

@@ -1,0 +1,11 @@
+// Accepted fixture for pinned top-level domain `models`
+// (compat/upstream/inventories/config-domains.json).
+{
+  models: {
+    mode: "merge",
+    providers: {
+      openai: { baseUrl: "https://api.example.test/v1" },
+    },
+    pricing: { enabled: true },
+  },
+}

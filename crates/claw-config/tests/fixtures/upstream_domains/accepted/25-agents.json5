@@ -1,0 +1,15 @@
+// Accepted fixture for pinned top-level domain `agents`
+// (compat/upstream/inventories/config-domains.json).
+{
+  agents: {
+    defaults: { model: "openai/gpt-5" },
+    list: [
+      {
+        id: "main",
+        default: true,
+        name: "Main",
+        description: "Primary agent",
+      },
+    ],
+  },
+}

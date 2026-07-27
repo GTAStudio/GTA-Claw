@@ -1,0 +1,13 @@
+// Accepted fixture for pinned top-level domain `marketplaces`
+// (compat/upstream/inventories/config-domains.json).
+{
+  marketplaces: {
+    feeds: {
+      official: { url: "https://feeds.example.test/claw.json" },
+    },
+    sources: {
+      registry: { type: "npm" },
+      hub: { type: "clawhub" },
+    },
+  },
+}

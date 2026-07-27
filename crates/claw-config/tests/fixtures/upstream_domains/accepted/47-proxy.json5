@@ -1,0 +1,9 @@
+// Accepted fixture for pinned top-level domain `proxy`
+// (compat/upstream/inventories/config-domains.json).
+{
+  proxy: {
+    enabled: true,
+    tls: { caFile: "/etc/ssl/certs/ca.pem" },
+    loopbackMode: "gateway-only",
+  },
+}
