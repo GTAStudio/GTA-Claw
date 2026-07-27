@@ -9,6 +9,7 @@ use axum::http::StatusCode;
 
 use crate::config::ApiConfig;
 use crate::error::ApiError;
+use crate::lifecycle::ServingStatePort;
 use crate::ports::ApiServices;
 use crate::watch::WatchRuntime;
 
@@ -24,6 +25,7 @@ pub(crate) struct ApiStateInner {
     pub(crate) config: ApiConfig,
     pub(crate) services: ApiServices,
     pub(crate) watch: WatchRuntime,
+    pub(crate) serving: Arc<dyn ServingStatePort>,
     response_sessions: Mutex<HashMap<String, ResponseSession>>,
     next_id: AtomicU64,
 }
@@ -37,13 +39,18 @@ struct ResponseSession {
 }
 
 impl ApiState {
-    pub(crate) fn new(config: ApiConfig, services: ApiServices) -> Self {
+    pub(crate) fn with_serving_state(
+        config: ApiConfig,
+        services: ApiServices,
+        serving: Arc<dyn ServingStatePort>,
+    ) -> Self {
         let watch = WatchRuntime::new(config.limits.clone(), services.watch_results.clone());
         Self {
             inner: Arc::new(ApiStateInner {
                 config,
                 services,
                 watch,
+                serving,
                 response_sessions: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
             }),
