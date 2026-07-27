@@ -508,6 +508,7 @@ dependencies = [
  "claw-security",
  "ed25519-dalek",
  "getrandom",
+ "serde",
  "serde_json",
  "wasmtime",
  "wat",
