@@ -4,7 +4,7 @@
 //! (`compat/upstream/inventories/providers.json`) with typed GTA-Claw metadata,
 //! and ships real clients for three wire dialects:
 //!
-//! * [`openai_compatible`] — the OpenAI `chat/completions` dialect.
+//! * [`openai_compatible`] — the `OpenAI` `chat/completions` dialect.
 //! * [`anthropic`] — Anthropic `POST /v1/messages`.
 //! * [`github_copilot`] — GitHub Copilot, reached through a pure-Rust
 //!   RFC 8628 device authorization flow.

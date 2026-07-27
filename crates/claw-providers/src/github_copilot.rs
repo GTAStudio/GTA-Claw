@@ -3,7 +3,7 @@
 //! Neither `github-copilot-sdk` nor the Copilot CLI appears anywhere in this
 //! crate's dependency graph. Authentication is an RFC 8628 OAuth 2.0 device
 //! authorization grant spoken directly over `hyper`/`rustls`, followed by the
-//! Copilot token exchange; the chat surface is the OpenAI dialect with the
+//! Copilot token exchange; the chat surface is the `OpenAI` dialect with the
 //! editor headers Copilot requires.
 //!
 //! The flow is:
@@ -219,12 +219,13 @@ pub fn oauth_error_kind(code: &str) -> ErrorKind {
     match code {
         "authorization_pending" | "slow_down" => ErrorKind::RateLimit,
         "access_denied"
-        | "unauthorized_client"
+        | "device_flow_disabled"
+        | "expired_token"
+        | "incorrect_client_credentials"
+        | "incorrect_device_code"
         | "invalid_client"
         | "invalid_grant"
-        | "incorrect_client_credentials"
-        | "incorrect_device_code" => ErrorKind::Authentication,
-        "expired_token" | "device_flow_disabled" => ErrorKind::Authentication,
+        | "unauthorized_client" => ErrorKind::Authentication,
         "unsupported_grant_type" | "invalid_request" => ErrorKind::InvalidRequest,
         _ => ErrorKind::Protocol,
     }
@@ -423,7 +424,9 @@ impl DeviceFlow {
     ///
     /// # Errors
     ///
-    /// See [`DeviceFlow::new`].
+    /// Returns [`ErrorKind::InvalidRequest`] if the pinned github.com endpoint
+    /// constants ever stop parsing, and [`ErrorKind::Transport`] when the TLS
+    /// stack cannot be built.
     pub fn github() -> Result<Self, ProviderError> {
         Self::new(DeviceFlowConfig::github()?)
     }
@@ -448,7 +451,10 @@ impl DeviceFlow {
     ///
     /// # Errors
     ///
-    /// Returns the typed transport or OAuth error.
+    /// Returns [`ErrorKind::Transport`] when the device-code endpoint cannot be
+    /// reached, [`ErrorKind::Cancelled`] when `cancel` fires, the typed error
+    /// for the OAuth `error` code the server returned, and
+    /// [`ErrorKind::Protocol`] when the reply is not a device authorization.
     pub async fn start(&self, cancel: &CancelToken) -> Result<DeviceAuthorization, ProviderError> {
         let form = encode_device_code_form(&self.client_id, &self.scope);
         let response = self
@@ -466,7 +472,11 @@ impl DeviceFlow {
     ///
     /// # Errors
     ///
-    /// Returns the typed transport or OAuth error. Pending and slow-down are
+    /// Returns [`ErrorKind::Transport`] when the access-token endpoint cannot
+    /// be reached, [`ErrorKind::Cancelled`] when `cancel` fires, the typed
+    /// error for a terminal OAuth `error` code such as `access_denied` or
+    /// `expired_token`, and [`ErrorKind::Protocol`] when the reply is neither
+    /// an error nor a token. `authorization_pending` and `slow_down` are
     /// reported as [`DevicePollOutcome`] values, not errors.
     pub async fn poll_once(
         &self,
@@ -744,7 +754,9 @@ impl GitHubCopilot {
     ///
     /// # Errors
     ///
-    /// See [`GitHubCopilot::new`].
+    /// Returns [`ErrorKind::Authentication`] when `github_token` is empty once
+    /// trimmed, and [`ErrorKind::Transport`] when the TLS stack cannot be
+    /// built.
     pub fn with_github_token(github_token: SecretString) -> Result<Self, ProviderError> {
         Self::new(GitHubCopilotConfig::new(github_token)?)
     }
@@ -782,7 +794,11 @@ impl GitHubCopilot {
     ///
     /// # Errors
     ///
-    /// Returns the typed transport or protocol error.
+    /// Returns [`ErrorKind::Authentication`] when GitHub rejects the token,
+    /// [`ErrorKind::Transport`] when the exchange endpoint cannot be reached,
+    /// [`ErrorKind::Cancelled`] when `cancel` fires, and
+    /// [`ErrorKind::Protocol`] when the reply is not a Copilot token
+    /// document.
     pub async fn exchange_token(
         &self,
         cancel: &CancelToken,
@@ -965,6 +981,12 @@ impl Provider for GitHubCopilot {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "this mirrors Copilot's `capabilities.supports` object one field per \
+              wire key; the flags are independent booleans upstream, so folding \
+              them into an enum would invent a state machine the API does not have"
+)]
 struct WireSupports {
     #[serde(default)]
     streaming: bool,
@@ -1009,7 +1031,7 @@ struct WireModelList {
 /// Decodes the Copilot model catalogue.
 ///
 /// Copilot publishes per-model capability and limit metadata, so unlike the
-/// plain OpenAI catalogue these descriptors carry real capability bits rather
+/// plain `OpenAI` catalogue these descriptors carry real capability bits rather
 /// than an empty set.
 ///
 /// # Errors

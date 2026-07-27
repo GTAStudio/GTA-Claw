@@ -31,7 +31,7 @@ use std::fmt::{self, Display, Formatter};
 use std::sync::OnceLock;
 
 use crate::descriptor::ProviderDescriptor;
-use crate::registry::ProviderRegistry;
+use crate::registry::{self, ProviderRegistry};
 
 /// GTA-Claw-owned convenience aliases.
 ///
@@ -118,7 +118,7 @@ impl Resolution {
 
     /// Returns `true` when the name was an alias rather than a frozen id.
     #[must_use]
-    pub fn is_alias(&self) -> bool {
+    pub const fn is_alias(&self) -> bool {
         matches!(self.matched, MatchKind::Alias(_))
     }
 }
@@ -224,7 +224,7 @@ pub struct AliasTable {
 impl AliasTable {
     /// Builds a table with no aliases, so only frozen identifiers resolve.
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             entries: BTreeMap::new(),
         }
@@ -310,26 +310,51 @@ impl AliasTable {
     /// A frozen identifier always wins over an alias, which cannot happen
     /// anyway because [`AliasTable::new`] refuses a shadowing alias.
     ///
+    /// Resolution is a single step and cannot loop: an alias maps straight to a
+    /// [`ProviderDescriptor`], and [`AliasTable::new`] only accepts a target
+    /// that is already a frozen identifier, so no alias can name another alias.
+    ///
     /// # Errors
     ///
     /// Returns [`UnknownProvider`] when the normalised name is neither a frozen
     /// identifier nor an alias in this table.
     pub fn resolve(&self, name: &str) -> Result<Resolution, UnknownProvider> {
-        let normalized = normalize(name);
-        if let Some(descriptor) = ProviderRegistry::global().get(&normalized) {
+        // The common input is a name already spelled the way the inventory
+        // spells it, and this runs per request, so the normalised form is only
+        // materialised when normalising would actually change something.
+        // Trimming is a borrow, and `normalize` lowercases ASCII only, so a
+        // trimmed name with no ASCII capital *is* its own normalised form.
+        let trimmed = name.trim();
+        if trimmed.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            self.resolve_normalized(&normalize(name), name)
+        } else {
+            self.resolve_normalized(trimmed, name)
+        }
+    }
+
+    /// Resolves a name that is already in normalised form.
+    ///
+    /// `original` is carried only to report the caller's own spelling back on
+    /// failure.
+    fn resolve_normalized(
+        &self,
+        normalized: &str,
+        original: &str,
+    ) -> Result<Resolution, UnknownProvider> {
+        if let Some(descriptor) = registry::lookup(normalized) {
             return Ok(Resolution {
                 descriptor,
                 matched: MatchKind::Canonical,
             });
         }
-        if let Some(descriptor) = self.entries.get(&normalized) {
+        if let Some(&descriptor) = self.entries.get(normalized) {
             return Ok(Resolution {
                 descriptor,
-                matched: MatchKind::Alias(normalized),
+                matched: MatchKind::Alias(normalized.to_owned()),
             });
         }
         Err(UnknownProvider {
-            name: name.to_owned(),
+            name: original.to_owned(),
         })
     }
 }
@@ -475,6 +500,66 @@ mod tests {
             MatchKind::Canonical
         );
         assert!(table.resolve("claude").is_err());
+    }
+
+    #[test]
+    fn resolution_terminates_in_one_hop_because_a_target_is_always_canonical() {
+        // The structural reason alias resolution cannot loop: `AliasTable::new`
+        // only accepts a target that the registry already knows, so an alias can
+        // never name another alias. This walks the built-in table and requires
+        // every target to resolve *canonically*, which is the property a cycle
+        // would break.
+        let table = AliasTable::builtin();
+        for &(alias, target) in BUILTIN_ALIASES {
+            let resolution = table.resolve(alias).expect("alias resolves");
+            assert_eq!(resolution.id(), target, "{alias}");
+            assert_eq!(resolution.matched, MatchKind::Alias(alias.to_owned()));
+
+            let hop = table.resolve(target).expect("target resolves");
+            assert_eq!(hop.matched, MatchKind::Canonical, "{alias} -> {target}");
+            assert_eq!(hop.id(), target);
+        }
+    }
+
+    #[test]
+    fn an_alias_that_would_need_a_second_hop_is_refused_at_construction() {
+        // `claude` is a built-in alias, not a frozen identifier, so pointing an
+        // alias at it is a dangling target rather than a two-step resolution.
+        assert_eq!(
+            AliasTable::new(&[("claude-3", "claude")]).expect_err("chained alias"),
+            AliasConflict::DanglingTarget {
+                alias: "claude-3".to_owned(),
+                target: "claude".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolution_accepts_the_same_surface_variation_with_or_without_allocation() {
+        // `resolve` skips normalisation when the trimmed name is already
+        // normalised. Both paths must agree, including on the reported alias.
+        for (written, expected) in [
+            ("openai", "openai"),
+            ("  openai  ", "openai"),
+            ("OpenAI", "openai"),
+            ("  OPENAI\t", "openai"),
+        ] {
+            let resolution = resolve(written).expect("resolves");
+            assert_eq!(resolution.id(), expected, "{written:?}");
+            assert_eq!(resolution.matched, MatchKind::Canonical, "{written:?}");
+        }
+        for written in ["claude", " CLAUDE ", "Claude"] {
+            let resolution = resolve(written).expect("resolves");
+            assert_eq!(resolution.id(), "anthropic", "{written:?}");
+            assert_eq!(
+                resolution.matched,
+                MatchKind::Alias("claude".to_owned()),
+                "{written:?}"
+            );
+        }
+        // A failure reports the caller's own spelling on both paths.
+        assert_eq!(resolve(" Nope ").expect_err("unknown").name, " Nope ");
+        assert_eq!(resolve(" nope ").expect_err("unknown").name, " nope ");
     }
 
     #[test]

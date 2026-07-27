@@ -1,6 +1,6 @@
 //! Anthropic `POST /v1/messages`.
 //!
-//! Anthropic's dialect differs from OpenAI's in four ways this module handles
+//! Anthropic's dialect differs from `OpenAI`'s in four ways this module handles
 //! explicitly: the system prompt is a top-level field rather than a message,
 //! `max_tokens` is mandatory, tool results are carried as blocks inside a user
 //! turn, and streaming is a typed event protocol rather than a single chunk
@@ -216,7 +216,9 @@ impl Anthropic {
     ///
     /// # Errors
     ///
-    /// See [`Anthropic::new`].
+    /// Returns [`ErrorKind::Authentication`] when `api_key` is empty or is
+    /// bound to an origin other than [`DEFAULT_BASE_URL`]'s, and
+    /// [`ErrorKind::Transport`] when the TLS stack cannot be built.
     pub fn with_api_key(api_key: ApiKey) -> Result<Self, ProviderError> {
         Self::new(AnthropicConfig::new(api_key)?)
     }
@@ -634,6 +636,12 @@ pub fn encode_messages(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Deserialize)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "these are Anthropic's wire field names; renaming them to drop the \
+              shared `_tokens` suffix would need `#[serde(rename)]` on every \
+              field and put the real name one indirection away from the type"
+)]
 struct WireUsage {
     #[serde(default)]
     input_tokens: u64,
@@ -1759,7 +1767,10 @@ mod tests {
                 "anthropic capability {capability:?}"
             );
         }
-        assert_eq!(client.capabilities().len(), supported.len() as u32);
+        assert_eq!(
+            client.capabilities().len(),
+            u32::try_from(supported.len()).expect("capability count fits in u32")
+        );
         assert!(!client.capabilities().contains(Capability::Embeddings));
 
         let request = client

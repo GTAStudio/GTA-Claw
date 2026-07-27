@@ -81,7 +81,22 @@ impl ProviderConfig {
     ///
     /// # Errors
     ///
-    /// See [`ConfigError`].
+    /// * [`ConfigError::UnknownProvider`] — `id` is neither a frozen identifier
+    ///   nor one of [`BUILTIN_ALIASES`](crate::alias::BUILTIN_ALIASES).
+    /// * [`ConfigError::NoClient`] — the provider is registered for metadata
+    ///   only, so this crate ships no client that could call it.
+    /// * [`ConfigError::MissingBaseUrl`] — the registry pins no default
+    ///   endpoint for this provider and `base-url` was not supplied.
+    /// * [`ConfigError::InvalidBaseUrl`] — the endpoint is not a parsable
+    ///   absolute URL, or names no host.
+    /// * [`ConfigError::InsecureBaseUrl`] — the endpoint is plaintext and is
+    ///   not a loopback address.
+    /// * [`ConfigError::ReservedHeader`] — a configured header is one of
+    ///   [`RESERVED_HEADERS`], so it would overwrite the credential header the
+    ///   client is about to set.
+    /// * [`ConfigError::Auth`] — this provider does not declare the offered
+    ///   authentication mode, or a required field of the credential is empty
+    ///   once trimmed.
     pub fn resolve(&self) -> Result<ResolvedProvider, ConfigError> {
         self.resolve_with(AliasTable::builtin())
     }
@@ -90,7 +105,9 @@ impl ProviderConfig {
     ///
     /// # Errors
     ///
-    /// See [`ConfigError`].
+    /// The same refusals as [`ProviderConfig::resolve`], except that
+    /// [`ConfigError::UnknownProvider`] is decided against `aliases` rather
+    /// than the built-in table.
     pub fn resolve_with(&self, aliases: &AliasTable) -> Result<ResolvedProvider, ConfigError> {
         let resolution = aliases
             .resolve(&self.id)
@@ -103,15 +120,16 @@ impl ProviderConfig {
             });
         }
 
-        let endpoint = match self.base_url.as_deref() {
-            Some(value) => parse_endpoint(descriptor, value)?,
-            None => {
-                let default = descriptor.base_url.ok_or(ConfigError::MissingBaseUrl {
-                    provider: descriptor.id,
-                })?;
-                parse_endpoint(descriptor, default)?
-            }
-        };
+        // The operator's override wins; otherwise the frozen default is used.
+        // A row that ships neither is refused *here*, at configuration time,
+        // rather than at the first request.
+        let configured = self.base_url.as_deref().or(descriptor.base_url);
+        let endpoint = parse_endpoint(
+            descriptor,
+            configured.ok_or(ConfigError::MissingBaseUrl {
+                provider: descriptor.id,
+            })?,
+        )?;
 
         for name in self.headers.keys() {
             let lowered = name.to_ascii_lowercase();

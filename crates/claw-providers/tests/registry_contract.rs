@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use claw_provider_sdk::model::{AuthMode, Capability, CapabilitySet};
 use claw_providers::alias::{self, AliasConflict, AliasTable, BUILTIN_ALIASES, MatchKind};
@@ -40,8 +40,8 @@ fn repository_file(relative: &str) -> PathBuf {
         .join(relative)
 }
 
-fn read_json(path: PathBuf) -> Value {
-    let bytes = fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+fn read_json(path: &Path) -> Value {
+    let bytes = fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
     serde_json::from_slice(bytes)
         .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
@@ -49,7 +49,7 @@ fn read_json(path: PathBuf) -> Value {
 
 /// The frozen inventory rows, as plain string maps.
 fn frozen_items() -> Vec<BTreeMap<String, String>> {
-    let inventory = read_json(repository_file(
+    let inventory = read_json(&repository_file(
         "compat/upstream/inventories/providers.json",
     ));
     assert_eq!(inventory["counts"]["total"], 78, "frozen row count");
@@ -344,8 +344,8 @@ fn every_frozen_provider_is_configurable_exactly_as_its_status_allows() {
                     credential_json(descriptor.auth_modes[0], "s3cret")
                 ))
                 .unwrap_or_else(|error| panic!("{id}: {error}"));
-                match descriptor.base_url {
-                    Some(default) => assert_eq!(
+                if let Some(default) = descriptor.base_url {
+                    assert_eq!(
                         without_endpoint
                             .resolve()
                             .unwrap_or_else(|error| panic!("{id}: {error}"))
@@ -354,15 +354,14 @@ fn every_frozen_provider_is_configurable_exactly_as_its_status_allows() {
                             .trim_end_matches('/'),
                         default.trim_end_matches('/'),
                         "{id}"
-                    ),
-                    None => {
-                        assert_eq!(
-                            without_endpoint.resolve().expect_err(id).code(),
-                            "missing_base_url",
-                            "{id}"
-                        );
-                        refused_for_want_of_an_endpoint += 1;
-                    }
+                    );
+                } else {
+                    assert_eq!(
+                        without_endpoint.resolve().expect_err(id).code(),
+                        "missing_base_url",
+                        "{id}"
+                    );
+                    refused_for_want_of_an_endpoint += 1;
                 }
             }
         }
@@ -400,7 +399,7 @@ fn every_frozen_provider_configuration_rejects_an_unknown_field() {
 #[test]
 fn the_configuration_fixture_corpus_is_classified_exactly() {
     let corpus = read_json(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")
             .join("provider-configs.json"),

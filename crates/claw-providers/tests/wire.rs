@@ -422,7 +422,7 @@ async fn exponential_backoff_grows_and_then_gives_up() {
         multiplier_centi: 200,
         jitter: JitterMode::None,
         respect_retry_after: true,
-        max_retry_after: Duration::from_secs(120),
+        max_retry_after: Duration::from_mins(2),
     };
     let client = openai_client(&server).with_runtime(manual_runtime("openai", &clock, policy));
 
@@ -746,7 +746,7 @@ async fn an_anthropic_overload_is_retried_and_the_key_never_leaks() {
         multiplier_centi: 200,
         jitter: JitterMode::None,
         respect_retry_after: true,
-        max_retry_after: Duration::from_secs(120),
+        max_retry_after: Duration::from_mins(2),
     };
     let client =
         anthropic_client(&server).with_runtime(manual_runtime("anthropic", &clock, policy));

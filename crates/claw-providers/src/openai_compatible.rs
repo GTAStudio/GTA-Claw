@@ -1,6 +1,6 @@
-//! The OpenAI `chat/completions` dialect.
+//! The `OpenAI` `chat/completions` dialect.
 //!
-//! This module implements the wire protocol shared by OpenAI and the many
+//! This module implements the wire protocol shared by `OpenAI` and the many
 //! services that reproduce it: chat completions (buffered and streamed),
 //! function calling, embeddings and model listing.
 //!
@@ -74,7 +74,7 @@ pub struct OpenAiConfig {
     pub capabilities: CapabilitySet,
     /// Whether to ask for usage accounting in streamed responses.
     ///
-    /// OpenAI only reports token usage in a stream when
+    /// `OpenAI` only reports token usage in a stream when
     /// `stream_options.include_usage` is set. Many compatible services reject
     /// the unknown field, so this defaults to `false` everywhere except
     /// `openai` itself.
@@ -234,17 +234,19 @@ impl OpenAiCompatible {
                 })
             })
             .transpose()?;
-        let base_url = match (base_url, registered.clone()) {
-            (Some(url), _) => url,
-            (None, Some(default)) => default,
-            (None, None) => {
-                return Err(ProviderError::new(
+        // The operator's endpoint wins; the registered default is only cloned
+        // when it is actually the one being used, because `registered` is still
+        // needed below to build the trust set.
+        let base_url = match base_url {
+            Some(url) => url,
+            None => registered.clone().ok_or_else(|| {
+                ProviderError::new(
                     ErrorKind::InvalidRequest,
                     id,
                     Operation::Authorize,
                     "this provider ships no default endpoint, so a base URL is required",
-                ));
-            }
+                )
+            })?,
         };
 
         // The set of origins this provider may present its credential to: the
@@ -564,7 +566,7 @@ struct WireCompletionRequest<'a> {
     clippy::trivially_copy_pass_by_ref,
     reason = "serde's skip_serializing_if requires a predicate taking a reference"
 )]
-fn is_false(value: &bool) -> bool {
+const fn is_false(value: &bool) -> bool {
     !*value
 }
 
@@ -732,7 +734,7 @@ fn encode_content(parts: &[ContentPart]) -> WireContent<'_> {
     )
 }
 
-/// Encodes a completion request as an OpenAI `chat/completions` document.
+/// Encodes a completion request as an `OpenAI` `chat/completions` document.
 ///
 /// # Errors
 ///
@@ -926,7 +928,7 @@ fn protocol_error(provider: &str, operation: Operation, detail: &str) -> Provide
     ProviderError::new(ErrorKind::Protocol, provider, operation, detail)
 }
 
-/// Maps an OpenAI `finish_reason` onto the portable enumeration.
+/// Maps an `OpenAI` `finish_reason` onto the portable enumeration.
 #[must_use]
 pub fn finish_reason(raw: &str) -> FinishReason {
     match raw {
@@ -1074,7 +1076,7 @@ struct WireModelList {
 
 /// Decodes a `models` response.
 ///
-/// The OpenAI model catalogue publishes no capability, context-window or
+/// The `OpenAI` model catalogue publishes no capability, context-window or
 /// display-name metadata, so every returned [`ModelDescriptor`] carries only an
 /// identifier and an empty capability set. Nothing is inferred.
 ///
@@ -1157,7 +1159,7 @@ struct WireStreamChunk {
     usage: Option<WireUsage>,
 }
 
-/// Turns OpenAI stream chunks into portable [`StreamEvent`] values.
+/// Turns `OpenAI` stream chunks into portable [`StreamEvent`] values.
 ///
 /// The decoder is a pure state machine over already-framed SSE events, so it can
 /// be driven directly from a recorded byte fixture.
@@ -1263,16 +1265,14 @@ impl OpenAiStreamDecoder {
         let mut events = Vec::new();
         let pending = self.assembler.len();
         for index in 0..pending {
-            match self.assembler.complete(index) {
-                Ok(event) => events.push(event),
-                Err(_) => {
-                    events.push(StreamEvent::Completed {
-                        finish_reason: FinishReason::Other("incomplete_tool_call".to_owned()),
-                        usage: self.usage,
-                    });
-                    return events;
-                }
-            }
+            let Ok(event) = self.assembler.complete(index) else {
+                events.push(StreamEvent::Completed {
+                    finish_reason: FinishReason::Other("incomplete_tool_call".to_owned()),
+                    usage: self.usage,
+                });
+                return events;
+            };
+            events.push(event);
         }
         let finish = self.finish_reason.clone().unwrap_or(if pending > 0 {
             FinishReason::ToolCalls

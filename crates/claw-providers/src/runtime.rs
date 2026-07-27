@@ -349,7 +349,7 @@ mod tests {
                     multiplier_centi: 200,
                     jitter: JitterMode::None,
                     respect_retry_after: true,
-                    max_retry_after: Duration::from_secs(60),
+                    max_retry_after: Duration::from_mins(1),
                 },
                 circuit: CircuitBreakerConfig {
                     failure_threshold: 3,
