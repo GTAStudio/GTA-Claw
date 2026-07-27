@@ -4,6 +4,7 @@ param([switch]$PortableOnly)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$isWindowsHost = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
 
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptRoot '..\..'))
@@ -364,11 +365,15 @@ channel = "1.96.0"
         $passed++
     }
 
-    if ($PortableOnly) {
+    if ($PortableOnly -or -not $isWindowsHost) {
         if ($passed -ne 49) {
             throw "Expected 49 portable self-tests, completed $passed."
         }
-        Write-Host "Portable Windows packaging self-tests passed: $passed."
+        if ($PortableOnly) {
+            Write-Host "Portable Windows packaging self-tests passed: $passed."
+        } else {
+            Write-Host "Portable Windows packaging self-tests passed: $passed (Windows-native tests skipped on non-Windows host)."
+        }
         return
     }
 
