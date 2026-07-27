@@ -412,6 +412,8 @@ fn admitted_skia_targets() -> BTreeSet<&'static str> {
 
 /// Packages known to fetch a prebuilt artifact from the network during their build script.
 ///
+/// `(package, admitted release, fixed archive key of that release)`.
+///
 /// A build that fetches an artifact the lockfile does not describe is trusting something outside
 /// the supply chain. `skia-bindings` is the only one today: it downloads a prebuilt archive through
 /// `curl -L -f -sS` and verifies nothing about it, its own source carrying a literal
@@ -419,8 +421,18 @@ fn admitted_skia_targets() -> BTreeSet<&'static str> {
 /// non-optional dependency of `i-slint-backend-winit` under
 /// `cfg(all(target_vendor = "apple", not(target_os = "macos")))`.
 ///
+/// The archive key identifies the upstream binary build and is uniform across one release: all 137
+/// assets of `skia-binaries` 0.99.0 carry `a25a0fdb7d90429aa2d1`. The release version appears only
+/// in the download path and never in the asset name, so binding a pin to a specific upstream build
+/// needs both. Re-derive with
+/// `gh api repos/rust-skia/skia-binaries/releases/tags/<version> --jq '.assets[].name'`.
+///
 /// Any package listed here must carry a reviewed pin below before a workspace using it is admitted.
-const BUILD_TIME_FETCHING_PACKAGES: [(&str, &str); 1] = [("skia-bindings", "0.99.0")];
+const BUILD_TIME_FETCHING_PACKAGES: [(&str, &str, &str); 1] =
+    [("skia-bindings", "0.99.0", "a25a0fdb7d90429aa2d1")];
+
+/// Length of an upstream prebuilt archive key.
+const BUILD_ARTIFACT_KEY_LEN: usize = 20;
 
 /// Reviewed build-time fetch pins: `(package, version, target, url, lowercase SHA-256)`.
 ///
@@ -429,11 +441,22 @@ const BUILD_TIME_FETCHING_PACKAGES: [(&str, &str); 1] = [("skia-bindings", "0.99
 /// fetch never happens. For `skia-bindings` the cache is populated through `SKIA_BINARIES_URL`,
 /// which accepts a `file://` URL.
 ///
-/// The archive key embeds the crate commit, the target, and the sorted resolved feature set, so it
-/// cannot be computed before the mobile lock exists. This table is therefore **empty by default**,
+/// The archive key is fixed per release and does not encode the target or the feature set, but the
+/// asset name also carries the sorted resolved feature set, so a complete URL cannot be written
+/// before the mobile lock exists. This table is therefore **empty by default**,
 /// and `validate_mobile_lock` refuses to admit any workspace whose lock contains a fetching package
 /// while the corresponding pins are absent. That makes the pin impossible to skip, keeps filling it
 /// a reviewed trust-root edit, and stops a second fetching package appearing silently.
+///
+/// A pin therefore binds a target and a feature set *together*: the asset name states both, and the
+/// digest covers the archive that one combination produced. Changing the resolved feature set of the
+/// Skia dependency changes the asset name, so every affected tuple must be regenerated — the old
+/// digest stays valid for an archive the build will no longer fetch, which is a stale pin rather
+/// than a failing one. Nothing below enforces that, and this comment does not claim it does: the
+/// validator cannot observe the build's resolved features. Enforcing it would mean reproducing
+/// `skia-bindings`' cargo-feature to asset-token mapping inside the trust root, where it could drift
+/// from upstream silently. Feature sets are also not uniform across platforms — 0.99.0 publishes
+/// `metal` for Apple targets and `vulkan` for Android ones — so no cross-target equality is assumed.
 const PINNED_BUILD_ARTIFACTS: [(&str, &str, &str, &str, &str); 0] = [];
 
 const FORBIDDEN_GUI_NAMES: [&str; 11] = [
@@ -1402,12 +1425,29 @@ pub fn validate_build_artifact_pin_table(
     pins: &[(&str, &str, &str, &str, &str)],
 ) -> PolicyResult<()> {
     let admitted_targets = admitted_skia_targets();
+    for (package, version, key) in BUILD_TIME_FETCHING_PACKAGES {
+        if build_artifact_asset_rule(package, version).is_none() {
+            return Err(PolicyError::new(format!(
+                "build-time fetching package has no reviewed asset rule: {package}"
+            )));
+        }
+        if key.len() != BUILD_ARTIFACT_KEY_LEN
+            || !key
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(PolicyError::new(format!(
+                "build-time fetching package archive key is not {BUILD_ARTIFACT_KEY_LEN} lowercase hex characters: {package} {key}"
+            )));
+        }
+    }
     let fetching = BUILD_TIME_FETCHING_PACKAGES
         .into_iter()
+        .map(|(package, version, key)| (package, (version, key)))
         .collect::<BTreeMap<_, _>>();
     let mut seen = BTreeSet::new();
     for (package, version, target, url, digest) in pins {
-        let Some(pinned_version) = fetching.get(package) else {
+        let Some((pinned_version, pinned_key)) = fetching.get(package) else {
             return Err(PolicyError::new(format!(
                 "reviewed build-artifact pin names a package that does not fetch at build time: {package}"
             )));
@@ -1432,13 +1472,81 @@ pub fn validate_build_artifact_pin_table(
                 "reviewed build-artifact digest is not a SHA-256: {package} {target}"
             )));
         }
-        if !url.starts_with("https://") || url.contains("..") || !url.contains(target) {
+        let Some((download_prefix, name_prefix)) = build_artifact_asset_rule(package, version)
+        else {
             return Err(PolicyError::new(format!(
-                "reviewed build-artifact URL is not a hardened absolute URL naming its target: {url}"
+                "reviewed build-artifact pin names a package with no reviewed asset rule: {package}"
+            )));
+        };
+        if !url.starts_with("https://") || url.contains("..") {
+            return Err(PolicyError::new(format!(
+                "reviewed build-artifact URL is not a hardened absolute URL: {url}"
+            )));
+        }
+        let Some(asset) = url.strip_prefix(&download_prefix) else {
+            return Err(PolicyError::new(format!(
+                "reviewed build-artifact URL is not the admitted {package} {pinned_version} release download prefix: {url}"
+            )));
+        };
+        if asset.contains('/') || !asset.ends_with(".tar.gz") {
+            return Err(PolicyError::new(format!(
+                "reviewed build-artifact URL is not a single {package} release asset: {url}"
+            )));
+        }
+        let Some(rest) = asset
+            .strip_prefix(name_prefix)
+            .and_then(|rest| rest.strip_prefix(*pinned_key))
+            .and_then(|rest| rest.strip_prefix('-'))
+        else {
+            return Err(PolicyError::new(format!(
+                "reviewed build-artifact asset does not carry the admitted {package} archive key {pinned_key}: {asset}"
+            )));
+        };
+        let Some(named_target) = derive_asset_target(rest, &admitted_targets) else {
+            return Err(PolicyError::new(format!(
+                "reviewed build-artifact asset names no admitted target: {asset}"
+            )));
+        };
+        if named_target != *target {
+            return Err(PolicyError::new(format!(
+                "reviewed build-artifact pin declares {target} but its archive is built for {named_target}: {asset}"
             )));
         }
     }
     Ok(())
+}
+
+/// Admitted release download prefix and asset-name prefix for one build-time fetching package.
+///
+/// A package with no rule here is rejected rather than falling back to a permissive check, so a
+/// second fetching package cannot silently inherit `skia-bindings`' asset naming.
+fn build_artifact_asset_rule(package: &str, version: &str) -> Option<(String, &'static str)> {
+    match package {
+        "skia-bindings" => Some((
+            format!("https://github.com/rust-skia/skia-binaries/releases/download/{version}/"),
+            "skia-binaries-",
+        )),
+        _ => None,
+    }
+}
+
+/// Derives the target an asset name states, as the longest admitted target it begins with.
+///
+/// A substring test cannot distinguish these: `aarch64-apple-ios-sim-jpegd-...` contains
+/// `aarch64-apple-ios`, so `contains` accepts a simulator archive for a device pin — a real
+/// upstream asset, a valid digest, and the wrong binary. Deriving the target and comparing it for
+/// equality is what separates them. The trailing separator is required because every one of the
+/// 137 assets in `skia-binaries` 0.99.0 carries at least one feature segment after its target, and
+/// without it `aarch64-apple-ios` would match the simulator name's prefix too.
+fn derive_asset_target(rest: &str, admitted: &BTreeSet<&'static str>) -> Option<&'static str> {
+    admitted
+        .iter()
+        .filter(|target| {
+            rest.strip_prefix(**target)
+                .is_some_and(|tail| tail.starts_with('-'))
+        })
+        .max_by_key(|target| target.len())
+        .copied()
 }
 
 /// Requires every target of a platform that consumes a fetching package to carry a reviewed pin.
@@ -1697,6 +1805,7 @@ fn validate_mobile_lock(
     let mut slint_versions = BTreeSet::new();
     let fetching = BUILD_TIME_FETCHING_PACKAGES
         .into_iter()
+        .map(|(package, version, _)| (package, version))
         .collect::<BTreeMap<_, _>>();
     for package in packages {
         let name = package
@@ -2062,7 +2171,7 @@ fn validate_desktop_lock(root: &SafeRoot) -> PolicyResult<()> {
             )));
         }
     }
-    for (fetching_package, admitted_version) in BUILD_TIME_FETCHING_PACKAGES {
+    for (fetching_package, admitted_version, _) in BUILD_TIME_FETCHING_PACKAGES {
         if let Some(found) = desktop_lock_package_version(root, fetching_package)?
             && found != admitted_version
         {
