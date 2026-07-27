@@ -196,6 +196,11 @@ fn corrupt_and_interrupted_files_are_backed_up_then_recovered() {
     );
     assert_eq!(report.interrupted_artifact_backups.len(), 1);
     assert_eq!(
+        report.warnings,
+        Vec::new(),
+        "a recovery reported as successful must also report full write durability"
+    );
+    assert_eq!(
         std::fs::read(&report.interrupted_artifact_backups[0]).expect("orphan backup"),
         interrupted_bytes
     );
@@ -203,6 +208,27 @@ fn corrupt_and_interrupted_files_are_backed_up_then_recovered() {
         std::fs::read(&interrupted_path).expect("orphan source retained"),
         interrupted_bytes
     );
+}
+
+#[test]
+fn a_state_file_with_a_torn_tail_is_corrupt_rather_than_healthy() {
+    let directory = common::TestDirectory::create();
+    let config_path = directory.path().join("config.json5");
+    let state_path = directory.path().join("crestodian.json");
+    std::fs::write(&config_path, VALID).expect("write valid config");
+    let healthy = br#"{"schema_version":1,"setup_completed":true,"workspace":null,"last_recovery_unix_ms":null}"#;
+    let mut torn = healthy.to_vec();
+    torn.extend_from_slice(br#"{"schema_version":1,"setup_"#);
+    std::fs::write(&state_path, &torn).expect("write torn state");
+
+    let assessment = Crestodian::new(&config_path, &state_path).inspect();
+
+    assert_eq!(assessment.config, ConfigCondition::Healthy);
+    match assessment.state {
+        StateCondition::Corrupt { diagnostic } => assert!(!diagnostic.is_empty()),
+        other => panic!("a state file with a torn tail must be corrupt, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&state_path).expect("state preserved"), torn);
 }
 
 #[test]

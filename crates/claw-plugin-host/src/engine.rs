@@ -13,11 +13,25 @@ use crate::bindings::Plugin;
 use crate::error::HostError;
 use crate::state::PluginState;
 
+/// How often the background thread advances the engine epoch, in milliseconds.
+///
+/// This, not [`EPOCH_TICK`], is the value the deadline arithmetic uses, so a
+/// millisecond budget is converted into ticks without ever narrowing the
+/// [`Duration::as_millis`] `u128`.
+const EPOCH_TICK_MS: u64 = 1;
+
 /// How often the background thread advances the engine epoch.
 ///
 /// One millisecond is the resolution of the wall-clock budget: a guest can
 /// overrun its deadline by at most one tick before it is interrupted.
-pub const EPOCH_TICK: Duration = Duration::from_millis(1);
+pub const EPOCH_TICK: Duration = Duration::from_millis(EPOCH_TICK_MS);
+
+/// Wasm frames Wasmtime keeps when it builds a trap backtrace.
+///
+/// Evaluated at compile time, so the `expect` is a build-time assertion rather
+/// than a run-time panic path.
+const MAX_BACKTRACE_FRAMES: core::num::NonZeroUsize =
+    core::num::NonZeroUsize::new(20).expect("20 is not zero");
 
 /// A configured engine plus the linker that only ever exposes this world.
 ///
@@ -44,8 +58,15 @@ impl PluginEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`HostError::Instantiate`] when Wasmtime rejects the
-    /// configuration or the world cannot be linked.
+    /// Returns [`HostError::Instantiate`] when Wasmtime rejects this
+    /// configuration (the component model, fuel metering and epoch
+    /// interruption must all be compiled in and supported on this target),
+    /// when one of the world's host functions cannot be added to the linker,
+    /// which happens if an import name is defined twice, or when the operating
+    /// system refuses to start the epoch ticker thread. The last one is fatal
+    /// on purpose: without a ticker nothing advances the epoch, so
+    /// `wall_clock_timeout_ms` would silently stop being enforced and a guest
+    /// that blocks without burning fuel would never be interrupted.
     pub fn new() -> Result<Self, HostError> {
         let mut config = Config::new();
         config
@@ -57,9 +78,7 @@ impl PluginEngine {
             // not compiled into this engine at all. There is therefore no
             // shared memory, no host-dependent relaxed-SIMD result and no WASI
             // implementation available to link, even by mistake.
-            .wasm_backtrace_max_frames(Some(
-                core::num::NonZeroUsize::new(20).expect("20 is not zero"),
-            ))
+            .wasm_backtrace_max_frames(Some(MAX_BACKTRACE_FRAMES))
             .wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Disable)
             .cranelift_opt_level(OptLevel::Speed)
             // A deep-recursion guest must trap inside its own stack budget
@@ -75,7 +94,11 @@ impl PluginEngine {
         Plugin::add_to_linker::<PluginState, HasSelf<PluginState>>(&mut linker, |state| state)
             .map_err(|error| HostError::Instantiate(error.to_string()))?;
 
-        let ticker = EpochTicker::start(&engine);
+        let ticker = EpochTicker::start(&engine).map_err(|error| {
+            HostError::Instantiate(format!(
+                "the epoch ticker thread could not be started: {error}"
+            ))
+        })?;
         Ok(Self {
             engine,
             linker,
@@ -104,9 +127,17 @@ impl PluginEngine {
     /// Creates a store wired to this engine with fuel, the epoch deadline and
     /// the per-instance resource limiter already applied.
     ///
+    /// The limiter is installed on the store itself, so Wasmtime consults the
+    /// instance's memory, table, instance and memory-count ceilings on every
+    /// growth request rather than after the fact, and both bounds on execution
+    /// (the fuel budget and the epoch deadline) are armed before the store is
+    /// ever handed a component.
+    ///
     /// # Errors
     ///
-    /// Returns [`HostError::Instantiate`] when the fuel budget cannot be set.
+    /// Returns [`HostError::Instantiate`] when the fuel budget cannot be set,
+    /// which only happens if the engine was built without fuel metering. The
+    /// store is dropped rather than returned unmetered.
     pub fn new_store(&self, state: PluginState) -> Result<Store<PluginState>, HostError> {
         let fuel = state.limits().fuel;
         let timeout_ms = state.limits().wall_clock_timeout_ms;
@@ -126,14 +157,16 @@ impl PluginEngine {
 /// Converts a millisecond budget into epoch ticks, never zero.
 #[must_use]
 pub(crate) const fn epoch_ticks_for(timeout_ms: u64) -> u64 {
-    let ticks = timeout_ms / (EPOCH_TICK.as_millis() as u64);
+    let ticks = timeout_ms / EPOCH_TICK_MS;
     if ticks == 0 { 1 } else { ticks }
 }
 
 /// A background thread that advances the engine epoch on a fixed cadence.
 ///
 /// The thread is stopped and joined when the engine is dropped, so a host that
-/// goes away does not leave a ticker behind.
+/// goes away does not leave a ticker behind. Nothing else advances the epoch,
+/// so this thread existing is what makes the wall-clock budget real; a host
+/// that cannot start it refuses to be built.
 struct EpochTicker {
     running: Arc<AtomicBool>,
     ticks: Arc<std::sync::atomic::AtomicU64>,
@@ -141,7 +174,7 @@ struct EpochTicker {
 }
 
 impl EpochTicker {
-    fn start(engine: &Engine) -> Self {
+    fn start(engine: &Engine) -> std::io::Result<Self> {
         let running = Arc::new(AtomicBool::new(true));
         let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let engine = engine.clone();
@@ -155,13 +188,12 @@ impl EpochTicker {
                     engine.increment_epoch();
                     thread_ticks.fetch_add(1, Ordering::Release);
                 }
-            })
-            .ok();
-        Self {
+            })?;
+        Ok(Self {
             running,
             ticks,
-            handle,
-        }
+            handle: Some(handle),
+        })
     }
 
     fn ticks(&self) -> u64 {

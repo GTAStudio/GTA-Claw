@@ -4,10 +4,17 @@
 //! `tests/fixtures/probe-guest.wat` is assembled by `wat` at test time and
 //! handed to Wasmtime unchanged.
 
-#![allow(dead_code, unreachable_pub)]
+#![expect(
+    dead_code,
+    unreachable_pub,
+    reason = "this module is compiled separately into every integration test binary, so each \
+              binary sees the helpers the other binaries use as unused `pub` items; splitting it \
+              per binary would duplicate the fixtures the tests are meant to share"
+)]
 
 pub mod qa;
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -286,10 +293,12 @@ pub fn probe_component_registering_tools(count: u32) -> Vec<u8> {
         // Each name is two bytes: `t` followed by a distinct letter, written
         // into scratch memory (between the answer buffer and the literals, so
         // it cannot collide with a `cabi_realloc` allocation) before the call.
-        body.push_str(&format!(
+        write!(
+            body,
             "          (i32.store8 (i32.const 640) (i32.const 116))\n          (i32.store8 (i32.const 641) (i32.const {}))\n          (call $h-tools\n            (i32.const 640) (i32.const 2)\n            (i32.const 1108) (i32.const 10)\n            (i32.const 1120) (i32.const 2)\n            (i32.const 288))\n",
             97 + index
-        ));
+        )
+        .expect("writing to a `String` cannot fail");
     }
     body.push_str("          (return (call $answer (i32.const 288) (i32.const 4)))))\n");
     let text = source.replacen(anchor, &format!("{body}{anchor}"), 1);
@@ -368,7 +377,7 @@ pub fn install_probe_named(
 ) -> PathBuf {
     let component = probe_component_named(id);
     let mut manifest = manifest_for(&component);
-    manifest.id = id.to_owned();
+    id.clone_into(&mut manifest.id);
     manifest.capabilities = grants;
     install(root, directory, &component, &manifest)
 }

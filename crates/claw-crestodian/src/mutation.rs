@@ -130,6 +130,17 @@ impl MutationField {
     /// Malformed syntax, credential-resolution roots and inference-route roots
     /// are each refused with their own reason before the table is consulted, so
     /// a refusal never depends on whether a forbidden path happens to be known.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MutationRejection::MalformedPath`] for an empty path, a path
+    /// longer than 128 bytes, an empty segment, or a character outside
+    /// `[A-Za-z0-9_$-]`; [`MutationRejection::CredentialResolution`] for an
+    /// `$include`, `env`, `plugins`, or `secrets` root;
+    /// [`MutationRejection::InferenceRoute`] for an `agents`, `auth`, `cli`,
+    /// `models`, or root `tools` path; and [`MutationRejection::UnknownPath`]
+    /// for a well-formed path that is not one of the six ring-zero writable
+    /// fields.
     pub fn parse(path: &str) -> Result<Self, MutationRejection> {
         validate_path_syntax(path)?;
         let root = path.split('.').next().unwrap_or(path);
@@ -171,6 +182,16 @@ pub enum TypedMutation {
 
 impl TypedMutation {
     /// Builds a mutation from a JSON value, refusing coercion of any kind.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every [`MutationField::parse`] rejection for `path`. Returns
+    /// [`MutationRejection::SecretRequiresReference`] for `gateway.auth.token`,
+    /// which never accepts a literal value; [`MutationRejection::TypeMismatch`]
+    /// when the JSON shape is not the declared type of the field, including a
+    /// negative, fractional, or string-wrapped number where a port or a
+    /// lifetime is declared; and [`MutationRejection::OutOfRange`] for a port
+    /// outside `1..=65535` or a lifetime outside `1..=1440` minutes.
     pub fn set_json(path: &str, value: &Value) -> Result<Self, MutationRejection> {
         let field = MutationField::parse(path)?;
         match field {
@@ -220,6 +241,18 @@ impl TypedMutation {
     }
 
     /// Builds a mutation from one rescue-grammar token, refusing coercion.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every [`MutationField::parse`] rejection for `path`. Returns
+    /// [`MutationRejection::SecretRequiresReference`] for `gateway.auth.token`,
+    /// which never accepts a literal value; [`MutationRejection::TypeMismatch`]
+    /// when the token is not the exact accepted spelling for the field — a
+    /// non-numeric port or lifetime, a boolean other than `true` or `false`, a
+    /// rescue mode other than `auto`, `true`, or `false`, or a workspace that is
+    /// empty or carries control characters; and
+    /// [`MutationRejection::OutOfRange`] for a port outside `1..=65535` or a
+    /// lifetime outside `1..=1440` minutes.
     pub fn set_text(path: &str, value: &str) -> Result<Self, MutationRejection> {
         let field = MutationField::parse(path)?;
         match field {
@@ -258,6 +291,15 @@ impl TypedMutation {
     }
 
     /// Builds a secret-reference mutation, the only way to write a secret field.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every [`MutationField::parse`] rejection for `path`. Returns
+    /// [`MutationRejection::NotASecretPath`] when the field holds no secret
+    /// material and therefore takes a literal value,
+    /// [`MutationRejection::UnsupportedSecretSource`] when `source` is anything
+    /// but `env`, and [`MutationRejection::InvalidSecretReference`] when `name`
+    /// is not a valid environment variable name.
     pub fn set_reference(path: &str, source: &str, name: &str) -> Result<Self, MutationRejection> {
         let field = MutationField::parse(path)?;
         if field.value_type() != ValueType::SecretReference {
@@ -322,8 +364,9 @@ impl TypedMutation {
             Self::RescueEnabled(RescueEnabled::Auto(RescueAuto::Auto)) => {
                 format!("set {path} = auto")
             }
-            Self::RescueEnabled(RescueEnabled::Explicit(flag)) => format!("set {path} = {flag}"),
-            Self::RescueOwnerDmOnly(flag) => format!("set {path} = {flag}"),
+            Self::RescueEnabled(RescueEnabled::Explicit(flag)) | Self::RescueOwnerDmOnly(flag) => {
+                format!("set {path} = {flag}")
+            }
             Self::RescuePendingTtlMinutes(minutes) => format!("set {path} = {minutes}"),
             Self::GatewayPort(port) => format!("set {path} = {port}"),
             Self::Workspace(workspace) => format!("set {path} = {}", workspace.display()),
@@ -546,6 +589,14 @@ impl CrestodianSettings {
     ///
     /// Bounds are re-checked rather than trusted, because a settings file can
     /// be edited by hand between two runs of the gateway.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operator-facing diagnostic when the file records a
+    /// `schemaVersion` this build does not support, a `gatewayPort` of `0`, a
+    /// `pendingTtlMinutes` outside `1..=1440`, or a `gatewayAuthToken` that is
+    /// not an `env:<NAME>` reference — the last of which means a plaintext
+    /// secret reached the settings file.
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != CRESTODIAN_SETTINGS_SCHEMA_VERSION {
             return Err(format!(
@@ -573,8 +624,11 @@ impl CrestodianSettings {
 
     /// Returns the canonical serialized bytes of these settings.
     ///
-    /// Serialization fails only for a workspace that is not valid UTF-8, which
-    /// no accepted mutation can produce.
+    /// # Errors
+    ///
+    /// Returns the `serde_json` diagnostic when the configured workspace is a
+    /// path that is not valid UTF-8, which is the only value this encoding can
+    /// refuse and which no accepted mutation can produce.
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
         let mut bytes = serde_json::to_vec_pretty(self).map_err(|error| error.to_string())?;
         bytes.push(b'\n');
@@ -582,6 +636,12 @@ impl CrestodianSettings {
     }
 
     /// Returns the SHA-256 digest of the canonical settings encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same encoding diagnostic as
+    /// [`CrestodianSettings::to_bytes`], because the digest is taken over
+    /// exactly those canonical bytes.
     pub fn digest(&self) -> Result<ConfigDigest, String> {
         Ok(ConfigDigest(encode_hex(&Sha256::digest(self.to_bytes()?))))
     }

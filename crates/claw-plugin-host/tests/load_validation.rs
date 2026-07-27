@@ -5,6 +5,8 @@
 
 mod support;
 
+use std::fmt::Write as _;
+
 use claw_plugin_api::abi::AbiIncompatibility;
 use claw_plugin_api::manifest::{
     ComponentRef, ManifestError, ManifestSignature, PluginManifest, SignatureAlgorithm,
@@ -49,7 +51,7 @@ fn a_component_that_imports_wasi_is_refused_before_it_is_instantiated() {
             .expect_err("an ambient import must be refused");
         match error {
             HostError::UnsatisfiedImport(name) => {
-                assert_eq!(name, interface, "the host must name the import it refused")
+                assert_eq!(name, interface, "the host must name the import it refused");
             }
             other => panic!("expected an unsatisfied import for {interface}, got {other}"),
         }
@@ -336,7 +338,7 @@ fn a_signed_plugin_loads_and_a_tampered_one_does_not() {
         let signature = key.sign(&payload);
         let mut hex = String::new();
         for byte in signature.to_bytes() {
-            hex.push_str(&format!("{byte:02x}"));
+            write!(hex, "{byte:02x}").expect("writing to a `String` cannot fail");
         }
         PluginManifest {
             signature: Some(ManifestSignature {
@@ -354,7 +356,7 @@ fn a_signed_plugin_loads_and_a_tampered_one_does_not() {
     let good = install(root.path(), "good", &component, &signed);
 
     // Same signature, but the manifest now asks for a bigger memory budget.
-    let mut escalated = signed.clone();
+    let mut escalated = signed;
     escalated.limits.max_memory_bytes *= 2;
     let bad = install(root.path(), "bad", &component, &escalated);
 

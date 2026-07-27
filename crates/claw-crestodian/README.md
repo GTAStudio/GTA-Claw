@@ -43,9 +43,18 @@ carry the secret itself.
 
 `CrestodianRuntime` owns the durable ring-zero settings and writes them
 atomically before they take effect, so a failed write can never leave a running
-gateway enforcing a policy that is not on disk. Settings loaded from disk are
-re-validated rather than trusted, and a hand-edited file fails closed instead of
-silently reverting to defaults. A pending approval lives only in memory, so a
-restart always drops it and an approval that arrives afterwards has nothing to
-apply. Applied configuration mutations record the SHA-256 configuration digest
-on both sides of the write into the durable JSON Lines audit trail.
+gateway enforcing a policy that is not on disk. Every write lands in a temporary
+file that is flushed and `fsync`-ed, is published by rename, and on Unix syncs
+the containing directory afterwards, so the previous bytes are never edited in
+place. Settings loaded from disk are re-validated rather than trusted, and a
+hand-edited file fails closed instead of silently reverting to defaults. A file
+that is empty, truncated, or carries bytes after its settings object — the
+shapes an interrupted write leaves behind — is refused as undecodable rather
+than accepted for the part that happened to parse. A pending approval lives only
+in memory, so a restart always drops it and an approval that arrives afterwards
+has nothing to apply. Applied configuration mutations record the SHA-256
+configuration digest on both sides of the write into the durable JSON Lines
+audit trail. A write that succeeds while reporting a non-fatal durability
+limitation — a rename that landed but whose directory entry could not be
+synchronized — surfaces it through `CrestodianRuntime::last_write_warnings` and
+`RecoveryReport::warnings` rather than reporting unqualified success.

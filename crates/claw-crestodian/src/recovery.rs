@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use claw_config::{ConfigError, ConfigSnapshot, load_file, write_file};
+use claw_config::{ConfigError, ConfigSnapshot, WriteWarning, load_file, write_file};
 
 use crate::setup::{read_optional_file, restore_paths};
 use crate::state::{CrestodianState, ensure_parent_directory, read_state, write_state};
@@ -89,6 +89,14 @@ pub struct RecoveryReport {
     pub backup_directory: Option<PathBuf>,
     /// Backups of orphaned atomic-write temporary files.
     pub interrupted_artifact_backups: Vec<PathBuf>,
+    /// Non-fatal atomic-write warnings raised while republishing.
+    ///
+    /// A [`WriteWarning::DirectorySyncFailed`] here means a replacement was
+    /// published by rename but its directory entry could not be synchronized,
+    /// so recovery completed without being able to promise the result survives
+    /// a power cut. It is reported rather than swallowed because the caller is
+    /// the only one that can decide whether that is acceptable.
+    pub warnings: Vec<WriteWarning>,
 }
 
 /// Setup and recovery owner for caller-selected paths.
@@ -122,6 +130,24 @@ impl Crestodian {
     /// Original bytes and orphaned atomic-write artifacts are copied and flushed
     /// before any replacement. If a later write fails, every earlier mutation is
     /// restored to its exact original bytes.
+    ///
+    /// A successful recovery still reports every non-fatal atomic-write warning
+    /// in [`RecoveryReport::warnings`], so a directory that could not be synced
+    /// is visible to the caller instead of being swallowed by the success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrestodianError::UnsafePath`] when the configuration or state
+    /// path exists but is not a regular file, and [`CrestodianError::Io`] when
+    /// no unique recovery directory can be allocated, an original file or an
+    /// orphaned atomic-write artifact cannot be read, or a backup cannot be
+    /// written, `fsync`-ed, and published into a synced directory. Returns
+    /// [`CrestodianError::Config`] when the baseline itself cannot be written
+    /// atomically. If the state write fails after the configuration was already
+    /// replaced, both files are restored to their exact original bytes and the
+    /// original failure is returned as-is, or wrapped in
+    /// [`CrestodianError::Rollback`] listing every restoration that also failed.
+    /// Nothing is ever replaced before its backup is durable.
     pub fn recover(
         &self,
         baseline: &ConfigSnapshot,
@@ -137,6 +163,7 @@ impl Crestodian {
                 state_action: RecoveryAction::Unchanged,
                 backup_directory: None,
                 interrupted_artifact_backups: Vec::new(),
+                warnings: Vec::new(),
             });
         }
 
@@ -162,38 +189,43 @@ impl Crestodian {
         let interrupted_artifact_backups =
             backup_interrupted_artifacts(&self.config_path, &backup_directory)?;
 
-        let config_action = action(original_config.as_ref(), config_backup);
-        let state_action = action(original_state.as_ref(), state_backup);
-        let mut config_mutated = false;
-        if repair_config {
+        let config_action = action(config_backup);
+        let state_action = action(state_backup);
+        let mut warnings = Vec::new();
+        let config_mutated = if repair_config {
             ensure_parent_directory(&self.config_path)?;
-            write_file(&self.config_path, baseline)?;
-            config_mutated = true;
-        }
+            warnings.extend(write_file(&self.config_path, baseline)?.warnings);
+            true
+        } else {
+            false
+        };
         if repair_state {
             let state = CrestodianState {
                 last_recovery_unix_ms: Some(unix_millis),
                 ..CrestodianState::default()
             };
-            if let Err(operation) = write_state(&self.state_path, &state) {
-                let mut restore_failures = Vec::new();
-                if config_mutated {
+            match write_state(&self.state_path, &state) {
+                Ok(outcome) => warnings.extend(outcome.warnings),
+                Err(operation) => {
+                    let mut restore_failures = Vec::new();
+                    if config_mutated {
+                        restore_failures.extend(restore_paths([(
+                            self.config_path.as_path(),
+                            original_config.as_deref(),
+                        )]));
+                    }
                     restore_failures.extend(restore_paths([(
-                        self.config_path.as_path(),
-                        original_config.as_deref(),
+                        self.state_path.as_path(),
+                        original_state.as_deref(),
                     )]));
+                    if restore_failures.is_empty() {
+                        return Err(operation);
+                    }
+                    return Err(CrestodianError::Rollback {
+                        operation: Box::new(operation),
+                        restore_failures,
+                    });
                 }
-                restore_failures.extend(restore_paths([(
-                    self.state_path.as_path(),
-                    original_state.as_deref(),
-                )]));
-                if restore_failures.is_empty() {
-                    return Err(operation);
-                }
-                return Err(CrestodianError::Rollback {
-                    operation: Box::new(operation),
-                    restore_failures,
-                });
             }
         }
         Ok(RecoveryReport {
@@ -210,6 +242,7 @@ impl Crestodian {
             },
             backup_directory: Some(backup_directory),
             interrupted_artifact_backups,
+            warnings,
         })
     }
 }
@@ -329,7 +362,7 @@ fn backup_interrupted_artifacts(
         .map_err(|source| CrestodianError::io(parent, source))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| CrestodianError::io(parent, source))?;
-    sources.sort_by_key(|entry| entry.file_name());
+    sources.sort_by_key(fs::DirEntry::file_name);
     let mut backups = Vec::new();
     for (index, entry) in sources.into_iter().enumerate() {
         let name = entry.file_name();
@@ -355,12 +388,15 @@ fn backup_interrupted_artifacts(
     Ok(backups)
 }
 
-fn action(original: Option<&Vec<u8>>, backup: Option<PathBuf>) -> RecoveryAction {
-    match (original, backup) {
-        (None, None) => RecoveryAction::Created,
-        (Some(_), Some(backup_path)) => RecoveryAction::Replaced { backup_path },
-        _ => unreachable!("backup state follows original file presence"),
-    }
+/// Classifies one recovered path from the backup its original bytes produced.
+///
+/// A backup exists exactly when the path held bytes worth preserving, so the
+/// backup alone decides between a creation and a replacement. Deriving the
+/// action from one value keeps the two from ever disagreeing.
+fn action(backup: Option<PathBuf>) -> RecoveryAction {
+    backup.map_or(RecoveryAction::Created, |backup_path| {
+        RecoveryAction::Replaced { backup_path }
+    })
 }
 
 #[cfg(unix)]

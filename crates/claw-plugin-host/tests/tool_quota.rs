@@ -136,7 +136,7 @@ fn a_trapping_plugin_loses_its_tools_immediately() {
     let root = support::tempdir();
     let mut grants = tools_grant(4);
     grants.push(CapabilityGrant::Events(EventsGrant {
-        emit_kinds: [EventKind::Heartbeat].into_iter().collect(),
+        emit_kinds: std::iter::once(EventKind::Heartbeat).collect(),
         max_payload_bytes: 1024,
     }));
     let dir = support::install_probe(root.path(), "probe", grants.clone());

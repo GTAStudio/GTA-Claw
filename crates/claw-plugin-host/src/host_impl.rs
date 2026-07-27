@@ -449,22 +449,21 @@ impl host_fs::Host for PluginState {
         };
         let mut names = Vec::new();
         for entry in entries {
-            match entry {
-                Ok(entry) => match entry.file_name().into_string() {
-                    Ok(name) => names.push(name),
-                    Err(_) => {
-                        drop(permit);
-                        return Ok(Err(wit_error(
-                            ErrorCode::Unsupported,
-                            "directory contains a non-UTF-8 name",
-                        )));
-                    }
-                },
+            let entry = match entry {
+                Ok(entry) => entry,
                 Err(error) => {
                     drop(permit);
                     return Ok(Err(wit_error(ErrorCode::Internal, error.to_string())));
                 }
-            }
+            };
+            let Ok(name) = entry.file_name().into_string() else {
+                drop(permit);
+                return Ok(Err(wit_error(
+                    ErrorCode::Unsupported,
+                    "directory contains a non-UTF-8 name",
+                )));
+            };
+            names.push(name);
         }
         names.sort_unstable();
         drop(permit);
@@ -594,7 +593,7 @@ impl host_http::Host for PluginState {
                 }
             };
             if attempt.response.status == 303 {
-                method = "GET".to_owned();
+                "GET".clone_into(&mut method);
                 body = None;
                 if !grant
                     .methods
@@ -609,7 +608,7 @@ impl host_http::Host for PluginState {
                     ));
                 }
             }
-            url = next.as_str().to_owned();
+            next.as_str().clone_into(&mut url);
         }
     }
 }
@@ -628,7 +627,7 @@ impl PluginState {
     /// route through the audit log) from a transport error (which is reported
     /// to the guest as-is).
     fn attempt_http(
-        &mut self,
+        &self,
         grant: &claw_plugin_api::capability::HttpGrant,
         method: &str,
         url: &str,
@@ -692,7 +691,7 @@ impl PluginState {
         let outbound = OutboundRequest {
             method: method.to_owned(),
             url: target.as_str().to_owned(),
-            host: host.clone(),
+            host,
             port: target.port(),
             addresses,
             headers: headers.to_vec(),

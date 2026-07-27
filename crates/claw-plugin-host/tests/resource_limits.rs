@@ -196,6 +196,63 @@ fn a_faulted_plugin_refuses_further_calls_until_it_is_reloaded() {
 }
 
 #[test]
+fn a_faulted_instance_is_destroyed_rather_than_kept_around() {
+    let root = support::tempdir();
+    let limits = ResourceLimits {
+        max_memory_bytes: 2 * 1024 * 1024,
+        max_payload_bytes: 64 * 1024,
+        fuel: 1_000_000_000,
+        wall_clock_timeout_ms: 30_000,
+        ..ResourceLimits::default()
+    };
+    let dir = install_probe_with(root.path(), "probe", Vec::new(), limits);
+    let mut host = host_for(root.path());
+    let id = host.load(&dir).expect("load");
+    host.activate(&id).expect("activate");
+    assert!(
+        host.phase(&id).is_some(),
+        "a live plugin must have a live instance"
+    );
+
+    host.invoke_tool(&id, "m", "{}")
+        .expect_err("the memory bomb must not return a value");
+
+    // Everything that can only be answered out of a live store now answers
+    // nothing, which is the observable form of "the instance was dropped".
+    assert!(
+        host.phase(&id).is_none(),
+        "the store must have been dropped"
+    );
+    assert!(host.effective_capabilities(&id).is_none());
+    assert!(host.registered_tools(&id).is_none());
+
+    // What the dead instance consumed is still reportable, because an operator
+    // has to be able to see why it was killed after it is gone.
+    let crashed = host
+        .resource_usage(&id)
+        .expect("usage outlives the instance");
+    assert!(crashed.hit_memory_ceiling);
+    assert!(crashed.peak_memory_bytes > 0);
+
+    // A reload is a new instance, not a resumed one: none of the memory the
+    // runaway had claimed is carried over.
+    host.reload(&id).expect("reload");
+    host.activate(&id).expect("reactivate");
+    let fresh = host.resource_usage(&id).expect("usage");
+    assert!(
+        !fresh.hit_memory_ceiling,
+        "a reloaded plugin must not inherit the crash it caused"
+    );
+    assert!(
+        fresh.peak_memory_bytes < crashed.peak_memory_bytes,
+        "the new instance started from the component's own initial memory, \
+         but peaked at {} against the runaway's {}",
+        fresh.peak_memory_bytes,
+        crashed.peak_memory_bytes
+    );
+}
+
+#[test]
 fn a_bystander_keeps_working_while_its_neighbour_keeps_running_away() {
     let root = support::tempdir();
     let limits = ResourceLimits {

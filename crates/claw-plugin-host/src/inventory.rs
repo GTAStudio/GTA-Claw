@@ -28,7 +28,7 @@ pub struct RegistryReport {
 impl RegistryReport {
     /// Whether any inventory plugin ships a loadable component.
     #[must_use]
-    pub fn has_any_component(&self) -> bool {
+    pub const fn has_any_component(&self) -> bool {
         !self.component_backed.is_empty()
     }
 }

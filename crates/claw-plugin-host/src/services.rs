@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use claw_plugin_api::capability::{EventKind, LogLevel};
 
@@ -334,28 +334,19 @@ impl InMemoryConfig {
         key: impl Into<String>,
         value: impl Into<String>,
     ) {
-        let mut guard = self
-            .values
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut guard = self.values.lock().unwrap_or_else(PoisonError::into_inner);
         guard.insert((plugin_id.into(), key.into()), value.into());
     }
 }
 
 impl ConfigProvider for InMemoryConfig {
     fn get(&self, plugin_id: &str, key: &str) -> Option<String> {
-        let guard = self
-            .values
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let guard = self.values.lock().unwrap_or_else(PoisonError::into_inner);
         guard.get(&(plugin_id.to_owned(), key.to_owned())).cloned()
     }
 
     fn keys(&self, plugin_id: &str) -> Vec<String> {
-        let guard = self
-            .values
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let guard = self.values.lock().unwrap_or_else(PoisonError::into_inner);
         guard
             .keys()
             .filter(|(owner, _)| owner == plugin_id)
@@ -381,10 +372,7 @@ impl InMemoryStore {
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut StoreMap) -> R) -> R {
-        let mut guard = self
-            .values
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut guard = self.values.lock().unwrap_or_else(PoisonError::into_inner);
         f(&mut guard)
     }
 }
@@ -471,13 +459,19 @@ impl RecordingSink {
     /// Every log record captured so far.
     #[must_use]
     pub fn logs(&self) -> Vec<LogRecord> {
-        self.logs.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.logs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Every tool registration captured so far.
     #[must_use]
     pub fn tools(&self) -> Vec<ToolRegistration> {
-        self.tools.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.tools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Every published event captured so far, with its plugin id.
@@ -485,7 +479,7 @@ impl RecordingSink {
     pub fn events(&self) -> Vec<(String, HostEvent)> {
         self.events
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 }
@@ -494,14 +488,14 @@ impl LogSink for RecordingSink {
     fn record(&self, record: LogRecord) {
         self.logs
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .push(record);
     }
 }
 
 impl ToolSink for RecordingSink {
     fn register(&self, registration: ToolRegistration) {
-        let mut guard = self.tools.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.tools.lock().unwrap_or_else(PoisonError::into_inner);
         guard.retain(|existing| {
             existing.plugin_id != registration.plugin_id || existing.name != registration.name
         });
@@ -509,7 +503,7 @@ impl ToolSink for RecordingSink {
     }
 
     fn unregister(&self, plugin_id: &str, name: &str) -> bool {
-        let mut guard = self.tools.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.tools.lock().unwrap_or_else(PoisonError::into_inner);
         let before = guard.len();
         guard.retain(|existing| existing.plugin_id != plugin_id || existing.name != name);
         guard.len() != before
@@ -520,7 +514,7 @@ impl EventSink for RecordingSink {
     fn publish(&self, plugin_id: &str, event: HostEvent) {
         self.events
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .push((plugin_id.to_owned(), event));
     }
 }

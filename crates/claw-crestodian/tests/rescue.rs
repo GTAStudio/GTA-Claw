@@ -233,7 +233,7 @@ fn sandbox_owner_identity_and_direct_message_gates_are_fail_closed() {
         authorize_rescue(&policy, &non_yolo),
         Err(RescueAuthorizationError::Disabled)
     );
-    let mut disabled = policy.clone();
+    let mut disabled = policy;
     disabled.enabled = RescueEnabled::Explicit(false);
     assert_eq!(
         authorize_rescue(&disabled, &context),
@@ -632,7 +632,7 @@ fn render(source: &str) -> String {
     }
 }
 
-fn restart() -> RescueCommand {
+const fn restart() -> RescueCommand {
     RescueCommand::Operation(CrestodianOperation::RestartGateway)
 }
 
@@ -688,7 +688,7 @@ fn control() -> Control {
     }
 }
 
-fn audit() -> Audit {
+const fn audit() -> Audit {
     Audit {
         events: Vec::new(),
         fail: false,

@@ -85,6 +85,16 @@ impl Error for RescueParseError {}
 ///
 /// The grammar is closed: nothing is guessed, no model is ever consulted, and a
 /// message that is not spelled exactly is refused with the accepted spellings.
+///
+/// # Errors
+///
+/// Returns a [`RescueParseError`] carrying
+/// [`RescueParseReason::NotARescueCommand`] when the message does not start with
+/// `/crestodian `, [`RescueParseReason::UnknownCommand`] when the remainder is
+/// outside the closed grammar, [`RescueParseReason::IncompleteCommand`] when
+/// `config set` or `config set-ref` is missing operands, and
+/// [`RescueParseReason::Mutation`] when the typed mutation surface refuses the
+/// path or the value those operands name.
 pub fn parse_rescue_command(message: &str) -> Result<RescueCommand, RescueParseError> {
     let trimmed = message.trim();
     let refuse = |reason: RescueParseReason| RescueParseError {
@@ -135,6 +145,13 @@ pub fn parse_rescue_command(message: &str) -> Result<RescueCommand, RescueParseE
 }
 
 /// Trusted message metadata used for authorization and audit.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is a separate trust fact the transport reports independently — owner \
+              verification, direct-message shape, sandboxing, and YOLO posture — and every one is \
+              read by a different gate in authorize_rescue; folding them into a single enum would \
+              invent postures no transport ever reports and hide which gate refused"
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RescueContext {
     /// Whether the sender exactly matches configured owner identity.
@@ -197,6 +214,17 @@ impl Error for RescueAuthorizationError {}
 /// Every gate fails closed, and identity is required to be explicit: a context
 /// that claims owner verification without stable channel, account, sender, and
 /// source-address metadata is refused rather than trusted.
+///
+/// # Errors
+///
+/// Returns [`RescueAuthorizationError::Sandboxed`] for a sandboxed session,
+/// which can never use remote rescue; [`RescueAuthorizationError::Disabled`]
+/// when the policy is explicitly off, or is `auto` outside an unsandboxed YOLO
+/// posture; [`RescueAuthorizationError::OwnerRequired`] when the sender is not
+/// an explicitly verified owner; [`RescueAuthorizationError::AnonymousIdentity`]
+/// naming the first of `channel`, `account`, `sender`, or `source_address` that
+/// is blank; and [`RescueAuthorizationError::DirectMessageRequired`] when an
+/// owner-direct-message-only policy sees a group message.
 pub fn authorize_rescue(
     policy: &CrestodianRescueConfig,
     context: &RescueContext,
@@ -245,12 +273,32 @@ pub trait RescueControlPlane {
     type Error: Error + Send + Sync + 'static;
 
     /// Reads gateway and config health.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the implementation cannot reach the gateway
+    /// or cannot read the configuration it reports on. A read-only status is the
+    /// one operation rescue runs without an approval, so a failure here must
+    /// never be reported as a healthy gateway.
     fn status(&mut self) -> Result<RescueStatus, Self::Error>;
 
     /// Restarts the gateway.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the restart cannot be carried out. The
+    /// rescue session has already persisted the approval record by then, so the
+    /// trail shows an approved restart that did not complete.
     fn restart_gateway(&mut self) -> Result<(), Self::Error>;
 
     /// Applies one approved typed mutation and reports both config digests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the mutation is refused or cannot be made
+    /// durable. An implementation must not report success for a write that is
+    /// only in memory: the returned digests are recorded as the audited outcome
+    /// of a durable configuration change.
     fn apply(&mut self, mutation: &TypedMutation) -> Result<ConfigDigestChange, Self::Error>;
 }
 
@@ -296,6 +344,13 @@ pub trait RescueAuditSink {
     type Error: Error + Send + Sync + 'static;
 
     /// Persists one metadata-only event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the event cannot be encoded or durably
+    /// appended. Audit persistence is mandatory: a failure on the pre-action
+    /// record abandons the approved operation, so a sink must not report success
+    /// for a record that is still only buffered.
     fn persist(&mut self, event: &RescueAuditEvent) -> Result<(), Self::Error>;
 }
 
@@ -451,6 +506,23 @@ impl RescueSession {
     }
 
     /// Executes read-only commands or manages one exact pending mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RescueError::Authorization`] when the context fails any policy
+    /// gate; [`RescueError::NoPendingApproval`] for an approval with nothing
+    /// staged, which is what a restart always leaves behind;
+    /// [`RescueError::ApprovalExpired`] once `unix_millis` is past the staged
+    /// expiry; [`RescueError::ApprovalIdentityChanged`] when the approval
+    /// carries different channel, account, sender, or source-address metadata
+    /// than the proposal; [`RescueError::Control`] when the control plane
+    /// refuses or fails the operation; [`RescueError::Audit`] when the mandatory
+    /// pre-action record cannot be persisted, in which case the operation never
+    /// runs; and [`RescueError::AppliedButAuditFailed`] when the operation
+    /// completed but its receipt did not, which needs operator attention rather
+    /// than a retry. An approval consumes the staged mutation before any of
+    /// those checks run, so every failure from `yes` onwards leaves nothing
+    /// pending and the owner must re-issue the command.
     pub fn handle<C, A>(
         &mut self,
         command: RescueCommand,

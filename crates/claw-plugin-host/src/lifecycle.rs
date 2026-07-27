@@ -35,6 +35,51 @@ enum Purge {
     Always,
 }
 
+/// Everything one lifecycle transition does apart from calling the guest.
+///
+/// Keeping the shape of a transition in one value is what lets `activate` and
+/// `deactivate` differ in exactly the places they are meant to differ - the
+/// phase the guest runs in, the phase it is left in, and whether its tools
+/// survive - rather than in a long positional argument list where two of those
+/// could be swapped without anyone noticing.
+#[derive(Clone, Copy, Debug)]
+struct Transition {
+    /// The operation name reported in `WrongState` errors.
+    operation: &'static str,
+    /// The states this transition may start from.
+    allowed: &'static [LifecycleState],
+    /// The state reached when the guest call succeeds.
+    next: LifecycleState,
+    /// The capability phase the guest call itself runs in.
+    during: LifecyclePhase,
+    /// The phase the instance is left in after a successful call.
+    after_success: LifecyclePhase,
+    /// Whether the plugin's tools are withdrawn even on success.
+    purge: Purge,
+}
+
+/// `activate`: reachable from `loaded` or `inactive`, runs with the full grant
+/// set, and keeps its tools only if the guest actually activated.
+const ACTIVATE: Transition = Transition {
+    operation: "activate",
+    allowed: &[LifecycleState::Loaded, LifecycleState::Inactive],
+    next: LifecycleState::Active,
+    during: LifecyclePhase::Active,
+    after_success: LifecyclePhase::Active,
+    purge: Purge::OnFailure,
+};
+
+/// `deactivate`: reachable only from `active`, runs with the cleanup grants
+/// alone, and withdraws every tool whether or not the guest cooperates.
+const DEACTIVATE: Transition = Transition {
+    operation: "deactivate",
+    allowed: &[LifecycleState::Active],
+    next: LifecycleState::Inactive,
+    during: LifecyclePhase::Deactivating,
+    after_success: LifecyclePhase::Inactive,
+    purge: Purge::Always,
+};
+
 /// The file every plugin directory must contain.
 pub const MANIFEST_FILE_NAME: &str = "plugin.json";
 
@@ -118,7 +163,7 @@ pub struct ResourceUsage {
 }
 
 impl ResourceUsage {
-    fn of(state: &PluginState) -> Self {
+    const fn of(state: &PluginState) -> Self {
         Self {
             peak_memory_bytes: state.peak_memory_bytes(),
             hit_memory_ceiling: state.hit_memory_ceiling(),
@@ -264,7 +309,10 @@ impl PluginHostBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`HostError::Instantiate`] when the engine cannot be created.
+    /// Returns [`HostError::Instantiate`] when Wasmtime refuses the engine
+    /// configuration - the component model, fuel metering and epoch
+    /// interruption must all be available - or when the world's host functions
+    /// cannot be added to the linker.
     pub fn build(self) -> Result<PluginHost, HostError> {
         let gate = self
             .gate
@@ -459,7 +507,39 @@ impl PluginHost {
     ///
     /// # Errors
     ///
-    /// Returns the first [`HostError`] that stops the plugin from running.
+    /// Returns the first check that refuses the plugin, in the order above:
+    ///
+    /// * [`HostError::Io`] when `plugin.json` or the component file cannot be
+    ///   read, or a granted filesystem root does not exist.
+    /// * [`HostError::Manifest`], [`HostError::CapabilitySet`],
+    ///   [`HostError::Limits`] or [`HostError::Version`] when the manifest is
+    ///   not schema-valid, asks for a capability set that cannot be built,
+    ///   states limits outside the allowed range, or carries a malformed
+    ///   version.
+    /// * [`HostError::Abi`] when the manifest, or the component's own
+    ///   `describe`, declares an ABI this host cannot run.
+    /// * [`HostError::DuplicatePlugin`] when a plugin with this id is loaded.
+    /// * [`HostError::Trust`] when the directory is outside every trusted root,
+    ///   the delivery class is not allowed, or the identity binding does not
+    ///   match.
+    /// * [`HostError::ComponentTooLarge`], [`HostError::DigestMismatch`] or
+    ///   [`HostError::Verification`] when the component file is bigger than the
+    ///   manifest allows, does not hash to the pinned digest, is not the size
+    ///   the manifest pins, or fails the signature check.
+    /// * [`HostError::Instantiate`] when the bytes are not a valid component,
+    ///   Wasmtime refuses to compile them, or instantiation itself fails.
+    /// * [`HostError::UnsatisfiedImport`] when the component imports anything
+    ///   outside [`ALLOWED_IMPORTS`], which for this host always means an
+    ///   attempt at ambient authority such as `wasi:filesystem`.
+    /// * [`HostError::Terminated`] when the component's start function or its
+    ///   `describe` exhausts fuel, runs past the wall-clock deadline, exceeds a
+    ///   memory or table ceiling, overflows its stack or traps. Note that no
+    ///   host call is reachable in either window, so a host call attempted
+    ///   there is refused and, under [`ViolationPolicy::Trap`], terminates the
+    ///   load.
+    /// * [`HostError::Guest`] when `describe` returns an ABI error, and
+    ///   [`HostError::IdentityMismatch`] when it reports an id, version or ABI
+    ///   version the manifest does not claim.
     pub fn load(&mut self, directory: &Path) -> Result<String, HostError> {
         let manifest = read_manifest(directory)?;
         self.load_manifest(directory, manifest)
@@ -471,7 +551,7 @@ impl PluginHost {
         manifest: PluginManifest,
     ) -> Result<String, HostError> {
         if self.plugins.contains_key(&manifest.id) {
-            return Err(HostError::DuplicatePlugin(manifest.id.clone()));
+            return Err(HostError::DuplicatePlugin(manifest.id));
         }
 
         manifest.limits.validate()?;
@@ -511,7 +591,7 @@ impl PluginHost {
         let digest = component_sha256(&bytes);
         if digest != manifest.component.sha256 {
             return Err(HostError::DigestMismatch {
-                expected: manifest.component.sha256.clone(),
+                expected: manifest.component.sha256,
                 actual: digest,
             });
         }
@@ -612,19 +692,21 @@ impl PluginHost {
     ///
     /// # Errors
     ///
-    /// Returns [`HostError`] when the plugin is unknown, in the wrong state,
-    /// traps, or returns an error of its own.
+    /// * [`HostError::UnknownPlugin`] when no plugin with this id is loaded.
+    /// * [`HostError::Faulted`] when a previous call trapped, so the instance
+    ///   no longer exists and the plugin must be reloaded first.
+    /// * [`HostError::WrongState`] when the plugin is already active.
+    /// * [`HostError::Guest`] when `activate` returned an ABI error. The
+    ///   plugin stays in the state it was in and its tools are withdrawn.
+    /// * [`HostError::Terminated`] when `activate` exhausted its fuel, ran past
+    ///   its wall-clock deadline, exceeded a memory or table ceiling, overflowed
+    ///   its stack, trapped, or was trapped by a host call refused under
+    ///   [`ViolationPolicy::Trap`]. The instance is destroyed and the plugin is
+    ///   left faulted.
     pub fn activate(&mut self, id: &str) -> Result<(), HostError> {
-        self.transition(
-            id,
-            "activate",
-            &[LifecycleState::Loaded, LifecycleState::Inactive],
-            LifecycleState::Active,
-            LifecyclePhase::Active,
-            LifecyclePhase::Active,
-            Purge::OnFailure,
-            |bindings, store| bindings.gta_claw_plugin_guest().call_activate(store),
-        )
+        self.transition(id, &ACTIVATE, |bindings, store| {
+            bindings.gta_claw_plugin_guest().call_activate(store)
+        })
     }
 
     /// Calls `deactivate` on an active plugin.
@@ -636,31 +718,26 @@ impl PluginHost {
     ///
     /// # Errors
     ///
-    /// Returns [`HostError`] when the plugin is unknown, not active, traps, or
-    /// returns an error of its own.
+    /// * [`HostError::UnknownPlugin`] when no plugin with this id is loaded.
+    /// * [`HostError::Faulted`] when a previous call trapped, so there is no
+    ///   instance left to deactivate.
+    /// * [`HostError::WrongState`] when the plugin is not active.
+    /// * [`HostError::Guest`] when `deactivate` returned an ABI error.
+    /// * [`HostError::Terminated`] when `deactivate` exhausted its fuel, ran
+    ///   past its wall-clock deadline, exceeded a memory or table ceiling,
+    ///   overflowed its stack, trapped, or was trapped by a host call refused
+    ///   under [`ViolationPolicy::Trap`]. The instance is destroyed and the
+    ///   plugin is left faulted; its tools are withdrawn either way.
     pub fn deactivate(&mut self, id: &str) -> Result<(), HostError> {
-        self.transition(
-            id,
-            "deactivate",
-            &[LifecycleState::Active],
-            LifecycleState::Inactive,
-            LifecyclePhase::Deactivating,
-            LifecyclePhase::Inactive,
-            Purge::Always,
-            |bindings, store| bindings.gta_claw_plugin_guest().call_deactivate(store),
-        )
+        self.transition(id, &DEACTIVATE, |bindings, store| {
+            bindings.gta_claw_plugin_guest().call_deactivate(store)
+        })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn transition(
         &mut self,
         id: &str,
-        operation: &'static str,
-        allowed: &[LifecycleState],
-        next: LifecycleState,
-        during: LifecyclePhase,
-        after_success: LifecyclePhase,
-        purge: Purge,
+        transition: &Transition,
         call: impl FnOnce(
             &Plugin,
             &mut Store<PluginState>,
@@ -679,11 +756,11 @@ impl PluginHost {
                     cause,
                 });
             }
-            if !allowed.contains(&plugin.state) {
+            if !transition.allowed.contains(&plugin.state) {
                 return Err(HostError::WrongState {
                     id: id.to_owned(),
                     actual: plugin.state.as_str(),
-                    expected: operation,
+                    expected: transition.operation,
                 });
             }
             plugin.manifest.limits
@@ -700,10 +777,10 @@ impl PluginHost {
                 .ok_or_else(|| HostError::WrongState {
                     id: id.to_owned(),
                     actual: "unloaded",
-                    expected: operation,
+                    expected: transition.operation,
                 })?;
             let previous_phase = instance.store.data().phase();
-            instance.store.data_mut().set_phase(during);
+            instance.store.data_mut().set_phase(transition.during);
             arm_call(&mut instance.store, &limits);
             let raw = call(&instance.bindings, &mut instance.store);
             disarm_call(&mut instance.store);
@@ -719,7 +796,7 @@ impl PluginHost {
         let succeeded = matches!(outcome, Ok(Ok(())));
         if outcome.is_ok() {
             let phase = if succeeded {
-                after_success
+                transition.after_success
             } else {
                 previous_phase
             };
@@ -731,14 +808,14 @@ impl PluginHost {
                 instance.store.data_mut().set_phase(phase);
             }
         }
-        if matches!(purge, Purge::Always) || !succeeded {
+        if matches!(transition.purge, Purge::Always) || !succeeded {
             self.purge_tools(id);
         }
 
         match outcome {
             Ok(Ok(())) => {
                 if let Some(plugin) = self.plugins.get_mut(id) {
-                    plugin.state = next;
+                    plugin.state = transition.next;
                 }
                 Ok(())
             }
@@ -754,8 +831,17 @@ impl PluginHost {
     ///
     /// # Errors
     ///
-    /// Returns [`HostError`] when the plugin is unknown, not active, traps, or
-    /// returns an error of its own.
+    /// * [`HostError::UnknownPlugin`] when no plugin with this id is loaded.
+    /// * [`HostError::Faulted`] when a previous call trapped and the plugin has
+    ///   not been reloaded.
+    /// * [`HostError::WrongState`] when the plugin is loaded or inactive rather
+    ///   than active.
+    /// * [`HostError::Guest`] when `handle-event` returns an ABI error.
+    /// * [`HostError::Terminated`] when the call exhausts its fuel, runs past
+    ///   its wall-clock deadline, exceeds a memory or table ceiling, overflows
+    ///   its stack, traps, or makes a host call that is refused while
+    ///   [`ViolationPolicy::Trap`] is in force. The instance is destroyed and
+    ///   the plugin is left faulted.
     pub fn handle_event(&mut self, id: &str, event: &HostEvent) -> Result<EventOutcome, HostError> {
         let limits = self.require_active(id, "handle-event")?;
         let wit = wit_event(event);
@@ -794,8 +880,18 @@ impl PluginHost {
     ///
     /// # Errors
     ///
-    /// Returns [`HostError`] when the plugin is unknown, not active, traps, or
-    /// returns an error of its own.
+    /// * [`HostError::UnknownPlugin`] when no plugin with this id is loaded.
+    /// * [`HostError::Faulted`] when a previous call trapped and the plugin has
+    ///   not been reloaded.
+    /// * [`HostError::WrongState`] when the plugin is not active.
+    /// * [`HostError::Guest`] when the guest rejects the call, which is also
+    ///   how an unknown tool name and invalid input are reported: the host does
+    ///   not keep a tool table of its own to answer from.
+    /// * [`HostError::Terminated`] when the call exhausts its fuel, runs past
+    ///   its wall-clock deadline, exceeds a memory or table ceiling, overflows
+    ///   its stack, traps, or makes a host call that is refused while
+    ///   [`ViolationPolicy::Trap`] is in force. The instance is destroyed and
+    ///   the plugin is left faulted.
     pub fn invoke_tool(&mut self, id: &str, name: &str, input: &str) -> Result<String, HostError> {
         let limits = self.require_active(id, "invoke-tool")?;
         let outcome = {
@@ -919,6 +1015,10 @@ impl PluginHost {
     /// # Errors
     ///
     /// Returns [`HostError`] when the plugin is unknown or fails to reload.
+    /// Every load error listed on [`PluginHost::load`] is possible here,
+    /// because the component is re-validated from scratch: a component that
+    /// changed on disk now fails its digest check, and a manifest that changed
+    /// is re-checked against the operator ceiling.
     pub fn reload(&mut self, id: &str) -> Result<String, HostError> {
         let directory = self
             .plugins
@@ -979,9 +1079,25 @@ fn reject_foreign_imports(
 }
 
 /// Gives a call its own fuel, epoch deadline and host-call deadline.
+///
+/// Every guest entry point - the component start function, `describe`,
+/// `activate`, `deactivate`, `handle-event` and `invoke-tool` - is armed
+/// immediately before it runs, so a budget is per call rather than per
+/// instance and a plugin cannot bank the fuel it did not spend last time.
 fn arm_call(store: &mut Store<PluginState>, limits: &ResourceLimits) {
-    let _ = store.set_fuel(limits.fuel);
+    // Every store this host runs came from `PluginEngine::new_store`, whose
+    // engine always has fuel metering enabled, so this cannot fail. Even if it
+    // somehow did, the two lines below still bound the call in wall-clock time:
+    // the guest is never left with no bound at all.
+    let armed = store.set_fuel(limits.fuel);
+    debug_assert!(
+        armed.is_ok(),
+        "a store from `PluginEngine::new_store` always meters fuel"
+    );
     store.set_epoch_deadline(epoch_ticks_for(limits.wall_clock_timeout_ms));
+    // `ResourceLimits::validate` caps `wall_clock_timeout_ms` at ten minutes
+    // and `load` runs it before any instance exists, so this addition cannot
+    // overflow even for a manifest written by a hostile author.
     store
         .data_mut()
         .set_deadline(Some(Instant::now() + limits.timeout()));

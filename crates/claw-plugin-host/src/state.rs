@@ -272,19 +272,24 @@ impl PluginState {
         &self.write_roots
     }
 
-    pub(crate) fn set_deadline(&mut self, deadline: Option<Instant>) {
+    pub(crate) const fn set_deadline(&mut self, deadline: Option<Instant>) {
         self.deadline = deadline;
     }
 
-    pub(crate) fn next_sequence(&mut self) -> u64 {
+    pub(crate) const fn next_sequence(&mut self) -> u64 {
         self.sequence = self.sequence.saturating_add(1);
         self.sequence
     }
 
     /// Opens a host call: checks the lifecycle phase, the grant, the deadline
     /// and the concurrency gate before any effect is reachable.
+    ///
+    /// This takes `&self` deliberately. Opening a call must not be able to
+    /// change the instance's own state, so the checks below cannot quietly
+    /// grow a side effect; the only thing that leaves is a permit, and the
+    /// permit's slots live in atomics shared with every other instance.
     pub(crate) fn enter(
-        &mut self,
+        &self,
         capability: Capability,
         operation: &'static str,
     ) -> Result<HostCallPermits, CapabilityDenial> {
@@ -429,7 +434,7 @@ mod tests {
     #[test]
     fn entering_an_ungranted_capability_is_refused_without_taking_a_slot() {
         let gate = HostCallGate::new(4);
-        let mut state = state(ViolationPolicy::ReturnError, gate.clone());
+        let state = state(ViolationPolicy::ReturnError, gate.clone());
         let denial = state
             .enter(Capability::Http, "send")
             .expect_err("http was never granted");
@@ -560,7 +565,7 @@ mod tests {
     #[test]
     fn entering_a_granted_capability_takes_and_returns_a_host_wide_slot() {
         let gate = HostCallGate::new(1);
-        let mut state = state(ViolationPolicy::ReturnError, gate.clone());
+        let state = state(ViolationPolicy::ReturnError, gate.clone());
         let permit = state.enter(Capability::Log, "log").expect("granted");
         assert_eq!(gate.in_flight(), 1);
         let denial = state
@@ -584,7 +589,7 @@ mod tests {
             max_host_call_concurrency: 1,
             ..ResourceLimits::default()
         };
-        let mut state = state_with_limits(ViolationPolicy::ReturnError, gate.clone(), limits);
+        let state = state_with_limits(ViolationPolicy::ReturnError, gate.clone(), limits);
         let permit = state.enter(Capability::Log, "log").expect("granted");
         assert_eq!(gate.in_flight(), 1);
         let denial = state
@@ -660,7 +665,9 @@ mod tests {
     fn an_expired_deadline_refuses_even_a_granted_capability() {
         let mut state = state(ViolationPolicy::ReturnError, HostCallGate::new(2));
         state.set_deadline(Some(
-            std::time::Instant::now() - std::time::Duration::from_millis(1),
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(1))
+                .expect("the process start instant is more than a millisecond ago"),
         ));
         let denial = state.enter(Capability::Log, "log").expect_err("expired");
         assert_eq!(denial.capability(), Capability::Log);

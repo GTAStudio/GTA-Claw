@@ -61,7 +61,7 @@ fn a_manifest_that_asks_for_the_whole_disk_gets_only_the_operator_root() {
         .expect("read survives");
     assert_eq!(
         effective.roots,
-        vec![sandbox.clone()],
+        vec![sandbox],
         "the manifest's wider root must have been dropped"
     );
     assert_eq!(effective.max_file_bytes, 4096, "the tighter quota wins");
