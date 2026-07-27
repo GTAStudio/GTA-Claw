@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::SocketAddr;
-use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
@@ -19,7 +18,7 @@ use http::HeaderValue;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
@@ -241,35 +240,9 @@ async fn request_at(
     extra_headers: &[(&str, &str)],
     body: &[u8],
 ) -> HttpResponse {
-    request_at_from(address, None, method, path, token, extra_headers, body).await
-}
-
-async fn request_at_from(
-    address: SocketAddr,
-    source_ip: Option<IpAddr>,
-    method: &str,
-    path: &str,
-    token: Option<&str>,
-    extra_headers: &[(&str, &str)],
-    body: &[u8],
-) -> HttpResponse {
-    let mut stream = if let Some(source_ip) = source_ip {
-        let socket = match source_ip {
-            IpAddr::V4(_) => TcpSocket::new_v4().expect("create IPv4 client socket"),
-            IpAddr::V6(_) => TcpSocket::new_v6().expect("create IPv6 client socket"),
-        };
-        socket
-            .bind(SocketAddr::new(source_ip, 0))
-            .expect("bind client source address");
-        socket
-            .connect(address)
-            .await
-            .expect("connect bound client socket")
-    } else {
-        TcpStream::connect(address)
-            .await
-            .expect("connect test server")
-    };
+    let mut stream = TcpStream::connect(address)
+        .await
+        .expect("connect test server");
     let mut head = format!(
         "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n",
         address,
@@ -595,17 +568,56 @@ async fn rate_limit_enforces_exact_contract_by_socket_peer_and_ignores_forwardin
     );
     assert!(!limited.headers.contains_key("retry-after"));
 
-    let isolated = request_at_from(
-        server.address,
-        Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
+    // A second socket peer must carry its own budget. `::1` is the only
+    // additional loopback address every supported platform assigns without
+    // administrative setup: macOS leaves 127.0.0.2 unassigned on lo0, so
+    // binding a client there fails with `AddrNotAvailable`. This extra
+    // listener shares the very same `HttpApi` (and therefore the very same
+    // limiter state) as `server`, so a 200 here can only come from the peer
+    // key, never from the listener.
+    let isolated_listener = TcpListener::bind("[::1]:0")
+        .await
+        .expect("bind IPv6 loopback test listener");
+    let isolated_address = isolated_listener
+        .local_addr()
+        .expect("IPv6 loopback listener address");
+    let isolated_api = server.api.clone();
+    let isolated_task = tokio::spawn(async move {
+        isolated_api
+            .serve(isolated_listener)
+            .await
+            .expect("serve IPv6 loopback test API");
+    });
+    for attempt in 0..2 {
+        let isolated = request_at(
+            isolated_address,
+            "GET",
+            "/v1/models",
+            Some("operator-token"),
+            &[("X-Forwarded-For", "203.0.113.40")],
+            b"",
+        )
+        .await;
+        assert_eq!(
+            isolated.status, 200,
+            "request {attempt} from a distinct socket peer spends its own budget"
+        );
+    }
+    let isolated_limited = request_at(
+        isolated_address,
         "GET",
         "/v1/models",
         Some("operator-token"),
-        &[("X-Forwarded-For", "203.0.113.40")],
+        &[("X-Forwarded-For", "198.51.100.77")],
         b"",
     )
     .await;
-    assert_eq!(isolated.status, 200);
+    assert_eq!(
+        isolated_limited.status, 429,
+        "the second peer shares the one limiter and exhausts the same budget size"
+    );
+    assert_eq!(isolated_limited.body, br#"{"error":"Too many requests"}"#);
+    isolated_task.abort();
 
     for path in ["/health", "/healthz", "/ready", "/readyz"] {
         let probe = request(&server, "GET", path, None, &[], b"").await;
