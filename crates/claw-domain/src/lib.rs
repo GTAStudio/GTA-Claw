@@ -14,6 +14,16 @@ pub struct SessionId(String);
 
 impl SessionId {
     /// Creates a session identifier after enforcing the domain invariant.
+    ///
+    /// The value is trimmed of leading and trailing whitespace first, so the
+    /// invariant is checked against the stored form.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidSessionId`] when the trimmed value is
+    /// empty, when it is longer than 128 bytes, or when it contains a control
+    /// character (identifiers travel through line-oriented logs and transports,
+    /// where an embedded newline or escape byte would be forgeable).
     pub fn new(value: impl Into<String>) -> Result<Self, DomainError> {
         let value = value.into();
         let value = value.trim();
@@ -67,6 +77,15 @@ pub struct Message {
 
 impl Message {
     /// Creates a message while preserving its original content.
+    ///
+    /// Unlike [`SessionId::new`], the content is *not* trimmed: leading and
+    /// trailing whitespace is meaningful to the model and is stored verbatim.
+    /// Only the emptiness check ignores whitespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidMessage`] when `content` is empty or
+    /// entirely whitespace, or when it is longer than 64 KiB.
     pub fn new(
         session_id: SessionId,
         role: MessageRole,
@@ -90,7 +109,7 @@ impl Message {
 
     /// Returns the conversation identifier.
     #[must_use]
-    pub fn session_id(&self) -> &SessionId {
+    pub const fn session_id(&self) -> &SessionId {
         &self.session_id
     }
 

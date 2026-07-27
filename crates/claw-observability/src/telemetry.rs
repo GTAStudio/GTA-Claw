@@ -60,6 +60,12 @@ pub struct TelemetryHandle {
 
 impl TelemetryHandle {
     /// Returns and clears the latest ordinary-log writer failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError`] carrying `telemetry writer lock poisoned`
+    /// when a thread panicked while holding the log writer mutex, which means
+    /// records emitted around that panic were dropped.
     pub fn take_writer_error(&self) -> Result<Option<String>, TelemetryError> {
         self.layer.take_error().map_err(TelemetryError)
     }
@@ -69,6 +75,15 @@ impl TelemetryHandle {
 ///
 /// Filter directives use `tracing-subscriber` syntax, including per-module
 /// directives such as `info,claw_gateway=debug,hyper=warn`.
+///
+/// # Errors
+///
+/// Returns [`TelemetryError`] when the filter environment variable named by
+/// [`TelemetryConfig::filter_env`] is set to a value that is not valid Unicode,
+/// when the resulting directives are not accepted by
+/// [`EnvFilter`], or when a global subscriber
+/// has already been installed by this process. An absent variable is not an
+/// error: [`TelemetryConfig::default_filter`] is used instead.
 pub fn init(config: &TelemetryConfig) -> Result<TelemetryHandle, TelemetryError> {
     let directives = match std::env::var(&config.filter_env) {
         Ok(value) => value,

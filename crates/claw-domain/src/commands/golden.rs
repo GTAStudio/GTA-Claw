@@ -100,13 +100,12 @@ impl GoldenRecord {
     /// exact record is what makes the table maintainable.
     #[must_use]
     pub fn require(&self, key: &str) -> &str {
-        match self.get(key) {
-            Some(value) => value,
-            None => panic!(
+        self.get(key).unwrap_or_else(|| {
+            panic!(
                 "golden record starting at line {} is missing required key `{key}`",
                 self.line
-            ),
-        }
+            )
+        })
     }
 
     /// Returns a boolean field, defaulting to `default` when the key is absent.

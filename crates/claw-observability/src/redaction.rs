@@ -66,10 +66,95 @@ impl<T> Serialize for Secret<T> {
     }
 }
 
+/// The value substituted for a secret, as a `serde_json` value.
+///
+/// [`REDACTED`] is a fixed constant: the replacement carries no length, prefix
+/// or type information about the value it replaced, so two different secrets
+/// are indistinguishable once redacted.
+fn redacted_value() -> Value {
+    Value::String(REDACTED.to_owned())
+}
+
+/// Field-name components that always denote a secret value.
+///
+/// Matching is on whole components rather than substrings so that `monkey` is
+/// not treated as a key. Plural spellings are listed explicitly for the same
+/// reason: `tokens` would otherwise slip past a `token` comparison.
+const SECRET_TERMS: [&str; 18] = [
+    "authorization",
+    "bearer",
+    "cookie",
+    "cookies",
+    "credential",
+    "credentials",
+    "jwt",
+    "key",
+    "keys",
+    "passphrase",
+    "passwd",
+    "password",
+    "passwords",
+    "pwd",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+];
+
+/// Words that qualify a `SECRET_TERMS` entry in an unseparated spelling.
+///
+/// `apiKey` and `api_key` already split into components, but the all-lowercase
+/// `apikey` does not. A component therefore also counts as secret when it is
+/// exactly one of these words followed by a secret term, which keeps `apikey`
+/// and `accesstoken` covered without redacting `monkey` or `whiskey`.
+const SECRET_QUALIFIERS: [&str; 21] = [
+    "access",
+    "api",
+    "app",
+    "auth",
+    "bearer",
+    "client",
+    "consumer",
+    "encryption",
+    "id",
+    "identity",
+    "master",
+    "oauth",
+    "private",
+    "public",
+    "refresh",
+    "secret",
+    "service",
+    "session",
+    "sign",
+    "signing",
+    "user",
+];
+
+fn component_is_secret(component: &str) -> bool {
+    if SECRET_TERMS.contains(&component) {
+        return true;
+    }
+    SECRET_TERMS.iter().any(|term| {
+        component
+            .strip_suffix(term)
+            .is_some_and(|qualifier| SECRET_QUALIFIERS.contains(&qualifier))
+    })
+}
+
 /// Returns whether a structured field name must be redacted.
+///
+/// The name is first normalized: `camelCase` boundaries become separators, so
+/// do runs of punctuation, and the result is lowercased. Every resulting
+/// component is then matched against the crate's secret-term list, which makes
+/// `apiKey`, `api_key`, `apikey`, `http.request.header.authorization` and
+/// `refresh-tokens` all sensitive while leaving `session_id` and `monkey`
+/// alone.
 #[must_use]
 pub fn is_sensitive_field(name: &str) -> bool {
-    let mut normalized = String::with_capacity(name.len());
+    // Splitting a camelCase boundary inserts a separator, so the normalized
+    // form can be longer than the input.
+    let mut normalized = String::with_capacity(name.len() + 8);
     let mut previous_was_lowercase = false;
     for character in name.chars() {
         if character.is_ascii_uppercase() {
@@ -86,19 +171,7 @@ pub fn is_sensitive_field(name: &str) -> bool {
             previous_was_lowercase = false;
         }
     }
-    normalized.split('_').any(|component| {
-        matches!(
-            component,
-            "authorization"
-                | "cookie"
-                | "credential"
-                | "key"
-                | "passwd"
-                | "password"
-                | "secret"
-                | "token"
-        )
-    })
+    normalized.split('_').any(component_is_secret)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -118,7 +191,7 @@ struct FieldVisitor<'a>(&'a mut BTreeMap<String, Value>);
 impl FieldVisitor<'_> {
     fn insert(&mut self, field: &Field, value: Value) {
         let value = if is_sensitive_field(field.name()) {
-            Value::String(REDACTED.to_owned())
+            redacted_value()
         } else {
             value
         };
@@ -126,6 +199,11 @@ impl FieldVisitor<'_> {
     }
 }
 
+/// Every [`Visit`] method that is not overridden below funnels into
+/// [`Visit::record_debug`] through its `tracing-core` default body, and every
+/// override goes through [`FieldVisitor::insert`]. There is therefore no
+/// recording entry point that can reach the output without passing the field
+/// name through [`is_sensitive_field`].
 impl Visit for FieldVisitor<'_> {
     fn record_bool(&mut self, field: &Field, value: bool) {
         self.insert(field, Value::Bool(value));
@@ -200,7 +278,11 @@ where
 
     /// Returns and clears the most recent writer failure.
     ///
-    /// Poisoned synchronization is reported rather than silently ignored.
+    /// # Errors
+    ///
+    /// Returns the message `telemetry writer lock poisoned` when a previous
+    /// caller panicked while holding the writer mutex. Poisoning is reported
+    /// rather than silently ignored because it means log records were lost.
     pub fn take_error(&self) -> Result<Option<String>, String> {
         let mut state = self
             .state
@@ -209,15 +291,19 @@ where
         Ok(state.last_error.take())
     }
 
-    fn write_line(&self, line: &str) {
+    /// Writes one already newline-terminated record.
+    ///
+    /// The terminator is part of `record` so a line reaches the writer in a
+    /// single `write_all`: a second call for the newline would both double the
+    /// syscalls per event and allow a half-written record if it failed.
+    fn write_record(&self, record: &str) {
         let Ok(mut state) = self.state.lock() else {
             eprintln!("claw-observability: telemetry writer lock poisoned");
             return;
         };
         if let Err(error) = state
             .writer
-            .write_all(line.as_bytes())
-            .and_then(|()| state.writer.write_all(b"\n"))
+            .write_all(record.as_bytes())
             .and_then(|()| state.writer.flush())
         {
             state.last_error = Some(error.to_string());
@@ -257,55 +343,64 @@ where
         let metadata = event.metadata();
         let mut event_fields = RecordedFields::default();
         event_fields.record(event);
-
-        let spans = context
-            .event_scope(event)
-            .map(|scope| {
-                scope
-                    .from_root()
-                    .map(|span| {
-                        let fields = span.extensions().get::<RecordedFields>().map_or_else(
-                            Map::new,
-                            |recorded| {
-                                recorded
-                                    .0
-                                    .iter()
-                                    .map(|(key, value)| (key.clone(), value.clone()))
-                                    .collect()
-                            },
-                        );
-                        json!({
-                            "name": span.metadata().name(),
-                            "fields": fields,
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let fields = event_fields.0;
 
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis());
-        let fields = event_fields.0;
-        let line = match self.format {
-            LogFormat::Json => serde_json::to_string(&json!({
-                "timestamp_ms": timestamp_ms,
-                "level": metadata.level().to_string(),
-                "target": metadata.target(),
-                "name": metadata.name(),
-                "fields": fields,
-                "spans": spans,
-            }))
-            .unwrap_or_else(|error| {
-                format!(
-                    "{{\"level\":\"ERROR\",\"message\":\"telemetry serialization failed: {error}\"}}"
-                )
-            }),
+        let mut line = match self.format {
+            LogFormat::Json => {
+                let spans = context
+                    .event_scope(event)
+                    .map(|scope| {
+                        scope
+                            .from_root()
+                            .map(|span| {
+                                let fields = span.extensions().get::<RecordedFields>().map_or_else(
+                                    Map::new,
+                                    |recorded| {
+                                        recorded
+                                            .0
+                                            .iter()
+                                            .map(|(key, value)| (key.clone(), value.clone()))
+                                            .collect()
+                                    },
+                                );
+                                json!({
+                                    "name": span.metadata().name(),
+                                    "fields": fields,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                serde_json::to_string(&json!({
+                    "timestamp_ms": timestamp_ms,
+                    "level": metadata.level().to_string(),
+                    "target": metadata.target(),
+                    "name": metadata.name(),
+                    "fields": fields,
+                    "spans": spans,
+                }))
+                .unwrap_or_else(|error| {
+                    format!(
+                        "{{\"level\":\"ERROR\",\"message\":\
+                         \"telemetry serialization failed: {error}\"}}"
+                    )
+                })
+            }
             LogFormat::Human => {
-                let span_names = spans
-                    .iter()
-                    .filter_map(|span| span.get("name").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
+                // Only the span names reach a human line, so the per-span field
+                // maps the JSON branch builds are never materialized here.
+                let span_names = context
+                    .event_scope(event)
+                    .map(|scope| {
+                        scope
+                            .from_root()
+                            .map(|span| span.metadata().name())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
                     .join(":");
                 format!(
                     "{} {} {} {} spans=[{}] fields={}",
@@ -314,13 +409,13 @@ where
                     metadata.target(),
                     metadata.name(),
                     span_names,
-                    serde_json::to_string(&fields).unwrap_or_else(|error| format!(
-                        "{{\"serialization_error\":\"{error}\"}}"
-                    ))
+                    serde_json::to_string(&fields)
+                        .unwrap_or_else(|error| format!("{{\"serialization_error\":\"{error}\"}}"))
                 )
             }
         };
-        self.write_line(&line);
+        line.push('\n');
+        self.write_record(&line);
     }
 }
 
@@ -396,6 +491,60 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_field_policy_covers_plural_and_unseparated_spellings() {
+        let cases = [
+            // Plurals: a `token` comparison alone would miss all of these.
+            ("tokens", true),
+            ("refresh_tokens", true),
+            ("credentials", true),
+            ("client_credentials", true),
+            ("api_keys", true),
+            ("secrets", true),
+            ("cookies", true),
+            // All-lowercase concatenations, which the camelCase splitter cannot
+            // separate on its own.
+            ("apikey", true),
+            ("apikeys", true),
+            ("accesstoken", true),
+            ("refreshtoken", true),
+            ("clientsecret", true),
+            ("idtoken", true),
+            ("sessionkey", true),
+            ("userpassword", true),
+            // Other names for the same thing.
+            ("passphrase", true),
+            ("pwd", true),
+            ("jwt", true),
+            ("bearer", true),
+            ("set-cookie", true),
+            ("proxy-authorization", true),
+            // Words that merely end in a secret term must stay visible.
+            ("monkey", false),
+            ("donkey", false),
+            ("turkey", false),
+            ("whiskey", false),
+            ("hockey", false),
+            // Ordinary correlation and lifecycle fields must stay visible.
+            ("session_id", false),
+            ("turn_id", false),
+            ("provider_name", false),
+            ("keystore_path", false),
+            ("message", false),
+            ("error", false),
+        ];
+        let actual = cases.map(|(field, _)| is_sensitive_field(field));
+        let expected = cases.map(|(_, expected)| expected);
+        let mismatched = cases
+            .iter()
+            .zip(actual)
+            .zip(expected)
+            .filter(|((_, actual), expected)| actual != expected)
+            .map(|((case, _), _)| case.0)
+            .collect::<Vec<_>>();
+        assert_eq!(mismatched, Vec::<&str>::new());
+    }
+
+    #[test]
     fn tracing_layer_redacts_event_and_span_fields() {
         let writer = SharedWriter::default();
         let captured = Arc::clone(&writer.0);
@@ -461,5 +610,147 @@ mod tests {
         }
 
         assert_eq!(format!("{:?}", Secret::new(LoudSecret)), REDACTED);
+    }
+
+    fn capture_json_events(emit: impl FnOnce()) -> Vec<Value> {
+        let writer = SharedWriter::default();
+        let captured = Arc::clone(&writer.0);
+        let subscriber =
+            tracing_subscriber::registry().with(RedactingLayer::new(LogFormat::Json, writer));
+        tracing::subscriber::with_default(subscriber, emit);
+        let output = String::from_utf8(captured.lock().expect("capture lock").clone())
+            .expect("UTF-8 output");
+        output
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON telemetry"))
+            .collect()
+    }
+
+    #[test]
+    fn every_value_kind_is_redacted_by_field_name() {
+        #[derive(Debug)]
+        struct LoudError;
+
+        impl fmt::Display for LoudError {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("must-not-appear")
+            }
+        }
+
+        impl std::error::Error for LoudError {}
+
+        // One event per `tracing::field::Visit` entry point the layer can be
+        // driven through: a new value kind must not become a redaction bypass.
+        let events = capture_json_events(|| {
+            tracing::info!(api_key = "text");
+            tracing::info!(api_key = 42_i64);
+            tracing::info!(api_key = 42_u64);
+            tracing::info!(api_key = 42_i128);
+            tracing::info!(api_key = 42_u128);
+            tracing::info!(api_key = 4.25_f64);
+            tracing::info!(api_key = true);
+            tracing::info!(api_key = &b"must-not-appear"[..]);
+            tracing::info!(api_key = ?"must-not-appear");
+            tracing::info!(api_key = %"must-not-appear");
+            tracing::info!(api_key = &LoudError as &dyn std::error::Error);
+        });
+
+        assert_eq!(events.len(), 11);
+        for event in &events {
+            assert_eq!(event["fields"]["api_key"], REDACTED);
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.to_string().contains("must-not-appear"))
+        );
+    }
+
+    #[test]
+    fn redacted_values_reveal_neither_length_nor_prefix() {
+        let events = capture_json_events(|| {
+            tracing::info!(password = "a");
+            tracing::info!(password = "correct-horse-battery-staple-0123456789");
+        });
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["fields"], events[1]["fields"]);
+        assert_eq!(events[0]["fields"]["password"], REDACTED);
+        assert_eq!(
+            format!("{}", Secret::new("a")),
+            format!("{}", Secret::new("correct-horse-battery-staple-0123456789"))
+        );
+    }
+
+    #[test]
+    fn lifecycle_and_error_fields_survive_redaction() {
+        #[derive(Debug)]
+        struct RefusedError;
+
+        impl fmt::Display for RefusedError {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("connection refused")
+            }
+        }
+
+        impl std::error::Error for RefusedError {}
+
+        let events = capture_json_events(|| {
+            let span = tracing::info_span!("session", session.id = "s-1");
+            let _entered = span.enter();
+            tracing::error!(
+                turn.id = "t-1",
+                attempt = 2_u64,
+                error = &RefusedError as &dyn std::error::Error,
+                access_token = "must-not-appear",
+                "provider request failed"
+            );
+        });
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event["level"], "ERROR");
+        assert_eq!(event["fields"]["message"], "provider request failed");
+        assert_eq!(event["fields"]["turn.id"], "t-1");
+        assert_eq!(event["fields"]["attempt"], 2);
+        assert_eq!(event["fields"]["error"], "connection refused");
+        assert_eq!(event["fields"]["access_token"], REDACTED);
+        assert_eq!(event["spans"][0]["name"], "session");
+        assert_eq!(event["spans"][0]["fields"]["session.id"], "s-1");
+        assert!(!event.to_string().contains("must-not-appear"));
+    }
+
+    #[test]
+    fn human_format_carries_the_same_span_names_and_redaction() {
+        let writer = SharedWriter::default();
+        let captured = Arc::clone(&writer.0);
+        let subscriber =
+            tracing_subscriber::registry().with(RedactingLayer::new(LogFormat::Human, writer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let session = tracing::info_span!("session", session.id = "s-1");
+            let _session = session.enter();
+            let turn = tracing::info_span!("turn", turn.id = "t-1");
+            let _turn = turn.enter();
+            tracing::warn!(api_token = "must-not-appear", "rate limited");
+        });
+
+        let output = String::from_utf8(captured.lock().expect("capture lock").clone())
+            .expect("UTF-8 output");
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains(" WARN "), "{}", lines[0]);
+        assert!(lines[0].contains("spans=[session:turn]"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("\"message\":\"rate limited\""),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains(&format!("\"api_token\":\"{REDACTED}\"")),
+            "{}",
+            lines[0]
+        );
+        assert!(!lines[0].contains("must-not-appear"));
     }
 }

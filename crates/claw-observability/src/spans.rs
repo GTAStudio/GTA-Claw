@@ -72,29 +72,29 @@ mod tests {
     fn span_names_follow_the_convention() {
         tracing::subscriber::with_default(tracing_subscriber::registry(), || {
             assert_eq!(
-                session("s").metadata().map(|meta| meta.name()),
+                session("s").metadata().map(tracing::Metadata::name),
                 Some("session")
             );
             assert_eq!(
-                turn("s", "t").metadata().map(|meta| meta.name()),
+                turn("s", "t").metadata().map(tracing::Metadata::name),
                 Some("turn")
             );
             assert_eq!(
                 tool_call("s", "t", "c", "shell")
                     .metadata()
-                    .map(|meta| meta.name()),
+                    .map(tracing::Metadata::name),
                 Some("tool.call")
             );
             assert_eq!(
                 provider_request("s", "t", "r", "openai", "gpt")
                     .metadata()
-                    .map(|meta| meta.name()),
+                    .map(tracing::Metadata::name),
                 Some("provider.request")
             );
             assert_eq!(
                 gateway_method("s", "r", "health")
                     .metadata()
-                    .map(|meta| meta.name()),
+                    .map(tracing::Metadata::name),
                 Some("gateway.method")
             );
         });

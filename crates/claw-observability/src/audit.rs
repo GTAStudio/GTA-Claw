@@ -84,6 +84,13 @@ impl AuditEvent {
 /// Separate synchronous port for security audit events.
 pub trait AuditSink: Send + Sync {
     /// Persists an event before returning success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`std::io::Error`] when the event could not be committed to the
+    /// sink's backing store: an encoding failure, a write or synchronization
+    /// failure, or a poisoned writer lock. A security audit record that cannot
+    /// be persisted must surface as an error rather than be dropped.
     fn record(&self, event: &AuditEvent) -> io::Result<()>;
 }
 
@@ -95,6 +102,12 @@ pub struct DurableFileAuditSink {
 
 impl DurableFileAuditSink {
     /// Opens or creates an append-only audit file.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`std::io::Error`] when `path` cannot be opened
+    /// for appending: a missing parent directory, a permission denial, or an
+    /// existing entry at `path` that is not a writable file.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
@@ -128,6 +141,12 @@ pub struct InMemoryAuditSink {
 
 impl InMemoryAuditSink {
     /// Returns all events in recording order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`std::io::Error`] with `audit memory lock poisoned` when a
+    /// thread panicked while recording, because the recorded history can no
+    /// longer be trusted to be complete.
     pub fn events(&self) -> io::Result<Vec<AuditEvent>> {
         self.events
             .lock()

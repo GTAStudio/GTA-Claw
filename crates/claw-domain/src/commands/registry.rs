@@ -304,14 +304,14 @@ impl CommandDefinition {
 
     /// Marks the command as accepting a trailing argument string.
     #[must_use]
-    pub fn accepting_args(mut self) -> Self {
+    pub const fn accepting_args(mut self) -> Self {
         self.accepts_args = true;
         self
     }
 
     /// Overrides the derived scope.
     #[must_use]
-    pub fn with_scope(mut self, scope: CommandScope) -> Self {
+    pub const fn with_scope(mut self, scope: CommandScope) -> Self {
         self.scope = scope;
         self
     }
@@ -623,13 +623,12 @@ impl CommandRegistry {
             return trimmed.to_owned();
         }
 
-        let (single_line, multiline_tail) = match trimmed.find('\n') {
-            None => (trimmed, None),
-            Some(index) => (
+        let (single_line, multiline_tail) = trimmed.find('\n').map_or((trimmed, None), |index| {
+            (
                 js_trim(&trimmed[..index]),
                 Some(js_trim_start(&trimmed[index + 1..])),
-            ),
-        };
+            )
+        });
 
         let normalized = apply_colon_syntax(single_line);
         let command_body = apply_bot_mention(&normalized, bot_username);

@@ -282,6 +282,12 @@ impl DirectiveParse {
 }
 
 /// The outcome of extracting `/exec` and its options.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the fields are the columns of the pinned `exec.golden` table, one `invalid_*` flag \
+              per option key; collapsing them would decouple the type from the fixture it is \
+              checked against"
+)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExecDirectiveParse {
     cleaned: String,
@@ -721,7 +727,7 @@ pub fn extract_exec_directive(body: &str) -> ExecDirectiveParse {
     }
 
     let joined = format!("{} {}", &body[..start], &raw[consumed..]);
-    parsed.cleaned = js_trim(&collapse_js_whitespace(&joined)).to_owned();
+    js_trim(&collapse_js_whitespace(&joined)).clone_into(&mut parsed.cleaned);
     parsed
 }
 
@@ -745,12 +751,14 @@ pub fn normalize_think_level(raw: &str) -> Option<DirectiveLevel> {
     }
     let level = match key.as_str() {
         "off" => ThinkLevel::Off,
-        "on" | "enable" | "enabled" => ThinkLevel::Low,
-        "min" | "minimal" => ThinkLevel::Minimal,
-        "low" | "thinkhard" | "think-hard" | "think_hard" => ThinkLevel::Low,
+        // `think` on its own, and the plain on/enable aliases, resolve to the
+        // same levels as their explicit spellings upstream.
+        "min" | "minimal" | "think" => ThinkLevel::Minimal,
+        "on" | "enable" | "enabled" | "low" | "thinkhard" | "think-hard" | "think_hard" => {
+            ThinkLevel::Low
+        }
         "mid" | "med" | "medium" | "thinkharder" | "think-harder" | "harder" => ThinkLevel::Medium,
         "high" | "ultrathink" | "thinkhardest" | "highest" => ThinkLevel::High,
-        "think" => ThinkLevel::Minimal,
         _ => return None,
     };
     Some(DirectiveLevel::Think(level))
