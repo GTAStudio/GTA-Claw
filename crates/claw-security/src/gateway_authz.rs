@@ -140,11 +140,10 @@ impl Principal {
 pub fn parse_granted_scopes<'a>(
     values: impl IntoIterator<Item = &'a str>,
 ) -> Result<ScopeSet, RegistryError> {
-    let mut scopes = Vec::new();
-    for value in values {
-        scopes.push(Scope::parse(value)?);
-    }
-    Ok(ScopeSet::from_scopes(scopes))
+    // Collecting straight into the bitset avoids the intermediate `Vec` this
+    // used to build per handshake; `Result` still short-circuits on the first
+    // unknown scope, so the rejected value is unchanged.
+    values.into_iter().map(Scope::parse).collect()
 }
 
 /// Parses an untrusted handshake identity through both closed registries.

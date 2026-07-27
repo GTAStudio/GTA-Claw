@@ -191,6 +191,12 @@ impl ScopeSet {
     }
 }
 
+impl FromIterator<Scope> for ScopeSet {
+    fn from_iter<I: IntoIterator<Item = Scope>>(iter: I) -> Self {
+        Self::from_scopes(iter)
+    }
+}
+
 /// Unknown identities are rejected rather than normalized.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegistryError {

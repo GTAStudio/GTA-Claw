@@ -1128,3 +1128,31 @@ fn targeted_events_do_not_advance_sequence() {
     assert_eq!(tracker.last().expect("one").get(), 1);
     assert_eq!(NonNegativeInteger::new(0).get(), 0);
 }
+
+#[test]
+fn opaque_json_constructors_agree_with_the_serialize_round_trip() {
+    // `OpaqueJson::from_serialize` exists to remove the `to_string` then
+    // `from_str` round trip from the per-event path, so it has to retain the
+    // same bytes that round trip produced, and so does a clone.
+    let value = serde_json::json!({
+        "sessionId": "ses_01",
+        "status": "running",
+        "turn": 17,
+        "tags": ["operator", "gateway"],
+    });
+    let encoded = serde_json::to_string(&value).expect("serialize");
+
+    let round_tripped: OpaqueJson = serde_json::from_str(&encoded).expect("deserialize");
+    let direct = OpaqueJson::from_serialize(&value).expect("serialize directly");
+    let adopted = OpaqueJson::from_json_string(encoded.clone()).expect("adopt text");
+
+    let cloned = direct.clone();
+    assert_eq!(direct.as_json(), round_tripped.as_json());
+    assert_eq!(adopted.as_json(), round_tripped.as_json());
+    assert_eq!(cloned.as_json(), round_tripped.as_json());
+    assert_eq!(cloned.encoded_len(), round_tripped.encoded_len());
+    assert_eq!(direct.encoded_len(), encoded.len());
+    assert_eq!(direct, round_tripped);
+
+    assert!(OpaqueJson::from_json_string("{".to_owned()).is_err());
+}

@@ -79,8 +79,8 @@ fn validate(value: &str) -> Result<(), IdentifierError> {
 macro_rules! identifier {
     ($name:ident, $what:literal) => {
         #[doc = concat!("A validated ", $what, ".")]
-        #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
-        #[serde(try_from = "String", into = "String")]
+        #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize)]
+        #[serde(try_from = "String")]
         pub struct $name(String);
 
         impl $name {
@@ -115,6 +115,19 @@ macro_rules! identifier {
         impl From<$name> for String {
             fn from(value: $name) -> Self {
                 value.0
+            }
+        }
+
+        // `#[serde(into = "String")]` would clone the identifier on every
+        // serialization, because `into` is defined as `self.clone().into()`.
+        // Writing the borrowed string produces the same bytes with no
+        // allocation, which matters on the per-call frame encode path.
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(&self.0)
             }
         }
 

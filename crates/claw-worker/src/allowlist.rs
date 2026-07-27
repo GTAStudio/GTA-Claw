@@ -84,8 +84,8 @@ impl Error for MethodNameError {}
 /// Names are case-sensitive and are only ever compared for exact equality, so
 /// `Worker.Heartbeat` is a different — and, given the lowercase alphabet,
 /// unspellable — name from `worker.heartbeat`.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
-#[serde(try_from = "String", into = "String")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize)]
+#[serde(try_from = "String")]
 pub struct MethodName(String);
 
 impl MethodName {
@@ -140,6 +140,17 @@ impl TryFrom<String> for MethodName {
 impl From<MethodName> for String {
     fn from(value: MethodName) -> Self {
         value.0
+    }
+}
+
+// `#[serde(into = "String")]` clones the name on every serialization; writing
+// the borrowed string is the same bytes without the allocation.
+impl Serialize for MethodName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
     }
 }
 

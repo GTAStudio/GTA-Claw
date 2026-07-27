@@ -152,16 +152,22 @@ impl GenerationLedger {
     /// advance. It is not wrapped, because wrapping would resurrect every
     /// superseded token at once.
     pub fn open_generation(&mut self, worker: &WorkerId) -> Result<FencingToken, FencingError> {
-        let next =
-            match self.current.get(worker) {
-                None => 1,
-                Some(current) => current.get().checked_add(1).ok_or_else(|| {
-                    FencingError::GenerationOverflow {
+        // One lookup, and the identity is cloned only when this worker has no
+        // entry yet: re-issuing for a known worker is the common case and it
+        // used to cost a second traversal plus a `String` copy of the identity.
+        if let Some(current) = self.current.get_mut(worker) {
+            let next =
+                current
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| FencingError::GenerationOverflow {
                         worker: worker.clone(),
-                    }
-                })?,
-            };
-        let token = FencingToken::new(next).ok_or(FencingError::ZeroGeneration)?;
+                    })?;
+            let token = FencingToken::new(next).ok_or(FencingError::ZeroGeneration)?;
+            *current = token;
+            return Ok(token);
+        }
+        let token = FencingToken::new(1).ok_or(FencingError::ZeroGeneration)?;
         self.current.insert(worker.clone(), token);
         Ok(token)
     }

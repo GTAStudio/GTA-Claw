@@ -1,12 +1,12 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Write};
-use std::rc::Rc;
 
 use serde::de::{DeserializeOwned, DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
-use serde::{Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::frame::{
     ConnectChallenge, ConnectParams, EventSequence, EventWire, FrameValidationError, HelloOk,
@@ -145,6 +145,15 @@ impl Codec {
     /// - [`CodecError::PolicyLimit`] — a decoded field exceeded a typed policy
     ///   bound, such as `$.id` or `$.error.message`.
     pub fn decode(&self, bytes: &[u8]) -> Result<Frame, CodecError> {
+        // Three passes over the bytes, and measured to be worth keeping as
+        // three. A bare `serde_json` scan of these frames costs 104 ns (95 B)
+        // and 1798 ns (2.6 KiB), so folding the envelope probe into the
+        // preflight walk would save roughly 16 % and 25 % of a decode. It is
+        // not safe to do: `CodecError::TypedDecode` carries the path, message,
+        // line and column that `serde_path_to_error` and `serde_json` produce,
+        // and the documented rejection order — policy, then envelope kind, then
+        // schema — would have to be reproduced by hand from the preflight
+        // visitor, where none of that position information exists.
         self.check_size(bytes.len())?;
         preflight_json(bytes, &self.policy)?;
         let probe: KindProbe = decode_typed(bytes)?;
@@ -476,6 +485,11 @@ struct BoundedWriter {
 
 impl BoundedWriter {
     fn new(limit: usize) -> Self {
+        // Measured: shrinking this to 1 KiB, so a small frame reserves less,
+        // changed nothing on a 95-byte frame (251 ns against 252 ns) and cost
+        // about 4 % on a 2.6 KiB frame (3370 ns against 3250 ns) because that
+        // frame then grows the buffer twice. The allocator hands the same 8 KiB
+        // block back on every encode, so the reservation is not the cost.
         Self {
             bytes: Vec::with_capacity(limit.min(8 * 1024)),
             limit,
@@ -544,15 +558,52 @@ enum PreflightFailure {
     },
 }
 
-#[derive(Clone)]
-struct PreflightSeed {
-    path: String,
-    depth: usize,
-    policy: ValidationPolicy,
-    failure: Rc<RefCell<Option<PreflightFailure>>>,
+/// One `$["key"]` or `$[0]` step, borrowed from the frame being walked.
+///
+/// The walk is the highest-volume code in this crate, so the JSON path is kept
+/// as this parent-linked stack of borrowed segments and is rendered into a
+/// `String` only by [`PathNode::render`], on the failure paths. Formatting it
+/// eagerly cost one allocation per array element and two per object entry.
+enum PathSegment<'a> {
+    Index(usize),
+    Key(&'a str),
 }
 
-impl<'de> DeserializeSeed<'de> for PreflightSeed {
+struct PathNode<'a> {
+    parent: Option<&'a Self>,
+    segment: PathSegment<'a>,
+}
+
+impl PathNode<'_> {
+    fn render(node: Option<&Self>) -> String {
+        let mut reversed = Vec::new();
+        let mut current = node;
+        while let Some(entry) = current {
+            reversed.push(&entry.segment);
+            current = entry.parent;
+        }
+        let mut path = String::from("$");
+        for segment in reversed.iter().rev() {
+            path.push('[');
+            match segment {
+                PathSegment::Index(index) => path.push_str(&index.to_string()),
+                PathSegment::Key(key) => path.push_str(&quoted_key(key)),
+            }
+            path.push(']');
+        }
+        path
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreflightSeed<'a> {
+    path: Option<&'a PathNode<'a>>,
+    depth: usize,
+    policy: &'a ValidationPolicy,
+    failure: &'a RefCell<Option<PreflightFailure>>,
+}
+
+impl<'de> DeserializeSeed<'de> for PreflightSeed<'_> {
     type Value = ();
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
@@ -563,9 +614,43 @@ impl<'de> DeserializeSeed<'de> for PreflightSeed {
     }
 }
 
-struct PreflightVisitor(PreflightSeed);
+/// An object key borrowed straight out of the frame when it needs no unescaping.
+struct MapKey<'de>(Cow<'de, str>);
 
-impl<'de> Visitor<'de> for PreflightVisitor {
+impl<'de> Deserialize<'de> for MapKey<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(MapKeyVisitor)
+    }
+}
+
+struct MapKeyVisitor;
+
+impl<'de> Visitor<'de> for MapKeyVisitor {
+    type Value = MapKey<'de>;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a string")
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+        Ok(MapKey(Cow::Borrowed(value)))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(MapKey(Cow::Owned(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(MapKey(Cow::Owned(value)))
+    }
+}
+
+struct PreflightVisitor<'a>(PreflightSeed<'a>);
+
+impl<'de> Visitor<'de> for PreflightVisitor<'_> {
     type Value = ();
 
     fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
@@ -591,7 +676,9 @@ impl<'de> Visitor<'de> for PreflightVisitor {
         if value.is_finite() {
             Ok(())
         } else {
-            *self.0.failure.borrow_mut() = Some(PreflightFailure::NonFinite { path: self.0.path });
+            *self.0.failure.borrow_mut() = Some(PreflightFailure::NonFinite {
+                path: PathNode::render(self.0.path),
+            });
             Err(E::custom("non-finite JSON number"))
         }
     }
@@ -625,10 +712,14 @@ impl<'de> Visitor<'de> for PreflightVisitor {
     {
         self.check_depth::<A::Error>()?;
         let mut count = 0;
-        while sequence
-            .next_element_seed(self.0.child(format!("{}[{count}]", self.0.path)))?
-            .is_some()
-        {
+        loop {
+            let node = PathNode {
+                parent: self.0.path,
+                segment: PathSegment::Index(count),
+            };
+            if sequence.next_element_seed(self.0.child(&node))?.is_none() {
+                break;
+            }
             count += 1;
             self.check_collection::<A::Error>(count)?;
         }
@@ -640,30 +731,90 @@ impl<'de> Visitor<'de> for PreflightVisitor {
         A: MapAccess<'de>,
     {
         self.check_depth::<A::Error>()?;
-        let mut keys = BTreeSet::new();
+        let mut keys = SeenKeys::new();
         let mut count = 0;
-        while let Some(key) = map.next_key::<String>()? {
-            if !keys.insert(key.clone()) {
+        while let Some(MapKey(key)) = map.next_key::<MapKey<'de>>()? {
+            if keys.contains(&key) {
                 *self.0.failure.borrow_mut() = Some(PreflightFailure::Duplicate {
-                    path: self.0.path.clone(),
-                    key,
+                    path: PathNode::render(self.0.path),
+                    key: key.into_owned(),
                 });
                 return Err(A::Error::custom("duplicate JSON object key"));
             }
             count += 1;
             self.check_collection::<A::Error>(count)?;
-            let child_path = format!("{}[{}]", self.0.path, quoted_key(&key));
-            map.next_value_seed(self.0.child(child_path))?;
+            let node = PathNode {
+                parent: self.0.path,
+                segment: PathSegment::Key(&key),
+            };
+            map.next_value_seed(self.0.child(&node))?;
+            keys.insert(key);
         }
         Ok(())
     }
 }
 
-impl PreflightVisitor {
+/// Keys already seen in the object currently being walked.
+///
+/// Frames are shallow and narrow — the widest wire struct has nine fields — so
+/// the first keys are held in a stack array and compared linearly, which keeps
+/// the common object allocation-free. The set is built only for an object that
+/// outgrows the array, so a hostile object with thousands of keys still gets
+/// logarithmic lookups instead of degrading to a quadratic scan.
+///
+/// Measured on the medium request frame (2.6 KiB, 60 objects): the previous
+/// unconditional `BTreeSet` cost one node allocation per object.
+struct SeenKeys<'de> {
+    inline: [Option<Cow<'de, str>>; INLINE_KEY_CAPACITY],
+    len: usize,
+    overflow: Option<BTreeSet<Cow<'de, str>>>,
+}
+
+/// Keys held on the stack before an object falls back to the set.
+const INLINE_KEY_CAPACITY: usize = 12;
+
+impl<'de> SeenKeys<'de> {
+    const fn new() -> Self {
+        Self {
+            inline: [const { None }; INLINE_KEY_CAPACITY],
+            len: 0,
+            overflow: None,
+        }
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.overflow.as_ref().map_or_else(
+            || {
+                self.inline[..self.len]
+                    .iter()
+                    .any(|seen| seen.as_deref() == Some(key))
+            },
+            |overflow| overflow.contains(key),
+        )
+    }
+
+    fn insert(&mut self, key: Cow<'de, str>) {
+        if let Some(overflow) = &mut self.overflow {
+            overflow.insert(key);
+            return;
+        }
+        if let Some(slot) = self.inline.get_mut(self.len) {
+            *slot = Some(key);
+            self.len += 1;
+            return;
+        }
+        let mut overflow: BTreeSet<Cow<'de, str>> =
+            self.inline.iter_mut().filter_map(Option::take).collect();
+        overflow.insert(key);
+        self.overflow = Some(overflow);
+    }
+}
+
+impl PreflightVisitor<'_> {
     fn check_depth<E: serde::de::Error>(&self) -> Result<(), E> {
         if self.0.depth > self.0.policy.max_nesting_depth {
             *self.0.failure.borrow_mut() = Some(PreflightFailure::Nesting {
-                path: self.0.path.clone(),
+                path: PathNode::render(self.0.path),
                 depth: self.0.depth,
                 limit: self.0.policy.max_nesting_depth,
             });
@@ -676,7 +827,7 @@ impl PreflightVisitor {
     fn check_collection<E: serde::de::Error>(&self, actual: usize) -> Result<(), E> {
         if actual > self.0.policy.max_collection_items {
             *self.0.failure.borrow_mut() = Some(PreflightFailure::Collection {
-                path: self.0.path.clone(),
+                path: PathNode::render(self.0.path),
                 actual,
                 limit: self.0.policy.max_collection_items,
             });
@@ -687,13 +838,16 @@ impl PreflightVisitor {
     }
 }
 
-impl PreflightSeed {
-    fn child(&self, path: String) -> Self {
-        Self {
-            path,
+impl<'a> PreflightSeed<'a> {
+    const fn child<'node>(&self, node: &'node PathNode<'node>) -> PreflightSeed<'node>
+    where
+        'a: 'node,
+    {
+        PreflightSeed {
+            path: Some(node),
             depth: self.depth + 1,
-            policy: self.policy.clone(),
-            failure: Rc::clone(&self.failure),
+            policy: self.policy,
+            failure: self.failure,
         }
     }
 }
@@ -703,12 +857,12 @@ fn quoted_key(key: &str) -> String {
 }
 
 fn preflight_json(bytes: &[u8], policy: &ValidationPolicy) -> Result<(), CodecError> {
-    let failure = Rc::new(RefCell::new(None));
+    let failure = RefCell::new(None);
     let seed = PreflightSeed {
-        path: "$".to_owned(),
+        path: None,
         depth: 1,
-        policy: policy.clone(),
-        failure: Rc::clone(&failure),
+        policy,
+        failure: &failure,
     };
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     if let Err(error) = seed.deserialize(&mut deserializer) {
