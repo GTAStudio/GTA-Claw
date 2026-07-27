@@ -39,12 +39,13 @@ pub use auth::{BearerAuthenticator, BearerCredential, Principal};
 pub use config::{ApiConfig, HttpLimits, WebhookRoute};
 pub use deterministic::DeterministicRuntime;
 pub use legacy::{
-    LEGACY_ADMIN_ACTIONS, LEGACY_HTTP_ENDPOINTS, LegacyAdminAction, LegacyAdminCredential,
-    LegacyApiConfig, LegacyApiServices, LegacyChannelMessage, LegacyChannelMessagePort,
-    LegacyChannelStatus, LegacyConfigError, LegacyDeviceFlowPort, LegacyExecResult,
-    LegacyHostAdminPort, LegacyHttpApi, LegacyHttpLimits, LegacyOsInfo, LegacyProcessInfo,
-    LegacyProcessMemory, LegacyReloadError, LegacyReloadPort, LegacyReloadResult,
-    LegacyRuntimePort, LegacyRuntimeSnapshot, LegacySystemInfo, LegacyTeamsPort,
+    LEGACY_ADMIN_ACTIONS, LEGACY_HTTP_ENDPOINTS, LEGACY_TEAMS_AUTHORIZATION_BYTES,
+    LegacyAdminAction, LegacyAdminCredential, LegacyApiConfig, LegacyApiServices,
+    LegacyChannelMessage, LegacyChannelMessagePort, LegacyChannelStatus, LegacyConfigError,
+    LegacyDeviceFlowPort, LegacyExecResult, LegacyHostAdminPort, LegacyHttpApi, LegacyHttpLimits,
+    LegacyOsInfo, LegacyProcessInfo, LegacyProcessMemory, LegacyReloadError, LegacyReloadPort,
+    LegacyReloadResult, LegacyRuntimePort, LegacyRuntimeSnapshot, LegacySystemInfo,
+    LegacyTeamsAuthorizationHeader, LegacyTeamsPort, LegacyTeamsRequestContext,
     LegacyWhatsAppConfig, LegacyWhatsAppPort, LegacyWhatsAppServices, ProviderLegacyRuntime,
     ProviderLegacyRuntimeConfig,
 };

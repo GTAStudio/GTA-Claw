@@ -9,14 +9,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use claw_http_api::{
-    DeterministicRuntime, LegacyAdminAction, LegacyAdminCredential, LegacyApiConfig,
-    LegacyApiServices, LegacyChannelMessage, LegacyChannelMessagePort, LegacyConfigError,
-    LegacyDeviceFlowPort, LegacyExecResult, LegacyHostAdminPort, LegacyHttpApi, LegacyOsInfo,
-    LegacyProcessInfo, LegacyProcessMemory, LegacyReloadError, LegacyReloadPort,
-    LegacyReloadResult, LegacyRuntimePort, LegacyRuntimeSnapshot, LegacySystemInfo,
-    LegacyTeamsPort, LegacyWhatsAppConfig, LegacyWhatsAppPort, LegacyWhatsAppServices, PortError,
-    PortErrorKind, PortFuture, ProviderLegacyRuntime, ProviderLegacyRuntimeConfig,
-    ServingStateHandle,
+    DeterministicRuntime, LEGACY_TEAMS_AUTHORIZATION_BYTES, LegacyAdminAction,
+    LegacyAdminCredential, LegacyApiConfig, LegacyApiServices, LegacyChannelMessage,
+    LegacyChannelMessagePort, LegacyConfigError, LegacyDeviceFlowPort, LegacyExecResult,
+    LegacyHostAdminPort, LegacyHttpApi, LegacyOsInfo, LegacyProcessInfo, LegacyProcessMemory,
+    LegacyReloadError, LegacyReloadPort, LegacyReloadResult, LegacyRuntimePort,
+    LegacyRuntimeSnapshot, LegacySystemInfo, LegacyTeamsPort, LegacyTeamsRequestContext,
+    LegacyWhatsAppConfig, LegacyWhatsAppPort, LegacyWhatsAppServices, PortError, PortErrorKind,
+    PortFuture, ProviderLegacyRuntime, ProviderLegacyRuntimeConfig, ServingStateHandle,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -109,16 +109,39 @@ impl LegacyDeviceFlowPort for ScriptedDeviceFlow {
 #[derive(Default)]
 struct ScriptedTeams {
     calls: AtomicUsize,
+    contexts: Mutex<Vec<LegacyTeamsRequestContext>>,
+    activities: Mutex<Vec<Value>>,
+    reject_missing_authorization: AtomicBool,
 }
 
 impl LegacyTeamsPort for ScriptedTeams {
     fn handle_activity(
         &self,
-        _activity: Value,
+        context: LegacyTeamsRequestContext,
+        activity: Value,
         _cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<(), PortError>> {
         self.calls.fetch_add(1, Ordering::AcqRel);
-        Box::pin(async { Ok(()) })
+        let missing_authorization = context.authorization().is_none();
+        self.contexts
+            .lock()
+            .expect("Teams context log")
+            .push(context);
+        self.activities
+            .lock()
+            .expect("Teams activity log")
+            .push(activity);
+        let reject_missing = self.reject_missing_authorization.load(Ordering::Acquire);
+        Box::pin(async move {
+            if reject_missing && missing_authorization {
+                Err(PortError::new(
+                    PortErrorKind::InvalidRequest,
+                    "Teams authorization is required",
+                ))
+            } else {
+                Ok(())
+            }
+        })
     }
 }
 
@@ -451,6 +474,18 @@ async fn teams_route_is_conditional_rate_limited_and_body_bounded() {
         accepted.json(),
         frozen_response("teams-messages", "adapter-ack")
     );
+    assert!(
+        fixtures
+            .teams
+            .contexts
+            .lock()
+            .expect("Teams contexts")
+            .first()
+            .expect("accepted Teams context")
+            .authorization()
+            .is_none(),
+        "a missing header must be delegated to the Teams adapter"
+    );
 
     let limited = request(
         &server,
@@ -527,6 +562,137 @@ async fn teams_route_is_conditional_rate_limited_and_body_bounded() {
     .await;
     assert_eq!(oversized.status, 413);
     assert_eq!(oversized.header("connection"), Some("close"));
+}
+
+#[tokio::test]
+async fn teams_authorization_context_is_validated_forwarded_and_redacted() {
+    let fixtures = Fixtures::new(true);
+    let mut config = LegacyApiConfig::default();
+    config.channels.set_teams(true);
+    config.teams_rate_limit_per_minute = 100;
+    let server = spawn(config, fixtures.services()).await;
+    let exact_header = "bEaReR aaa.BBB_cc-1~+/==";
+    let activity = json!({"type":"message","id":"activity-1"});
+
+    let accepted = request(
+        &server,
+        "POST",
+        "/api/messages",
+        None,
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", exact_header),
+        ],
+        &serde_json::to_vec(&activity).expect("serialize Teams activity"),
+    )
+    .await;
+    assert_eq!(accepted.status, 200);
+    {
+        let contexts = fixtures.teams.contexts.lock().expect("Teams contexts");
+        let context = contexts.last().expect("forwarded Teams context");
+        let authorization = context.authorization().expect("forwarded authorization");
+        assert_eq!(authorization.as_str(), exact_header);
+        assert_eq!(authorization.bearer_token(), "aaa.BBB_cc-1~+/==");
+        for rendered in [format!("{authorization:?}"), format!("{context:?}")] {
+            assert!(rendered.contains("[REDACTED]"));
+            assert!(!rendered.contains("aaa.BBB"));
+        }
+        drop(contexts);
+    }
+    assert_eq!(
+        fixtures
+            .teams
+            .activities
+            .lock()
+            .expect("Teams activities")
+            .last(),
+        Some(&activity)
+    );
+
+    fixtures
+        .teams
+        .reject_missing_authorization
+        .store(true, Ordering::Release);
+    let missing = request(
+        &server,
+        "POST",
+        "/api/messages",
+        None,
+        &[("Content-Type", "application/json")],
+        b"{}",
+    )
+    .await;
+    assert_eq!(
+        missing.status, 500,
+        "the adapter, not the generic HTTP crate, decides whether missing auth is allowed"
+    );
+
+    let calls_before_invalid = fixtures.teams.calls.load(Ordering::Acquire);
+    let invalid_response = json!({"error":"Invalid Authorization header"});
+    for invalid in [
+        "Basic opaque",
+        "Bearer",
+        "Bearer two tokens",
+        "Bearer token,second",
+        "Bearer =",
+    ] {
+        let response = request(
+            &server,
+            "POST",
+            "/api/messages",
+            None,
+            &[
+                ("Content-Type", "application/json"),
+                ("Authorization", invalid),
+            ],
+            b"{}",
+        )
+        .await;
+        assert_eq!(response.status, 400, "{invalid}");
+        assert_eq!(response.json(), invalid_response, "{invalid}");
+        assert!(!response.text().contains(invalid), "{invalid}");
+    }
+
+    let duplicate = request(
+        &server,
+        "POST",
+        "/api/messages",
+        None,
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", "Bearer first"),
+            ("Authorization", "Bearer second"),
+        ],
+        b"{}",
+    )
+    .await;
+    assert_eq!(duplicate.status, 400);
+    assert_eq!(duplicate.json(), invalid_response);
+
+    let oversized = format!(
+        "Bearer {}",
+        "a".repeat(LEGACY_TEAMS_AUTHORIZATION_BYTES - "Bearer ".len() + 1)
+    );
+    let oversized_response = request(
+        &server,
+        "POST",
+        "/api/messages",
+        None,
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", &oversized),
+        ],
+        b"{}",
+    )
+    .await;
+    assert_eq!(oversized_response.status, 400);
+    assert_eq!(oversized_response.json(), invalid_response);
+    assert!(!oversized_response.text().contains(&oversized));
+    assert_eq!(
+        fixtures.teams.calls.load(Ordering::Acquire),
+        calls_before_invalid,
+        "invalid headers must never reach the Teams adapter"
+    );
 }
 
 #[tokio::test]

@@ -18,7 +18,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use super::config::{LegacyApiConfig, LegacyConfigError};
 use super::ports::{
     LEGACY_ADMIN_ACTIONS, LegacyAdminAction, LegacyApiServices, LegacyChannelMessage,
-    LegacyExecResult,
+    LegacyExecResult, LegacyTeamsRequestContext,
 };
 use super::rate_limit::RateLimiter;
 use crate::auth::bearer_token;
@@ -370,9 +370,13 @@ async fn teams_messages(
             .await;
         }
     }
+    let context = LegacyTeamsRequestContext::from_headers(request.headers());
     let activity = match read_legacy_json(&state, request).await {
         Ok(value) => value,
         Err(response) => return response,
+    };
+    let Ok(context) = context else {
+        return legacy_error(StatusCode::BAD_REQUEST, "Invalid Authorization header");
     };
     let teams = state
         .inner
@@ -385,7 +389,7 @@ async fn teams_messages(
     let _cancel_on_drop = CancelOnDrop::new(&cancellation);
     match timeout(
         state.inner.config.limits.operation_timeout,
-        teams.handle_activity(activity, cancellation),
+        teams.handle_activity(context, activity, cancellation),
     )
     .await
     {

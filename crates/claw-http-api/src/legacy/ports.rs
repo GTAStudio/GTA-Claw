@@ -1,12 +1,17 @@
 //! Typed services consumed by the legacy Node-compatible routes.
 
+use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
+use http::{HeaderMap, header};
 use serde::Serialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::{PortError, PortFuture, ReadinessPort};
+
+/// Maximum accepted bytes in the Teams `Authorization` header value.
+pub const LEGACY_TEAMS_AUTHORIZATION_BYTES: usize = 4_096;
 
 /// Current runtime metadata rendered by `/` and `/health`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,11 +53,120 @@ pub trait LegacyDeviceFlowPort: Send + Sync {
     ) -> PortFuture<'_, Result<String, PortError>>;
 }
 
-/// Accepts one bounded Bot Framework activity.
+/// A structurally valid Teams bearer header retained exactly as received.
+///
+/// This type proves only the HTTP authentication-scheme syntax and token byte
+/// budget. The daemon-owned Teams adapter must still verify the JWT signature,
+/// issuer, audience, lifetime, and Bot Framework claims.
+#[derive(Clone, Eq, PartialEq)]
+pub struct LegacyTeamsAuthorizationHeader {
+    value: Box<str>,
+    bearer_token_offset: usize,
+}
+
+impl LegacyTeamsAuthorizationHeader {
+    /// Returns the exact header value, including the caller's scheme casing.
+    ///
+    /// The returned value is secret and must not be logged.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    /// Returns the structurally validated bearer token without its scheme.
+    ///
+    /// The returned value is secret and must not be logged.
+    #[must_use]
+    pub fn bearer_token(&self) -> &str {
+        &self.value[self.bearer_token_offset..]
+    }
+}
+
+impl Debug for LegacyTeamsAuthorizationHeader {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("LegacyTeamsAuthorizationHeader")
+            .field(&"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Validated HTTP metadata accompanying one Teams activity.
+#[derive(Clone, Eq, PartialEq)]
+pub struct LegacyTeamsRequestContext {
+    authorization: Option<LegacyTeamsAuthorizationHeader>,
+}
+
+impl LegacyTeamsRequestContext {
+    /// Returns the optional bearer header for daemon-owned JWT verification.
+    #[must_use]
+    pub const fn authorization(&self) -> Option<&LegacyTeamsAuthorizationHeader> {
+        self.authorization.as_ref()
+    }
+
+    pub(crate) fn from_headers(
+        headers: &HeaderMap,
+    ) -> Result<Self, InvalidLegacyTeamsAuthorization> {
+        let mut values = headers.get_all(header::AUTHORIZATION).iter();
+        let Some(value) = values.next() else {
+            return Ok(Self {
+                authorization: None,
+            });
+        };
+        if values.next().is_some() || value.as_bytes().len() > LEGACY_TEAMS_AUTHORIZATION_BYTES {
+            return Err(InvalidLegacyTeamsAuthorization);
+        }
+        let value = value
+            .to_str()
+            .map_err(|_| InvalidLegacyTeamsAuthorization)?;
+        let (scheme, token) = value
+            .split_once(' ')
+            .ok_or(InvalidLegacyTeamsAuthorization)?;
+        if !scheme.eq_ignore_ascii_case("bearer") || !valid_token68(token) {
+            return Err(InvalidLegacyTeamsAuthorization);
+        }
+        Ok(Self {
+            authorization: Some(LegacyTeamsAuthorizationHeader {
+                value: value.into(),
+                bearer_token_offset: scheme.len() + 1,
+            }),
+        })
+    }
+}
+
+impl Debug for LegacyTeamsRequestContext {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LegacyTeamsRequestContext")
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InvalidLegacyTeamsAuthorization;
+
+fn valid_token68(token: &str) -> bool {
+    let unpadded = token.trim_end_matches('=');
+    !unpadded.is_empty()
+        && unpadded.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+        })
+        && token[unpadded.len()..].bytes().all(|byte| byte == b'=')
+}
+
+/// Accepts one bounded Bot Framework activity and its HTTP authentication context.
 pub trait LegacyTeamsPort: Send + Sync {
     /// Processes one decoded Bot Framework request body.
+    ///
+    /// The generic HTTP crate does not authenticate the caller. Implementations
+    /// decide whether a missing header is allowed and validate any presented JWT.
     fn handle_activity(
         &self,
+        context: LegacyTeamsRequestContext,
         activity: Value,
         cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<(), PortError>>;

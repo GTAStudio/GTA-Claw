@@ -23,11 +23,12 @@ pub use config::{
     LegacyHttpLimits, LegacyWhatsAppConfig,
 };
 pub use ports::{
-    LEGACY_ADMIN_ACTIONS, LegacyAdminAction, LegacyApiServices, LegacyChannelMessage,
-    LegacyChannelMessagePort, LegacyDeviceFlowPort, LegacyExecResult, LegacyHostAdminPort,
-    LegacyOsInfo, LegacyProcessInfo, LegacyProcessMemory, LegacyReloadError, LegacyReloadPort,
-    LegacyReloadResult, LegacyRuntimePort, LegacyRuntimeSnapshot, LegacySystemInfo,
-    LegacyTeamsPort, LegacyWhatsAppPort, LegacyWhatsAppServices,
+    LEGACY_ADMIN_ACTIONS, LEGACY_TEAMS_AUTHORIZATION_BYTES, LegacyAdminAction, LegacyApiServices,
+    LegacyChannelMessage, LegacyChannelMessagePort, LegacyDeviceFlowPort, LegacyExecResult,
+    LegacyHostAdminPort, LegacyOsInfo, LegacyProcessInfo, LegacyProcessMemory, LegacyReloadError,
+    LegacyReloadPort, LegacyReloadResult, LegacyRuntimePort, LegacyRuntimeSnapshot,
+    LegacySystemInfo, LegacyTeamsAuthorizationHeader, LegacyTeamsPort, LegacyTeamsRequestContext,
+    LegacyWhatsAppPort, LegacyWhatsAppServices,
 };
 pub use provider::{ProviderLegacyRuntime, ProviderLegacyRuntimeConfig};
 
