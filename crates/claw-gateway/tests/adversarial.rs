@@ -496,6 +496,39 @@ async fn a_second_connect_request_after_the_hello_is_rejected() {
 }
 
 #[tokio::test]
+async fn a_request_burst_larger_than_the_inbound_queue_is_answered_in_wire_order() {
+    const REQUESTS: usize = 64;
+
+    let handle = start(fast_config()).await;
+    let mut socket = connect(handle.local_address()).await;
+    handshake(&mut socket).await;
+
+    for index in 0..REQUESTS {
+        send_text(
+            &mut socket,
+            json!({
+                "type": "req",
+                "id": format!("burst-{index}"),
+                "method": "health",
+                "params": {},
+            })
+            .to_string(),
+        )
+        .await;
+    }
+
+    for index in 0..REQUESTS {
+        let response = next_text(&mut socket).await;
+        assert_eq!(response["type"], json!("res"));
+        assert_eq!(response["id"], json!(format!("burst-{index}")));
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["payload"]["protocol"], json!(4));
+    }
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_slow_consumer_is_closed_once_its_bounded_queue_overflows() {
     let mut config = fast_config();
     config.limits.event_queue_capacity = 4;

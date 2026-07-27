@@ -323,7 +323,7 @@ async fn dispatch_loop(
                     return ConnectionClose::Unresponsive;
                 }
                 unanswered_pings = unanswered_pings.saturating_add(1);
-                if let Err(error) = transport::write_ping(write, PING_PAYLOAD.to_vec()).await {
+                if let Err(error) = transport::write_ping(write, PING_PAYLOAD).await {
                     return ConnectionClose::Transport(error);
                 }
             }
@@ -411,7 +411,6 @@ async fn serve_request(
         ));
     };
     let request_id = request.id().clone();
-
     // Keyed by borrowed text: the registry is a `BTreeMap<&'static str, _>`, so
     // only the identity that turns out *not* to be catalogued needs an owned
     // copy, and that is the path that is about to end the request anyway.
