@@ -1,0 +1,181 @@
+{
+  "description": "A streamed tool call pins the two-phase framing: an indexed chunk announcing the call identity with empty arguments, then argument deltas, then the tool_calls stop chunk.",
+  "feature_id": "interop.openai.chat-completions",
+  "request": {
+    "body": {
+      "messages": [
+        {
+          "content": "What is the weather in Berlin?",
+          "role": "user"
+        }
+      ],
+      "model": "openclaw",
+      "stream": true,
+      "stream_options": {
+        "include_usage": true
+      },
+      "tools": [
+        {
+          "function": {
+            "name": "get_weather",
+            "parameters": {
+              "type": "object"
+            }
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "token": "operator-token"
+  },
+  "response": {
+    "events": [
+      {
+        "data": {
+          "choices": [
+            {
+              "delta": {
+                "role": "assistant"
+              },
+              "finish_reason": null,
+              "index": 0
+            }
+          ],
+          "created": "<created#1>",
+          "id": "<id:chatcmpl#1>",
+          "model": "openclaw",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "choices": [
+            {
+              "delta": {
+                "content": "Looking that up. "
+              },
+              "finish_reason": null,
+              "index": 0
+            }
+          ],
+          "created": "<created#1>",
+          "id": "<id:chatcmpl#1>",
+          "model": "openclaw",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "choices": [
+            {
+              "delta": {
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "",
+                      "name": "get_weather"
+                    },
+                    "id": "call_weather_1",
+                    "index": 0,
+                    "type": "function"
+                  }
+                ]
+              },
+              "finish_reason": null,
+              "index": 0
+            }
+          ],
+          "created": "<created#1>",
+          "id": "<id:chatcmpl#1>",
+          "model": "openclaw",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "choices": [
+            {
+              "delta": {
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "{\"city\":\"Berlin\"}"
+                    },
+                    "index": 0
+                  }
+                ]
+              },
+              "finish_reason": null,
+              "index": 0
+            }
+          ],
+          "created": "<created#1>",
+          "id": "<id:chatcmpl#1>",
+          "model": "openclaw",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "choices": [
+            {
+              "delta": {},
+              "finish_reason": "tool_calls",
+              "index": 0
+            }
+          ],
+          "created": "<created#1>",
+          "id": "<id:chatcmpl#1>",
+          "model": "openclaw",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "choices": [],
+          "created": "<created#1>",
+          "id": "<id:chatcmpl#1>",
+          "model": "openclaw",
+          "object": "chat.completion.chunk",
+          "usage": {
+            "completion_tokens": 13,
+            "prompt_tokens": 21,
+            "total_tokens": 34
+          }
+        }
+      },
+      {
+        "data": "[DONE]"
+      }
+    ],
+    "headers": {
+      "cache-control": "no-cache",
+      "content-type": "text/event-stream; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "stream": {
+      "events": [
+        {
+          "text": "Looking that up. "
+        },
+        {
+          "tool_call": {
+            "arguments": "{\"city\":\"Berlin\"}",
+            "id": "call_weather_1",
+            "name": "get_weather"
+          }
+        }
+      ],
+      "kind": "events",
+      "usage": {
+        "input_tokens": 21,
+        "output_tokens": 13,
+        "total_tokens": 34
+      }
+    }
+  }
+}

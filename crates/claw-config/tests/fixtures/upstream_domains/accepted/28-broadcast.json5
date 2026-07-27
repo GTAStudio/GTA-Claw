@@ -1,0 +1,8 @@
+// Accepted fixture for pinned top-level domain `broadcast`
+// (compat/upstream/inventories/config-domains.json).
+{
+  broadcast: {
+    strategy: "parallel",
+    ops: ["discord:900002", "slack:C01"],
+  },
+}

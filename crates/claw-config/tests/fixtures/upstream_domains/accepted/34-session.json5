@@ -1,0 +1,16 @@
+// Accepted fixture for pinned top-level domain `session`
+// (compat/upstream/inventories/config-domains.json).
+{
+  session: {
+    scope: "per-sender",
+    dmScope: "per-peer",
+    identityLinks: { "discord:10010": ["slack:U01"] },
+    resetTriggers: ["/reset"],
+    idleMinutes: 45,
+    reset: { mode: "daily", atHour: 4 },
+    store: "sqlite",
+    typingIntervalSeconds: 5,
+    typingMode: "thinking",
+    mainKey: "main",
+  },
+}

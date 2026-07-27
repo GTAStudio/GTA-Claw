@@ -1,0 +1,39 @@
+{
+  "description": "A tool declaration the adapter cannot honour is refused up front rather than being silently downgraded.",
+  "feature_id": "interop.openai.chat-completions",
+  "request": {
+    "body": {
+      "messages": [
+        {
+          "content": "hello",
+          "role": "user"
+        }
+      ],
+      "model": "openclaw",
+      "tools": [
+        {
+          "function": {
+            "name": "get_weather",
+            "strict": true
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "Invalid tools/tool_choice: invalid tool configuration",
+        "type": "invalid_request_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 400
+  }
+}

@@ -1,0 +1,14 @@
+// Accepted fixture for pinned top-level domain `plugins`
+// (compat/upstream/inventories/config-domains.json).
+{
+  plugins: {
+    enabled: true,
+    allow: ["core"],
+    deny: ["legacy"],
+    load: { paths: ["/opt/claw/plugins"] },
+    bundledDiscovery: "allowlist",
+    entries: {
+      core: { enabled: true },
+    },
+  },
+}

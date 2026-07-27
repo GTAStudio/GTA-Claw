@@ -1,0 +1,24 @@
+{
+  "description": "A request without a model is refused by name.",
+  "feature_id": "interop.openai.embeddings",
+  "request": {
+    "body": {
+      "input": "Berlin"
+    },
+    "method": "POST",
+    "path": "/v1/embeddings",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "Missing `model`.",
+        "type": "invalid_request_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 400
+  }
+}

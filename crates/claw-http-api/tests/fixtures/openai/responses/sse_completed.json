@@ -1,0 +1,223 @@
+{
+  "description": "A streamed response pins the complete Responses event sequence from response.created through response.completed and the [DONE] terminator, including every named event and its payload type.",
+  "feature_id": "interop.openai.openresponses",
+  "request": {
+    "body": {
+      "input": "What is the weather in Berlin?",
+      "model": "openclaw",
+      "stream": true
+    },
+    "method": "POST",
+    "path": "/v1/responses",
+    "token": "operator-token"
+  },
+  "response": {
+    "events": [
+      {
+        "data": {
+          "response": {
+            "created_at": "<created#1>",
+            "id": "<id:resp#1>",
+            "model": "openclaw",
+            "object": "response",
+            "output": [],
+            "status": "in_progress",
+            "usage": {
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "total_tokens": 0
+            }
+          },
+          "type": "response.created"
+        },
+        "event": "response.created"
+      },
+      {
+        "data": {
+          "response": {
+            "created_at": "<created#1>",
+            "id": "<id:resp#1>",
+            "model": "openclaw",
+            "object": "response",
+            "output": [],
+            "status": "in_progress",
+            "usage": {
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "total_tokens": 0
+            }
+          },
+          "type": "response.in_progress"
+        },
+        "event": "response.in_progress"
+      },
+      {
+        "data": {
+          "item": {
+            "content": [
+              {
+                "text": "",
+                "type": "output_text"
+              }
+            ],
+            "id": "<id:msg#1>",
+            "role": "assistant",
+            "status": "in_progress",
+            "type": "message"
+          },
+          "output_index": 0,
+          "type": "response.output_item.added"
+        },
+        "event": "response.output_item.added"
+      },
+      {
+        "data": {
+          "content_index": 0,
+          "item_id": "<id:msg#1>",
+          "output_index": 0,
+          "part": {
+            "text": "",
+            "type": "output_text"
+          },
+          "type": "response.content_part.added"
+        },
+        "event": "response.content_part.added"
+      },
+      {
+        "data": {
+          "content_index": 0,
+          "delta": "Berlin ",
+          "item_id": "<id:msg#1>",
+          "output_index": 0,
+          "type": "response.output_text.delta"
+        },
+        "event": "response.output_text.delta"
+      },
+      {
+        "data": {
+          "content_index": 0,
+          "delta": "is ",
+          "item_id": "<id:msg#1>",
+          "output_index": 0,
+          "type": "response.output_text.delta"
+        },
+        "event": "response.output_text.delta"
+      },
+      {
+        "data": {
+          "content_index": 0,
+          "delta": "sunny.",
+          "item_id": "<id:msg#1>",
+          "output_index": 0,
+          "type": "response.output_text.delta"
+        },
+        "event": "response.output_text.delta"
+      },
+      {
+        "data": {
+          "content_index": 0,
+          "item_id": "<id:msg#1>",
+          "output_index": 0,
+          "text": "Berlin is sunny.",
+          "type": "response.output_text.done"
+        },
+        "event": "response.output_text.done"
+      },
+      {
+        "data": {
+          "content_index": 0,
+          "item_id": "<id:msg#1>",
+          "output_index": 0,
+          "part": {
+            "text": "Berlin is sunny.",
+            "type": "output_text"
+          },
+          "type": "response.content_part.done"
+        },
+        "event": "response.content_part.done"
+      },
+      {
+        "data": {
+          "item": {
+            "content": [
+              {
+                "text": "Berlin is sunny.",
+                "type": "output_text"
+              }
+            ],
+            "id": "<id:msg#1>",
+            "phase": "final_answer",
+            "role": "assistant",
+            "status": "completed",
+            "type": "message"
+          },
+          "output_index": 0,
+          "type": "response.output_item.done"
+        },
+        "event": "response.output_item.done"
+      },
+      {
+        "data": {
+          "response": {
+            "created_at": "<created#1>",
+            "id": "<id:resp#1>",
+            "model": "openclaw",
+            "object": "response",
+            "output": [
+              {
+                "content": [
+                  {
+                    "text": "Berlin is sunny.",
+                    "type": "output_text"
+                  }
+                ],
+                "id": "<id:msg#1>",
+                "phase": "final_answer",
+                "role": "assistant",
+                "status": "completed",
+                "type": "message"
+              }
+            ],
+            "status": "completed",
+            "usage": {
+              "input_tokens": 13,
+              "output_tokens": 5,
+              "total_tokens": 18
+            }
+          },
+          "type": "response.completed"
+        },
+        "event": "response.completed"
+      },
+      {
+        "data": "[DONE]"
+      }
+    ],
+    "headers": {
+      "cache-control": "no-cache",
+      "content-type": "text/event-stream; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "stream": {
+      "events": [
+        {
+          "text": "Berlin "
+        },
+        {
+          "text": "is "
+        },
+        {
+          "text": "sunny."
+        }
+      ],
+      "kind": "events",
+      "usage": {
+        "input_tokens": 13,
+        "output_tokens": 5,
+        "total_tokens": 18
+      }
+    }
+  }
+}

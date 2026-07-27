@@ -1,0 +1,25 @@
+{
+  "description": "Provider policy is pinned: embeddings route through the same OpenClaw identifiers as completions, and nothing else is accepted.",
+  "feature_id": "interop.openai.embeddings",
+  "request": {
+    "body": {
+      "input": "Berlin",
+      "model": "text-embedding-3-small"
+    },
+    "method": "POST",
+    "path": "/v1/embeddings",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "Invalid `model`. Use `openclaw` or `openclaw/<agentId>`.",
+        "type": "invalid_request_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 400
+  }
+}

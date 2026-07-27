@@ -1,0 +1,61 @@
+{
+  "description": "GET /v1/models publishes the configured OpenClaw identifier set, de-duplicated, and filters out identifiers the provider advertises under other names.",
+  "feature_id": "interop.openai.models",
+  "request": {
+    "method": "GET",
+    "path": "/v1/models",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "data": [
+        {
+          "created": 0,
+          "id": "openclaw",
+          "object": "model",
+          "owned_by": "openclaw",
+          "permission": []
+        },
+        {
+          "created": 0,
+          "id": "openclaw/default",
+          "object": "model",
+          "owned_by": "openclaw",
+          "permission": []
+        },
+        {
+          "created": 0,
+          "id": "openclaw/main",
+          "object": "model",
+          "owned_by": "openclaw",
+          "permission": []
+        },
+        {
+          "created": 0,
+          "id": "openclaw/research",
+          "object": "model",
+          "owned_by": "openclaw",
+          "permission": []
+        }
+      ],
+      "object": "list"
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "agents": [
+      "main",
+      "research"
+    ],
+    "models": {
+      "ids": [
+        "openclaw",
+        "secret-internal"
+      ],
+      "kind": "ids"
+    }
+  }
+}

@@ -1,0 +1,4 @@
+// reject: decode surfaces.discord:guild
+{
+  surfaces: { "discord:guild": 7 },
+}

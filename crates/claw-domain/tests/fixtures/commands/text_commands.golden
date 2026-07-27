@@ -1,0 +1,114 @@
+# Golden table for text command resolution.
+#
+# Source: openclaw/openclaw@b43e832fcc8000ed7287c7accc54e381db607f85
+#   src/auto-reply/commands-registry-normalize.ts
+#
+# `alias` is the canonical alias the body normalizes to, not the alias the
+# sender typed: `normalizeCommandBody` rewrites a known alias to its primary
+# spelling before resolution, so `/id` resolves through `/whoami`.
+
+name: plain command
+input: "/help"
+key: help
+alias: /help
+
+name: aliases are matched case-insensitively
+input: "/HELP"
+key: help
+alias: /help
+
+name: a command that takes no args refuses a trailing argument
+input: "/help extra"
+resolved: false
+
+name: surrounding whitespace is trimmed
+input: "   /new   "
+key: new
+alias: /new
+
+name: arguments are trimmed and preserved verbatim
+input: "/think    high"
+key: think
+alias: /think
+args: high
+
+name: colon syntax is rewritten to a space
+input: "/t: high"
+key: think
+alias: /think
+args: high
+
+name: colon syntax without a value drops the colon
+input: "/verbose:"
+key: verbose
+alias: /verbose
+
+name: a registered secondary alias canonicalizes to the primary alias
+input: "/id"
+key: whoami
+alias: /whoami
+
+name: registerAlias entries resolve with their arguments
+input: "/tell go left"
+key: steer
+alias: /steer
+args: "go left"
+
+name: multi-alias definitions canonicalize
+input: "/side note this"
+key: btw
+alias: /btw
+args: "note this"
+
+name: plugin alias canonicalizes and keeps its subcommand
+input: "/plugin install demo"
+key: plugins
+alias: /plugins
+args: "install demo"
+
+name: a bot mention matching the configured bot is stripped
+input: "/status@clawbot plugins"
+bot: clawbot
+key: status
+alias: /status
+args: plugins
+
+name: a bot mention for a different bot is left alone and fails to resolve
+input: "/status@otherbot plugins"
+bot: clawbot
+resolved: false
+
+name: unknown commands do not resolve
+input: "/definitely-not-a-command"
+resolved: false
+
+name: a bare slash does not resolve
+input: "/"
+resolved: false
+
+name: non-command text does not resolve
+input: "hello there"
+resolved: false
+
+name: skill keeps its multiline tail
+input: "/skill demo\nfirst line\nsecond line"
+key: skill
+alias: /skill
+args: "demo\nfirst line\nsecond line"
+
+name: learn keeps its multiline tail
+input: "/learn\nremember this"
+key: learn
+alias: /learn
+args: "remember this"
+
+name: reset flattens its multiline tail
+input: "/reset\nkeep    this"
+key: reset
+alias: /reset
+args: "keep this"
+
+name: every other command drops its multiline tail
+input: "/help\ndropped tail"
+key: help
+alias: /help

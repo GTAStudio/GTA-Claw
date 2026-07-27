@@ -1,0 +1,26 @@
+{
+  "description": "A read-only operator is refused the write scope invocation requires.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "args": {},
+      "name": "echo"
+    },
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "read-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "missing scope: operator.write",
+        "type": "forbidden"
+      },
+      "ok": false
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 403
+  }
+}

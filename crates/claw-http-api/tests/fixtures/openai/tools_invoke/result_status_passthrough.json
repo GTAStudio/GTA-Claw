@@ -1,0 +1,39 @@
+{
+  "description": "A tool that succeeds with its own status pins the pass-through of both the status and the structured result.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "args": {
+        "payload": "x"
+      },
+      "name": "enqueue"
+    },
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "ok": true,
+      "result": {
+        "jobId": "job-7",
+        "queued": true
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 202
+  },
+  "runtime": {
+    "tool": {
+      "kind": "outcome",
+      "ok": true,
+      "result": {
+        "jobId": "job-7",
+        "queued": true
+      },
+      "status": 202
+    }
+  }
+}

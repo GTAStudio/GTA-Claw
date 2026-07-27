@@ -1,0 +1,45 @@
+{
+  "description": "A provider outage is a service-unavailable failed response resource.",
+  "feature_id": "interop.openai.openresponses",
+  "request": {
+    "body": {
+      "input": "hello",
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/responses",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "created_at": "<created#1>",
+      "error": {
+        "code": "api_error",
+        "message": "upstream provider is unavailable"
+      },
+      "id": "<id:resp#1>",
+      "model": "openclaw",
+      "object": "response",
+      "output": [],
+      "status": "failed",
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 503
+  },
+  "runtime": {
+    "generate": {
+      "error": {
+        "kind": "unavailable",
+        "message": "upstream provider is unavailable"
+      },
+      "kind": "error"
+    }
+  }
+}

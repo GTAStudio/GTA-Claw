@@ -1,0 +1,7 @@
+// Accepted fixture for pinned top-level domain `tui`
+// (compat/upstream/inventories/config-domains.json).
+{
+  tui: {
+    footer: { showRemoteHost: true },
+  },
+}

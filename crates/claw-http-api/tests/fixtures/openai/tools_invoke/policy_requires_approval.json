@@ -1,0 +1,39 @@
+{
+  "description": "A policy decision that withholds execution pins the failure envelope and the requiresApproval flag a client needs in order to escalate.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "args": {
+        "command": "rm -rf /"
+      },
+      "name": "shell"
+    },
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "operator approval is required for this tool",
+        "requiresApproval": true,
+        "type": "approval_required"
+      },
+      "ok": false
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 403
+  },
+  "runtime": {
+    "tool": {
+      "error_message": "operator approval is required for this tool",
+      "error_type": "approval_required",
+      "kind": "outcome",
+      "ok": false,
+      "requires_approval": true,
+      "status": 403
+    }
+  }
+}

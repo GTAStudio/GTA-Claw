@@ -1,0 +1,27 @@
+{
+  "description": "GET /v1/models/{id} returns the pinned OpenAI model resource for a configured agent identifier.",
+  "feature_id": "interop.openai.models",
+  "request": {
+    "method": "GET",
+    "path": "/v1/models/openclaw%2Fmain",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "created": 0,
+      "id": "openclaw/main",
+      "object": "model",
+      "owned_by": "openclaw",
+      "permission": []
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "agents": [
+      "main"
+    ]
+  }
+}

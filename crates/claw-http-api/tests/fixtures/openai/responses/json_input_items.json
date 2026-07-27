@@ -1,0 +1,78 @@
+{
+  "description": "Structured input items are accepted and pinned: system items become instructions and the latest user item becomes the active turn.",
+  "feature_id": "interop.openai.openresponses",
+  "request": {
+    "body": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "Be terse.",
+              "type": "input_text"
+            }
+          ],
+          "role": "system",
+          "type": "message"
+        },
+        {
+          "content": [
+            {
+              "text": "How many moons does Mars have?",
+              "type": "input_text"
+            }
+          ],
+          "role": "user",
+          "type": "message"
+        }
+      ],
+      "model": "openclaw/main"
+    },
+    "method": "POST",
+    "path": "/v1/responses",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "created_at": "<created#1>",
+      "id": "<id:resp#1>",
+      "model": "openclaw/main",
+      "object": "response",
+      "output": [
+        {
+          "content": [
+            {
+              "text": "Two.",
+              "type": "output_text"
+            }
+          ],
+          "id": "<id:msg#1>",
+          "phase": "final_answer",
+          "role": "assistant",
+          "status": "completed",
+          "type": "message"
+        }
+      ],
+      "status": "completed",
+      "usage": {
+        "input_tokens": 31,
+        "output_tokens": 2,
+        "total_tokens": 33
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "generate": {
+      "kind": "output",
+      "text": "Two.",
+      "usage": {
+        "input_tokens": 31,
+        "output_tokens": 2,
+        "total_tokens": 33
+      }
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "description": "A policy denial that cannot be escalated pins the same failure envelope without the requiresApproval flag.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "args": {},
+      "name": "shell"
+    },
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "tool is disabled by policy",
+        "type": "policy_denied"
+      },
+      "ok": false
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 403
+  },
+  "runtime": {
+    "tool": {
+      "error_message": "tool is disabled by policy",
+      "error_type": "policy_denied",
+      "kind": "outcome",
+      "ok": false,
+      "status": 403
+    }
+  }
+}

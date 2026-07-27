@@ -1,0 +1,15 @@
+// Accepted fixture for pinned top-level domain `hooks`
+// (compat/upstream/inventories/config-domains.json).
+{
+  hooks: {
+    enabled: true,
+    path: "/hooks",
+    allowRequestSessionKey: false,
+    allowedSessionKeyPrefixes: ["team:"],
+    allowedAgentIds: ["main"],
+    maxBodyBytes: 1048576,
+    presets: ["github"],
+    transformsDir: "hooks/transforms",
+    mappings: [{ id: "github-push" }],
+  },
+}

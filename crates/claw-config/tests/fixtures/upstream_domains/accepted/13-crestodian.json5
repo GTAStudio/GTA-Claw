@@ -1,0 +1,11 @@
+// Accepted fixture for pinned top-level domain `crestodian`
+// (compat/upstream/inventories/config-domains.json).
+{
+  crestodian: {
+    rescue: {
+      enabled: true,
+      ownerDmOnly: true,
+      pendingTtlMinutes: 45,
+    },
+  },
+}

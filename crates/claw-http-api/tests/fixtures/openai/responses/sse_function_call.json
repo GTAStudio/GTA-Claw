@@ -1,0 +1,251 @@
+{
+  "description": "A streamed function call pins the extra output item added and done events that carry the call, alongside the assistant text item.",
+  "feature_id": "interop.openai.openresponses",
+  "request": {
+    "body": {
+      "input": "What is the weather in Berlin?",
+      "model": "openclaw",
+      "stream": true,
+      "tools": [
+        {
+          "name": "get_weather",
+          "parameters": {
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "method": "POST",
+    "path": "/v1/responses",
+    "token": "operator-token"
+  },
+  "response": {
+    "events": [
+      {
+        "data": {
+          "response": {
+            "created_at": "<created#1>",
+            "id": "<id:resp#1>",
+            "model": "openclaw",
+            "object": "response",
+            "output": [],
+            "status": "in_progress",
+            "usage": {
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "total_tokens": 0
+            }
+          },
+          "type": "response.created"
+        },
+        "event": "response.created"
+      },
+      {
+        "data": {
+          "response": {
+            "created_at": "<created#1>",
+            "id": "<id:resp#1>",
+            "model": "openclaw",
+            "object": "response",
+            "output": [],
+            "status": "in_progress",
+            "usage": {
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "total_tokens": 0
+            }
+          },
+          "type": "response.in_progress"
+        },
+        "event": "response.in_progress"
+      },
+      {
+        "data": {
+          "item": {
+            "content": [
+              {
+                "text": "",
+                "type": "output_text"
+              }
+            ],
+            "id": "<id:msg#1>",
+            "role": "assistant",
+            "status": "in_progress",
+            "type": "message"
+          },
+          "output_index": 0,
+          "type": "response.output_item.added"
+        },
+        "event": "response.output_item.added"
+      },
+      {
+        "data": {
+          "content_index": 0,
+          "item_id": "<id:msg#1>",
+          "output_index": 0,
+          "part": {
+            "text": "",
+            "type": "output_text"
+          },
+          "type": "response.content_part.added"
+        },
+        "event": "response.content_part.added"
+      },
+      {
+        "data": {
+          "content_index": 0,
+          "delta": "Looking that up. ",
+          "item_id": "<id:msg#1>",
+          "output_index": 0,
+          "type": "response.output_text.delta"
+        },
+        "event": "response.output_text.delta"
+      },
+      {
+        "data": {
+          "content_index": 0,
+          "item_id": "<id:msg#1>",
+          "output_index": 0,
+          "text": "Looking that up. ",
+          "type": "response.output_text.done"
+        },
+        "event": "response.output_text.done"
+      },
+      {
+        "data": {
+          "content_index": 0,
+          "item_id": "<id:msg#1>",
+          "output_index": 0,
+          "part": {
+            "text": "Looking that up. ",
+            "type": "output_text"
+          },
+          "type": "response.content_part.done"
+        },
+        "event": "response.content_part.done"
+      },
+      {
+        "data": {
+          "item": {
+            "content": [
+              {
+                "text": "Looking that up. ",
+                "type": "output_text"
+              }
+            ],
+            "id": "<id:msg#1>",
+            "phase": "commentary",
+            "role": "assistant",
+            "status": "completed",
+            "type": "message"
+          },
+          "output_index": 0,
+          "type": "response.output_item.done"
+        },
+        "event": "response.output_item.done"
+      },
+      {
+        "data": {
+          "item": {
+            "arguments": "{\"city\":\"Berlin\"}",
+            "call_id": "call_weather_1",
+            "id": "<id:call#1>",
+            "name": "get_weather",
+            "status": "completed",
+            "type": "function_call"
+          },
+          "output_index": 1,
+          "type": "response.output_item.added"
+        },
+        "event": "response.output_item.added"
+      },
+      {
+        "data": {
+          "item": {
+            "arguments": "{\"city\":\"Berlin\"}",
+            "call_id": "call_weather_1",
+            "id": "<id:call#1>",
+            "name": "get_weather",
+            "status": "completed",
+            "type": "function_call"
+          },
+          "output_index": 1,
+          "type": "response.output_item.done"
+        },
+        "event": "response.output_item.done"
+      },
+      {
+        "data": {
+          "response": {
+            "created_at": "<created#1>",
+            "id": "<id:resp#1>",
+            "model": "openclaw",
+            "object": "response",
+            "output": [
+              {
+                "content": [
+                  {
+                    "text": "Looking that up. ",
+                    "type": "output_text"
+                  }
+                ],
+                "id": "<id:msg#1>",
+                "phase": "commentary",
+                "role": "assistant",
+                "status": "completed",
+                "type": "message"
+              },
+              {
+                "arguments": "{\"city\":\"Berlin\"}",
+                "call_id": "call_weather_1",
+                "id": "<id:call#1>",
+                "name": "get_weather",
+                "status": "completed",
+                "type": "function_call"
+              }
+            ],
+            "status": "incomplete",
+            "usage": {
+              "input_tokens": 27,
+              "output_tokens": 11,
+              "total_tokens": 38
+            }
+          },
+          "type": "response.completed"
+        },
+        "event": "response.completed"
+      },
+      {
+        "data": "[DONE]"
+      }
+    ],
+    "headers": {
+      "cache-control": "no-cache",
+      "content-type": "text/event-stream; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "stream": {
+      "events": [
+        {
+          "text": "Looking that up. "
+        },
+        {
+          "tool_call": {
+            "arguments": "{\"city\":\"Berlin\"}",
+            "id": "call_weather_1",
+            "name": "get_weather"
+          }
+        }
+      ],
+      "kind": "events",
+      "usage": {
+        "input_tokens": 27,
+        "output_tokens": 11,
+        "total_tokens": 38
+      }
+    }
+  }
+}

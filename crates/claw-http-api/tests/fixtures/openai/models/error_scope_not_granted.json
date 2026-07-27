@@ -1,0 +1,22 @@
+{
+  "description": "An authenticated operator holding no scopes is refused the read scope the model list requires.",
+  "feature_id": "interop.openai.models",
+  "request": {
+    "method": "GET",
+    "path": "/v1/models",
+    "token": "scopeless-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "missing scope: operator.read",
+        "type": "forbidden"
+      },
+      "ok": false
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 403
+  }
+}

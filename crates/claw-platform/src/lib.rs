@@ -3,6 +3,8 @@
 use claw_application::SystemProbe;
 use claw_protocol::RuntimeDescriptor;
 
+pub mod suspend;
+
 /// Reads platform identity from the Rust target.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeSystemProbe;

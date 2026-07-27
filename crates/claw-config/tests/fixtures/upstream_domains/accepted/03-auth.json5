@@ -1,0 +1,10 @@
+// Accepted fixture for pinned top-level domain `auth`
+// (compat/upstream/inventories/config-domains.json).
+{
+  auth: {
+    order: {
+      anthropic: ["work", "personal"],
+      openai: ["default"],
+    },
+  },
+}
