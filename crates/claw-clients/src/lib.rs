@@ -28,6 +28,18 @@
 //! browse/read-only clients. It is a protocol wire identity, so local code must
 //! not rename it or split it into narrower GTA-Claw-only scopes.
 
+//!
+//! ## Additional contracts in this crate
+//!
+//! - [`clawhub`] implements the offline ClawHub marketplace lifecycle: search,
+//!   install, update, publish, risk acknowledgement, trust and uninstall.
+//! - [`conformance`] is the shared protocol-v4 connection compliance and
+//!   platform smoke suite that every inventoried surface is run through, plus
+//!   the honest per-surface [`conformance::COVERAGE`] table.
+
+pub mod clawhub;
+pub mod conformance;
+
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
