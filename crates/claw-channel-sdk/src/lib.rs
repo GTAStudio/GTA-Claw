@@ -13,6 +13,19 @@ use std::time::Duration;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
+pub mod commands;
+pub mod lifecycle;
+
+pub use commands::{
+    COMMAND_PREFIX, CommandDispatchError, CommandInvocation, CommandParseError, CommandRegistry,
+    CommandRegistryError, CommandSpec, MAX_COMMAND_ARGUMENT_CHARS, MAX_COMMAND_ARGUMENTS,
+    MAX_COMMAND_MENTION_CHARS, MAX_COMMAND_NAME_CHARS, parse_command,
+};
+pub use lifecycle::{
+    ChannelSession, ConnectionState, ConnectionSupervisor, IllegalTransition, LifecycleEvent,
+    LifecycleObserver,
+};
+
 /// Maximum number of attachment bytes accepted by the common message model.
 pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 
@@ -945,6 +958,13 @@ pub enum ChannelError {
     },
     /// Adapter does not implement the requested operation.
     Unsupported(UnsupportedOperation),
+    /// A lifecycle event was requested in a state that forbids it.
+    Lifecycle(IllegalTransition),
+    /// Messages were exchanged while no session was open.
+    NotConnected {
+        /// State the channel was actually in.
+        state: ConnectionState,
+    },
 }
 
 impl ChannelError {
@@ -967,7 +987,9 @@ impl ChannelError {
             | Self::Authentication
             | Self::Transport(TransportErrorKind::Tls)
             | Self::Protocol(_)
-            | Self::Unsupported(_) => false,
+            | Self::Unsupported(_)
+            | Self::Lifecycle(_)
+            | Self::NotConnected { .. } => false,
         }
     }
 
@@ -1005,6 +1027,10 @@ impl Display for ChannelError {
             }
             Self::Unsupported(operation) => {
                 write!(formatter, "channel operation is unsupported: {operation:?}")
+            }
+            Self::Lifecycle(transition) => Display::fmt(transition, formatter),
+            Self::NotConnected { state } => {
+                write!(formatter, "channel is not connected: {state:?}")
             }
         }
     }
