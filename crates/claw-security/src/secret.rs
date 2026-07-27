@@ -192,6 +192,14 @@ pub trait SecretResolver {
     type Error: Error + Send + Sync + 'static;
 
     /// Resolves for the caller's current use and returns owned secret material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the backend refused or could not complete
+    /// the lookup — a locked or absent keyring entry, a closed file descriptor,
+    /// a denied service credential, or an unreachable adapter. Implementations
+    /// must not place resolved secret bytes, or any fragment of them, into that
+    /// error: it is formatted by [`SecretResolutionError`] and reaches logs.
     fn resolve(
         &self,
         reference: &SecretRef,
@@ -244,6 +252,16 @@ where
 ///
 /// On audit failure after a successful backend lookup, the secrecy wrapper is
 /// dropped and zeroized before the error is returned.
+///
+/// # Errors
+///
+/// - [`SecretResolutionError::Audit`] when `audit` could not persist the
+///   pre-lookup authorization record, in which case the resolver is never
+///   called; or when it could not persist the post-lookup outcome, in which
+///   case a secret that was already read is dropped and zeroized instead of
+///   being returned. An unauditable resolution never yields a secret.
+/// - [`SecretResolutionError::Resolver`] when the backend refused or failed.
+///   The denial is audited before this is returned.
 pub fn resolve_audited<R, A>(
     resolver: &R,
     reference: &SecretRef,
@@ -295,7 +313,7 @@ where
     }
 }
 
-fn resolution_event(
+const fn resolution_event(
     reference: &SecretRef,
     outcome: AuditOutcome,
     reason: AuditReason,

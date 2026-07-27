@@ -13,6 +13,8 @@ use crate::authorization::{ClientClass, Role, Scope, ScopeSet};
 
 const DEVICE_ID_PREFIX: &str = "claw-device-v1:";
 const HANDSHAKE_DOMAIN: &[u8] = b"GTA-Claw/handshake-proof/v1\0";
+const GATEWAY_PROOF_VERSION: &str = "v3";
+const GATEWAY_PROOF_SEPARATOR: char = '|';
 
 /// Stable public identifier: SHA-256 over the canonical 32-byte Ed25519 key.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -29,6 +31,17 @@ impl DeviceId {
     }
 
     /// Parses only the lowercase, versioned canonical representation.
+    ///
+    /// # Errors
+    ///
+    /// - [`DeviceIdError::UnsupportedVersion`] when the value does not start
+    ///   with the exact `claw-device-v1:` algorithm/version prefix.
+    /// - [`DeviceIdError::InvalidLength`] when the text after the prefix is not
+    ///   exactly 64 bytes, so a truncated or padded digest cannot be accepted.
+    /// - [`DeviceIdError::NonCanonicalEncoding`] when any of those 64 bytes is
+    ///   outside `0-9a-f`. Uppercase hexadecimal and Unicode digit look-alikes
+    ///   are rejected rather than normalized, so one key has exactly one
+    ///   spelling and fingerprints can be compared as strings.
     pub fn parse(value: &str) -> Result<Self, DeviceIdError> {
         let encoded = value
             .strip_prefix(DEVICE_ID_PREFIX)
@@ -49,7 +62,7 @@ impl DeviceId {
         &self.0
     }
 
-    /// Returns the lowercase SHA-256 identity used by the pinned OpenClaw Gateway wire protocol.
+    /// Returns the lowercase SHA-256 identity used by the pinned `OpenClaw` Gateway wire protocol.
     #[must_use]
     pub fn gateway_wire_id(&self) -> String {
         let mut encoded = String::with_capacity(64);
@@ -82,7 +95,7 @@ fn decode_hex_pair(pair: &[u8]) -> Result<u8, DeviceIdError> {
     Ok((high << 4) | low)
 }
 
-fn decode_hex_digit(value: u8) -> Result<u8, DeviceIdError> {
+const fn decode_hex_digit(value: u8) -> Result<u8, DeviceIdError> {
     match value {
         b'0'..=b'9' => Ok(value - b'0'),
         b'a'..=b'f' => Ok(value - b'a' + 10),
@@ -119,6 +132,14 @@ pub struct DevicePublicKey(VerifyingKey);
 
 impl DevicePublicKey {
     /// Decodes exactly 32 canonical Ed25519 public-key bytes.
+    ///
+    /// # Errors
+    ///
+    /// - [`KeyDecodeError::InvalidLength`] when `bytes` is not exactly 32 bytes
+    ///   long.
+    /// - [`KeyDecodeError::InvalidEncoding`] when those 32 bytes are not a
+    ///   canonical compressed Edwards point, so a non-canonical field element
+    ///   can never be silently reinterpreted as some other valid key.
     pub fn decode(bytes: &[u8]) -> Result<Self, KeyDecodeError> {
         let bytes: &[u8; 32] = bytes
             .try_into()
@@ -141,6 +162,29 @@ impl DevicePublicKey {
     }
 
     /// Strictly verifies a domain-separated handshake proof.
+    ///
+    /// Verification uses `verify_strict`, which rejects small-order and
+    /// torsion-component public keys, so one signature cannot be made to verify
+    /// under two different keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SignatureError::VerificationFailed`] when the signature does
+    /// not verify under this key for the exact byte encoding of `input`. Every
+    /// claim in `input` — device fingerprint, role, scope bits, protocol
+    /// version, client class, timestamp, nonce and challenge — is covered by
+    /// the signed message, so altering any one of them fails verification. The
+    /// error deliberately carries no detail that would distinguish *which*
+    /// check failed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `input.nonce` or `input.challenge` is longer than
+    /// [`u32::MAX`] bytes, because the signed message length-prefixes both with
+    /// a big-endian `u32`. [`crate::pairing`] bounds both well below that, so
+    /// this is reachable only by calling the signing API directly with a slice
+    /// larger than four gibibytes.
+    #[must_use = "an ignored verification result is a silent authentication bypass"]
     pub fn verify_handshake(
         &self,
         input: HandshakeSigningInput<'_>,
@@ -152,7 +196,20 @@ impl DevicePublicKey {
             .map_err(|_| SignatureError::VerificationFailed)
     }
 
-    /// Strictly verifies a pinned OpenClaw Gateway v3 device proof.
+    /// Strictly verifies a pinned `OpenClaw` Gateway v3 device proof.
+    ///
+    /// Verification uses `verify_strict` over the canonical v3 payload rebuilt
+    /// from `input` and this key's own fingerprint, so a proof cannot be
+    /// replayed against a different device identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SignatureError::VerificationFailed`] when the signature does
+    /// not verify under this key for that exact payload. Any difference in the
+    /// client identity, client mode, role, scope list, timestamp, shared token,
+    /// nonce, or normalized platform/device-family metadata produces a
+    /// different payload and therefore a failure.
+    #[must_use = "an ignored verification result is a silent authentication bypass"]
     pub fn verify_gateway_device(
         &self,
         input: GatewayDeviceSigningInput<'_>,
@@ -191,6 +248,15 @@ pub struct DeviceSignature(Signature);
 
 impl DeviceSignature {
     /// Decodes exactly 64 signature bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SignatureDecodeError::InvalidLength`] when `bytes` is not
+    /// exactly 64 bytes long. Decoding deliberately performs no other check:
+    /// a non-canonical scalar `S` is rejected later, by the `verify_strict`
+    /// call inside [`DevicePublicKey::verify_handshake`] and
+    /// [`DevicePublicKey::verify_gateway_device`], so a malleable signature can
+    /// never be treated as a verified one.
     pub fn decode(bytes: &[u8]) -> Result<Self, SignatureDecodeError> {
         Signature::from_slice(bytes)
             .map(Self)
@@ -240,10 +306,11 @@ pub struct HandshakeSigningInput<'a> {
     pub challenge: &'a [u8],
 }
 
-/// Exact inputs covered by the pinned OpenClaw Gateway v3 device proof.
+/// Exact inputs covered by the pinned `OpenClaw` Gateway v3 device proof.
 ///
 /// The shared credential participates in the signature but is intentionally
 /// represented by a secrecy wrapper and omitted from `Debug`.
+#[derive(Clone, Copy)]
 pub struct GatewayDeviceSigningInput<'a> {
     /// Closed Gateway client identity.
     pub client_id: &'a str,
@@ -313,35 +380,76 @@ fn encode_handshake(input: HandshakeSigningInput<'_>) -> Vec<u8> {
     message
 }
 
+/// Builds the exact pinned Gateway v3 canonical payload.
+///
+/// The parts and the `|` separators between them are the wire contract every
+/// client signs; their order, spelling and count must not change.
+///
+/// The payload is assembled into one pre-sized buffer rather than with
+/// `format!`. The shared token lives inside this buffer, and a `String` that
+/// grows while holding it leaves un-zeroized copies of the token in freed heap
+/// that the final [`Zeroizing`] can no longer reach. The capacity is the exact
+/// sum of the part lengths plus one separator per part, computed from the same
+/// array that is then appended, so it cannot drift; the debug assertions make
+/// "never reallocates" an enforced property rather than an assumed one.
+///
+/// The scope list, the timestamp and the normalized metadata are formatted into
+/// their own small buffers first. Those may reallocate freely — none of them
+/// ever contains the token.
 fn encode_gateway_device(
     device_id: &DeviceId,
     input: GatewayDeviceSigningInput<'_>,
 ) -> Zeroizing<String> {
+    let wire_id = device_id.gateway_wire_id();
     let scopes = input
         .scopes
         .iter()
         .map(Scope::as_str)
         .collect::<Vec<_>>()
         .join(",");
+    let signed_at = input.signed_at_unix_millis.to_string();
     let token = input.token.map_or("", |secret| secret.expose_secret());
     let platform = normalize_gateway_metadata(input.platform);
     let device_family = input
         .device_family
         .map(normalize_gateway_metadata)
         .unwrap_or_default();
-    Zeroizing::new(format!(
-        "v3|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-        device_id.gateway_wire_id(),
+
+    let parts = [
+        wire_id.as_str(),
         input.client_id,
         input.client_mode,
         input.role.as_str(),
-        scopes,
-        input.signed_at_unix_millis,
+        scopes.as_str(),
+        signed_at.as_str(),
         token,
         input.nonce,
-        platform,
-        device_family,
-    ))
+        platform.as_str(),
+        device_family.as_str(),
+    ];
+    let capacity = GATEWAY_PROOF_VERSION.len()
+        + parts.len()
+        + parts.iter().map(|part| part.len()).sum::<usize>();
+    let mut payload = Zeroizing::new(String::with_capacity(capacity));
+    let reserved = payload.capacity();
+
+    payload.push_str(GATEWAY_PROOF_VERSION);
+    for part in parts {
+        payload.push(GATEWAY_PROOF_SEPARATOR);
+        payload.push_str(part);
+    }
+
+    debug_assert_eq!(
+        payload.len(),
+        capacity,
+        "reserved capacity must equal the exact payload length"
+    );
+    debug_assert_eq!(
+        payload.capacity(),
+        reserved,
+        "the payload buffer holds the shared token and must never be reallocated"
+    );
+    payload
 }
 
 fn normalize_gateway_metadata(value: &str) -> String {
@@ -350,7 +458,7 @@ fn normalize_gateway_metadata(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn is_ecmascript_trim_character(character: char) -> bool {
+const fn is_ecmascript_trim_character(character: char) -> bool {
     matches!(
         character,
         '\u{0009}'
@@ -375,7 +483,7 @@ fn is_ecmascript_trim_character(character: char) -> bool {
 /// In-memory Ed25519 signer.
 ///
 /// The private key cannot be cloned, displayed, serialized, or exported. The
-/// underlying RustCrypto key zeroizes on drop. A later platform adapter may
+/// underlying `RustCrypto` key zeroizes on drop. A later platform adapter may
 /// create identities from an OS keyring, but this crate provides no persistence.
 pub struct DeviceIdentity {
     signing_key: SigningKey,
@@ -383,6 +491,13 @@ pub struct DeviceIdentity {
 
 impl DeviceIdentity {
     /// Tries to generate an identity using a fallible cryptographic RNG.
+    ///
+    /// # Errors
+    ///
+    /// Returns the RNG's own `Error` verbatim when `rng` could not produce 32
+    /// bytes of entropy — for example an operating-system entropy source that
+    /// is unavailable or refuses the request. No fallback source is used and no
+    /// partially seeded key is ever returned.
     pub fn try_generate<R>(rng: &mut R) -> Result<Self, R::Error>
     where
         R: TryCryptoRng + ?Sized,
@@ -414,12 +529,20 @@ impl DeviceIdentity {
     }
 
     /// Signs the deterministic, domain-separated handshake payload.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `input.nonce` or `input.challenge` is longer than
+    /// [`u32::MAX`] bytes, because the signed message length-prefixes both with
+    /// a big-endian `u32`. [`crate::pairing`] bounds both well below that, so
+    /// this is reachable only by calling the signing API directly with a slice
+    /// larger than four gibibytes.
     #[must_use]
     pub fn sign_handshake(&self, input: HandshakeSigningInput<'_>) -> DeviceSignature {
         DeviceSignature(self.signing_key.sign(&encode_handshake(input)))
     }
 
-    /// Signs the exact pinned OpenClaw Gateway v3 device-authentication payload.
+    /// Signs the exact pinned `OpenClaw` Gateway v3 device-authentication payload.
     ///
     /// The secret-bearing canonical payload is zeroized immediately after signing.
     #[must_use]
@@ -627,6 +750,54 @@ mod tests {
                 &DeviceSignature(signature),
             )
             .expect("pinned Gateway payload verifies");
+    }
+
+    #[test]
+    fn gateway_payload_buffer_holding_the_token_is_never_reallocated() {
+        let identity = DeviceIdentity {
+            signing_key: SigningKey::from_bytes(&[7_u8; 32]),
+        };
+        let device_id = identity.device_id();
+        let token = SecretString::from("a-token-long-enough-to-force-growth".to_owned());
+        let empty_token = SecretString::from(String::new());
+        let cases = [
+            (None, ScopeSet::EMPTY, "", None, 0),
+            (
+                Some(&token),
+                ScopeSet::from_scopes(Scope::ALL),
+                "  WinDows\u{feff}",
+                Some(" DeskTop "),
+                u64::MAX,
+            ),
+            (
+                Some(&empty_token),
+                ScopeSet::from_scopes([Scope::OperatorRead]),
+                "linux",
+                None,
+                1_700_000_000_123,
+            ),
+        ];
+        for (token, scopes, platform, device_family, signed_at_unix_millis) in cases {
+            let payload = encode_gateway_device(
+                &device_id,
+                GatewayDeviceSigningInput {
+                    client_id: "gateway-client",
+                    client_mode: "backend",
+                    role: Role::Operator,
+                    scopes,
+                    signed_at_unix_millis,
+                    token,
+                    nonce: "nonce-123",
+                    platform,
+                    device_family,
+                },
+            );
+            assert_eq!(
+                payload.capacity(),
+                payload.len(),
+                "the buffer must be exactly full, so it was never grown while holding the token"
+            );
+        }
     }
 
     #[test]

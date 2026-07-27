@@ -37,7 +37,11 @@ pub trait SecurityClock {
 }
 
 /// Fixed-size random challenge nonce.
-#[derive(Clone, Copy, Eq, PartialEq)]
+///
+/// Equality is constant time. The derived comparison a byte array would
+/// otherwise get short-circuits on the first differing byte, which leaks how
+/// much of a guessed nonce was correct.
+#[derive(Clone, Copy, Eq)]
 pub struct ChallengeNonce([u8; 32]);
 
 impl ChallengeNonce {
@@ -53,8 +57,15 @@ impl ChallengeNonce {
         &self.0
     }
 
+    #[must_use = "an ignored nonce comparison silently accepts a mismatched challenge"]
     fn constant_time_eq(&self, other: &Self) -> bool {
         bool::from(self.0.ct_eq(&other.0))
+    }
+}
+
+impl PartialEq for ChallengeNonce {
+    fn eq(&self, other: &Self) -> bool {
+        self.constant_time_eq(other)
     }
 }
 
@@ -72,6 +83,17 @@ pub trait NonceStore {
     type Error: Error + Send + Sync + 'static;
 
     /// Reserves a unique nonce until the monotonic deadline.
+    ///
+    /// Returns `Ok(false)` when the nonce is already reserved; a collision is a
+    /// normal policy outcome, not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the store could not decide the question at
+    /// all — an unreachable backing store, a failed durable write, or an
+    /// exhausted capacity bound. The caller must abandon the challenge rather
+    /// than assume the nonce is fresh, because a lost reservation would allow
+    /// the same nonce to be issued twice.
     fn reserve(
         &mut self,
         nonce: &ChallengeNonce,
@@ -79,6 +101,13 @@ pub trait NonceStore {
     ) -> Result<bool, Self::Error>;
 
     /// Atomically consumes a nonce, returning false for replay or absence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the atomic test-and-remove could not be
+    /// performed — an unreachable backing store or a failed durable write. A
+    /// caller must treat this as a refusal: an error is not evidence that the
+    /// nonce was unused, and proceeding would defeat replay detection.
     fn consume(&mut self, nonce: &ChallengeNonce) -> Result<bool, Self::Error>;
 }
 
@@ -92,6 +121,18 @@ pub struct PairingPolicy {
 
 impl PairingPolicy {
     /// Creates a bounded policy.
+    ///
+    /// # Errors
+    ///
+    /// - [`PairingPolicyError::TtlOutOfBounds`] when `ttl_millis` is below one
+    ///   second or above five minutes, so a challenge can neither expire before
+    ///   a client can answer it nor stay outstanding indefinitely.
+    /// - [`PairingPolicyError::AttemptsOutOfBounds`] when `max_attempts` is `0`
+    ///   or above ten; zero would deny every proof and a larger budget would
+    ///   widen online guessing.
+    /// - [`PairingPolicyError::ClockSkewOutOfBounds`] when
+    ///   `max_clock_skew_millis` exceeds one minute, which would extend the
+    ///   window in which a captured proof timestamp is still accepted.
     pub fn new(
         ttl_millis: u64,
         max_attempts: u8,
@@ -222,7 +263,7 @@ pub struct PairingProof {
 }
 
 /// Typed, wire-decoded proof parts accepted from a transport adapter.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct PairingProofParts {
     /// Versioned public device fingerprint.
     pub device_id: DeviceId,
@@ -366,6 +407,29 @@ impl PairingSession {
     }
 
     /// Issues one bounded, unique challenge.
+    ///
+    /// # Errors
+    ///
+    /// Every rejection is audited before it is returned.
+    ///
+    /// - [`PairingRejection::IllegalTransition`] unless the session is
+    ///   [`PairingState::Unpaired`]; an outstanding challenge is never replaced.
+    /// - [`PairingRejection::InvalidChallengeLength`] when
+    ///   `request.challenge` is shorter than 16 or longer than 256 bytes.
+    /// - [`PairingRejection::CrossDevice`] when `request.public_key` does not
+    ///   fingerprint to the device this session was created for.
+    /// - [`PairingRejection::RoleScopeMismatch`] when a non-operator role
+    ///   requests operator scopes.
+    /// - [`PairingRejection::ProtocolMismatch`] when the role, client class,
+    ///   and protocol version fall outside the pinned compatibility window.
+    /// - [`PairingRejection::ClockOverflow`] when the monotonic clock plus the
+    ///   policy TTL overflows [`u64`].
+    /// - [`PairingRejection::NonceCollision`] when `nonce_store` reports the
+    ///   nonce is already reserved.
+    /// - [`PairingOperationError::NonceStore`] when the reservation could not
+    ///   be decided, and [`PairingOperationError::Audit`] when the audit record
+    ///   could not be persisted. In both cases no challenge is issued, so an
+    ///   unauditable or unverifiable issuance fails closed.
     pub fn issue_challenge<N, A, C>(
         &mut self,
         request: ChallengeRequest,
@@ -461,6 +525,38 @@ impl PairingSession {
     }
 
     /// Verifies exact claims, timestamp, nonce freshness, and Ed25519 proof.
+    ///
+    /// # Errors
+    ///
+    /// Every rejection is audited before it is returned, and each failed
+    /// cryptographic attempt consumes one of the policy's bounded attempts.
+    ///
+    /// - [`PairingRejection::IllegalTransition`] unless a challenge is
+    ///   outstanding.
+    /// - [`PairingRejection::Expired`] when the monotonic TTL of the challenge
+    ///   has elapsed; the session moves to [`PairingState::Expired`].
+    /// - [`PairingRejection::FutureTimestamp`] or
+    ///   [`PairingRejection::StaleTimestamp`] when the signed timestamp is
+    ///   outside the policy's clock-skew window.
+    /// - [`PairingRejection::CrossDevice`] when the proof's device identifier,
+    ///   the fingerprint of its public key, or that key itself differs from the
+    ///   one the challenge was issued to.
+    /// - [`PairingRejection::RoleMismatch`], [`PairingRejection::ScopeMismatch`],
+    ///   [`PairingRejection::ProtocolMismatch`], or
+    ///   [`PairingRejection::ClientClassMismatch`] when the corresponding claim
+    ///   differs from the issued challenge.
+    /// - [`PairingRejection::NonceMismatch`] when the proof nonce is not the
+    ///   issued one, compared in constant time.
+    /// - [`PairingRejection::InvalidSignature`] when `verify_strict` rejects the
+    ///   Ed25519 proof over the exact challenge claims.
+    /// - [`PairingRejection::AttemptsExhausted`] when that failure was the last
+    ///   permitted attempt; the session moves to [`PairingState::Denied`].
+    /// - [`PairingRejection::Replay`] when the nonce store reports the nonce was
+    ///   already consumed.
+    /// - [`PairingOperationError::NonceStore`] when the consume could not be
+    ///   decided, and [`PairingOperationError::Audit`] when a record could not
+    ///   be persisted; neither advances the session to
+    ///   [`PairingState::ProofVerified`].
     pub fn verify_proof<N, A, C>(
         &mut self,
         proof: &PairingProof,
@@ -570,6 +666,16 @@ impl PairingSession {
     }
 
     /// Moves a verified proof to the explicit approval gate.
+    ///
+    /// # Errors
+    ///
+    /// - [`PairingRejection::IllegalTransition`] unless the session is
+    ///   [`PairingState::ProofVerified`], so approval can never be requested for
+    ///   a proof that was not cryptographically verified first.
+    /// - [`PairingRejection::Expired`] when the challenge TTL elapsed before the
+    ///   request; the session moves to [`PairingState::Expired`].
+    /// - [`PairingOperationError::Audit`] when the audit record could not be
+    ///   persisted, in which case the state is left unchanged.
     pub fn request_approval<A: AuditSink, C: SecurityClock>(
         &mut self,
         clock: &C,
@@ -614,6 +720,17 @@ impl PairingSession {
     }
 
     /// Approves only a proof waiting at the approval gate.
+    ///
+    /// # Errors
+    ///
+    /// - [`PairingRejection::IllegalTransition`] unless the session is
+    ///   [`PairingState::AwaitingApproval`], so nothing can be approved that did
+    ///   not pass verification and reach the explicit gate.
+    /// - [`PairingRejection::Expired`] when the challenge TTL elapsed while the
+    ///   approval was pending; the session moves to [`PairingState::Expired`]
+    ///   rather than being approved late.
+    /// - [`PairingOperationError::Audit`] when the audit record could not be
+    ///   persisted, in which case the pairing is not approved.
     pub fn approve<A: AuditSink, C: SecurityClock>(
         &mut self,
         clock: &C,
@@ -660,6 +777,13 @@ impl PairingSession {
     }
 
     /// Denies only a proof waiting at the approval gate.
+    ///
+    /// # Errors
+    ///
+    /// - [`PairingRejection::IllegalTransition`] unless the session is
+    ///   [`PairingState::AwaitingApproval`].
+    /// - [`PairingOperationError::Audit`] when the audit record could not be
+    ///   persisted, in which case the session stays at the approval gate.
     pub fn deny<A: AuditSink, C: SecurityClock>(
         &mut self,
         clock: &C,
@@ -688,6 +812,18 @@ impl PairingSession {
     }
 
     /// Expires an outstanding challenge/proof/approval after its monotonic TTL.
+    ///
+    /// # Errors
+    ///
+    /// - [`PairingRejection::IllegalTransition`] unless the session is
+    ///   [`PairingState::ChallengeIssued`], [`PairingState::ProofVerified`], or
+    ///   [`PairingState::AwaitingApproval`]; a settled session has nothing to
+    ///   expire.
+    /// - [`PairingRejection::NotYetExpired`] when the monotonic deadline has not
+    ///   been reached, so expiry cannot be forced early to discard an
+    ///   inconvenient proof.
+    /// - [`PairingOperationError::Audit`] when the audit record could not be
+    ///   persisted, in which case the state is left unchanged.
     pub fn expire<A: AuditSink, C: SecurityClock>(
         &mut self,
         clock: &C,
@@ -731,6 +867,14 @@ impl PairingSession {
     }
 
     /// Revokes an approved pairing.
+    ///
+    /// # Errors
+    ///
+    /// - [`PairingRejection::IllegalTransition`] unless the session is
+    ///   [`PairingState::Approved`].
+    /// - [`PairingOperationError::Audit`] when the audit record could not be
+    ///   persisted. The pairing then remains approved, so a caller must retry
+    ///   rather than assume revocation took effect.
     pub fn revoke<A: AuditSink, C: SecurityClock>(
         &mut self,
         clock: &C,
@@ -1069,9 +1213,9 @@ mod tests {
             .expect("challenge");
     }
 
-    fn rejected<N, A>(error: PairingOperationError<N, A>) -> PairingRejection {
+    fn rejected<N, A>(error: &PairingOperationError<N, A>) -> PairingRejection {
         match error {
-            PairingOperationError::Rejected(rejection) => rejection,
+            PairingOperationError::Rejected(rejection) => *rejection,
             PairingOperationError::NonceStore(_) => panic!("unexpected nonce error"),
             PairingOperationError::Audit(_) => panic!("unexpected audit error"),
         }
@@ -1137,7 +1281,7 @@ mod tests {
         let mut replay = pristine;
         assert_eq!(
             rejected(
-                replay
+                &replay
                     .verify_proof(&proof, policy, &clock, &mut nonces, &mut audit)
                     .expect_err("replay")
             ),
@@ -1164,7 +1308,7 @@ mod tests {
         );
         assert_eq!(
             rejected(
-                cross_session
+                &cross_session
                     .verify_proof(&cross, policy, &clock, &mut cross_nonces, &mut cross_audit)
                     .expect_err("cross device")
             ),
@@ -1189,7 +1333,7 @@ mod tests {
         role_proof.role = Role::Node;
         assert_eq!(
             rejected(
-                session
+                &session
                     .verify_proof(&role_proof, policy, &clock, &mut nonces, &mut audit)
                     .expect_err("role mismatch")
             ),
@@ -1200,7 +1344,7 @@ mod tests {
         protocol_proof.protocol_version = 3;
         assert_eq!(
             rejected(
-                session
+                &session
                     .verify_proof(&protocol_proof, policy, &clock, &mut nonces, &mut audit)
                     .expect_err("attempts exhausted")
             ),
@@ -1236,7 +1380,7 @@ mod tests {
             );
             assert_eq!(
                 rejected(
-                    session
+                    &session
                         .verify_proof(&proof, policy, &clock, &mut nonces, &mut audit)
                         .expect_err("timestamp rejected")
                 ),
@@ -1264,7 +1408,7 @@ mod tests {
         });
         assert_eq!(
             rejected(
-                session
+                &session
                     .verify_proof(&proof, policy, &expired_clock, &mut nonces, &mut audit)
                     .expect_err("expired")
             ),
@@ -1298,7 +1442,7 @@ mod tests {
         });
         assert_eq!(
             rejected(
-                session
+                &session
                     .request_approval(&expired_clock, &mut audit)
                     .expect_err("verified proof expires")
             ),
@@ -1328,7 +1472,7 @@ mod tests {
             .expect("awaiting");
         assert_eq!(
             rejected(
-                session
+                &session
                     .approve(&expired_clock, &mut audit)
                     .expect_err("pending approval expires")
             ),
@@ -1341,7 +1485,7 @@ mod tests {
     fn denial_and_illegal_transitions_are_explicit() {
         let (identity, mut session, policy, clock, mut nonces, mut audit) = fixture();
         assert_eq!(
-            rejected(session.approve(&clock, &mut audit).expect_err("illegal")),
+            rejected(&session.approve(&clock, &mut audit).expect_err("illegal")),
             PairingRejection::IllegalTransition
         );
         issue(

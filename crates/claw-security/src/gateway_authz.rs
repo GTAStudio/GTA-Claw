@@ -56,6 +56,14 @@ impl MethodRequirement {
     /// This reads the classification alone and never applies the
     /// [`DUAL_PLANE_METHOD`] exception; use [`method_requirement`] for a whole
     /// row. An unrecognised classification is rejected rather than normalised.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::UnknownScope`] when `classification` is neither
+    /// [`NODE_PLANE_CLASSIFICATION`], [`DYNAMIC_CLASSIFICATION`], nor one of the
+    /// six frozen operator scopes in [`Scope::ALL`]. A corrupt or newly added
+    /// classification therefore fails closed instead of resolving to some
+    /// weaker requirement.
     pub fn parse(classification: &str) -> Result<Self, RegistryError> {
         match classification {
             NODE_PLANE_CLASSIFICATION => Ok(Self::NodePlane),
@@ -75,6 +83,13 @@ impl MethodRequirement {
 ///
 /// The classification is parsed first, so a corrupt classification is rejected
 /// even for the dual-plane method.
+///
+/// # Errors
+///
+/// Returns [`RegistryError::UnknownScope`] when `classification` is not one the
+/// closed registry recognises, exactly as [`MethodRequirement::parse`] does.
+/// This is checked before the [`DUAL_PLANE_METHOD`] exception, so naming the
+/// dual-plane method cannot rescue an unreadable row.
 pub fn method_requirement(
     method: &str,
     classification: &str,
@@ -116,6 +131,12 @@ impl Principal {
 /// The set is closed: a single unrecognised member rejects the whole list
 /// rather than being dropped, so an unknown scope can never be silently
 /// tolerated alongside recognised ones.
+///
+/// # Errors
+///
+/// Returns [`RegistryError::UnknownScope`] for the first value outside
+/// [`Scope::ALL`], in iteration order. Recognised members parsed before it are
+/// discarded with it: the caller receives no partially accepted scope set.
 pub fn parse_granted_scopes<'a>(
     values: impl IntoIterator<Item = &'a str>,
 ) -> Result<ScopeSet, RegistryError> {
@@ -127,6 +148,14 @@ pub fn parse_granted_scopes<'a>(
 }
 
 /// Parses an untrusted handshake identity through both closed registries.
+///
+/// # Errors
+///
+/// - [`RegistryError::UnknownRole`] when `role` is not `operator`, `node`, or
+///   `worker`. The role is parsed first, so a handshake that is wrong about
+///   both role and scopes reports the role.
+/// - [`RegistryError::UnknownScope`] when any member of `granted_scopes` is
+///   outside [`Scope::ALL`], as described on [`parse_granted_scopes`].
 pub fn parse_principal<'a>(
     role: &str,
     granted_scopes: impl IntoIterator<Item = &'a str>,
@@ -136,6 +165,13 @@ pub fn parse_principal<'a>(
 }
 
 /// Rejects a handshake that pairs a non-operator role with operator scopes.
+///
+/// # Errors
+///
+/// Returns [`RoleScopeError::OperatorScopesRequireOperatorRole`] when the
+/// principal's role is [`Role::Node`] or [`Role::Worker`] and its granted set
+/// is not empty.
+#[must_use = "an ignored principal check silently admits an over-scoped handshake"]
 pub fn validate_principal(principal: Principal) -> Result<(), RoleScopeError> {
     crate::authorization::validate_role_scopes(principal.role, principal.granted_scopes)
 }
@@ -228,6 +264,21 @@ impl Error for MethodDenial {}
 /// `dynamic_resolution` is consulted only by
 /// [`MethodRequirement::DynamicOperatorScope`] and is never defaulted: a
 /// missing resolution denies, and so does an empty one.
+///
+/// # Errors
+///
+/// - [`MethodDenial::WorkerNotAdmitted`] when the principal holds
+///   [`Role::Worker`], whatever the method or its scopes.
+/// - [`MethodDenial::RoleMismatch`] when a node-plane method is called by a
+///   non-node, or an operator-plane method by a non-operator. The role gate
+///   runs before the scope gate, so an over-scoped node is still refused here.
+/// - [`MethodDenial::ScopeNotGranted`] when no granted scope satisfies the
+///   required one under the rules in [`satisfying_scope`]. For a dynamic
+///   method this names the first unsatisfied scope in frozen ordinal order.
+/// - [`MethodDenial::UnresolvedDynamicScope`] when the method's scope is
+///   resolved at runtime but `dynamic_resolution` is [`None`].
+/// - [`MethodDenial::EmptyDynamicScope`] when the runtime resolution is present
+///   but empty; an empty requirement is a denial, never a free pass.
 pub fn authorize_method(
     principal: Principal,
     requirement: MethodRequirement,
@@ -252,13 +303,12 @@ pub fn authorize_method(
             })
         }
         MethodRequirement::OperatorScope(required) => {
-            match satisfying_scope(principal.granted_scopes, required) {
-                Some(satisfied_by) => Ok(MethodGrant::OperatorScope {
+            satisfying_scope(principal.granted_scopes, required)
+                .map(|satisfied_by| MethodGrant::OperatorScope {
                     required,
                     satisfied_by,
-                }),
-                None => Err(MethodDenial::ScopeNotGranted { required }),
-            }
+                })
+                .ok_or(MethodDenial::ScopeNotGranted { required })
         }
         MethodRequirement::DynamicOperatorScope => {
             let resolved = dynamic_resolution.ok_or(MethodDenial::UnresolvedDynamicScope)?;
@@ -280,6 +330,15 @@ pub fn authorize_method(
 /// Resolution of the row and authorization of the caller fail closed
 /// independently: an unrecognised classification is a [`RegistryError`], not a
 /// denial that a caller could mistake for a scope problem.
+///
+/// # Errors
+///
+/// The outer [`Err`] is a [`RegistryError::UnknownScope`] from
+/// [`method_requirement`]: the row itself could not be read, so no decision was
+/// made about the caller at all. The inner [`Err`] is a [`MethodDenial`] from
+/// [`authorize_method`], which describes the caller. Callers must not collapse
+/// the two — an unreadable row is an inventory defect, not an under-scoped
+/// principal.
 pub fn authorize_inventory_method(
     principal: Principal,
     method: &str,

@@ -320,16 +320,15 @@ fn oracle(
         return Ok(MethodGrant::DynamicOperatorScopes);
     }
     let required = oracle_scope(classification);
-    match oracle_satisfier(granted, required) {
-        Some(satisfied_by) => Ok(MethodGrant::OperatorScope {
+    oracle_satisfier(granted, required)
+        .map(|satisfied_by| MethodGrant::OperatorScope {
             required,
             satisfied_by,
-        }),
-        None => Err(MethodDenial::ScopeNotGranted { required }),
-    }
+        })
+        .ok_or(MethodDenial::ScopeNotGranted { required })
 }
 
-fn denial_label(denial: MethodDenial) -> &'static str {
+const fn denial_label(denial: MethodDenial) -> &'static str {
     match denial {
         MethodDenial::WorkerNotAdmitted => "worker-not-admitted",
         MethodDenial::RoleMismatch { .. } => "role-mismatch",

@@ -94,6 +94,15 @@ pub trait AuditSink {
     type Error: Error + Send + Sync + 'static;
 
     /// Persists exactly one event or fails the protected operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the event was not durably committed — for
+    /// example an unreachable or full audit store, a rejected record, or a
+    /// write that could not be flushed. Implementations must not report success
+    /// for a buffered or queued write: every caller in this crate treats the
+    /// error as fatal to the protected transition, so a returned `Ok` is the
+    /// claim that the decision is already on durable storage.
     fn persist(&mut self, event: &AuditEvent) -> Result<(), Self::Error>;
 }
 
