@@ -22,7 +22,9 @@ use claw_provider_sdk::model::{
     ToolCall, ToolChoice, Usage,
 };
 use claw_provider_sdk::origin::{BoundApiKey, Origin, OriginApproval, OriginError};
-use claw_provider_sdk::provider::{BoxFuture, Provider, RequestContext};
+use claw_provider_sdk::provider::{
+    BoxFuture, Provider, ProviderPhase, ProviderStatus, RequestContext,
+};
 use claw_provider_sdk::secret::ApiKey;
 use claw_provider_sdk::sse::{SseDecoder, SseEvent};
 use claw_provider_sdk::stream::{CompletionStream, StreamEvent, ToolCallAssembler};
@@ -407,6 +409,21 @@ impl OpenAiCompatible {
             "this provider does not advertise the requested capability",
         ))
     }
+
+    async fn probe(
+        &self,
+        operation: Operation,
+        phase: ProviderPhase,
+        context: &RequestContext,
+    ) -> Result<ProviderStatus, ProviderError> {
+        let url = self.endpoint("models")?;
+        self.runtime
+            .execute(operation, context.cancel(), || {
+                self.request(Method::Get, url.clone())
+            })
+            .await?;
+        Ok(ProviderStatus::new(self.id.clone(), phase))
+    }
 }
 
 impl Provider for OpenAiCompatible {
@@ -416,6 +433,20 @@ impl Provider for OpenAiCompatible {
 
     fn capabilities(&self) -> CapabilitySet {
         self.capabilities
+    }
+
+    fn startup<'a>(
+        &'a self,
+        context: &'a RequestContext,
+    ) -> BoxFuture<'a, Result<ProviderStatus, ProviderError>> {
+        Box::pin(self.probe(Operation::Startup, ProviderPhase::Started, context))
+    }
+
+    fn ping<'a>(
+        &'a self,
+        context: &'a RequestContext,
+    ) -> BoxFuture<'a, Result<ProviderStatus, ProviderError>> {
+        Box::pin(self.probe(Operation::Ping, ProviderPhase::Reachable, context))
     }
 
     fn complete<'a>(
@@ -428,15 +459,18 @@ impl Provider for OpenAiCompatible {
             validate(self.id.as_str(), request, Operation::Complete)?;
             let url = self.endpoint("chat/completions")?;
             let body = encode_completion(request, false, false)?;
-            let response = self
-                .runtime
-                .execute(Operation::Complete, context.cancel(), || {
-                    Ok(self
-                        .request(Method::Post, url.clone())?
-                        .body(Body::Json(body.clone())))
-                })
-                .await?;
-            decode_completion(self.id.as_str(), response.body())
+            self.runtime
+                .execute_decoded(
+                    Operation::Complete,
+                    context.cancel(),
+                    || {
+                        Ok(self
+                            .request(Method::Post, url.clone())?
+                            .body(Body::Json(body.clone())))
+                    },
+                    |response| decode_completion(self.id.as_str(), response.body()),
+                )
+                .await
         })
     }
 
@@ -451,7 +485,8 @@ impl Provider for OpenAiCompatible {
             let url = self.endpoint("chat/completions")?;
             let body = encode_completion(request, true, self.stream_usage)?;
             let cancel = context.cancel().clone();
-            let stream = self
+            let provider = self.id.as_str().to_owned();
+            let events = self
                 .runtime
                 .execute_streaming(Operation::StreamCompletion, &cancel, || {
                     Ok(self
@@ -459,12 +494,9 @@ impl Provider for OpenAiCompatible {
                         .replace_header("accept", "text/event-stream")
                         .body(Body::Json(body.clone())))
                 })
-                .await?;
-            Ok(CompletionStream::new(
-                self.id.as_str(),
-                cancel,
-                event_stream(self.id.as_str().to_owned(), stream.into_chunks()),
-            ))
+                .await?
+                .decode(move |chunks| event_stream(provider, chunks));
+            Ok(CompletionStream::new(self.id.as_str(), cancel, events))
         })
     }
 
@@ -485,15 +517,18 @@ impl Provider for OpenAiCompatible {
             })?;
             let url = self.endpoint("embeddings")?;
             let body = encode_embeddings(request)?;
-            let response = self
-                .runtime
-                .execute(Operation::Embed, context.cancel(), || {
-                    Ok(self
-                        .request(Method::Post, url.clone())?
-                        .body(Body::Json(body.clone())))
-                })
-                .await?;
-            decode_embeddings(self.id.as_str(), response.body())
+            self.runtime
+                .execute_decoded(
+                    Operation::Embed,
+                    context.cancel(),
+                    || {
+                        Ok(self
+                            .request(Method::Post, url.clone())?
+                            .body(Body::Json(body.clone())))
+                    },
+                    |response| decode_embeddings(self.id.as_str(), response.body()),
+                )
+                .await
         })
     }
 
@@ -504,13 +539,14 @@ impl Provider for OpenAiCompatible {
         Box::pin(async move {
             self.check_capability(Capability::ModelListing, Operation::ListModels)?;
             let url = self.endpoint("models")?;
-            let response = self
-                .runtime
-                .execute(Operation::ListModels, context.cancel(), || {
-                    self.request(Method::Get, url.clone())
-                })
-                .await?;
-            decode_models(self.id.as_str(), response.body())
+            self.runtime
+                .execute_decoded(
+                    Operation::ListModels,
+                    context.cancel(),
+                    || self.request(Method::Get, url.clone()),
+                    |response| decode_models(self.id.as_str(), response.body()),
+                )
+                .await
         })
     }
 }
@@ -1342,7 +1378,7 @@ struct StreamState {
     exhausted: bool,
 }
 
-fn event_stream(provider: String, chunks: ChunkStream) -> EventStream {
+pub(crate) fn event_stream(provider: String, chunks: ChunkStream) -> EventStream {
     let state = StreamState {
         chunks,
         sse: SseDecoder::new(),

@@ -290,6 +290,65 @@ impl StatePort for MemoryState {
     }
 }
 
+/// A state adapter that parks session loads until a test opens its gate.
+pub(crate) struct GatedLoadState {
+    inner: Arc<MemoryState>,
+    gate: Arc<Gate>,
+    loads: AtomicUsize,
+}
+
+impl GatedLoadState {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryState::new(),
+            gate: Gate::new(),
+            loads: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn load_count(&self) -> usize {
+        self.loads.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn open(&self) {
+        self.gate.open();
+    }
+}
+
+impl StatePort for GatedLoadState {
+    fn load_session(
+        &self,
+        session_id: &SessionId,
+    ) -> PortFuture<'_, Result<Option<SessionSnapshot>, PortError>> {
+        let session_id = session_id.clone();
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            self.gate.wait().await;
+            self.inner.load_session(&session_id).await
+        })
+    }
+
+    fn save_session(&self, snapshot: SessionSnapshot) -> PortFuture<'_, Result<u64, PortError>> {
+        self.inner.save_session(snapshot)
+    }
+
+    fn save_turn(&self, record: TurnRecord) -> PortFuture<'_, Result<(), PortError>> {
+        self.inner.save_turn(record)
+    }
+
+    fn load_turn(
+        &self,
+        session_id: &SessionId,
+        turn: TurnId,
+    ) -> PortFuture<'_, Result<Option<TurnRecord>, PortError>> {
+        self.inner.load_turn(session_id, turn)
+    }
+
+    fn list_sessions(&self) -> PortFuture<'_, Result<Vec<SessionSnapshot>, PortError>> {
+        self.inner.list_sessions()
+    }
+}
+
 /// An in-memory [`GoalStorePort`] that preserves insertion order.
 #[derive(Default)]
 pub(crate) struct MemoryGoals {
@@ -718,6 +777,60 @@ impl ContextEnginePort for SimpleContext {
         };
         drop(data);
         Box::pin(async move { Ok(report) })
+    }
+}
+
+/// A context engine whose bootstrap never resolves.
+pub(crate) struct HangingBootstrapContext {
+    delegate: Arc<SimpleContext>,
+    entered: AtomicUsize,
+}
+
+impl HangingBootstrapContext {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            delegate: SimpleContext::new(),
+            entered: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn entered(&self) -> usize {
+        self.entered.load(Ordering::SeqCst)
+    }
+}
+
+impl ContextEnginePort for HangingBootstrapContext {
+    fn bootstrap(
+        &self,
+        _request: ContextBootstrap,
+    ) -> PortFuture<'_, Result<ContextState, PortError>> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::pending())
+    }
+
+    fn ingest(&self, request: ContextIngest) -> PortFuture<'_, Result<ContextState, PortError>> {
+        self.delegate.ingest(request)
+    }
+
+    fn assemble(
+        &self,
+        request: ContextAssembly,
+    ) -> PortFuture<'_, Result<AssembledContext, PortError>> {
+        self.delegate.assemble(request)
+    }
+
+    fn maintain(
+        &self,
+        request: ContextMaintenance,
+    ) -> PortFuture<'_, Result<ContextState, PortError>> {
+        self.delegate.maintain(request)
+    }
+
+    fn compact(
+        &self,
+        request: ContextCompaction,
+    ) -> PortFuture<'_, Result<CompactionReport, PortError>> {
+        self.delegate.compact(request)
     }
 }
 

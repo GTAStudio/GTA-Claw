@@ -88,6 +88,91 @@ pub enum ErrorKind {
     Unsupported,
 }
 
+/// Stable user-facing classification of a provider failure.
+///
+/// [`ErrorKind`] is intentionally detailed enough for reliability policy. This
+/// coarser classification is safe to render directly in a client without
+/// exposing an upstream response body or credential-bearing diagnostic.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FailureClass {
+    /// The credential is absent, expired, or rejected.
+    Authentication,
+    /// The provider asked the caller to reduce request rate.
+    RateLimited,
+    /// The account has exhausted a billing or usage quota.
+    Quota,
+    /// The provider cannot currently serve the request.
+    Unavailable,
+    /// The provider returned bytes that violate its protocol.
+    InvalidResponse,
+    /// The caller must change the request before trying again.
+    InvalidRequest,
+    /// The caller or host stopped the operation.
+    Cancelled,
+    /// The selected provider does not implement the operation.
+    Unsupported,
+}
+
+impl FailureClass {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 8] = [
+        Self::Authentication,
+        Self::RateLimited,
+        Self::Quota,
+        Self::Unavailable,
+        Self::InvalidResponse,
+        Self::InvalidRequest,
+        Self::Cancelled,
+        Self::Unsupported,
+    ];
+
+    /// Returns the stable wire-safe identifier of this classification.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::RateLimited => "rate_limited",
+            Self::Quota => "quota",
+            Self::Unavailable => "unavailable",
+            Self::InvalidResponse => "invalid_response",
+            Self::InvalidRequest => "invalid_request",
+            Self::Cancelled => "cancelled",
+            Self::Unsupported => "unsupported",
+        }
+    }
+
+    /// Returns a secret-free message suitable for an end user.
+    #[must_use]
+    pub const fn user_message(self) -> &'static str {
+        match self {
+            Self::Authentication => {
+                "Provider authentication failed. Sign in again or update the credential."
+            }
+            Self::RateLimited => {
+                "The provider is rate limiting requests. Retry after the indicated delay."
+            }
+            Self::Quota => {
+                "The provider account has no remaining quota. Check its plan or billing."
+            }
+            Self::Unavailable => "The provider is temporarily unavailable. Try again shortly.",
+            Self::InvalidResponse => {
+                "The provider returned an invalid response. Try another model or provider."
+            }
+            Self::InvalidRequest => {
+                "The provider rejected this request. Check the model and request options."
+            }
+            Self::Cancelled => "The provider request was cancelled.",
+            Self::Unsupported => "The selected provider does not support this operation.",
+        }
+    }
+}
+
+impl Display for FailureClass {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 impl ErrorKind {
     /// Every variant, in declaration order.
     pub const ALL: [Self; 11] = [
@@ -147,6 +232,23 @@ impl ErrorKind {
             Self::Transport | Self::Server | Self::Timeout | Self::Protocol
         )
     }
+
+    /// Returns the stable classification a user interface should present.
+    #[must_use]
+    pub const fn failure_class(self) -> FailureClass {
+        match self {
+            Self::Authentication => FailureClass::Authentication,
+            Self::RateLimit => FailureClass::RateLimited,
+            Self::Quota => FailureClass::Quota,
+            Self::Transport | Self::Server | Self::Timeout | Self::CircuitOpen => {
+                FailureClass::Unavailable
+            }
+            Self::Protocol => FailureClass::InvalidResponse,
+            Self::InvalidRequest => FailureClass::InvalidRequest,
+            Self::Cancelled => FailureClass::Cancelled,
+            Self::Unsupported => FailureClass::Unsupported,
+        }
+    }
 }
 
 impl Display for ErrorKind {
@@ -158,6 +260,10 @@ impl Display for ErrorKind {
 /// Provider operation that produced a failure.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Operation {
+    /// Provider construction, credential warm-up, and initial readiness probe.
+    Startup,
+    /// Lightweight provider reachability and credential probe.
+    Ping,
     /// Non-streaming chat completion.
     Complete,
     /// Streaming chat completion.
@@ -177,6 +283,8 @@ impl Operation {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Startup => "startup",
+            Self::Ping => "ping",
             Self::Complete => "complete",
             Self::StreamCompletion => "stream_completion",
             Self::Embed => "embed",
@@ -296,6 +404,18 @@ impl ProviderError {
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         self.kind.is_retryable()
+    }
+
+    /// Returns the stable classification a user interface should present.
+    #[must_use]
+    pub const fn failure_class(&self) -> FailureClass {
+        self.kind.failure_class()
+    }
+
+    /// Returns a secret-free message suitable for an end user.
+    #[must_use]
+    pub const fn user_message(&self) -> &'static str {
+        self.failure_class().user_message()
     }
 
     /// Classifies an HTTP status code into the error taxonomy.
@@ -510,6 +630,59 @@ mod tests {
                 ErrorKind::Timeout,
             ]
         );
+    }
+
+    #[test]
+    fn user_facing_classification_is_exhaustive_stable_and_secret_free() {
+        let classes = ErrorKind::ALL
+            .into_iter()
+            .map(ErrorKind::failure_class)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            classes,
+            vec![
+                FailureClass::Authentication,
+                FailureClass::RateLimited,
+                FailureClass::Quota,
+                FailureClass::Unavailable,
+                FailureClass::InvalidResponse,
+                FailureClass::Unavailable,
+                FailureClass::InvalidRequest,
+                FailureClass::Cancelled,
+                FailureClass::Unavailable,
+                FailureClass::Unavailable,
+                FailureClass::Unsupported,
+            ]
+        );
+
+        let mut identifiers = Vec::new();
+        for class in FailureClass::ALL {
+            assert!(!class.user_message().is_empty());
+            assert!(
+                class
+                    .as_str()
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            );
+            assert!(!identifiers.contains(&class.as_str()));
+            identifiers.push(class.as_str());
+        }
+
+        let error = ProviderError::new(
+            ErrorKind::Authentication,
+            "github-copilot",
+            Operation::Startup,
+            "rejected secret-token-value",
+        );
+        assert_eq!(error.failure_class(), FailureClass::Authentication);
+        assert!(!error.user_message().contains("secret-token-value"));
+    }
+
+    #[test]
+    fn lifecycle_operation_identifiers_are_distinct() {
+        assert_eq!(Operation::Startup.as_str(), "startup");
+        assert_eq!(Operation::Ping.as_str(), "ping");
+        assert_ne!(Operation::Startup, Operation::Ping);
     }
 
     #[test]

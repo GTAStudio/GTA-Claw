@@ -6,17 +6,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use claw_application::model::session::SessionState;
+use claw_application::ports::PortError;
 use claw_application::ports::context::ContextItem;
 use claw_application::ports::provider::{PromptMessage, ProviderChunk};
 use claw_application::ports::tool::ToolStatus;
-use claw_runtime::command::TurnOptions;
-use claw_runtime::runtime::{Runtime, RuntimeConfig, RuntimeEventKind, RuntimePorts};
+use claw_runtime::approval::ApprovalError;
+use claw_runtime::command::{CommandEffect, TurnOptions};
+use claw_runtime::runtime::{
+    Runtime, RuntimeConfig, RuntimeError, RuntimeEventKind, RuntimeFailureClass, RuntimePorts,
+};
 use claw_runtime::stream::StreamPayload;
 
 use support::{
-    FakeClock, MemoryGoals, MemoryState, RecordingApprovals, RecordingTools, Round,
-    ScriptedProvider, SimpleContext, ToolBehaviour, guarded_tool, readonly_tool, session,
-    text_round, tool_round,
+    FakeClock, GatedLoadState, HangingBootstrapContext, MemoryGoals, MemoryState,
+    RecordingApprovals, RecordingTools, Round, ScriptedProvider, SimpleContext, ToolBehaviour,
+    guarded_tool, readonly_tool, session, text_round, tool_round,
 };
 
 struct Harness {
@@ -516,4 +520,383 @@ async fn the_clock_port_supplies_every_persisted_timestamp() {
     );
 
     harness.runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn session_capacity_evicts_the_least_recently_touched_idle_conversation() {
+    let harness = harness(
+        vec![text_round("a"), text_round("b"), text_round("c")],
+        RuntimeConfig {
+            session_capacity: 2,
+            ..RuntimeConfig::default()
+        },
+    );
+    let a = session("lru-a");
+    let b = session("lru-b");
+    let c = session("lru-c");
+
+    harness
+        .runtime
+        .submit(&a, "a")
+        .await
+        .expect("a")
+        .join()
+        .await
+        .expect("a completes");
+    harness.clock.advance(Duration::from_millis(1));
+    harness
+        .runtime
+        .submit(&b, "b")
+        .await
+        .expect("b")
+        .join()
+        .await
+        .expect("b completes");
+    harness
+        .runtime
+        .execute_effect(&b, CommandEffect::SetModel("model-b".to_owned()))
+        .await
+        .expect("model selection");
+
+    harness.clock.advance(Duration::from_millis(1));
+    assert_eq!(harness.runtime.selected_model(&a), None);
+    harness.clock.advance(Duration::from_millis(1));
+    harness
+        .runtime
+        .submit(&c, "c")
+        .await
+        .expect("c")
+        .join()
+        .await
+        .expect("c completes");
+
+    assert_eq!(harness.runtime.managed_session_ids(), vec![a, c]);
+    assert_eq!(
+        harness.runtime.selected_model(&b),
+        None,
+        "eviction terminally drops session-scoped model state"
+    );
+    harness.runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn idle_ttl_is_strict_and_cleanup_uses_the_fake_clock() {
+    let harness = harness(
+        vec![text_round("done")],
+        RuntimeConfig {
+            session_idle_ttl: Duration::from_secs(10),
+            ..RuntimeConfig::default()
+        },
+    );
+    let session_id = session("ttl-strict");
+    harness
+        .runtime
+        .submit(&session_id, "run")
+        .await
+        .expect("turn")
+        .join()
+        .await
+        .expect("turn completes");
+    harness
+        .runtime
+        .execute_effect(&session_id, CommandEffect::SetModel("temporary".to_owned()))
+        .await
+        .expect("model selection");
+
+    harness.clock.advance(Duration::from_secs(10));
+    assert_eq!(
+        harness.runtime.sweep_sessions(),
+        Vec::new(),
+        "the legacy TTL is strictly greater than the idle duration"
+    );
+    assert_eq!(
+        harness.runtime.managed_session_ids(),
+        vec![session_id.clone()]
+    );
+
+    harness.clock.advance(Duration::from_millis(1));
+    assert_eq!(harness.runtime.sweep_sessions(), vec![session_id.clone()]);
+    assert_eq!(harness.runtime.selected_model(&session_id), None);
+    assert_eq!(harness.runtime.managed_session_ids(), Vec::new());
+    harness.runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn capacity_never_evicts_an_active_conversation() {
+    let harness = harness(
+        vec![Round::stalling(vec![ProviderChunk::TextDelta {
+            text: "busy".to_owned(),
+        }])],
+        RuntimeConfig {
+            session_capacity: 1,
+            ..RuntimeConfig::default()
+        },
+    );
+    let active = harness
+        .runtime
+        .submit(&session("capacity-active"), "run")
+        .await
+        .expect("first conversation is admitted");
+    let error = harness
+        .runtime
+        .submit(&session("capacity-other"), "run")
+        .await
+        .expect_err("active ownership is pinned");
+    assert_eq!(error, RuntimeError::SessionCapacityReached { capacity: 1 });
+
+    active.cancel();
+    assert_eq!(
+        active.join().await.expect("cancelled outcome").state,
+        SessionState::Cancelled
+    );
+    harness.runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn terminal_destruction_cancels_and_joins_the_owned_turn() {
+    let harness = harness(
+        vec![Round::stalling(vec![ProviderChunk::TextDelta {
+            text: "partial".to_owned(),
+        }])],
+        RuntimeConfig::default(),
+    );
+    let session_id = session("destroy-active");
+    harness
+        .runtime
+        .execute_effect(&session_id, CommandEffect::SetModel("temporary".to_owned()))
+        .await
+        .expect("model selection");
+    let handle = harness
+        .runtime
+        .submit(&session_id, "run")
+        .await
+        .expect("turn");
+    support::eventually("the provider stream to start", || {
+        !harness.provider.requests().is_empty()
+    })
+    .await;
+
+    assert!(harness.runtime.destroy_session(&session_id).await);
+    assert_eq!(
+        handle.join().await.expect("terminal outcome").state,
+        SessionState::Cancelled
+    );
+    assert_eq!(harness.runtime.managed_session_ids(), Vec::new());
+    assert_eq!(harness.runtime.selected_model(&session_id), None);
+    assert!(!harness.runtime.destroy_session(&session_id).await);
+    harness.runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn reload_fences_old_sessions_and_new_turns_use_fresh_scope() {
+    let harness = harness(
+        vec![
+            Round::stalling(vec![ProviderChunk::TextDelta {
+                text: "old".to_owned(),
+            }]),
+            text_round("new"),
+        ],
+        RuntimeConfig::default(),
+    );
+    let session_id = session("reload-fence");
+    harness
+        .runtime
+        .execute_effect(&session_id, CommandEffect::SetModel("old-model".to_owned()))
+        .await
+        .expect("old model");
+    let old = harness
+        .runtime
+        .submit(&session_id, "old")
+        .await
+        .expect("old turn");
+    support::eventually("the old provider request", || {
+        !harness.provider.requests().is_empty()
+    })
+    .await;
+
+    let report = harness.runtime.reload_sessions().await;
+    assert_eq!(report.generation, 1);
+    assert_eq!(report.destroyed, 1);
+    assert_eq!(report.cancelled_turns, 1);
+    assert_eq!(report.forced_turns, 0);
+    assert_eq!(
+        old.join().await.expect("old turn reports").state,
+        SessionState::Cancelled
+    );
+    assert_eq!(harness.runtime.managed_session_ids(), Vec::new());
+
+    let fresh = harness
+        .runtime
+        .submit(&session_id, "new")
+        .await
+        .expect("fresh turn")
+        .join()
+        .await
+        .expect("fresh turn completes");
+    assert_eq!(fresh.message.expect("message").text, "new");
+    let requests = harness.provider.requests();
+    assert_eq!(requests[0].model.as_deref(), Some("old-model"));
+    assert_eq!(requests[1].model, None);
+    harness.runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn destruction_fences_a_session_creation_parked_in_state_io() {
+    let clock = FakeClock::new(0);
+    let state = GatedLoadState::new();
+    let provider = ScriptedProvider::new(vec![text_round("must not run")]);
+    let runtime = Runtime::new(
+        RuntimePorts {
+            clock: Arc::clone(&clock) as Arc<_>,
+            provider: provider as Arc<_>,
+            state: Arc::clone(&state) as Arc<_>,
+            tools: RecordingTools::new(Vec::new(), Vec::new()) as Arc<_>,
+            approvals: RecordingApprovals::new() as Arc<_>,
+            goals: MemoryGoals::new() as Arc<_>,
+            context: SimpleContext::new() as Arc<_>,
+        },
+        RuntimeConfig::default(),
+    );
+    let session_id = session("destroy-create-race");
+    let submitting = tokio::spawn({
+        let runtime = runtime.clone();
+        let session_id = session_id.clone();
+        async move { runtime.submit(&session_id, "race").await }
+    });
+    support::eventually("the state load to park", || state.load_count() == 1).await;
+
+    assert!(
+        !runtime.destroy_session(&session_id).await,
+        "no session had been published yet"
+    );
+    state.open();
+    let error = submitting
+        .await
+        .expect("submit task joins")
+        .expect_err("pre-destruction creation is fenced");
+    assert_eq!(
+        error,
+        RuntimeError::ReloadFenced {
+            expected: 0,
+            current: 1,
+        }
+    );
+    assert_eq!(runtime.managed_session_ids(), Vec::new());
+    runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn destruction_aborts_a_turn_that_ignores_cancellation() {
+    let context = HangingBootstrapContext::new();
+    let runtime = Runtime::new(
+        RuntimePorts {
+            clock: FakeClock::new(0) as Arc<_>,
+            provider: ScriptedProvider::new(Vec::new()) as Arc<_>,
+            state: MemoryState::new() as Arc<_>,
+            tools: RecordingTools::new(Vec::new(), Vec::new()) as Arc<_>,
+            approvals: RecordingApprovals::new() as Arc<_>,
+            goals: MemoryGoals::new() as Arc<_>,
+            context: Arc::clone(&context) as Arc<_>,
+        },
+        RuntimeConfig {
+            session_retire_timeout: Duration::from_millis(20),
+            ..RuntimeConfig::default()
+        },
+    );
+    let session_id = session("destroy-forced");
+    let handle = runtime
+        .submit(&session_id, "hang")
+        .await
+        .expect("turn starts");
+    support::eventually("context bootstrap to hang", || context.entered() == 1).await;
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), runtime.destroy_session(&session_id))
+            .await
+            .expect("terminal destruction is bounded")
+    );
+    assert_eq!(
+        handle.join().await.expect_err("aborted task"),
+        RuntimeError::Abandoned
+    );
+    assert_eq!(runtime.managed_session_ids(), Vec::new());
+    runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn dropping_destruction_still_aborts_the_retiring_turn() {
+    let context = HangingBootstrapContext::new();
+    let runtime = Runtime::new(
+        RuntimePorts {
+            clock: FakeClock::new(0) as Arc<_>,
+            provider: ScriptedProvider::new(Vec::new()) as Arc<_>,
+            state: MemoryState::new() as Arc<_>,
+            tools: RecordingTools::new(Vec::new(), Vec::new()) as Arc<_>,
+            approvals: RecordingApprovals::new() as Arc<_>,
+            goals: MemoryGoals::new() as Arc<_>,
+            context: Arc::clone(&context) as Arc<_>,
+        },
+        RuntimeConfig {
+            session_retire_timeout: Duration::from_secs(10),
+            ..RuntimeConfig::default()
+        },
+    );
+    let session_id = session("destroy-dropped");
+    let handle = runtime
+        .submit(&session_id, "hang")
+        .await
+        .expect("turn starts");
+    support::eventually("context bootstrap to hang", || context.entered() == 1).await;
+
+    let destroying = tokio::spawn({
+        let runtime = runtime.clone();
+        let session_id = session_id.clone();
+        async move { runtime.destroy_session(&session_id).await }
+    });
+    support::eventually("retirement generation to advance", || {
+        runtime.session_generation() == 1
+    })
+    .await;
+    destroying.abort();
+    assert!(
+        destroying
+            .await
+            .expect_err("destruction future was dropped")
+            .is_cancelled()
+    );
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("RAII abort finishes the turn")
+            .expect_err("aborted task"),
+        RuntimeError::Abandoned
+    );
+    assert_eq!(runtime.managed_session_ids(), Vec::new());
+    runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[test]
+fn runtime_failures_have_stable_user_facing_classification() {
+    let error = RuntimeError::ReloadFenced {
+        expected: 2,
+        current: 3,
+    };
+    assert_eq!(error.failure_class(), RuntimeFailureClass::Busy);
+    assert!(error.is_retryable());
+    assert_eq!(
+        error.user_message(),
+        "This conversation is busy. Retry after the current work finishes."
+    );
+    assert!(!error.user_message().contains('2'));
+
+    let unavailable = RuntimeError::Approval(ApprovalError::Port(PortError::Unavailable(
+        "adapter-secret-detail".to_owned(),
+    )));
+    assert_eq!(
+        unavailable.failure_class(),
+        RuntimeFailureClass::Unavailable
+    );
+    assert!(unavailable.is_retryable());
+    assert!(!unavailable.user_message().contains("adapter-secret-detail"));
 }

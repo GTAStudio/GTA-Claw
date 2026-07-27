@@ -139,6 +139,7 @@ pub struct HttpRequest {
     headers: Vec<Header>,
     body: Body,
     timeout: Option<Duration>,
+    stream_idle_timeout: Option<Duration>,
 }
 
 /// A header and whether its value is credential material.
@@ -163,6 +164,7 @@ impl Debug for HttpRequest {
             .field("headers", &headers)
             .field("body_bytes", &self.body.as_bytes().len())
             .field("timeout", &self.timeout)
+            .field("stream_idle_timeout", &self.stream_idle_timeout)
             .finish()
     }
 }
@@ -177,6 +179,7 @@ impl HttpRequest {
             headers: Vec::new(),
             body: Body::Empty,
             timeout: None,
+            stream_idle_timeout: None,
         }
     }
 
@@ -293,6 +296,13 @@ impl HttpRequest {
     #[must_use]
     pub const fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Sets how long a streaming response may remain silent between body chunks.
+    #[must_use]
+    pub const fn stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_idle_timeout = Some(timeout);
         self
     }
 
@@ -551,6 +561,8 @@ pub struct TransportConfig {
     pub user_agent: String,
     /// Deadline for a complete non-streaming exchange.
     pub request_timeout: Duration,
+    /// Maximum silence allowed between chunks of a streaming response.
+    pub stream_idle_timeout: Duration,
     /// Deadline for establishing a connection.
     pub connect_timeout: Duration,
     /// Idle pool timeout for keep-alive connections.
@@ -566,6 +578,7 @@ impl Default for TransportConfig {
         Self {
             user_agent: concat!("gta-claw/", env!("CARGO_PKG_VERSION")).to_owned(),
             request_timeout: Duration::from_mins(2),
+            stream_idle_timeout: Duration::from_mins(2),
             connect_timeout: Duration::from_secs(15),
             pool_idle_timeout: Duration::from_mins(1),
             tls_policy: TlsPolicy::RequireHttps,
@@ -583,6 +596,7 @@ pub struct HttpTransport {
     proxy_rules: Arc<ProxyRules>,
     user_agent: String,
     request_timeout: Duration,
+    stream_idle_timeout: Duration,
 }
 
 /// The hyper `client` is omitted: it holds the connection pool and its own
@@ -596,6 +610,7 @@ impl Debug for HttpTransport {
             .field("proxy_rules", &self.proxy_rules)
             .field("user_agent", &self.user_agent)
             .field("request_timeout", &self.request_timeout)
+            .field("stream_idle_timeout", &self.stream_idle_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -650,6 +665,7 @@ impl HttpTransport {
             proxy_rules,
             user_agent: config.user_agent.clone(),
             request_timeout: config.request_timeout,
+            stream_idle_timeout: config.stream_idle_timeout,
         })
     }
 
@@ -728,16 +744,25 @@ impl HttpTransport {
         request: HttpRequest,
         cancel: &CancelToken,
     ) -> Result<HttpStream, ProviderError> {
-        // A streamed response has no overall deadline: the point of streaming
-        // is that the body arrives over an open-ended window. The headers still
-        // must arrive within one.
+        // A streamed response has no total deadline, but both its handshake and
+        // every silent interval are bounded so a dead upstream cannot retain a
+        // connection forever.
         let deadline = request.timeout.unwrap_or(self.request_timeout);
+        let idle_timeout = request
+            .stream_idle_timeout
+            .unwrap_or(self.stream_idle_timeout);
         let response = self
             .dispatch(provider, operation, &request, deadline, cancel)
             .await?;
         let status = response.status().as_u16();
         let headers = collect_headers(response.headers());
-        let chunks = CancellableChunks::new(response.into_body(), cancel, provider, operation);
+        let chunks = CancellableChunks::new(
+            response.into_body(),
+            cancel,
+            provider,
+            operation,
+            idle_timeout,
+        );
         Ok(HttpStream {
             status,
             headers,
@@ -917,17 +942,27 @@ where
 struct CancellableChunks {
     inner: Incoming,
     cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
+    idle: Pin<Box<tokio::time::Sleep>>,
+    idle_timeout: Duration,
     provider: String,
     operation: Operation,
     done: bool,
 }
 
 impl CancellableChunks {
-    fn new(inner: Incoming, cancel: &CancelToken, provider: &str, operation: Operation) -> Self {
+    fn new(
+        inner: Incoming,
+        cancel: &CancelToken,
+        provider: &str,
+        operation: Operation,
+        idle_timeout: Duration,
+    ) -> Self {
         let token = cancel.clone();
         Self {
             inner,
             cancelled: Box::pin(async move { token.cancelled().await }),
+            idle: Box::pin(tokio::time::sleep(idle_timeout)),
+            idle_timeout,
             provider: provider.to_owned(),
             operation,
             done: false,
@@ -955,6 +990,15 @@ impl Stream for CancellableChunks {
                 "the response body was cancelled",
             ))));
         }
+        if this.idle.as_mut().poll(context).is_ready() {
+            this.done = true;
+            return Poll::Ready(Some(Err(ProviderError::new(
+                ErrorKind::Timeout,
+                &this.provider,
+                this.operation,
+                "the streaming response exceeded its idle deadline",
+            ))));
+        }
         loop {
             return match Pin::new(&mut this.inner).poll_frame(context) {
                 Poll::Pending => Poll::Pending,
@@ -971,7 +1015,12 @@ impl Stream for CancellableChunks {
                     ))))
                 }
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                    Ok(chunk) => Poll::Ready(Some(Ok(chunk))),
+                    Ok(chunk) => {
+                        this.idle
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + this.idle_timeout);
+                        Poll::Ready(Some(Ok(chunk)))
+                    }
                     // Trailers carry no body bytes, so keep polling rather than
                     // ending the stream early on a trailing metadata frame.
                     Err(_) => continue,
@@ -1433,6 +1482,7 @@ mod tests {
         let config = TransportConfig::default();
         assert_eq!(config.tls_policy, TlsPolicy::RequireHttps);
         assert_eq!(config.request_timeout, Duration::from_mins(2));
+        assert_eq!(config.stream_idle_timeout, Duration::from_mins(2));
         assert_eq!(config.connect_timeout, Duration::from_secs(15));
         assert_eq!(config.pool_idle_timeout, Duration::from_mins(1));
         assert!(config.user_agent.starts_with("gta-claw/"));

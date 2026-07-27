@@ -423,6 +423,8 @@ pub enum CommandEffect {
     },
     /// Override the provider model for the session.
     SetModel(String),
+    /// Terminally destroy the in-memory conversation session.
+    DestroySession,
     /// A registry-defined command with no built-in meaning.
     Custom {
         /// The canonical command name.
@@ -590,6 +592,7 @@ impl CommandRegistry {
                 lease_id: required_argument(invocation, 0)?,
             },
             "model" => CommandEffect::SetModel(required_argument(invocation, 0)?),
+            "session-close" => CommandEffect::DestroySession,
             _ => CommandEffect::Custom {
                 name: invocation.name.clone(),
                 arguments: invocation.arguments.clone(),
@@ -699,6 +702,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
         .with_arity(CommandArity::exactly(1)),
         CommandSpec::new("model", "Override the provider model", OperatorScope::Write)
             .with_arity(CommandArity::exactly(1)),
+        CommandSpec::new(
+            "session-close",
+            "Destroy the in-memory conversation session",
+            OperatorScope::Admin,
+        ),
     ]
 }
 
@@ -1188,6 +1196,7 @@ mod tests {
                 ("suspend-status".to_owned(), Vec::new(), "operator.read"),
                 ("resume-host".to_owned(), Vec::new(), "operator.admin"),
                 ("model".to_owned(), Vec::new(), "operator.write"),
+                ("session-close".to_owned(), Vec::new(), "operator.admin"),
             ]
         );
     }
@@ -1445,6 +1454,7 @@ mod tests {
                 },
             ),
             ("/model gpt-x", CommandEffect::SetModel("gpt-x".to_owned())),
+            ("/session-close", CommandEffect::DestroySession),
         ];
 
         for (line, expected) in cases {

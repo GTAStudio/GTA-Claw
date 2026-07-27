@@ -36,7 +36,7 @@ pub mod sse;
 pub mod stream;
 
 pub use cancel::CancelToken;
-pub use error::{ErrorKind, Operation, ProviderError};
+pub use error::{ErrorKind, FailureClass, Operation, ProviderError};
 pub use model::{
     AssistantMessage, AuthMode, Capability, CapabilitySet, ChatMessage, CompletionRequest,
     CompletionResponse, Embedding, EmbeddingsRequest, EmbeddingsResponse, FinishReason,
@@ -44,6 +44,6 @@ pub use model::{
     ToolChoice, ToolDefinition, ToolParameters, Usage,
 };
 pub use origin::{BoundApiKey, BoundSecret, Origin, OriginApproval, OriginError, TrustedOrigins};
-pub use provider::{BoxFuture, Provider, RequestContext};
+pub use provider::{BoxFuture, Provider, ProviderPhase, ProviderStatus, RequestContext};
 pub use secret::{ApiKey, CredentialKey, SecretStore, SecretStoreError, SecretString};
 pub use stream::{CompletionStream, StreamEvent};

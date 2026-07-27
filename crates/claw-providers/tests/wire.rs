@@ -11,23 +11,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use claw_provider_sdk::cancel::CancelToken;
+use claw_provider_sdk::circuit::{CircuitBreakerConfig, CircuitState};
 use claw_provider_sdk::clock::{Clock, FixedJitter, ManualClock};
-use claw_provider_sdk::error::{ErrorKind, Operation};
-use claw_provider_sdk::http::{HttpTransport, TlsPolicy, TransportConfig};
+use claw_provider_sdk::error::{ErrorKind, Operation, ProviderError};
+use claw_provider_sdk::http::{HttpRequest, HttpTransport, Method, TlsPolicy, TransportConfig};
 use claw_provider_sdk::model::{
     AssistantMessage, Capability, CapabilitySet, ChatMessage, CompletionRequest, ContentPart,
     FinishReason, ModelId, ProviderId, ToolArguments, ToolCall, ToolDefinition, ToolParameters,
     Usage,
 };
 use claw_provider_sdk::origin::{BoundApiKey, Origin, OriginApproval};
-use claw_provider_sdk::provider::{Provider as _, RequestContext};
+use claw_provider_sdk::provider::{Provider as _, ProviderPhase, RequestContext};
 use claw_provider_sdk::retry::{JitterMode, RetryPolicy};
 use claw_provider_sdk::secret::{ApiKey, SecretString};
 use claw_provider_sdk::stream::{StreamAccumulator, StreamEvent};
 use claw_providers::anthropic::{Anthropic, AnthropicConfig};
 use claw_providers::descriptor::OPENAI_CAPABILITIES;
 use claw_providers::github_copilot::{
-    DeviceFlow, DeviceFlowConfig, DevicePollOutcome, GitHubCopilot, GitHubCopilotConfig,
+    DeviceFlow, DeviceFlowConfig, DeviceFlowSession, DevicePollOutcome, GitHubCopilot,
+    GitHubCopilotConfig,
 };
 use claw_providers::openai_compatible::{AuthStyle, OpenAiCompatible, OpenAiConfig};
 use claw_providers::runtime::{ProviderRuntime, ReliabilityConfig};
@@ -73,6 +75,262 @@ fn manual_runtime(provider: &str, clock: &Arc<ManualClock>, retry: RetryPolicy) 
 /// situation [`OriginApproval::enroll`] exists for.
 fn approve(server: &TestServer) -> OriginApproval {
     OriginApproval::enroll(Origin::of(&server.base_url()).expect("loopback origin"))
+}
+
+#[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the test deliberately inspects capacity while the handshake still owns its permits"
+)]
+async fn streaming_holds_provider_capacity_until_clean_eof() {
+    let server = TestServer::start(vec![Reply::sse(&["data: first\n\n"])]).await;
+    let clock = Arc::new(ManualClock::new(0));
+    let runtime = ProviderRuntime::with_parts(
+        "test",
+        HttpTransport::with_config(&TransportConfig {
+            tls_policy: TlsPolicy::AllowLoopbackPlaintext,
+            ..TransportConfig::default()
+        })
+        .expect("transport"),
+        ReliabilityConfig {
+            max_concurrency: 1,
+            ..ReliabilityConfig::default()
+        },
+        clock,
+        Arc::new(FixedJitter::new(0.0)),
+    );
+    let cancel = CancelToken::new();
+    let stream = runtime
+        .execute_streaming(Operation::StreamCompletion, &cancel, || {
+            Ok(HttpRequest::new(Method::Post, server.url("stream")))
+        })
+        .await
+        .expect("stream opens");
+    assert_eq!(runtime.in_flight(), 1);
+
+    let mut chunks = stream.into_chunks();
+    while let Some(chunk) = chunks.next().await {
+        chunk.expect("chunk decodes");
+    }
+    assert_eq!(
+        runtime.in_flight(),
+        0,
+        "clean EOF releases capacity even while the fused stream value is retained"
+    );
+    drop(chunks);
+    assert_eq!(runtime.in_flight(), 0);
+}
+
+#[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the test deliberately inspects the circuit before transferring the handshake into its body stream"
+)]
+async fn a_stream_body_timeout_trips_the_provider_circuit() {
+    let server = TestServer::start(vec![Reply::sse_hold(&["data: first\n\n"])]).await;
+    let clock = Arc::new(ManualClock::new(0));
+    let runtime = ProviderRuntime::with_parts(
+        "test",
+        HttpTransport::with_config(&TransportConfig {
+            tls_policy: TlsPolicy::AllowLoopbackPlaintext,
+            ..TransportConfig::default()
+        })
+        .expect("transport"),
+        ReliabilityConfig {
+            retry: RetryPolicy::never(),
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..CircuitBreakerConfig::default()
+            },
+            max_concurrency: 1,
+        },
+        clock,
+        Arc::new(FixedJitter::new(0.0)),
+    );
+    let stream = runtime
+        .execute_streaming(Operation::StreamCompletion, &CancelToken::new(), || {
+            Ok(HttpRequest::new(Method::Post, server.url("stream"))
+                .stream_idle_timeout(Duration::from_millis(30)))
+        })
+        .await
+        .expect("headers arrive");
+    assert_eq!(runtime.circuit_state(), CircuitState::Closed);
+
+    let mut chunks = stream.into_chunks();
+    chunks
+        .next()
+        .await
+        .expect("first chunk")
+        .expect("first chunk decodes");
+    let error = chunks
+        .next()
+        .await
+        .expect("terminal error")
+        .expect_err("idle stream times out");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert_eq!(runtime.circuit_state(), CircuitState::Open);
+    assert_eq!(runtime.in_flight(), 0);
+}
+
+#[tokio::test]
+async fn a_request_queued_for_capacity_rechecks_an_opened_circuit() {
+    let server = TestServer::start(vec![
+        Reply::sse_hold(&["data: first\n\n"]),
+        Reply::json(r#"{"should":"not arrive"}"#),
+    ])
+    .await;
+    let runtime = Arc::new(ProviderRuntime::with_parts(
+        "test",
+        HttpTransport::with_config(&TransportConfig {
+            tls_policy: TlsPolicy::AllowLoopbackPlaintext,
+            ..TransportConfig::default()
+        })
+        .expect("transport"),
+        ReliabilityConfig {
+            retry: RetryPolicy::never(),
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..CircuitBreakerConfig::default()
+            },
+            max_concurrency: 1,
+        },
+        Arc::new(ManualClock::new(0)),
+        Arc::new(FixedJitter::new(0.0)),
+    ));
+    let mut chunks = runtime
+        .execute_streaming(Operation::StreamCompletion, &CancelToken::new(), || {
+            Ok(HttpRequest::new(Method::Get, server.url("stream"))
+                .stream_idle_timeout(Duration::from_millis(30)))
+        })
+        .await
+        .expect("stream opens")
+        .into_chunks();
+    let queued = tokio::spawn({
+        let runtime = Arc::clone(&runtime);
+        let url = server.url("queued");
+        async move {
+            runtime
+                .execute(Operation::Ping, &CancelToken::new(), || {
+                    Ok(HttpRequest::new(Method::Get, url.clone()))
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    chunks
+        .next()
+        .await
+        .expect("first chunk")
+        .expect("first chunk decodes");
+    assert!(
+        chunks
+            .next()
+            .await
+            .expect("terminal item")
+            .is_err_and(|error| error.kind() == ErrorKind::Timeout)
+    );
+
+    let error = queued
+        .await
+        .expect("queued task joins")
+        .expect_err("the opened circuit rejects queued work");
+    assert_eq!(error.kind(), ErrorKind::CircuitOpen);
+    assert_eq!(
+        server.request_count().await,
+        1,
+        "queued work never reaches transport after the circuit opens"
+    );
+}
+
+#[tokio::test]
+async fn provider_decoding_failures_trip_the_same_circuit_permit() {
+    let server = TestServer::start(vec![Reply::json("{}")]).await;
+    let clock = Arc::new(ManualClock::new(0));
+    let runtime = ProviderRuntime::with_parts(
+        "test",
+        HttpTransport::with_config(&TransportConfig {
+            tls_policy: TlsPolicy::AllowLoopbackPlaintext,
+            ..TransportConfig::default()
+        })
+        .expect("transport"),
+        ReliabilityConfig {
+            retry: RetryPolicy::never(),
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..CircuitBreakerConfig::default()
+            },
+            max_concurrency: 1,
+        },
+        clock,
+        Arc::new(FixedJitter::new(0.0)),
+    );
+
+    let error = runtime
+        .execute_decoded(
+            Operation::Complete,
+            &CancelToken::new(),
+            || Ok(HttpRequest::new(Method::Get, server.url("response"))),
+            |_response| {
+                Err::<(), ProviderError>(ProviderError::new(
+                    ErrorKind::Protocol,
+                    "test",
+                    Operation::Complete,
+                    "synthetic decoder failure",
+                ))
+            },
+        )
+        .await
+        .expect_err("decoder rejects the successful response");
+    assert_eq!(error.kind(), ErrorKind::Protocol);
+    assert_eq!(runtime.circuit_state(), CircuitState::Open);
+}
+
+#[tokio::test]
+async fn decoded_stream_protocol_failures_trip_the_circuit() {
+    let server = TestServer::start(vec![Reply::sse(&["data: {}\n\n"])]).await;
+    let clock = Arc::new(ManualClock::new(0));
+    let runtime = ProviderRuntime::with_parts(
+        "test",
+        HttpTransport::with_config(&TransportConfig {
+            tls_policy: TlsPolicy::AllowLoopbackPlaintext,
+            ..TransportConfig::default()
+        })
+        .expect("transport"),
+        ReliabilityConfig {
+            retry: RetryPolicy::never(),
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..CircuitBreakerConfig::default()
+            },
+            max_concurrency: 1,
+        },
+        clock,
+        Arc::new(FixedJitter::new(0.0)),
+    );
+    let mut decoded = runtime
+        .execute_streaming(Operation::StreamCompletion, &CancelToken::new(), || {
+            Ok(HttpRequest::new(Method::Get, server.url("stream")))
+        })
+        .await
+        .expect("headers")
+        .decode::<(), _>(|_chunks| {
+            Box::pin(futures_util::stream::iter(vec![Err(ProviderError::new(
+                ErrorKind::Protocol,
+                "test",
+                Operation::StreamCompletion,
+                "synthetic SSE failure",
+            ))]))
+        });
+
+    let error = decoded
+        .next()
+        .await
+        .expect("terminal item")
+        .expect_err("decoder rejects the stream");
+    assert_eq!(error.kind(), ErrorKind::Protocol);
+    assert_eq!(runtime.circuit_state(), CircuitState::Open);
+    assert_eq!(runtime.in_flight(), 0);
 }
 
 fn openai_client(server: &TestServer) -> OpenAiCompatible {
@@ -793,6 +1051,56 @@ async fn anthropic_advertises_no_embeddings_support() {
     assert_eq!(server.request_count().await, 0);
 }
 
+#[tokio::test]
+async fn openai_and_anthropic_startup_and_ping_are_typed_health_probes() {
+    let openai_server = TestServer::start(vec![Reply::json("{}"), Reply::json("{}")]).await;
+    let openai = openai_client(&openai_server);
+    let startup = openai
+        .startup(&RequestContext::new())
+        .await
+        .expect("OpenAI startup probe");
+    let ping = openai
+        .ping(&RequestContext::new())
+        .await
+        .expect("OpenAI ping");
+    assert_eq!(startup.provider(), openai.id());
+    assert_eq!(startup.phase(), ProviderPhase::Started);
+    assert_eq!(ping.phase(), ProviderPhase::Reachable);
+    assert!(
+        openai_server
+            .requests()
+            .await
+            .iter()
+            .all(|request| request.target == "/models")
+    );
+
+    let anthropic_server = TestServer::start(vec![Reply::json("{}"), Reply::json("{}")]).await;
+    let anthropic = anthropic_client(&anthropic_server);
+    assert_eq!(
+        anthropic
+            .startup(&RequestContext::new())
+            .await
+            .expect("Anthropic startup probe")
+            .phase(),
+        ProviderPhase::Started
+    );
+    assert_eq!(
+        anthropic
+            .ping(&RequestContext::new())
+            .await
+            .expect("Anthropic ping")
+            .phase(),
+        ProviderPhase::Reachable
+    );
+    assert!(
+        anthropic_server
+            .requests()
+            .await
+            .iter()
+            .all(|request| request.target == "/v1/models")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // GitHub Copilot
 // ---------------------------------------------------------------------------
@@ -816,6 +1124,8 @@ async fn the_copilot_device_flow_polls_until_the_grant_is_approved() {
         access_token_url: server.url("login/oauth/access_token"),
         approved_origins: vec![approve(&server)],
         reliability: ReliabilityConfig::default(),
+        request_timeout: Duration::from_secs(15),
+        max_wait: Duration::from_mins(15),
     })
     .expect("build flow")
     .with_runtime(manual_runtime(
@@ -880,6 +1190,8 @@ async fn a_denied_device_grant_stops_polling_immediately() {
         access_token_url: server.url("login/oauth/access_token"),
         approved_origins: vec![approve(&server)],
         reliability: ReliabilityConfig::default(),
+        request_timeout: Duration::from_secs(15),
+        max_wait: Duration::from_mins(15),
     })
     .expect("build flow")
     .with_runtime(manual_runtime(
@@ -908,6 +1220,8 @@ async fn a_cancelled_device_flow_stops_before_polling() {
         access_token_url: server.url("login/oauth/access_token"),
         approved_origins: vec![approve(&server)],
         reliability: ReliabilityConfig::default(),
+        request_timeout: Duration::from_secs(15),
+        max_wait: Duration::from_mins(15),
     })
     .expect("build flow")
     .with_runtime(manual_runtime(
@@ -941,6 +1255,8 @@ async fn the_device_poll_reports_a_pending_grant_without_erroring() {
         access_token_url: server.url("login/oauth/access_token"),
         approved_origins: vec![approve(&server)],
         reliability: ReliabilityConfig::default(),
+        request_timeout: Duration::from_secs(15),
+        max_wait: Duration::from_mins(15),
     })
     .expect("build flow")
     .with_runtime(manual_runtime(
@@ -954,6 +1270,168 @@ async fn the_device_poll_reports_a_pending_grant_without_erroring() {
             .await
             .expect("pending is not an error"),
         DevicePollOutcome::Pending
+    );
+}
+
+#[tokio::test]
+async fn a_device_flow_session_reuses_the_code_and_activates_once() {
+    let server = TestServer::start(vec![
+        Reply::json(
+            r#"{"device_code":"dc-reused","user_code":"ABCD-EFGH","verification_uri":"https://github.com/login/device","expires_in":60,"interval":1}"#,
+        ),
+        Reply::json(r#"{"access_token":"gho_activated","token_type":"bearer"}"#),
+    ])
+    .await;
+    let clock = Arc::new(ManualClock::new(0));
+    let flow = DeviceFlow::new(DeviceFlowConfig {
+        client_id: "Iv1.test".to_owned(),
+        scope: "read:user".to_owned(),
+        device_code_url: server.url("login/device/code"),
+        access_token_url: server.url("login/oauth/access_token"),
+        approved_origins: vec![approve(&server)],
+        reliability: ReliabilityConfig::default(),
+        request_timeout: Duration::from_secs(15),
+        max_wait: Duration::from_secs(30),
+    })
+    .expect("build flow")
+    .with_runtime(manual_runtime(
+        "github-copilot",
+        &clock,
+        RetryPolicy::never(),
+    ));
+    let lifecycle = DeviceFlowSession::new(flow);
+    let cancel = CancelToken::new();
+
+    let first = lifecycle.begin(&cancel).await.expect("first code");
+    let reused = lifecycle.begin(&cancel).await.expect("reused code");
+    assert_eq!(first, reused);
+    assert_eq!(
+        server.request_count().await,
+        1,
+        "an unexpired code is reused"
+    );
+
+    let activated = lifecycle
+        .activate_with(&cancel, |token, _cancel| async move {
+            Ok::<String, claw_provider_sdk::ProviderError>(token.expose().to_owned())
+        })
+        .await
+        .expect("activation callback succeeds");
+    assert_eq!(activated, "gho_activated");
+    assert_eq!(lifecycle.pending().await, None);
+    assert_eq!(server.request_count().await, 2);
+    assert_eq!(clock.recorded_sleeps(), vec![Duration::from_secs(1)]);
+}
+
+#[tokio::test]
+async fn finishing_an_old_activation_does_not_clear_a_replacement_code() {
+    let server = TestServer::start(vec![
+        Reply::json(
+            r#"{"device_code":"dc-old","user_code":"OLD-CODE","verification_uri":"https://github.com/login/device","expires_in":60,"interval":1}"#,
+        ),
+        Reply::sse_hold(&[]),
+        Reply::json(
+            r#"{"device_code":"dc-new","user_code":"NEW-CODE","verification_uri":"https://github.com/login/device","expires_in":60,"interval":1}"#,
+        ),
+    ])
+    .await;
+    let clock = Arc::new(ManualClock::new(0));
+    let lifecycle = Arc::new(DeviceFlowSession::new(
+        DeviceFlow::new(DeviceFlowConfig {
+            client_id: "Iv1.test".to_owned(),
+            scope: "read:user".to_owned(),
+            device_code_url: server.url("login/device/code"),
+            access_token_url: server.url("login/oauth/access_token"),
+            approved_origins: vec![approve(&server)],
+            reliability: ReliabilityConfig::default(),
+            request_timeout: Duration::from_secs(15),
+            max_wait: Duration::from_secs(30),
+        })
+        .expect("flow")
+        .with_runtime(manual_runtime(
+            "github-copilot",
+            &clock,
+            RetryPolicy::never(),
+        )),
+    ));
+    let old_cancel = CancelToken::new();
+    let activating = tokio::spawn({
+        let lifecycle = Arc::clone(&lifecycle);
+        let old_cancel = old_cancel.clone();
+        async move {
+            lifecycle
+                .activate_with(&old_cancel, |_token, _cancel| async move {
+                    Ok::<(), claw_provider_sdk::ProviderError>(())
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.request_count().await < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("old activation reaches its poll");
+
+    assert!(lifecycle.clear().await);
+    let replacement = lifecycle
+        .begin(&CancelToken::new())
+        .await
+        .expect("replacement code");
+    assert_eq!(replacement.user_code, "NEW-CODE");
+
+    old_cancel.cancel();
+    let error = activating
+        .await
+        .expect("activation task joins")
+        .expect_err("old activation is cancelled");
+    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert_eq!(
+        lifecycle.pending().await.map(|pending| pending.user_code),
+        Some("NEW-CODE".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn the_device_flow_hard_deadline_stops_before_an_extra_poll() {
+    let server = TestServer::start(vec![Reply::json(r#"{"error":"authorization_pending"}"#)]).await;
+    let clock = Arc::new(ManualClock::new(0));
+    let flow = DeviceFlow::new(DeviceFlowConfig {
+        client_id: "Iv1.test".to_owned(),
+        scope: "read:user".to_owned(),
+        device_code_url: server.url("login/device/code"),
+        access_token_url: server.url("login/oauth/access_token"),
+        approved_origins: vec![approve(&server)],
+        reliability: ReliabilityConfig::default(),
+        request_timeout: Duration::from_secs(15),
+        max_wait: Duration::from_secs(6),
+    })
+    .expect("build flow")
+    .with_runtime(manual_runtime(
+        "github-copilot",
+        &clock,
+        RetryPolicy::never(),
+    ));
+    let authorization = claw_providers::github_copilot::decode_device_authorization(
+        br#"{"device_code":"dc","user_code":"u","verification_uri":"v","expires_in":900,"interval":5}"#,
+    )
+    .expect("decode");
+
+    let error = flow
+        .wait_for_token(&authorization, &CancelToken::new())
+        .await
+        .expect_err("the configured hard deadline wins");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert_eq!(error.upstream_code(), Some("device_flow_timeout"));
+    assert_eq!(
+        clock.recorded_sleeps(),
+        vec![Duration::from_secs(5), Duration::from_secs(1)]
+    );
+    assert_eq!(
+        server.request_count().await,
+        1,
+        "expiry is checked before issuing another poll"
     );
 }
 
@@ -1030,6 +1508,44 @@ async fn copilot_exchanges_the_github_token_once_and_reuses_it() {
         !format!("{cached:?}").contains("tid=copilot_secret"),
         "the token debug rendering leaked the Copilot token"
     );
+}
+
+#[tokio::test]
+async fn copilot_startup_warms_the_token_and_ping_reuses_it() {
+    let server = TestServer::start(vec![
+        Reply::json(r#"{"token":"tid=ready","expires_at":9999999999}"#),
+        Reply::json("{}"),
+        Reply::json("{}"),
+    ])
+    .await;
+    let mut config = GitHubCopilotConfig::new(SecretString::new(GITHUB_TOKEN)).expect("config");
+    config.token_exchange_url = server.url("copilot_internal/v2/token");
+    config.api_base_url = Some(server.base_url());
+    config.approved_origins = vec![approve(&server)];
+    let client = GitHubCopilot::new(config).expect("build client");
+
+    assert_eq!(
+        client
+            .startup(&RequestContext::new())
+            .await
+            .expect("startup")
+            .phase(),
+        ProviderPhase::Started
+    );
+    assert_eq!(
+        client
+            .ping(&RequestContext::new())
+            .await
+            .expect("ping")
+            .phase(),
+        ProviderPhase::Reachable
+    );
+
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].target, "/copilot_internal/v2/token");
+    assert_eq!(requests[1].target, "/models");
+    assert_eq!(requests[2].target, "/models");
 }
 
 #[tokio::test]

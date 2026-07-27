@@ -270,6 +270,46 @@ async fn cancelling_wakes_a_read_already_parked_on_a_silent_upstream() {
 }
 
 #[tokio::test]
+async fn a_silent_stream_hits_its_idle_deadline_and_closes_the_socket() {
+    let server = TestServer::start(vec![Reply::sse_hold(&["data: {\"n\":1}\n\n"])]).await;
+    let stream = transport()
+        .send_streaming(
+            "test",
+            Operation::StreamCompletion,
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions"))
+                .stream_idle_timeout(Duration::from_millis(50)),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("stream must open");
+    let mut chunks = stream.into_chunks();
+    chunks
+        .next()
+        .await
+        .expect("the first chunk arrives")
+        .expect("the first chunk decodes");
+
+    let error = tokio::time::timeout(Duration::from_secs(2), chunks.next())
+        .await
+        .expect("the idle deadline wakes the parked reader")
+        .expect("the timeout is emitted as one terminal item")
+        .expect_err("silence is a timeout");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert_eq!(error.operation(), Operation::StreamCompletion);
+    assert_eq!(
+        error.detail(),
+        "the streaming response exceeded its idle deadline"
+    );
+    assert_eq!(chunks.next().await, None);
+    drop(chunks);
+
+    assert!(
+        server.wait_for_peer_close(Duration::from_secs(5)).await,
+        "timing out the stream must close the TCP connection"
+    );
+}
+
+#[tokio::test]
 async fn a_body_larger_than_the_buffer_limit_is_refused_instead_of_being_held() {
     // The request deadline bounds how long an upstream may take, not how many
     // bytes it may send, so without a byte ceiling one response could exhaust

@@ -74,6 +74,13 @@ pub const MAX_TOOL_CALLS: usize = 1_024;
 /// stream decoder does not bound them; this does.
 pub const MAX_TOOL_ARGUMENT_BYTES: usize = 1_048_576;
 
+/// Largest aggregate argument payload retained across one streamed assistant turn.
+///
+/// A per-call bound alone still allowed [`MAX_TOOL_CALLS`] calls to retain one
+/// mebibyte each. This aggregate ceiling keeps the whole assembler within a
+/// predictable memory budget.
+pub const MAX_TOTAL_TOOL_ARGUMENT_BYTES: usize = 4 * MAX_TOOL_ARGUMENT_BYTES;
+
 /// Largest reassembled identifier or name for one tool call, in bytes.
 ///
 /// Both arrive as fragments and both are identifiers, not payloads.
@@ -89,14 +96,14 @@ pub const MAX_TOOL_NAME_BYTES: usize = 512;
 ///
 /// Everything the assembler stores comes from the wire, so every buffer is
 /// capped: at most [`MAX_TOOL_CALLS`] calls, [`MAX_TOOL_NAME_BYTES`] of
-/// identifier and of name and [`MAX_TOOL_ARGUMENT_BYTES`] of arguments per
-/// call. Fragments past a cap are dropped rather than buffered, which leaves
-/// the argument document truncated and makes [`ToolCallAssembler::complete`]
-/// reject the call — a hostile stream gets a typed protocol failure instead of
-/// an allocation the process cannot satisfy.
+/// identifier and of name, [`MAX_TOOL_ARGUMENT_BYTES`] of arguments per call,
+/// and [`MAX_TOTAL_TOOL_ARGUMENT_BYTES`] across the turn. Fragments past a cap
+/// are rejected and make [`ToolCallAssembler::complete`] return a typed size
+/// error instead of allowing a truncated document to look valid.
 #[derive(Debug, Default)]
 pub struct ToolCallAssembler {
     partials: Vec<PartialToolCall>,
+    total_argument_bytes: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -106,6 +113,7 @@ struct PartialToolCall {
     arguments: String,
     announced: bool,
     completed: bool,
+    overflowed: bool,
 }
 
 impl ToolCallAssembler {
@@ -134,7 +142,8 @@ impl ToolCallAssembler {
     ///
     /// An `index` at or above [`MAX_TOOL_CALLS`] is ignored and yields no
     /// events, as is any fragment that would push a buffer past
-    /// [`MAX_TOOL_NAME_BYTES`] or [`MAX_TOOL_ARGUMENT_BYTES`].
+    /// [`MAX_TOOL_NAME_BYTES`], [`MAX_TOOL_ARGUMENT_BYTES`], or
+    /// [`MAX_TOTAL_TOOL_ARGUMENT_BYTES`].
     pub fn accept(
         &mut self,
         index: usize,
@@ -174,13 +183,21 @@ impl ToolCallAssembler {
             }
             if let Some(fragment) = arguments
                 && !fragment.is_empty()
-                && partial.arguments.len() + fragment.len() <= MAX_TOOL_ARGUMENT_BYTES
             {
-                partial.arguments.push_str(fragment);
-                events.push(StreamEvent::ToolCallArgumentsDelta {
-                    index,
-                    delta: fragment.to_owned(),
-                });
+                let call_size = partial.arguments.len().checked_add(fragment.len());
+                let total_size = self.total_argument_bytes.checked_add(fragment.len());
+                if call_size.is_some_and(|size| size <= MAX_TOOL_ARGUMENT_BYTES)
+                    && total_size.is_some_and(|size| size <= MAX_TOTAL_TOOL_ARGUMENT_BYTES)
+                {
+                    partial.arguments.push_str(fragment);
+                    self.total_argument_bytes += fragment.len();
+                    events.push(StreamEvent::ToolCallArgumentsDelta {
+                        index,
+                        delta: fragment.to_owned(),
+                    });
+                } else {
+                    partial.overflowed = true;
+                }
             }
         }
         events
@@ -193,9 +210,9 @@ impl ToolCallAssembler {
     /// Returns [`ModelError::InvalidIdentifier`] when `index` was never seen
     /// (including an index the size caps rejected), when the call never
     /// received a name, or when it was already completed, and
-    /// [`ModelError::ToolArgumentsNotAnObject`] when the accumulated fragments
-    /// do not parse as a single JSON object — which is also what a document
-    /// truncated by [`MAX_TOOL_ARGUMENT_BYTES`] looks like.
+    /// [`ModelError::ToolArgumentsTooLarge`] when a fragment crossed a size
+    /// ceiling, and [`ModelError::ToolArgumentsNotAnObject`] when the accepted
+    /// fragments do not parse as a single JSON object.
     pub fn complete(&mut self, index: usize) -> Result<StreamEvent, ModelError> {
         let partial = self
             .partials
@@ -203,6 +220,11 @@ impl ToolCallAssembler {
             .ok_or(ModelError::InvalidIdentifier { field: "tool_call" })?;
         if partial.name.is_empty() || partial.completed {
             return Err(ModelError::InvalidIdentifier { field: "tool_call" });
+        }
+        if partial.overflowed {
+            return Err(ModelError::ToolArgumentsTooLarge {
+                limit: MAX_TOTAL_TOOL_ARGUMENT_BYTES,
+            });
         }
         partial.completed = true;
         let call = ToolCall {
@@ -218,13 +240,19 @@ impl ToolCallAssembler {
     /// # Errors
     ///
     /// Returns [`ModelError::InvalidIdentifier`] for the first call that never
-    /// received a name, and [`ModelError::ToolArgumentsNotAnObject`] for the
-    /// first call whose accumulated fragments are not a single JSON object.
+    /// received a name, [`ModelError::ToolArgumentsTooLarge`] when a size limit
+    /// was crossed, and [`ModelError::ToolArgumentsNotAnObject`] for the first
+    /// call whose accepted fragments are not a single JSON object.
     pub fn complete_all(&mut self) -> Result<Vec<ToolCall>, ModelError> {
         let mut calls = Vec::with_capacity(self.partials.len());
         for partial in &mut self.partials {
             if partial.name.is_empty() {
                 return Err(ModelError::InvalidIdentifier { field: "tool_call" });
+            }
+            if partial.overflowed {
+                return Err(ModelError::ToolArgumentsTooLarge {
+                    limit: MAX_TOTAL_TOOL_ARGUMENT_BYTES,
+                });
             }
             partial.completed = true;
             calls.push(ToolCall {
@@ -550,11 +578,11 @@ mod tests {
             assembler.accept(0, None, None, Some(&oversized)).is_empty(),
             "a fragment past the ceiling produces no delta event"
         );
-        // The document is left truncated, so the call fails to assemble rather
-        // than growing the buffer without bound.
         assert_eq!(
             assembler.complete(0),
-            Err(ModelError::ToolArgumentsNotAnObject)
+            Err(ModelError::ToolArgumentsTooLarge {
+                limit: MAX_TOTAL_TOOL_ARGUMENT_BYTES
+            })
         );
 
         let mut assembler = ToolCallAssembler::new();
@@ -565,6 +593,37 @@ mod tests {
                 .complete(0)
                 .is_err_and(|error| error == ModelError::InvalidIdentifier { field: "tool_call" }),
             "an over-long name is dropped, leaving the call nameless"
+        );
+    }
+
+    #[test]
+    fn aggregate_tool_arguments_are_bounded_across_calls() {
+        let mut assembler = ToolCallAssembler::new();
+        let full = format!(
+            "{{\"value\":\"{}\"}}",
+            "a".repeat(MAX_TOOL_ARGUMENT_BYTES - 12)
+        );
+        assert_eq!(full.len(), MAX_TOOL_ARGUMENT_BYTES);
+
+        for index in 0..4 {
+            assembler.accept(
+                index,
+                Some(&format!("call-{index}")),
+                Some("tool"),
+                Some(&full),
+            );
+        }
+        assembler.accept(4, Some("call-4"), Some("tool"), Some("{}"));
+
+        assert_eq!(
+            assembler.complete(4),
+            Err(ModelError::ToolArgumentsTooLarge {
+                limit: MAX_TOTAL_TOOL_ARGUMENT_BYTES
+            })
+        );
+        assert!(
+            assembler.complete(0).is_ok(),
+            "calls accepted before the aggregate ceiling remain usable"
         );
     }
 

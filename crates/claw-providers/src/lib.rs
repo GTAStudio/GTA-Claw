@@ -42,11 +42,14 @@ pub use anthropic::Anthropic;
 pub use auth::{AuthConfig, AuthError, Authorization, SecretField, authorize};
 pub use config::{ConfigError, ProviderConfig, ResolvedProvider};
 pub use descriptor::{ImplementationStatus, ProviderDescriptor, ProviderFamily};
-pub use github_copilot::{DeviceFlow, GitHubCopilot};
+pub use github_copilot::{ActivatedCopilot, DeviceFlow, DeviceFlowSession, GitHubCopilot};
 pub use openai_compatible::OpenAiCompatible;
 pub use registry::{PROVIDERS, ProviderRegistry, lookup};
 pub use routing::{Route, RouteError, RouteRequest, RoutingTable};
-pub use runtime::{ProviderRuntime, ReliabilityConfig};
+pub use runtime::{
+    ProviderChunkStream, ProviderDecodedStream, ProviderGeneration, ProviderLease, ProviderRuntime,
+    ProviderSlot, ProviderStream, ReliabilityConfig,
+};
 
 /// Number of provider descriptors in the frozen inventory.
 pub const FROZEN_PROVIDER_COUNT: usize = 78;

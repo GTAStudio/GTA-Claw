@@ -77,11 +77,8 @@ struct Pending {
 #[derive(Default)]
 struct BrokerState {
     pending: HashMap<ApprovalId, Pending>,
-    // Grows by one entry per (session, tool) pair that is ever answered with `remember`, and
-    // nothing removes those entries: a decision has to outlive the turn that made it, and this
-    // crate has no session-close hook to retire it at. `StatePort` is load/save only, and no
-    // command ends a session, so bounded cleanup needs a session-termination signal that does not
-    // exist yet. Long-lived hosts leak here in proportion to distinct sessions, slowly.
+    // Runtime TTL, LRU, reload, and terminal-destruction paths clear this through
+    // `forget_session`, so its ownership matches the bounded conversation registry.
     remembered: HashMap<(String, String), ApprovalDecision>,
     next_id: u64,
 }
@@ -207,6 +204,26 @@ impl ApprovalBroker {
     pub fn forget(&self, session_id: &SessionId, tool_name: &str) -> bool {
         let key = (session_id.as_str().to_owned(), tool_name.to_owned());
         self.lock().remembered.remove(&key).is_some()
+    }
+
+    /// Forgets every remembered decision owned by one conversation session.
+    ///
+    /// Returns the number of decisions removed. Runtime TTL, LRU, reload, and
+    /// terminal-destruction paths all call this, so remembered approval state is
+    /// bounded by the same ownership policy as model selection.
+    #[must_use]
+    pub fn forget_session(&self, session_id: &SessionId) -> usize {
+        let before;
+        let after;
+        {
+            let mut state = self.lock();
+            before = state.remembered.len();
+            state
+                .remembered
+                .retain(|(owned_session, _), _| owned_session != session_id.as_str());
+            after = state.remembered.len();
+        }
+        before.saturating_sub(after)
     }
 
     /// Answers one outstanding request.

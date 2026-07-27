@@ -27,6 +27,11 @@ pub enum ModelError {
     ToolParametersNotAnObject,
     /// Tool-call arguments were not a JSON object document.
     ToolArgumentsNotAnObject,
+    /// Streamed tool-call arguments exceeded the aggregate memory budget.
+    ToolArgumentsTooLarge {
+        /// The aggregate byte limit.
+        limit: usize,
+    },
     /// A request had no messages, or the message sequence is unusable.
     EmptyConversation,
     /// A numeric sampling parameter was outside its documented range.
@@ -59,6 +64,12 @@ impl Display for ModelError {
             }
             Self::ToolArgumentsNotAnObject => {
                 formatter.write_str("tool-call arguments must be a JSON object")
+            }
+            Self::ToolArgumentsTooLarge { limit } => {
+                write!(
+                    formatter,
+                    "streamed tool-call arguments exceed the {limit} byte limit"
+                )
             }
             Self::EmptyConversation => {
                 formatter.write_str("a completion needs at least one message")

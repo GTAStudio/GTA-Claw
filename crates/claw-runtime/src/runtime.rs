@@ -17,6 +17,7 @@ use claw_application::model::goal::GoalRecord;
 use claw_application::model::ids::{ApprovalId, IdentifierError, TurnId};
 use claw_application::model::message::{AssistantMessage, PartialAssistantMessage, ToolCall};
 use claw_application::model::session::{SessionEvent, SessionState};
+use claw_application::model::time::Timestamp;
 use claw_application::ports::PortError;
 use claw_application::ports::approval::ApprovalPort;
 use claw_application::ports::clock::ClockPort;
@@ -76,6 +77,12 @@ pub struct RuntimeConfig {
     /// Turning this off hides [`GOAL_TOOL_NAME`] from the provider's tool list and from `/tools`,
     /// and makes a call to it fail like any other unknown tool.
     pub goal_tool_enabled: bool,
+    /// Maximum number of conversation sessions retained in memory.
+    pub session_capacity: usize,
+    /// How long an idle conversation remains owned without being touched.
+    pub session_idle_ttl: Duration,
+    /// Grace period before a retiring turn is forcibly aborted.
+    pub session_retire_timeout: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -88,6 +95,9 @@ impl Default for RuntimeConfig {
             context_token_budget: 128_000,
             goals: GoalConfig::default(),
             goal_tool_enabled: true,
+            session_capacity: 100,
+            session_idle_ttl: Duration::from_hours(1),
+            session_retire_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -202,6 +212,68 @@ pub struct TurnOutcome {
     pub tool_outcomes: Vec<ToolOutcome>,
 }
 
+/// Stable user-facing classification of a runtime failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeFailureClass {
+    /// Capacity, optimistic concurrency, or reload fencing temporarily blocked work.
+    Busy,
+    /// An external adapter is unavailable.
+    Unavailable,
+    /// The requested entity does not exist.
+    NotFound,
+    /// Caller input or a provider stream violated a contract.
+    InvalidRequest,
+    /// The caller or host cancelled the work.
+    Cancelled,
+    /// An internal runtime invariant failed.
+    Internal,
+}
+
+impl RuntimeFailureClass {
+    /// Returns the stable wire-safe label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Unavailable => "unavailable",
+            Self::NotFound => "not_found",
+            Self::InvalidRequest => "invalid_request",
+            Self::Cancelled => "cancelled",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// Returns a detail-free message suitable for an end user.
+    #[must_use]
+    pub const fn user_message(self) -> &'static str {
+        match self {
+            Self::Busy => "This conversation is busy. Retry after the current work finishes.",
+            Self::Unavailable => {
+                "A required service is temporarily unavailable. Try again shortly."
+            }
+            Self::NotFound => "The requested runtime resource no longer exists.",
+            Self::InvalidRequest => {
+                "The request could not be processed. Check its input and retry."
+            }
+            Self::Cancelled => "The operation was cancelled.",
+            Self::Internal => "The runtime could not complete the operation.",
+        }
+    }
+}
+
+/// Result of fencing and clearing conversation sessions for a reload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionReloadReport {
+    /// New generation assigned before stale work was cancelled.
+    pub generation: u64,
+    /// Number of idle and active sessions terminally removed.
+    pub destroyed: usize,
+    /// Number of active turns cancelled and joined.
+    pub cancelled_turns: usize,
+    /// Number of turns that ignored cancellation through the grace period and were aborted.
+    pub forced_turns: usize,
+}
+
 /// A refused or failed runtime operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeError {
@@ -232,6 +304,20 @@ pub enum RuntimeError {
         /// The turn that holds the session.
         turn: TurnId,
     },
+    /// Every conversation slot is occupied by active work.
+    SessionCapacityReached {
+        /// Configured in-memory session capacity.
+        capacity: usize,
+    },
+    /// The conversation is being terminally destroyed.
+    SessionRetiring,
+    /// A reload changed generation while session creation was awaiting I/O.
+    ReloadFenced {
+        /// Generation captured before the await.
+        expected: u64,
+        /// Generation active after the await.
+        current: u64,
+    },
     /// No turn is running for that session.
     NoTurnInFlight,
     /// An identifier could not be minted.
@@ -257,6 +343,19 @@ impl Display for RuntimeError {
             Self::TurnInFlight { turn } => {
                 write!(formatter, "turn {turn} is already running for this session")
             }
+            Self::SessionCapacityReached { capacity } => {
+                write!(
+                    formatter,
+                    "all {capacity} in-memory conversation slots are active"
+                )
+            }
+            Self::SessionRetiring => {
+                formatter.write_str("the conversation session is being destroyed")
+            }
+            Self::ReloadFenced { expected, current } => write!(
+                formatter,
+                "session creation was fenced by reload generation {expected} -> {current}"
+            ),
             Self::NoTurnInFlight => formatter.write_str("no turn is running for this session"),
             Self::Identifier(error) => write!(formatter, "identifier rejected: {error}"),
             Self::Abandoned => formatter.write_str("the turn ended without reporting an outcome"),
@@ -265,6 +364,88 @@ impl Display for RuntimeError {
 }
 
 impl Error for RuntimeError {}
+
+impl RuntimeError {
+    /// Returns the stable classification a user interface should present.
+    #[must_use]
+    pub const fn failure_class(&self) -> RuntimeFailureClass {
+        match self {
+            Self::Port(error) => classify_port_error(error),
+            Self::Goal(error) => classify_goal_error(error),
+            Self::Approval(error) | Self::Tool(ToolExecutionError::Approval(error)) => {
+                classify_approval_error(error)
+            }
+            Self::Suspend(
+                SuspendError::AlreadySuspended { .. } | SuspendError::AlreadyDraining { .. },
+            )
+            | Self::Quiescing(_)
+            | Self::TurnInFlight { .. }
+            | Self::SessionCapacityReached { .. }
+            | Self::SessionRetiring
+            | Self::ReloadFenced { .. } => RuntimeFailureClass::Busy,
+            Self::Suspend(SuspendError::NotSuspended) | Self::NoTurnInFlight => {
+                RuntimeFailureClass::NotFound
+            }
+            Self::Suspend(SuspendError::LeaseMismatch { .. })
+            | Self::Stream(_)
+            | Self::Command(_)
+            | Self::Directive(_)
+            | Self::Identifier(_) => RuntimeFailureClass::InvalidRequest,
+            Self::ShuttingDown => RuntimeFailureClass::Cancelled,
+            Self::State(_) | Self::Suspend(SuspendError::DeadlineOverflow) | Self::Abandoned => {
+                RuntimeFailureClass::Internal
+            }
+        }
+    }
+
+    /// Returns a detail-free message suitable for an end user.
+    #[must_use]
+    pub const fn user_message(&self) -> &'static str {
+        self.failure_class().user_message()
+    }
+
+    /// Returns whether retrying after the immediate condition clears can succeed.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        matches!(
+            self.failure_class(),
+            RuntimeFailureClass::Busy | RuntimeFailureClass::Unavailable
+        )
+    }
+}
+
+const fn classify_port_error(error: &PortError) -> RuntimeFailureClass {
+    match error {
+        PortError::Unavailable(_) => RuntimeFailureClass::Unavailable,
+        PortError::Conflict(_) => RuntimeFailureClass::Busy,
+        PortError::NotFound(_) => RuntimeFailureClass::NotFound,
+        PortError::Invalid(_) => RuntimeFailureClass::InvalidRequest,
+        PortError::Cancelled => RuntimeFailureClass::Cancelled,
+    }
+}
+
+const fn classify_approval_error(error: &ApprovalError) -> RuntimeFailureClass {
+    match error {
+        ApprovalError::Port(error) => classify_port_error(error),
+        ApprovalError::Unknown(_) => RuntimeFailureClass::NotFound,
+        ApprovalError::DeadlineOverflow | ApprovalError::Identifier(_) => {
+            RuntimeFailureClass::Internal
+        }
+    }
+}
+
+const fn classify_goal_error(error: &GoalError) -> RuntimeFailureClass {
+    match error {
+        GoalError::Port(error) => classify_port_error(error),
+        GoalError::Unknown(_) | GoalError::NoActiveGoal => RuntimeFailureClass::NotFound,
+        GoalError::AlreadyClosed { .. } => RuntimeFailureClass::Busy,
+        GoalError::NotATerminalStatus(_)
+        | GoalError::InvalidObjective(_)
+        | GoalError::InvalidNote(_)
+        | GoalError::InvalidBudget
+        | GoalError::UnusableGoalId(_) => RuntimeFailureClass::InvalidRequest,
+    }
+}
 
 macro_rules! runtime_error_from {
     ($($source:ty => $variant:ident),* $(,)?) => {
@@ -385,6 +566,11 @@ pub enum CommandOutcome {
         /// The model now pinned for the session, or `None` once the override was cleared.
         model: Option<String>,
     },
+    /// A conversation session reached terminal destruction.
+    SessionDestroyed {
+        /// Whether the runtime owned that conversation before the command.
+        existed: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -395,6 +581,396 @@ struct LiveTurn {
     /// and release that lock before notifying the turn: `send` wakes the turn's watcher, and
     /// waking a task is work no other session should have to queue behind.
     paused: Arc<watch::Sender<bool>>,
+    /// Fires only after ownership and the suspension permit are released.
+    finished: CancellationToken,
+    /// Installed immediately after spawn so retirement can force a stuck task down.
+    abort: Arc<Mutex<TurnAbortState>>,
+}
+
+#[derive(Debug, Default)]
+struct TurnAbortState {
+    handle: Option<tokio::task::AbortHandle>,
+    requested: bool,
+}
+
+#[derive(Debug)]
+struct ManagedConversation {
+    session_id: SessionId,
+    last_access: Timestamp,
+    access_order: u64,
+    generation: u64,
+    live: Option<LiveTurn>,
+    model: Option<String>,
+    retiring: bool,
+}
+
+#[derive(Debug)]
+struct ConversationRegistry {
+    entries: HashMap<String, ManagedConversation>,
+    capacity: usize,
+    idle_ttl: Duration,
+    generation: u64,
+    next_access: u64,
+}
+
+#[derive(Clone)]
+struct RetiringTurn {
+    cancel: CancellationToken,
+    finished: CancellationToken,
+    abort: Arc<Mutex<TurnAbortState>>,
+}
+
+struct RetirementAbortGuard {
+    turns: Vec<RetiringTurn>,
+    armed: bool,
+}
+
+impl RetirementAbortGuard {
+    const fn new(turns: Vec<RetiringTurn>) -> Self {
+        Self { turns, armed: true }
+    }
+
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RetirementAbortGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for turn in &self.turns {
+            turn.cancel.cancel();
+            if !turn.finished.is_cancelled() {
+                request_turn_abort(&turn.abort);
+            }
+        }
+    }
+}
+
+fn install_turn_abort(state: &Mutex<TurnAbortState>, handle: tokio::task::AbortHandle) {
+    let abort = {
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.requested {
+            Some(handle)
+        } else {
+            state.handle = Some(handle);
+            None
+        }
+    };
+    if let Some(abort) = abort {
+        abort.abort();
+    }
+}
+
+fn request_turn_abort(state: &Mutex<TurnAbortState>) {
+    let abort = {
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.requested = true;
+        state.handle.take()
+    };
+    if let Some(abort) = abort {
+        abort.abort();
+    }
+}
+
+struct Retirement {
+    existed: bool,
+    idle: Option<RetiredSession>,
+    active: Option<RetiringTurn>,
+}
+
+#[derive(Clone)]
+struct RetiredSession {
+    session_id: SessionId,
+    generation: u64,
+}
+
+struct ReloadPlan {
+    generation: u64,
+    idle: Vec<RetiredSession>,
+    active: Vec<RetiringTurn>,
+}
+
+impl ConversationRegistry {
+    fn new(capacity: usize, idle_ttl: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            capacity: capacity.max(1),
+            idle_ttl,
+            generation: 0,
+            next_access: 1,
+        }
+    }
+
+    const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    const fn next_access(&mut self) -> u64 {
+        let access = self.next_access;
+        self.next_access = self.next_access.saturating_add(1);
+        access
+    }
+
+    fn sweep(&mut self, now: Timestamp) -> Vec<SessionId> {
+        let idle_ttl = self.idle_ttl;
+        let mut expired: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.live.is_none()
+                    && entry
+                        .last_access
+                        .checked_add(idle_ttl)
+                        .is_some_and(|deadline| now > deadline)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        expired.sort();
+        expired
+            .into_iter()
+            .filter_map(|key| self.entries.remove(&key))
+            .map(|entry| entry.session_id)
+            .collect()
+    }
+
+    fn claim(
+        &mut self,
+        session_id: &SessionId,
+        expected_generation: u64,
+        live: LiveTurn,
+        now: Timestamp,
+    ) -> Result<Option<SessionId>, RuntimeError> {
+        if expected_generation != self.generation {
+            return Err(RuntimeError::ReloadFenced {
+                expected: expected_generation,
+                current: self.generation,
+            });
+        }
+
+        let key = session_id.as_str();
+        if let Some(existing) = self.entries.get(key) {
+            if existing.retiring {
+                return Err(RuntimeError::SessionRetiring);
+            }
+            if let Some(turn) = existing.live.as_ref().map(|turn| turn.turn) {
+                return Err(RuntimeError::TurnInFlight { turn });
+            }
+        }
+
+        let evicted = if self.entries.contains_key(key) {
+            None
+        } else {
+            self.make_room()?
+        };
+        let access_order = self.next_access();
+        let entry = self
+            .entries
+            .entry(key.to_owned())
+            .or_insert_with(|| ManagedConversation {
+                session_id: session_id.clone(),
+                last_access: now,
+                access_order,
+                generation: expected_generation,
+                live: None,
+                model: None,
+                retiring: false,
+            });
+        entry.last_access = now;
+        entry.access_order = access_order;
+        entry.generation = expected_generation;
+        entry.live = Some(live);
+        Ok(evicted)
+    }
+
+    fn model(&mut self, session_id: &SessionId, now: Timestamp) -> Option<String> {
+        let access_order = self.next_access();
+        let entry = self.entries.get_mut(session_id.as_str())?;
+        if entry.retiring {
+            return None;
+        }
+        entry.last_access = now;
+        entry.access_order = access_order;
+        entry.model.clone()
+    }
+
+    fn set_model(
+        &mut self,
+        session_id: &SessionId,
+        model: Option<String>,
+        now: Timestamp,
+    ) -> Result<Option<SessionId>, RuntimeError> {
+        if self
+            .entries
+            .get(session_id.as_str())
+            .is_some_and(|entry| entry.retiring)
+        {
+            return Err(RuntimeError::SessionRetiring);
+        }
+        let evicted = if self.entries.contains_key(session_id.as_str()) {
+            None
+        } else {
+            self.make_room()?
+        };
+        let access_order = self.next_access();
+        let entry = self
+            .entries
+            .entry(session_id.as_str().to_owned())
+            .or_insert_with(|| ManagedConversation {
+                session_id: session_id.clone(),
+                last_access: now,
+                access_order,
+                generation: self.generation,
+                live: None,
+                model: None,
+                retiring: false,
+            });
+        entry.last_access = now;
+        entry.access_order = access_order;
+        entry.model = model;
+        Ok(evicted)
+    }
+
+    fn make_room(&mut self) -> Result<Option<SessionId>, RuntimeError> {
+        if self.entries.len() < self.capacity {
+            return Ok(None);
+        }
+        let candidate = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.live.is_none() && !entry.retiring)
+            .min_by(|(left_key, left), (right_key, right)| {
+                left.access_order
+                    .cmp(&right.access_order)
+                    .then_with(|| left_key.cmp(right_key))
+            })
+            .map(|(key, _)| key.clone())
+            .ok_or(RuntimeError::SessionCapacityReached {
+                capacity: self.capacity,
+            })?;
+        Ok(self
+            .entries
+            .remove(&candidate)
+            .map(|entry| entry.session_id))
+    }
+
+    fn release(
+        &mut self,
+        session_id: &SessionId,
+        turn: TurnId,
+        generation: u64,
+        now: Timestamp,
+    ) -> Option<SessionId> {
+        let key = session_id.as_str();
+        let access_order = self.next_access();
+        let entry = self.entries.get_mut(key)?;
+        if entry.generation != generation
+            || entry.live.as_ref().is_none_or(|live| live.turn != turn)
+        {
+            return None;
+        }
+        entry.live = None;
+        entry.last_access = now;
+        entry.access_order = access_order;
+        entry.retiring.then(|| entry.session_id.clone())
+    }
+
+    fn finish_retirement(&mut self, session_id: &SessionId, generation: u64) {
+        let removable = self.entries.get(session_id.as_str()).is_some_and(|entry| {
+            entry.retiring && entry.live.is_none() && entry.generation == generation
+        });
+        if removable {
+            self.entries.remove(session_id.as_str());
+        }
+    }
+
+    fn retire(&mut self, session_id: &SessionId) -> Retirement {
+        // Fence every session creation that began before this terminal action.
+        // Existing owned sessions remain valid; only claims still awaiting I/O
+        // must retry against the new generation.
+        self.generation = self.generation.saturating_add(1);
+        let key = session_id.as_str();
+        let Some(entry) = self.entries.get_mut(key) else {
+            return Retirement {
+                existed: false,
+                idle: None,
+                active: None,
+            };
+        };
+        entry.model = None;
+        entry.retiring = true;
+        let active = entry.live.as_ref().map(|live| RetiringTurn {
+            cancel: live.cancel.clone(),
+            finished: live.finished.clone(),
+            abort: Arc::clone(&live.abort),
+        });
+        let idle = active.is_none().then(|| RetiredSession {
+            session_id: entry.session_id.clone(),
+            generation: entry.generation,
+        });
+        Retirement {
+            existed: true,
+            idle,
+            active,
+        }
+    }
+
+    fn reload(&mut self) -> ReloadPlan {
+        self.generation = self.generation.saturating_add(1);
+        let mut idle = Vec::new();
+        let mut active = Vec::new();
+        for entry in self.entries.values_mut() {
+            entry.model = None;
+            entry.retiring = true;
+            if let Some(live) = &entry.live {
+                active.push(RetiringTurn {
+                    cancel: live.cancel.clone(),
+                    finished: live.finished.clone(),
+                    abort: Arc::clone(&live.abort),
+                });
+            } else {
+                idle.push(RetiredSession {
+                    session_id: entry.session_id.clone(),
+                    generation: entry.generation,
+                });
+            }
+        }
+        ReloadPlan {
+            generation: self.generation,
+            idle,
+            active,
+        }
+    }
+
+    fn clear(&mut self) -> Vec<SessionId> {
+        self.entries
+            .drain()
+            .map(|(_, entry)| entry.session_id)
+            .collect()
+    }
+
+    fn ids(&self) -> Vec<SessionId> {
+        let mut ids: Vec<SessionId> = self
+            .entries
+            .values()
+            .map(|entry| entry.session_id.clone())
+            .collect();
+        ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        ids
+    }
+
+    fn live_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| entry.live.is_some())
+            .count()
+    }
 }
 
 /// Releases a session's live-turn registration and its work permit when the turn task ends.
@@ -405,19 +981,34 @@ struct LiveTurn {
 /// having a turn in flight, which would make every later [`Runtime::submit`] return
 /// [`RuntimeError::TurnInFlight`].
 ///
-/// The permit is a field rather than a separate binding so that it is released *after* the
-/// live-turn entry is removed on every path: [`Drop::drop`] runs before a value's fields are
-/// dropped. A suspension that observes zero in-flight work therefore also observes an empty
-/// live-turn map.
+/// The permit is held in an [`Option`] so [`Drop::drop`] can release ownership first, then the
+/// permit, and only then signal terminal completion. A destroy caller that observes `finished`
+/// therefore also observes no live turn and no suspension work permit.
 struct LiveTurnGuard {
     inner: Arc<RuntimeInner>,
-    session_key: String,
-    _permit: WorkPermit,
+    session_id: SessionId,
+    turn: TurnId,
+    generation: u64,
+    finished: CancellationToken,
+    permit: Option<WorkPermit>,
 }
 
 impl Drop for LiveTurnGuard {
     fn drop(&mut self) {
-        self.inner.live().remove(&self.session_key);
+        let removed = self.inner.sessions().release(
+            &self.session_id,
+            self.turn,
+            self.generation,
+            self.inner.ports.clock.now(),
+        );
+        if let Some(session_id) = removed {
+            self.inner.cleanup_sessions([session_id.clone()]);
+            self.inner
+                .sessions()
+                .finish_retirement(&session_id, self.generation);
+        }
+        drop(self.permit.take());
+        self.finished.cancel();
     }
 }
 
@@ -430,27 +1021,21 @@ struct RuntimeInner {
     suspension: SuspensionController,
     commands: CommandRegistry,
     directives: DirectiveRegistry,
-    live: Mutex<HashMap<String, LiveTurn>>,
-    // Grows by one entry per session that ever selects a model, and only an explicit reset to the
-    // default removes one: an override has to outlive the turn that set it, and this crate has no
-    // session-close hook to retire it at. `StatePort` is load/save only, and no command ends a
-    // session, so bounded cleanup needs a session-termination signal that does not exist yet.
-    // Long-lived hosts leak here in proportion to distinct sessions, slowly.
-    models: Mutex<HashMap<String, String>>,
+    sessions: Mutex<ConversationRegistry>,
     shutdown: CancellationToken,
 }
 
 impl RuntimeInner {
-    fn live(&self) -> MutexGuard<'_, HashMap<String, LiveTurn>> {
-        self.live
+    fn sessions(&self) -> MutexGuard<'_, ConversationRegistry> {
+        self.sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn models(&self) -> MutexGuard<'_, HashMap<String, String>> {
-        self.models
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn cleanup_sessions(&self, session_ids: impl IntoIterator<Item = SessionId>) {
+        for session_id in session_ids {
+            let _forgotten = self.broker.forget_session(&session_id);
+        }
     }
 
     /// Returns every tool name the provider may call this turn.
@@ -472,11 +1057,20 @@ pub struct Runtime {
 
 impl fmt::Debug for Runtime {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        // Read out first: a `Debug` render must not hold the live-turn lock while it formats.
-        let live_turns = self.inner.live().len();
+        // Read out first: formatting must not hold the registry lock.
+        let (live_turns, managed_sessions, generation) = {
+            let sessions = self.inner.sessions();
+            (
+                sessions.live_count(),
+                sessions.entries.len(),
+                sessions.generation(),
+            )
+        };
         formatter
             .debug_struct("Runtime")
             .field("live_turns", &live_turns)
+            .field("managed_sessions", &managed_sessions)
+            .field("session_generation", &generation)
             .field("tracked_tasks", &self.tracker.len())
             .field("shutting_down", &self.inner.shutdown.is_cancelled())
             .finish_non_exhaustive()
@@ -487,6 +1081,8 @@ impl Runtime {
     /// Creates a runtime over a set of ports.
     #[must_use]
     pub fn new(ports: RuntimePorts, config: RuntimeConfig) -> Self {
+        let session_capacity = config.session_capacity;
+        let session_idle_ttl = config.session_idle_ttl;
         let broker = ApprovalBroker::new(
             Arc::clone(&ports.approvals),
             Arc::clone(&ports.clock),
@@ -517,8 +1113,10 @@ impl Runtime {
                 suspension,
                 commands: CommandRegistry::builtin(),
                 directives: DirectiveRegistry::builtin(),
-                live: Mutex::new(HashMap::new()),
-                models: Mutex::new(HashMap::new()),
+                sessions: Mutex::new(ConversationRegistry::new(
+                    session_capacity,
+                    session_idle_ttl,
+                )),
                 shutdown: CancellationToken::new(),
             }),
             tracker: TaskTracker::new(),
@@ -543,7 +1141,37 @@ impl Runtime {
     /// this returns.
     #[must_use]
     pub fn selected_model(&self, session_id: &SessionId) -> Option<String> {
-        self.inner.models().get(session_id.as_str()).cloned()
+        let _expired = self.sweep_sessions();
+        self.inner
+            .sessions()
+            .model(session_id, self.inner.ports.clock.now())
+    }
+
+    /// Removes every strictly expired idle session and returns their identifiers.
+    ///
+    /// The same sweep runs before every session access; hosts may call this on a
+    /// timer to reclaim idle entries even when no traffic arrives.
+    #[must_use]
+    pub fn sweep_sessions(&self) -> Vec<SessionId> {
+        let expired = self.inner.sessions().sweep(self.inner.ports.clock.now());
+        self.inner.cleanup_sessions(expired.iter().cloned());
+        expired
+    }
+
+    /// Returns the currently owned conversation identifiers in lexical order.
+    ///
+    /// Reading the inventory performs strict TTL cleanup but does not refresh
+    /// any individual session's LRU position.
+    #[must_use]
+    pub fn managed_session_ids(&self) -> Vec<SessionId> {
+        let _expired = self.sweep_sessions();
+        self.inner.sessions().ids()
+    }
+
+    /// Returns the generation used to fence asynchronous session creation.
+    #[must_use]
+    pub fn session_generation(&self) -> u64 {
+        self.inner.sessions().generation()
     }
 
     /// Returns every tool the runtime can dispatch, including the model-callable goal tool.
@@ -613,6 +1241,8 @@ impl Runtime {
         }
 
         let permit = self.inner.suspension.admit()?;
+        let _expired = self.sweep_sessions();
+        let generation = self.session_generation();
 
         let snapshot = self.inner.ports.state.load_session(session_id).await?;
         let (turn, revision, reason) = snapshot.map_or(
@@ -633,25 +1263,25 @@ impl Runtime {
         if self.inner.shutdown.is_cancelled() {
             return Err(RuntimeError::ShuttingDown);
         }
-
         let cancel = self.inner.shutdown.child_token();
         let (paused, pause_rx) = watch::channel(false);
-
-        {
-            let mut live = self.inner.live();
-            if let Some(existing) = live.get(session_id.as_str()) {
-                let turn = existing.turn;
-                drop(live);
-                return Err(RuntimeError::TurnInFlight { turn });
-            }
-            live.insert(
-                session_id.as_str().to_owned(),
-                LiveTurn {
-                    turn,
-                    cancel: cancel.clone(),
-                    paused: Arc::new(paused),
-                },
-            );
+        let paused = Arc::new(paused);
+        let finished = CancellationToken::new();
+        let abort = Arc::new(Mutex::new(TurnAbortState::default()));
+        let evicted = self.inner.sessions().claim(
+            session_id,
+            generation,
+            LiveTurn {
+                turn,
+                cancel: cancel.clone(),
+                paused: Arc::clone(&paused),
+                finished: finished.clone(),
+                abort: Arc::clone(&abort),
+            },
+            self.inner.ports.clock.now(),
+        )?;
+        if let Some(evicted) = evicted {
+            self.inner.cleanup_sessions([evicted]);
         }
 
         let (events_tx, events_rx) = mpsc::channel(self.inner.config.event_capacity.max(1));
@@ -672,8 +1302,11 @@ impl Runtime {
 
         let live_guard = LiveTurnGuard {
             inner: Arc::clone(&self.inner),
-            session_key: session_id.as_str().to_owned(),
-            _permit: permit,
+            session_id: session_id.clone(),
+            turn,
+            generation,
+            finished,
+            permit: Some(permit),
         };
 
         // The guard is captured by the task future itself rather than created inside it, so a task
@@ -683,6 +1316,7 @@ impl Runtime {
             drop(live_guard);
             let _ = completion_tx.send(result);
         });
+        install_turn_abort(&abort, spawned.abort_handle());
         drop(spawned);
 
         Ok(TurnHandle {
@@ -734,8 +1368,11 @@ impl Runtime {
                 // own cleanup path, which takes this same lock. The token is lifted out and the
                 // guard released before it fires.
                 let cancel = {
-                    let live = self.inner.live();
-                    live.get(session_id.as_str())
+                    let sessions = self.inner.sessions();
+                    sessions
+                        .entries
+                        .get(session_id.as_str())
+                        .and_then(|session| session.live.as_ref())
                         .map(|turn| turn.cancel.clone())
                         .ok_or(RuntimeError::NoTurnInFlight)?
                 };
@@ -823,10 +1460,103 @@ impl Runtime {
                 ))
             }
             CommandEffect::SetModel(model) => Ok(CommandOutcome::ModelSelected {
-                model: self.select_model(session_id, &model),
+                model: self.select_model(session_id, &model)?,
+            }),
+            CommandEffect::DestroySession => Ok(CommandOutcome::SessionDestroyed {
+                existed: self.destroy_session(session_id).await,
             }),
             CommandEffect::Custom { name, .. } => Ok(CommandOutcome::Unsupported { name }),
         }
+    }
+
+    /// Terminally destroys one in-memory conversation session.
+    ///
+    /// An active turn is fenced, cancelled, and joined before this returns.
+    /// Session-scoped model selection and remembered approvals are removed on
+    /// every path. Durable state remains owned by [`StatePort`], whose current
+    /// contract intentionally has no delete operation.
+    ///
+    pub async fn destroy_session(&self, session_id: &SessionId) -> bool {
+        let _expired = self.sweep_sessions();
+        let Retirement {
+            existed,
+            idle,
+            active,
+        } = self.inner.sessions().retire(session_id);
+        if let Some(idle) = idle {
+            self.inner.cleanup_sessions([idle.session_id.clone()]);
+            self.inner
+                .sessions()
+                .finish_retirement(&idle.session_id, idle.generation);
+        }
+        if let Some(active) = active {
+            let mut abort_guard = RetirementAbortGuard::new(vec![active.clone()]);
+            active.cancel.cancel();
+            if tokio::time::timeout(
+                self.inner.config.session_retire_timeout,
+                active.finished.cancelled(),
+            )
+            .await
+            .is_err()
+            {
+                Self::abort_retiring_turn(&active).await;
+            }
+            abort_guard.disarm();
+        }
+        existed
+    }
+
+    /// Fences all existing sessions for a provider/role/tool reload.
+    ///
+    /// Idle sessions retain a tombstone through approval cleanup. Active turns
+    /// are marked retiring, cancelled, and joined; their drop guards cannot
+    /// reinsert the old generation. New conversations may start against the
+    /// replacement while unrelated old turns drain.
+    ///
+    pub async fn reload_sessions(&self) -> SessionReloadReport {
+        let plan = self.inner.sessions().reload();
+        let destroyed = plan.idle.len().saturating_add(plan.active.len());
+        let cancelled_turns = plan.active.len();
+        for idle in &plan.idle {
+            self.inner.cleanup_sessions([idle.session_id.clone()]);
+            self.inner
+                .sessions()
+                .finish_retirement(&idle.session_id, idle.generation);
+        }
+        let mut abort_guard = RetirementAbortGuard::new(plan.active.clone());
+
+        for active in &plan.active {
+            active.cancel.cancel();
+        }
+        let graceful = tokio::time::timeout(self.inner.config.session_retire_timeout, async {
+            for active in &plan.active {
+                active.finished.cancelled().await;
+            }
+        })
+        .await
+        .is_ok();
+        let mut forced_turns = 0_usize;
+        if !graceful {
+            for active in &plan.active {
+                if !active.finished.is_cancelled() {
+                    forced_turns = forced_turns.saturating_add(1);
+                    Self::abort_retiring_turn(active).await;
+                }
+            }
+        }
+        abort_guard.disarm();
+
+        SessionReloadReport {
+            generation: plan.generation,
+            destroyed,
+            cancelled_turns,
+            forced_turns,
+        }
+    }
+
+    async fn abort_retiring_turn(active: &RetiringTurn) {
+        request_turn_abort(&active.abort);
+        active.finished.cancelled().await;
     }
 
     /// Cancels every live turn, withdraws every outstanding approval, and joins every task.
@@ -847,6 +1577,8 @@ impl Runtime {
 
         self.tracker.close();
         self.tracker.wait().await;
+        let sessions = self.inner.sessions().clear();
+        self.inner.cleanup_sessions(sessions);
 
         withdrawal.map_err(RuntimeError::Approval)
     }
@@ -859,8 +1591,11 @@ impl Runtime {
         // The sender is lifted out of the map so the watch notification — which wakes the turn
         // task — happens outside the live-turn lock every other session contends for.
         let sender = {
-            let live = self.inner.live();
-            live.get(session_id.as_str())
+            let sessions = self.inner.sessions();
+            sessions
+                .entries
+                .get(session_id.as_str())
+                .and_then(|session| session.live.as_ref())
                 .map(|turn| Arc::clone(&turn.paused))
                 .ok_or(RuntimeError::NoTurnInFlight)?
         };
@@ -884,18 +1619,24 @@ impl Runtime {
     ///
     /// The literal argument [`DEFAULT_MODEL_ARGUMENT`], compared case-insensitively, clears the
     /// override so the provider adapter falls back to its own default.
-    fn select_model(&self, session_id: &SessionId, requested: &str) -> Option<String> {
+    fn select_model(
+        &self,
+        session_id: &SessionId,
+        requested: &str,
+    ) -> Result<Option<String>, RuntimeError> {
+        let _expired = self.sweep_sessions();
         let requested = requested.trim();
-        if requested.eq_ignore_ascii_case(DEFAULT_MODEL_ARGUMENT) {
-            self.inner.models().remove(session_id.as_str());
-            return None;
+        let selected =
+            (!requested.eq_ignore_ascii_case(DEFAULT_MODEL_ARGUMENT)).then(|| requested.to_owned());
+        let evicted = self.inner.sessions().set_model(
+            session_id,
+            selected.clone(),
+            self.inner.ports.clock.now(),
+        )?;
+        if let Some(evicted) = evicted {
+            self.inner.cleanup_sessions([evicted]);
         }
-        // Both allocations happen before the lock is taken, so the critical section is one map
-        // insert.
-        let key = session_id.as_str().to_owned();
-        let selected = requested.to_owned();
-        self.inner.models().insert(key, selected.clone());
-        Some(selected)
+        Ok(selected)
     }
 }
 
@@ -1010,11 +1751,11 @@ impl TurnExecution {
         // A `!model` directive wins for this turn only; otherwise the session's `/model` selection
         // applies. Resolved once so every round of the turn runs against the same model even if an
         // operator issues `/model` while the turn is streaming.
-        let model = self
-            .options
-            .model
-            .clone()
-            .or_else(|| self.inner.models().get(self.session_id.as_str()).cloned());
+        let model = self.options.model.clone().or_else(|| {
+            self.inner
+                .sessions()
+                .model(&self.session_id, self.inner.ports.clock.now())
+        });
 
         let mut changed_workspace = false;
 
@@ -1035,19 +1776,22 @@ impl TurnExecution {
                 })
                 .await?;
 
-            let mut stream = self
-                .inner
-                .ports
-                .provider
-                .start_round(ProviderRequest {
-                    session_id: self.session_id.clone(),
-                    turn: self.turn,
-                    round,
-                    messages: prompt.messages,
-                    tool_names: tool_names.clone(),
-                    model: model.clone(),
-                })
-                .await?;
+            let opening = self.inner.ports.provider.start_round(ProviderRequest {
+                session_id: self.session_id.clone(),
+                turn: self.turn,
+                round,
+                messages: prompt.messages,
+                tool_names: tool_names.clone(),
+                model: model.clone(),
+            });
+            let mut stream = tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => {
+                    self.advance(machine, SessionEvent::Cancel).await?;
+                    return Ok(());
+                }
+                opened = opening => opened?,
+            };
 
             if machine.accepts(SessionEvent::Stream) {
                 self.advance(machine, SessionEvent::Stream).await?;
@@ -1413,6 +2157,7 @@ impl TurnExecution {
             result = self.events.send(event) => {
                 drop(result);
             }
+            () = self.cancel.cancelled() => {}
             () = self.inner.shutdown.cancelled() => {}
         }
     }

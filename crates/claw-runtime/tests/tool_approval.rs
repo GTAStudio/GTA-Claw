@@ -187,7 +187,7 @@ async fn a_remembered_decision_answers_later_requests_without_asking() {
         Some(ApprovalDecision::approve_for_session())
     );
 
-    assert!(broker.forget(&session("approvals"), "write_file"));
+    assert_eq!(broker.forget_session(&session("approvals")), 1);
     assert_eq!(broker.remembered(&session("approvals"), "write_file"), None);
     assert!(!broker.forget(&session("approvals"), "write_file"));
 }
