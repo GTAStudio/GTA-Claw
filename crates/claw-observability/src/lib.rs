@@ -31,4 +31,7 @@ pub use metrics::{
     MetricsExporter, MetricsLimits, MetricsSnapshot,
 };
 pub use redaction::{REDACTED, RedactingLayer, Secret, is_sensitive_field};
-pub use telemetry::{LogFormat, TelemetryConfig, TelemetryError, TelemetryHandle, init};
+pub use telemetry::{
+    LogFormat, TelemetryConfig, TelemetryError, TelemetryErrorKind, TelemetryHandle,
+    TelemetryOutput, init, init_with_output,
+};
