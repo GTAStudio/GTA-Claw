@@ -584,11 +584,11 @@ exit 0
 %post
 set -e
 if [ -d /run/systemd/system ]; then
-  systemctl daemon-reload >/dev/null 2>&1
+  systemctl daemon-reload >/dev/null
   if [ "\$1" -eq 1 ]; then
-    systemctl preset gta-claw-daemon.service >/dev/null 2>&1
+    systemctl preset gta-claw-daemon.service >/dev/null
   elif [ "\$1" -gt 1 ] && [ -e /run/gta-claw-daemon.was-active ]; then
-    systemctl restart gta-claw-daemon.service >/dev/null 2>&1
+    systemctl restart gta-claw-daemon.service >/dev/null
   fi
 fi
 exit 0
@@ -597,7 +597,7 @@ exit 0
 set -e
 if [ -d /run/systemd/system ]; then
   if [ "\$1" -eq 0 ]; then
-    systemctl disable --now gta-claw-daemon.service >/dev/null 2>&1
+    systemctl disable --now gta-claw-daemon.service >/dev/null
     if systemctl is-active --quiet gta-claw-daemon.service; then
       exit 1
     fi
@@ -611,7 +611,7 @@ exit 0
 %postun
 set -e
 if [ -d /run/systemd/system ]; then
-  systemctl daemon-reload >/dev/null 2>&1
+  systemctl daemon-reload >/dev/null
 fi
 exit 0
 

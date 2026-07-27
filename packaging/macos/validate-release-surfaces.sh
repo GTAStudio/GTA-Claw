@@ -13,9 +13,15 @@ grep -F '"total":  24' "$inventory" >/dev/null
 grep -F '"schema": 1' "$implementation" >/dev/null
 grep -F '"platform": "macos"' "$implementation" >/dev/null
 
-expected="$(mktemp "${TMPDIR:-/tmp}/gta-claw-macos-surfaces.XXXXXX")"
-actual="$(mktemp "${TMPDIR:-/tmp}/gta-claw-macos-implemented.XXXXXX")"
-trap 'rm -f -- "$expected" "$actual"' EXIT
+work="$REPO_ROOT/target/macos-release-surfaces-$$"
+[[ ! -e "$work" && ! -L "$work" ]] || {
+  printf 'validation work path already exists: %s\n' "$work" >&2
+  exit 1
+}
+mkdir -p "$work"
+expected="$work/expected"
+actual="$work/actual"
+trap 'rm -rf -- "$work"' EXIT
 
 awk -F'"' '/"id":/ { print $4 }' "$inventory" |
   while IFS= read -r id; do

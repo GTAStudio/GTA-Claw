@@ -151,6 +151,7 @@ while IFS= read -r artifact; do
       pkgutil --expand-full "$artifact" "$pkg_stage"
       reject_symlinks "$pkg_stage"
       assert_no_javascript_payload "$pkg_stage"
+      assert_expanded_pkg_install_contract "$pkg_stage"
       if find "$pkg_stage" -type d -name Scripts -print -quit | grep . >/dev/null; then
         die "PKG contains forbidden installer scripts"
       fi
@@ -197,10 +198,6 @@ done < <(find "$artifact_root" -maxdepth 1 -type f \( \
 if [[ -f "$artifact_root/dmg-content.sha256" && ! -L "$artifact_root/dmg-content.sha256" ]]; then
   allowed_files+="dmg-content.sha256"$'\n'
 fi
-while IFS= read -r published_file; do
-  published_name="$(basename "$published_file")"
-  grep -Fx "$published_name" <<<"$allowed_files" >/dev/null ||
-    die "unexpected published macOS file: $published_name"
-done < <(find "$artifact_root" -maxdepth 1 -type f | LC_ALL=C sort)
+assert_flat_publication_allowlist "$artifact_root" "$allowed_files"
 verify_sha256_manifest "$artifact_root" "$artifact_root/$checksum_name" >/dev/null
 note "validated $artifacts published macOS artifact(s) from $artifact_root"

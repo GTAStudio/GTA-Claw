@@ -105,6 +105,98 @@ function Remove-OwnedDirectory {
     }
 }
 
+function Start-OwnedDirectoryTransaction {
+    param(
+        [Parameter(Mandatory)][string]$OwnedRoot,
+        [Parameter(Mandatory)][string]$Destination
+    )
+    $rootPath = Get-NormalizedFullPath $OwnedRoot
+    $destinationPath = Assert-ChildPath -Parent $rootPath -Child $Destination
+    $workPath = "$destinationPath.packaging-new"
+    $backupPath = "$destinationPath.packaging-previous"
+    Assert-NoReparsePathComponents -Root $rootPath -Path $destinationPath
+    Assert-NoReparsePathComponents -Root $rootPath -Path $workPath
+    Assert-NoReparsePathComponents -Root $rootPath -Path $backupPath
+
+    if (Test-Path -LiteralPath $backupPath) {
+        if (Test-Path -LiteralPath $destinationPath) {
+            Remove-OwnedDirectory -OwnedRoot $rootPath -Path $backupPath
+        } else {
+            Move-Item -LiteralPath $backupPath -Destination $destinationPath
+        }
+    }
+    if (Test-Path -LiteralPath $workPath) {
+        Remove-OwnedDirectory -OwnedRoot $rootPath -Path $workPath
+    }
+    [System.IO.Directory]::CreateDirectory($workPath) | Out-Null
+    Assert-NoReparsePathComponents -Root $rootPath -Path $workPath
+    return [pscustomobject]@{
+        OwnedRoot = $rootPath
+        Destination = $destinationPath
+        WorkPath = $workPath
+        BackupPath = $backupPath
+    }
+}
+
+function Complete-OwnedDirectoryTransaction {
+    param(
+        [Parameter(Mandatory)]$Transaction,
+        [scriptblock]$BackupCleanupAction
+    )
+    $rootPath = Get-NormalizedFullPath $Transaction.OwnedRoot
+    $destinationPath = Assert-ChildPath -Parent $rootPath -Child $Transaction.Destination
+    $workPath = Assert-ChildPath -Parent $rootPath -Child $Transaction.WorkPath
+    $backupPath = Assert-ChildPath -Parent $rootPath -Child $Transaction.BackupPath
+    Assert-NoReparsePathComponents -Root $rootPath -Path $workPath
+    if (-not (Test-Path -LiteralPath $workPath -PathType Container)) {
+        throw "Packaging transaction has no completed output directory: $workPath"
+    }
+    if (Test-Path -LiteralPath $backupPath) {
+        throw "Packaging transaction backup already exists: $backupPath"
+    }
+
+    if (Test-Path -LiteralPath $destinationPath) {
+        Move-Item -LiteralPath $destinationPath -Destination $backupPath
+    }
+    try {
+        Move-Item -LiteralPath $workPath -Destination $destinationPath
+    } catch {
+        if (-not (Test-Path -LiteralPath $destinationPath) -and
+            (Test-Path -LiteralPath $backupPath)) {
+            Move-Item -LiteralPath $backupPath -Destination $destinationPath
+        }
+        throw
+    }
+    if (Test-Path -LiteralPath $backupPath) {
+        try {
+            if ($null -ne $BackupCleanupAction) {
+                & $BackupCleanupAction $rootPath $backupPath
+            } else {
+                Remove-OwnedDirectory -OwnedRoot $rootPath -Path $backupPath
+            }
+        } catch {
+            Write-Warning `
+                -Message "Packaging output was committed to '$destinationPath', but its previous-output backup could not be removed: $($_.Exception.Message)" `
+                -WarningAction Continue
+        }
+    }
+}
+
+function Undo-OwnedDirectoryTransaction {
+    param([Parameter(Mandatory)]$Transaction)
+    $rootPath = Get-NormalizedFullPath $Transaction.OwnedRoot
+    $destinationPath = Assert-ChildPath -Parent $rootPath -Child $Transaction.Destination
+    $workPath = Assert-ChildPath -Parent $rootPath -Child $Transaction.WorkPath
+    $backupPath = Assert-ChildPath -Parent $rootPath -Child $Transaction.BackupPath
+    if (Test-Path -LiteralPath $workPath) {
+        Remove-OwnedDirectory -OwnedRoot $rootPath -Path $workPath
+    }
+    if (-not (Test-Path -LiteralPath $destinationPath) -and
+        (Test-Path -LiteralPath $backupPath)) {
+        Move-Item -LiteralPath $backupPath -Destination $destinationPath
+    }
+}
+
 function Write-Utf8File {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -141,6 +233,58 @@ function Get-CanonicalVersion {
         throw "Desktop version '$desktopVersion' differs from canonical root Cargo version '$version'."
     }
     return Convert-WindowsVersion $version
+}
+
+function Get-PinnedRustVersion {
+    param([Parameter(Mandatory)][string]$RepoRoot)
+    $toolchainPath = Assert-PlainFile (Join-Path $RepoRoot 'rust-toolchain.toml')
+    $section = ''
+    foreach ($line in [System.IO.File]::ReadAllLines($toolchainPath)) {
+        if ($line -match '^\s*\[([^\]]+)\]\s*$') {
+            $section = $Matches[1]
+            continue
+        }
+        if ($section -eq 'toolchain' -and $line -match '^\s*channel\s*=\s*"([^"]+)"\s*$') {
+            if ($Matches[1] -ne '1.97.1') {
+                throw "Windows packaging requires the repository Rust 1.97.1 pin; found '$($Matches[1])'."
+            }
+            return $Matches[1]
+        }
+    }
+    throw "Missing [toolchain].channel in $toolchainPath"
+}
+
+function Assert-RustToolchain {
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [string]$RustcPath,
+        [string]$CargoPath
+    )
+    $expected = Get-PinnedRustVersion $RepoRoot
+    if ([string]::IsNullOrWhiteSpace($RustcPath)) {
+        $RustcPath = (Get-Command rustc -ErrorAction Stop).Source
+    }
+    if ([string]::IsNullOrWhiteSpace($CargoPath)) {
+        $CargoPath = (Get-Command cargo -ErrorAction Stop).Source
+    }
+    if (-not (Test-Path -LiteralPath $RustcPath -PathType Leaf)) {
+        throw "Resolved rustc command is missing: $RustcPath"
+    }
+    if (-not (Test-Path -LiteralPath $CargoPath -PathType Leaf)) {
+        throw "Resolved cargo command is missing: $CargoPath"
+    }
+    $rustcOutput = @(& $RustcPath --version)
+    $rustcExitCode = $LASTEXITCODE
+    $rustcVersion = ($rustcOutput -join "`n").Trim()
+    if ($rustcExitCode -ne 0 -or $rustcVersion -notmatch "^rustc $([regex]::Escape($expected))(?:\s|$)") {
+        throw "Windows packaging requires rustc $expected; resolved '$rustcVersion'. Set RUSTUP_TOOLCHAIN=$expected or run from the repository root."
+    }
+    $cargoOutput = @(& $CargoPath --version)
+    $cargoExitCode = $LASTEXITCODE
+    $cargoVersion = ($cargoOutput -join "`n").Trim()
+    if ($cargoExitCode -ne 0 -or $cargoVersion -notmatch "^cargo $([regex]::Escape($expected))(?:\s|$)") {
+        throw "Windows packaging requires cargo $expected; resolved '$cargoVersion'. Set RUSTUP_TOOLCHAIN=$expected or run from the repository root."
+    }
 }
 
 function Convert-WindowsVersion {
@@ -719,12 +863,392 @@ function New-DeterministicZip {
 }
 
 function Write-ArtifactHash {
-    param([Parameter(Mandatory)][string]$Path)
-    Assert-PlainFile $Path | Out-Null
-    $hashPath = "$Path.sha256"
-    $line = "$((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash)  $([System.IO.Path]::GetFileName($Path))`n"
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$HashPath,
+        [string]$ArtifactName
+    )
+    $artifact = Assert-PlainFile $Path
+    if ([string]::IsNullOrWhiteSpace($HashPath)) {
+        $HashPath = "$artifact.sha256"
+    }
+    if ([string]::IsNullOrWhiteSpace($ArtifactName)) {
+        $ArtifactName = [System.IO.Path]::GetFileName($artifact)
+    }
+    if ([System.IO.Path]::GetFileName($ArtifactName) -cne $ArtifactName) {
+        throw "Artifact hash name must be a file name, not a path: $ArtifactName"
+    }
+    $hashPath = [System.IO.Path]::GetFullPath($HashPath)
+    $line = "$((Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash)  $ArtifactName`n"
     Write-Utf8File -Path $hashPath -Content $line
     return $hashPath
+}
+
+function Test-ArtifactHash {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$HashPath,
+        [string]$ArtifactName
+    )
+    $artifact = Assert-PlainFile $Path
+    if ([string]::IsNullOrWhiteSpace($HashPath)) {
+        $HashPath = "$artifact.sha256"
+    }
+    if ([string]::IsNullOrWhiteSpace($ArtifactName)) {
+        $ArtifactName = [System.IO.Path]::GetFileName($artifact)
+    }
+    if ([System.IO.Path]::GetFileName($ArtifactName) -cne $ArtifactName) {
+        throw "Artifact hash name must be a file name, not a path: $ArtifactName"
+    }
+    $hashPath = Assert-PlainFile $HashPath
+    $lines = [System.IO.File]::ReadAllLines($hashPath)
+    if ($lines.Count -ne 1 -or $lines[0] -notmatch '^([0-9A-Fa-f]{64})  ([^\\/]+)$') {
+        throw "Artifact SHA-256 companion has an invalid format: $hashPath"
+    }
+    if ($Matches[2] -cne $ArtifactName) {
+        throw "Artifact SHA-256 companion names '$($Matches[2])' instead of '$ArtifactName'."
+    }
+    $actual = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash
+    if ($actual -ne $Matches[1]) {
+        throw "Artifact SHA-256 companion does not match the published bytes: $artifact"
+    }
+}
+
+function Test-ArtifactHashPair {
+    param(
+        [Parameter(Mandatory)][string]$ArtifactPath,
+        [Parameter(Mandatory)][string]$HashPath,
+        [Parameter(Mandatory)][string]$ArtifactName
+    )
+    if (-not (Test-Path -LiteralPath $ArtifactPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $HashPath -PathType Leaf)) {
+        return $false
+    }
+    try {
+        Test-ArtifactHash -Path $ArtifactPath -HashPath $HashPath -ArtifactName $ArtifactName
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Repair-OwnedArtifactPairTransaction {
+    param(
+        [Parameter(Mandatory)][string]$OwnedRoot,
+        [Parameter(Mandatory)][string]$DestinationArtifact,
+        [string]$DestinationHash = "$DestinationArtifact.sha256",
+        [string[]]$PreserveStagedPath = @()
+    )
+    $rootPath = Get-NormalizedFullPath $OwnedRoot
+    $destinationArtifactPath = Assert-ChildPath -Parent $rootPath -Child $DestinationArtifact
+    $destinationHashPath = Assert-ChildPath -Parent $rootPath -Child $DestinationHash
+    $artifactName = [System.IO.Path]::GetFileName($destinationArtifactPath)
+    $artifactBackup = "$destinationArtifactPath.packaging-previous"
+    $hashBackup = "$destinationHashPath.packaging-previous"
+    $statePath = "$destinationArtifactPath.packaging-transaction.json"
+    $phase = ''
+    $stateStagedPaths = @()
+    if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+        try {
+            $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+            if ($state.schema -eq 1) {
+                $phase = [string]$state.phase
+                foreach ($property in @('staged_artifact', 'staged_hash')) {
+                    if ($state.PSObject.Properties.Name -contains $property) {
+                        $candidate = Assert-ChildPath -Parent $rootPath -Child ([string]$state.$property)
+                        $stateStagedPaths += $candidate
+                    }
+                }
+            }
+        } catch {
+            $phase = ''
+            $stateStagedPaths = @()
+        }
+    }
+
+    $finalValid = Test-ArtifactHashPair `
+        -ArtifactPath $destinationArtifactPath `
+        -HashPath $destinationHashPath `
+        -ArtifactName $artifactName
+    $backupValid = Test-ArtifactHashPair `
+        -ArtifactPath $artifactBackup `
+        -HashPath $hashBackup `
+        -ArtifactName $artifactName
+    $splitArtifactBackupValid = Test-ArtifactHashPair `
+        -ArtifactPath $artifactBackup `
+        -HashPath $destinationHashPath `
+        -ArtifactName $artifactName
+    $splitHashBackupValid = Test-ArtifactHashPair `
+        -ArtifactPath $destinationArtifactPath `
+        -HashPath $hashBackup `
+        -ArtifactName $artifactName
+    $committed = $phase -in @('committed', 'artifact-backup-removed', 'hash-backup-removed')
+
+    if ($committed -and $finalValid) {
+        # The destination pair is the commit point; unmatched backups are cleanup debris.
+    } elseif ($backupValid) {
+        foreach ($destination in @($destinationArtifactPath, $destinationHashPath)) {
+            if (Test-Path -LiteralPath $destination) {
+                Remove-Item -LiteralPath $destination -Force
+            }
+        }
+        Move-Item -LiteralPath $artifactBackup -Destination $destinationArtifactPath
+        Move-Item -LiteralPath $hashBackup -Destination $destinationHashPath
+        $finalValid = $true
+    } elseif ($splitArtifactBackupValid) {
+        if (Test-Path -LiteralPath $destinationArtifactPath) {
+            Remove-Item -LiteralPath $destinationArtifactPath -Force
+        }
+        Move-Item -LiteralPath $artifactBackup -Destination $destinationArtifactPath
+        $finalValid = $true
+    } elseif ($splitHashBackupValid) {
+        if (Test-Path -LiteralPath $destinationHashPath) {
+            Remove-Item -LiteralPath $destinationHashPath -Force
+        }
+        Move-Item -LiteralPath $hashBackup -Destination $destinationHashPath
+        $finalValid = $true
+    } elseif (-not $finalValid) {
+        foreach ($debris in @(
+            $destinationArtifactPath,
+            $destinationHashPath,
+            $artifactBackup,
+            $hashBackup
+        )) {
+            if (Test-Path -LiteralPath $debris) {
+                Remove-Item -LiteralPath $debris -Force
+            }
+        }
+    }
+
+    if ($finalValid) {
+        Test-ArtifactHash $destinationArtifactPath
+        foreach ($backup in @($artifactBackup, $hashBackup)) {
+            if (Test-Path -LiteralPath $backup) {
+                Remove-Item -LiteralPath $backup -Force
+            }
+        }
+    }
+    if (Test-Path -LiteralPath $statePath) {
+        Remove-Item -LiteralPath $statePath -Force
+    }
+
+    $preserved = @{}
+    foreach ($path in $PreserveStagedPath) {
+        $preserved[(Get-NormalizedFullPath $path)] = $true
+    }
+    foreach ($stagedPath in $stateStagedPaths) {
+        if (-not $preserved.ContainsKey((Get-NormalizedFullPath $stagedPath)) -and
+            (Test-Path -LiteralPath $stagedPath)) {
+            Remove-Item -LiteralPath $stagedPath -Force
+        }
+    }
+}
+
+function Publish-OwnedArtifactPair {
+    param(
+        [Parameter(Mandatory)][string]$OwnedRoot,
+        [Parameter(Mandatory)][string]$StagedArtifact,
+        [Parameter(Mandatory)][string]$StagedHash,
+        [Parameter(Mandatory)][string]$DestinationArtifact,
+        [string]$DestinationHash = "$DestinationArtifact.sha256",
+        [scriptblock]$HashPublishAction,
+        [ValidateSet(
+            '',
+            'prepared',
+            'artifact-backup-renamed',
+            'artifact-backed-up',
+            'hash-backup-renamed',
+            'hash-backed-up',
+            'artifact-publish-renamed',
+            'artifact-published',
+            'hash-publish-renamed',
+            'hash-published',
+            'committed',
+            'artifact-backup-deleted',
+            'artifact-backup-removed',
+            'hash-backup-deleted',
+            'hash-backup-removed'
+        )]
+        [string]$StopAfterPhase = '',
+        [scriptblock]$PostCommitCleanupAction
+    )
+    $rootPath = Get-NormalizedFullPath $OwnedRoot
+    $stagedArtifactPath = Assert-ChildPath -Parent $rootPath -Child $StagedArtifact
+    $stagedHashPath = Assert-ChildPath -Parent $rootPath -Child $StagedHash
+    $destinationArtifactPath = Assert-ChildPath -Parent $rootPath -Child $DestinationArtifact
+    $destinationHashPath = Assert-ChildPath -Parent $rootPath -Child $DestinationHash
+    $artifactName = [System.IO.Path]::GetFileName($destinationArtifactPath)
+    $artifactBackup = "$destinationArtifactPath.packaging-previous"
+    $hashBackup = "$destinationHashPath.packaging-previous"
+    $statePath = "$destinationArtifactPath.packaging-transaction.json"
+    Assert-NoReparsePathComponents -Root $rootPath -Path $stagedArtifactPath
+    Assert-NoReparsePathComponents -Root $rootPath -Path $stagedHashPath
+
+    Repair-OwnedArtifactPairTransaction `
+        -OwnedRoot $rootPath `
+        -DestinationArtifact $destinationArtifactPath `
+        -DestinationHash $destinationHashPath `
+        -PreserveStagedPath @($stagedArtifactPath, $stagedHashPath)
+    Test-ArtifactHash `
+        -Path $stagedArtifactPath `
+        -HashPath $stagedHashPath `
+        -ArtifactName $artifactName
+
+    $hasPriorPair = Test-ArtifactHashPair `
+        -ArtifactPath $destinationArtifactPath `
+        -HashPath $destinationHashPath `
+        -ArtifactName $artifactName
+    if (-not $hasPriorPair -and
+        ((Test-Path -LiteralPath $destinationArtifactPath) -or
+         (Test-Path -LiteralPath $destinationHashPath))) {
+        throw 'Artifact-pair recovery left an incomplete destination.'
+    }
+
+    function Set-TransactionPhase([string]$Phase) {
+        $state = [ordered]@{
+            schema = 1
+            phase = $Phase
+            had_prior_pair = $hasPriorPair
+            staged_artifact = $stagedArtifactPath
+            staged_hash = $stagedHashPath
+        }
+        Write-Utf8File -Path $statePath -Content (($state | ConvertTo-Json -Compress) + "`n")
+        return ($StopAfterPhase -eq $Phase)
+    }
+
+    if (Set-TransactionPhase 'prepared') {
+        return
+    }
+
+    try {
+        if ($hasPriorPair) {
+            Move-Item -LiteralPath $destinationArtifactPath -Destination $artifactBackup
+            if ($StopAfterPhase -eq 'artifact-backup-renamed') {
+                return
+            }
+            if (Set-TransactionPhase 'artifact-backed-up') {
+                return
+            }
+            Move-Item -LiteralPath $destinationHashPath -Destination $hashBackup
+            if ($StopAfterPhase -eq 'hash-backup-renamed') {
+                return
+            }
+            if (Set-TransactionPhase 'hash-backed-up') {
+                return
+            }
+        }
+        Move-Item -LiteralPath $stagedArtifactPath -Destination $destinationArtifactPath
+        if ($StopAfterPhase -eq 'artifact-publish-renamed') {
+            return
+        }
+        if (Set-TransactionPhase 'artifact-published') {
+            return
+        }
+        if ($null -ne $HashPublishAction) {
+            & $HashPublishAction $stagedHashPath $destinationHashPath
+        } else {
+            Move-Item -LiteralPath $stagedHashPath -Destination $destinationHashPath
+        }
+        if ($StopAfterPhase -eq 'hash-publish-renamed') {
+            return
+        }
+        if (Set-TransactionPhase 'hash-published') {
+            return
+        }
+        Test-ArtifactHash $destinationArtifactPath
+        if (Set-TransactionPhase 'committed') {
+            return
+        }
+    } catch {
+        Repair-OwnedArtifactPairTransaction `
+            -OwnedRoot $rootPath `
+            -DestinationArtifact $destinationArtifactPath `
+            -DestinationHash $destinationHashPath
+        throw
+    }
+
+    function Invoke-PostCommitCleanup(
+        [string]$Operation,
+        [string]$Description,
+        [scriptblock]$Action
+    ) {
+        try {
+            if ($null -ne $PostCommitCleanupAction) {
+                & $PostCommitCleanupAction $Operation | Out-Null
+            }
+            & $Action | Out-Null
+            return $true
+        } catch {
+            Write-Warning `
+                -Message "Committed artifact pair '$destinationArtifactPath' was retained, but post-commit cleanup could not $Description. Recovery will retry next run: $($_.Exception.Message)" `
+                -WarningAction Continue
+            return $false
+        }
+    }
+
+    $artifactBackupRemoved = Invoke-PostCommitCleanup `
+        -Operation 'remove-artifact-backup' `
+        -Description "remove artifact backup '$artifactBackup'" `
+        -Action {
+            if (Test-Path -LiteralPath $artifactBackup) {
+                Remove-Item -LiteralPath $artifactBackup -Force
+            }
+        }
+    if ($artifactBackupRemoved -and $StopAfterPhase -eq 'artifact-backup-deleted') {
+        return
+    }
+    $artifactPhaseUpdated = Invoke-PostCommitCleanup `
+        -Operation 'write-artifact-backup-removed-phase' `
+        -Description 'update the cleanup phase after removing the artifact backup' `
+        -Action { Set-TransactionPhase 'artifact-backup-removed' | Out-Null }
+    if ($artifactPhaseUpdated -and $StopAfterPhase -eq 'artifact-backup-removed') {
+        return
+    }
+
+    $hashBackupRemoved = Invoke-PostCommitCleanup `
+        -Operation 'remove-hash-backup' `
+        -Description "remove hash backup '$hashBackup'" `
+        -Action {
+            if (Test-Path -LiteralPath $hashBackup) {
+                Remove-Item -LiteralPath $hashBackup -Force
+            }
+        }
+    if ($hashBackupRemoved -and $StopAfterPhase -eq 'hash-backup-deleted') {
+        return
+    }
+    $hashPhaseUpdated = Invoke-PostCommitCleanup `
+        -Operation 'write-hash-backup-removed-phase' `
+        -Description 'update the cleanup phase after removing the hash backup' `
+        -Action { Set-TransactionPhase 'hash-backup-removed' | Out-Null }
+    if ($hashPhaseUpdated -and $StopAfterPhase -eq 'hash-backup-removed') {
+        return
+    }
+    $stagedArtifactRemoved = Invoke-PostCommitCleanup `
+        -Operation 'remove-staged-artifact' `
+        -Description "remove staged artifact debris '$stagedArtifactPath'" `
+        -Action {
+            if (Test-Path -LiteralPath $stagedArtifactPath) {
+                Remove-Item -LiteralPath $stagedArtifactPath -Force
+            }
+        }
+    $stagedHashRemoved = Invoke-PostCommitCleanup `
+        -Operation 'remove-staged-hash' `
+        -Description "remove staged hash debris '$stagedHashPath'" `
+        -Action {
+            if (Test-Path -LiteralPath $stagedHashPath) {
+                Remove-Item -LiteralPath $stagedHashPath -Force
+            }
+        }
+    if ($stagedArtifactRemoved -and $stagedHashRemoved) {
+        Invoke-PostCommitCleanup `
+            -Operation 'remove-phase-journal' `
+            -Description "remove phase journal '$statePath'" `
+            -Action {
+                if (Test-Path -LiteralPath $statePath) {
+                    Remove-Item -LiteralPath $statePath -Force
+                }
+            } | Out-Null
+    }
 }
 
 function New-VisualAssets {
@@ -1023,50 +1547,83 @@ function Test-MsiPackage {
         if ($required -notin $features) {
             throw "Published MSI is missing feature '$required'."
         }
-        $properties = @{}
-        foreach ($row in @(Invoke-MsiQuery -Database $database -Sql 'SELECT `Property`, `Value` FROM `Property`' -Columns 2)) {
-            $properties[$row[0]] = $row[1]
+    }
+    $properties = @{}
+    foreach ($row in @(Invoke-MsiQuery -Database $database -Sql 'SELECT `Property`, `Value` FROM `Property`' -Columns 2)) {
+        $properties[$row[0]] = $row[1]
+    }
+    $version = Get-CanonicalVersion ([System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..')))
+    $arch = Get-Architecture $Architecture
+    $productNamespace = [Guid]'DAD72B88-4094-5FD5-9494-D8C54C8DFE7D'
+    $productGuid = New-UuidV5 -Namespace $productNamespace -Name "$($arch.Name):$($version.Msi)"
+    $expectedProductCode = $productGuid.ToString('B').ToUpperInvariant()
+    $packageNamespace = [Guid]'30E765FA-E804-5919-987E-C06725F6F25B'
+    $packageGuid = New-UuidV5 -Namespace $packageNamespace -Name "$($arch.Name):$($version.Msi)"
+    $expectedPackageCode = $packageGuid.ToString('B').ToUpperInvariant()
+    if ($properties.ProductName -ne 'GTA Claw' -or
+        $properties.Manufacturer -ne 'GTAStudio' -or
+        $properties.ProductVersion -ne $version.Msi -or
+        $properties.ProductCode.ToUpperInvariant() -ne $expectedProductCode -or
+        $properties.UpgradeCode.ToUpperInvariant() -ne "{$($arch.UpgradeCode)}" -or
+        $properties.ContainsKey('ARPNOREMOVE') -or
+        $properties.ContainsKey('ARPNOMODIFY') -or
+        $properties.ContainsKey('ARPNOREPAIR')) {
+        throw 'Published MSI product identity or standard modify/repair/remove behavior is invalid.'
+    }
+    $summary = $database.GetType().InvokeMember(
+        'SummaryInformation',
+        [System.Reflection.BindingFlags]::GetProperty,
+        $null,
+        $database,
+        $null
+    )
+    $template = $summary.GetType().InvokeMember(
+        'Property',
+        [System.Reflection.BindingFlags]::GetProperty,
+        $null,
+        $summary,
+        @(7)
+    )
+    $packageCode = [string]$summary.GetType().InvokeMember(
+        'Property',
+        [System.Reflection.BindingFlags]::GetProperty,
+        $null,
+        $summary,
+        @(9)
+    )
+    $expectedTemplate = "$(if ($Architecture -eq 'x64') { 'x64' } else { 'Arm64' });1033"
+    if ($template -ne $expectedTemplate -or $packageCode.ToUpperInvariant() -ne $expectedPackageCode) {
+        throw 'Published MSI package identity or platform metadata is invalid.'
+    }
+
+    $componentRows = @(Invoke-MsiQuery -Database $database -Sql 'SELECT `Component`, `Attributes` FROM `Component`' -Columns 2)
+    foreach ($row in $componentRows) {
+        if (([int]$row[1] -band 16) -ne 0) {
+            throw "Published MSI component '$($row[0])' is permanent and would survive uninstall."
         }
-        $version = Get-CanonicalVersion ([System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..')))
-        $arch = Get-Architecture $Architecture
-        $productNamespace = [Guid]'DAD72B88-4094-5FD5-9494-D8C54C8DFE7D'
-        $productGuid = New-UuidV5 -Namespace $productNamespace -Name "$($arch.Name):$($version.Msi)"
-        $expectedProductCode = $productGuid.ToString('B').ToUpperInvariant()
-        $packageNamespace = [Guid]'30E765FA-E804-5919-987E-C06725F6F25B'
-        $packageGuid = New-UuidV5 -Namespace $packageNamespace -Name "$($arch.Name):$($version.Msi)"
-        $expectedPackageCode = $packageGuid.ToString('B').ToUpperInvariant()
-        if ($properties.ProductName -ne 'GTA Claw' -or
-            $properties.Manufacturer -ne 'GTAStudio' -or
-            $properties.ProductVersion -ne $version.Msi -or
-            $properties.ProductCode.ToUpperInvariant() -ne $expectedProductCode -or
-            $properties.UpgradeCode.ToUpperInvariant() -ne "{$($arch.UpgradeCode)}") {
-            throw 'Published MSI product identity differs from the deterministic release identity.'
+    }
+    $upgradeRows = @(Invoke-MsiQuery -Database $database -Sql 'SELECT `UpgradeCode`, `Attributes`, `ActionProperty` FROM `Upgrade`' -Columns 3)
+    $upgradeDetection = @($upgradeRows | Where-Object {
+        $_[0].ToUpperInvariant() -eq "{$($arch.UpgradeCode)}" -and
+        $_[2] -eq 'WIX_UPGRADE_DETECTED'
+    })
+    if ($upgradeDetection.Count -ne 1 -or (([int]$upgradeDetection[0][1] -band 1) -eq 0)) {
+        throw 'Published MSI does not detect related products and migrate selected features during major upgrades.'
+    }
+    $sequence = @{}
+    foreach ($row in @(Invoke-MsiQuery -Database $database -Sql 'SELECT `Action`, `Sequence` FROM `InstallExecuteSequence`' -Columns 2)) {
+        $sequence[$row[0]] = [int]$row[1]
+    }
+    foreach ($action in @('FindRelatedProducts', 'InstallInitialize', 'RemoveExistingProducts', 'InstallFiles', 'InstallFinalize')) {
+        if (-not $sequence.ContainsKey($action)) {
+            throw "Published MSI install sequence is missing '$action'."
         }
-        $summary = $database.GetType().InvokeMember(
-            'SummaryInformation',
-            [System.Reflection.BindingFlags]::GetProperty,
-            $null,
-            $database,
-            $null
-        )
-        $template = $summary.GetType().InvokeMember(
-            'Property',
-            [System.Reflection.BindingFlags]::GetProperty,
-            $null,
-            $summary,
-            @(7)
-        )
-        $packageCode = [string]$summary.GetType().InvokeMember(
-            'Property',
-            [System.Reflection.BindingFlags]::GetProperty,
-            $null,
-            $summary,
-            @(9)
-        )
-        $expectedTemplate = "$(if ($Architecture -eq 'x64') { 'x64' } else { 'Arm64' });1033"
-        if ($template -ne $expectedTemplate -or $packageCode.ToUpperInvariant() -ne $expectedPackageCode) {
-            throw 'Published MSI package identity or platform metadata is invalid.'
-        }
+    }
+    if ($sequence.FindRelatedProducts -ge $sequence.InstallInitialize -or
+        $sequence.RemoveExistingProducts -le $sequence.InstallInitialize -or
+        $sequence.RemoveExistingProducts -ge $sequence.InstallFiles -or
+        $sequence.InstallFiles -ge $sequence.InstallFinalize) {
+        throw 'Published MSI major-upgrade sequence is not rollback-safe.'
     }
     $tables = @(Invoke-MsiQuery -Database $database -Sql 'SELECT `Name` FROM `_Tables`' -Columns 1 |
         ForEach-Object { $_[0] })
@@ -1311,8 +1868,20 @@ function Test-WixSource {
     $manager = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
     $manager.AddNamespace('w', 'http://wixtoolset.org/schemas/v4/wxs')
     $package = $xml.SelectSingleNode('/w:Wix/w:Package', $manager)
-    if ($null -eq $package -or $package.Scope -ne 'perMachine') {
+    if ($null -eq $package -or
+        $package.Scope -ne 'perMachine' -or
+        $package.ProductCode -ne '$(var.ProductCode)' -or
+        $package.UpgradeCode -ne '$(var.UpgradeCode)') {
         throw "WiX package must be explicitly per-machine."
+    }
+    $majorUpgrade = $xml.SelectSingleNode('/w:Wix/w:Package/w:MajorUpgrade', $manager)
+    if ($null -eq $majorUpgrade -or
+        $majorUpgrade.Schedule -ne 'afterInstallInitialize' -or
+        $majorUpgrade.AllowSameVersionUpgrades -ne 'no' -or
+        $majorUpgrade.MigrateFeatures -ne 'yes' -or
+        $majorUpgrade.IgnoreRemoveFailure -ne 'no' -or
+        [string]::IsNullOrWhiteSpace($majorUpgrade.DowngradeErrorMessage)) {
+        throw 'WiX major-upgrade behavior must preserve feature selection, reject same-version/downgrade installs, and roll back removal failures.'
     }
     foreach ($feature in @('Gui', 'Headless')) {
         if ($null -eq $xml.SelectSingleNode("//w:Feature[@Id='$feature']", $manager)) {
@@ -1334,12 +1903,15 @@ Export-ModuleMember -Function @(
     'Assert-PeArchitecture',
     'Assert-PlainFile',
     'Assert-RelativePackagePath',
+    'Assert-RustToolchain',
+    'Complete-OwnedDirectoryTransaction',
     'Convert-WindowsVersion',
     'Copy-PlainFile',
     'Find-WindowsSdkTool',
     'Get-Architecture',
     'Get-CanonicalVersion',
     'Get-MsixBundleValidationProfile',
+    'Get-PinnedRustVersion',
     'Initialize-MsvcEnvironment',
     'Invoke-CheckedCommand',
     'New-AppxManifest',
@@ -1347,11 +1919,15 @@ Export-ModuleMember -Function @(
     'New-HashManifest',
     'New-UuidV5',
     'New-VisualAssets',
+    'Publish-OwnedArtifactPair',
+    'Repair-OwnedArtifactPairTransaction',
     'Remove-OwnedDirectory',
     'Set-NormalizedTreeTimestamp',
     'Set-NormalizedMsiStorageTimestamps',
     'Set-NormalizedZipTimestamps',
+    'Start-OwnedDirectoryTransaction',
     'Test-AppxManifest',
+    'Test-ArtifactHash',
     'Test-MsiPackage',
     'Test-HashManifest',
     'Test-MsixBundle',
@@ -1360,6 +1936,7 @@ Export-ModuleMember -Function @(
     'Test-PeDependencies',
     'Test-WixSource',
     'Test-ZipPackage',
+    'Undo-OwnedDirectoryTransaction',
     'Write-ArtifactHash',
     'Write-Utf8File'
 )

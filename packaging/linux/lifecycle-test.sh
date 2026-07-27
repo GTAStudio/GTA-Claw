@@ -24,6 +24,7 @@ done
 
 cleanup() {
   sudo rm -rf /etc/systemd/system/gta-claw-daemon.service.d
+  sudo rm -f /etc/gta-claw/gta-claw.env.rpmsave
   sudo systemctl disable --now gta-claw-daemon.service >/dev/null 2>&1 || true
   if dpkg-query -W gta-claw >/dev/null 2>&1; then
     sudo dpkg --purge gta-claw >/dev/null 2>&1 || true
@@ -31,6 +32,10 @@ cleanup() {
   if rpm -q gta-claw >/dev/null 2>&1; then
     sudo rpm -e --nodeps gta-claw >/dev/null 2>&1 || true
   fi
+  sudo rm -f \
+    /etc/gta-claw/gta-claw.env.rpmsave \
+    /run/gta-claw-daemon.deb-was-active \
+    /run/gta-claw-daemon.deb-was-enabled
   sudo systemctl daemon-reload >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
@@ -71,6 +76,8 @@ remove_failure_dropin() {
 
 sudo dpkg -i "$deb1"
 assert_disabled_and_inactive
+printf 'DEB_LIFECYCLE_MARKER=preserved\n' |
+  sudo tee /etc/gta-claw/gta-claw.env >/dev/null
 install_failure_dropin Service 'ExecStartPre=/bin/false'
 if sudo systemctl start gta-claw-daemon.service; then
   die "intentional Debian start failure unexpectedly succeeded"
@@ -88,6 +95,9 @@ remove_failure_dropin
 sudo systemctl start gta-claw-daemon.service
 sudo dpkg --configure gta-claw
 assert_active_restart "$deb_pid"
+[[ "$(sudo cat /etc/gta-claw/gta-claw.env)" == \
+  "DEB_LIFECYCLE_MARKER=preserved" ]] ||
+  die "Debian upgrade replaced administrator configuration"
 sudo systemctl stop gta-claw-daemon.service
 sudo dpkg -i --force-downgrade "$deb1"
 ! systemctl is-active --quiet gta-claw-daemon.service ||
@@ -99,18 +109,31 @@ if sudo dpkg --remove gta-claw; then
 fi
 [[ -e /usr/libexec/gta-claw/gta-claw-daemon ]] ||
   die "Debian removal unlinked the daemon after stop failure"
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "Debian failed removal did not restore the active service state"
+[[ "$(systemctl is-enabled gta-claw-daemon.service)" == "enabled" ]] ||
+  die "Debian failed removal did not restore the enabled service state"
 remove_failure_dropin
 sudo systemctl start gta-claw-daemon.service
 sudo dpkg --remove gta-claw
 ! systemctl is-active --quiet gta-claw-daemon.service ||
   die "Debian removal left the daemon active"
+[[ "$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null || true)" != "enabled" ]] ||
+  die "Debian removal left the service enabled"
 [[ ! -e /usr/libexec/gta-claw/gta-claw-daemon &&
   ! -e /usr/lib/systemd/system/gta-claw-daemon.service ]] ||
   die "Debian removal left package-owned executable or unit"
+[[ "$(sudo cat /etc/gta-claw/gta-claw.env)" == \
+  "DEB_LIFECYCLE_MARKER=preserved" ]] ||
+  die "Debian removal did not preserve administrator configuration"
 sudo dpkg --purge gta-claw
+[[ ! -e /etc/gta-claw/gta-claw.env ]] ||
+  die "Debian purge left the environment conffile"
 
 sudo rpm -ivh --nodeps "$rpm1"
 assert_disabled_and_inactive
+printf 'RPM_LIFECYCLE_MARKER=preserved\n' |
+  sudo tee /etc/gta-claw/gta-claw.env >/dev/null
 install_failure_dropin Service 'ExecStartPre=/bin/false'
 if sudo systemctl start gta-claw-daemon.service; then
   die "intentional RPM start failure unexpectedly succeeded"
@@ -126,6 +149,9 @@ remove_failure_dropin
 sudo systemctl start gta-claw-daemon.service
 sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"
 assert_active_restart "$rpm_pid"
+[[ "$(sudo cat /etc/gta-claw/gta-claw.env)" == \
+  "RPM_LIFECYCLE_MARKER=preserved" ]] ||
+  die "RPM upgrade replaced administrator configuration"
 sudo systemctl stop gta-claw-daemon.service
 sudo rpm -Uvh --nodeps --oldpackage "$rpm1"
 ! systemctl is-active --quiet gta-claw-daemon.service ||
@@ -150,9 +176,15 @@ sudo systemctl start gta-claw-daemon.service
 sudo rpm -e --nodeps gta-claw
 ! systemctl is-active --quiet gta-claw-daemon.service ||
   die "RPM removal left the daemon active"
+[[ "$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null || true)" != "enabled" ]] ||
+  die "RPM removal left the service enabled"
 [[ ! -e /usr/libexec/gta-claw/gta-claw-daemon &&
   ! -e /usr/lib/systemd/system/gta-claw-daemon.service ]] ||
   die "RPM removal left package-owned executable or unit"
+[[ ! -e /etc/gta-claw/gta-claw.env &&
+  "$(sudo cat /etc/gta-claw/gta-claw.env.rpmsave)" == \
+    "RPM_LIFECYCLE_MARKER=preserved" ]] ||
+  die "RPM removal did not preserve administrator configuration as .rpmsave"
 
 trap - EXIT INT TERM
 echo "Debian and RPM install/start/upgrade/remove lifecycle tests passed"

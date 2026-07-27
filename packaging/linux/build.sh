@@ -34,6 +34,11 @@ target="$(arch_target "$arch")"
 [[ "$BUILD_RECIPE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "invalid build recipe digest"
 [[ "$BUILD_ENVIRONMENT_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] ||
   die "invalid build environment image ID"
+export RUSTUP_TOOLCHAIN="$LINUX_RUST_TOOLCHAIN"
+[[ "$(rustc --version)" == "rustc $LINUX_RUST_TOOLCHAIN "* ]] ||
+  die "rustc does not match pinned toolchain $LINUX_RUST_TOOLCHAIN"
+[[ "$(cargo --version)" == "cargo $LINUX_RUST_TOOLCHAIN "* ]] ||
+  die "cargo does not match pinned toolchain $LINUX_RUST_TOOLCHAIN"
 
 OUTPUT_ROOT="$CARGO_TARGET_DIR"
 initialize_output_root
@@ -343,9 +348,11 @@ write_json_file "$manifest" -n \
     runtimeManifest: {path: $runtime_path, sha256: $runtime_sha}
   }'
 manifest_sha="$(sha256_file "$manifest")"
-private_key="$(mktemp /tmp/gta-claw-build-key.XXXXXXXXXX)"
+private_key="$OUTPUT_ROOT/.build-private-key.pem"
 trap 'rm -f -- "$private_key"; release_output_lock' EXIT INT TERM
-openssl genpkey -algorithm ED25519 -out "$private_key"
+open_output_file "$private_key" 0600
+openssl genpkey -algorithm ED25519 >&"$OPEN_OUTPUT_FD"
+finish_output_file
 open_output_file "$OUTPUT_ROOT/build-public-key.pem" 0644
 openssl pkey -in "$private_key" -pubout >&"$OPEN_OUTPUT_FD"
 finish_output_file

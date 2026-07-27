@@ -54,14 +54,16 @@ The native packages install the CLI at `/usr/bin/gta-claw-cli`, the daemon at
 
 Debian conffiles and RPM `%config(noreplace)` preserve local environment and
 credential-file edits on upgrade. Package removal removes package-owned
-programs, units, and unmodified configuration according to the native package
-manager. Native packages deliberately do not own `/var/lib/gta-claw`,
+programs and units; Debian keeps conffiles until purge, while RPM preserves
+modified configuration as `.rpmsave`. Native packages deliberately do not own `/var/lib/gta-claw`,
 `/var/cache/gta-claw`, `/var/log/gta-claw`, or `/run/gta-claw`: systemd creates
 the private/persistent or ephemeral paths declared by the unit. Fresh installs
-stay disabled and stopped; active upgrades restart, inactive upgrades remain
-inactive, final removal stops/disables before executable unlink, and
-post-transaction hooks reload systemd. Stop/restart errors propagate. The RPM
-upgrade path carries active state through `/run` and uses a critical old-package
+apply the explicit disable preset and stay stopped; active upgrades restart,
+inactive upgrades remain inactive, final removal stops/disables before
+executable unlink, and post-transaction hooks reload systemd. Stop/restart/
+disable errors propagate with native `systemctl` diagnostics. Alternate-root
+Debian transactions never invoke host `systemctl`. The RPM upgrade
+path carries active state through `/run` and uses a critical old-package
 `%preun` postcondition because RPM treats `%post` errors as warnings. No hook
 executes network or dynamic code.
 
@@ -102,6 +104,9 @@ and ownership are restored only after recursive no-link checks. Existing,
 dangling, intermediate and final links, hard links, special files, traversal,
 or non-regular collisions fail closed. Deterministic ancestor- and final-path
 swap regressions prove outside sentinels are never created or modified.
+Partially-created anchored mount roots are removed on setup failure, and the
+ephemeral build-manifest key is created and erased inside the held build output
+capability rather than in a shared temporary directory.
 
 ELF validation uses a bounded binary parser rather than human `readelf` output:
 it checks ELF64 structure, PIE type, exact PT_INTERP bytes, canonical
@@ -111,6 +116,10 @@ duplicate archive members, links/devices/FIFOs/whiteouts, and bounded
 compressed/expanded/member/file sizes before extraction. Published rootfs
 contents and application/runtime hashes are compared to the independently
 authenticated build manifest, not image-local declarations.
+The published native tarball is likewise bounded and extracted once, then its
+exact file set, embedded checksum closure, strict JSON, binary modes, ELF
+contracts, and binary/build/runtime-manifest bytes are checked against the
+authenticated build inputs.
 
 `release.sh` fails unless release mode, an annotated semantic tag, and the full
 matching commit are supplied. It then still fails because production signing
@@ -131,6 +140,20 @@ OUTPUT_ROOT="$PWD/target/linux-x86-run1" \
   ./packaging/linux/package-container.sh \
     x86_64 "$build_manifest" "$build_key_sha"
 ./packaging/linux/self-test.sh
+./packaging/linux/lifecycle-contract-self-test.sh
+./packaging/linux/container-mount-self-test.sh
+```
+
+With the x86 native archive from the package run, its independent published-byte
+mutation checks can be run in the pinned container:
+
+```sh
+OUTPUT_ROOT="$PWD/target/linux-native-mutations" \
+  ./packaging/linux/native-self-test-container.sh \
+    x86_64 \
+    "$PWD"/target/linux-x86-run1/artifacts/gta-claw-*-linux-x86_64.tar.gz \
+    "$build_manifest" \
+    "$build_key_sha"
 ```
 
 The dedicated workflow performs root formatting, checks, Clippy, tests, MSRV,
@@ -138,7 +161,8 @@ deny, audit, metadata proof, pinned-Bookworm x86_64 execution and Debian
 installation, real arm64 Rust cross-build, PIE/interpreter/RPATH/versioned-symbol
 checks, a fresh minimal snapshot-pinned Bookworm resolver install, real Ubuntu
 systemd DEB/RPM install-start-upgrade-remove and forced-failure flows,
-published-byte OCI descriptor/DiffID/layer inspection, strict duplicate/
+published-byte native archive and OCI descriptor/DiffID/layer inspection,
+strict duplicate/
 resource limits, fully resealed extra-executable/application/runtime mutations,
 deterministic reruns, complete provider-attributed license materials,
 license-aware SPDX/provenance, and negative path/release/forged-build tests.

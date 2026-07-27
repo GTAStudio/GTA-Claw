@@ -61,9 +61,8 @@ Assert-NoReparsePathComponents -Root $ownedRoot -Path $OutputRoot
 
 $arch = Get-Architecture $Architecture
 $version = Get-CanonicalVersion $repoRoot
-$archRoot = Join-Path $OutputRoot $arch.Name
-Remove-OwnedDirectory -OwnedRoot $OutputRoot -Path $archRoot
-[System.IO.Directory]::CreateDirectory($archRoot) | Out-Null
+$publishedArchRoot = Join-Path $OutputRoot $arch.Name
+Assert-RustToolchain $repoRoot
 
 $license = Join-Path $scriptRoot 'LICENSE.txt'
 $assetSpec = Join-Path $scriptRoot 'assets\logo-spec.json'
@@ -147,6 +146,11 @@ if ($null -eq (Get-Command dumpbin.exe -ErrorAction SilentlyContinue)) {
     Initialize-MsvcEnvironment $arch.Name | Out-Null
 }
 
+$outputTransaction = Start-OwnedDirectoryTransaction `
+    -OwnedRoot $OutputRoot `
+    -Destination $publishedArchRoot
+$archRoot = $outputTransaction.WorkPath
+try {
 $releaseStatusText = @"
 UNSIGNED NON-RELEASE VALIDATION ARTIFACT
 
@@ -370,5 +374,10 @@ if ($null -ne $msiPackage) {
     $inventory.artifacts += [System.IO.Path]::GetFileName($msiPackage)
 }
 Write-Utf8File -Path (Join-Path $archRoot 'artifacts.json') -Content (($inventory | ConvertTo-Json -Depth 5) + "`n")
+    Complete-OwnedDirectoryTransaction $outputTransaction
+} catch {
+    Undo-OwnedDirectoryTransaction $outputTransaction
+    throw
+}
 
-Write-Host "Created inspected Windows packaging outputs in '$archRoot' with status '$($inventory.status)'."
+Write-Host "Created inspected Windows packaging outputs in '$publishedArchRoot' with status '$($inventory.status)'."

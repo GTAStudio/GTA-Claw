@@ -99,6 +99,10 @@ case_root="$(prepare_clone wrong-toolchain)"
 mutate_manifest "$case_root" '.builder.rustcVerbose = "rustc 9.99.0 (forged)"'
 expect_failure wrong-toolchain verify_case "$case_root/build-manifest.json"
 
+case_root="$(prepare_clone wrong-cargo-toolchain)"
+mutate_manifest "$case_root" '.builder.cargoVersion = "cargo 9.99.0 (forged)"'
+expect_failure wrong-cargo-toolchain verify_case "$case_root/build-manifest.json"
+
 case_root="$(prepare_clone wrong-target)"
 mutate_manifest "$case_root" '.build.rustTarget = "x86_64-unknown-linux-musl"'
 expect_failure wrong-target verify_case "$case_root/build-manifest.json"

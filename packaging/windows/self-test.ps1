@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([switch]$PortableOnly)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -36,6 +36,25 @@ try {
     Assert-Throws { Assert-RelativePackagePath '..\escape.exe' } 'path traversal'
     Assert-Throws { Assert-RelativePackagePath 'C:\escape.exe' } 'rooted package path'
     Assert-Throws { Assert-PlainFile (Join-Path $testRoot 'missing.exe') } 'missing required file'
+    Assert-RustToolchain $repoRoot
+    $passed++
+    $wrongRustRoot = Join-Path $testRoot 'wrong-rust'
+    [System.IO.Directory]::CreateDirectory($wrongRustRoot) | Out-Null
+    Write-Utf8File -Path (Join-Path $wrongRustRoot 'rust-toolchain.toml') -Content @"
+[toolchain]
+channel = "1.96.0"
+"@
+    Assert-Throws { Get-PinnedRustVersion $wrongRustRoot } 'wrong repository Rust pin'
+    $fakeRustc = Join-Path $testRoot 'rustc.ps1'
+    $fakeCargo = Join-Path $testRoot 'cargo.ps1'
+    Write-Utf8File -Path $fakeRustc -Content "'rustc 1.96.0 (fixture)'`n"
+    Write-Utf8File -Path $fakeCargo -Content "'cargo 1.97.1 (fixture)'`n"
+    Assert-Throws {
+        Assert-RustToolchain `
+            -RepoRoot $repoRoot `
+            -RustcPath $fakeRustc `
+            -CargoPath $fakeCargo
+    } 'active Rust compiler version mismatch'
 
     $missingSdk = Join-Path $testRoot 'empty-sdk'
     [System.IO.Directory]::CreateDirectory($missingSdk) | Out-Null
@@ -51,6 +70,22 @@ try {
     $artifactSet = Join-Path $testRoot 'artifact-set'
     [System.IO.Directory]::CreateDirectory($artifactSet) | Out-Null
     Write-Utf8File -Path (Join-Path $artifactSet 'artifact.bin') -Content 'published'
+    Write-ArtifactHash (Join-Path $artifactSet 'artifact.bin') | Out-Null
+    Test-ArtifactHash (Join-Path $artifactSet 'artifact.bin')
+    $passed++
+    Write-Utf8File -Path (Join-Path $artifactSet 'artifact.bin.sha256') -Content (
+        ('0' * 64) + "  artifact.bin`n"
+    )
+    Assert-Throws {
+        Test-ArtifactHash (Join-Path $artifactSet 'artifact.bin')
+    } 'per-artifact published-byte hash mismatch'
+    Write-ArtifactHash (Join-Path $artifactSet 'artifact.bin') | Out-Null
+    $missingHashArtifact = Join-Path $artifactSet 'missing-hash.bin'
+    Write-Utf8File -Path $missingHashArtifact -Content 'published without companion'
+    Assert-Throws {
+        Test-ArtifactHash $missingHashArtifact
+    } 'missing per-artifact SHA-256 companion'
+    Remove-Item -LiteralPath $missingHashArtifact -Force
     Write-ArtifactSetChecksums $artifactSet | Out-Null
     Test-ArtifactSetChecksums $artifactSet
     $passed++
@@ -58,6 +93,284 @@ try {
     Assert-Throws {
         Test-ArtifactSetChecksums $artifactSet
     } 'incomplete artifact checksum coverage'
+
+    $supplyArtifact = Join-Path $testRoot 'supply.bin'
+    Write-Utf8File -Path $supplyArtifact -Content 'attested bytes'
+    $supplyHash = (Get-FileHash $supplyArtifact -Algorithm SHA256).Hash.ToLowerInvariant()
+    $supplyName = [System.IO.Path]::GetFileName($supplyArtifact)
+    $sbom = [ordered]@{
+        spdxVersion = 'SPDX-2.3'
+        documentDescribes = @('SPDXRef-Artifact')
+        packages = @([ordered]@{ name = 'fixture' })
+        files = @([ordered]@{
+            fileName = "./$supplyName"
+            SPDXID = 'SPDXRef-Artifact'
+            checksums = @([ordered]@{ algorithm = 'SHA256'; checksumValue = $supplyHash })
+        })
+    }
+    $provenance = [ordered]@{
+        _type = 'https://in-toto.io/Statement/v1'
+        predicateType = 'https://slsa.dev/provenance/v1'
+        subject = @([ordered]@{
+            name = $supplyName
+            digest = [ordered]@{ sha256 = $supplyHash }
+        })
+    }
+    Write-Utf8File -Path "$supplyArtifact.spdx.json" -Content (($sbom | ConvertTo-Json -Depth 8) + "`n")
+    Write-Utf8File -Path "$supplyArtifact.provenance.json" -Content (($provenance | ConvertTo-Json -Depth 8) + "`n")
+    Test-ArtifactSupplyChain $supplyArtifact
+    $passed++
+    $sbom.files[0].checksums[0].algorithm = 'SHA1'
+    Write-Utf8File -Path "$supplyArtifact.spdx.json" -Content (($sbom | ConvertTo-Json -Depth 8) + "`n")
+    Assert-Throws {
+        Test-ArtifactSupplyChain $supplyArtifact
+    } 'SBOM checksum algorithm substitution'
+
+    $transactionRoot = Join-Path $testRoot 'transactions'
+    $transactionDestination = Join-Path $transactionRoot 'published'
+    [System.IO.Directory]::CreateDirectory($transactionDestination) | Out-Null
+    Write-Utf8File -Path (Join-Path $transactionDestination 'old.txt') -Content 'old'
+    $transaction = Start-OwnedDirectoryTransaction `
+        -OwnedRoot $transactionRoot `
+        -Destination $transactionDestination
+    Write-Utf8File -Path (Join-Path $transaction.WorkPath 'new.txt') -Content 'new'
+    Undo-OwnedDirectoryTransaction $transaction
+    if (-not (Test-Path -LiteralPath (Join-Path $transactionDestination 'old.txt') -PathType Leaf) -or
+        (Test-Path -LiteralPath (Join-Path $transactionDestination 'new.txt'))) {
+        throw 'Packaging transaction rollback did not preserve the prior output.'
+    }
+    $passed++
+    $transaction = Start-OwnedDirectoryTransaction `
+        -OwnedRoot $transactionRoot `
+        -Destination $transactionDestination
+    Write-Utf8File -Path (Join-Path $transaction.WorkPath 'new.txt') -Content 'new'
+    $cleanupWarnings = @(Complete-OwnedDirectoryTransaction `
+        -Transaction $transaction `
+        -BackupCleanupAction { throw 'simulated backup cleanup failure' } 3>&1)
+    if (-not (Test-Path -LiteralPath (Join-Path $transactionDestination 'new.txt') -PathType Leaf) -or
+        (Test-Path -LiteralPath (Join-Path $transactionDestination 'old.txt')) -or
+        -not (Test-Path -LiteralPath $transaction.BackupPath -PathType Container) -or
+        $cleanupWarnings.Count -ne 1) {
+        throw 'Packaging transaction did not remain committed after backup cleanup failed.'
+    }
+    $recoveryTransaction = Start-OwnedDirectoryTransaction `
+        -OwnedRoot $transactionRoot `
+        -Destination $transactionDestination
+    Undo-OwnedDirectoryTransaction $recoveryTransaction
+    if (Test-Path -LiteralPath $transaction.BackupPath) {
+        throw 'The next packaging transaction did not clean the stale post-commit backup.'
+    }
+    $passed++
+
+    $pairRoot = Join-Path $testRoot 'artifact-pair'
+    [System.IO.Directory]::CreateDirectory($pairRoot) | Out-Null
+    $publishedMsi = Join-Path $pairRoot 'package.msi'
+    Write-Utf8File -Path $publishedMsi -Content 'old msi'
+    Write-ArtifactHash $publishedMsi | Out-Null
+    $stagedMsi = Join-Path $pairRoot '.package.packaging-new.msi'
+    $stagedMsiHash = "$stagedMsi.sha256"
+    Write-Utf8File -Path $stagedMsi -Content 'new msi'
+    Write-ArtifactHash `
+        -Path $stagedMsi `
+        -HashPath $stagedMsiHash `
+        -ArtifactName 'package.msi' | Out-Null
+    Assert-Throws {
+        Publish-OwnedArtifactPair `
+            -OwnedRoot $pairRoot `
+            -StagedArtifact $stagedMsi `
+            -StagedHash $stagedMsiHash `
+            -DestinationArtifact $publishedMsi `
+            -HashPublishAction { throw 'simulated checksum publication failure' }
+    } 'MSI checksum publication failure rollback'
+    if ([System.IO.File]::ReadAllText($publishedMsi) -ne 'old msi') {
+        throw 'MSI pair rollback did not restore the previous installer bytes.'
+    }
+    Test-ArtifactHash $publishedMsi
+    foreach ($path in @(
+        "$publishedMsi.packaging-previous",
+        "$publishedMsi.sha256.packaging-previous",
+        $stagedMsi,
+        $stagedMsiHash
+    )) {
+        if (Test-Path -LiteralPath $path) {
+            throw "MSI pair rollback left transaction material behind: $path"
+        }
+    }
+    $firstPublicationPhases = @(
+        'prepared',
+        'artifact-publish-renamed',
+        'artifact-published',
+        'hash-publish-renamed',
+        'hash-published',
+        'committed',
+        'artifact-backup-removed',
+        'hash-backup-removed'
+    )
+    $replacementPhases = @(
+        'prepared',
+        'artifact-backup-renamed',
+        'artifact-backed-up',
+        'hash-backup-renamed',
+        'hash-backed-up',
+        'artifact-publish-renamed',
+        'artifact-published',
+        'hash-publish-renamed',
+        'hash-published',
+        'committed',
+        'artifact-backup-deleted',
+        'artifact-backup-removed',
+        'hash-backup-deleted',
+        'hash-backup-removed'
+    )
+    foreach ($profile in @(
+        [pscustomobject]@{ Name = 'first'; HasPrior = $false; Phases = $firstPublicationPhases },
+        [pscustomobject]@{ Name = 'replacement'; HasPrior = $true; Phases = $replacementPhases }
+    )) {
+        foreach ($phase in $profile.Phases) {
+            $phaseRoot = Join-Path $testRoot "pair-$($profile.Name)-$phase"
+            [System.IO.Directory]::CreateDirectory($phaseRoot) | Out-Null
+            $phaseArtifact = Join-Path $phaseRoot 'package.msi'
+            if ($profile.HasPrior) {
+                Write-Utf8File -Path $phaseArtifact -Content 'known-good old msi'
+                Write-ArtifactHash $phaseArtifact | Out-Null
+            }
+            $phaseStaged = Join-Path $phaseRoot '.package.packaging-new.msi'
+            $phaseStagedHash = "$phaseStaged.sha256"
+            Write-Utf8File -Path $phaseStaged -Content 'validated new msi'
+            Write-ArtifactHash `
+                -Path $phaseStaged `
+                -HashPath $phaseStagedHash `
+                -ArtifactName 'package.msi' | Out-Null
+            Publish-OwnedArtifactPair `
+                -OwnedRoot $phaseRoot `
+                -StagedArtifact $phaseStaged `
+                -StagedHash $phaseStagedHash `
+                -DestinationArtifact $phaseArtifact `
+                -StopAfterPhase $phase
+            Repair-OwnedArtifactPairTransaction `
+                -OwnedRoot $phaseRoot `
+                -DestinationArtifact $phaseArtifact
+
+            $newPairCommitted = $phase -in @(
+                'hash-publish-renamed',
+                'hash-published',
+                'committed',
+                'artifact-backup-deleted',
+                'artifact-backup-removed',
+                'hash-backup-deleted',
+                'hash-backup-removed'
+            )
+            if ($profile.HasPrior -and $phase -notin @(
+                'committed',
+                'artifact-backup-deleted',
+                'artifact-backup-removed',
+                'hash-backup-deleted',
+                'hash-backup-removed'
+            )) {
+                $newPairCommitted = $false
+            }
+            if ($newPairCommitted) {
+                Test-ArtifactHash $phaseArtifact
+                if ([System.IO.File]::ReadAllText($phaseArtifact) -ne 'validated new msi') {
+                    throw "Crash recovery at '$($profile.Name)/$phase' did not retain the committed new pair."
+                }
+            } elseif ($profile.HasPrior) {
+                Test-ArtifactHash $phaseArtifact
+                if ([System.IO.File]::ReadAllText($phaseArtifact) -ne 'known-good old msi') {
+                    throw "Crash recovery at '$($profile.Name)/$phase' did not restore the prior pair."
+                }
+            } elseif ((Test-Path -LiteralPath $phaseArtifact) -or
+                (Test-Path -LiteralPath "$phaseArtifact.sha256")) {
+                throw "Crash recovery at '$($profile.Name)/$phase' retained an incomplete first publication."
+            }
+            foreach ($debris in @(
+                "$phaseArtifact.packaging-previous",
+                "$phaseArtifact.sha256.packaging-previous",
+                "$phaseArtifact.packaging-transaction.json",
+                $phaseStaged,
+                $phaseStagedHash
+            )) {
+                if (Test-Path -LiteralPath $debris) {
+                    throw "Crash recovery at '$($profile.Name)/$phase' left debris '$debris'."
+                }
+            }
+            $passed++
+        }
+    }
+
+    foreach ($cleanupOperation in @(
+        'remove-artifact-backup',
+        'write-artifact-backup-removed-phase',
+        'remove-hash-backup',
+        'write-hash-backup-removed-phase',
+        'remove-phase-journal',
+        'remove-staged-artifact',
+        'remove-staged-hash'
+    )) {
+        $cleanupRoot = Join-Path $testRoot "pair-cleanup-$cleanupOperation"
+        [System.IO.Directory]::CreateDirectory($cleanupRoot) | Out-Null
+        $cleanupArtifact = Join-Path $cleanupRoot 'package.msi'
+        Write-Utf8File -Path $cleanupArtifact -Content 'known-good old msi'
+        Write-ArtifactHash $cleanupArtifact | Out-Null
+        $cleanupStaged = Join-Path $cleanupRoot '.package.packaging-new.msi'
+        $cleanupStagedHash = "$cleanupStaged.sha256"
+        Write-Utf8File -Path $cleanupStaged -Content 'committed new msi'
+        Write-ArtifactHash `
+            -Path $cleanupStaged `
+            -HashPath $cleanupStagedHash `
+            -ArtifactName 'package.msi' | Out-Null
+
+        $cleanupWarnings = @(Publish-OwnedArtifactPair `
+            -OwnedRoot $cleanupRoot `
+            -StagedArtifact $cleanupStaged `
+            -StagedHash $cleanupStagedHash `
+            -DestinationArtifact $cleanupArtifact `
+            -PostCommitCleanupAction {
+                param($operation)
+                if ($operation -eq $cleanupOperation) {
+                    if ($operation -eq 'remove-staged-artifact') {
+                        Write-Utf8File -Path $cleanupStaged -Content 'simulated staged artifact debris'
+                    }
+                    if ($operation -eq 'remove-staged-hash') {
+                        Write-Utf8File -Path $cleanupStagedHash -Content 'simulated staged hash debris'
+                    }
+                    throw "simulated $operation failure"
+                }
+            } 3>&1)
+        Test-ArtifactHash $cleanupArtifact
+        if ([System.IO.File]::ReadAllText($cleanupArtifact) -ne 'committed new msi' -or
+            $cleanupWarnings.Count -ne 1) {
+            throw "Post-commit '$cleanupOperation' failure changed successful publication semantics."
+        }
+
+        Repair-OwnedArtifactPairTransaction `
+            -OwnedRoot $cleanupRoot `
+            -DestinationArtifact $cleanupArtifact
+        Test-ArtifactHash $cleanupArtifact
+        if ([System.IO.File]::ReadAllText($cleanupArtifact) -ne 'committed new msi') {
+            throw "Next-run repair after '$cleanupOperation' did not retain the committed pair."
+        }
+        foreach ($debris in @(
+            "$cleanupArtifact.packaging-previous",
+            "$cleanupArtifact.sha256.packaging-previous",
+            "$cleanupArtifact.packaging-transaction.json",
+            $cleanupStaged,
+            $cleanupStagedHash
+        )) {
+            if (Test-Path -LiteralPath $debris) {
+                throw "Next-run repair after '$cleanupOperation' left debris '$debris'."
+            }
+        }
+        $passed++
+    }
+
+    if ($PortableOnly) {
+        if ($passed -ne 49) {
+            throw "Expected 49 portable self-tests, completed $passed."
+        }
+        Write-Host "Portable Windows packaging self-tests passed: $passed."
+        return
+    }
 
     $junctionTarget = Join-Path $testRoot 'junction-target'
     $junctionRoot = Join-Path $testRoot 'junction-root'
@@ -203,8 +516,8 @@ echo gta-claw-cli v0.1.0
     & (Join-Path $scriptRoot 'validate-release-surfaces.ps1')
     $passed++
 
-    if ($passed -ne 24) {
-        throw "Expected 24 self-tests, completed $passed."
+    if ($passed -ne 64) {
+        throw "Expected 64 self-tests, completed $passed."
     }
     Write-Host "Windows packaging self-tests passed: $passed."
 } finally {

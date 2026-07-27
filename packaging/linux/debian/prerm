@@ -4,7 +4,18 @@ set -e
 
 if [ -z "${DPKG_ROOT:-}" ] && [ "$1" = "remove" ] &&
   [ -d /run/systemd/system ]; then
+  if systemctl --system is-active --quiet gta-claw-daemon.service; then
+    touch /run/gta-claw-daemon.deb-was-active
+  else
+    rm -f /run/gta-claw-daemon.deb-was-active
+  fi
+  if systemctl --system is-enabled --quiet gta-claw-daemon.service; then
+    touch /run/gta-claw-daemon.deb-was-enabled
+  else
+    rm -f /run/gta-claw-daemon.deb-was-enabled
+  fi
   deb-systemd-invoke stop gta-claw-daemon.service >/dev/null
+  systemctl --system disable gta-claw-daemon.service >/dev/null
 fi
 
 exit 0

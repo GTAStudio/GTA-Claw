@@ -37,6 +37,15 @@ expect_success() {
 
 expect_failure missing-tool \
   bash -c "source '$common'; require_tool gta-claw-tool-that-does-not-exist"
+expect_failure strict-artifact-missing-input \
+  python3 "$SCRIPT_DIR/strict_artifact.py" json "$work/missing.json"
+grep -F 'strict-artifact: artifact I/O failed:' \
+  "$work/strict-artifact-missing-input.stderr" >/dev/null ||
+  die "strict artifact missing-input error is not actionable"
+if grep -F 'Traceback (most recent call last):' \
+  "$work/strict-artifact-missing-input.stderr" >/dev/null; then
+  die "strict artifact missing-input error leaked a Python traceback"
+fi
 expect_failure unsafe-version \
   env VERSION=../escape bash -c "source '$common'"
 expect_failure unsafe-output-traversal \

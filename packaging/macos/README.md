@@ -3,7 +3,9 @@
 This directory builds GTA Claw for macOS 14 or newer using Cargo and
 Apple/Xcode tooling only. It produces a native Slint application and separate
 headless Rust archives without JavaScript, Node.js, or Slint in the headless
-dependency graph.
+dependency graph. Packaging requires the repository-pinned Rust 1.97.1
+toolchain and fails before fetching or building when another toolchain is
+active.
 
 ## Architecture and artifact matrix
 
@@ -77,3 +79,32 @@ generates supply-chain companions, and runs published-byte validation.
 Missing credentials fail the protected release. Normal pull requests still
 produce clearly labeled unsigned/ad-hoc prototype artifacts and never claim a
 signature or notarization result.
+
+## Install, upgrade, and remove
+
+Drag `GTA Claw.app` from the DMG to `/Applications`, or install the PKG with
+Installer. The PKG is non-relocatable and uses macOS Installer's `upgrade`
+bundle action: a first install creates `/Applications/GTA Claw.app`, while a
+reinstall, upgrade, or downgrade atomically replaces the existing bundle and
+removes stale files from the old bundle. It does not install scripts or modify
+shell profiles.
+
+There is no uninstaller and removing the app does not remove user-created
+data. To remove only the installed application and forget its Installer
+receipt:
+
+```sh
+sudo rm -rf "/Applications/GTA Claw.app"
+sudo pkgutil --forget com.gtastudio.gta-claw.pkg.component
+```
+
+Packaging is transactional: artifacts are fully assembled and validated under
+`target/macos-package/staging` before the validated distribution directory
+replaces the previous one. A failed package or validation run leaves the last
+validated `target/macos-package/distribution` intact. The desktop Cargo package
+inventory is resolved once per packaging transaction and reused for each
+artifact's deterministic SBOM. Renaming the validated directory into place is
+the publication commit point. If deleting the previous directory then fails,
+packaging succeeds with an explicit warning and may retain
+`distribution.rollback`; the next publication removes any stale backup before
+replacing the committed distribution.
