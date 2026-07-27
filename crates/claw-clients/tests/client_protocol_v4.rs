@@ -333,7 +333,7 @@ fn local_attachment_is_fail_closed_on_identity_secret_loopback_and_transport() {
     );
 }
 
-fn attach_local(
+const fn attach_local(
     surface_id: SurfaceId,
     identity: bool,
     secret: bool,

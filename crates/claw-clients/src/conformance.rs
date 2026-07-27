@@ -286,7 +286,7 @@ impl Error for AttachmentError {}
 /// Returns the [`AttachmentError`] naming the proof that was absent, or
 /// [`AttachmentError::GatewaySurface`] / [`AttachmentError::TransportMismatch`]
 /// when the surface does not use this transport at all.
-pub fn attach(
+pub const fn attach(
     surface_id: SurfaceId,
     evidence: AttachmentEvidence,
 ) -> Result<AttachmentOutcome, AttachmentError> {
@@ -325,7 +325,7 @@ pub fn attach(
 }
 
 /// One suite run against a surface.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SmokeReport {
     /// Surface that was exercised.
     pub surface: SurfaceId,

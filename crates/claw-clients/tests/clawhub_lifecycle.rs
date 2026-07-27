@@ -7,7 +7,7 @@
 //!
 //! Every case runs against the in-memory `StaticRegistry` and
 //! `PinnedTrustStore`; the crate has no transport dependency, so no case can
-//! reach a real ClawHub endpoint.
+//! reach a real `ClawHub` endpoint.
 
 use std::collections::BTreeSet;
 

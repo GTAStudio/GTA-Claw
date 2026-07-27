@@ -93,10 +93,10 @@ impl ProtocolError {
     /// Creates an ACP resource-not-found error.
     #[must_use]
     pub fn resource_not_found(uri: Option<String>) -> Self {
-        match uri {
-            Some(uri) => Self::with_data(-32002, "Resource not found", json!({ "uri": uri })),
-            None => Self::new(-32002, "Resource not found"),
-        }
+        uri.map_or_else(
+            || Self::new(-32002, "Resource not found"),
+            |uri| Self::with_data(-32002, "Resource not found", json!({ "uri": uri })),
+        )
     }
 
     /// Creates an implementation-defined JSON-RPC server error.
@@ -143,6 +143,45 @@ impl std::error::Error for ProtocolError {}
 struct PeerState {
     connected: bool,
     pending: HashMap<u64, PendingResponse>,
+}
+
+/// Correlation entry for one outstanding request.
+///
+/// Dropping it removes the entry, so a request future that is cancelled — by a
+/// `select!` branch, a timeout, or an aborted task — cannot leave a waiter
+/// behind in the pending map.
+struct PendingRequest {
+    state: Arc<Mutex<PeerState>>,
+    id: u64,
+}
+
+impl PendingRequest {
+    fn register(
+        state: &Arc<Mutex<PeerState>>,
+        id: u64,
+        sender: PendingResponse,
+    ) -> std::result::Result<Self, ProtocolError> {
+        let mut locked = state
+            .lock()
+            .map_err(|_| ProtocolError::internal_error().data("ACP pending map poisoned"))?;
+        if !locked.connected {
+            return Err(ProtocolError::disconnected());
+        }
+        locked.pending.insert(id, sender);
+        drop(locked);
+        Ok(Self {
+            state: Arc::clone(state),
+            id,
+        })
+    }
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.pending.remove(&self.id);
+        }
+    }
 }
 
 struct Outbound {
@@ -193,33 +232,18 @@ impl RpcPeer {
         let params = serde_json::to_value(params)
             .map_err(|error| ProtocolError::internal_error().data(error.to_string()))?;
         let (sender, receiver) = oneshot::channel();
-        {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| ProtocolError::internal_error().data("ACP pending map poisoned"))?;
-            if !state.connected {
-                return Err(ProtocolError::disconnected());
-            }
-            state.pending.insert(id, sender);
-        }
-        if let Err(error) = self
-            .write(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": method,
-                "params": params,
-            }))
-            .await
-        {
-            if let Ok(mut state) = self.state.lock() {
-                state.pending.remove(&id);
-            }
-            return Err(error);
-        }
+        let pending = PendingRequest::register(&self.state, id, sender)?;
+        self.write(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .await?;
         let result = receiver
             .await
             .map_err(|_| ProtocolError::disconnected())??;
+        drop(pending);
         serde_json::from_value(result)
             .map_err(|error| ProtocolError::invalid_request().data(error.to_string()))
     }
@@ -302,7 +326,7 @@ impl RpcPeer {
     }
 
     pub(crate) fn mark_disconnected(&self) {
-        disconnect_state(&self.state, ProtocolError::disconnected());
+        disconnect_state(&self.state, &ProtocolError::disconnected());
         self.disconnected.cancel();
     }
 
@@ -351,7 +375,7 @@ async fn writer_loop<W>(
             .cloned()
             .unwrap_or_else(ProtocolError::disconnected);
         if failed {
-            disconnect_state(&state, error.clone());
+            disconnect_state(&state, &error);
             writer_disconnected.cancel();
         }
         let _ = outbound.completion.send(result);
@@ -362,10 +386,10 @@ async fn writer_loop<W>(
             return;
         }
     }
-    disconnect_state(&state, ProtocolError::disconnected());
+    disconnect_state(&state, &ProtocolError::disconnected());
 }
 
-fn disconnect_state(state: &Mutex<PeerState>, error: ProtocolError) {
+fn disconnect_state(state: &Mutex<PeerState>, error: &ProtocolError) {
     let Ok(mut state) = state.lock() else {
         return;
     };
@@ -581,5 +605,36 @@ mod tests {
             let error = message_parts(&message).expect_err("invalid request id");
             assert_eq!(error.code, -32600);
         }
+    }
+
+    fn pending_len(peer: &RpcPeer) -> usize {
+        peer.state.lock().expect("pending map").pending.len()
+    }
+
+    #[tokio::test]
+    async fn a_dropped_request_future_removes_its_pending_entry() {
+        let (writer, reader) = duplex(1024);
+        let peer = RpcPeer::new(writer);
+        let mut reader = BufReader::new(reader);
+        let mut frame = Vec::new();
+        let mut request = Box::pin(peer.request::<_, Value>("initialize", json!({})));
+
+        let sent = tokio::select! {
+            _ = request.as_mut() => panic!("request must not resolve before a response arrives"),
+            message = read_message(&mut reader, &mut frame) => message,
+        }
+        .expect("request frame")
+        .expect("request value");
+
+        assert_eq!(sent["id"], 1);
+        assert_eq!(pending_len(&peer), 1);
+
+        drop(request);
+
+        assert_eq!(pending_len(&peer), 0);
+        assert!(
+            peer.resolve_response(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}))
+                .is_err()
+        );
     }
 }

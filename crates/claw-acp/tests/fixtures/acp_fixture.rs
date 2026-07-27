@@ -72,33 +72,33 @@ fn send_unsupported_protocol_version() -> io::Result<()> {
 }
 
 impl AcpBackend for FixtureBackend {
-    fn new_session<'a>(
-        &'a self,
+    fn new_session(
+        &self,
         request: NewSessionRequest,
         _context: AcpSessionContext,
-    ) -> AcpFuture<'a, NewSessionResponse> {
+    ) -> AcpFuture<'_, NewSessionResponse> {
         Box::pin(async move {
             validate_mcp_servers(&request.mcp_servers)?;
             Ok(NewSessionResponse::new("fixture-session"))
         })
     }
 
-    fn load_session<'a>(
-        &'a self,
+    fn load_session(
+        &self,
         request: LoadSessionRequest,
         _context: AcpSessionContext,
-    ) -> AcpFuture<'a, LoadSessionResponse> {
+    ) -> AcpFuture<'_, LoadSessionResponse> {
         Box::pin(async move {
             validate_mcp_servers(&request.mcp_servers)?;
             Ok(LoadSessionResponse::new())
         })
     }
 
-    fn resume_session<'a>(
-        &'a self,
+    fn resume_session(
+        &self,
         request: ResumeSessionRequest,
         _context: AcpSessionContext,
-    ) -> AcpFuture<'a, ResumeSessionResponse> {
+    ) -> AcpFuture<'_, ResumeSessionResponse> {
         Box::pin(async move {
             if request.session_id.to_string() != "fixture-session" {
                 return Err(Error::invalid_params().data("unexpected session to resume"));
@@ -108,10 +108,7 @@ impl AcpBackend for FixtureBackend {
         })
     }
 
-    fn list_sessions<'a>(
-        &'a self,
-        _request: ListSessionsRequest,
-    ) -> AcpFuture<'a, ListSessionsResponse> {
+    fn list_sessions(&self, _request: ListSessionsRequest) -> AcpFuture<'_, ListSessionsResponse> {
         Box::pin(async {
             Ok(ListSessionsResponse::new(vec![SessionInfo::new(
                 "fixture-session",
@@ -120,18 +117,15 @@ impl AcpBackend for FixtureBackend {
         })
     }
 
-    fn close_session<'a>(
-        &'a self,
-        _request: CloseSessionRequest,
-    ) -> AcpFuture<'a, CloseSessionResponse> {
+    fn close_session(&self, _request: CloseSessionRequest) -> AcpFuture<'_, CloseSessionResponse> {
         Box::pin(async { Ok(CloseSessionResponse::new()) })
     }
 
-    fn prompt<'a>(
-        &'a self,
+    fn prompt(
+        &self,
         request: PromptRequest,
         context: AcpSessionContext,
-    ) -> AcpFuture<'a, PromptResponse> {
+    ) -> AcpFuture<'_, PromptResponse> {
         Box::pin(async move {
             if std::env::var_os("REQUEST_PERMISSION").is_some() {
                 let permission = context
@@ -168,10 +162,7 @@ impl AcpBackend for FixtureBackend {
         })
     }
 
-    fn set_mode<'a>(
-        &'a self,
-        request: SetSessionModeRequest,
-    ) -> AcpFuture<'a, SetSessionModeResponse> {
+    fn set_mode(&self, request: SetSessionModeRequest) -> AcpFuture<'_, SetSessionModeResponse> {
         Box::pin(async move {
             if request.session_id.to_string() != "fixture-session"
                 || request.mode_id.to_string() != "plan"
@@ -182,10 +173,10 @@ impl AcpBackend for FixtureBackend {
         })
     }
 
-    fn set_config_option<'a>(
-        &'a self,
+    fn set_config_option(
+        &self,
         request: SetSessionConfigOptionRequest,
-    ) -> AcpFuture<'a, SetSessionConfigOptionResponse> {
+    ) -> AcpFuture<'_, SetSessionConfigOptionResponse> {
         Box::pin(async move {
             if request.session_id.to_string() != "fixture-session"
                 || request.config_id.to_string() != "model"
@@ -211,7 +202,7 @@ impl AcpBackend for FixtureBackend {
         })
     }
 
-    fn cancel<'a>(&'a self, _notification: CancelNotification) -> AcpFuture<'a, ()> {
+    fn cancel(&self, _notification: CancelNotification) -> AcpFuture<'_, ()> {
         Box::pin(async {
             self.cancelled.store(true, Ordering::SeqCst);
             Ok(())
@@ -248,14 +239,24 @@ fn hold_windows_delete_lock(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Path the fixture records its grandchild's process identifier at.
+fn grandchild_pid_path(lock_path: &Path) -> PathBuf {
+    let mut path = lock_path.as_os_str().to_os_string();
+    path.push(".pid");
+    PathBuf::from(path)
+}
+
 fn spawn_locking_grandchild(path: &Path) -> io::Result<()> {
-    Command::new(std::env::current_exe()?)
+    let grandchild = Command::new(std::env::current_exe()?)
         .arg("--grandchild")
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
+    // Recorded before waiting for the lock so that a client which kills this
+    // process tree early still leaves the descendant's identity observable.
+    std::fs::write(grandchild_pid_path(path), grandchild.id().to_string())?;
     for _ in 0..100 {
         if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == 5) {
             return Ok(());
@@ -297,6 +298,12 @@ async fn main() {
             }
         }
         _ => {}
+    }
+    if std::env::var_os("NEVER_RESPOND").is_some() {
+        // Never read stdin and never answer `initialize`: the client's own
+        // deadline is the only thing that can end this interaction.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        return;
     }
     let mut session_capabilities =
         SessionCapabilities::new().resume(SessionResumeCapabilities::new());

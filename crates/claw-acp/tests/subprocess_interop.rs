@@ -416,3 +416,132 @@ async fn debug_client_terminates_the_agent_descendant_process_tree() {
     .await
     .expect("ACP descendant file lock must be released promptly");
 }
+
+#[cfg(unix)]
+use std::{future::Future, pin::Pin};
+
+#[cfg(unix)]
+fn recorded_grandchild(lock_path: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(format!("{}.pid", lock_path.display()))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "pid="])
+        .output()
+        .expect("ps must run")
+        .status
+        .success()
+}
+
+/// Drives `run` until the fixture has recorded the grandchild it spawned.
+///
+/// The fixture never answers `initialize`, so the run future is polled purely
+/// to let the spawn happen; observing the descendant before the run ends is
+/// what keeps the kill assertions free of a spawn-versus-deadline race.
+#[cfg(unix)]
+async fn wait_for_grandchild<F>(run: &mut Pin<Box<F>>, lock_path: &std::path::Path) -> u32
+where
+    F: Future,
+    F::Output: std::fmt::Debug,
+{
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some(grandchild) = recorded_grandchild(lock_path) {
+                return grandchild;
+            }
+            tokio::select! {
+                result = &mut *run => {
+                    panic!("an unresponsive agent must not finish its run: {result:?}")
+                }
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    })
+    .await
+    .expect("fixture must record its grandchild process identifier")
+}
+
+#[cfg(unix)]
+async fn expect_descendant_exit(grandchild: u32, lock_path: &std::path::Path) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while process_exists(grandchild) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("ACP agent descendant must not survive its parent");
+    let _ = std::fs::remove_file(lock_path);
+    let _ = std::fs::remove_file(format!("{}.pid", lock_path.display()));
+}
+
+#[cfg(unix)]
+fn process_tree_lock_path(label: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "gta-claw-acp-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must follow epoch")
+            .as_nanos()
+    ))
+}
+
+#[cfg(unix)]
+fn unresponsive_tree_client(lock_path: &std::path::Path, timeout: Duration) -> DebugClient {
+    let mut config = DebugClientConfig::new(PathBuf::from(env!("CARGO_BIN_EXE_claw-acp-fixture")));
+    config.arguments = vec![
+        "--spawn-grandchild".into(),
+        lock_path.to_string_lossy().into_owned(),
+    ];
+    config
+        .environment
+        .insert("NEVER_RESPOND".into(), "1".into());
+    config.timeout = timeout;
+    DebugClient::new(config, Arc::new(DenyPermissions))
+}
+
+#[cfg(unix)]
+fn process_tree_request() -> DebugRunRequest {
+    DebugRunRequest::new(
+        std::env::current_dir().expect("test cwd must resolve"),
+        vec![ContentBlock::Text(TextContent::new("process tree fixture"))],
+    )
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn debug_client_times_out_an_agent_that_never_answers_initialize() {
+    let lock_path = process_tree_lock_path("timeout-tree");
+    let client = unresponsive_tree_client(&lock_path, Duration::from_secs(5));
+    let mut run = Box::pin(client.run(process_tree_request()));
+    let grandchild = wait_for_grandchild(&mut run, &lock_path).await;
+
+    let error = run
+        .await
+        .expect_err("an agent that never answers initialize must not hang the client");
+
+    assert!(
+        matches!(error, AcpInteropError::Timeout(deadline) if deadline == Duration::from_secs(5)),
+        "unexpected error: {error:?}"
+    );
+    expect_descendant_exit(grandchild, &lock_path).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_a_debug_run_kills_the_whole_agent_process_group() {
+    let lock_path = process_tree_lock_path("dropped-tree");
+    let client = unresponsive_tree_client(&lock_path, Duration::from_secs(30));
+    let mut run = Box::pin(client.run(process_tree_request()));
+    let grandchild = wait_for_grandchild(&mut run, &lock_path).await;
+
+    drop(run);
+
+    expect_descendant_exit(grandchild, &lock_path).await;
+}

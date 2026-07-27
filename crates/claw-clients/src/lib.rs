@@ -1,4 +1,4 @@
-//! Host-side compatibility contracts for the frozen OpenClaw client inventory.
+//! Host-side compatibility contracts for the frozen `OpenClaw` client inventory.
 //!
 //! GTA-Claw does not ship the upstream mobile applications, Control UI, or
 //! browser extension. This crate defines the authenticated connection profiles,
@@ -31,7 +31,7 @@
 //!
 //! ## Additional contracts in this crate
 //!
-//! - [`clawhub`] implements the offline ClawHub marketplace lifecycle: search,
+//! - [`clawhub`] implements the offline `ClawHub` marketplace lifecycle: search,
 //!   install, update, publish, risk acknowledgement, trust and uninstall.
 //! - [`conformance`] is the shared protocol-v4 connection compliance and
 //!   platform smoke suite that every inventoried surface is run through, plus
@@ -207,7 +207,7 @@ pub enum ClientCapability {
     SpeechSynthesis,
     /// Provide local speech capture.
     SpeechCapture,
-    /// Relay explicitly allowed Chrome DevTools operations.
+    /// Relay explicitly allowed Chrome `DevTools` operations.
     ChromeDevtools,
 }
 
@@ -522,6 +522,16 @@ pub const fn surface(id: SurfaceId) -> &'static SurfaceContract {
 /// Operator scopes are subset-checked: the frozen profile is a ceiling, not an
 /// exact-request quota. A candidate may omit any ceiling scope, but may not add
 /// a scope outside it.
+///
+/// # Errors
+///
+/// Returns [`ConnectionError::ProtocolMismatch`] when `protocol` is not
+/// [`GATEWAY_PROTOCOL_VERSION`], [`ConnectionError::WrongTransport`] when the
+/// surface attaches locally instead of over the Gateway, and
+/// [`ConnectionError::ProfileNotAllowed`] when no frozen profile has the
+/// candidate's client identity, mode, role and device-identity requirement,
+/// when a [`Role::Node`] candidate carries any operator scope, or when the
+/// candidate requests a scope outside that profile's ceiling.
 pub fn validate_gateway_profile(
     surface_id: SurfaceId,
     candidate: GatewayProfile,
@@ -578,6 +588,12 @@ impl Display for ConnectionError {
 impl Error for ConnectionError {}
 
 /// Negotiates requested host features using an exact deny-by-default registry.
+///
+/// # Errors
+///
+/// Returns [`CapabilityError::NotAllowed`] carrying the first requested
+/// capability that the surface's frozen contract does not list. Nothing is
+/// granted when any single request is refused.
 pub fn negotiate_capabilities(
     surface_id: SurfaceId,
     requested: &[ClientCapability],
@@ -685,6 +701,12 @@ pub struct EventDelivery {
 
 impl EventDelivery {
     /// Creates one per-connection delivery queue with explicit nonzero bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::InvalidBound`] when `capacity` or
+    /// `max_payload_bytes` is zero, because a zero bound would make every
+    /// later `push` fail instead of bounding a working queue.
     pub fn new(
         surface: SurfaceId,
         capacity: usize,
@@ -703,6 +725,16 @@ impl EventDelivery {
     }
 
     /// Enqueues one authorized event without affecting any other connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::EventNotAllowed`] when the surface's frozen
+    /// contract does not list `kind`, [`DeliveryError::QueueFull`] when this
+    /// connection already holds `capacity` undelivered events,
+    /// [`DeliveryError::PayloadTooLarge`] when the encoded payload exceeds
+    /// `max_payload_bytes`, and [`DeliveryError::SequenceExhausted`] when the
+    /// per-connection sequence counter reached [`u64::MAX`]. The event is not
+    /// queued in any of those cases.
     pub fn push(
         &mut self,
         kind: SessionEventKind,
@@ -798,6 +830,10 @@ mod tests {
     use super::*;
 
     #[derive(Debug, Deserialize, Eq, PartialEq)]
+    #[expect(
+        clippy::struct_field_names,
+        reason = "these are the frozen inventory's JSON keys transcribed verbatim, so `inventory_id` must not be shortened to `id`; `InventoryItem::id` already means something else"
+    )]
     struct Inventory {
         schema_version: u64,
         inventory_id: String,
