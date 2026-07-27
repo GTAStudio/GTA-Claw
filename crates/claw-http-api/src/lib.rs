@@ -11,6 +11,7 @@ mod config;
 mod deterministic;
 mod error;
 mod http_support;
+mod legacy;
 mod lifecycle;
 mod mcp;
 mod openai;
@@ -37,6 +38,16 @@ pub use admin::ADMIN_HTTP_RPC_METHODS;
 pub use auth::{BearerAuthenticator, BearerCredential, Principal};
 pub use config::{ApiConfig, HttpLimits, WebhookRoute};
 pub use deterministic::DeterministicRuntime;
+pub use legacy::{
+    LEGACY_ADMIN_ACTIONS, LEGACY_HTTP_ENDPOINTS, LegacyAdminAction, LegacyAdminCredential,
+    LegacyApiConfig, LegacyApiServices, LegacyChannelMessage, LegacyChannelMessagePort,
+    LegacyChannelStatus, LegacyConfigError, LegacyDeviceFlowPort, LegacyExecResult,
+    LegacyHostAdminPort, LegacyHttpApi, LegacyHttpLimits, LegacyOsInfo, LegacyProcessInfo,
+    LegacyProcessMemory, LegacyReloadError, LegacyReloadPort, LegacyReloadResult,
+    LegacyRuntimePort, LegacyRuntimeSnapshot, LegacySystemInfo, LegacyTeamsPort,
+    LegacyWhatsAppConfig, LegacyWhatsAppPort, LegacyWhatsAppServices, ProviderLegacyRuntime,
+    ProviderLegacyRuntimeConfig,
+};
 pub use lifecycle::{
     PHASE_DRAINING, PHASE_RUNNING, PHASE_STARTING, ServingState, ServingStateHandle,
     ServingStatePort,
@@ -52,6 +63,7 @@ pub use ports::{
 pub use watch::WatchNodeHandle;
 
 use crate::auth::{AuthMiddlewareState, require_bearer};
+use crate::lifecycle::{ServingMiddlewareState, require_serving};
 use crate::state::ApiState;
 
 macro_rules! method_router {
@@ -85,6 +97,8 @@ macro_rules! http_api_endpoints {
                 (POST, "/v1/chat/completions", openai::chat),
                 (POST, "/v1/responses", openai::responses),
                 (POST, "/tools/invoke", tools::invoke),
+            }
+            admin {
                 (POST, "/api/v1/admin/rpc", admin::rpc),
             }
             mcp {
@@ -98,6 +112,7 @@ macro_rules! build_route_groups {
     (
         public { $(($public_method:ident, $public_path:literal, $public_handler:path),)* }
         protected { $(($protected_method:ident, $protected_path:literal, $protected_handler:path),)* }
+        admin { $(($admin_method:ident, $admin_path:literal, $admin_handler:path),)* }
         mcp { $(($mcp_method:ident, $mcp_path:literal, $mcp_handler:path),)* }
     ) => {{
         let public = Router::new()
@@ -107,9 +122,11 @@ macro_rules! build_route_groups {
                 $protected_path,
                 method_router!($protected_method, $protected_handler),
             ))*;
+        let admin = Router::new()
+            $(.route($admin_path, method_router!($admin_method, $admin_handler)))*;
         let mcp = Router::new()
             $(.route($mcp_path, method_router!($mcp_method, $mcp_handler)))*;
-        (public, protected, mcp)
+        (public, protected, admin, mcp)
     }};
 }
 
@@ -117,11 +134,13 @@ macro_rules! collect_registered_endpoints {
     (
         public { $(($public_method:ident, $public_path:literal, $public_handler:path),)* }
         protected { $(($protected_method:ident, $protected_path:literal, $protected_handler:path),)* }
+        admin { $(($admin_method:ident, $admin_path:literal, $admin_handler:path),)* }
         mcp { $(($mcp_method:ident, $mcp_path:literal, $mcp_handler:path),)* }
     ) => {
         &[
             $((stringify!($public_method), $public_path),)*
             $((stringify!($protected_method), $protected_path),)*
+            $((stringify!($admin_method), $admin_path),)*
             $((stringify!($mcp_method), $mcp_path),)*
         ]
     };
@@ -159,13 +178,17 @@ impl HttpApi {
         services: ApiServices,
         serving: Arc<dyn ServingStatePort>,
     ) -> Self {
+        let serving_middleware = ServingMiddlewareState {
+            serving: serving.clone(),
+            limits: config.limits.clone(),
+        };
         let auth_state = AuthMiddlewareState {
             authenticator: config.authenticator.clone(),
             limits: config.limits.clone(),
         };
         let cors_origins = config.cors_origins.clone();
         let state = ApiState::with_serving_state(config, services, serving);
-        let (router, protected, mcp_router) = http_api_endpoints!(build_route_groups);
+        let (router, protected, admin, mcp_router) = http_api_endpoints!(build_route_groups);
         let protected = protected.layer(middleware::from_fn_with_state(auth_state, require_bearer));
         let cors = CorsLayer::new()
             .allow_methods([Method::GET, Method::HEAD, Method::POST, Method::DELETE])
@@ -188,6 +211,7 @@ impl HttpApi {
         };
         let router = router
             .merge(protected)
+            .merge(admin)
             .layer(SetResponseHeaderLayer::if_not_present(
                 HeaderName::from_static("x-content-type-options"),
                 HeaderValue::from_static("nosniff"),
@@ -200,6 +224,10 @@ impl HttpApi {
                 HeaderName::from_static("permissions-policy"),
                 HeaderValue::from_static("camera=(), microphone=(self), geolocation=()"),
             ))
+            .route_layer(middleware::from_fn_with_state(
+                serving_middleware.clone(),
+                require_serving,
+            ))
             .layer(cors)
             .with_state(state.clone());
         let mcp_router = mcp_router
@@ -210,6 +238,10 @@ impl HttpApi {
             .layer(SetResponseHeaderLayer::if_not_present(
                 HeaderName::from_static("referrer-policy"),
                 HeaderValue::from_static("no-referrer"),
+            ))
+            .route_layer(middleware::from_fn_with_state(
+                serving_middleware,
+                require_serving,
             ))
             .with_state(state.clone());
         Self {
@@ -280,5 +312,6 @@ mod admin_rpc;
 pub use admin_rpc::{
     ADMIN_RPC_PATH, AdminMethodPolicy, AdminRpcAuthRejection, AdminRpcAuthenticator,
     AdminRpcCaller, AdminRpcEnvelope, AdminRpcError, AdminRpcLimits, AdminRpcService,
-    DenyAllAuthenticator, FnAuthenticator, dispatch_status, operator_scope_to_security,
+    BearerAdminRpcAuthenticator, DenyAllAuthenticator, FnAuthenticator, dispatch_status,
+    operator_scope_to_security,
 };

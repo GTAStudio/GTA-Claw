@@ -223,6 +223,10 @@ impl ProviderPort for DeterministicRuntime {
         cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<Usage, PortError>> {
         Box::pin(async move {
+            let _cancellation_observer = StreamCancellationObserver {
+                cancelled: &self.stream_cancelled,
+                token: cancellation.clone(),
+            };
             *self
                 .last_generation_request
                 .lock()
@@ -246,6 +250,7 @@ impl ProviderPort for DeterministicRuntime {
                             ));
                         }
                     }
+
                     () = cancellation.cancelled() => {
                         self.stream_cancelled.store(true, Ordering::Release);
                         return Err(PortError::new(
@@ -294,6 +299,19 @@ impl ProviderPort for DeterministicRuntime {
                 .collect();
             Ok(vectors)
         })
+    }
+}
+
+struct StreamCancellationObserver<'a> {
+    cancelled: &'a AtomicBool,
+    token: CancellationToken,
+}
+
+impl Drop for StreamCancellationObserver<'_> {
+    fn drop(&mut self) {
+        if self.token.is_cancelled() {
+            self.cancelled.store(true, Ordering::Release);
+        }
     }
 }
 

@@ -169,6 +169,11 @@ impl AdminRpcError {
                 HeaderValue::from_static("Bearer realm=\"admin\""),
             );
         }
+        if matches!(self, Self::BodyTooLarge | Self::BodyTimeout) {
+            response
+                .headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("close"));
+        }
         response
     }
 

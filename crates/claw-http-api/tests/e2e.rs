@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use claw_http_api::{
     ApiConfig, BearerAuthenticator, BearerCredential, DeterministicRuntime, GenerationOutput,
-    HTTP_ENDPOINTS, HttpApi, InputMedia, InputMediaKind, InputMediaSource, ToolCall,
-    ToolInvocation, ToolInvocationContext, Usage, WebhookRoute,
+    HTTP_ENDPOINTS, HttpApi, InputMedia, InputMediaKind, InputMediaSource, ServingStateHandle,
+    ToolCall, ToolInvocation, ToolInvocationContext, Usage, WebhookRoute,
 };
 use claw_security::authorization::{Role, Scope, ScopeSet};
 use http::HeaderValue;
@@ -173,7 +173,15 @@ fn config() -> ApiConfig {
 }
 
 async fn spawn_with(config: ApiConfig, runtime: Arc<DeterministicRuntime>) -> Server {
-    let api = HttpApi::new(config, runtime.services());
+    spawn_with_serving(config, runtime, ServingStateHandle::serving()).await
+}
+
+async fn spawn_with_serving(
+    config: ApiConfig,
+    runtime: Arc<DeterministicRuntime>,
+    serving: ServingStateHandle,
+) -> Server {
+    let api = HttpApi::with_serving_state(config, runtime.services(), Arc::new(serving));
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test listener");
@@ -955,7 +963,7 @@ async fn tools_admin_mcp_and_webhooks_enforce_and_map_contracts() {
     assert_eq!(scope_denied.status, 403);
     assert_eq!(
         scope_denied.json(),
-        json!({"ok":false,"error":{"type":"forbidden","message":"Forbidden"}})
+        json!({"ok":false,"error":{"type":"forbidden","message":"missing scope: operator.admin"}})
     );
     assert_eq!(
         runtime.audit_events().expect("scope audit events").len(),
@@ -2421,4 +2429,238 @@ async fn generation_ports_receive_validated_parameters_media_and_strict_response
             "type":"invalid_request_error"
         }})
     );
+}
+
+#[tokio::test]
+async fn draining_rejects_new_main_api_work_before_dispatch() {
+    let runtime = DeterministicRuntime::new();
+    let serving = ServingStateHandle::serving();
+    let server = spawn_with_serving(config(), runtime.clone(), serving.clone()).await;
+
+    serving.begin_draining();
+
+    let chat = request(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(&json!({
+            "model":"openclaw",
+            "messages":[{"role":"user","content":"must not dispatch"}]
+        })),
+    )
+    .await;
+    assert_eq!(chat.status, 503);
+    assert_eq!(
+        chat.json(),
+        json!({"error":{"message":"Service draining","type":"api_error"}})
+    );
+    assert_eq!(
+        chat.headers.get("retry-after").map(String::as_str),
+        Some("1")
+    );
+    assert!(
+        runtime
+            .last_generation_request()
+            .expect("provider request lock")
+            .is_none(),
+        "draining traffic reached the provider"
+    );
+
+    let admin = request(
+        &server,
+        "POST",
+        "/api/v1/admin/rpc",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(&json!({"id":"drain","method":"status"})),
+    )
+    .await;
+    assert_eq!(admin.status, 503);
+    assert_eq!(
+        admin.json(),
+        json!({"ok":false,"error":{"type":"unavailable","message":"service is draining"}})
+    );
+
+    let webhook = request(
+        &server,
+        "POST",
+        "/plugins/webhooks/zapier",
+        None,
+        &[("Content-Type", "application/json")],
+        &json_body(&json!({"action":"list_flows"})),
+    )
+    .await;
+    assert_eq!(webhook.status, 503);
+    assert_eq!(
+        webhook.json(),
+        json!({"ok":false,"code":"unavailable","error":"service is draining"})
+    );
+
+    let liveness = request(&server, "GET", "/health", None, &[], b"").await;
+    assert_eq!(liveness.status, 200);
+    assert_eq!(liveness.json()["phase"], "draining");
+}
+
+#[tokio::test]
+async fn provider_stream_budgets_fail_deterministically_without_unbounded_buffering() {
+    let runtime = DeterministicRuntime::new();
+    runtime
+        .set_output(GenerationOutput {
+            text: "x".repeat(128),
+            tool_calls: Vec::new(),
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 128,
+                total_tokens: 129,
+            },
+        })
+        .expect("set oversized stream output");
+    let mut limits = config();
+    limits.limits.stream_event_bytes = 16;
+    limits.limits.stream_output_bytes = 32;
+    limits.limits.stream_events = 2;
+    let server = spawn_with(limits, runtime).await;
+
+    let response = request(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(&json!({
+            "model":"openclaw",
+            "stream":true,
+            "messages":[{"role":"user","content":"overflow"}]
+        })),
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    assert!(
+        response
+            .text()
+            .contains("provider stream exceeded configured limits"),
+        "stream omitted its deterministic budget failure: {}",
+        response.text()
+    );
+    assert!(response.text().contains("[DONE]"));
+}
+
+#[tokio::test]
+async fn watch_session_capacity_evicts_the_oldest_live_node() {
+    let runtime = DeterministicRuntime::new();
+    let mut watch_config = config();
+    watch_config.limits.watch_sessions = 1;
+    watch_config.limits.watch_poll_timeout = Duration::from_millis(25);
+    let server = spawn_with(watch_config, runtime).await;
+
+    let first = connect_watch(&server, "bounded-watch-1").await;
+    let second = connect_watch(&server, "bounded-watch-2").await;
+
+    let evicted = request(
+        &server,
+        "POST",
+        "/api/nodes/watch/poll",
+        Some(&first),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(evicted.status, 401);
+    assert!(
+        !server
+            .api
+            .watch_handle()
+            .send("bounded-watch-1", "node.invoke.request", None)
+            .expect("old-node enqueue")
+    );
+    assert!(
+        server
+            .api
+            .watch_handle()
+            .send(
+                "bounded-watch-2",
+                "node.invoke.request",
+                Some(json!({"id":"bounded"}))
+            )
+            .expect("new-node enqueue")
+    );
+    let current = request(
+        &server,
+        "POST",
+        "/api/nodes/watch/poll",
+        Some(&second),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(current.status, 200);
+    assert_eq!(
+        current.json()["event"],
+        json!({"event":"node.invoke.request","payload":{"id":"bounded"}})
+    );
+
+    let runtime = DeterministicRuntime::new();
+    let mut reconnect_config = config();
+    reconnect_config.limits.watch_sessions = 2;
+    let reconnect_server = spawn_with(reconnect_config, runtime).await;
+    let first_node = connect_watch(&reconnect_server, "reconnect-watch-1").await;
+    let old_second = connect_watch(&reconnect_server, "reconnect-watch-2").await;
+    let _new_second = connect_watch(&reconnect_server, "reconnect-watch-2").await;
+    assert!(
+        reconnect_server
+            .api
+            .watch_handle()
+            .send(
+                "reconnect-watch-1",
+                "node.invoke.request",
+                Some(json!({"id":"still-live"}))
+            )
+            .expect("unrelated node enqueue"),
+        "reconnecting one node must not evict an unrelated session"
+    );
+    let unrelated = request(
+        &reconnect_server,
+        "POST",
+        "/api/nodes/watch/poll",
+        Some(&first_node),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(unrelated.status, 200);
+    assert_eq!(unrelated.json()["event"]["payload"]["id"], "still-live");
+    let replaced = request(
+        &reconnect_server,
+        "POST",
+        "/api/nodes/watch/poll",
+        Some(&old_second),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(replaced.status, 401);
+}
+
+async fn connect_watch(server: &Server, device_id: &str) -> String {
+    let challenge = request(server, "GET", "/api/nodes/watch/challenge", None, &[], b"").await;
+    let nonce = challenge.json()["nonce"]
+        .as_str()
+        .expect("watch challenge nonce")
+        .to_owned();
+    let connect = request(
+        server,
+        "POST",
+        "/api/nodes/watch/connect",
+        None,
+        &[("Content-Type", "application/json")],
+        &watch_connect_body(&nonce, device_id),
+    )
+    .await;
+    assert_eq!(connect.status, 200, "{}", connect.text());
+    connect.json()["sessionToken"]
+        .as_str()
+        .expect("watch session token")
+        .to_owned()
 }

@@ -8,7 +8,10 @@
 use std::fmt::{self, Debug, Formatter};
 
 use axum::http::HeaderMap;
+use axum::http::header;
 use claw_security::authorization::{Role, ScopeSet};
+
+use crate::auth::BearerAuthenticator;
 
 /// An admin caller whose credential some other layer has already verified.
 ///
@@ -92,6 +95,53 @@ impl AdminRpcAuthenticator for DenyAllAuthenticator {
     fn authenticate(&self, _headers: &HeaderMap) -> Result<AdminRpcCaller, AdminRpcAuthRejection> {
         Err(AdminRpcAuthRejection::Missing)
     }
+}
+
+/// Adapts the HTTP crate's pre-hashed bearer credential store to Admin RPC.
+///
+/// The resulting caller subject is a stable SHA-256 identifier, never the
+/// presented token. This is the production bridge used by [`crate::HttpApi`].
+#[derive(Clone, Debug)]
+pub struct BearerAdminRpcAuthenticator {
+    authenticator: BearerAuthenticator,
+}
+
+impl BearerAdminRpcAuthenticator {
+    /// Creates an Admin RPC authenticator over an existing bearer store.
+    #[must_use]
+    pub const fn new(authenticator: BearerAuthenticator) -> Self {
+        Self { authenticator }
+    }
+}
+
+impl AdminRpcAuthenticator for BearerAdminRpcAuthenticator {
+    fn authenticate(&self, headers: &HeaderMap) -> Result<AdminRpcCaller, AdminRpcAuthRejection> {
+        let principal = self
+            .authenticator
+            .authenticate_headers(headers)
+            .ok_or_else(|| {
+                if headers.contains_key(header::AUTHORIZATION) {
+                    AdminRpcAuthRejection::Invalid
+                } else {
+                    AdminRpcAuthRejection::Missing
+                }
+            })?;
+        Ok(AdminRpcCaller::new(
+            hex_subject(&principal.subject),
+            principal.role,
+            principal.scopes,
+        ))
+    }
+}
+
+fn hex_subject(subject: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(subject.len() * 2);
+    for byte in subject {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 /// An authenticator built from a caller-supplied closure.

@@ -51,6 +51,12 @@ pub struct HttpLimits {
     pub operation_timeout: Duration,
     /// Bounded SSE/provider channel capacity.
     pub stream_buffer: usize,
+    /// Maximum provider events accepted by one streamed response.
+    pub stream_events: usize,
+    /// Maximum bytes accepted in one provider stream event.
+    pub stream_event_bytes: usize,
+    /// Maximum aggregate provider bytes accepted by one streamed response.
+    pub stream_output_bytes: usize,
     /// SSE heartbeat interval.
     pub heartbeat_interval: Duration,
     /// Watch long-poll timeout.
@@ -59,6 +65,8 @@ pub struct HttpLimits {
     pub watch_idle_timeout: Duration,
     /// Maximum watch queue events.
     pub watch_queue_events: usize,
+    /// Maximum simultaneously retained watch sessions.
+    pub watch_sessions: usize,
     /// Maximum watch queue bytes.
     pub watch_queue_bytes: usize,
     /// Maximum individual watch event bytes.
@@ -78,12 +86,30 @@ impl Default for HttpLimits {
             body_timeout: Duration::from_secs(30),
             operation_timeout: Duration::from_mins(2),
             stream_buffer: 16,
+            stream_events: 16_384,
+            stream_event_bytes: 256 * 1024,
+            stream_output_bytes: 8 * 1024 * 1024,
             heartbeat_interval: Duration::from_secs(15),
             watch_poll_timeout: Duration::from_secs(20),
             watch_idle_timeout: Duration::from_secs(75),
             watch_queue_events: 32,
+            watch_sessions: 1_024,
             watch_queue_bytes: 512 * 1024,
             watch_event_bytes: 64 * 1024,
+        }
+    }
+}
+
+impl HttpLimits {
+    pub(crate) fn body_limit_for_path(&self, path: &str) -> usize {
+        match path {
+            "/v1/embeddings" => self.embeddings_body_bytes,
+            "/tools/invoke" => self.tools_body_bytes,
+            "/api/v1/admin/rpc" => self.admin_body_bytes,
+            "/mcp" => self.mcp_body_bytes,
+            _ if path.starts_with("/api/nodes/watch/") => self.watch_body_bytes,
+            _ if path.starts_with("/plugins/webhooks/") => self.webhook_body_bytes,
+            _ => self.openai_body_bytes,
         }
     }
 }

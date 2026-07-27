@@ -12,6 +12,7 @@ use crate::error::ApiError;
 use crate::lifecycle::ServingStatePort;
 use crate::ports::ApiServices;
 use crate::watch::WatchRuntime;
+use crate::{AdminRpcLimits, AdminRpcService, BearerAdminRpcAuthenticator};
 
 const RESPONSE_SESSION_TTL: Duration = Duration::from_mins(30);
 const MAX_RESPONSE_SESSIONS: usize = 500;
@@ -25,6 +26,7 @@ pub(crate) struct ApiStateInner {
     pub(crate) config: ApiConfig,
     pub(crate) services: ApiServices,
     pub(crate) watch: WatchRuntime,
+    pub(crate) admin_rpc: AdminRpcService,
     pub(crate) serving: Arc<dyn ServingStatePort>,
     response_sessions: Mutex<HashMap<String, ResponseSession>>,
     next_id: AtomicU64,
@@ -45,11 +47,21 @@ impl ApiState {
         serving: Arc<dyn ServingStatePort>,
     ) -> Self {
         let watch = WatchRuntime::new(config.limits.clone(), services.watch_results.clone());
+        let admin_rpc = AdminRpcService::new(services.admin.clone(), services.audit.clone())
+            .with_authenticator(Arc::new(BearerAdminRpcAuthenticator::new(
+                config.authenticator.clone(),
+            )))
+            .with_limits(AdminRpcLimits {
+                body_bytes: config.limits.admin_body_bytes,
+                body_timeout: config.limits.body_timeout,
+                dispatch_timeout: config.limits.operation_timeout,
+            });
         Self {
             inner: Arc::new(ApiStateInner {
                 config,
                 services,
                 watch,
+                admin_rpc,
                 serving,
                 response_sessions: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),

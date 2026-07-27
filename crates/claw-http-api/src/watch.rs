@@ -1,6 +1,7 @@
 //! Bounded watchOS direct-node HTTP transport.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -154,15 +155,46 @@ impl WatchRuntime {
             .node_tokens
             .lock()
             .map_err(|_| internal_error())?;
-        if let Some(previous_token) = node_tokens.insert(node_id, token.clone())
+        if let Some(previous_token) = node_tokens.remove(&node_id)
             && let Some(previous) = sessions.remove(&previous_token)
         {
             previous.close();
         }
+        self.prune_sessions(&mut sessions, &mut node_tokens);
+        node_tokens.insert(node_id, token.clone());
         sessions.insert(token, session.clone());
         drop(node_tokens);
         drop(sessions);
         Ok(session)
+    }
+
+    fn prune_sessions(
+        &self,
+        sessions: &mut HashMap<String, Arc<WatchSession>>,
+        node_tokens: &mut HashMap<String, String>,
+    ) {
+        let stale = sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.closed.load(Ordering::Acquire)
+                    || session.expired(self.inner.limits.watch_idle_timeout)
+            })
+            .map(|(token, _)| token.clone())
+            .collect::<Vec<_>>();
+        for token in stale {
+            remove_session(sessions, node_tokens, &token);
+        }
+        let capacity = self.inner.limits.watch_sessions.max(1);
+        while sessions.len() >= capacity {
+            let Some(oldest) = sessions
+                .iter()
+                .max_by_key(|(_, session)| session.idle_elapsed())
+                .map(|(token, _)| token.clone())
+            else {
+                break;
+            };
+            remove_session(sessions, node_tokens, &oldest);
+        }
     }
 
     fn session(&self, token: &str) -> Result<Option<Arc<WatchSession>>, ApiError> {
@@ -260,18 +292,17 @@ impl WatchRuntime {
         let Some(session) = session else {
             return Ok(false);
         };
+        if session.closed.load(Ordering::Acquire)
+            || session.expired(self.inner.limits.watch_idle_timeout)
+        {
+            self.close_session_port(&session)?;
+            return Ok(false);
+        }
         let value = payload.map_or_else(
             || json!({"event": event}),
             |payload| json!({"event": event, "payload": payload}),
         );
-        let bytes = serde_json::to_vec(&value)
-            .map_err(|_| {
-                PortError::new(
-                    crate::ports::PortErrorKind::InvalidRequest,
-                    "event is not serializable",
-                )
-            })?
-            .len();
+        let bytes = serialized_len(&value)?;
         if bytes > self.inner.limits.watch_event_bytes {
             self.close_session_port(&session)?;
             return Ok(false);
@@ -301,9 +332,13 @@ impl WatchSession {
     }
 
     fn expired(&self, idle: Duration) -> bool {
+        self.idle_elapsed() >= idle
+    }
+
+    fn idle_elapsed(&self) -> Duration {
         self.last_seen
             .lock()
-            .map_or(true, |last_seen| last_seen.elapsed() >= idle)
+            .map_or(Duration::MAX, |last_seen| last_seen.elapsed())
     }
 
     fn close(&self) {
@@ -323,6 +358,50 @@ impl WatchSession {
         }
         drop(queue);
         Ok(event.map(|event| event.value))
+    }
+}
+
+fn remove_session(
+    sessions: &mut HashMap<String, Arc<WatchSession>>,
+    node_tokens: &mut HashMap<String, String>,
+    token: &str,
+) {
+    let Some(session) = sessions.remove(token) else {
+        return;
+    };
+    session.close();
+    if node_tokens
+        .get(&session.node_id)
+        .is_some_and(|active| active == token)
+    {
+        node_tokens.remove(&session.node_id);
+    }
+}
+
+fn serialized_len(value: &Value) -> Result<usize, PortError> {
+    let mut writer = ByteCounter::default();
+    serde_json::to_writer(&mut writer, value).map_err(|_| {
+        PortError::new(
+            crate::ports::PortErrorKind::InvalidRequest,
+            "event is not serializable",
+        )
+    })?;
+    Ok(writer.bytes)
+}
+
+#[derive(Default)]
+struct ByteCounter {
+    bytes: usize,
+}
+
+impl Write for ByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
