@@ -198,10 +198,10 @@ impl TxtRecord {
 }
 
 fn split_string(string: &[u8]) -> (&[u8], Option<&[u8]>) {
-    match string.iter().position(|&byte| byte == b'=') {
-        Some(index) => (&string[..index], Some(&string[index + 1..])),
-        None => (string, None),
-    }
+    let Some(index) = string.iter().position(|&byte| byte == b'=') else {
+        return (string, None);
+    };
+    (&string[..index], Some(&string[index + 1..]))
 }
 
 fn validate_key(key: &str) -> Result<(), DnsSdError> {

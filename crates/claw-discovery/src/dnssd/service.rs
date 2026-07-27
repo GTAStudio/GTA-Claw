@@ -229,7 +229,7 @@ pub fn resolve_services(
         .collect();
 
     let mut instances: Vec<Name> = Vec::new();
-    for record in usable.iter() {
+    for record in &usable {
         let RecordData::Ptr(target) = &record.data else {
             continue;
         };
@@ -249,7 +249,7 @@ pub fn resolve_services(
     for instance in instances {
         let mut service: Option<(u16, u16, u16, Name)> = None;
         let mut txt: Option<TxtRecord> = None;
-        for record in usable.iter() {
+        for record in &usable {
             if record.name != instance {
                 continue;
             }
@@ -290,7 +290,7 @@ pub fn resolve_services(
 
         let mut v4 = Vec::new();
         let mut v6 = Vec::new();
-        for record in usable.iter() {
+        for record in &usable {
             if record.name != host {
                 continue;
             }

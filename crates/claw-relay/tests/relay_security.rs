@@ -4497,3 +4497,95 @@ fn late_pending_attach_after_cdp_disconnect_is_immediately_detached() {
     );
     assert!(!bridge.targets()[0].attached);
 }
+
+#[test]
+fn browser_sessions_are_bounded_per_connection_and_released_on_detach() {
+    let mut endpoint = endpoint(4096);
+    let extension = endpoint
+        .accept(&extension_upgrade(
+            &format!("chrome-extension://{EXTENSION_ID}"),
+            TOKEN,
+        ))
+        .expect("extension");
+    let cdp = endpoint.accept(&cdp_upgrade()).expect("CDP");
+    let mut bridge = CdpBridge::with_pending_limit(3).expect("positive bound");
+    bridge.connect_extension(extension);
+    bridge.connect_cdp(cdp).expect("CDP");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Hello {
+                user_agent: "Fixture".to_owned(),
+                browser_version: "Chrome/144".to_owned(),
+                extension_version: "2.0.0".to_owned(),
+                tabs: vec![tab()],
+            },
+        )
+        .expect("hello");
+
+    let mut sessions = Vec::new();
+    for id in 1..=3 {
+        let effects = bridge
+            .receive_cdp(
+                cdp,
+                CdpRequest {
+                    id,
+                    method: "Target.attachToBrowserTarget".to_owned(),
+                    params: None,
+                    session_id: None,
+                },
+            )
+            .expect("browser session within the bound");
+        let [BridgeEffect::ToCdp { response, .. }] = effects.as_slice() else {
+            panic!("expected exactly one browser session response");
+        };
+        let session_id = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("sessionId"))
+            .and_then(serde_json::Value::as_str)
+            .expect("session id")
+            .to_owned();
+        sessions.push(session_id);
+    }
+
+    // A browser session is only released by an explicit detach or by the client
+    // going away, so the map must refuse to grow past the connection's bound
+    // instead of accumulating for the life of the connection.
+    assert_eq!(
+        bridge.receive_cdp(
+            cdp,
+            CdpRequest {
+                id: 4,
+                method: "Target.attachToBrowserTarget".to_owned(),
+                params: None,
+                session_id: None,
+            },
+        ),
+        Err(BridgeError::SessionLimit)
+    );
+
+    let released = bridge
+        .receive_cdp(
+            cdp,
+            CdpRequest {
+                id: 5,
+                method: "Target.detachFromTarget".to_owned(),
+                params: Some(json!({ "sessionId": sessions[0] })),
+                session_id: None,
+            },
+        )
+        .expect("detach releases the browser session");
+    assert_eq!(released.len(), 1);
+    bridge
+        .receive_cdp(
+            cdp,
+            CdpRequest {
+                id: 6,
+                method: "Target.attachToBrowserTarget".to_owned(),
+                params: None,
+                session_id: None,
+            },
+        )
+        .expect("released capacity is reusable");
+}

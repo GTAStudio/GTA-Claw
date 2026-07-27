@@ -4,6 +4,8 @@
 //! the hashed-host fixtures built on top of them rest on a verified base rather
 //! than on the implementation agreeing with itself.
 
+use core::fmt::Write as _;
+
 use claw_discovery::known_hosts::digest::{base64_decode, base64_encode, hmac_sha1, sha1};
 use claw_discovery::known_hosts::{HostKey, KnownHosts, KnownHostsError, Marker, RejectionCause};
 
@@ -454,5 +456,8 @@ fn malformed_lines_are_errors_rather_than_silently_skipped() {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
 }

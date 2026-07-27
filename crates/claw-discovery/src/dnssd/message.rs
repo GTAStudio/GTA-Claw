@@ -75,7 +75,7 @@ pub enum RecordData {
 impl RecordData {
     /// Returns the numeric record type of this payload.
     #[must_use]
-    pub fn record_type(&self) -> u16 {
+    pub const fn record_type(&self) -> u16 {
         match self {
             Self::A(_) => TYPE_A,
             Self::Aaaa(_) => TYPE_AAAA,
@@ -105,7 +105,7 @@ pub struct ResourceRecord {
 impl ResourceRecord {
     /// Returns the numeric record type.
     #[must_use]
-    pub fn record_type(&self) -> u16 {
+    pub const fn record_type(&self) -> u16 {
         self.data.record_type()
     }
 }
@@ -143,13 +143,13 @@ pub struct Message {
 impl Message {
     /// Returns `true` when the `QR` bit is set.
     #[must_use]
-    pub fn is_response(&self) -> bool {
+    pub const fn is_response(&self) -> bool {
         self.flags & FLAG_RESPONSE != 0
     }
 
     /// Returns `true` when the `TC` bit is set.
     #[must_use]
-    pub fn is_truncated(&self) -> bool {
+    pub const fn is_truncated(&self) -> bool {
         self.flags & FLAG_TRUNCATED != 0
     }
 

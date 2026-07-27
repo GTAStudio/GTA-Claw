@@ -568,7 +568,7 @@ fn truncated_and_overlong_wire_forms_are_refused() {
 
     // A record that claims more rdata than the buffer holds must not be read
     // past the end.
-    let mut overlong = wire.clone();
+    let mut overlong = wire;
     let rdlen = overlong.len() - 18;
     overlong[rdlen] = 0xff;
     assert_eq!(Message::decode(&overlong), Err(DnsSdError::Truncated));
@@ -733,5 +733,22 @@ fn instance_conflict_suffixes_are_deterministic_and_bounded() {
     assert_eq!(
         resolve_instance_conflict(&long, &taken, 5),
         Err(DnsSdError::NoFreeInstanceName(long))
+    );
+}
+
+#[test]
+fn non_printable_label_bytes_round_trip_through_the_decimal_escape() {
+    // RFC 1035 section 5.1 renders a byte outside printable US-ASCII as an
+    // exact three-digit decimal escape. An operator copying the presentation
+    // form out of a log must get the identical labels back.
+    let name = Name::from_labels([vec![b'a', 0x00, 0x1f, 0x7f, 0xff, b'z'], b"local".to_vec()])
+        .expect("labels");
+    assert_eq!(name.to_string(), "a\\000\\031\\127\\255z.local.");
+    assert_eq!(Name::parse(&name.to_string()).expect("reparse"), name);
+    assert_eq!(
+        Name::parse("a\\000\\031\\127\\255z.local.")
+            .expect("parse")
+            .labels()[0],
+        vec![b'a', 0x00, 0x1f, 0x7f, 0xff, b'z']
     );
 }

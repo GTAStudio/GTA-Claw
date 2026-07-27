@@ -86,7 +86,7 @@ struct CleanupDetach {
 }
 
 /// Command sent from the bridge to the paired extension.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum ExtensionCommand {
     /// Attach `chrome.debugger` to one shared tab.
@@ -132,7 +132,7 @@ pub struct CdpErrorObject {
 }
 
 /// Response delivered to one isolated CDP connection.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CdpResponse {
     /// Request identity.
@@ -149,7 +149,7 @@ pub struct CdpResponse {
 }
 
 /// Event delivered to one isolated CDP connection.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CdpEvent {
     /// Flattened debugger session, when applicable.
@@ -162,7 +162,7 @@ pub struct CdpEvent {
 }
 
 /// Observable bridge action for a WebSocket adapter.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BridgeEffect {
     /// Send a command to the authenticated extension connection.
     ToExtension(ExtensionCommand),
@@ -263,6 +263,12 @@ impl CdpBridge {
     }
 
     /// Creates a disconnected bridge with explicit per-client pending-work and child-session bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::InvalidPendingLimit`] when `pending_limit` is
+    /// zero, which would make every command unqueueable, or when multiplying it
+    /// by the eight CDP client partitions overflows `usize`.
     pub fn with_pending_limit(pending_limit: usize) -> Result<Self, BridgeError> {
         if pending_limit == 0 {
             return Err(BridgeError::InvalidPendingLimit);
@@ -289,6 +295,14 @@ impl CdpBridge {
     }
 
     /// Attaches one authenticated CDP client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::DuplicateConnection`] when the identity is
+    /// already attached, and [`BridgeError::CdpConnectionLimit`] when all eight
+    /// client partitions are assigned. A partition stays assigned while a
+    /// disconnected client's debugger state is still being cleaned up on the
+    /// Chrome side, so a new client is refused rather than inheriting it.
     pub fn connect_cdp(&mut self, connection: ConnectionId) -> Result<(), BridgeError> {
         if self.clients.contains(&connection) {
             return Err(BridgeError::DuplicateConnection);
@@ -304,6 +318,28 @@ impl CdpBridge {
     }
 
     /// Processes one strictly decoded extension message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::UnknownExtensionConnection`] when the frame did
+    /// not come from the currently attached extension,
+    /// [`BridgeError::HelloRequired`] when the first frame is not a hello, and
+    /// [`BridgeError::DuplicateHello`] when a second hello arrives.
+    ///
+    /// Afterwards it returns [`BridgeError::UnknownTab`] when the extension
+    /// names a tab it never shared, [`BridgeError::TabNotAttached`] when it
+    /// reports an event for a tab with no debugger session,
+    /// [`BridgeError::ExtensionEventNotAllowed`] for an event outside the
+    /// explicit event policy, [`BridgeError::InvalidChildSessionId`],
+    /// [`BridgeError::ChildSessionCollision`] or
+    /// [`BridgeError::ChildSessionNotFound`] for a child session that is empty,
+    /// relay-reserved, reused for a different root session, or outside the
+    /// target's current root session, [`BridgeError::UnknownCommandSequence`]
+    /// for a result or error naming a sequence the relay never issued,
+    /// [`BridgeError::TargetDiedDuringCommand`] when the tab vanished while its
+    /// attach was in flight, and [`BridgeError::PendingLimit`],
+    /// [`BridgeError::SessionLimit`] or [`BridgeError::SequenceExhausted`] when
+    /// a follow-up auto-attach cannot be queued.
     pub fn receive_extension(
         &mut self,
         connection: ConnectionId,
@@ -367,6 +403,29 @@ impl CdpBridge {
     }
 
     /// Processes one strictly decoded CDP request.
+    ///
+    /// A request that names a session is routed to that session's owner only;
+    /// a session belonging to another connection is reported as not found
+    /// rather than served.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::UnknownCdpConnection`] when the connection is not
+    /// attached, [`BridgeError::ExtensionUnavailable`] when a command would
+    /// have to reach an extension that is absent or has not said hello,
+    /// [`BridgeError::PendingLimit`] when this client already has
+    /// `pending_limit` commands in flight or the bridge is at its global bound,
+    /// [`BridgeError::SessionLimit`] when the client's root-session or browser
+    /// session partition is full, [`BridgeError::TargetAttachmentReserved`]
+    /// when an attach for the target was reserved between the policy check and
+    /// the queueing, [`BridgeError::UnknownTab`] when the target disappeared in
+    /// the same window, and [`BridgeError::SequenceExhausted`] once the
+    /// process-local command or session ordinal would wrap.
+    ///
+    /// A request that is merely refused by CDP policy — unknown target, unknown
+    /// session, target already attached elsewhere, detach already pending, or a
+    /// method outside the allowlist — is *not* an error here: it is delivered to
+    /// the requesting connection as a [`CdpErrorObject`].
     pub fn receive_cdp(
         &mut self,
         connection: ConnectionId,
@@ -375,15 +434,16 @@ impl CdpBridge {
         if !self.clients.contains(&connection) {
             return Err(BridgeError::UnknownCdpConnection);
         }
-        if let Some(session_id) = request.session_id.clone()
-            && self.browser_sessions.get(&session_id) == Some(&connection)
-        {
-            return self.receive_browser_cdp(connection, request);
+        // A browser session of this connection is served as a browser request;
+        // anything else that names a session is routed by session identity.
+        let routed_session = request.session_id.as_deref().and_then(|session_id| {
+            (self.browser_sessions.get(session_id) != Some(&connection))
+                .then(|| session_id.to_owned())
+        });
+        match routed_session {
+            Some(session_id) => self.receive_session_cdp(connection, &session_id, request),
+            None => self.receive_browser_cdp(connection, &request),
         }
-        if let Some(session_id) = request.session_id.clone() {
-            return self.receive_session_cdp(connection, &session_id, request);
-        }
-        self.receive_browser_cdp(connection, request)
     }
 
     /// Handles abrupt extension/browser death and announces every detached page.
@@ -494,6 +554,15 @@ impl CdpBridge {
     }
 
     /// Expires pending work or a late-response tombstone after the adapter's timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::UnknownCommandSequence`] when `seq` was never
+    /// issued by this bridge; a sequence that was issued and already resolved
+    /// expires to no effects. Returns [`BridgeError::PendingLimit`],
+    /// [`BridgeError::SessionLimit`], [`BridgeError::TargetAttachmentReserved`],
+    /// [`BridgeError::UnknownTab`] or [`BridgeError::SequenceExhausted`] when
+    /// the auto-attach work freed by the expiry cannot itself be queued.
     pub fn expire_command(&mut self, seq: u64) -> Result<Vec<BridgeEffect>, BridgeError> {
         if self.cleanup_detaches.contains_key(&seq) {
             return Ok(self.fail_closed_extension("Chrome debugger cleanup timed out"));
@@ -624,7 +693,16 @@ impl CdpBridge {
             if let Some(child) = self.child_sessions.get(session_id).cloned() {
                 let valid_root = self.targets.get(&child.tab_id).is_some_and(|target| {
                     target.session.is_some_and(|root| {
-                        root.owner == child.owner && root.attach_seq == child.root_attach_seq
+                        #[expect(
+                            clippy::suspicious_operation_groupings,
+                            reason = "a child session records the root attach generation it was \
+                                      announced under, so `SessionState::attach_seq` is compared \
+                                      against `ChildSessionState::root_attach_seq`; the field \
+                                      clippy proposes does not exist"
+                        )]
+                        {
+                            root.owner == child.owner && root.attach_seq == child.root_attach_seq
+                        }
                     })
                 });
                 if !valid_root {
@@ -663,7 +741,7 @@ impl CdpBridge {
                 &request,
                 CdpError::MethodNotAllowed,
             )]);
-        };
+        }
         let seq = self.reserve_pending(connection, &request, PendingKind::Cdp { tab_id })?;
         Ok(vec![BridgeEffect::ToExtension(ExtensionCommand::Cdp {
             seq,
@@ -677,12 +755,12 @@ impl CdpBridge {
     fn receive_browser_cdp(
         &mut self,
         connection: ConnectionId,
-        request: CdpRequest,
+        request: &CdpRequest,
     ) -> Result<Vec<BridgeEffect>, BridgeError> {
         match request.method.as_str() {
             "Browser.getVersion" => Ok(vec![success_effect(
                 connection,
-                &request,
+                request,
                 json!({
                     "protocolVersion": "1.3",
                     "product": self.browser_version,
@@ -692,22 +770,41 @@ impl CdpBridge {
                 }),
             )]),
             "Browser.close" => Ok(vec![
-                success_effect(connection, &request, json!({})),
+                success_effect(connection, request, json!({})),
                 BridgeEffect::CloseCdp {
                     connection,
                     code: 1000,
                     reason: "Browser.close",
                 },
             ]),
-            "Target.setDiscoverTargets" => {
-                Ok(vec![success_effect(connection, &request, json!({}))])
-            }
+            "Target.setDiscoverTargets" => Ok(vec![success_effect(connection, request, json!({}))]),
+            #[expect(
+                clippy::match_same_arms,
+                reason = "Chrome exposes `Browser.setDownloadBehavior` and upstream relays \
+                          forward it; naming it beside the catch-all records that the denial \
+                          is an audited policy decision, not an unlisted method"
+            )]
             "Browser.setDownloadBehavior" => Ok(vec![error_effect(
                 connection,
-                &request,
+                request,
                 CdpError::MethodNotAllowed,
             )]),
             "Target.attachToBrowserTarget" => {
+                // A browser session is only ever released by an explicit
+                // `Target.detachFromTarget` or by the client disconnecting, so
+                // an unbounded map here lets one connection allocate for as
+                // long as it stays alive. Bound it exactly like the child
+                // session partitions.
+                let owned = self
+                    .browser_sessions
+                    .values()
+                    .filter(|owner| **owner == connection)
+                    .count();
+                if owned >= self.pending_limit
+                    || self.browser_sessions.len() >= self.global_pending_limit
+                {
+                    return Err(BridgeError::SessionLimit);
+                }
                 let session_id = browser_session_name(self.next_session);
                 self.next_session = self
                     .next_session
@@ -716,7 +813,7 @@ impl CdpBridge {
                 self.browser_sessions.insert(session_id.clone(), connection);
                 Ok(vec![success_effect(
                     connection,
-                    &request,
+                    request,
                     json!({ "sessionId": session_id }),
                 )])
             }
@@ -730,17 +827,17 @@ impl CdpBridge {
                 if !enabled {
                     self.auto_attach.remove(&connection);
                     self.auto_attach_suppressed.remove(&connection);
-                    return Ok(vec![success_effect(connection, &request, json!({}))]);
+                    return Ok(vec![success_effect(connection, request, json!({}))]);
                 }
                 self.auto_attach.insert(connection);
                 self.auto_attach_suppressed.remove(&connection);
-                let mut effects = vec![success_effect(connection, &request, json!({}))];
+                let mut effects = vec![success_effect(connection, request, json!({}))];
                 effects.extend(self.schedule_available_auto_attaches()?);
                 Ok(effects)
             }
             "Target.getTargets" => Ok(vec![success_effect(
                 connection,
-                &request,
+                request,
                 json!({ "targetInfos": self.targets() }),
             )]),
             "Target.getTargetInfo" => {
@@ -752,7 +849,7 @@ impl CdpBridge {
                 if target_id.is_none() || target_id == Some(BROWSER_TARGET_ID) {
                     return Ok(vec![success_effect(
                         connection,
-                        &request,
+                        request,
                         json!({
                             "targetInfo": {
                                 "targetId": BROWSER_TARGET_ID,
@@ -769,18 +866,16 @@ impl CdpBridge {
                     .targets
                     .values()
                     .find(|target| Some(target.target_id.as_str()) == target_id);
-                match found {
-                    Some(target) => Ok(vec![success_effect(
-                        connection,
-                        &request,
-                        json!({ "targetInfo": target_info(target) }),
-                    )]),
-                    None => Ok(vec![error_effect(
-                        connection,
-                        &request,
-                        CdpError::TargetNotFound,
-                    )]),
-                }
+                Ok(vec![found.map_or_else(
+                    || error_effect(connection, request, CdpError::TargetNotFound),
+                    |target| {
+                        success_effect(
+                            connection,
+                            request,
+                            json!({ "targetInfo": target_info(target) }),
+                        )
+                    },
+                )])
             }
             "Target.attachToTarget" => {
                 let target_id = request
@@ -793,7 +888,7 @@ impl CdpBridge {
                 }) else {
                     return Ok(vec![error_effect(
                         connection,
-                        &request,
+                        request,
                         CdpError::TargetNotFound,
                     )]);
                 };
@@ -804,7 +899,7 @@ impl CdpBridge {
                 {
                     return Ok(vec![error_effect(
                         connection,
-                        &request,
+                        request,
                         CdpError::DetachAlreadyPending,
                     )]);
                 }
@@ -812,13 +907,13 @@ impl CdpBridge {
                     if session.owner != connection {
                         return Ok(vec![error_effect(
                             connection,
-                            &request,
+                            request,
                             CdpError::TargetAlreadyAttached,
                         )]);
                     }
                     return Ok(vec![success_effect(
                         connection,
-                        &request,
+                        request,
                         json!({ "sessionId": session_name(session.id) }),
                     )]);
                 }
@@ -830,7 +925,7 @@ impl CdpBridge {
                 {
                     return Ok(vec![error_effect(
                         connection,
-                        &request,
+                        request,
                         CdpError::TargetAlreadyAttached,
                     )]);
                 }
@@ -856,7 +951,7 @@ impl CdpBridge {
                     && self.browser_sessions.get(session_id) == Some(&connection)
                 {
                     self.browser_sessions.remove(session_id);
-                    return Ok(vec![success_effect(connection, &request, json!({}))]);
+                    return Ok(vec![success_effect(connection, request, json!({}))]);
                 }
                 let Some(tab_id) = self.targets.iter().find_map(|(tab_id, target)| {
                     target.session.and_then(|session| {
@@ -867,7 +962,7 @@ impl CdpBridge {
                 }) else {
                     return Ok(vec![error_effect(
                         connection,
-                        &request,
+                        request,
                         CdpError::SessionNotFound,
                     )]);
                 };
@@ -875,7 +970,7 @@ impl CdpBridge {
             }
             _ => Ok(vec![error_effect(
                 connection,
-                &request,
+                request,
                 CdpError::MethodNotAllowed,
             )]),
         }
@@ -1076,18 +1171,16 @@ impl CdpBridge {
         };
         self.release_attach_reservation(seq, &pending.kind);
         self.release_detach_reservation(seq, &pending.kind);
-        if result.is_err()
-            && matches!(
-                pending.kind,
-                PendingKind::Attach {
-                    tab_id: _,
-                    respond: false
-                }
-            )
+        // Binding the tab out of the same pattern that selects the branch keeps
+        // this failure path free of an `unreachable!`: a broker that outlives
+        // every connection must not carry a panic that a future refactor could
+        // make reachable.
+        if let PendingKind::Attach {
+            tab_id,
+            respond: false,
+        } = pending.kind
+            && result.is_err()
         {
-            let PendingKind::Attach { tab_id, respond: _ } = pending.kind else {
-                unreachable!("matched auto-attach command");
-            };
             self.auto_attach_suppressed
                 .entry(pending.client)
                 .or_default()
@@ -1121,7 +1214,7 @@ impl CdpBridge {
                         .and_then(|value| value.get("targetId"))
                         .and_then(Value::as_str)
                     {
-                        target.target_id = target_id.to_owned();
+                        target_id.clone_into(&mut target.target_id);
                     }
                     target.session = Some(SessionState {
                         id: session_id,
@@ -1363,12 +1456,12 @@ impl CdpBridge {
 
     fn can_cleanup_abandoned_attach(&self, seq: u64, tab_id: u64) -> bool {
         self.targets.get(&tab_id).is_none_or(|target| {
-            !target
+            target
                 .attach_seq
-                .is_some_and(|current_seq| current_seq > seq)
-                && !target
+                .is_none_or(|current_seq| current_seq <= seq)
+                && target
                     .session
-                    .is_some_and(|session| session.attach_seq > seq)
+                    .is_none_or(|session| session.attach_seq <= seq)
         })
     }
 
@@ -1748,42 +1841,47 @@ fn error_effect(connection: ConnectionId, request: &CdpRequest, error: CdpError)
     }
 }
 
+/// Session-scoped CDP methods the relay forwards, in ascending order.
+///
+/// Kept sorted because [`allowed_session_command`] resolves it with
+/// `binary_search`; the `allowlist_is_sorted` test pins that invariant.
+const ALLOWED_SESSION_COMMANDS: &[&str] = &[
+    "Accessibility.getFullAXTree",
+    "DOM.getDocument",
+    "DOM.getOuterHTML",
+    "DOM.getTextContent",
+    "DOM.querySelector",
+    "DOM.querySelectorAll",
+    "DOM.requestNode",
+    "DOM.resolveNode",
+    "Emulation.clearDeviceMetricsOverride",
+    "Emulation.setDeviceMetricsOverride",
+    "Input.dispatchKeyEvent",
+    "Input.dispatchMouseEvent",
+    "Input.insertText",
+    "Log.enable",
+    "Network.disable",
+    "Network.enable",
+    "Network.getResponseBody",
+    "Network.setCacheDisabled",
+    "Page.addScriptToEvaluateOnNewDocument",
+    "Page.captureScreenshot",
+    "Page.enable",
+    "Page.getFrameTree",
+    "Page.navigate",
+    "Page.reload",
+    "Page.setLifecycleEventsEnabled",
+    "Runtime.callFunctionOn",
+    "Runtime.enable",
+    "Runtime.evaluate",
+    "Runtime.getProperties",
+    "Runtime.releaseObject",
+    "Runtime.runIfWaitingForDebugger",
+    "Target.setAutoAttach",
+];
+
 fn allowed_session_command(method: &str) -> bool {
-    const ALLOWED: &[&str] = &[
-        "Accessibility.getFullAXTree",
-        "DOM.getDocument",
-        "DOM.getOuterHTML",
-        "DOM.getTextContent",
-        "DOM.querySelector",
-        "DOM.querySelectorAll",
-        "DOM.requestNode",
-        "DOM.resolveNode",
-        "Emulation.clearDeviceMetricsOverride",
-        "Emulation.setDeviceMetricsOverride",
-        "Input.dispatchKeyEvent",
-        "Input.dispatchMouseEvent",
-        "Input.insertText",
-        "Log.enable",
-        "Network.disable",
-        "Network.enable",
-        "Network.getResponseBody",
-        "Network.setCacheDisabled",
-        "Page.addScriptToEvaluateOnNewDocument",
-        "Page.captureScreenshot",
-        "Page.enable",
-        "Page.getFrameTree",
-        "Page.navigate",
-        "Page.reload",
-        "Page.setLifecycleEventsEnabled",
-        "Runtime.callFunctionOn",
-        "Runtime.enable",
-        "Runtime.evaluate",
-        "Runtime.getProperties",
-        "Runtime.releaseObject",
-        "Runtime.runIfWaitingForDebugger",
-        "Target.setAutoAttach",
-    ];
-    ALLOWED.binary_search(&method).is_ok()
+    ALLOWED_SESSION_COMMANDS.binary_search(&method).is_ok()
 }
 
 fn allowed_event(method: &str) -> bool {
@@ -1906,3 +2004,17 @@ impl Display for BridgeError {
 }
 
 impl Error for BridgeError {}
+
+#[cfg(test)]
+mod tests {
+    use super::ALLOWED_SESSION_COMMANDS;
+
+    #[test]
+    fn allowlist_is_sorted() {
+        assert!(
+            ALLOWED_SESSION_COMMANDS.is_sorted(),
+            "allowed_session_command resolves the allowlist with binary_search, \
+             which silently stops finding entries once the table is unsorted"
+        );
+    }
+}

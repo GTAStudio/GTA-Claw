@@ -62,6 +62,23 @@ impl Mv3Manifest {
     /// module service worker, holds exactly the relay capability set, requests
     /// no page-injection capability at all, and targets a Chrome milestone that
     /// actually carries the debugger surface the relay drives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingError::MalformedManifest`] when the bytes are not a
+    /// JSON object or a required string field is missing or empty,
+    /// [`PairingError::NotManifestV3`] when `manifest_version` is not `3`,
+    /// [`PairingError::ForbiddenManifestKey`] for any of the page-injection
+    /// keys (`host_permissions`, `content_scripts`, `web_accessible_resources`,
+    /// `externally_connectable`, `optional_host_permissions`,
+    /// `optional_permissions`), [`PairingError::MissingServiceWorker`] when
+    /// `background` is absent, is not `type: "module"`, or names an empty
+    /// worker, [`PairingError::ForbiddenPermission`] for a permission outside
+    /// the relay capability set, [`PairingError::MissingPermission`] when one
+    /// of `debugger`, `tabs`, `tabGroups`, `storage` or `alarms` is absent, and
+    /// [`PairingError::UnsupportedChromeVersion`] when
+    /// `minimum_chrome_version` is missing, unparsable, or below
+    /// [`MINIMUM_CHROME_VERSION`].
     pub fn parse(bytes: &[u8]) -> Result<Self, PairingError> {
         let document: Value =
             serde_json::from_slice(bytes).map_err(|_| PairingError::MalformedManifest)?;
@@ -190,6 +207,14 @@ impl PairingOffer {
     /// port. Accepting a port-less authority would make the extension offer the
     /// relay secret to whatever unrelated service happens to hold loopback
     /// port 80. The token must be the canonical 64-lowercase-hex relay secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingError::NonLoopbackRelay`] when the authority is empty,
+    /// carries whitespace, does not name `localhost`, `127.0.0.1` or `[::1]`,
+    /// or omits an explicit non-zero port. Returns
+    /// [`PairingError::MalformedToken`] when the token is not exactly 64
+    /// lowercase hex characters.
     pub fn new(authority: &str, token: &str) -> Result<Self, PairingError> {
         if !is_loopback_relay_authority(authority) {
             return Err(PairingError::NonLoopbackRelay);
@@ -204,6 +229,15 @@ impl PairingOffer {
     }
 
     /// Parses one pairing string exactly as the extension popup parses it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingError::MalformedPairingString`] when the string carries
+    /// no `#` secret fragment, is not a `ws://` URL, does not end in
+    /// [`EXTENSION_PATH`], or leaves an empty authority or one containing a
+    /// path separator. Returns [`PairingError::NonLoopbackRelay`] or
+    /// [`PairingError::MalformedToken`] for the same reasons as
+    /// [`PairingOffer::new`], which validates the parsed halves.
     pub fn parse(raw: &str) -> Result<Self, PairingError> {
         let trimmed = raw.trim();
         let (url, token) = trimmed

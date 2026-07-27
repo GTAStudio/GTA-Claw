@@ -131,13 +131,13 @@ pub enum HostKeyVerdict {
 impl HostKeyVerdict {
     /// Returns `true` only for [`HostKeyVerdict::Accepted`].
     #[must_use]
-    pub fn is_accepted(&self) -> bool {
+    pub const fn is_accepted(&self) -> bool {
         matches!(self, Self::Accepted { .. })
     }
 
     /// Returns the rejection cause, or `None` when the key was accepted.
     #[must_use]
-    pub fn cause(&self) -> Option<RejectionCause> {
+    pub const fn cause(&self) -> Option<RejectionCause> {
         match self {
             Self::Accepted { .. } => None,
             Self::Rejected(rejection) => Some(rejection.cause),
@@ -178,19 +178,19 @@ pub struct KnownHostEntry {
 impl KnownHostEntry {
     /// Returns the one-based line number this entry came from.
     #[must_use]
-    pub fn line(&self) -> usize {
+    pub const fn line(&self) -> usize {
         self.line
     }
 
     /// Returns the marker on this line, if any.
     #[must_use]
-    pub fn marker(&self) -> Option<Marker> {
+    pub const fn marker(&self) -> Option<Marker> {
         self.marker
     }
 
     /// Returns the recorded key.
     #[must_use]
-    pub fn key(&self) -> &HostKey {
+    pub const fn key(&self) -> &HostKey {
         &self.key
     }
 
@@ -400,10 +400,9 @@ fn parse_entry(number: usize, line: &str) -> Result<KnownHostEntry, KnownHostsEr
     } else {
         let mut patterns = Vec::new();
         for element in hosts.split(',') {
-            let (negated, pattern) = match element.strip_prefix('!') {
-                Some(rest) => (true, rest),
-                None => (false, element),
-            };
+            let (negated, pattern) = element
+                .strip_prefix('!')
+                .map_or((false, element), |rest| (true, rest));
             if pattern.is_empty() {
                 return Err(KnownHostsError::Malformed(
                     number,

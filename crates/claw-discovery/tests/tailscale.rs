@@ -1,6 +1,6 @@
 //! Tailscale Serve and Funnel authorisation oracles.
 //!
-//! Each denial below is a condition that a faithful LocalAPI client will happily
+//! Each denial below is a condition that a faithful `LocalAPI` client will happily
 //! publish through if nothing checks it first, and each one has a distinct
 //! failure mode in production: a Funnel on a port Tailscale does not terminate
 //! looks published and silently never receives traffic; a Funnel without the
@@ -19,7 +19,7 @@ use claw_discovery::tailscale_policy::{
 const NODE: &str = "studio.tail.example";
 const PLAIN_NODE: &str = "plain.tail.example";
 
-fn loopback(port: u16) -> SocketAddr {
+const fn loopback(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
 

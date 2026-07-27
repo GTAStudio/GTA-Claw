@@ -1,9 +1,9 @@
 //! The Tailscale Serve and Funnel authorisation gate.
 //!
-//! This is the decision that has to happen *before* any LocalAPI call: whether
+//! This is the decision that has to happen *before* any `LocalAPI` call: whether
 //! an exposure is allowed to exist at all. It is deliberately separate from the
 //! transport, because a transport that faithfully performs a read-modify-write
-//! against the LocalAPI will just as faithfully publish an exposure that policy
+//! against the `LocalAPI` will just as faithfully publish an exposure that policy
 //! should never have permitted.
 //!
 //! Four conditions gate a Funnel exposure and all four fail closed:
@@ -176,7 +176,7 @@ impl TailnetPolicy {
     }
 }
 
-fn is_loopback(address: IpAddr) -> bool {
+const fn is_loopback(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(value) => value.is_loopback(),
         IpAddr::V6(value) => value.is_loopback(),
@@ -198,7 +198,7 @@ pub struct ExposureRequest {
     pub path: String,
 }
 
-/// An authorised exposure, in the shape the LocalAPI serve config uses.
+/// An authorised exposure, in the shape the `LocalAPI` serve config uses.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExposurePlan {
     /// `node:port` key the serve config is indexed by.

@@ -19,7 +19,7 @@ pub struct RelayTab {
 }
 
 /// Strict extension-to-relay wire message.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "type")]
 pub enum ExtensionMessage {
     /// Mandatory first frame.
@@ -79,7 +79,7 @@ pub enum ExtensionMessage {
 }
 
 /// Strict CDP request frame accepted from an automation client.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CdpRequest {
     /// Client request identity.
@@ -95,6 +95,16 @@ pub struct CdpRequest {
 }
 
 /// Decodes one complete bounded extension text frame.
+///
+/// # Errors
+///
+/// Returns [`FrameError::InvalidBound`] when `max_frame_bytes` is zero,
+/// [`FrameError::TooLarge`] when the complete frame exceeds that bound,
+/// [`FrameError::InvalidUtf8`] when the text frame is not UTF-8, and
+/// [`FrameError::InvalidJson`] when the frame is not a JSON object, carries no
+/// known `type` discriminant, or holds any key outside the exact set that
+/// discriminant allows. Unknown keys are refused rather than ignored, so an
+/// extension cannot smuggle a field past the strict message shape.
 pub fn decode_extension_frame(
     bytes: &[u8],
     max_frame_bytes: usize,
@@ -128,6 +138,14 @@ pub fn decode_extension_frame(
 }
 
 /// Decodes one complete bounded CDP text frame.
+///
+/// # Errors
+///
+/// Returns [`FrameError::InvalidBound`] when `max_frame_bytes` is zero,
+/// [`FrameError::TooLarge`] when the complete frame exceeds that bound,
+/// [`FrameError::InvalidUtf8`] when the text frame is not UTF-8, and
+/// [`FrameError::InvalidJson`] when the frame is not a [`CdpRequest`] — a
+/// missing `id` or `method`, a wrong field type, or any unknown field.
 pub fn decode_cdp_frame(bytes: &[u8], max_frame_bytes: usize) -> Result<CdpRequest, FrameError> {
     decode(bytes, max_frame_bytes)
 }
