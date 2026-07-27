@@ -82,4 +82,55 @@ if ! awk '
   exit 1
 fi
 
+# The signed artifact must be the artifact a test ran against. The containers
+# job used to run build.sh, producing a second binary that no test had ever
+# executed against; these assertions keep that closed structurally rather than
+# relying on nobody re-adding it.
+native_job="$(sed -n '/^  native:/,/^  containers:/p' "$workflow")"
+containers_job="$(sed -n '/^  containers:/,/^  release-disabled:/p' "$workflow")"
+tested_artifact='macos-arm64-tested-build-${{ github.sha }}'
+
+grep -F 'needs: [source-policy, native]' <<<"$containers_job" >/dev/null || {
+  echo "containers job must consume the native job it depends on" >&2
+  exit 1
+}
+if grep -E 'packaging/macos/build\.sh' <<<"$containers_job" >/dev/null; then
+  echo "containers job must not rebuild: it must package what the native job tested" >&2
+  exit 1
+fi
+grep -F 'transport.sh unpack arm64' <<<"$containers_job" >/dev/null || {
+  echo "containers job must restore the tested arm64 build" >&2
+  exit 1
+}
+grep -F 'transport.sh pack arm64' <<<"$native_job" >/dev/null || {
+  echo "native job must pack the arm64 build it tested" >&2
+  exit 1
+}
+# shellcheck disable=SC2016
+for job_section in "$native_job" "$containers_job"; do
+  grep -F "$tested_artifact" <<<"$job_section" >/dev/null || {
+    echo "producer and consumer must name the same tested-build artifact" >&2
+    exit 1
+  }
+done
+
+# Removing the rebuild also removed the locked cargo cache it left behind, which
+# package.sh needs to emit the SBOM. The requirement is an ordering, so assert the
+# ordering rather than the mere presence of the fetch.
+containers_line() {
+  grep -n -F "$1" <<<"$containers_job" | head -n 1 | cut -d: -f1
+}
+for manifest in Cargo.toml desktop/Cargo.toml; do
+  grep -F "cargo fetch --manifest-path $manifest --locked" <<<"$containers_job" >/dev/null || {
+    echo "containers job must acquire the locked graph for $manifest" >&2
+    exit 1
+  }
+done
+fetch_at="$(containers_line 'cargo fetch --manifest-path desktop/Cargo.toml --locked')"
+package_at="$(containers_line 'packaging/macos/package.sh prototype')"
+[[ -n "$fetch_at" && -n "$package_at" && "$fetch_at" -lt "$package_at" ]] || {
+  echo "containers job must acquire the locked graph before it packages" >&2
+  exit 1
+}
+
 echo "macOS workflow trust-boundary self-tests passed"
