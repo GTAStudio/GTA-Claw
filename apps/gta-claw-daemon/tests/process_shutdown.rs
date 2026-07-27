@@ -9,6 +9,13 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+/// How long a drained daemon is given to leave the process table.
+///
+/// Generous on purpose: the point is to tell "exits promptly" apart from "never
+/// exits", not to time the teardown.
+#[cfg(unix)]
+const EXIT_BUDGET: Duration = Duration::from_secs(5);
+
 /// Kills the child if an assertion unwinds before the test gets to stop it.
 struct ChildGuard(Child);
 
@@ -295,6 +302,121 @@ fn a_terminated_daemon_exits_successfully_rather_than_being_killed() {
     assert!(
         status.success(),
         "the daemon exited unsuccessfully: {status:?}"
+    );
+}
+
+/// A daemon that has drained must exit even though the pipe on its control
+/// channel is still open.
+///
+/// This is the failure the other tests in this file cannot see. `Child::wait`
+/// drops the parent's end of stdin before it waits, so every test that stops a
+/// daemon through the `stopped` helper closes the control channel on the way
+/// out, and a daemon that only exits because its stdin reached end-of-file
+/// still looks healthy. A supervisor does not do that: systemd, `docker` and a
+/// shell pipeline all hold the child's stdin open until the child is gone. This
+/// keeps the handle and polls instead, so it fails if the process needs the pipe
+/// closed to finish exiting.
+#[cfg(unix)]
+#[test]
+fn a_drained_daemon_exits_while_its_control_channel_is_still_held_open() {
+    use std::time::Instant;
+
+    let (mut child, mut reader) = started();
+    let pid = child.0.id().to_string();
+
+    let signalled = Command::new("kill")
+        .arg("-TERM")
+        .arg(&pid)
+        .status()
+        .expect("kill is available");
+    assert!(signalled.success(), "could not signal pid {pid}");
+
+    let mut summary = String::new();
+    reader
+        .read_line(&mut summary)
+        .expect("daemon stop summary is readable");
+    let summary = StopLine::parse(summary.trim_end());
+    assert_eq!(summary.reason, "terminate");
+    assert!(
+        summary.clean,
+        "the daemon did not stop cleanly: {summary:?}"
+    );
+
+    // Deliberately polled rather than waited on: `wait` would close the very
+    // pipe this test is holding open.
+    let deadline = Instant::now() + EXIT_BUDGET;
+    let status = loop {
+        if let Some(status) = child.0.try_wait().expect("daemon status is available") {
+            break status;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "the daemon printed its stop summary but was still running {EXIT_BUDGET:?} later, \
+             with its control channel still open"
+        );
+
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    assert!(
+        status.success(),
+        "the daemon exited unsuccessfully: {status:?}"
+    );
+}
+
+/// Repeating the stop signal must not deadlock the drain or cut it short.
+///
+/// A supervisor that has not seen a process exit yet sends the signal again,
+/// and an operator holding down `Ctrl-C` does the same. The handlers stay
+/// installed for the life of the process, so each repeat is caught rather than
+/// falling through to the default disposition that would kill the daemon
+/// mid-drain; every subsystem must still be drained and every task still
+/// joined.
+#[cfg(unix)]
+#[test]
+fn repeating_the_stop_signal_neither_deadlocks_the_drain_nor_skips_the_cleanup() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let (mut child, mut reader) = started();
+    let pid = child.0.id().to_string();
+
+    // Only ever `SIGTERM`, so the reason below stays deterministic. The first
+    // one starts the drain; the rest land during it or after the process is
+    // already gone, which is why their exit status is ignored.
+    for _ in 0..5 {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(&pid)
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    let summary = stopped(&mut child, &mut reader);
+
+    assert_eq!(
+        summary.reason, "terminate",
+        "a repeated termination changed the reason the daemon reported"
+    );
+    assert!(
+        summary.clean,
+        "repeating the signal left the shutdown incomplete: {summary:?}"
+    );
+    assert_eq!(summary.abandoned, 0);
+    assert_eq!(
+        summary.drained, 12,
+        "a repeated signal cut the drain short: {summary:?}"
+    );
+    assert_eq!(
+        summary.joined, summary.spawned,
+        "a repeated signal left a task unjoined"
+    );
+
+    let status = child.0.wait().expect("the daemon process is waitable");
+    assert_eq!(
+        status.signal(),
+        None,
+        "a repeated signal killed the daemon instead of being handled"
     );
 }
 

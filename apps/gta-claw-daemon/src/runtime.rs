@@ -10,15 +10,32 @@
 //! guard's `Drop`, so a task that is cancelled part way through still counts as
 //! terminated. Comparing the spawn count with the termination count is therefore
 //! a real leak check rather than a check that shutdown returned.
+//!
+//! [`RuntimeHost::shutdown_within`] trades that guarantee for a bound, which is
+//! what a process stop needs: tasks are asked to stop and never aborted, so a
+//! task that ignores the signal would otherwise keep the process alive for as
+//! long as it liked. The bounded form reports the difference in the ledger
+//! rather than waiting it out.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use claw_application::composition::{
     BoxFuture, ShutdownSignal, SubsystemError, SubsystemId, TaskSpawner,
 };
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+
+/// The identifier this module's own errors are reported under.
+///
+/// The one fallible construction in this module lives here rather than in
+/// [`TrackedSpawner::new`], so that the constructor a caller uses carries no
+/// failure of its own; `the_runtime_identifier_satisfies_the_grammar` pins the
+/// literal against the grammar it has to satisfy.
+fn runtime_subsystem() -> SubsystemId {
+    SubsystemId::new("runtime").expect("the literal satisfies the grammar")
+}
 
 /// Increments the termination counter however the task ended.
 struct TerminationGuard(Arc<AtomicU64>);
@@ -47,7 +64,7 @@ impl TrackedSpawner {
         Self {
             tracker,
             cancellation,
-            subsystem: SubsystemId::new("runtime").expect("the literal satisfies the grammar"),
+            subsystem: runtime_subsystem(),
             spawned: Arc::new(AtomicU64::new(0)),
             terminated: Arc::new(AtomicU64::new(0)),
         }
@@ -203,11 +220,43 @@ impl RuntimeHost {
     /// Closing the tracker before waiting is what makes the wait terminate: a
     /// closed tracker refuses new registrations, so the set being waited on
     /// cannot grow while the wait is in progress.
+    ///
+    /// The wait itself is unbounded, so this is for a caller that already has a
+    /// deadline of its own. The daemon's last stop uses
+    /// [`shutdown_within`](Self::shutdown_within) instead.
     pub async fn shutdown(&self) -> TaskLedger {
         self.cancellation.cancel();
         self.tracker.close();
         self.tracker.wait().await;
 
+        self.ledger()
+    }
+
+    /// Cancels outstanding work and waits up to `budget` for every tracked task
+    /// to terminate.
+    ///
+    /// A task is asked to stop, never aborted, so a task that ignores its
+    /// shutdown signal would keep an unbounded wait — and therefore the whole
+    /// process — alive for as long as it likes. This bounds that wait. Running
+    /// out of budget is not an error to propagate: it is a fact about the run,
+    /// and the returned ledger states it, because a task that never terminated
+    /// is counted in [`spawned`](TaskLedger::spawned) and not in
+    /// [`terminated`](TaskLedger::terminated) and leaves
+    /// [`outstanding`](TaskLedger::outstanding) above zero. The caller reports
+    /// an unsettled ledger as an unclean stop and exits anyway.
+    pub async fn shutdown_within(&self, budget: Duration) -> TaskLedger {
+        self.cancellation.cancel();
+        self.tracker.close();
+
+        // Deliberately not `?`-style handling: both outcomes continue to the
+        // same ledger, which is what distinguishes them.
+        let _ = tokio::time::timeout(budget, self.tracker.wait()).await;
+
+        self.ledger()
+    }
+
+    /// Reads the three counters that make up one run's task accounting.
+    fn ledger(&self) -> TaskLedger {
         TaskLedger {
             spawned: self.spawner.spawned(),
             terminated: self.spawner.terminated(),
@@ -230,7 +279,12 @@ mod tests {
 
     use claw_application::composition::SubsystemErrorKind;
 
-    use super::RuntimeHost;
+    use super::{RuntimeHost, runtime_subsystem};
+
+    #[test]
+    fn the_runtime_identifier_satisfies_the_grammar() {
+        assert_eq!(runtime_subsystem().as_str(), "runtime");
+    }
 
     #[tokio::test]
     async fn every_spawned_task_is_joined_before_shutdown_returns() {
@@ -322,5 +376,65 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), signal.triggered())
             .await
             .expect("an already-triggered signal resolves immediately");
+    }
+
+    /// A task that ignores its shutdown signal must not hold the process open.
+    ///
+    /// The unbounded `shutdown` would wait for this task for a full minute.
+    /// Bounding the wait is what lets the daemon report the leak and exit
+    /// instead of hanging with a supervisor's kill timer running.
+    #[tokio::test]
+    async fn a_task_that_ignores_cancellation_cannot_outlast_the_budget() {
+        let host = RuntimeHost::new();
+
+        host.spawner()
+            .spawn(
+                "deaf",
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_mins(1)).await;
+                }),
+            )
+            .expect("the daemon is running");
+
+        let ledger = tokio::time::timeout(
+            Duration::from_secs(5),
+            host.shutdown_within(Duration::from_millis(50)),
+        )
+        .await
+        .expect("the bounded shutdown returns without waiting for the task");
+
+        assert_eq!(ledger.spawned(), 1);
+        assert_eq!(ledger.terminated(), 0, "the task did not stop, by design");
+        assert_eq!(ledger.outstanding(), 1);
+        assert!(
+            !ledger.is_settled(),
+            "an abandoned task must be reported as an unsettled ledger"
+        );
+    }
+
+    /// The budget is a ceiling, not a delay.
+    #[tokio::test]
+    async fn a_cooperative_task_settles_the_bounded_shutdown_immediately() {
+        let host = RuntimeHost::new();
+        let signal = host.shutdown_signal();
+
+        host.spawner()
+            .spawn(
+                "waiter",
+                Box::pin(async move {
+                    signal.triggered().await;
+                }),
+            )
+            .expect("the daemon is running");
+
+        let started = std::time::Instant::now();
+        let ledger = host.shutdown_within(Duration::from_secs(30)).await;
+
+        assert!(ledger.is_settled());
+        assert_eq!(ledger.terminated(), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the bounded shutdown waited for the budget instead of for the task"
+        );
     }
 }

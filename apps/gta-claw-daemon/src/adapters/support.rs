@@ -1,4 +1,20 @@
 //! Clock, DNS, configuration, observability and policy stand-ins.
+//!
+//! None of these is the real subsystem. The clock is driven by hand, the
+//! resolver answers from a table nobody populated from the network, and the
+//! policy is whatever a test last set it to. They exist so the composition can
+//! be assembled, started and exercised before `claw-config`,
+//! `claw-observability` and the real authority land.
+//!
+//! # Lock poisoning
+//!
+//! Every accessor below takes a `Mutex` or `RwLock` and unwraps the guard, so
+//! each one panics if a previous holder panicked while holding it. That is
+//! deliberate: what these locks guard is process-lifetime in-memory state, and
+//! carrying on against a half-written store would turn one panic into wrong
+//! answers everywhere downstream. An operator who sees one of these panics
+//! should restart the daemon and investigate the *first* panic in the log; this
+//! one is only its echo, and no configuration change will prevent it.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::IpAddr;
@@ -61,6 +77,11 @@ impl TableDns {
     }
 
     /// Replaces the answer for `host`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the answer table's lock is poisoned; see the module note on
+    /// lock poisoning.
     pub fn set(&self, host: &str, addresses: Vec<IpAddr>) {
         self.0
             .write()
@@ -98,7 +119,7 @@ pub struct MutableConfig {
 impl MutableConfig {
     /// Creates a configuration port serving `settings`.
     #[must_use]
-    pub fn new(settings: RuntimeSettings) -> Self {
+    pub const fn new(settings: RuntimeSettings) -> Self {
         Self {
             settings: RwLock::new(settings),
             generation: AtomicU64::new(0),
@@ -106,6 +127,12 @@ impl MutableConfig {
     }
 
     /// Replaces the settings and bumps the generation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the settings lock is poisoned; see the module note on lock
+    /// poisoning. The daemon then has no usable configuration source, so this
+    /// is not a condition to catch and continue from.
     pub fn replace(&self, settings: RuntimeSettings) {
         *self.settings.write().expect("uncontended") = settings;
         self.generation.fetch_add(1, Ordering::SeqCst);
@@ -142,6 +169,11 @@ impl MemoryObservability {
     }
 
     /// Returns every event still held, oldest first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the event buffer's lock is poisoned; see the module note on
+    /// lock poisoning.
     #[must_use]
     pub fn events(&self) -> Vec<ObservedEvent> {
         self.events
@@ -153,6 +185,11 @@ impl MemoryObservability {
     }
 
     /// Returns how many events of `severity` are held.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the event buffer's lock is poisoned; see the module note on
+    /// lock poisoning.
     #[must_use]
     pub fn count_at(&self, severity: Severity) -> usize {
         self.events
@@ -216,7 +253,7 @@ pub struct LivePolicy {
 impl LivePolicy {
     /// Creates a permissive policy granting `ttl` per action.
     #[must_use]
-    pub fn new(ttl: Duration) -> Self {
+    pub const fn new(ttl: Duration) -> Self {
         Self {
             stance: RwLock::new(PolicyStance::Permit),
             ttl: RwLock::new(ttl),
@@ -226,6 +263,11 @@ impl LivePolicy {
     }
 
     /// Changes what the policy says from the next decision onwards.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stance lock is poisoned; see the module note on lock
+    /// poisoning.
     pub fn set_stance(&self, stance: PolicyStance) {
         *self.stance.write().expect("uncontended") = stance;
     }
@@ -237,11 +279,21 @@ impl LivePolicy {
     /// The change takes effect *after* the numbered decision, which is what
     /// makes the assertion meaningful: the decision before it succeeds and the
     /// one after it is refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pending-change lock is poisoned; see the module note on
+    /// lock poisoning.
     pub fn change_stance_after(&self, decision: u64, stance: PolicyStance) {
         *self.pending.write().expect("uncontended") = Some((decision, stance));
     }
 
     /// Changes the lifetime granted from the next decision onwards.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lifetime lock is poisoned; see the module note on lock
+    /// poisoning.
     pub fn set_ttl(&self, ttl: Duration) {
         *self.ttl.write().expect("uncontended") = ttl;
     }
@@ -314,7 +366,7 @@ impl AuthorityPort for LivePolicy {
 
 /// Builds an observed event for the daemon's own reporting.
 #[must_use]
-pub fn note(
+pub const fn note(
     subsystem: SubsystemId,
     severity: Severity,
     message: String,

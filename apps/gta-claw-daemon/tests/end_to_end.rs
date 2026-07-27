@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use claw_application::composition::{
-    BoxFuture, Capability, CapabilitySet, Clock, ConfigPort, GatewayPort, GatewayRequest,
-    HttpApiPort, LifecyclePhase, ObservabilityPort, Principal, ProviderReply, ServiceHandle,
-    Severity, StartContext, Subsystem, SubsystemDescriptor, SubsystemError, SubsystemId,
-    SubsystemKind, ToolName, TurnEvent, TurnEventSink, well_known,
+    BoxFuture, Capability, CapabilitySet, Clock, ConfigPort, DrainReport, GatewayPort,
+    GatewayRequest, HttpApiPort, LifecyclePhase, ObservabilityPort, Principal, ProviderReply,
+    ServiceHandle, Severity, StartContext, Subsystem, SubsystemDescriptor, SubsystemError,
+    SubsystemId, SubsystemKind, ToolName, TurnEvent, TurnEventSink, well_known,
 };
 use claw_domain::SessionId;
 use gta_claw_daemon::adapters::model::request_tool;
@@ -704,6 +704,83 @@ async fn the_turn_deadline_comes_from_configuration_read_at_the_start_of_the_tur
     assert!(daemon.stop().await.expect("the daemon stops").is_clean());
 }
 
+/// A subsystem whose drain never finishes, standing in for the real failure a
+/// stop deadline exists for: a subsystem waiting on work that will not arrive.
+#[derive(Debug, Default)]
+struct StuckSubsystem;
+
+impl StuckSubsystem {
+    fn id() -> SubsystemId {
+        SubsystemId::new("stuck-ingress").expect("a valid subsystem id")
+    }
+}
+
+impl Subsystem for StuckSubsystem {
+    fn descriptor(&self) -> SubsystemDescriptor {
+        SubsystemDescriptor::new(Self::id(), SubsystemKind::Ingress)
+            .depends_on(well_known::engine())
+    }
+
+    fn initialize<'a>(
+        &'a self,
+        _context: &'a StartContext,
+    ) -> BoxFuture<'a, Result<(), SubsystemError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn start<'a>(
+        &'a self,
+        _context: &'a StartContext,
+    ) -> BoxFuture<'a, Result<ServiceHandle, SubsystemError>> {
+        Box::pin(async { Ok(ServiceHandle::inert(Self::id())) })
+    }
+
+    fn drain(&self) -> BoxFuture<'_, Result<DrainReport, SubsystemError>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), SubsystemError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A subsystem that will not drain must not hold the process open forever.
+///
+/// Without a deadline this is a hang, not a slow shutdown: the supervisor waits
+/// out its own patience and sends `SIGKILL`, so nothing is drained, nothing is
+/// reported and the operator is left with a killed process and no summary. With
+/// one, the daemon gives up on its own terms and says so, which is what turns
+/// this into a diagnosable defect in the named subsystem.
+#[tokio::test]
+async fn a_subsystem_that_never_drains_cannot_hold_the_process_past_the_deadline() {
+    let mut daemon = Daemon::builder()
+        .clock(Arc::new(SteppedClock::new()))
+        .with_subsystem(Arc::new(StuckSubsystem) as Arc<dyn Subsystem>)
+        .build()
+        .expect("the composition builds with an added subsystem");
+
+    daemon.start().await.expect("the daemon starts");
+
+    // The outer timeout is the regression guard: a stop that ignored its budget
+    // would hang this test rather than fail it.
+    let summary = tokio::time::timeout(
+        Duration::from_secs(10),
+        daemon.stop_within(Duration::from_millis(200)),
+    )
+    .await
+    .expect("the stop deadline bounded the shutdown")
+    .expect("stopping reports rather than errors");
+
+    assert!(
+        summary.deadline_expired(),
+        "a shutdown that could not finish did not say so: {summary:?}"
+    );
+    assert!(
+        !summary.is_clean(),
+        "a shutdown that gave up was reported as clean: {summary:?}"
+    );
+}
+
 /// A subsystem supplied from outside the daemon, standing in for a real
 /// ingress that owns a bound socket.
 ///
@@ -769,7 +846,7 @@ impl Subsystem for ExternalIngress {
         })
     }
 
-    fn shutdown<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), SubsystemError>> {
         Box::pin(async move {
             self.record("shutdown");
             Ok(())

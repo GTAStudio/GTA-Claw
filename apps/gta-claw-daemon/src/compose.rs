@@ -32,6 +32,7 @@ use claw_application::composition::{
     well_known,
 };
 use claw_domain::SessionId;
+use tokio::time::{Instant, timeout};
 
 use crate::adapters::engine::DeterministicEngine;
 use crate::adapters::ingress::{LoopbackGateway, LoopbackHttpApi, PortSubsystem};
@@ -50,12 +51,24 @@ const CREDENTIAL: &str = "primary-provider-key";
 /// How long an authorization may live, whatever the policy asks for.
 const MAX_AUTHORIZATION_TTL: Duration = Duration::from_secs(30);
 
+/// How long [`Daemon::stop`] gives the whole teardown before it reports the
+/// stop as incomplete and returns anyway.
+///
+/// Chosen to sit inside the supervisor's own patience:
+/// `packaging/linux/systemd/gta-claw-daemon.service` sets `TimeoutStopSec=15s`
+/// with `SendSIGKILL=yes`, so a daemon that took longer than that would be
+/// killed mid-teardown and the operator would be left with no summary at all.
+/// Expiring first means the daemon is the one that reports the failure, names
+/// the phase it was stuck in, and still exits.
+pub const STOP_DEADLINE: Duration = Duration::from_secs(10);
+
 /// What a completed run reports.
 #[derive(Debug)]
 pub struct StopSummary {
     shutdown: ShutdownReport,
     tasks: TaskLedger,
     phase: LifecyclePhase,
+    deadline_expired: bool,
 }
 
 impl StopSummary {
@@ -77,10 +90,25 @@ impl StopSummary {
         self.phase
     }
 
+    /// Returns whether the stop ran out of time.
+    ///
+    /// When this is true the teardown was abandoned part way through, so
+    /// [`shutdown`](Self::shutdown) describes only the subsystems that had
+    /// already been drained and [`phase`](Self::phase) names how far the
+    /// composition got. The subsystem that did not return is the one after the
+    /// last drained one.
+    #[must_use]
+    pub const fn deadline_expired(&self) -> bool {
+        self.deadline_expired
+    }
+
     /// Returns whether the run ended with nothing abandoned and nothing leaked.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.shutdown.is_clean() && self.tasks.is_settled() && self.phase == LifecyclePhase::Stopped
+        !self.deadline_expired
+            && self.shutdown.is_clean()
+            && self.tasks.is_settled()
+            && self.phase == LifecyclePhase::Stopped
     }
 }
 
@@ -166,22 +194,67 @@ impl Daemon {
     }
 
     /// Quiesces ingress, drains work, stops every subsystem and joins every
-    /// spawned task.
+    /// spawned task, within [`STOP_DEADLINE`].
     ///
     /// # Errors
     ///
     /// Returns a [`CompositionError`] when the host was not in a phase that can
-    /// be stopped. Subsystem failures during shutdown are collected into the
-    /// report rather than aborting it.
+    /// be stopped — a daemon that was never started, or one already stopped.
+    /// Nothing has been torn down that was not torn down already, so this is a
+    /// caller sequencing mistake and the process may still exit.
+    ///
+    /// Subsystem failures during shutdown are *not* errors here: they are
+    /// collected into the report so that one uncooperative adapter cannot abort
+    /// the teardown of the others, and they show up as
+    /// [`StopSummary::is_clean`] returning false.
     pub async fn stop(&mut self) -> Result<StopSummary, CompositionError> {
-        let shutdown = self.host.shutdown().await?;
-        let tasks = self.runtime.shutdown().await;
+        self.stop_within(STOP_DEADLINE).await
+    }
+
+    /// Stops the daemon, giving the whole teardown at most `budget`.
+    ///
+    /// The budget covers both halves — draining the subsystems and joining the
+    /// tasks — because a supervisor's kill timer covers both too. Whatever the
+    /// first half leaves is what the second half gets.
+    ///
+    /// Running out of time is reported, not raised: the returned summary has
+    /// [`deadline_expired`](StopSummary::deadline_expired) set and is not
+    /// clean, and the caller is expected to log it and exit rather than retry.
+    /// Retrying is nonetheless safe — the abandoned teardown resumes where it
+    /// stopped, calling `shutdown` exactly once per subsystem — which is what
+    /// makes abandoning it defensible in the first place.
+    ///
+    /// # Errors
+    ///
+    /// As [`stop`](Self::stop): only a phase the host cannot be stopped from.
+    pub async fn stop_within(&mut self, budget: Duration) -> Result<StopSummary, CompositionError> {
+        let started = Instant::now();
+        let outcome = timeout(budget, self.host.shutdown()).await;
+        let deadline_expired = outcome.is_err();
+        let shutdown = match outcome {
+            Ok(report) => report?,
+            // The teardown future has been dropped part way through. The host
+            // records that itself, so a later stop finishes what this one
+            // abandoned; what is lost here is only the report of the drains
+            // that had already happened.
+            Err(_elapsed) => ShutdownReport::default(),
+        };
+
+        // The tasks are joined even when the subsystems ran out of time, so
+        // that the ledger describes the whole process rather than nothing, and
+        // with whatever budget is left rather than none: a stop that has
+        // already overrun must not then wait indefinitely here.
+        let tasks = self
+            .runtime
+            .shutdown_within(budget.saturating_sub(started.elapsed()))
+            .await;
         self.started = false;
 
         Ok(StopSummary {
             shutdown,
             tasks,
             phase: self.host.phase(),
+            deadline_expired,
         })
     }
 
@@ -481,17 +554,14 @@ impl DaemonBuilder {
             .clock
             .unwrap_or_else(|| Arc::new(ProcessClock) as Arc<dyn Clock>);
 
-        let provider = ProviderName::new("primary").expect("the literal satisfies the grammar");
-        let model = ModelName::new("standard").expect("the literal satisfies the grammar");
-        let credential =
-            CredentialName::new(CREDENTIAL).expect("the literal satisfies the grammar");
+        let (provider, model, credential) = fixed_names();
 
         let settings = Arc::new(RuntimeSettings::new(
             self.listen,
             provider.clone(),
             model.clone(),
             4,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             self.authorization_ttl,
         ));
 
@@ -524,12 +594,12 @@ impl DaemonBuilder {
         let transport = Arc::new(ScriptedTransport::new());
         let tools = Arc::new(MemoryToolSurface::new([
             FakeTool::succeeding(
-                ToolName::new("workspace.read").expect("the literal satisfies the grammar"),
+                tool_name("workspace.read"),
                 reading_workspace(),
                 "the workspace contains one crate",
             ),
             FakeTool::failing(
-                ToolName::new("workspace.write").expect("the literal satisfies the grammar"),
+                tool_name("workspace.write"),
                 CapabilitySet::from_capabilities([Capability::WriteWorkspace]),
                 "the workspace is read only in this composition",
             ),
@@ -669,4 +739,46 @@ fn default_routes() -> Vec<HttpRoute> {
         HttpRoute::streaming("POST", "/v1/sessions/stream"),
         HttpRoute::unary("GET", "/v1/health"),
     ]
+}
+
+/// The provider, model and credential names this composition is fixed to.
+///
+/// Kept out of [`DaemonBuilder::build`] so that building a daemon contains no
+/// fallible name construction: these three literals are the only ones, and
+/// `the_fixed_names_satisfy_their_grammars` is what holds them to the grammars
+/// their types enforce. A typo here fails that test rather than an operator's
+/// start-up.
+fn fixed_names() -> (ProviderName, ModelName, CredentialName) {
+    (
+        ProviderName::new("primary").expect("the literal satisfies the grammar"),
+        ModelName::new("standard").expect("the literal satisfies the grammar"),
+        CredentialName::new(CREDENTIAL).expect("the literal satisfies the grammar"),
+    )
+}
+
+/// Names one of the built-in tools.
+///
+/// Private, and called only with the two literals in [`DaemonBuilder::build`];
+/// both are pinned by `the_fixed_names_satisfy_their_grammars`.
+fn tool_name(literal: &str) -> ToolName {
+    ToolName::new(literal).expect("the literal satisfies the grammar")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CREDENTIAL, fixed_names, tool_name};
+
+    /// The composition builds these names without a fallback, so the daemon can
+    /// only start if every one of them satisfies its type's grammar. Proving it
+    /// here is what keeps `build` infallible in that respect.
+    #[test]
+    fn the_fixed_names_satisfy_their_grammars() {
+        let (provider, model, credential) = fixed_names();
+
+        assert_eq!(provider.as_str(), "primary");
+        assert_eq!(model.as_str(), "standard");
+        assert_eq!(credential.as_str(), CREDENTIAL);
+        assert_eq!(tool_name("workspace.read").as_str(), "workspace.read");
+        assert_eq!(tool_name("workspace.write").as_str(), "workspace.write");
+    }
 }

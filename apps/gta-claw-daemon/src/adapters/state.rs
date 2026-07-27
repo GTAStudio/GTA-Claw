@@ -1,10 +1,22 @@
 //! Durable-state stand-ins: sessions, turns and origin-bound credentials.
 //!
-//! Both stores are transactional in the way the real ones must be. A
-//! transaction stages its work in a local buffer and only touches the shared
-//! map on commit, so a turn that fails part way through leaves nothing behind.
-//! `Drop` rolls back, which is why the staging buffer is dropped rather than
-//! applied when a transaction is abandoned.
+//! Neither store is durable. Both hold everything in memory for the lifetime of
+//! the process and stand in for `claw-state` and `claw-provider-sdk` until those
+//! land; a restart loses every session, turn and credential.
+//!
+//! What they do implement for real is the transactional shape the real ones
+//! must have. A transaction stages its work in a local buffer and only touches
+//! the shared map on commit, so a turn that fails part way through leaves
+//! nothing behind. `Drop` rolls back, which is why the staging buffer is
+//! dropped rather than applied when a transaction is abandoned.
+//!
+//! # Lock poisoning
+//!
+//! The accessors below unwrap their lock guards, so each panics if a previous
+//! holder panicked while holding it. A poisoned store here means the in-memory
+//! session table or credential map may be half-written, and answering from it
+//! would be worse than stopping. An operator should restart the daemon and
+//! investigate the *first* panic in the log.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,6 +55,11 @@ impl MemoryPersistence {
 
     /// Returns every turn recorded for `session`, in the order they were
     /// appended.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the session table's lock is poisoned; see the module note on
+    /// lock poisoning.
     #[must_use]
     pub fn turns_for(&self, session: &SessionId) -> Vec<TurnRecord> {
         self.table
@@ -236,6 +253,11 @@ impl MemorySecrets {
     /// This bypasses the transaction, which is exactly what a fixture wants and
     /// exactly what production code must not do; it is why the method is named
     /// for its purpose rather than looking like part of the port.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the credential map's lock is poisoned; see the module note on
+    /// lock poisoning.
     pub fn preload(&self, name: &CredentialName, origin: ResolvedEndpoint, secret: &str) {
         self.entries.lock().expect("uncontended").insert(
             name.as_str().to_owned(),
@@ -313,10 +335,17 @@ impl SecretStorePort for MemorySecrets {
                 // entitled to copy the material it holds, and it hands the copy
                 // straight to a `CredentialLease` without it ever existing as a
                 // loggable `String`.
-                (
+                let released = (
                     stored.origin.clone(),
                     SecretString::from(stored.secret.expose_secret().to_owned()),
-                )
+                );
+
+                // The map is released here rather than at the end of the block:
+                // every lease in the daemon passes through this lock, and
+                // holding it across the release counter below would serialise
+                // them for no reason.
+                drop(entries);
+                released
             };
 
             self.releases.fetch_add(1, Ordering::SeqCst);
@@ -371,6 +400,7 @@ impl SecretTransaction for MemorySecretTransaction {
                 entries.insert(name, credential);
             }
 
+            drop(entries);
             Ok(())
         })
     }

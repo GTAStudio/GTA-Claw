@@ -10,10 +10,16 @@
 //! guarantees persistence exists before the engine tries to use it.
 //!
 //! [`LoopbackGateway`] and [`LoopbackHttpApi`] are ingress. They own a
-//! [`GatewayDispatch`], accept requests through a bounded queue, and refuse new
-//! work the moment they are quiesced. They are the reason
+//! [`GatewayDispatch`], accept requests only while they are running, and refuse
+//! new work the moment they are quiesced. They are the reason
 //! [`SubsystemKind::Ingress`] exists: the composition stops the edges before it
 //! drains the middle.
+//!
+//! Both are stand-ins. Neither binds a socket, neither speaks a wire protocol,
+//! and neither bounds how many requests may be in flight at once — a real
+//! ingress has to do all three. What they do implement for real is the part the
+//! composition is responsible for: the accept/refuse gate, and the count of
+//! what was still running when the drain arrived.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -88,7 +94,7 @@ impl Subsystem for PortSubsystem {
         })
     }
 
-    fn shutdown<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), SubsystemError>> {
         Box::pin(async move {
             self.stopped.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -98,10 +104,14 @@ impl Subsystem for PortSubsystem {
 
 impl std::fmt::Debug for PortSubsystem {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (initialized, started, stopped) = self.steps();
+
         formatter
             .debug_struct("PortSubsystem")
             .field("id", self.descriptor.id())
-            .field("steps", &self.steps())
+            .field("initialized", &initialized)
+            .field("started", &started)
+            .field("stopped", &stopped)
             .finish()
     }
 }
@@ -123,6 +133,35 @@ impl IngressGate {
             refused: AtomicU64::new(0),
         }
     }
+
+    /// Reports what the drain found: everything served, and everything still
+    /// running at the moment the drain was asked for.
+    ///
+    /// Shared by both ingresses deliberately. This accounting was written out
+    /// twice and the second copy omitted the in-flight check, so the HTTP
+    /// surface reported every shutdown as a clean drain even with requests
+    /// still in flight — and a clean drain is what the daemon's exit status is
+    /// derived from.
+    fn drain_report(&self, subsystem: SubsystemId) -> DrainReport {
+        let abandoned = narrowed(self.in_flight.load(Ordering::SeqCst));
+        let completed = narrowed(self.served.load(Ordering::SeqCst));
+
+        if abandoned == 0 {
+            DrainReport::clean(subsystem, completed)
+        } else {
+            DrainReport::partial(subsystem, completed, abandoned)
+        }
+    }
+}
+
+/// Narrows a request count to the width [`DrainReport`] uses.
+///
+/// Saturating rather than wrapping: a single ingress with more than four
+/// billion requests in one run is already beyond what this stand-in models, and
+/// `u32::MAX` keeps "there was work" true where wrapping to zero would report a
+/// clean drain for the busiest possible daemon.
+fn narrowed(count: u64) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 /// An in-process Gateway v4 ingress.
@@ -222,29 +261,18 @@ impl Subsystem for LoopbackGateway {
         })
     }
 
-    fn quiesce<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
+    fn quiesce(&self) -> BoxFuture<'_, Result<(), SubsystemError>> {
         Box::pin(async move {
             self.gate.accepting.store(false, Ordering::SeqCst);
             Ok(())
         })
     }
 
-    fn drain<'a>(&'a self) -> BoxFuture<'a, Result<DrainReport, SubsystemError>> {
-        Box::pin(async move {
-            let abandoned =
-                u32::try_from(self.gate.in_flight.load(Ordering::SeqCst)).unwrap_or(u32::MAX);
-            let completed =
-                u32::try_from(self.gate.served.load(Ordering::SeqCst)).unwrap_or(u32::MAX);
-
-            Ok(if abandoned == 0 {
-                DrainReport::clean(well_known::gateway(), completed)
-            } else {
-                DrainReport::partial(well_known::gateway(), completed, abandoned)
-            })
-        })
+    fn drain(&self) -> BoxFuture<'_, Result<DrainReport, SubsystemError>> {
+        Box::pin(async move { Ok(self.gate.drain_report(well_known::gateway())) })
     }
 
-    fn shutdown<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), SubsystemError>> {
         Box::pin(async move { Ok(()) })
     }
 }
@@ -368,23 +396,18 @@ impl Subsystem for LoopbackHttpApi {
         })
     }
 
-    fn quiesce<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
+    fn quiesce(&self) -> BoxFuture<'_, Result<(), SubsystemError>> {
         Box::pin(async move {
             self.gate.accepting.store(false, Ordering::SeqCst);
             Ok(())
         })
     }
 
-    fn drain<'a>(&'a self) -> BoxFuture<'a, Result<DrainReport, SubsystemError>> {
-        Box::pin(async move {
-            let completed =
-                u32::try_from(self.gate.served.load(Ordering::SeqCst)).unwrap_or(u32::MAX);
-
-            Ok(DrainReport::clean(well_known::http_api(), completed))
-        })
+    fn drain(&self) -> BoxFuture<'_, Result<DrainReport, SubsystemError>> {
+        Box::pin(async move { Ok(self.gate.drain_report(well_known::http_api())) })
     }
 
-    fn shutdown<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), SubsystemError>> {
         Box::pin(async move { Ok(()) })
     }
 }
@@ -407,5 +430,207 @@ impl std::fmt::Debug for LoopbackHttpApi {
             .field("routes", &self.routes.len())
             .field("served", &self.served())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use claw_application::composition::{
+        BoxFuture, CapabilitySet, Clock, GatewayDispatch, GatewayRequest, GatewayResponse,
+        HttpRoute, ModelName, Principal, ProcessClock, ProviderName, RuntimeSettings, StartContext,
+        Subsystem, SubsystemError, well_known,
+    };
+    use claw_domain::SessionId;
+    use tokio::sync::Notify;
+
+    use super::{LoopbackGateway, LoopbackHttpApi};
+    use crate::runtime::RuntimeHost;
+
+    /// A dispatcher that parks every request until it is released.
+    ///
+    /// Parking is the only way to observe a request that is genuinely in
+    /// flight while the drain runs, which is the state both ingresses have to
+    /// account for and one of them used to ignore.
+    #[derive(Debug, Default)]
+    struct ParkedDispatch {
+        entered: AtomicU64,
+        release: Notify,
+    }
+
+    impl ParkedDispatch {
+        fn entered(&self) -> u64 {
+            self.entered.load(Ordering::SeqCst)
+        }
+
+        fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    impl GatewayDispatch for ParkedDispatch {
+        fn dispatch(
+            &self,
+            _request: GatewayRequest,
+        ) -> BoxFuture<'_, Result<GatewayResponse, SubsystemError>> {
+            Box::pin(async move {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                self.release.notified().await;
+
+                Ok(GatewayResponse::new("served".to_owned(), 0))
+            })
+        }
+
+        fn methods(&self) -> Vec<String> {
+            vec!["session.prompt".to_owned()]
+        }
+    }
+
+    fn request() -> GatewayRequest {
+        GatewayRequest::new(
+            "session.prompt".to_owned(),
+            Principal::new("operator", CapabilitySet::all()),
+            SessionId::new("ingress").expect("the literal is a usable session id"),
+            "hello".to_owned(),
+        )
+    }
+
+    /// The context a subsystem is started with, built the way the composition
+    /// builds it so that `start` runs its real path rather than a shortcut.
+    fn start_context(runtime: &RuntimeHost) -> StartContext {
+        let settings = Arc::new(RuntimeSettings::new(
+            Vec::new(),
+            ProviderName::new("primary").expect("the literal satisfies the grammar"),
+            ModelName::new("standard").expect("the literal satisfies the grammar"),
+            4,
+            Duration::from_mins(1),
+            Duration::from_secs(5),
+        ));
+
+        StartContext::new(
+            well_known::gateway(),
+            settings,
+            runtime.spawner(),
+            runtime.shutdown_signal(),
+            Arc::new(ProcessClock) as Arc<dyn Clock>,
+        )
+    }
+
+    /// Yields until `condition` holds, so the test never sleeps for a fixed
+    /// time and never spins forever.
+    async fn settled(condition: impl Fn() -> bool + Send + Sync) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request reached the dispatcher");
+    }
+
+    #[tokio::test]
+    async fn a_gateway_request_still_in_flight_is_reported_as_abandoned() {
+        let runtime = RuntimeHost::new();
+        let dispatch = Arc::new(ParkedDispatch::default());
+        let gateway = Arc::new(LoopbackGateway::new(
+            Arc::clone(&dispatch) as Arc<dyn GatewayDispatch>
+        ));
+
+        gateway
+            .start(&start_context(&runtime))
+            .await
+            .expect("the ingress starts");
+
+        let parked = tokio::spawn({
+            let gateway = Arc::clone(&gateway);
+            async move { gateway.handle(request()).await }
+        });
+        settled(|| dispatch.entered() == 1).await;
+
+        let report = gateway.drain().await.expect("the drain reports");
+
+        assert_eq!(
+            report.abandoned(),
+            1,
+            "an in-flight request was not counted"
+        );
+        assert_eq!(report.completed(), 0);
+        assert!(!report.is_clean());
+
+        dispatch.release();
+        parked
+            .await
+            .expect("the parked request finishes")
+            .expect("the request is served");
+    }
+
+    /// The same must hold for the HTTP surface.
+    ///
+    /// It did not: its drain only reported what it had served, so a shutdown
+    /// with requests still running was reported as clean, and the daemon's
+    /// `clean=true` summary — and its exit status — were derived from that.
+    #[tokio::test]
+    async fn an_http_request_still_in_flight_is_reported_as_abandoned() {
+        let runtime = RuntimeHost::new();
+        let dispatch = Arc::new(ParkedDispatch::default());
+        let http = Arc::new(LoopbackHttpApi::new(
+            Arc::clone(&dispatch) as Arc<dyn GatewayDispatch>,
+            vec![HttpRoute::unary("POST", "/v1/sessions")],
+        ));
+
+        http.start(&start_context(&runtime))
+            .await
+            .expect("the ingress starts");
+
+        let parked = tokio::spawn({
+            let http = Arc::clone(&http);
+            async move { http.handle("POST", "/v1/sessions", request()).await }
+        });
+        settled(|| dispatch.entered() == 1).await;
+
+        let report = http.drain().await.expect("the drain reports");
+
+        assert_eq!(
+            report.abandoned(),
+            1,
+            "an in-flight request was not counted"
+        );
+        assert_eq!(report.completed(), 0);
+        assert!(!report.is_clean());
+
+        dispatch.release();
+        parked
+            .await
+            .expect("the parked request finishes")
+            .expect("the request is served");
+    }
+
+    /// An idle ingress drains clean, so the assertions above mean something.
+    #[tokio::test]
+    async fn an_idle_ingress_drains_clean_after_serving_its_requests() {
+        let runtime = RuntimeHost::new();
+        let dispatch = Arc::new(ParkedDispatch::default());
+        let http = Arc::new(LoopbackHttpApi::new(
+            Arc::clone(&dispatch) as Arc<dyn GatewayDispatch>,
+            vec![HttpRoute::unary("POST", "/v1/sessions")],
+        ));
+
+        http.start(&start_context(&runtime))
+            .await
+            .expect("the ingress starts");
+        dispatch.release();
+        http.handle("POST", "/v1/sessions", request())
+            .await
+            .expect("the request is served");
+
+        let report = http.drain().await.expect("the drain reports");
+
+        assert_eq!(report.completed(), 1);
+        assert_eq!(report.abandoned(), 0);
+        assert!(report.is_clean());
+        assert_eq!(http.served(), 1);
     }
 }

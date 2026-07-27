@@ -57,3 +57,65 @@ fn one_shot_probe_exits_successfully() {
     assert!(output.starts_with("healthy runtime="));
     assert!(!output.contains("ready protocol="));
 }
+
+#[test]
+fn an_unsupported_argument_is_refused_with_the_usage_line() {
+    let output = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
+        .arg("--reload")
+        .output()
+        .expect("daemon starts");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an unsupported argument must be a plain start-up failure"
+    );
+
+    let message = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(
+        message.contains("usage: gta-claw-daemon [--probe]"),
+        "an operator was not told how to invoke the daemon: {message:?}"
+    );
+}
+
+/// An argument that is not valid Unicode must be refused, not panic.
+///
+/// `std::env::args` panics part way through iteration on an argument like this,
+/// which would turn a mistyped invocation into exit 101 and a panic message
+/// naming a std internal — telling an operator nothing about what to fix, and
+/// indistinguishable from a defect in the daemon. Restricted to unix because
+/// Windows arguments are UTF-16 and cannot carry this byte.
+#[cfg(unix)]
+#[test]
+fn an_argument_that_is_not_valid_unicode_is_refused_rather_than_panicking() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::ExitStatusExt;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
+        .arg(OsStr::from_bytes(b"--pro\xffbe"))
+        .output()
+        .expect("daemon starts");
+
+    assert_eq!(
+        output.status.signal(),
+        None,
+        "the daemon died by signal on a malformed argument"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a malformed argument must be a start-up failure, not a panic (101): {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        message.contains("usage: gta-claw-daemon [--probe]"),
+        "an operator was not told how to invoke the daemon: {message:?}"
+    );
+    assert!(
+        !message.contains("panicked"),
+        "a malformed argument panicked instead of being refused: {message:?}"
+    );
+}

@@ -130,7 +130,7 @@ async fn a_capability_expires_against_the_clock_at_the_moment_it_is_redeemed() {
         Arc::clone(&policy) as Arc<dyn AuthorityPort>,
         Arc::clone(&clock) as Arc<dyn Clock>,
         gate.epoch_gate(),
-        Duration::from_secs(60),
+        Duration::from_mins(1),
     );
 
     let request = ActionRequest::new(well_known::engine(), operator(), Action::SubmitTurn)
@@ -164,13 +164,13 @@ async fn a_capability_expires_against_the_clock_at_the_moment_it_is_redeemed() {
 #[tokio::test]
 async fn a_capability_dies_when_the_run_it_was_issued_in_drains() {
     let clock = Arc::new(SteppedClock::new());
-    let policy = Arc::new(LivePolicy::new(Duration::from_secs(60)));
+    let policy = Arc::new(LivePolicy::new(Duration::from_mins(1)));
     let mut lifecycle = running_lifecycle();
     let issuer = GrantIssuer::new(
         Arc::clone(&policy) as Arc<dyn AuthorityPort>,
         Arc::clone(&clock) as Arc<dyn Clock>,
         lifecycle.epoch_gate(),
-        Duration::from_secs(60),
+        Duration::from_mins(1),
     );
 
     let request = ActionRequest::new(well_known::engine(), operator(), Action::SubmitTurn)
@@ -348,13 +348,13 @@ async fn a_credential_filed_for_one_origin_is_refused_for_another() {
     let secrets = MemorySecrets::new();
     secrets.preload(&name, one.clone(), "super-secret");
 
-    let policy = Arc::new(LivePolicy::new(Duration::from_secs(60)));
+    let policy = Arc::new(LivePolicy::new(Duration::from_mins(1)));
     let lifecycle = running_lifecycle();
     let issuer = GrantIssuer::new(
         Arc::clone(&policy) as Arc<dyn AuthorityPort>,
         Arc::clone(&clock),
         lifecycle.epoch_gate(),
-        Duration::from_secs(60),
+        Duration::from_mins(1),
     );
 
     let request = ActionRequest::new(
@@ -460,13 +460,13 @@ async fn a_plugin_instance_holds_only_the_capabilities_decided_for_it() {
     use claw_application::composition::{PluginActivation, PluginHostPort};
 
     let clock = Arc::new(SteppedClock::new()) as Arc<dyn Clock>;
-    let policy = Arc::new(LivePolicy::new(Duration::from_secs(60)));
+    let policy = Arc::new(LivePolicy::new(Duration::from_mins(1)));
     let lifecycle = running_lifecycle();
     let issuer = GrantIssuer::new(
         Arc::clone(&policy) as Arc<dyn AuthorityPort>,
         clock,
         lifecycle.epoch_gate(),
-        Duration::from_secs(60),
+        Duration::from_mins(1),
     );
 
     let host = gta_claw_daemon::adapters::plugins::PerActivationPluginHost::new();
