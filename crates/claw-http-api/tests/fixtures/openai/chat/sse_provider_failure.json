@@ -1,0 +1,87 @@
+{
+  "description": "A provider that fails after streaming deltas pins the terminal error frame carried inside the stream, followed by [DONE], rather than a truncated stream or a late status code.",
+  "feature_id": "interop.openai.chat-completions",
+  "request": {
+    "body": {
+      "messages": [
+        {
+          "content": "What is the weather in Berlin?",
+          "role": "user"
+        }
+      ],
+      "model": "openclaw",
+      "stream": true
+    },
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "token": "operator-token"
+  },
+  "response": {
+    "events": [
+      {
+        "data": {
+          "choices": [
+            {
+              "delta": {
+                "role": "assistant"
+              },
+              "finish_reason": null,
+              "index": 0
+            }
+          ],
+          "created": "<created#1>",
+          "id": "<id:chatcmpl#1>",
+          "model": "openclaw",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "choices": [
+            {
+              "delta": {
+                "content": "Berlin "
+              },
+              "finish_reason": null,
+              "index": 0
+            }
+          ],
+          "created": "<created#1>",
+          "id": "<id:chatcmpl#1>",
+          "model": "openclaw",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "error": {
+            "message": "upstream provider dropped the connection",
+            "type": "api_error"
+          }
+        }
+      },
+      {
+        "data": "[DONE]"
+      }
+    ],
+    "headers": {
+      "cache-control": "no-cache",
+      "content-type": "text/event-stream; charset=utf-8"
+    },
+    "status": 200
+  },
+  "runtime": {
+    "stream": {
+      "error": {
+        "kind": "unavailable",
+        "message": "upstream provider dropped the connection"
+      },
+      "events": [
+        {
+          "text": "Berlin "
+        }
+      ],
+      "kind": "error"
+    }
+  }
+}

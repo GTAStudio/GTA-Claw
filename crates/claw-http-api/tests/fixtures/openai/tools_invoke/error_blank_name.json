@@ -1,0 +1,25 @@
+{
+  "description": "A whitespace-only tool name is refused rather than trimmed into an empty lookup.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "args": {},
+      "name": "   "
+    },
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "tools.invoke requires name",
+        "type": "invalid_request"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 400
+  }
+}

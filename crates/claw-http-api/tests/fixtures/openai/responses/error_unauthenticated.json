@@ -1,0 +1,24 @@
+{
+  "description": "An unauthenticated response request is refused before any generation is started.",
+  "feature_id": "interop.openai.openresponses",
+  "request": {
+    "body": {
+      "input": "hello",
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/responses"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "Unauthorized",
+        "type": "unauthorized"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 401
+  }
+}

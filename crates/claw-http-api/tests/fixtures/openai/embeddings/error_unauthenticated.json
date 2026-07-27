@@ -1,0 +1,24 @@
+{
+  "description": "An unauthenticated embedding request is refused before the provider is consulted.",
+  "feature_id": "interop.openai.embeddings",
+  "request": {
+    "body": {
+      "input": "Berlin",
+      "model": "openclaw"
+    },
+    "method": "POST",
+    "path": "/v1/embeddings"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "Unauthorized",
+        "type": "unauthorized"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 401
+  }
+}

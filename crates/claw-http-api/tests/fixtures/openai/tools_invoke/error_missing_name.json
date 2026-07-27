@@ -1,0 +1,26 @@
+{
+  "description": "An invocation without a tool name is a request error.",
+  "feature_id": "interop.openai.tools-invoke",
+  "request": {
+    "body": {
+      "args": {
+        "message": "hello"
+      }
+    },
+    "method": "POST",
+    "path": "/tools/invoke",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "tools.invoke requires name",
+        "type": "invalid_request"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 400
+  }
+}

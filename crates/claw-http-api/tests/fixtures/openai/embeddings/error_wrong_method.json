@@ -1,0 +1,16 @@
+{
+  "description": "An embedding request with the wrong method is refused by the router with an Allow header.",
+  "feature_id": "interop.openai.embeddings",
+  "request": {
+    "method": "GET",
+    "path": "/v1/embeddings",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": null,
+    "headers": {
+      "allow": "POST"
+    },
+    "status": 405
+  }
+}

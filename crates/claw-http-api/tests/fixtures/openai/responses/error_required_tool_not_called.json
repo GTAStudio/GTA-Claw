@@ -1,0 +1,57 @@
+{
+  "description": "A required tool that the provider never called is a failed response resource rather than a silently downgraded text answer.",
+  "feature_id": "interop.openai.openresponses",
+  "request": {
+    "body": {
+      "input": "hello",
+      "model": "openclaw",
+      "tool_choice": "required",
+      "tools": [
+        {
+          "name": "get_weather",
+          "parameters": {
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "method": "POST",
+    "path": "/v1/responses",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "created_at": "<created#1>",
+      "error": {
+        "code": "api_error",
+        "message": "The model did not call the required tool."
+      },
+      "id": "<id:resp#1>",
+      "model": "openclaw",
+      "object": "response",
+      "output": [],
+      "status": "failed",
+      "usage": {
+        "input_tokens": 9,
+        "output_tokens": 8,
+        "total_tokens": 17
+      }
+    },
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "status": 502
+  },
+  "runtime": {
+    "generate": {
+      "kind": "output",
+      "text": "I would rather just answer directly.",
+      "usage": {
+        "input_tokens": 9,
+        "output_tokens": 8,
+        "total_tokens": 17
+      }
+    }
+  }
+}

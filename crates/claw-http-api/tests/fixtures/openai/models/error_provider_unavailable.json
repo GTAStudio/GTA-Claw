@@ -1,0 +1,30 @@
+{
+  "description": "A provider that cannot answer turns the model list into a service-unavailable api_error rather than a partial list.",
+  "feature_id": "interop.openai.models",
+  "request": {
+    "method": "GET",
+    "path": "/v1/models",
+    "token": "operator-token"
+  },
+  "response": {
+    "body": {
+      "error": {
+        "message": "provider registry is offline",
+        "type": "api_error"
+      }
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 503
+  },
+  "runtime": {
+    "models": {
+      "error": {
+        "kind": "unavailable",
+        "message": "provider registry is offline"
+      },
+      "kind": "error"
+    }
+  }
+}
