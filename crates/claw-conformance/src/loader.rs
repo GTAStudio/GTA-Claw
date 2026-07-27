@@ -122,6 +122,24 @@ pub struct Contract {
 
 impl Contract {
     /// Loads all three ledgers and all ten inventories from `compat/upstream`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ViolationCode::Io`] error when a frozen artifact is missing
+    /// or unreadable, and a [`ViolationCode::JsonSchema`] error carrying the
+    /// exact serde JSON path when one does not match its strongly typed schema.
+    ///
+    /// The remaining variants report drift in artifacts that are supposed to be
+    /// byte-sealed and must be investigated, never re-baselined to make the
+    /// check pass: [`ViolationCode::ManifestDrift`] when `baseline.json`, the
+    /// feature schema, or the fixed manifest metadata no longer hashes to its
+    /// pinned digest; [`ViolationCode::InventoryDrift`] when an inventory's
+    /// content hash, ID, or row count changed, which means a frozen upstream ID
+    /// was renamed or removed; [`ViolationCode::LedgerDrift`] when a ledger's
+    /// ID, classification, baseline SHA, or row count changed, a feature ID is
+    /// duplicated across ledgers, or the total is not exactly 47 rows; and
+    /// [`ViolationCode::LedgerEvidence`] when a ledger row claims a status above
+    /// `unimplemented` without the acceptance evidence that status requires.
     pub fn load(root: impl AsRef<Path>) -> Result<Self, ConformanceError> {
         let root = root.as_ref();
         let repository_root = repository_root_for_contract(root);
@@ -229,7 +247,7 @@ impl Contract {
 
     /// Validated inventories keyed by inventory ID.
     #[must_use]
-    pub fn inventories(&self) -> &BTreeMap<String, Vec<InventoryRecord>> {
+    pub const fn inventories(&self) -> &BTreeMap<String, Vec<InventoryRecord>> {
         &self.inventories
     }
 
@@ -915,11 +933,7 @@ fn verify_hash(
     subject: &str,
     reason: &str,
 ) -> Result<(), ConformanceError> {
-    let normalized = normalize_line_endings(bytes);
-    let actual = Sha256::digest(&normalized)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let actual = normalized_digest(bytes);
     if actual == expected {
         Ok(())
     } else {
@@ -939,11 +953,7 @@ fn verify_hashes<'a>(
     subject: &str,
     reason: &str,
 ) -> Result<&'a str, ConformanceError> {
-    let normalized = normalize_line_endings(bytes);
-    let actual = Sha256::digest(&normalized)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let actual = normalized_digest(bytes);
     expected
         .iter()
         .copied()
@@ -958,6 +968,20 @@ fn verify_hashes<'a>(
                 ),
             )
         })
+}
+
+/// Lowercase hexadecimal SHA-256 of `bytes` with CRLF folded to LF, so a frozen
+/// artifact hashes the same whichever way a checkout materialized its line
+/// endings.
+fn normalized_digest(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(normalize_line_endings(bytes));
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
 }
 
 fn normalize_line_endings(bytes: &[u8]) -> Vec<u8> {

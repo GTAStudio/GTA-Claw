@@ -11,8 +11,14 @@ use crate::claims::{
 };
 use crate::error::{ConformanceError, ViolationCode};
 use crate::loader::Contract;
+use crate::model::{Feature, FeatureLedger};
 
-/// Effective measured state for one feature row.
+/// Claim state recorded for one feature row.
+///
+/// This is the level of the registered claim, once that claim's cited evidence
+/// was verified to resolve. It reports what is claimed and cited, not observed
+/// behavior; see the crate documentation for what evidence verification does
+/// and does not establish.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParityStatus {
@@ -25,7 +31,7 @@ pub enum ParityStatus {
 }
 
 impl ParityStatus {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Unimplemented => "unimplemented",
             Self::Partial => "partial",
@@ -41,7 +47,7 @@ pub struct FeatureReport {
     pub feature_id: String,
     /// Human-readable title.
     pub title: String,
-    /// Measured implementation state.
+    /// Level of the row's verified claim.
     pub status: ParityStatus,
     /// Whether any metadata or implementation claim is registered.
     pub registered: bool,
@@ -56,11 +62,11 @@ pub struct LedgerReport {
     pub ledger_id: String,
     /// Rows in frozen order.
     pub features: Vec<FeatureReport>,
-    /// Fully implemented row count.
+    /// Rows with a verified complete claim.
     pub implemented: usize,
-    /// Partially implemented row count.
+    /// Rows with a verified partial claim.
     pub partial: usize,
-    /// Unimplemented row count.
+    /// Rows with no verified implementation claim.
     pub unimplemented: usize,
     /// Rows with any metadata or implementation registration.
     pub registered: usize,
@@ -79,14 +85,14 @@ pub struct InventoryCoverage {
     pub total: usize,
 }
 
-/// Aggregate feature totals.
+/// Aggregate feature claim totals.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ParityTotals {
-    /// Fully implemented feature rows.
+    /// Feature rows with a verified complete claim.
     pub implemented: usize,
-    /// Partially implemented feature rows.
+    /// Feature rows with a verified partial claim.
     pub partial: usize,
-    /// Unimplemented feature rows.
+    /// Feature rows with no verified implementation claim.
     pub unimplemented: usize,
     /// Total frozen feature rows.
     pub total: usize,
@@ -103,7 +109,7 @@ pub struct ParityReport {
     pub ledgers: Vec<LedgerReport>,
     /// Per-inventory coverage results.
     pub inventories: Vec<InventoryCoverage>,
-    /// Aggregate feature totals.
+    /// Aggregate feature claim totals.
     pub totals: ParityTotals,
 }
 
@@ -170,12 +176,33 @@ impl ParityReport {
     }
 
     /// Serializes the machine-readable report as pretty JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`serde_json::Error`] raised while serializing the report.
+    /// Every field is a `String`, a `usize`, or a plain enum, so this cannot
+    /// fail on the data itself; a failure means the serializer itself failed.
     pub fn to_pretty_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
 }
 
-/// Validates every claim and generates the measured parity report.
+/// Validates every claim and generates the parity report.
+///
+/// # Errors
+///
+/// Returns a [`ViolationCode::UnknownClaim`] error when a claim names a feature
+/// ID or inventory record that is not in the frozen ledgers or inventories —
+/// usually a typo, or a claim left behind after upstream renamed a row.
+///
+/// Returns a [`ViolationCode::ClaimEvidence`] error when a claim above
+/// `registered`, or any claim that carries evidence, cannot have that evidence
+/// verified: the cited test is not literally declared in a standard-libtest
+/// Cargo target of an admitted workspace package, the citing path is not
+/// reachable through `mod` declarations from one, or an implementation pointer
+/// does not exist or resolves outside the repository root. Unverifiable evidence
+/// is refused rather than downgraded, because the report is a claim about what
+/// is proven.
 pub fn generate_report(
     contract: &Contract,
     registry: &Registry,
@@ -185,8 +212,8 @@ pub fn generate_report(
     let known_features = contract
         .ledgers()
         .iter()
-        .flat_map(|ledger| ledger.features())
-        .map(|feature| feature.id())
+        .flat_map(FeatureLedger::features)
+        .map(Feature::id)
         .collect::<BTreeSet<_>>();
     let mut cargo_test_targets: Option<CargoTestTargets> =
         contract.cargo_test_targets(repository_root);

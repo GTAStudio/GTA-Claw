@@ -85,8 +85,7 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments, String> {
-    let mut arguments = arguments.peekable();
+fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<Arguments, String> {
     let mut contract_root = PathBuf::from("compat/upstream");
     let mut claim_files = Vec::new();
     let mut format = OutputFormat::Human;

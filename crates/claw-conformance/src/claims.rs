@@ -38,7 +38,7 @@ impl Evidence {
     #[must_use]
     pub fn test(path: impl Into<PathBuf>, test: impl Into<String>) -> Self {
         Self {
-            path: normalized_api_path(path.into()),
+            path: normalized_api_path(&path.into()),
             test: test.into(),
         }
     }
@@ -59,7 +59,7 @@ impl ImplementationPointer {
     #[must_use]
     pub fn new(path: impl Into<PathBuf>, note: impl Into<String>) -> Self {
         Self {
-            path: normalized_api_path(path.into()),
+            path: normalized_api_path(&path.into()),
             note: note.into(),
         }
     }
@@ -279,7 +279,7 @@ impl CargoWorkspaceSpec {
         let Ok(relative) = package_directory.strip_prefix(&self.directory) else {
             return false;
         };
-        let relative = normalized_api_path(relative.to_path_buf());
+        let relative = normalized_api_path(relative);
         if self
             .exclude
             .iter()
@@ -464,8 +464,7 @@ fn load_manifest_scope(
     let subject = normalized_api_path(
         manifest_path
             .strip_prefix(repository_root)
-            .unwrap_or(manifest_path)
-            .to_path_buf(),
+            .unwrap_or(manifest_path),
     );
     let source = fs::read_to_string(manifest_path).map_err(|error| {
         ConformanceError::new(
@@ -592,8 +591,7 @@ fn load_manifest_targets(
     let subject = normalized_api_path(
         manifest_path
             .strip_prefix(repository_root)
-            .unwrap_or(manifest_path)
-            .to_path_buf(),
+            .unwrap_or(manifest_path),
     );
     let source = fs::read_to_string(manifest_path).map_err(|error| {
         ConformanceError::new(
@@ -812,8 +810,7 @@ fn reachable_rust_sources(
                     current
                         .path
                         .strip_prefix(repository_root)
-                        .unwrap_or(&current.path)
-                        .to_path_buf(),
+                        .unwrap_or(&current.path),
                 )),
                 format!(
                     "cannot read test-enabled Cargo source '{}': {error}",
@@ -871,8 +868,7 @@ fn reachable_rust_sources(
                         current
                             .path
                             .strip_prefix(repository_root)
-                            .unwrap_or(&current.path)
-                            .to_path_buf(),
+                            .unwrap_or(&current.path),
                     )),
                     format!(
                         "Rust module '{}' is ambiguous because both '{}.rs' and '{}/mod.rs' exist",
@@ -914,7 +910,7 @@ fn resolve_module_file(
     let Some(relative) = normalized_repository_relative(repository_root, candidate) else {
         return Ok(None);
     };
-    resolve_ordinal_file(repository_root, &normalized_api_path(relative))
+    resolve_ordinal_file(repository_root, &normalized_api_path(&relative))
 }
 
 fn normalized_repository_relative(repository_root: &Path, path: &Path) -> Option<PathBuf> {
@@ -946,6 +942,13 @@ impl Registry {
     }
 
     /// Registers one feature claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ViolationCode::DuplicateClaim`] error when a claim for the
+    /// same frozen feature ID has already been registered. Two claims for one
+    /// row cannot both be authoritative, so the harness refuses the second
+    /// instead of letting it silently replace the first.
     pub fn register_feature(&mut self, claim: FeatureClaim) -> Result<(), ConformanceError> {
         let id = claim.feature_id.clone();
         if self.features.insert(id.clone(), claim).is_some() {
@@ -959,6 +962,12 @@ impl Registry {
     }
 
     /// Registers one inventory claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ViolationCode::DuplicateClaim`] error when a claim for the
+    /// same `(inventory ID, record ID)` pair has already been registered, so a
+    /// second claim can never overwrite the first unnoticed.
     pub fn register_inventory(&mut self, claim: InventoryClaim) -> Result<(), ConformanceError> {
         let key = (claim.inventory_id.clone(), claim.record_id.clone());
         if self.inventories.insert(key.clone(), claim).is_some() {
@@ -972,6 +981,16 @@ impl Registry {
     }
 
     /// Loads and registers a JSON claim manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ViolationCode::Io`] error when `path` cannot be read, and a
+    /// [`ViolationCode::JsonSchema`] error carrying the exact serde JSON path
+    /// when the manifest does not match [`ClaimsFile`], contains an unknown
+    /// member, has trailing content after the document, declares a
+    /// `schema_version` other than `1`, or leaves `crate_name` blank. A
+    /// [`ViolationCode::DuplicateClaim`] error is returned when one of the
+    /// contained claims collides with a claim already in the registry.
     pub fn load_claims_file(&mut self, path: impl AsRef<Path>) -> Result<(), ConformanceError> {
         let path = path.as_ref();
         let bytes = fs::read(path).map_err(|error| {
@@ -1016,6 +1035,13 @@ impl Registry {
 
 /// Finds conventional `conformance-claims.json` manifests under `apps/` and
 /// `crates/`, returning a deterministic sorted list.
+///
+/// # Errors
+///
+/// Returns a [`ViolationCode::Io`] error when `apps/` or `crates/` exists but a
+/// directory beneath it cannot be listed. Discovery is silent about missing
+/// top-level directories, but never about an unreadable one: skipping it would
+/// quietly drop every claim a whole subtree publishes.
 pub fn discover_claim_files(
     repository_root: impl AsRef<Path>,
 ) -> Result<Vec<PathBuf>, ConformanceError> {
@@ -1317,7 +1343,7 @@ pub(crate) fn validate_implementation_pointers(
                     pointer.path
                 ),
             ));
-        };
+        }
     }
     Ok(())
 }
@@ -1335,7 +1361,7 @@ fn valid_reference_path(value: &str) -> bool {
         })
 }
 
-fn normalized_api_path(path: PathBuf) -> String {
+fn normalized_api_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
@@ -2269,7 +2295,7 @@ mod tests {
                     .canonicalize()
                     .expect("canonical tracked Rust source");
                 let accepted = targets.contains_compiled_source(&canonical);
-                (normalized_api_path(PathBuf::from(path)), accepted)
+                (normalized_api_path(Path::new(&path)), accepted)
             })
             .collect::<Vec<_>>();
         if let Some(output_path) = env::var_os("CLAW_CONFORMANCE_VERDICT_OUT") {

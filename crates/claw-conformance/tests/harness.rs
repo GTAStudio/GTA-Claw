@@ -1,6 +1,7 @@
 //! End-to-end and mutation-based conformance harness tests.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -104,8 +105,11 @@ fn install_fixture_workspace(root: &Path, crate_name: &str, targets: &[(&str, &s
     .expect("write fixture lockfile");
     let test_targets = targets
         .iter()
-        .map(|(name, path)| format!("\n[[test]]\nname = \"{name}\"\npath = \"{path}\"\n"))
-        .collect::<String>();
+        .fold(String::new(), |mut buffer, (name, path)| {
+            write!(buffer, "\n[[test]]\nname = \"{name}\"\npath = \"{path}\"\n")
+                .expect("writing to String cannot fail");
+            buffer
+        });
     for (_, path) in targets {
         let target_path = crate_root.join(path);
         fs::create_dir_all(target_path.parent().expect("fixture target parent"))
@@ -258,10 +262,12 @@ fn install_transition_evidence(root: &Path) {
             let relative = path
                 .strip_prefix(&format!("{package_path}/"))
                 .expect("artifact path belongs to package");
-            manifest.push_str(&format!(
+            write!(
+                manifest,
                 "\n[[test]]\nname = \"ledger-evidence-{index}\"\npath = \"{}\"\n",
                 relative.replace('\\', "/")
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
         fs::write(manifest_path, manifest).expect("write evidence manifest");
         members.insert(package_path.clone());
@@ -292,9 +298,11 @@ fn install_transition_evidence(root: &Path) {
          version = 4\n",
     );
     for package in package_names {
-        lock.push_str(&format!(
+        write!(
+            lock,
             "\n[[package]]\nname = \"{package}\"\nversion = \"0.0.0\"\n"
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     fs::write(root.join("Cargo.lock"), lock).expect("write transitioned fixture lockfile");
 }

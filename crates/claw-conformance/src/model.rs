@@ -80,6 +80,11 @@ pub(crate) struct AcceptanceEvidence {
 /// One compatibility feature row.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "`feature_id` is the member name in the byte-sealed compat/upstream ledgers and \
+`deny_unknown_fields` is on, so renaming it would stop the frozen artifacts deserializing"
+)]
 pub struct Feature {
     feature_id: String,
     pub(crate) title: String,
@@ -197,6 +202,11 @@ pub(crate) struct InventoryHeader {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "`inventory_id` is the member name in the byte-sealed compat/upstream inventories and \
+`deny_unknown_fields` is on, so renaming it would stop the frozen artifacts deserializing"
+)]
 pub(crate) struct Inventory<C, I> {
     pub(crate) schema_version: u8,
     pub(crate) inventory_id: String,

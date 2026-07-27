@@ -1,4 +1,4 @@
-//! Data-driven conformance harness for the frozen OpenClaw compatibility data.
+//! Data-driven conformance harness for the frozen `OpenClaw` compatibility data.
 //!
 //! The harness never changes the authoritative `compat/upstream` artifacts. It
 //! loads and validates them, accepts evidence-backed implementation claims, and
