@@ -1,0 +1,41 @@
+# Golden table for command registry validation errors.
+#
+# Source: openclaw/openclaw@b43e832fcc8000ed7287c7accc54e381db607f85
+#   src/auto-reply/commands-registry.shared.ts (`assertCommandRegistry`)
+#
+# `scenario` names a malformed registry built by the test; `error` is the exact
+# message upstream throws. An alias collision must be rejected, which is what
+# makes the pinned alias table safe to trust.
+
+scenario: duplicate_key
+error: "Duplicate command key: dup"
+
+scenario: text_only_has_native_name
+error: "Text-only command has native name: texty"
+
+scenario: text_only_has_native_aliases
+error: "Text-only command has native aliases: texty"
+
+scenario: text_only_missing_text_alias
+error: "Text-only command missing text alias: texty"
+
+scenario: native_missing_native_name
+error: "Native command missing native name: nat"
+
+scenario: duplicate_native_command
+error: "Duplicate native command: shared"
+
+scenario: duplicate_native_alias
+error: "Duplicate native command: shared"
+
+scenario: native_only_has_text_aliases
+error: "Native-only command has text aliases: nat"
+
+scenario: alias_missing_leading_slash
+error: "Command alias missing leading '/': help"
+
+scenario: duplicate_alias
+error: "Duplicate command alias: /dupe"
+
+scenario: duplicate_alias_differing_case
+error: "Duplicate command alias: /DUPE"
