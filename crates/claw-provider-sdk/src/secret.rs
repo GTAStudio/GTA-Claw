@@ -70,13 +70,13 @@ impl SecretString {
 
     /// Returns the length of the secret in bytes.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.0.len()
     }
 
     /// Returns `true` when the secret is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }
@@ -157,7 +157,7 @@ impl ApiKey {
 
     /// Returns `true` when the credential carries no bytes.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }
@@ -579,12 +579,16 @@ impl SecretStore for MemorySecretStore {
         key: &CredentialKey,
         secret: &SecretString,
     ) -> Result<bool, SecretStoreError> {
-        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        if entries.contains_key(key) {
-            return Ok(false);
-        }
-        entries.insert(key.clone(), secret.clone());
-        Ok(true)
+        let inserted = {
+            let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            if entries.contains_key(key) {
+                false
+            } else {
+                entries.insert(key.clone(), secret.clone());
+                true
+            }
+        };
+        Ok(inserted)
     }
 
     fn accounts(&self, service: &str) -> Result<Vec<String>, SecretStoreError> {
@@ -698,10 +702,7 @@ impl SecretStore for LayeredSecretStore {
                 Err(error) => last_error = Some(error),
             }
         }
-        match last_error {
-            Some(error) => Err(error),
-            None => Ok(None),
-        }
+        last_error.map_or(Ok(None), Err)
     }
 
     fn set(&self, key: &CredentialKey, secret: &SecretString) -> Result<(), SecretStoreError> {

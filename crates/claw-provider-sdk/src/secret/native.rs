@@ -89,7 +89,7 @@ impl NativeKeyringStore {
             .map_err(|error| self.map_error(&error))
     }
 
-    fn map_error(&self, error: &keyring_core::Error) -> SecretStoreError {
+    const fn map_error(&self, error: &keyring_core::Error) -> SecretStoreError {
         use keyring_core::Error as KeyringError;
 
         match error {
@@ -185,7 +185,7 @@ impl SecretStore for NativeKeyringStore {
         };
         Ok(found
             .iter()
-            .filter_map(|entry| entry.get_specifiers())
+            .filter_map(keyring_core::Entry::get_specifiers)
             .filter(|(found_service, _)| found_service == &encoded_service)
             .filter_map(|(_, account)| decode_component(&account))
             .collect())

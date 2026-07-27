@@ -31,6 +31,16 @@ use crate::error::{ErrorKind, Operation, ProviderError, parse_retry_after};
 use crate::origin::{BoundApiKey, BoundSecret, OriginError};
 use crate::secret::{REDACTED, SecretString, is_sensitive_header};
 
+/// The largest response body [`HttpTransport::send`] will hold in memory.
+///
+/// Provider error documents and completion responses are kilobytes; 64 MiB is
+/// far above any legitimate payload and far below what would exhaust a host.
+/// A body that crosses it fails with [`ErrorKind::Protocol`] rather than
+/// growing the buffer, so a hostile or broken upstream cannot turn a single
+/// request into unbounded memory. Streaming responses are unaffected: they are
+/// delivered chunk by chunk and never accumulate here.
+pub const MAX_BUFFERED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// HTTP methods used by provider APIs.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Method {
@@ -98,7 +108,7 @@ impl Body {
 
     /// Returns the body bytes.
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
+    pub const fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Empty => &[],
             Self::Json(text) | Self::Form(text) => text.as_bytes(),
@@ -152,7 +162,7 @@ impl Debug for HttpRequest {
 impl HttpRequest {
     /// Starts a request.
     #[must_use]
-    pub fn new(method: Method, url: Url) -> Self {
+    pub const fn new(method: Method, url: Url) -> Self {
         Self {
             method,
             url,
@@ -358,7 +368,7 @@ impl Debug for HttpResponse {
 impl HttpResponse {
     /// Builds a response.
     #[must_use]
-    pub fn new(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> Self {
+    pub const fn new(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> Self {
         Self {
             status,
             headers,
@@ -407,6 +417,8 @@ pub struct HttpStream {
     chunks: Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> + Send>>,
 }
 
+/// The `chunks` stream is omitted: it is an opaque boxed future chain with no
+/// useful representation, and polling it to describe it would consume the body.
 impl Debug for HttpStream {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         let names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
@@ -414,7 +426,7 @@ impl Debug for HttpStream {
             .debug_struct("HttpStream")
             .field("status", &self.status)
             .field("header_names", &names)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -523,9 +535,9 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             user_agent: concat!("gta-claw/", env!("CARGO_PKG_VERSION")).to_owned(),
-            request_timeout: Duration::from_secs(120),
+            request_timeout: Duration::from_mins(2),
             connect_timeout: Duration::from_secs(15),
-            pool_idle_timeout: Duration::from_secs(60),
+            pool_idle_timeout: Duration::from_mins(1),
             tls_policy: TlsPolicy::RequireHttps,
             proxy_policy: ProxyPolicy::FromEnvironment,
         }
@@ -542,6 +554,8 @@ pub struct HttpTransport {
     request_timeout: Duration,
 }
 
+/// The hyper `client` is omitted: it holds the connection pool and its own
+/// `Debug` would leak pool internals into provider logs.
 impl Debug for HttpTransport {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter
@@ -550,7 +564,7 @@ impl Debug for HttpTransport {
             .field("proxy_policy", &self.proxy_policy)
             .field("user_agent", &self.user_agent)
             .field("request_timeout", &self.request_timeout)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -614,6 +628,10 @@ impl HttpTransport {
     /// Cancelling `cancel` drops the in-flight request, which closes the
     /// connection.
     ///
+    /// The buffered body is capped at [`MAX_BUFFERED_RESPONSE_BYTES`]; the
+    /// deadline bounds how long a response may take, but only this bounds how
+    /// much memory a hostile or broken upstream can make the client hold.
+    ///
     /// # Errors
     ///
     /// Returns a [`ProviderError`] classified by [`ErrorKind`].
@@ -638,11 +656,10 @@ impl HttpTransport {
             deadline,
             cancel,
             "the request was cancelled while the body was being read",
-            response.into_body().collect(),
+            collect_bounded(provider, operation, response.into_body()),
         )
-        .await?
-        .map_err(|error| classify_hyper(provider, operation, &error))?;
-        Ok(HttpResponse::new(status, headers, body.to_bytes().to_vec()))
+        .await??;
+        Ok(HttpResponse::new(status, headers, body))
     }
 
     /// Sends a request and returns the response body as a chunk stream.
@@ -666,12 +683,7 @@ impl HttpTransport {
             .await?;
         let status = response.status().as_u16();
         let headers = collect_headers(response.headers());
-        let chunks = CancellableChunks {
-            inner: response.into_body(),
-            cancel: cancel.clone(),
-            provider: provider.to_owned(),
-            operation,
-        };
+        let chunks = CancellableChunks::new(response.into_body(), cancel, provider, operation);
         Ok(HttpStream {
             status,
             headers,
@@ -764,6 +776,45 @@ impl HttpTransport {
     }
 }
 
+/// Reads a body into memory, refusing to hold more than
+/// [`MAX_BUFFERED_RESPONSE_BYTES`].
+///
+/// `Body::collect` grows without a ceiling, so a hostile or broken upstream
+/// could stream until the process ran out of memory; the request deadline
+/// bounds time, not bytes.
+async fn collect_bounded(
+    provider: &str,
+    operation: Operation,
+    mut body: Incoming,
+) -> Result<Vec<u8>, ProviderError> {
+    // `size_hint` is upstream-supplied, so it only sizes the first allocation.
+    let hinted = usize::try_from(body.size_hint().lower()).unwrap_or(0);
+    let mut buffer = Vec::with_capacity(hinted.min(MAX_BUFFERED_RESPONSE_BYTES));
+    while let Some(frame) = body
+        .frame()
+        .await
+        .transpose()
+        .map_err(|error| classify_hyper(provider, operation, &error))?
+    {
+        // Trailers carry no body bytes.
+        let Ok(chunk) = frame.into_data() else {
+            continue;
+        };
+        if buffer.len() + chunk.len() > MAX_BUFFERED_RESPONSE_BYTES {
+            return Err(ProviderError::new(
+                ErrorKind::Protocol,
+                provider,
+                operation,
+                format!(
+                    "the response body exceeded the {MAX_BUFFERED_RESPONSE_BYTES} byte buffer limit"
+                ),
+            ));
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer)
+}
+
 /// Races a future against the cancel token and a deadline.
 ///
 /// Cancellation wins over the deadline, and both win over the future, so a
@@ -798,11 +849,36 @@ where
     }
 }
 
+/// The body half of [`HttpStream`], wired so that cancellation is observed even
+/// while a poll is parked.
+///
+/// `poll_frame` on a silent upstream parks the task with only the connection's
+/// waker registered. Polling `cancelled` on every wakeup registers this task
+/// with the token as well, so [`CancelToken::cancel`] from another task wakes
+/// this one instead of leaving it parked until the TCP layer notices.
+///
+/// The stream is fused: it yields the cancellation error at most once and then
+/// ends, so a caller that keeps polling after an error terminates instead of
+/// spinning on an endless tail of identical errors.
 struct CancellableChunks {
     inner: Incoming,
-    cancel: CancelToken,
+    cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
     provider: String,
     operation: Operation,
+    done: bool,
+}
+
+impl CancellableChunks {
+    fn new(inner: Incoming, cancel: &CancelToken, provider: &str, operation: Operation) -> Self {
+        let token = cancel.clone();
+        Self {
+            inner,
+            cancelled: Box::pin(async move { token.cancelled().await }),
+            provider: provider.to_owned(),
+            operation,
+            done: false,
+        }
+    }
 }
 
 impl Stream for CancellableChunks {
@@ -813,7 +889,11 @@ impl Stream for CancellableChunks {
         context: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if this.cancel.is_cancelled() {
+        if this.done {
+            return Poll::Ready(None);
+        }
+        if this.cancelled.as_mut().poll(context).is_ready() {
+            this.done = true;
             return Poll::Ready(Some(Err(ProviderError::new(
                 ErrorKind::Cancelled,
                 &this.provider,
@@ -824,12 +904,18 @@ impl Stream for CancellableChunks {
         loop {
             return match Pin::new(&mut this.inner).poll_frame(context) {
                 Poll::Pending => Poll::Pending,
-                Poll::Ready(None) => Poll::Ready(None),
-                Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(classify_hyper(
-                    &this.provider,
-                    this.operation,
-                    &error,
-                )))),
+                Poll::Ready(None) => {
+                    this.done = true;
+                    Poll::Ready(None)
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    this.done = true;
+                    Poll::Ready(Some(Err(classify_hyper(
+                        &this.provider,
+                        this.operation,
+                        &error,
+                    ))))
+                }
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                     Ok(chunk) => Poll::Ready(Some(Ok(chunk))),
                     // Trailers carry no body bytes, so keep polling rather than
@@ -949,7 +1035,10 @@ pub fn error_from_response(
     now: std::time::SystemTime,
 ) -> ProviderError {
     let kind = ProviderError::kind_for_status(response.status());
-    let detail = extract_message(&response.text());
+    // `text` allocates a lossy copy of the whole body, so decode once and let
+    // both extractors read the same buffer.
+    let text = response.text();
+    let detail = extract_message(&text);
     let mut error =
         ProviderError::new(kind, provider, operation, detail).with_status(response.status());
     if let Some(retry_after) = response.header("retry-after")
@@ -957,7 +1046,7 @@ pub fn error_from_response(
     {
         error = error.with_retry_after(delay);
     }
-    if let Some(code) = extract_code(&response.text()) {
+    if let Some(code) = extract_code(&text) {
         error = error.with_upstream_code(code);
     }
     error
@@ -1289,9 +1378,9 @@ mod tests {
     fn transport_config_defaults_are_conservative() {
         let config = TransportConfig::default();
         assert_eq!(config.tls_policy, TlsPolicy::RequireHttps);
-        assert_eq!(config.request_timeout, Duration::from_secs(120));
+        assert_eq!(config.request_timeout, Duration::from_mins(2));
         assert_eq!(config.connect_timeout, Duration::from_secs(15));
-        assert_eq!(config.pool_idle_timeout, Duration::from_secs(60));
+        assert_eq!(config.pool_idle_timeout, Duration::from_mins(1));
         assert!(config.user_agent.starts_with("gta-claw/"));
     }
 }

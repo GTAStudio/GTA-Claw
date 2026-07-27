@@ -14,7 +14,8 @@ use std::time::Duration;
 use claw_provider_sdk::cancel::CancelToken;
 use claw_provider_sdk::error::{ErrorKind, Operation};
 use claw_provider_sdk::http::{
-    Body, HttpRequest, HttpTransport, Method, ProxyPolicy, TlsPolicy, TransportConfig,
+    Body, HttpRequest, HttpTransport, MAX_BUFFERED_RESPONSE_BYTES, Method, ProxyPolicy, TlsPolicy,
+    TransportConfig,
 };
 use claw_provider_sdk::secret::SecretString;
 use futures_util::StreamExt as _;
@@ -219,6 +220,87 @@ async fn cancelling_an_in_flight_stream_closes_the_socket() {
     assert!(
         server.wait_for_peer_close(Duration::from_secs(5)).await,
         "the server never observed the client close the connection"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_wakes_a_read_already_parked_on_a_silent_upstream() {
+    // The interesting case is not "cancel, then poll" but "park, then cancel":
+    // a task blocked inside the body read has only the connection's waker
+    // registered, so unless the chunk stream also registers itself with the
+    // token, `cancel()` from another task leaves this one parked indefinitely.
+    let server = TestServer::start(vec![Reply::sse_hold(&["data: {\"n\":1}\n\n"])]).await;
+    let transport = transport();
+    let cancel = CancelToken::new();
+
+    let stream = transport
+        .send_streaming(
+            "test",
+            Operation::StreamCompletion,
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions")),
+            &cancel,
+        )
+        .await
+        .expect("stream must open");
+    let mut chunks = stream.into_chunks();
+    let first = chunks.next().await.expect("a first chunk arrives");
+    assert!(!first.expect("the first chunk decodes").is_empty());
+
+    // The server holds the socket open without writing, so this parks.
+    let parked = tokio::spawn(async move {
+        let item = chunks.next().await;
+        // The stream is fused: the cancellation error is terminal, so a caller
+        // that keeps polling terminates instead of spinning on repeats of it.
+        let after = chunks.next().await;
+        (item, after)
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancel.cancel();
+
+    let (item, after) = tokio::time::timeout(Duration::from_secs(5), parked)
+        .await
+        .expect("the parked read is woken by cancellation")
+        .expect("the reader task does not panic");
+    let error = item
+        .expect("a terminal item is produced")
+        .expect_err("cancellation surfaces as an error");
+    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert!(after.is_none(), "the stream ends after the terminal error");
+}
+
+#[tokio::test]
+async fn a_body_larger_than_the_buffer_limit_is_refused_instead_of_being_held() {
+    // The request deadline bounds how long an upstream may take, not how many
+    // bytes it may send, so without a byte ceiling one response could exhaust
+    // the host. Frames are 4 MiB so the server writes just past the limit
+    // rather than materializing a second copy of it.
+    const FRAME_BYTES: usize = 4 * 1024 * 1024;
+    let frame = vec![b'a'; FRAME_BYTES];
+    let frames = vec![frame; MAX_BUFFERED_RESPONSE_BYTES / FRAME_BYTES + 1];
+    let server = TestServer::start(vec![Reply::Chunked {
+        status: 200,
+        content_type: "application/json".to_owned(),
+        frames,
+        hold_open: false,
+    }])
+    .await;
+
+    let error = transport()
+        .send(
+            "test",
+            Operation::Complete,
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions")),
+            &CancelToken::new(),
+        )
+        .await
+        .expect_err("an oversized body is refused");
+
+    assert_eq!(error.kind(), ErrorKind::Protocol);
+    assert!(
+        error.detail().contains("buffer limit"),
+        "the detail names the limit: {}",
+        error.detail()
     );
 }
 

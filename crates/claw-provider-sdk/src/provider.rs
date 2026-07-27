@@ -34,7 +34,7 @@ impl RequestContext {
 
     /// Creates a context bound to an existing cancellation token.
     #[must_use]
-    pub fn with_cancel(cancel: CancelToken) -> Self {
+    pub const fn with_cancel(cancel: CancelToken) -> Self {
         Self {
             cancel,
             idempotency_key: None,

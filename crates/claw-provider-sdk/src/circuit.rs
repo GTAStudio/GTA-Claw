@@ -1,6 +1,6 @@
 //! Circuit breaker that stops hammering an unhealthy provider.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::error::{ErrorKind, Operation, ProviderError};
@@ -81,7 +81,7 @@ impl CircuitBreaker {
     /// Returns the state the breaker would report at `now_millis`.
     #[must_use]
     pub fn state(&self, now_millis: u64) -> CircuitState {
-        let mut inner = self.inner.lock().expect("circuit breaker mutex");
+        let mut inner = self.lock();
         Self::refresh(&mut inner, &self.config, now_millis);
         inner.state
     }
@@ -97,27 +97,34 @@ impl CircuitBreaker {
         operation: Operation,
         now_millis: u64,
     ) -> Result<CircuitPermit<'_>, ProviderError> {
-        let mut inner = self.inner.lock().expect("circuit breaker mutex");
+        let mut inner = self.lock();
         Self::refresh(&mut inner, &self.config, now_millis);
-        match inner.state {
-            CircuitState::Closed => Ok(CircuitPermit { breaker: self }),
+        let admitted = match inner.state {
+            CircuitState::Closed => Ok(()),
             CircuitState::HalfOpen => {
                 if inner.probes_in_flight >= self.config.half_open_probes {
-                    Err(self.rejection(operation, "half-open probe budget exhausted"))
+                    Err("half-open probe budget exhausted")
                 } else {
                     inner.probes_in_flight += 1;
-                    Ok(CircuitPermit { breaker: self })
+                    Ok(())
                 }
             }
-            CircuitState::Open => {
-                Err(self.rejection(operation, "circuit is open after repeated failures"))
-            }
+            CircuitState::Open => Err("circuit is open after repeated failures"),
+        };
+        // The error is built outside the critical section: allocating and
+        // sanitizing a `ProviderError` under the breaker lock would serialize
+        // every caller of an unhealthy provider behind that allocation, which is
+        // exactly when the most callers arrive.
+        drop(inner);
+        match admitted {
+            Ok(()) => Ok(CircuitPermit { breaker: self }),
+            Err(detail) => Err(self.rejection(operation, detail)),
         }
     }
 
     /// Records a successful call.
     pub fn record_success(&self, now_millis: u64) {
-        let mut inner = self.inner.lock().expect("circuit breaker mutex");
+        let mut inner = self.lock();
         inner.consecutive_failures = 0;
         inner.probes_in_flight = inner.probes_in_flight.saturating_sub(1);
         match inner.state {
@@ -143,7 +150,7 @@ impl CircuitBreaker {
     /// Only failures for which [`ErrorKind::trips_circuit`] holds affect the
     /// breaker; client-side mistakes are ignored.
     pub fn record_failure(&self, kind: ErrorKind, now_millis: u64) {
-        let mut inner = self.inner.lock().expect("circuit breaker mutex");
+        let mut inner = self.lock();
         inner.probes_in_flight = inner.probes_in_flight.saturating_sub(1);
         if !kind.trips_circuit() {
             return;
@@ -165,6 +172,16 @@ impl CircuitBreaker {
             }
             CircuitState::Open => inner.opened_at_millis = now_millis,
         }
+    }
+
+    /// Locks the breaker, recovering from a poisoned mutex.
+    ///
+    /// Nothing inside a critical section can panic, so poisoning can only come
+    /// from a panic elsewhere in the process. Refusing to serve every later
+    /// request because of that would turn one unrelated panic into a permanent
+    /// provider outage.
+    fn lock(&self) -> std::sync::MutexGuard<'_, BreakerState> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn rejection(&self, operation: Operation, detail: &str) -> ProviderError {
@@ -215,7 +232,7 @@ mod tests {
             "openai",
             CircuitBreakerConfig {
                 failure_threshold: 3,
-                open_duration: Duration::from_millis(1_000),
+                open_duration: Duration::from_secs(1),
                 half_open_probes: 1,
                 success_threshold: 2,
             },

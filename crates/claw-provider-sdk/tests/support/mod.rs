@@ -9,10 +9,18 @@
 //! line, headers, an optional `Content-Length` body, and either a
 //! `Content-Length` response or a `Transfer-Encoding: chunked` response.
 
-#![allow(dead_code, unreachable_pub)]
+#![expect(
+    dead_code,
+    reason = "this module is compiled into every integration-test binary that declares `mod support`, and each binary only exercises the part of the server it needs"
+)]
+#![expect(
+    unreachable_pub,
+    reason = "the crate lints `unreachable_pub` at warn, but `pub` is the right visibility here: these items are the public surface a sibling test binary consumes through `mod support`"
+)]
 
 pub mod proxy;
 
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -323,9 +331,9 @@ async fn serve(mut stream: TcpStream, reply: Reply, state: Arc<ServerState>) {
         } => {
             let mut head = format!("HTTP/1.1 {status} {}\r\n", reason(status));
             for (name, value) in headers {
-                head.push_str(&format!("{name}: {value}\r\n"));
+                let _ = write!(head, "{name}: {value}\r\n");
             }
-            head.push_str(&format!("content-length: {}\r\n", body.len()));
+            let _ = write!(head, "content-length: {}\r\n", body.len());
             head.push_str("connection: close\r\n\r\n");
             if stream.write_all(head.as_bytes()).await.is_err() {
                 return;

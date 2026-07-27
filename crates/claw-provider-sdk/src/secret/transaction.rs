@@ -109,9 +109,13 @@ impl TransactionId {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
         let high = RandomState::new().build_hasher().finish();
+        // The nanosecond count only feeds the entropy mix, so the low 64 bits
+        // are as good as the full `u128` and the mask keeps the conversion total.
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_nanos() & u128::from(u64::MAX)).unwrap_or(u64::MAX)
+            });
         let low = RandomState::new().build_hasher().finish()
             ^ nanos.rotate_left(17)
             ^ COUNTER.fetch_add(1, Ordering::Relaxed);

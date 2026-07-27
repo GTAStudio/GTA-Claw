@@ -14,6 +14,9 @@ pub const DEFAULT_MAX_LINE_BYTES: usize = 1_048_576;
 /// Default limit on the accumulated `data:` payload of one event, in bytes.
 pub const DEFAULT_MAX_EVENT_BYTES: usize = 8_388_608;
 
+/// The UTF-8 byte-order mark, stripped once at the very start of a stream.
+const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
 /// Failure while decoding a stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StreamDecodeError {
@@ -66,6 +69,15 @@ pub struct SseEvent {
 /// with `\r\n`, `\n` or a lone `\r`; a leading UTF-8 byte-order mark is
 /// discarded; lines starting with `:` are comments; a field without a colon has
 /// an empty value; and a single space directly after the colon is removed.
+///
+/// # Bounded memory
+///
+/// A hostile or broken upstream cannot make the decoder allocate without limit.
+/// The unterminated-line buffer is capped at `max_line_bytes` and the
+/// accumulated `data:` payload of one event is capped at `max_event_bytes`;
+/// crossing either cap fails the stream with [`StreamDecodeError`] instead of
+/// growing the buffer. A single event that never terminates therefore costs at
+/// most `max_line_bytes + max_event_bytes`.
 #[derive(Debug)]
 pub struct SseDecoder {
     line: Vec<u8>,
@@ -116,8 +128,13 @@ impl SseDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`StreamDecodeError`] when a configured limit is exceeded or a
-    /// line is not valid UTF-8.
+    /// Returns [`StreamDecodeError::LineTooLong`] when the current line reaches
+    /// `max_line_bytes` without a terminator,
+    /// [`StreamDecodeError::EventTooLarge`] when the accumulated `data:`
+    /// payload of the current event would exceed `max_event_bytes`, and
+    /// [`StreamDecodeError::InvalidUtf8`] when a completed line is not valid
+    /// UTF-8. The decoder must not be used after an error: the failing line has
+    /// already been consumed.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, StreamDecodeError> {
         let mut events = Vec::new();
         let mut index = 0;
@@ -158,12 +175,14 @@ impl SseDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`StreamDecodeError`] when the buffered event violates a limit.
+    /// Never fails today; the `Result` is part of the decoder contract so that
+    /// `finish` can mirror [`SseDecoder::push`] at call sites, and so a future
+    /// limit check can be reported without breaking callers.
     pub fn finish(&mut self) -> Result<Vec<SseEvent>, StreamDecodeError> {
         let mut events = Vec::new();
         self.line.clear();
         if self.saw_data_field {
-            self.dispatch(&mut events)?;
+            self.dispatch(&mut events);
         }
         Ok(events)
     }
@@ -172,7 +191,6 @@ impl SseDecoder {
         if self.checked_bom {
             return chunk;
         }
-        const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
         let mut offset = 0;
         while offset < chunk.len() && self.bom_progress < BOM.len() {
             if chunk[offset] == BOM[self.bom_progress] {
@@ -198,7 +216,7 @@ impl SseDecoder {
         let line = String::from_utf8(line).map_err(|_| StreamDecodeError::InvalidUtf8)?;
         if line.is_empty() {
             if self.saw_data_field {
-                self.dispatch(events)?;
+                self.dispatch(events);
             } else {
                 self.event.clear();
             }
@@ -246,7 +264,7 @@ impl SseDecoder {
         Ok(())
     }
 
-    fn dispatch(&mut self, events: &mut Vec<SseEvent>) -> Result<(), StreamDecodeError> {
+    fn dispatch(&mut self, events: &mut Vec<SseEvent>) {
         let event = if self.event.is_empty() {
             "message".to_owned()
         } else {
@@ -260,7 +278,6 @@ impl SseDecoder {
         });
         self.event.clear();
         self.saw_data_field = false;
-        Ok(())
     }
 }
 
@@ -268,6 +285,9 @@ impl SseDecoder {
 ///
 /// Several providers stream chunked JSON documents separated by `\n` rather than
 /// using server-sent events. Empty lines are skipped.
+///
+/// The pending-line buffer is capped at `max_line_bytes`, so a payload that
+/// never sends a newline fails instead of growing without bound.
 #[derive(Debug)]
 pub struct LineDecoder {
     buffer: Vec<u8>,
@@ -294,8 +314,10 @@ impl LineDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`StreamDecodeError`] when a line exceeds the limit or is not
-    /// valid UTF-8.
+    /// Returns [`StreamDecodeError::LineTooLong`] when the pending line reaches
+    /// `max_line_bytes` without a newline, and
+    /// [`StreamDecodeError::InvalidUtf8`] when a completed line is not valid
+    /// UTF-8.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, StreamDecodeError> {
         let mut lines = Vec::new();
         for byte in chunk {

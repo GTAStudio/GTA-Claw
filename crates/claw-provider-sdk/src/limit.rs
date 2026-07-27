@@ -40,8 +40,8 @@ pub struct ConcurrencyLimiter {
 impl ConcurrencyLimiter {
     /// Builds a limiter with a shared default limit and per-provider overrides.
     ///
-    /// Every limit is clamped into `1..=`[`MAX_CONCURRENCY`]. A duplicated
-    /// provider entry keeps the last value.
+    /// Every limit is clamped into the range `1..=MAX_CONCURRENCY`, see
+    /// [`MAX_CONCURRENCY`]. A duplicated provider entry keeps the last value.
     #[must_use]
     pub fn new(default_limit: usize, overrides: &[(&str, usize)]) -> Self {
         let mut table = BTreeMap::new();
@@ -80,6 +80,10 @@ impl ConcurrencyLimiter {
 
     /// Waits for a slot for `provider`.
     ///
+    /// The returned permit releases its slot when it is dropped, including on
+    /// the error and cancellation paths of whatever the caller does with it, so
+    /// a failed request never leaks concurrency.
+    ///
     /// # Errors
     ///
     /// Returns an [`ErrorKind::Transport`] error when the semaphore has been
@@ -90,15 +94,15 @@ impl ConcurrencyLimiter {
         operation: Operation,
     ) -> Result<ConcurrencyPermit, ProviderError> {
         let semaphore = Arc::clone(&self.slot(provider).semaphore);
-        match semaphore.acquire_owned().await {
-            Ok(permit) => Ok(ConcurrencyPermit { _permit: permit }),
-            Err(_) => Err(ProviderError::new(
+        let permit = semaphore.acquire_owned().await.map_err(|_closed| {
+            ProviderError::new(
                 ErrorKind::Transport,
                 provider,
                 operation,
                 "provider concurrency limiter is shut down",
-            )),
-        }
+            )
+        })?;
+        Ok(ConcurrencyPermit { _permit: permit })
     }
 }
 
