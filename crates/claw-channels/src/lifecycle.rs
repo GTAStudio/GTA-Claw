@@ -52,6 +52,15 @@ impl<C, S> SupervisedChannel<C, S> {
 
 impl<C, S: ChannelSession> SupervisedChannel<C, S> {
     /// Opens the session, retrying transient failures with bounded backoff.
+    ///
+    /// # Errors
+    ///
+    /// - [`ChannelError::Lifecycle`] when connecting is illegal in the current
+    ///   state, meaning the channel is already opening or open, or was shut
+    ///   down for good.
+    /// - The error the wrapped [`ChannelSession::open`] returned once it is not
+    ///   retryable or the retry policy's attempts are spent — a missing
+    ///   credential, a rejected token, or a transport that never came up.
     pub fn connect(
         &mut self,
         sleeper: &mut impl BackoffSleeper,
@@ -62,6 +71,11 @@ impl<C, S: ChannelSession> SupervisedChannel<C, S> {
     }
 
     /// Records that the session dropped on its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Lifecycle`] when no session could have dropped,
+    /// meaning the channel is disconnected, already reconnecting, or closed.
     pub fn connection_lost(
         &mut self,
         observer: &mut impl LifecycleObserver,
@@ -70,6 +84,13 @@ impl<C, S: ChannelSession> SupervisedChannel<C, S> {
     }
 
     /// Closes the session while leaving reconnection available.
+    ///
+    /// # Errors
+    ///
+    /// - [`ChannelError::Lifecycle`] when there is nothing to disconnect, so the
+    ///   transport is left untouched.
+    /// - The error the wrapped [`ChannelSession::close`] returned. The channel
+    ///   is already disconnected at that point.
     pub fn disconnect(
         &mut self,
         observer: &mut impl LifecycleObserver,
@@ -78,11 +99,17 @@ impl<C, S: ChannelSession> SupervisedChannel<C, S> {
     }
 
     /// Closes the session permanently.
+    ///
+    /// # Errors
+    ///
+    /// - [`ChannelError::Lifecycle`] when the channel was already shut down.
+    /// - The error the wrapped [`ChannelSession::close`] returned. The channel
+    ///   is closed either way and will never reconnect.
     pub fn shutdown(&mut self, observer: &mut impl LifecycleObserver) -> Result<(), ChannelError> {
         self.supervisor.shutdown(&mut self.session, observer)
     }
 
-    fn require_open_session(&self) -> Result<(), ChannelError> {
+    const fn require_open_session(&self) -> Result<(), ChannelError> {
         if self.supervisor.state().can_exchange() {
             Ok(())
         } else {

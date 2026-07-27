@@ -46,6 +46,17 @@ impl ConnectionState {
     /// The rejection is the point: an adapter that reports `Established` twice,
     /// or reconnects after shutdown, has a defect that must surface as an error
     /// rather than as a silently repaired state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IllegalTransition`] carrying this state and the refused event
+    /// whenever the pair is not in the table: any event other than
+    /// [`LifecycleEvent::ShutdownRequested`] once the channel is
+    /// [`Self::Closed`], a second [`LifecycleEvent::Established`] while already
+    /// [`Self::Connected`], a [`LifecycleEvent::ConnectionLost`] or
+    /// [`LifecycleEvent::DisconnectRequested`] while nothing is open, and a
+    /// [`LifecycleEvent::ConnectRequested`] while a session is already opening
+    /// or open.
     pub const fn apply(self, event: LifecycleEvent) -> Result<Self, IllegalTransition> {
         let next = match (self, event) {
             (Self::Disconnected | Self::Reconnecting, LifecycleEvent::ConnectRequested) => {
@@ -113,9 +124,29 @@ impl Error for IllegalTransition {}
 /// times and then succeed.
 pub trait ChannelSession {
     /// Opens one session, blocking until it is usable or has failed.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return the failure that stopped the session from
+    /// opening: [`ChannelError::Transport`] when the socket was refused, timed
+    /// out, could not be resolved, or failed TLS; [`ChannelError::Credential`]
+    /// when the credential this channel needs is missing from the secret store;
+    /// [`ChannelError::Authentication`] when the provider rejected it; and
+    /// [`ChannelError::Configuration`] when the adapter was built without a
+    /// usable endpoint or account. Only errors for which
+    /// [`ChannelError::is_retryable`] holds cause
+    /// [`ConnectionSupervisor::connect`] to attempt another open.
     fn open(&mut self) -> Result<(), ChannelError>;
 
     /// Closes the session. Implementations must tolerate repeated calls.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return [`ChannelError::Transport`] when the close could
+    /// not be completed cleanly, for example a socket shutdown that failed.
+    /// Closing an already-closed session is not one of those cases and must
+    /// return `Ok`, because the supervisor calls this once per requested
+    /// disconnect and once again on shutdown.
     fn close(&mut self) -> Result<(), ChannelError>;
 }
 
@@ -164,6 +195,17 @@ impl ConnectionSupervisor {
     /// consulted. Opening a session delivers nothing, so a repeated attempt
     /// cannot duplicate a message; only a retryable failure and a remaining
     /// attempt are required.
+    ///
+    /// # Errors
+    ///
+    /// - [`ChannelError::Lifecycle`] when connecting is illegal in the current
+    ///   state: the channel is already `Connecting` or `Connected`, or it was
+    ///   shut down and is `Closed` for good. The session is never touched in
+    ///   that case.
+    /// - The error [`ChannelSession::open`] returned, once it is not retryable
+    ///   or the attempt budget in the retry policy is spent. This is the error
+    ///   an operator sees when a channel will not start: a missing credential,
+    ///   a rejected token, or a transport that never came up.
     pub fn connect(
         &mut self,
         session: &mut impl ChannelSession,
@@ -196,6 +238,13 @@ impl ConnectionSupervisor {
     }
 
     /// Records that an open session dropped without a deliberate request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Lifecycle`] when no session could have dropped,
+    /// meaning the channel is `Disconnected`, already `Reconnecting`, or
+    /// `Closed`. A caller seeing this reported a loss twice or reported one for
+    /// a channel it never opened.
     pub fn connection_lost(
         &mut self,
         observer: &mut impl LifecycleObserver,
@@ -204,6 +253,16 @@ impl ConnectionSupervisor {
     }
 
     /// Closes the session while leaving reconnection available.
+    ///
+    /// # Errors
+    ///
+    /// - [`ChannelError::Lifecycle`] when there is nothing to disconnect: the
+    ///   channel is already `Disconnected` or permanently `Closed`. The
+    ///   transport is not touched, so a refused disconnect cannot close a
+    ///   session another caller still owns.
+    /// - The error [`ChannelSession::close`] returned. The state has already
+    ///   moved to `Disconnected` at that point, so the supervisor never claims
+    ///   a session that failed to close is still usable.
     pub fn disconnect(
         &mut self,
         session: &mut impl ChannelSession,
@@ -217,6 +276,13 @@ impl ConnectionSupervisor {
     ///
     /// The state moves before the transport call so a failing close cannot
     /// leave a supervisor that believes it is still connected.
+    ///
+    /// # Errors
+    ///
+    /// - [`ChannelError::Lifecycle`] when the channel is already `Closed`, so a
+    ///   second shutdown cannot re-close a transport that has been handed back.
+    /// - The error [`ChannelSession::close`] returned. The channel is `Closed`
+    ///   either way and will never reconnect.
     pub fn shutdown(
         &mut self,
         session: &mut impl ChannelSession,

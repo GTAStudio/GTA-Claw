@@ -44,6 +44,19 @@ pub struct Attachment {
 
 impl Attachment {
     /// Validates common attachment invariants before transport-specific work.
+    ///
+    /// # Errors
+    ///
+    /// - [`InvalidMessageReason::InvalidMediaType`] when the media type is
+    ///   empty, padded with whitespace, missing the `/` separator, or contains
+    ///   a control character.
+    /// - [`InvalidMessageReason::AttachmentTooLarge`] when `byte_len` exceeds
+    ///   [`MAX_ATTACHMENT_BYTES`].
+    /// - [`InvalidMessageReason::AttachmentLengthMismatch`] when inline bytes
+    ///   are present and their length is not exactly `byte_len`, so a truncated
+    ///   upload cannot be presented as a complete one.
+    /// - [`InvalidMessageReason::InvalidAttachmentUrl`] when a remote source is
+    ///   not an `http://` or `https://` URL.
     pub fn validate(&self) -> Result<(), InvalidMessageReason> {
         if self.media_type.is_empty()
             || self.media_type.trim() != self.media_type
@@ -104,6 +117,19 @@ pub struct InboundMessage {
 
 impl InboundMessage {
     /// Validates common identifiers and content invariants.
+    ///
+    /// # Errors
+    ///
+    /// - [`InvalidMessageReason::InvalidIdentifier`] when the message id,
+    ///   channel id, account id, conversation id, or sender id is empty, longer
+    ///   than 256 bytes, padded with whitespace, or contains a control
+    ///   character.
+    /// - [`InvalidMessageReason::EmptyContent`] when the message carries
+    ///   neither text nor attachments and so has nothing to deliver.
+    /// - [`InvalidMessageReason::InvalidText`] when the text contains a null
+    ///   character.
+    /// - Any reason from [`Attachment::validate`] for the first attachment that
+    ///   fails.
     pub fn validate(&self) -> Result<(), InvalidMessageReason> {
         validate_message_fields(
             [
@@ -141,6 +167,18 @@ pub struct OutboundMessage {
 
 impl OutboundMessage {
     /// Validates common identifiers and content invariants.
+    ///
+    /// # Errors
+    ///
+    /// - [`InvalidMessageReason::InvalidIdentifier`] when the correlation key,
+    ///   account id, conversation id, or `reply_to` id is empty, longer than
+    ///   256 bytes, padded with whitespace, or contains a control character.
+    /// - [`InvalidMessageReason::EmptyContent`] when the message carries
+    ///   neither text nor attachments and so has nothing to deliver.
+    /// - [`InvalidMessageReason::InvalidText`] when the text contains a null
+    ///   character.
+    /// - Any reason from [`Attachment::validate`] for the first attachment that
+    ///   fails.
     pub fn validate(&self) -> Result<(), InvalidMessageReason> {
         validate_message_fields(
             [
@@ -232,6 +270,15 @@ pub trait Channel {
     fn id(&self) -> &str;
 
     /// Polls one normalized inbound message.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return [`ChannelError::Unsupported`] with
+    /// [`UnsupportedOperation::Inbound`] when the adapter is outbound-only,
+    /// [`ChannelError::NotConnected`] when no session is open,
+    /// [`ChannelError::Transport`] when the poll itself failed, and
+    /// [`ChannelError::Protocol`] when the provider answered with a payload
+    /// that could not be normalized into an [`InboundMessage`].
     fn poll_inbound(&mut self) -> Result<Option<InboundMessage>, ChannelError>;
 
     /// Declares whether failed outbound attempts are safe to repeat.
@@ -243,6 +290,21 @@ pub trait Channel {
     }
 
     /// Sends one normalized outbound message with an optional scoped credential.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return [`ChannelError::InvalidMessage`] when
+    /// [`OutboundMessage::validate`] rejects the message,
+    /// [`ChannelError::Configuration`] when the message is addressed to an
+    /// account or conversation this adapter is not bound to,
+    /// [`ChannelError::Credential`] when a credential this channel requires was
+    /// not supplied, [`ChannelError::CredentialBinding`] when the supplied
+    /// credential is enrolled for another scope or destination,
+    /// [`ChannelError::Unsupported`] for attachments or replies the adapter does
+    /// not implement, [`ChannelError::NotConnected`] when no session is open,
+    /// and [`ChannelError::Authentication`], [`ChannelError::RateLimited`],
+    /// [`ChannelError::RemoteRejected`], [`ChannelError::Transport`] or
+    /// [`ChannelError::Protocol`] for what the provider did with the request.
     fn send_outbound(
         &mut self,
         message: &OutboundMessage,
@@ -308,6 +370,21 @@ pub struct NetworkOrigin {
 
 impl NetworkOrigin {
     /// Parses an HTTPS host and optional non-zero port.
+    ///
+    /// # Errors
+    ///
+    /// - [`NetworkOriginError::InvalidPort`] when the port is explicitly `0`.
+    /// - [`NetworkOriginError::InvalidHost`] when the host is empty, longer
+    ///   than 253 bytes, padded with whitespace, contains a control character,
+    ///   contains any of `/ \ @ ? # [ ]`, ends with a dot, or has a DNS label
+    ///   that is empty, longer than 63 bytes, hyphen-anchored, or not
+    ///   alphanumeric-or-hyphen. Every one of these would let a path, query,
+    ///   user-info, or trailing-dot spelling smuggle a second destination past
+    ///   an origin comparison.
+    /// - [`NetworkOriginError::AmbiguousIpLiteral`] when the host is a decimal,
+    ///   octal, or hexadecimal spelling of an IP address such as `2130706433`
+    ///   or `0x7f000001`. These resolve like an address but compare like a
+    ///   name, so they are refused rather than canonicalized.
     pub fn https(host: &str, port: Option<u16>) -> Result<Self, NetworkOriginError> {
         if port == Some(0) {
             return Err(NetworkOriginError::InvalidPort);
@@ -322,10 +399,7 @@ impl NetworkOrigin {
     /// Returns the canonical HTTPS origin.
     #[must_use]
     pub fn as_str(&self) -> String {
-        match self.port {
-            Some(port) => format!("https://{}:{port}", display_host(&self.host)),
-            None => format!("https://{}", display_host(&self.host)),
-        }
+        self.to_string()
     }
 
     /// Returns the canonical host without brackets.
@@ -355,7 +429,16 @@ impl Debug for NetworkOrigin {
 
 impl Display for NetworkOrigin {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.as_str())
+        formatter.write_str("https://")?;
+        if self.host.contains(':') {
+            write!(formatter, "[{}]", self.host)?;
+        } else {
+            formatter.write_str(&self.host)?;
+        }
+        if let Some(port) = self.port {
+            write!(formatter, ":{port}")?;
+        }
+        Ok(())
     }
 }
 
@@ -407,14 +490,6 @@ fn canonical_host(host: &str) -> Result<String, NetworkOriginError> {
     Ok(host.to_ascii_lowercase())
 }
 
-fn display_host(host: &str) -> String {
-    if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_owned()
-    }
-}
-
 /// Invalid network-origin syntax.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkOriginError {
@@ -446,6 +521,16 @@ impl Error for NetworkOriginError {}
 /// exact channel and account.
 pub trait OriginTrustStore {
     /// Returns whether the exact scope and origin were explicitly enrolled.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return [`OriginTrustError::Unavailable`] when the
+    /// enrollment record could not be read at all, and
+    /// [`OriginTrustError::PolicyDenied`] when the origin is refused on policy
+    /// grounds regardless of enrollment, such as a loopback, link-local, or
+    /// otherwise private destination an operator is not allowed to enroll. An
+    /// origin that is simply not enrolled is `Ok(false)`, not an error, so a
+    /// missing enrollment cannot be confused with a broken policy store.
     fn is_enrolled(
         &self,
         channel_id: &str,
@@ -511,6 +596,16 @@ impl Display for ApprovedOrigin {
 }
 
 /// Authorizes a parsed origin through explicit durable enrollment.
+///
+/// # Errors
+///
+/// - [`OriginTrustError::PolicyDenied`] when `channel_id` or `account_id` is
+///   empty, because an unscoped enrollment would authorize every channel.
+/// - [`OriginTrustError::NotEnrolled`] when the trust store has no enrollment
+///   for this exact channel, account, and origin. This is what an operator sees
+///   after pointing a channel at a self-hosted endpoint without enrolling it.
+/// - Whatever [`OriginTrustStore::is_enrolled`] returned, unchanged, when the
+///   policy store itself refused or could not answer.
 pub fn authorize_origin<T: OriginTrustStore>(
     trust: &T,
     channel_id: &str,
@@ -543,6 +638,20 @@ pub struct ChannelCredential {
 
 impl ChannelCredential {
     /// Binds owned secret material to the exact request used as its store key.
+    ///
+    /// # Errors
+    ///
+    /// - [`CredentialBindingError::ScopeMismatch`] when the scope's channel or
+    ///   account id is empty, over 256 bytes, whitespace-padded, or contains a
+    ///   control character, and when the scope carries an [`ApprovedOrigin`]
+    ///   that was enrolled for a different channel or account. The second case
+    ///   is the one that matters: it stops one channel's enrollment from
+    ///   authorizing another channel's secret.
+    /// - [`CredentialBindingError::InvalidBinding`] when
+    ///   [`CredentialKind::WebhookUrl`] is paired with anything other than
+    ///   [`CredentialBinding::EmbeddedEndpoint`], or that binding is used for
+    ///   any other kind. A webhook URL is its own destination, so the two must
+    ///   travel together.
     pub fn bind(
         secret: impl Into<String>,
         scope: CredentialRequest,
@@ -576,6 +685,18 @@ impl ChannelCredential {
     }
 
     /// Exposes an origin-bound credential only to its approved HTTPS origin.
+    ///
+    /// # Errors
+    ///
+    /// - [`CredentialBindingError::ScopeMismatch`] when `channel_id`,
+    ///   `account_id`, or `kind` differs from the enrollment this credential
+    ///   was bound to.
+    /// - [`CredentialBindingError::DestinationMismatch`] when the credential is
+    ///   not origin-bound at all, or is bound to a different approved origin
+    ///   than `origin`. This is the check that stops a redirected or
+    ///   reconfigured endpoint from receiving the old secret.
+    ///
+    /// The secret is lent to `operation` only after both checks pass.
     pub fn expose_for_origin<T>(
         &self,
         channel_id: &str,
@@ -594,6 +715,16 @@ impl ChannelCredential {
     }
 
     /// Exposes a credential that embeds its own endpoint.
+    ///
+    /// # Errors
+    ///
+    /// - [`CredentialBindingError::ScopeMismatch`] when `channel_id` or
+    ///   `account_id` differs from the enrollment, or the credential is not a
+    ///   [`CredentialKind::WebhookUrl`]. A bot token can never be posted as a
+    ///   webhook URL.
+    /// - [`CredentialBindingError::DestinationMismatch`] when the credential is
+    ///   a webhook URL bound to an origin or to local use instead of being its
+    ///   own endpoint.
     pub fn expose_embedded_endpoint<T>(
         &self,
         channel_id: &str,
@@ -610,6 +741,15 @@ impl ChannelCredential {
     }
 
     /// Exposes a local-only credential to a matching local operation.
+    ///
+    /// # Errors
+    ///
+    /// - [`CredentialBindingError::ScopeMismatch`] when `channel_id`,
+    ///   `account_id`, or `kind` differs from the enrollment.
+    /// - [`CredentialBindingError::DestinationMismatch`] when the credential is
+    ///   bound to a network origin or is an embedded endpoint, so a secret
+    ///   enrolled for a remote provider cannot be handed to a local companion
+    ///   service.
     pub fn expose_local<T>(
         &self,
         channel_id: &str,
@@ -679,6 +819,17 @@ impl Error for CredentialBindingError {}
 /// Port for retrieving credentials from platform-owned secure storage.
 pub trait SecretStore {
     /// Retrieves exactly one scoped credential.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return [`SecretStoreError::NotFound`] when nothing is
+    /// stored for this exact channel, account, purpose, and destination — the
+    /// error an operator sees when a channel is enabled before its credential
+    /// is provisioned; [`SecretStoreError::AccessDenied`] when the platform
+    /// keychain refused the process; [`SecretStoreError::Unavailable`] when the
+    /// backend could not be reached or is locked; and
+    /// [`SecretStoreError::InvalidCredential`] when the stored material exists
+    /// but cannot be bound to the requested scope.
     fn get(&self, request: &CredentialRequest) -> Result<ChannelCredential, SecretStoreError>;
 }
 
@@ -709,6 +860,21 @@ impl Display for SecretStoreError {
 impl Error for SecretStoreError {}
 
 /// Sends with a credential loaded from a scope-checked [`SecretStore`].
+///
+/// # Errors
+///
+/// - [`ChannelError::Configuration`] with
+///   [`ConfigurationError::CredentialScopeMismatch`] when the request names a
+///   different channel than the adapter reports, or a different account than
+///   the message is addressed to. The store is not consulted in that case.
+/// - [`ChannelError::Credential`] with whatever the store reported, typically
+///   [`SecretStoreError::NotFound`] for a channel whose credential was never
+///   provisioned.
+/// - [`ChannelError::CredentialBinding`] with
+///   [`CredentialBindingError::ScopeMismatch`] when the store answered with a
+///   credential enrolled for some other scope than the one requested.
+/// - Whatever [`Channel::send_outbound`] returned once the credential was
+///   loaded and scope-checked.
 pub fn send_using_store<C, S>(
     channel: &mut C,
     store: &S,
@@ -744,6 +910,13 @@ pub struct RetryPolicy {
 
 impl RetryPolicy {
     /// Creates a retry policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigurationError::InvalidRetryPolicy`] when `initial_delay`
+    /// is zero, which would make the backoff spin, or when `max_delay` is
+    /// shorter than `initial_delay`, which would clamp the very first wait to
+    /// less than the operator asked for.
     pub fn new(
         max_attempts: NonZeroU32,
         initial_delay: Duration,
@@ -779,6 +952,17 @@ pub trait BackoffSleeper {
 /// A retryable error alone is insufficient: it may have happened after a
 /// provider accepted the message. The channel must positively guarantee that
 /// repeating the operation cannot duplicate delivery.
+///
+/// # Errors
+///
+/// Returns the error [`Channel::send_outbound`] last produced. That happens on
+/// the first attempt when the error is not retryable, when the channel declares
+/// [`OutboundRetrySafety::NotSafeToRepeat`] — the default, so an undeclared
+/// channel never retries — and otherwise once the policy's attempt budget is
+/// spent. Typical values an operator sees are [`ChannelError::Credential`] for
+/// a channel with no provisioned secret, [`ChannelError::Authentication`] for a
+/// rejected token, and [`ChannelError::RateLimited`] or
+/// [`ChannelError::Transport`] when every permitted attempt failed.
 pub fn send_with_retry<C, S>(
     channel: &mut C,
     message: &OutboundMessage,
@@ -823,7 +1007,13 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     /// Creates a limiter beginning at `started_at`.
-    pub fn new(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigurationError::InvalidRateLimit`] when `window` is zero,
+    /// which would restart the window on every call and let the limit through
+    /// unenforced.
+    pub const fn new(
         limit: NonZeroU32,
         window: Duration,
         started_at: Duration,
@@ -840,6 +1030,14 @@ impl RateLimiter {
     }
 
     /// Consumes one permit or returns an exact retry duration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] when this window's permits are
+    /// already spent. `retry_after` is the exact remainder of the current
+    /// window, so a caller can wait that long instead of guessing. A `now`
+    /// earlier than the window start is treated as a clock step and opens a
+    /// fresh window rather than locking the channel out.
     pub fn acquire(&mut self, now: Duration) -> Result<(), ChannelError> {
         let elapsed = now.saturating_sub(self.window_started_at);
         if elapsed >= self.window || now < self.window_started_at {
@@ -972,8 +1170,8 @@ impl ChannelError {
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
-            Self::RateLimited { .. } => true,
-            Self::Transport(
+            Self::RateLimited { .. }
+            | Self::Transport(
                 TransportErrorKind::Connection
                 | TransportErrorKind::Timeout
                 | TransportErrorKind::NameResolution
@@ -1075,7 +1273,7 @@ mod tests {
     }
 
     impl Channel for TestChannel {
-        fn id(&self) -> &str {
+        fn id(&self) -> &'static str {
             "test"
         }
 

@@ -110,6 +110,12 @@ pub enum ExchangeSupport {
 ///
 /// This is derived from the registry rather than declared twice, so a
 /// capability added to a descriptor cannot disagree with what routing believes.
+///
+/// # Errors
+///
+/// Returns [`RoutingError::UnknownChannel`] when `channel_id` is not one of the
+/// 29 frozen official identifiers. Case, padding, and the `channel:` record
+/// prefix all fail here rather than resolving to a near neighbour.
 pub fn exchange_support(channel_id: &str) -> Result<ExchangeSupport, RoutingError> {
     let entry = descriptor(channel_id).ok_or(RoutingError::UnknownChannel)?;
     Ok(exchange_support_of(entry))
@@ -143,9 +149,14 @@ const fn exchange_support_of(entry: &ChannelDescriptor) -> ExchangeSupport {
 }
 
 /// Routes messages to one adapter per registered channel and account pair.
+///
+/// The map is keyed by channel first and account second rather than by an owned
+/// pair, so resolving a destination for an inbound message borrows both halves
+/// of the key instead of allocating a copy of the account identifier on every
+/// message.
 #[derive(Debug)]
 pub struct ChannelRouter<C> {
-    routes: BTreeMap<(&'static str, String), C>,
+    routes: BTreeMap<&'static str, BTreeMap<String, C>>,
 }
 
 impl<C> Default for ChannelRouter<C> {
@@ -166,33 +177,40 @@ impl<C> ChannelRouter<C> {
     /// Returns the number of registered channel and account pairs.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.routes.len()
+        self.routes.values().map(BTreeMap::len).sum()
     }
 
     /// Returns whether nothing is registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.routes.is_empty()
+        self.routes.values().all(BTreeMap::is_empty)
     }
 
     /// Returns every channel identifier that has at least one account.
     #[must_use]
     pub fn channels(&self) -> BTreeSet<&'static str> {
-        self.routes.keys().map(|(channel, _)| *channel).collect()
+        self.routes
+            .iter()
+            .filter(|(_, accounts)| !accounts.is_empty())
+            .map(|(channel, _)| *channel)
+            .collect()
     }
 
     /// Returns the accounts registered for one channel, in sorted order.
     ///
     /// A channel outside the frozen registry is an error rather than an empty
     /// list, so a typo cannot read as "this channel has no accounts".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoutingError::UnknownChannel`] when `channel_id` is not one of
+    /// the 29 frozen official identifiers. A registered channel that simply has
+    /// no accounts yet returns an empty list.
     pub fn accounts(&self, channel_id: &str) -> Result<Vec<&str>, RoutingError> {
         let entry = descriptor(channel_id).ok_or(RoutingError::UnknownChannel)?;
-        Ok(self
-            .routes
-            .keys()
-            .filter(|(channel, _)| *channel == entry.id)
-            .map(|(_, account)| account.as_str())
-            .collect())
+        Ok(self.routes.get(entry.id).map_or_else(Vec::new, |accounts| {
+            accounts.keys().map(String::as_str).collect()
+        }))
     }
 }
 
@@ -201,6 +219,19 @@ impl<C: Channel> ChannelRouter<C> {
     ///
     /// Returns the frozen descriptor the registration resolved to, so a caller
     /// cannot hold a routing entry without also holding its upstream identity.
+    ///
+    /// # Errors
+    ///
+    /// - [`RoutingError::UnknownChannel`] when `channel_id` is not one of the
+    ///   29 frozen official identifiers.
+    /// - [`RoutingError::InvalidAccountId`] when the account identifier is
+    ///   empty, longer than 256 bytes, whitespace-padded, or contains a control
+    ///   character. These would produce a key no lookup could reproduce.
+    /// - [`RoutingError::AdapterIdentityMismatch`] when the adapter reports a
+    ///   different channel identifier than the one it is being registered
+    ///   under, which would send this channel's traffic to another provider.
+    /// - [`RoutingError::DuplicateAccount`] when this channel and account pair
+    ///   already has an adapter. The existing adapter is kept.
     pub fn register(
         &mut self,
         channel_id: &str,
@@ -215,32 +246,46 @@ impl<C: Channel> ChannelRouter<C> {
         if channel.id() != entry.id {
             return Err(RoutingError::AdapterIdentityMismatch);
         }
-        let key = (entry.id, account_id);
-        if self.routes.contains_key(&key) {
+        let accounts = self.routes.entry(entry.id).or_default();
+        if accounts.contains_key(&account_id) {
             return Err(RoutingError::DuplicateAccount);
         }
-        self.routes.insert(key, channel);
+        accounts.insert(account_id, channel);
         Ok(entry)
     }
 
     /// Returns the adapter bound to one channel and account pair.
+    ///
+    /// # Errors
+    ///
+    /// - [`RoutingError::UnknownChannel`] when `channel_id` is not one of the
+    ///   29 frozen official identifiers.
+    /// - [`RoutingError::UnroutedAccount`] when the channel is registered but
+    ///   this account has no adapter, which is what an operator sees after
+    ///   configuring an account the channel was never started for.
     pub fn route(&self, channel_id: &str, account_id: &str) -> Result<&C, RoutingError> {
         let entry = descriptor(channel_id).ok_or(RoutingError::UnknownChannel)?;
         self.routes
-            .get(&(entry.id, account_id.to_owned()))
+            .get(entry.id)
+            .and_then(|accounts| accounts.get(account_id))
             .ok_or(RoutingError::UnroutedAccount)
     }
 
     /// Returns the adapter bound to one channel and account pair for mutation.
+    ///
+    /// # Errors
+    ///
+    /// - [`RoutingError::UnknownChannel`] when `channel_id` is not one of the
+    ///   29 frozen official identifiers.
+    /// - [`RoutingError::UnroutedAccount`] when the channel is registered but
+    ///   this account has no adapter.
     pub fn route_mut(
         &mut self,
         channel_id: &str,
         account_id: &str,
     ) -> Result<&mut C, RoutingError> {
         let entry = descriptor(channel_id).ok_or(RoutingError::UnknownChannel)?;
-        self.routes
-            .get_mut(&(entry.id, account_id.to_owned()))
-            .ok_or(RoutingError::UnroutedAccount)
+        self.adapter_mut(entry, account_id)
     }
 
     /// Resolves the adapter that owns an inbound message.
@@ -249,16 +294,37 @@ impl<C: Channel> ChannelRouter<C> {
     /// receiver uses; it never falls back to "the first adapter for this
     /// channel", which is how a multi-account deployment leaks conversations
     /// between tenants.
+    ///
+    /// # Errors
+    ///
+    /// - [`RoutingError::InvalidMessage`] when the message fails common
+    ///   validation, carrying the exact reason.
+    /// - [`RoutingError::UnknownChannel`] when the message names a channel that
+    ///   is not in the frozen registry.
+    /// - [`RoutingError::InboundUnsupported`] when the channel is registered but
+    ///   implements no inbound direction at this baseline, so no adapter could
+    ///   legitimately have produced this message.
+    /// - [`RoutingError::UnroutedAccount`] when no adapter is registered for the
+    ///   message's account on that channel.
     pub fn route_inbound(&mut self, message: &InboundMessage) -> Result<&mut C, RoutingError> {
         message.validate().map_err(RoutingError::InvalidMessage)?;
         let entry = descriptor(&message.channel_id).ok_or(RoutingError::UnknownChannel)?;
         if !supports_inbound(entry) {
             return Err(RoutingError::InboundUnsupported);
         }
-        self.route_mut(entry.id, &message.account_id)
+        self.adapter_mut(entry, &message.account_id)
     }
 
     /// Sends an outbound message through the adapter for its own account.
+    ///
+    /// # Errors
+    ///
+    /// - [`RouterError::Routing`] with [`RoutingError::UnknownChannel`] for an
+    ///   unregistered identifier, or [`RoutingError::UnroutedAccount`] when the
+    ///   message's account has no adapter on that channel.
+    /// - [`RouterError::Channel`] with whatever the resolved adapter returned,
+    ///   which keeps "this destination does not exist" distinguishable from
+    ///   "this destination refused the message".
     pub fn send(
         &mut self,
         channel_id: &str,
@@ -270,6 +336,14 @@ impl<C: Channel> ChannelRouter<C> {
     }
 
     /// Polls one inbound message from the adapter for a channel and account.
+    ///
+    /// # Errors
+    ///
+    /// - [`RouterError::Routing`] with [`RoutingError::UnknownChannel`] for an
+    ///   unregistered identifier, [`RoutingError::InboundUnsupported`] for a
+    ///   channel with no inbound implementation, or
+    ///   [`RoutingError::UnroutedAccount`] when that account has no adapter.
+    /// - [`RouterError::Channel`] with whatever the adapter's own poll returned.
     pub fn poll_inbound(
         &mut self,
         channel_id: &str,
@@ -279,7 +353,22 @@ impl<C: Channel> ChannelRouter<C> {
         if !supports_inbound(entry) {
             return Err(RoutingError::InboundUnsupported.into());
         }
-        Ok(self.route_mut(entry.id, account_id)?.poll_inbound()?)
+        Ok(self.adapter_mut(entry, account_id)?.poll_inbound()?)
+    }
+
+    /// Resolves an adapter from an already-resolved descriptor.
+    ///
+    /// Callers that have a descriptor in hand use this instead of
+    /// [`Self::route_mut`] so one message costs one registry lookup.
+    fn adapter_mut(
+        &mut self,
+        entry: &'static ChannelDescriptor,
+        account_id: &str,
+    ) -> Result<&mut C, RoutingError> {
+        self.routes
+            .get_mut(entry.id)
+            .and_then(|accounts| accounts.get_mut(account_id))
+            .ok_or(RoutingError::UnroutedAccount)
     }
 }
 

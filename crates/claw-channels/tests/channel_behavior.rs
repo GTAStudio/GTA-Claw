@@ -9,10 +9,10 @@ use std::thread;
 use std::time::Duration;
 
 use claw_channel_sdk::{
-    BackoffSleeper, Channel, ChannelCredential, ChannelError, CredentialBinding,
-    CredentialBindingError, CredentialKind, CredentialRequest, DeliveryAcknowledgement,
-    DeliveryState, InboundMessage, OutboundMessage, OutboundRetrySafety, RetryPolicy,
-    TransportErrorKind, UnsupportedOperation, send_with_retry,
+    BackoffSleeper, Channel, ChannelCredential, ChannelError, ConfigurationError,
+    CredentialBinding, CredentialBindingError, CredentialKind, CredentialRequest,
+    DeliveryAcknowledgement, DeliveryState, InboundMessage, OutboundMessage, OutboundRetrySafety,
+    RetryPolicy, TransportErrorKind, UnsupportedOperation, send_with_retry,
 };
 use claw_channels::{
     AuthMode, ChannelCapability, ImplementationStatus, LoopbackHttpTransport, QaChannel,
@@ -480,4 +480,33 @@ fn redirect_response_is_not_treated_as_delivery() {
         server.join().expect("fixture server").body,
         br#"{"content":"hello fixture"}"#
     );
+}
+
+#[test]
+fn a_webhook_endpoint_carrying_crlf_cannot_smuggle_a_second_request() {
+    // The endpoint is a secret supplied by configuration, and the loopback
+    // transport writes it straight into the request line. Anything that could
+    // terminate that line early must be refused before a socket is opened.
+    for endpoint in [
+        "http://127.0.0.1:9/hook\r\nX-Injected: 1",
+        "http://127.0.0.1:9/hook HTTP/1.1\r\nHost: evil.example",
+        "http://127.0.0.1:9/hook\nGET /admin HTTP/1.1",
+    ] {
+        let credential = webhook_credential("slack", endpoint.to_owned());
+        let mut channel = WebhookChannel::new(
+            "slack",
+            "primary",
+            "room-1",
+            LoopbackHttpTransport,
+            FixedClock(7),
+        )
+        .expect("valid adapter");
+        assert_eq!(
+            channel.send_outbound(&outbound(), Some(&credential)),
+            Err(ChannelError::Configuration(
+                ConfigurationError::InvalidAdapterConfiguration
+            )),
+            "{endpoint:?}"
+        );
+    }
 }
