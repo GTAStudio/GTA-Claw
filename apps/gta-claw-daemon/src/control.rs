@@ -18,6 +18,7 @@ use std::io::{self, Write};
 use claw_application::Application;
 use claw_platform::NativeSystemProbe;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
+use tokio_util::sync::CancellationToken;
 
 use crate::compose::{Daemon, STOP_DEADLINE, StopSummary};
 use crate::production::{
@@ -414,7 +415,8 @@ pub async fn serve_production(
     let mut signals = StopSignals::install()?;
     let application = Application::new(NativeSystemProbe);
     let mut control = ControlChannel::new(control);
-    let startup = ProductionService::start(options, loaded);
+    let startup_cancellation = CancellationToken::new();
+    let startup = ProductionService::start(options, loaded, startup_cancellation.clone());
     tokio::pin!(startup);
     let mut reload_deferred = false;
     let mut service = loop {
@@ -431,12 +433,20 @@ pub async fn serve_production(
         match event {
             StartupEvent::Started(result) => break result?,
             StartupEvent::Signal(SignalEvent::Stop(trigger)) => {
-                let summary = ProductionStopSummary::before_start();
+                startup_cancellation.cancel();
+                let summary = match startup.as_mut().await {
+                    Ok(service) => service.stop(None).await,
+                    Err(_) => ProductionStopSummary::before_start(),
+                };
                 write_production_stop(&mut output, trigger.label(), &summary)?;
                 return Ok(summary);
             }
             StartupEvent::Control(ControlEvent::Stop) => {
-                let summary = ProductionStopSummary::before_start();
+                startup_cancellation.cancel();
+                let summary = match startup.as_mut().await {
+                    Ok(service) => service.stop(None).await,
+                    Err(_) => ProductionStopSummary::before_start(),
+                };
                 write_production_stop(&mut output, StopTrigger::Control.label(), &summary)?;
                 return Ok(summary);
             }
@@ -457,7 +467,7 @@ pub async fn serve_production(
         }
     };
     if reload_deferred {
-        writeln!(output, "{}", reload_line(&service))?;
+        writeln!(output, "{}", reload_line(&service).await)?;
         output.flush()?;
     }
     let addresses = service.addresses();
@@ -506,7 +516,7 @@ pub async fn serve_production(
                 break ("runtime", Some(error.to_string()));
             }
             Event::Signal(SignalEvent::Reload) | Event::Control(ControlEvent::Reload) => {
-                let line = reload_line(&service);
+                let line = reload_line(&service).await;
                 if let Err(error) = writeln!(output, "{line}").and_then(|()| output.flush()) {
                     break (
                         "runtime",
@@ -542,8 +552,8 @@ pub async fn serve_production(
     Ok(summary)
 }
 
-fn reload_line(service: &ProductionService) -> String {
-    match service.reload() {
+async fn reload_line(service: &ProductionService) -> String {
+    match service.reload().await {
         Ok(applied) => format!(
             "reloaded generation={} changed={}",
             applied.generation,

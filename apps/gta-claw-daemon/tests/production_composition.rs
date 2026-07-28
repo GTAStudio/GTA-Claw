@@ -281,6 +281,28 @@ fn bound_http_is_ready_and_dispatches_to_the_composed_provider() {
         status_body["payload"]["plugins"]["outcomes"],
         serde_json::json!([])
     );
+    assert_eq!(
+        status_body["payload"]["runtime"]["memory"]["insertRefusals"],
+        0
+    );
+    assert_eq!(
+        status_body["payload"]["runtime"]["goals"]["unlockFailures"],
+        0
+    );
+    let goal = request(
+        daemon.http,
+        "POST",
+        "/tools/invoke",
+        Some("operator-token"),
+        Some(
+            r#"{"name":"update_goal","sessionKey":"goal-e2e","args":{"action":"set","objective":"finish composition"}}"#,
+        ),
+    );
+    assert!(goal.starts_with("HTTP/1.1 200"), "{goal}");
+    assert!(
+        goal.contains("finish composition") || goal.contains("goal goal-e2e:"),
+        "{goal}"
+    );
 
     let update = request(
         daemon.http,

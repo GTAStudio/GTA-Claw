@@ -18,6 +18,8 @@
 //! They remain intentionally separate so production cannot accidentally claim a
 //! loopback fixture as a live dependency.
 
+pub mod agent_runtime;
+pub mod channels;
 pub mod engine;
 pub mod http_api;
 pub mod ingress;
@@ -27,3 +29,4 @@ pub mod plugins;
 pub mod signed_plugins;
 pub mod state;
 pub mod support;
+pub mod updater;

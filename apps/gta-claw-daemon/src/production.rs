@@ -2,11 +2,11 @@
 
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
-use std::io;
+use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use claw_channels::{ExchangeSupport, ImplementationStatus, descriptor, exchange_support};
@@ -24,15 +24,17 @@ use claw_http_api::{
     ApiConfig, ApiServices, BearerAuthenticator, BearerCredential, HttpApi, LegacyAdminCredential,
     LegacyApiConfig, LegacyApiServices, LegacyChannelStatus, LegacyHttpApi, LegacyReloadError,
     LegacyReloadPort, LegacyReloadResult, LegacyRuntimePort, LegacyWhatsAppConfig,
-    LegacyWhatsAppServices, PortError, PortErrorKind, PortFuture, ProviderLegacyRuntime,
-    ProviderLegacyRuntimeConfig, ServingStateHandle,
+    LegacyWhatsAppServices, PortError, PortErrorKind, PortFuture, ServingStateHandle,
 };
 use claw_observability::{LogFormat, TelemetryConfig, TelemetryHandle, TelemetryOutput};
 use claw_provider_sdk::clock::{PseudoRandomJitter, SystemClock as ProviderClock};
 use claw_provider_sdk::http::{
     HttpRequest, HttpTransport, Method, ProxyPolicy, TlsPolicy, TransportConfig,
 };
-use claw_provider_sdk::{CancelToken, Operation, Provider, SecretString};
+use claw_provider_sdk::{
+    CancelToken, CredentialKey, Operation, Provider, SecretStore as ProviderSecretStore,
+    SecretString,
+};
 use claw_providers::github_copilot::{DeviceFlowConfig, GitHubCopilotConfig};
 use claw_providers::{DeviceFlow, GitHubCopilot, ProviderRuntime};
 use claw_security::authorization::{Role, Scope, ScopeSet};
@@ -45,16 +47,20 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+use crate::adapters::agent_runtime::{AgentRuntime, RuntimeModelTools};
+use crate::adapters::channels::{ChannelSupervisor, DiscordSettings, TelegramSettings};
 use crate::adapters::http_api::{
     AppliedReload, ConfigController, DependencyReadiness, Diagnostics, DurableSecurityAudit,
-    ModelToolCatalog, OperatorAdmin, OperatorInventory, ProviderHistoryConfig, SmokeProvider,
-    SwappableProvider, UnavailableExternalPorts, copilot_request_timeout_ms, updates_enabled,
+    ModelToolCatalog, OperatorAdmin, OperatorInventory, OperatorRuntimeStatus,
+    ProviderHistoryConfig, SmokeProvider, SwappableProvider, UnavailableExternalPorts,
+    copilot_request_timeout_ms, updates_enabled,
 };
 use crate::adapters::legacy::{
     DeviceTaskReport, DeviceTokenActivator, GraphWhatsAppAdapter, LegacyDeviceFlowAdapter,
     LegacyTeamsAdapter, NativeLegacyHostAdmin,
 };
 use crate::adapters::signed_plugins::SignedPluginRuntime;
+use crate::adapters::updater::UpdateMonitor;
 
 /// Whole-process shutdown ceiling.
 pub const PRODUCTION_STOP_DEADLINE: Duration = Duration::from_secs(10);
@@ -424,6 +430,8 @@ struct LegacySettings {
     device_flow_enabled: bool,
     channels: LegacyChannelStatus,
     teams: Option<LegacyTeamsSettings>,
+    telegram: Option<TelegramSettings>,
+    discord: Option<DiscordSettings>,
     whatsapp: Option<LegacyWhatsAppSettings>,
     teams_rate_limit_per_minute: u32,
     trust_proxy: bool,
@@ -457,21 +465,23 @@ pub struct BoundAddresses {
 
 struct CopilotDeviceActivator {
     provider: Arc<SwappableProvider>,
-    runtime: Arc<ProviderLegacyRuntime>,
     proxy: ProxyPolicy,
     request_timeout: Duration,
 }
 
 impl DeviceTokenActivator for CopilotDeviceActivator {
-    fn activate(&self, token: SecretString) -> PortFuture<'_, Result<(), PortError>> {
+    fn activate(
+        &self,
+        token: SecretString,
+        cancellation: CancelToken,
+    ) -> PortFuture<'_, Result<(), PortError>> {
         Box::pin(async move {
             let client = build_copilot_from_token(token, self.proxy.clone(), self.request_timeout)
                 .map_err(|error| production_port_error(&error))?;
             self.provider
-                .activate(Arc::new(client))
+                .activate_with_cancel(Arc::new(client), cancellation)
                 .await
                 .map_err(|error| provider_port_error(&error))?;
-            self.runtime.set_authenticated(true)?;
             self.provider.mark_ready();
             Ok(())
         })
@@ -490,7 +500,7 @@ struct DaemonLegacyReload {
     in_progress: AtomicBool,
     config: Arc<ConfigController>,
     provider: Arc<SwappableProvider>,
-    runtime: Arc<ProviderLegacyRuntime>,
+    runtime: Arc<AgentRuntime>,
     proxy: ProxyPolicy,
     diagnostics: Arc<Diagnostics>,
     skill_count: usize,
@@ -535,12 +545,11 @@ impl LegacyReloadPort for DaemonLegacyReload {
             })?;
             self.provider.set_role_prompt(&role.prompt);
             self.provider.clear_history();
-            self.runtime.clear_sessions().map_err(|error| {
-                self.diagnostics
-                    .record(format!("legacy session reset failed: {}", error.message));
-                LegacyReloadError::Failed
-            })?;
-            self.runtime.set_skill_count(self.skill_count);
+            let report = self.runtime.reload_sessions().await;
+            self.diagnostics.record(format!(
+                "legacy runtime reload generation={} destroyed={} cancelled={} forced={}",
+                report.generation, report.destroyed, report.cancelled_turns, report.forced_turns
+            ));
             for diagnostic in &role.diagnostics {
                 self.diagnostics
                     .record(format!("legacy role reload: {diagnostic}"));
@@ -566,6 +575,9 @@ pub struct ProductionService {
     http_tasks: JoinSet<(&'static str, io::Result<()>)>,
     gateway: Option<ServerHandle>,
     device_flow: Option<Arc<LegacyDeviceFlowAdapter>>,
+    channels: ChannelSupervisor,
+    agent_runtime: Arc<AgentRuntime>,
+    updater: UpdateMonitor,
     plugins: Option<SignedPluginRuntime>,
     terminated_http_tasks: u64,
 }
@@ -581,7 +593,11 @@ impl ProductionService {
     pub async fn start(
         options: &ProductionOptions,
         loaded: LoadedConfig,
+        startup_cancellation: CancellationToken,
     ) -> Result<Self, ProductionError> {
+        if startup_cancellation.is_cancelled() {
+            return Err(startup_cancelled());
+        }
         validate_exposure(options)?;
         let diagnostics = Arc::new(Diagnostics::new(256));
         diagnostics.record(format!("configuration loaded from {}", loaded.source));
@@ -663,6 +679,7 @@ impl ProductionService {
             "role",
             "skills",
             "provider",
+            "runtime",
             "channels",
             "gateway",
             "http",
@@ -711,7 +728,10 @@ impl ProductionService {
                 diagnostics: Vec::new(),
             }
         } else {
-            load_role(&loaded.snapshot, proxy.clone()).await?
+            tokio::select! {
+                result = load_role(&loaded.snapshot, proxy.clone()) => result?,
+                () = startup_cancellation.cancelled() => return Err(startup_cancelled()),
+            }
         };
         for diagnostic in &role.diagnostics {
             diagnostics.record(format!("role: {diagnostic}"));
@@ -735,9 +755,22 @@ impl ProductionService {
             registered = registered_skill_count,
             "skill inventory classified"
         );
-        let plugins = SignedPluginRuntime::activate(&diagnostics)
-            .map_err(|error| ProductionError::message("plugins", error))?;
+        let plugin_diagnostics = Arc::clone(&diagnostics);
+        let mut plugin_task =
+            tokio::task::spawn_blocking(move || SignedPluginRuntime::activate(&plugin_diagnostics));
+        let plugins = tokio::select! {
+            result = &mut plugin_task => {
+                result
+                    .map_err(|error| ProductionError::new("plugins", error))?
+                    .map_err(|error| ProductionError::message("plugins", error))?
+            }
+            () = startup_cancellation.cancelled() => {
+                plugin_task.abort();
+                return Err(startup_cancelled());
+            }
+        };
         let plugin_tools = plugins.tools();
+        let model_tools = RuntimeModelTools::new(Arc::clone(&plugin_tools));
         let active_skill_count = plugins.summary().activated();
         let plugin_activation = plugins.summary().as_json();
         diagnostics.record(format!("plugin activation report: {plugin_activation}"));
@@ -749,27 +782,21 @@ impl ProductionService {
         );
         readiness.set("skills", true);
 
-        let legacy_settings = legacy_settings(&loaded.snapshot)?;
+        let mut legacy_settings = legacy_settings(&loaded.snapshot)?;
         let channels = channel_statuses(&legacy_settings)?;
-        readiness.set("channels", true);
-        info!(
-            stage = "channels",
-            enabled = 0,
-            "channel lifecycle validated"
-        );
 
         let configured_model = role
             .model
             .clone()
             .unwrap_or_else(|| loaded.snapshot.core().copilot().default_model().to_owned());
         let provider = Arc::new(SwappableProvider::new(
-            configured_model,
+            configured_model.clone(),
             role.prompt,
             ProviderHistoryConfig {
                 max_conversations: legacy_settings.session_max_entries,
                 idle_timeout: legacy_settings.session_idle_timeout,
             },
-            Arc::clone(&plugin_tools) as Arc<dyn ModelToolCatalog>,
+            model_tools as Arc<dyn ModelToolCatalog>,
             Arc::clone(&readiness),
         ));
         let provider_to_activate: Option<Arc<dyn Provider>> = if options.smoke {
@@ -783,10 +810,21 @@ impl ProductionService {
             None
         };
         if let Some(provider_to_activate) = provider_to_activate {
-            provider
-                .activate(provider_to_activate)
-                .await
-                .map_err(|error| ProductionError::new("provider-readiness", error))?;
+            let activation_cancel = CancelToken::new();
+            tokio::select! {
+                result = provider.activate_with_cancel(
+                    provider_to_activate,
+                    activation_cancel.clone(),
+                ) => {
+                    result.map_err(|error| {
+                        ProductionError::new("provider-readiness", error)
+                    })?;
+                }
+                () = startup_cancellation.cancelled() => {
+                    activation_cancel.cancel();
+                    return Err(startup_cancelled());
+                }
+            }
             provider.mark_ready();
             info!(
                 stage = "provider",
@@ -808,39 +846,43 @@ impl ProductionService {
             Arc::clone(&provider),
             Arc::clone(&diagnostics),
         ));
-        let legacy_runtime = ProviderLegacyRuntime::new(
-            Arc::clone(&provider) as Arc<dyn claw_http_api::ProviderPort>,
-            ProviderLegacyRuntimeConfig {
-                model: "openclaw".to_owned(),
-                skill_count: active_skill_count,
-                max_sessions: legacy_settings.session_max_entries,
-                session_idle_timeout: legacy_settings.session_idle_timeout,
-            },
+        let agent_runtime = AgentRuntime::new(
+            Arc::clone(&provider),
+            Arc::clone(&plugin_tools),
+            &state_dir,
+            configured_model.clone(),
+            active_skill_count,
+            legacy_settings.session_max_entries,
+            legacy_settings.session_idle_timeout,
+            Arc::clone(&diagnostics),
         )
-        .map_err(|error| ProductionError::new("legacy-runtime", error))?;
-        if !provider.is_active() {
-            legacy_runtime
-                .set_authenticated(false)
-                .map_err(|error| ProductionError::new("legacy-runtime", error))?;
-        }
+        .map_err(|error| ProductionError::message("runtime", error))?;
+        let http_tools = agent_runtime.http_tools(Arc::clone(&plugin_tools));
+        readiness.set("runtime", true);
 
-        let teams = if let Some(teams) = legacy_settings.teams {
+        let channel_authentication = Arc::new(RwLock::new(None));
+        let teams = if let Some(teams) = legacy_settings.teams.take() {
             let transport = HttpTransport::with_config(&TransportConfig {
                 proxy_policy: proxy.clone(),
                 request_timeout: Duration::from_secs(15),
                 ..TransportConfig::default()
             })
             .map_err(|error| ProductionError::new("teams-transport", error))?;
-            Some(LegacyTeamsAdapter::new(
-                Arc::clone(&legacy_runtime) as Arc<dyn claw_http_api::LegacyChannelMessagePort>,
-                transport,
-                teams.app_id,
-                teams.app_password,
-            ))
+            Some(
+                LegacyTeamsAdapter::new(
+                    Arc::clone(&agent_runtime),
+                    transport,
+                    teams.app_id,
+                    teams.app_password,
+                    Arc::clone(&channel_authentication),
+                    Arc::clone(&diagnostics),
+                )
+                .map_err(|error| ProductionError::new("teams", error))?,
+            )
         } else {
             None
         };
-        let whatsapp = if let Some(whatsapp) = legacy_settings.whatsapp {
+        let whatsapp = if let Some(whatsapp) = legacy_settings.whatsapp.take() {
             let transport = HttpTransport::with_config(&TransportConfig {
                 proxy_policy: proxy.clone(),
                 request_timeout: Duration::from_secs(10),
@@ -850,13 +892,14 @@ impl ProductionService {
             let sender = GraphWhatsAppAdapter::new(
                 transport,
                 &whatsapp.phone_number_id,
-                whatsapp.access_token,
+                &whatsapp.access_token,
+                Arc::clone(&diagnostics),
             )
             .map_err(|error| ProductionError::new("whatsapp", error))?;
             Some((
                 whatsapp.route,
                 LegacyWhatsAppServices {
-                    messages: Arc::clone(&legacy_runtime)
+                    messages: Arc::clone(&agent_runtime)
                         as Arc<dyn claw_http_api::LegacyChannelMessagePort>,
                     sender,
                 },
@@ -873,34 +916,76 @@ impl ProductionService {
             let flow = build_device_flow(&loaded.snapshot, proxy.clone())?;
             let activator = Arc::new(CopilotDeviceActivator {
                 provider: Arc::clone(&provider),
-                runtime: Arc::clone(&legacy_runtime),
                 proxy: proxy.clone(),
                 request_timeout,
             });
             Some(LegacyDeviceFlowAdapter::new(
                 flow,
                 activator,
+                Arc::clone(&channel_authentication),
                 Arc::clone(&diagnostics),
             ))
         } else {
             None
         };
+        if let Some(flow) = device_flow.as_ref()
+            && (teams.is_some()
+                || whatsapp.is_some()
+                || legacy_settings.telegram.is_some()
+                || legacy_settings.discord.is_some())
+            && !provider.is_active()
+        {
+            let instructions = claw_http_api::LegacyDeviceFlowPort::instructions(
+                flow.as_ref(),
+                startup_cancellation.child_token(),
+            )
+            .await
+            .map_err(|error| ProductionError::new("device-flow", error))?;
+            diagnostics.record(format!(
+                "channel authentication instructions prepared ({} bytes)",
+                instructions.len()
+            ));
+        }
+        let enabled_channel_count = [
+            legacy_settings.channels.teams(),
+            legacy_settings.channels.telegram(),
+            legacy_settings.channels.discord(),
+            legacy_settings.channels.whatsapp(),
+        ]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count();
+        let channel_supervisor = ChannelSupervisor::start(
+            legacy_settings.telegram.take(),
+            legacy_settings.discord.take(),
+            Arc::clone(&agent_runtime),
+            Arc::clone(&channel_authentication),
+            proxy.clone(),
+            Arc::clone(&diagnostics),
+            startup_cancellation.clone(),
+        )
+        .await
+        .map_err(|error| ProductionError::message("channels", error))?;
+        readiness.set("channels", true);
+        info!(
+            stage = "channels",
+            enabled = enabled_channel_count,
+            "channel lifecycles are live"
+        );
         let reload = Arc::new(DaemonLegacyReload {
             in_progress: AtomicBool::new(false),
             config: Arc::clone(&config),
             provider: Arc::clone(&provider),
-            runtime: Arc::clone(&legacy_runtime),
+            runtime: Arc::clone(&agent_runtime),
             proxy: proxy.clone(),
             diagnostics: Arc::clone(&diagnostics),
             skill_count: active_skill_count,
         });
         let updates_enabled = updates_enabled(&loaded.snapshot)
             .map_err(|error| ProductionError::message("updates", error))?;
-        if updates_enabled {
-            diagnostics.record(
-                "signed update checks are enabled but require the external updater manifest API",
-            );
-        }
+        let update_monitor =
+            UpdateMonitor::start(updates_enabled, &proxy, Arc::clone(&diagnostics))
+                .map_err(|error| ProductionError::message("updates", error))?;
         let admin = Arc::new(OperatorAdmin::new(
             Arc::clone(&config),
             Arc::clone(&provider),
@@ -913,6 +998,7 @@ impl ProductionService {
                 updates_enabled,
                 config_resolution,
                 plugin_activation,
+                Arc::clone(&agent_runtime) as Arc<dyn OperatorRuntimeStatus>,
             ),
         ));
         let admin_token = admin_token(&loaded.snapshot)?;
@@ -920,7 +1006,7 @@ impl ProductionService {
         let services = ApiServices {
             provider: Arc::clone(&provider) as Arc<dyn claw_http_api::ProviderPort>,
             readiness: Arc::clone(&readiness) as Arc<dyn claw_http_api::ReadinessPort>,
-            tools: Arc::clone(&plugin_tools) as Arc<dyn claw_http_api::ToolPort>,
+            tools: http_tools as Arc<dyn claw_http_api::ToolPort>,
             admin,
             watch_auth: Arc::clone(&external) as Arc<dyn claw_http_api::WatchAuthPort>,
             watch_results: Arc::clone(&external) as Arc<dyn claw_http_api::WatchResultPort>,
@@ -961,7 +1047,7 @@ impl ProductionService {
             ..LegacyApiConfig::default()
         };
         let legacy_services = LegacyApiServices {
-            runtime: Arc::clone(&legacy_runtime) as Arc<dyn LegacyRuntimePort>,
+            runtime: Arc::clone(&agent_runtime) as Arc<dyn LegacyRuntimePort>,
             readiness: Arc::clone(&readiness) as Arc<dyn claw_http_api::ReadinessPort>,
             device_flow: device_flow
                 .as_ref()
@@ -1131,6 +1217,9 @@ impl ProductionService {
             http_tasks,
             gateway: Some(gateway),
             device_flow,
+            channels: channel_supervisor,
+            agent_runtime,
+            updater: update_monitor,
             plugins: Some(plugins),
             terminated_http_tasks: 0,
         })
@@ -1177,7 +1266,7 @@ impl ProductionService {
     ///
     /// Returns a `reload`-stage error when no file was configured, the file
     /// cannot be read, or the candidate is rejected and rolled back.
-    pub fn reload(&self) -> Result<AppliedReload, ProductionError> {
+    pub async fn reload(&self) -> Result<AppliedReload, ProductionError> {
         let path = self.config_path.as_ref().ok_or_else(|| {
             ProductionError::message(
                 "reload",
@@ -1199,9 +1288,16 @@ impl ProductionService {
         }
         let source =
             to_json5(&resolved.config).map_err(|error| ProductionError::new("reload", error))?;
-        self.config
+        let applied = self
+            .config
             .apply_json5(&source, &path.display().to_string())
-            .map_err(|error| ProductionError::message("reload", error))
+            .map_err(|error| ProductionError::message("reload", error))?;
+        let report = self.agent_runtime.reload_sessions().await;
+        self.diagnostics.record(format!(
+            "runtime reload generation={} destroyed={} cancelled={} forced={}",
+            report.generation, report.destroyed, report.cancelled_turns, report.forced_turns
+        ));
+        Ok(applied)
     }
 
     /// Waits for an ingress task to exit without a stop request.
@@ -1223,6 +1319,9 @@ impl ProductionService {
         self.readiness.set("legacy-http", false);
         self.readiness.set("mcp", false);
         self.readiness.set("gateway", false);
+        self.readiness.set("channels", false);
+        self.readiness.set("runtime", false);
+        self.readiness.set("provider", false);
         info!(stage = "shutdown", "readiness disabled; draining ingress");
 
         let mut abandoned = 0_u32;
@@ -1236,6 +1335,19 @@ impl ProductionService {
                 stage = "shutdown",
                 subsystem = "gateway",
                 "quiesce deadline expired"
+            );
+        }
+
+        let channel_report = self.channels.shutdown(remaining(started)).await;
+        abandoned = abandoned.saturating_add(channel_report.abandoned);
+        let updater_spawned = u64::from(self.updater.is_enabled());
+        let updater_joined = self.updater.shutdown(remaining(started)).await;
+        if !updater_joined {
+            abandoned = abandoned.saturating_add(1);
+            warn!(
+                stage = "shutdown",
+                subsystem = "updater",
+                "update check deadline expired"
             );
         }
 
@@ -1277,6 +1389,23 @@ impl ProductionService {
             }
         };
         abandoned = abandoned.saturating_add(device_report.abandoned);
+
+        match tokio::time::timeout(remaining(started), self.agent_runtime.shutdown()).await {
+            Ok(Ok(())) => info!(stage = "shutdown", subsystem = "runtime", "runtime stopped"),
+            Ok(Err(error)) => {
+                abandoned = abandoned.saturating_add(1);
+                warn!(stage = "shutdown", subsystem = "runtime", error = %error);
+            }
+            Err(_) => {
+                abandoned = abandoned.saturating_add(1);
+                warn!(
+                    stage = "shutdown",
+                    subsystem = "runtime",
+                    "runtime shutdown deadline expired"
+                );
+            }
+        }
+        self.provider.shutdown().await;
 
         let mut plugins_joined = false;
         let mut plugin_invocations_spawned = 0;
@@ -1357,12 +1486,16 @@ impl ProductionService {
 
         let spawned = 6_u64
             .saturating_add(device_report.spawned)
+            .saturating_add(channel_report.spawned)
+            .saturating_add(updater_spawned)
             .saturating_add(plugin_invocations_spawned);
         let terminated = self
             .terminated_http_tasks
             .saturating_add(if gateway_joined { 2 } else { 0 })
             .saturating_add(u64::from(plugins_joined))
             .saturating_add(device_report.terminated)
+            .saturating_add(channel_report.terminated)
+            .saturating_add(u64::from(updater_spawned > 0 && updater_joined))
             .saturating_add(plugin_invocations_terminated);
         let deadline_expired = started.elapsed() >= PRODUCTION_STOP_DEADLINE;
         let clean = abandoned == 0 && terminated == spawned && !deadline_expired && fault.is_none();
@@ -1488,6 +1621,10 @@ fn remaining(started: Instant) -> Duration {
     PRODUCTION_STOP_DEADLINE.saturating_sub(started.elapsed())
 }
 
+fn startup_cancelled() -> ProductionError {
+    ProductionError::message("startup", "startup was cancelled by the supervisor")
+}
+
 fn joined_http_result(
     result: Result<(&'static str, io::Result<()>), tokio::task::JoinError>,
 ) -> String {
@@ -1566,6 +1703,7 @@ fn channel_statuses(settings: &LegacySettings) -> Result<Vec<Value>, ProductionE
             "implementation": match entry.implementation {
                 ImplementationStatus::Full => "full",
                 ImplementationStatus::OutboundWebhook => "outbound_webhook",
+                ImplementationStatus::CompatibilityShim => "compatibility_shim",
                 ImplementationStatus::RegistrationOnly => "registration_only",
             },
             "exchange": match exchange {
@@ -1575,16 +1713,12 @@ fn channel_statuses(settings: &LegacySettings) -> Result<Vec<Value>, ProductionE
                 ExchangeSupport::Bidirectional => "bidirectional",
             },
             "legacyHttpAdapter": enabled && matches!(id, "msteams" | "whatsapp"),
+            "nativeAdapter": enabled,
         }));
-        if enabled
-            && !matches!(id, "msteams" | "whatsapp")
-            && exchange != ExchangeSupport::Bidirectional
-        {
+        if enabled && exchange != ExchangeSupport::Bidirectional {
             return Err(ProductionError::message(
                 "channels",
-                format!(
-                    "{id} is enabled but its Rust adapter is {exchange:?}; disable it or install a bidirectional native port"
-                ),
+                format!("{id} is enabled but the integrated registry reports {exchange:?}"),
             ));
         }
     }
@@ -1676,6 +1810,47 @@ fn legacy_settings(snapshot: &ConfigSnapshot) -> Result<LegacySettings, Producti
     } else {
         None
     };
+    let telegram = if telegram_enabled {
+        let token_reference = get(&["core", "channels", "telegram", "bot_token"])
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProductionError::message("legacy-config", "Telegram bot token is missing")
+            })?;
+        let token_reference = SecretRef::parse(token_reference)
+            .map_err(|error| ProductionError::message("legacy-config", error))?;
+        Some(TelegramSettings {
+            token: resolve_secret(&token_reference)?,
+            poll_interval: Duration::from_millis(required_u64(&[
+                "core",
+                "channels",
+                "telegram",
+                "poll_interval_ms",
+            ])?),
+        })
+    } else {
+        None
+    };
+    let discord = if discord_enabled {
+        let token_reference = get(&["core", "channels", "discord", "bot_token"])
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProductionError::message("legacy-config", "Discord bot token is missing")
+            })?;
+        let token_reference = SecretRef::parse(token_reference)
+            .map_err(|error| ProductionError::message("legacy-config", error))?;
+        let gateway_url = get(&["core", "channels", "discord", "gateway_url"])
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProductionError::message("legacy-config", "Discord Gateway URL is missing")
+            })?;
+        Some(DiscordSettings {
+            token: resolve_secret(&token_reference)?,
+            gateway_url: gateway_url.to_owned(),
+            intents: required_u64(&["core", "channels", "discord", "gateway_intents"])?,
+        })
+    } else {
+        None
+    };
     let whatsapp = if whatsapp_enabled {
         let verify_reference = get(&["core", "channels", "whatsapp", "verify_token"])
             .and_then(Value::as_str)
@@ -1716,6 +1891,8 @@ fn legacy_settings(snapshot: &ConfigSnapshot) -> Result<LegacySettings, Producti
         device_flow_enabled: snapshot.core().auth().device_enabled(),
         channels,
         teams,
+        telegram,
+        discord,
         whatsapp,
         teams_rate_limit_per_minute: u32::try_from(required_u64(&[
             "core",
@@ -1733,21 +1910,93 @@ fn legacy_settings(snapshot: &ConfigSnapshot) -> Result<LegacySettings, Producti
 }
 
 fn resolve_secret(reference: &SecretRef) -> Result<SecretString, ProductionError> {
-    let Some(name) = reference.as_str().strip_prefix("env:") else {
-        return Err(ProductionError::message(
-            "secrets",
-            "this daemon build currently composes env: secret references only",
-        ));
-    };
-    let value = std::env::var(name)
-        .map_err(|_| ProductionError::message("secrets", format!("{name} is not available")))?;
-    if value.is_empty() {
-        return Err(ProductionError::message(
-            "secrets",
-            format!("{name} is empty"),
-        ));
+    if let Some(name) = reference.as_str().strip_prefix("env:") {
+        let value = std::env::var(name)
+            .map_err(|_| ProductionError::message("secrets", format!("{name} is not available")))?;
+        if value.is_empty() {
+            return Err(ProductionError::message(
+                "secrets",
+                format!("{name} is empty"),
+            ));
+        }
+        return Ok(SecretString::new(value));
     }
-    Ok(SecretString::new(value))
+    if let Some(identifier) = reference
+        .as_str()
+        .strip_prefix("keyring://")
+        .or_else(|| reference.as_str().strip_prefix("service://"))
+    {
+        let (service, account) = identifier.split_once('/').ok_or_else(|| {
+            ProductionError::message("secrets", "platform secret reference is malformed")
+        })?;
+        let key = CredentialKey::new(service, account)
+            .map_err(|error| ProductionError::new("secrets", error))?;
+        return native_secret(&key)?.ok_or_else(|| {
+            ProductionError::message("secrets", "platform credential is not available")
+        });
+    }
+    if let Some(descriptor) = reference.as_str().strip_prefix("fd://") {
+        #[cfg(unix)]
+        {
+            let descriptor = descriptor
+                .parse::<u32>()
+                .map_err(|_| ProductionError::message("secrets", "secret descriptor is invalid"))?;
+            let file = std::fs::File::open(format!("/dev/fd/{descriptor}"))
+                .map_err(|error| ProductionError::new("secrets", error))?;
+            let mut value = String::new();
+            file.take(1024 * 1024)
+                .read_to_string(&mut value)
+                .map_err(|error| ProductionError::new("secrets", error))?;
+            while value.ends_with(['\r', '\n']) {
+                value.pop();
+            }
+            if value.is_empty() {
+                return Err(ProductionError::message(
+                    "secrets",
+                    "secret descriptor is empty",
+                ));
+            }
+            return Ok(SecretString::new(value));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = descriptor;
+            return Err(ProductionError::message(
+                "secrets",
+                "fd secret references are unavailable on this platform",
+            ));
+        }
+    }
+    Err(ProductionError::message(
+        "secrets",
+        "secret reference backend is not supported",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn native_secret(key: &CredentialKey) -> Result<Option<SecretString>, ProductionError> {
+    let store = claw_provider_sdk::secret::AppleKeychainStore::new()
+        .map_err(|error| ProductionError::new("secrets", error))?;
+    store
+        .get(key)
+        .map_err(|error| ProductionError::new("secrets", error))
+}
+
+#[cfg(target_os = "windows")]
+fn native_secret(key: &CredentialKey) -> Result<Option<SecretString>, ProductionError> {
+    let store = claw_provider_sdk::secret::WindowsCredentialManagerStore::new()
+        .map_err(|error| ProductionError::new("secrets", error))?;
+    store
+        .get(key)
+        .map_err(|error| ProductionError::new("secrets", error))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn native_secret(_key: &CredentialKey) -> Result<Option<SecretString>, ProductionError> {
+    Err(ProductionError::message(
+        "secrets",
+        "native credential storage is unavailable on this platform",
+    ))
 }
 
 fn proxy_policy(snapshot: &ConfigSnapshot) -> Result<ProxyPolicy, ProductionError> {
@@ -1767,15 +2016,17 @@ fn proxy_policy(snapshot: &ConfigSnapshot) -> Result<ProxyPolicy, ProductionErro
         })
 }
 
-struct CompletedRoleFetcher(Option<Result<RoleResponse, ProductionError>>);
+struct TransportRoleFetcher {
+    proxy: ProxyPolicy,
+    runtime: tokio::runtime::Handle,
+}
 
-impl RoleSourceFetcher for CompletedRoleFetcher {
+impl RoleSourceFetcher for TransportRoleFetcher {
     type Error = ProductionError;
 
-    fn fetch(&mut self, _request: RoleFetchRequest<'_>) -> Result<RoleResponse, Self::Error> {
-        self.0.take().ok_or_else(|| {
-            ProductionError::message("role-fetch", "role response was already consumed")
-        })?
+    fn fetch(&mut self, request: RoleFetchRequest<'_>) -> Result<RoleResponse, Self::Error> {
+        self.runtime
+            .block_on(fetch_role_response(request, self.proxy.clone()))
     }
 }
 
@@ -1783,18 +2034,21 @@ async fn load_role(
     snapshot: &ConfigSnapshot,
     proxy: ProxyPolicy,
 ) -> Result<RoleProfile, ProductionError> {
-    let role_config = snapshot.core().role();
-    let request = RoleFetchRequest::new(role_config.source_url());
-    let response = fetch_role_response(request, proxy).await;
-    let mut fetcher = CompletedRoleFetcher(Some(response));
-    let document = load_role_document(&mut fetcher, role_config)
-        .map_err(|error| ProductionError::new("role", error))?;
-    Ok(RoleProfile {
-        prompt: document.content().to_owned(),
-        model: document.model().map(str::to_owned),
-        outcome: document.outcome(),
-        diagnostics: document.diagnostics().to_vec(),
+    let role_config = snapshot.core().role().clone();
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let mut fetcher = TransportRoleFetcher { proxy, runtime };
+        let document = load_role_document(&mut fetcher, &role_config)
+            .map_err(|error| ProductionError::new("role", error))?;
+        Ok(RoleProfile {
+            prompt: document.content().to_owned(),
+            model: document.model().map(str::to_owned),
+            outcome: document.outcome(),
+            diagnostics: document.diagnostics().to_vec(),
+        })
     })
+    .await
+    .map_err(|error| ProductionError::new("role", error))?
 }
 
 async fn fetch_role_response(

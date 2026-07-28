@@ -1,6 +1,6 @@
 //! Concrete adapters for the shipped HTTP surface.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
@@ -26,8 +26,9 @@ use claw_provider_sdk::model::{
 use claw_provider_sdk::stream::StreamAccumulator;
 use claw_provider_sdk::{
     BoxFuture as ProviderFuture, CancelToken, CompletionStream, ErrorKind, Provider, ProviderError,
-    RequestContext, StreamEvent,
+    ProviderPhase, ProviderStatus, RequestContext, StreamEvent,
 };
+use claw_providers::{ProviderLease, ProviderSlot};
 use claw_security::audit::{AuditAction, AuditEvent, AuditOutcome, AuditReason, AuditSubject};
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
@@ -146,6 +147,20 @@ impl ModelToolCatalog for EmptyModelTools {
     }
 }
 
+/// Dynamic runtime state projected into operator status.
+pub trait OperatorRuntimeStatus: Send + Sync {
+    /// Returns a machine-readable bounded status snapshot.
+    fn status(&self) -> Value;
+
+    /// Dispatches one runtime-owned admin method.
+    fn dispatch<'a>(
+        &'a self,
+        method: &'a str,
+        params: Option<&'a Value>,
+        cancellation: CancellationToken,
+    ) -> PortFuture<'a, Result<Option<Value>, PortError>>;
+}
+
 /// HTTP/provider-SDK bridge with a startup-populated model cache.
 #[derive(Clone, Copy, Debug)]
 pub struct ProviderHistoryConfig {
@@ -227,11 +242,8 @@ impl ProviderAdapter {
     ///
     /// Returns the provider's typed model-listing error, or an invalid-request
     /// error when the configured default is absent from the live catalogue.
-    pub async fn initialize(&self) -> Result<(), ProviderError> {
-        let models = self
-            .provider
-            .list_models(&RequestContext::new().correlation_id("daemon-startup"))
-            .await?;
+    pub async fn initialize(&self, context: &RequestContext) -> Result<(), ProviderError> {
+        let models = self.provider.list_models(context).await?;
         let selected = self.default_model();
         if !models.iter().any(|model| model.id.as_str() == selected) {
             return Err(ProviderError::new(
@@ -595,6 +607,7 @@ impl ProviderPort for ProviderAdapter {
 
 /// Provider port that can start unauthenticated and atomically activate later.
 pub struct SwappableProvider {
+    slot: Arc<ProviderSlot>,
     state: RwLock<SwappableState>,
     history_config: ProviderHistoryConfig,
     model_tools: Arc<dyn ModelToolCatalog>,
@@ -609,6 +622,22 @@ struct SwappableState {
     generation: u64,
 }
 
+struct ProviderActivationGuard(Option<CancelToken>);
+
+impl ProviderActivationGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ProviderActivationGuard {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            cancel.cancel();
+        }
+    }
+}
+
 impl SwappableProvider {
     /// Creates an unauthenticated provider slot.
     #[must_use]
@@ -620,6 +649,7 @@ impl SwappableProvider {
         readiness: Arc<DependencyReadiness>,
     ) -> Self {
         Self {
+            slot: Arc::new(ProviderSlot::new()),
             state: RwLock::new(SwappableState {
                 current: None,
                 default_model: default_model.into(),
@@ -640,6 +670,25 @@ impl SwappableProvider {
     /// Returns the provider's typed model-listing failure, an unknown-model
     /// refusal, or an internal error when the provider slot is poisoned.
     pub async fn activate(&self, provider: Arc<dyn Provider>) -> Result<(), ProviderError> {
+        self.activate_with_cancel(provider, CancelToken::new())
+            .await
+    }
+
+    /// Activates a provider under caller-owned cooperative cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider's typed startup, ping, or model-listing failure.
+    pub async fn activate_with_cancel(
+        &self,
+        provider: Arc<dyn Provider>,
+        cancel: CancelToken,
+    ) -> Result<(), ProviderError> {
+        let mut cancel_on_drop = ProviderActivationGuard(Some(cancel.clone()));
+        let previous = self.slot.active().await;
+        let activation =
+            RequestContext::with_cancel(cancel).correlation_id("daemon-provider-activation");
+        let lease = self.slot.activate(provider, &activation).await?;
         loop {
             let (generation, model, role) = {
                 let state = self.state.read().map_err(|_| provider_slot_error())?;
@@ -650,7 +699,7 @@ impl SwappableProvider {
                 )
             };
             let adapter = Arc::new(ProviderAdapter::new(
-                Arc::clone(&provider),
+                lease.provider_arc(),
                 model,
                 role,
                 self.history_config,
@@ -658,15 +707,56 @@ impl SwappableProvider {
                 Arc::clone(&self.readiness),
                 Arc::clone(&self.ready_gate),
             ));
-            adapter.initialize().await?;
+            if let Err(error) = adapter.initialize(&activation).await {
+                self.restore_slot(previous).await;
+                return Err(error);
+            }
+            lease.ensure_current(self.slot.as_ref(), claw_provider_sdk::Operation::Startup)?;
             let mut state = self.state.write().map_err(|_| provider_slot_error())?;
             if state.generation != generation {
                 continue;
             }
             state.current = Some(adapter);
             drop(state);
+            cancel_on_drop.disarm();
             return Ok(());
         }
+    }
+
+    async fn restore_slot(&self, previous: Option<ProviderLease>) {
+        if let Some(previous) = previous {
+            let context = RequestContext::new().correlation_id("daemon-provider-rollback");
+            let _ = self.slot.activate(previous.provider_arc(), &context).await;
+        } else {
+            let _ = self.slot.clear().await;
+        }
+    }
+
+    /// Fences new calls and clears the active provider.
+    pub async fn shutdown(&self) {
+        let _ = self.slot.clear().await;
+        if let Ok(mut state) = self.state.write() {
+            state.current = None;
+            state.generation = state.generation.saturating_add(1);
+        }
+        self.ready_gate.store(false, Ordering::Release);
+        self.readiness.set("provider", false);
+    }
+
+    /// Returns the shared provider-generation fence.
+    #[must_use]
+    pub fn provider_generation(&self) -> u64 {
+        self.slot.current_generation().get()
+    }
+
+    /// Returns tool names already supplied by the host-owned model catalogue.
+    #[must_use]
+    pub fn model_tool_names(&self) -> BTreeSet<String> {
+        self.model_tools
+            .definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect()
     }
 
     /// Returns whether a provider is currently active.
@@ -1391,7 +1481,6 @@ impl WebhookPort for UnavailableExternalPorts {
 }
 
 /// Immutable configuration and capability inventory exposed to operators.
-#[derive(Debug)]
 pub struct OperatorInventory {
     channels: Vec<Value>,
     registered_skill_count: usize,
@@ -1399,6 +1488,19 @@ pub struct OperatorInventory {
     updates_enabled: bool,
     config_resolution: Value,
     plugin_activation: Value,
+    runtime: Arc<dyn OperatorRuntimeStatus>,
+}
+
+impl std::fmt::Debug for OperatorInventory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OperatorInventory")
+            .field("channels", &self.channels)
+            .field("registered_skill_count", &self.registered_skill_count)
+            .field("active_skill_count", &self.active_skill_count)
+            .field("updates_enabled", &self.updates_enabled)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OperatorInventory {
@@ -1411,6 +1513,7 @@ impl OperatorInventory {
         updates_enabled: bool,
         config_resolution: Value,
         plugin_activation: Value,
+        runtime: Arc<dyn OperatorRuntimeStatus>,
     ) -> Self {
         Self {
             channels,
@@ -1419,6 +1522,7 @@ impl OperatorInventory {
             updates_enabled,
             config_resolution,
             plugin_activation,
+            runtime,
         }
     }
 }
@@ -1460,15 +1564,21 @@ impl OperatorAdmin {
             "failing": readiness.failing,
             "uptimeMs": readiness.uptime_ms,
             "provider": self.provider.provider_name(),
+            "providerGeneration": self.provider.provider_generation(),
             "model": model,
             "configGeneration": generation,
             "configuration": self.inventory.config_resolution,
             "plugins": self.inventory.plugin_activation,
+            "runtime": self.inventory.runtime.status(),
             "channels": self.inventory.channels,
             "skills": {
                 "registered": self.inventory.registered_skill_count,
                 "active": self.inventory.active_skill_count,
-                "state": "requires_native_ports",
+                "state": if self.inventory.active_skill_count > 0 {
+                    "signed_plugins_active"
+                } else {
+                    "requires_native_ports"
+                },
             },
         }))
     }
@@ -1479,7 +1589,7 @@ impl AdminPort for OperatorAdmin {
         &self,
         method: String,
         params: Option<Value>,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<AdminSuccess, AdminFailure>> {
         Box::pin(async move {
             let payload = match method.as_str() {
@@ -1494,7 +1604,11 @@ impl AdminPort for OperatorAdmin {
                 "channels.status" => json!({"channels": self.inventory.channels}),
                 "update.status" => json!({
                     "configured": self.inventory.updates_enabled,
-                    "state": "external_updater_required",
+                    "state": if self.inventory.updates_enabled {
+                        "signed_check_scheduled"
+                    } else {
+                        "disabled"
+                    },
                     "version": env!("CARGO_PKG_VERSION"),
                     "retryOwner": "gta-claw-updater",
                     "installCleanup": "updater_owned",
@@ -1526,6 +1640,18 @@ impl AdminPort for OperatorAdmin {
                     json!({"generation": applied.generation, "changed": applied.changed})
                 }
                 _ => {
+                    if let Some(payload) = self
+                        .inventory
+                        .runtime
+                        .dispatch(&method, params.as_ref(), cancellation)
+                        .await
+                        .map_err(admin_port_failure)?
+                    {
+                        return Ok(AdminSuccess {
+                            payload,
+                            meta: None,
+                        });
+                    }
                     return Err(AdminFailure {
                         code: "UNAVAILABLE".to_owned(),
                         message: format!(
@@ -1639,6 +1765,25 @@ impl Provider for SmokeProvider {
             Capability::Embeddings,
             Capability::ModelListing,
         ])
+    }
+
+    fn startup<'a>(
+        &'a self,
+        _context: &'a RequestContext,
+    ) -> ProviderFuture<'a, Result<ProviderStatus, ProviderError>> {
+        Box::pin(async move { Ok(ProviderStatus::new(self.id.clone(), ProviderPhase::Started)) })
+    }
+
+    fn ping<'a>(
+        &'a self,
+        _context: &'a RequestContext,
+    ) -> ProviderFuture<'a, Result<ProviderStatus, ProviderError>> {
+        Box::pin(async move {
+            Ok(ProviderStatus::new(
+                self.id.clone(),
+                ProviderPhase::Reachable,
+            ))
+        })
     }
 
     fn complete<'a>(

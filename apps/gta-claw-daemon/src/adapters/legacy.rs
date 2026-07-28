@@ -1,20 +1,29 @@
 //! Concrete adapters consumed by the legacy HTTP compatibility facade.
 
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 use std::process::{Command as BlockingCommand, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use claw_channels::segment_outbound_text;
+use claw_channel_sdk::{
+    Channel, ChannelCredential, ChannelError, CredentialBinding, CredentialKind, CredentialRequest,
+    NetworkOrigin, OriginTrustError, OriginTrustStore, OutboundMessage, authorize_origin,
+};
+use claw_channels::{
+    AuthenticationPrompt, DiagnosticLevel, DiagnosticSink, OperatorDiagnostic, SystemClock,
+    TeamsAction, TeamsActivityHandler, TeamsActivityOutcome, WhatsAppChannel, WhatsAppSendRequest,
+    WhatsAppTransport, segment_outbound_text,
+};
 use claw_http_api::{
-    LegacyAdminAction, LegacyChannelMessage, LegacyChannelMessagePort, LegacyDeviceFlowPort,
-    LegacyExecResult, LegacyHostAdminPort, LegacyOsInfo, LegacyProcessInfo, LegacyProcessMemory,
-    LegacySystemInfo, LegacyTeamsPort, LegacyWhatsAppPort, PortError, PortErrorKind, PortFuture,
+    LegacyAdminAction, LegacyDeviceFlowPort, LegacyExecResult, LegacyHostAdminPort, LegacyOsInfo,
+    LegacyProcessInfo, LegacyProcessMemory, LegacySystemInfo, LegacyTeamsPort, LegacyWhatsAppPort,
+    PortError, PortErrorKind, PortFuture,
 };
 use claw_provider_sdk::http::{Body, HttpRequest, HttpTransport, Method};
 use claw_provider_sdk::{BoundSecret, CancelToken, Operation, Origin, SecretString};
-use claw_providers::DeviceFlow;
+use claw_providers::{DeviceFlow, DeviceFlowSession};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -23,21 +32,19 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use super::agent_runtime::AgentRuntime;
 use super::http_api::Diagnostics;
 
 const ADMIN_OUTPUT_LIMIT: usize = 1024 * 1024;
-const WHATSAPP_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Activates a provider from a GitHub OAuth token obtained by Device Flow.
 pub trait DeviceTokenActivator: Send + Sync {
     /// Builds and publishes the provider.
-    fn activate(&self, token: SecretString) -> PortFuture<'_, Result<(), PortError>>;
-}
-
-#[derive(Clone)]
-struct PendingAuthorization {
-    authorization: claw_providers::github_copilot::DeviceAuthorization,
-    expires_at: Instant,
+    fn activate(
+        &self,
+        token: SecretString,
+        cancellation: CancelToken,
+    ) -> PortFuture<'_, Result<(), PortError>>;
 }
 
 struct TerminationGuard(Arc<AtomicU64>);
@@ -61,16 +68,32 @@ pub struct DeviceTaskReport {
 
 /// Reusable Device Flow instructions plus one tracked bounded poller.
 pub struct LegacyDeviceFlowAdapter {
-    flow: Arc<DeviceFlow>,
+    flow: Arc<DeviceFlowSession>,
     activator: Arc<dyn DeviceTokenActivator>,
-    pending: Arc<AsyncMutex<Option<PendingAuthorization>>>,
     single_flight: AsyncMutex<()>,
     task: AsyncMutex<Option<JoinHandle<()>>>,
     active_cancel: AsyncMutex<Option<CancelToken>>,
+    instructions: Arc<RwLock<Option<String>>>,
     diagnostics: Arc<Diagnostics>,
     stopping: AtomicBool,
     spawned: Arc<AtomicU64>,
     terminated: Arc<AtomicU64>,
+}
+
+impl Drop for LegacyDeviceFlowAdapter {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        if let Ok(active) = self.active_cancel.try_lock()
+            && let Some(cancel) = active.as_ref()
+        {
+            cancel.cancel();
+        }
+        if let Ok(task) = self.task.try_lock()
+            && let Some(task) = task.as_ref()
+        {
+            task.abort();
+        }
+    }
 }
 
 impl LegacyDeviceFlowAdapter {
@@ -79,15 +102,16 @@ impl LegacyDeviceFlowAdapter {
     pub fn new(
         flow: DeviceFlow,
         activator: Arc<dyn DeviceTokenActivator>,
+        instructions: Arc<RwLock<Option<String>>>,
         diagnostics: Arc<Diagnostics>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            flow: Arc::new(flow),
+            flow: Arc::new(DeviceFlowSession::new(flow)),
             activator,
-            pending: Arc::new(AsyncMutex::new(None)),
             single_flight: AsyncMutex::new(()),
             task: AsyncMutex::new(None),
             active_cancel: AsyncMutex::new(None),
+            instructions,
             diagnostics,
             stopping: AtomicBool::new(false),
             spawned: Arc::new(AtomicU64::new(0)),
@@ -103,6 +127,7 @@ impl LegacyDeviceFlowAdapter {
         if let Some(cancel) = active_cancel {
             cancel.cancel();
         }
+        let _ = self.flow.clear().await;
         let Ok(_single_flight) = tokio::time::timeout(budget, self.single_flight.lock()).await
         else {
             return DeviceTaskReport {
@@ -130,10 +155,12 @@ impl LegacyDeviceFlowAdapter {
         }
     }
 
-    fn instructions_for(authorization: &PendingAuthorization) -> String {
+    fn instructions_for(
+        authorization: &claw_providers::github_copilot::DeviceAuthorization,
+    ) -> String {
         format!(
             "Please authorize GTA-Claw with your GitHub account:\n1. Open: {}\n2. Enter code: **{}**",
-            authorization.authorization.verification_uri, authorization.authorization.user_code
+            authorization.verification_uri, authorization.user_code
         )
     }
 }
@@ -151,13 +178,8 @@ impl LegacyDeviceFlowPort for LegacyDeviceFlowAdapter {
                     "Device Flow is shutting down",
                 ));
             }
-            {
-                let pending = self.pending.lock().await;
-                if let Some(pending) = pending.as_ref()
-                    && Instant::now() < pending.expires_at
-                {
-                    return Ok(Self::instructions_for(pending));
-                }
+            if let Some(pending) = self.flow.pending().await {
+                return Ok(Self::instructions_for(&pending));
             }
 
             let active_cancel = self.active_cancel.lock().await.take();
@@ -175,7 +197,7 @@ impl LegacyDeviceFlowPort for LegacyDeviceFlowAdapter {
             let sdk_cancel = CancelToken::new();
             *self.active_cancel.lock().await = Some(sdk_cancel.clone());
             let authorization = tokio::select! {
-                result = self.flow.start(&sdk_cancel) => {
+                result = self.flow.begin(&sdk_cancel) => {
                     result.map_err(|error| provider_port_error(&error))?
                 },
                 () = cancellation.cancelled() => {
@@ -190,46 +212,37 @@ impl LegacyDeviceFlowPort for LegacyDeviceFlowAdapter {
                     "Device Flow is shutting down",
                 ));
             }
-            let pending = PendingAuthorization {
-                expires_at: Instant::now()
-                    .checked_add(Duration::from_secs(authorization.expires_in))
-                    .unwrap_or_else(Instant::now),
-                authorization,
-            };
-            let instructions = Self::instructions_for(&pending);
-            *self.pending.lock().await = Some(pending.clone());
+            let instructions = Self::instructions_for(&authorization);
+            *self
+                .instructions
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = Some(instructions.clone());
             self.spawned.fetch_add(1, Ordering::SeqCst);
 
             let flow = Arc::clone(&self.flow);
             let activator = Arc::clone(&self.activator);
-            let pending_state = Arc::clone(&self.pending);
             let diagnostics = Arc::clone(&self.diagnostics);
             let terminated = Arc::clone(&self.terminated);
-            let user_code = pending.authorization.user_code.clone();
             let task = tokio::spawn(async move {
                 let _guard = TerminationGuard(terminated);
                 match flow
-                    .wait_for_token(&pending.authorization, &sdk_cancel)
+                    .activate_with(&sdk_cancel, |token, cancel| async {
+                        activator.activate(token, cancel).await.map_err(|error| {
+                            claw_provider_sdk::ProviderError::new(
+                                claw_provider_sdk::ErrorKind::Server,
+                                "github-copilot",
+                                Operation::Authorize,
+                                error.message,
+                            )
+                        })
+                    })
                     .await
                 {
-                    Ok(token) => match activator.activate(token).await {
-                        Ok(()) => diagnostics.record("GitHub Device Flow activated the provider"),
-                        Err(error) => diagnostics.record(format!(
-                            "GitHub Device Flow provider activation failed: {}",
-                            error.message
-                        )),
-                    },
+                    Ok(()) => diagnostics.record("GitHub Device Flow activated the provider"),
                     Err(error) => diagnostics.record(format!(
                         "GitHub Device Flow polling ended: {}",
                         error.kind().as_str()
                     )),
-                }
-                let mut current = pending_state.lock().await;
-                if current
-                    .as_ref()
-                    .is_some_and(|pending| pending.authorization.user_code == user_code)
-                {
-                    *current = None;
                 }
             });
             *self.task.lock().await = Some(task);
@@ -238,14 +251,87 @@ impl LegacyDeviceFlowPort for LegacyDeviceFlowAdapter {
     }
 }
 
-/// Teams activity adapter that normalizes inbound text through the shared runtime.
+struct ChannelDiagnostics(Arc<Diagnostics>);
+
+impl DiagnosticSink for ChannelDiagnostics {
+    fn record(&mut self, diagnostic: OperatorDiagnostic<'_>) {
+        self.0.record(format!("channel: {diagnostic}"));
+        match diagnostic.level {
+            DiagnosticLevel::Info => tracing::info!(
+                channel = diagnostic.channel_id,
+                code = %diagnostic.code,
+                "channel diagnostic"
+            ),
+            DiagnosticLevel::Warning => tracing::warn!(
+                channel = diagnostic.channel_id,
+                code = %diagnostic.code,
+                "channel diagnostic"
+            ),
+            DiagnosticLevel::Error => tracing::error!(
+                channel = diagnostic.channel_id,
+                code = %diagnostic.code,
+                "channel diagnostic"
+            ),
+        }
+    }
+}
+
+struct ExactOriginTrust {
+    channel: &'static str,
+    account: String,
+    host: &'static str,
+}
+
+impl OriginTrustStore for ExactOriginTrust {
+    fn is_enrolled(
+        &self,
+        channel_id: &str,
+        account_id: &str,
+        origin: &NetworkOrigin,
+    ) -> Result<bool, OriginTrustError> {
+        Ok(channel_id == self.channel
+            && account_id == self.account
+            && origin.host() == self.host
+            && origin.port().is_none_or(|port| port == 443))
+    }
+}
+
+fn official_origin(
+    channel: &'static str,
+    account: &str,
+    host: &'static str,
+) -> Result<claw_channel_sdk::ApprovedOrigin, PortError> {
+    let origin = NetworkOrigin::https(host, None)
+        .map_err(|error| invalid(format!("{channel} origin is invalid: {error}")))?;
+    authorize_origin(
+        &ExactOriginTrust {
+            channel,
+            account: account.to_owned(),
+            host,
+        },
+        channel,
+        account,
+        &origin,
+    )
+    .map_err(|error| invalid(format!("{channel} origin is not enrolled: {error}")))
+}
+
+/// Teams activity adapter over the integrated channel state machine.
 pub struct LegacyTeamsAdapter {
-    messages: Arc<dyn LegacyChannelMessagePort>,
+    runtime: Arc<AgentRuntime>,
+    handler: Mutex<TeamsActivityHandler>,
+    authentication: Arc<RwLock<Option<String>>>,
+    diagnostics: Arc<Diagnostics>,
     transport: HttpTransport,
     app_id: String,
     app_password: SecretString,
     token: AsyncMutex<Option<CachedTeamsToken>>,
     replies: Mutex<VecDeque<String>>,
+}
+
+enum PendingTeamsDispatch {
+    Actions(Vec<TeamsAction>),
+    Command(String),
 }
 
 #[derive(Clone)]
@@ -256,21 +342,38 @@ struct CachedTeamsToken {
 
 impl LegacyTeamsAdapter {
     /// Creates a Teams activity adapter.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-request error when the integrated Teams state machine
+    /// rejects account routing or startup.
     pub fn new(
-        messages: Arc<dyn LegacyChannelMessagePort>,
+        runtime: Arc<AgentRuntime>,
         transport: HttpTransport,
         app_id: String,
         app_password: SecretString,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            messages,
+        authentication: Arc<RwLock<Option<String>>>,
+        diagnostics: Arc<Diagnostics>,
+    ) -> Result<Arc<Self>, PortError> {
+        let action_capacity = NonZeroUsize::new(64)
+            .ok_or_else(|| invalid("Teams action capacity must be non-zero"))?;
+        let mut handler =
+            TeamsActivityHandler::new(app_id.clone(), app_id.clone(), None, action_capacity)
+                .map_err(|error| invalid(format!("Teams handler configuration: {error}")))?;
+        handler
+            .start(&mut ChannelDiagnostics(Arc::clone(&diagnostics)))
+            .map_err(|error| invalid(format!("Teams handler startup: {error}")))?;
+        Ok(Arc::new(Self {
+            runtime,
+            handler: Mutex::new(handler),
+            authentication,
+            diagnostics,
             transport,
             app_id,
             app_password,
             token: AsyncMutex::new(None),
             replies: Mutex::new(VecDeque::with_capacity(16)),
-        })
+        }))
     }
 
     /// Returns the most recent reply retained for transport diagnostics.
@@ -287,62 +390,97 @@ impl LegacyTeamsAdapter {
 impl LegacyTeamsPort for LegacyTeamsAdapter {
     fn handle_activity(
         &self,
-        activity: Value,
+        mut activity: Value,
         cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<(), PortError>> {
         Box::pin(async move {
-            let object = activity
-                .as_object()
-                .ok_or_else(|| invalid("Teams activity must be an object"))?;
-            let kind = object
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if !matches!(kind, "message" | "messageUpdate") {
-                return Ok(());
+            if let Some(sender) = activity.get_mut("from").and_then(Value::as_object_mut)
+                && !sender.contains_key("id")
+            {
+                let id = sender
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or("teams-user")
+                    .to_owned();
+                sender.insert("id".to_owned(), Value::String(id));
             }
-            let Some(text) = object
-                .get("text")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-            else {
-                return Ok(());
-            };
-            let conversation_id = object
+            let conversation_id = activity
                 .get("conversation")
                 .and_then(Value::as_object)
                 .and_then(|conversation| conversation.get("id"))
                 .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| invalid("Teams message has no conversation id"))?;
-            let user_name = object
-                .get("from")
-                .and_then(Value::as_object)
-                .and_then(|from| from.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or("Unknown");
-            let service_url = object
+                .map(str::to_owned);
+            let service_url = activity
                 .get("serviceUrl")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let reply = self
-                .messages
-                .process(
-                    LegacyChannelMessage {
-                        channel: "teams",
-                        conversation_id: conversation_id.to_owned(),
-                        user_name: user_name.to_owned(),
-                        text: text.to_owned(),
-                    },
-                    cancellation.clone(),
-                )
-                .await?;
-            if let Some(service_url) = service_url
-                && !reply.trim().is_empty()
+            let payload = serde_json::to_vec(&activity)
+                .map_err(|_| invalid("Teams activity encoding failed"))?;
+            let instructions = self
+                .authentication
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            let mut conversation = self.runtime.conversation();
+            let pending = {
+                let mut handler = self.handler.lock().map_err(|_| {
+                    PortError::new(PortErrorKind::Internal, "Teams state unavailable")
+                })?;
+                let outcome = handler
+                    .handle_activity(
+                        &payload,
+                        self.runtime.authenticated().then_some(&mut conversation),
+                        instructions.as_deref().map_or(
+                            AuthenticationPrompt::Unconfigured,
+                            AuthenticationPrompt::Instructions,
+                        ),
+                        &mut ChannelDiagnostics(Arc::clone(&self.diagnostics)),
+                    )
+                    .map_err(|error| invalid(format!("Teams activity rejected: {error}")))?;
+                match outcome {
+                    TeamsActivityOutcome::Ignored => PendingTeamsDispatch::Actions(Vec::new()),
+                    TeamsActivityOutcome::ActionsQueued { .. } => {
+                        let mut actions = Vec::new();
+                        while let Some(action) = handler.poll_action().map_err(|error| {
+                            invalid(format!("Teams action drain failed: {error}"))
+                        })? {
+                            actions.push(action);
+                        }
+                        PendingTeamsDispatch::Actions(actions)
+                    }
+                    TeamsActivityOutcome::DeferredCommand(invocation) => {
+                        PendingTeamsDispatch::Command(invocation.name)
+                    }
+                }
+            };
+            let actions = match pending {
+                PendingTeamsDispatch::Actions(actions) => actions,
+                PendingTeamsDispatch::Command(command) => {
+                    let conversation_id = conversation_id
+                        .as_deref()
+                        .ok_or_else(|| invalid("Teams command has no conversation id"))?;
+                    let reply = self
+                        .runtime
+                        .channel_command(conversation_id, &command)
+                        .await?;
+                    let mut actions = Vec::new();
+                    for segment in segment_outbound_text("msteams", &reply)
+                        .map_err(|error| invalid(format!("Teams command segmentation: {error}")))?
+                    {
+                        actions.push(TeamsAction::Reply(segment.into_owned()));
+                    }
+                    actions
+                }
+            };
+            if !actions.is_empty()
+                && let (Some(service_url), Some(conversation_id)) =
+                    (service_url.as_deref(), conversation_id.as_deref())
             {
-                self.send_reply(&service_url, conversation_id, &reply, cancellation)
-                    .await?;
+                for action in &actions {
+                    self.send_action(service_url, conversation_id, action, cancellation.clone())
+                        .await?;
+                }
             }
             let mut replies = self.replies.lock().map_err(|_| {
                 PortError::new(PortErrorKind::Internal, "Teams reply state unavailable")
@@ -350,7 +488,10 @@ impl LegacyTeamsPort for LegacyTeamsAdapter {
             if replies.len() == 16 {
                 replies.pop_front();
             }
-            replies.push_back(reply);
+            replies.extend(actions.into_iter().filter_map(|action| match action {
+                TeamsAction::Typing => None,
+                TeamsAction::Reply(reply) => Some(reply),
+            }));
             drop(replies);
             Ok(())
         })
@@ -358,11 +499,11 @@ impl LegacyTeamsPort for LegacyTeamsAdapter {
 }
 
 impl LegacyTeamsAdapter {
-    async fn send_reply(
+    async fn send_action(
         &self,
         service_url: &str,
         conversation_id: &str,
-        reply: &str,
+        action: &TeamsAction,
         cancellation: CancellationToken,
     ) -> Result<(), PortError> {
         let base = Url::parse(service_url).map_err(|_| invalid("Teams service URL is invalid"))?;
@@ -391,39 +532,36 @@ impl LegacyTeamsAdapter {
                 .map_err(|error| invalid(format!("Teams reply origin: {error}")))?,
             token,
         );
-        let segments = segment_outbound_text("msteams", reply)
-            .map_err(|error| invalid(format!("Teams reply segmentation failed: {error}")))?;
-        for segment in segments {
-            let body = serde_json::to_string(&json!({
-                "type": "message",
-                "text": segment,
-            }))
+        let body = match action {
+            TeamsAction::Typing => json!({"type":"typing"}),
+            TeamsAction::Reply(text) => json!({"type":"message","text":text}),
+        };
+        let body = serde_json::to_string(&body)
             .map_err(|_| PortError::new(PortErrorKind::Internal, "Teams encoding failed"))?;
-            let request = HttpRequest::new(Method::Post, endpoint.clone())
-                .header("accept", "application/json")
-                .bound_secret_header("authorization", "Bearer ", &credential)
-                .map_err(|_| invalid("Teams credential origin mismatch"))?
-                .body(Body::Json(body))
-                .timeout(Duration::from_secs(15));
-            let sdk_cancel = CancelToken::new();
-            let response = tokio::select! {
-                result = self.transport.send(
-                    "msteams",
-                    Operation::Transport,
-                    request,
-                    &sdk_cancel,
-                ) => result.map_err(|error| provider_port_error(&error))?,
-                () = cancellation.cancelled() => {
-                    sdk_cancel.cancel();
-                    return Err(PortError::new(PortErrorKind::Unavailable, "request cancelled"));
-                }
-            };
-            if !response.is_success() {
-                return Err(PortError::new(
-                    PortErrorKind::Unavailable,
-                    format!("Teams reply returned HTTP {}", response.status()),
-                ));
+        let request = HttpRequest::new(Method::Post, endpoint)
+            .header("accept", "application/json")
+            .bound_secret_header("authorization", "Bearer ", &credential)
+            .map_err(|_| invalid("Teams credential origin mismatch"))?
+            .body(Body::Json(body))
+            .timeout(Duration::from_secs(15));
+        let sdk_cancel = CancelToken::new();
+        let response = tokio::select! {
+            result = self.transport.send(
+                "msteams",
+                Operation::Transport,
+                request,
+                &sdk_cancel,
+            ) => result.map_err(|error| provider_port_error(&error))?,
+            () = cancellation.cancelled() => {
+                sdk_cancel.cancel();
+                return Err(PortError::new(PortErrorKind::Unavailable, "request cancelled"));
             }
+        };
+        if !response.is_success() {
+            return Err(PortError::new(
+                PortErrorKind::Unavailable,
+                format!("Teams reply returned HTTP {}", response.status()),
+            ));
         }
         Ok(())
     }
@@ -496,11 +634,87 @@ impl LegacyTeamsAdapter {
     }
 }
 
-/// Origin-bound `WhatsApp` Graph API sender.
-pub struct GraphWhatsAppAdapter {
+struct GraphWhatsAppTransport {
     transport: HttpTransport,
-    endpoint: Url,
-    credential: BoundSecret,
+    runtime: tokio::runtime::Handle,
+    request_cancel: Arc<Mutex<Option<CancelToken>>>,
+}
+
+impl WhatsAppTransport for GraphWhatsAppTransport {
+    fn send_text(
+        &mut self,
+        request: &WhatsAppSendRequest<'_>,
+    ) -> Result<claw_channels::ProviderResponse, ChannelError> {
+        let endpoint = Url::parse(&format!(
+            "https://graph.facebook.com/v{}.0/{}/messages",
+            request.api_version(),
+            request.phone_number_id()
+        ))
+        .map_err(|_| {
+            ChannelError::Configuration(
+                claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
+            )
+        })?;
+        let origin = Origin::of(&endpoint).map_err(|_| {
+            ChannelError::Configuration(
+                claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
+            )
+        })?;
+        let credential = BoundSecret::new(origin, SecretString::new(request.access_token()));
+        let body = serde_json::to_string(&json!({
+            "messaging_product": request.messaging_product(),
+            "to": request.to(),
+            "type": "text",
+            "text": {"body": request.text()},
+        }))
+        .map_err(|_| ChannelError::Protocol(claw_channel_sdk::ProtocolErrorKind::InvalidField))?;
+        let http_request = HttpRequest::new(Method::Post, endpoint)
+            .header("accept", "application/json")
+            .bound_secret_header("authorization", "Bearer ", &credential)
+            .map_err(|_| ChannelError::Authentication)?
+            .body(Body::Json(body))
+            .timeout(request.request_timeout());
+        let cancel = self
+            .request_cancel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or(ChannelError::Transport(
+                claw_channel_sdk::TransportErrorKind::Io,
+            ))?;
+        let response = self
+            .runtime
+            .block_on(async {
+                self.transport
+                    .send("whatsapp", Operation::Transport, http_request, &cancel)
+                    .await
+            })
+            .map_err(|error| provider_channel_error(&error))?;
+        Ok(claw_channels::ProviderResponse::new(
+            response.status(),
+            response.body().to_vec(),
+        ))
+    }
+}
+
+/// Origin-bound `WhatsApp` Graph API sender using the integrated channel state machine.
+pub struct GraphWhatsAppAdapter {
+    account_id: String,
+    channel: Arc<AsyncMutex<WhatsAppChannel<GraphWhatsAppTransport, SystemClock>>>,
+    credential: ChannelCredential,
+    request_cancel: Arc<Mutex<Option<CancelToken>>>,
+}
+
+struct WhatsAppRequestGuard {
+    cancel: CancelToken,
+    slot: Arc<Mutex<Option<CancelToken>>>,
+}
+
+impl Drop for WhatsAppRequestGuard {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
 }
 
 impl GraphWhatsAppAdapter {
@@ -513,7 +727,8 @@ impl GraphWhatsAppAdapter {
     pub fn new(
         transport: HttpTransport,
         phone_number_id: &str,
-        access_token: SecretString,
+        access_token: &SecretString,
+        diagnostics: Arc<Diagnostics>,
     ) -> Result<Arc<Self>, PortError> {
         if phone_number_id.is_empty()
             || !phone_number_id
@@ -522,16 +737,42 @@ impl GraphWhatsAppAdapter {
         {
             return Err(invalid("WhatsApp phone number id is invalid"));
         }
-        let endpoint = Url::parse(&format!(
-            "https://graph.facebook.com/v20.0/{phone_number_id}/messages"
-        ))
-        .map_err(|_| invalid("WhatsApp Graph endpoint is invalid"))?;
-        let origin =
-            Origin::of(&endpoint).map_err(|error| invalid(format!("WhatsApp origin: {error}")))?;
+        let account_id = phone_number_id.to_owned();
+        let origin = official_origin("whatsapp", &account_id, "graph.facebook.com")?;
+        let credential = ChannelCredential::bind(
+            access_token.expose(),
+            CredentialRequest {
+                channel_id: "whatsapp".to_owned(),
+                account_id: account_id.clone(),
+                kind: CredentialKind::Token,
+                binding: CredentialBinding::Origin(origin.clone()),
+            },
+        )
+        .map_err(|error| invalid(format!("WhatsApp credential binding failed: {error}")))?;
+        let inbound_capacity = NonZeroUsize::new(64)
+            .ok_or_else(|| invalid("WhatsApp inbound capacity must be non-zero"))?;
+        let request_cancel = Arc::new(Mutex::new(None));
+        let mut channel = WhatsAppChannel::new(
+            account_id.clone(),
+            phone_number_id,
+            origin,
+            GraphWhatsAppTransport {
+                transport,
+                runtime: tokio::runtime::Handle::current(),
+                request_cancel: Arc::clone(&request_cancel),
+            },
+            SystemClock,
+            inbound_capacity,
+        )
+        .map_err(|error| invalid(format!("WhatsApp channel configuration failed: {error}")))?;
+        channel
+            .start(&mut ChannelDiagnostics(diagnostics))
+            .map_err(|error| invalid(format!("WhatsApp channel startup failed: {error}")))?;
         Ok(Arc::new(Self {
-            transport,
-            endpoint,
-            credential: BoundSecret::new(origin, access_token),
+            account_id,
+            channel: Arc::new(AsyncMutex::new(channel)),
+            credential,
+            request_cancel,
         }))
     }
 }
@@ -547,39 +788,62 @@ impl LegacyWhatsAppPort for GraphWhatsAppAdapter {
             if to.trim().is_empty() || text.trim().is_empty() {
                 return Err(invalid("WhatsApp destination and text are required"));
             }
-            let body = serde_json::to_string(&json!({
-                "messaging_product": "whatsapp",
-                "to": to,
-                "type": "text",
-                "text": {"body": text},
-            }))
-            .map_err(|_| PortError::new(PortErrorKind::Internal, "WhatsApp encoding failed"))?;
-            let request = HttpRequest::new(Method::Post, self.endpoint.clone())
-                .header("accept", "application/json")
-                .bound_secret_header("authorization", "Bearer ", &self.credential)
-                .map_err(|_| invalid("WhatsApp credential origin mismatch"))?
-                .body(Body::Json(body))
-                .timeout(WHATSAPP_SEND_TIMEOUT);
-            let sdk_cancel = CancelToken::new();
-            let response = tokio::select! {
-                result = self.transport.send(
-                    "whatsapp",
-                    Operation::Transport,
-                    request,
-                    &sdk_cancel,
-                ) => result.map_err(|error| provider_port_error(&error))?,
-                () = cancellation.cancelled() => {
-                    sdk_cancel.cancel();
-                    return Err(PortError::new(PortErrorKind::Unavailable, "request cancelled"));
-                }
-            };
-            if !response.is_success() {
+            if cancellation.is_cancelled() {
                 return Err(PortError::new(
                     PortErrorKind::Unavailable,
-                    format!("WhatsApp Graph API returned HTTP {}", response.status()),
+                    "request cancelled",
                 ));
             }
-            Ok(())
+            let channel = tokio::select! {
+                channel = Arc::clone(&self.channel).lock_owned() => channel,
+                () = cancellation.cancelled() => {
+                    return Err(PortError::new(
+                        PortErrorKind::Unavailable,
+                        "request cancelled",
+                    ));
+                }
+            };
+            let sdk_cancel = CancelToken::new();
+            *self
+                .request_cancel
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(sdk_cancel.clone());
+            let _cancel_on_drop = WhatsAppRequestGuard {
+                cancel: sdk_cancel.clone(),
+                slot: Arc::clone(&self.request_cancel),
+            };
+            let credential = self.credential.clone();
+            let outbound = OutboundMessage {
+                correlation_key: format!("legacy-{:016x}", stable_text_hash(&text)),
+                account_id: self.account_id.clone(),
+                conversation_id: format!("whatsapp:{to}"),
+                text: Some(text),
+                attachments: Vec::new(),
+                reply_to: None,
+            };
+            let mut task = tokio::task::spawn_blocking(move || {
+                let mut channel = channel;
+                channel.send_outbound(&outbound, Some(&credential))
+            });
+            tokio::select! {
+                result = &mut task => {
+                    result
+                        .map_err(|_| PortError::new(
+                            PortErrorKind::Internal,
+                            "WhatsApp transport task failed",
+                        ))?
+                        .map_err(|error| channel_port_error(&error))?;
+                    Ok(())
+                }
+                () = cancellation.cancelled() => {
+                    sdk_cancel.cancel();
+                    let _ = task.await;
+                    Err(PortError::new(
+                        PortErrorKind::Unavailable,
+                        "request cancelled",
+                    ))
+                }
+            }
         })
     }
 }
@@ -932,19 +1196,65 @@ fn provider_port_error(error: &claw_provider_sdk::ProviderError) -> PortError {
     PortError::new(kind, error.to_string())
 }
 
+fn provider_channel_error(error: &claw_provider_sdk::ProviderError) -> ChannelError {
+    match error.kind() {
+        claw_provider_sdk::ErrorKind::Authentication => ChannelError::Authentication,
+        claw_provider_sdk::ErrorKind::RateLimit => ChannelError::RateLimited {
+            retry_after: error.retry_after().unwrap_or(Duration::from_secs(1)),
+        },
+        claw_provider_sdk::ErrorKind::Timeout => {
+            ChannelError::Transport(claw_channel_sdk::TransportErrorKind::Timeout)
+        }
+        claw_provider_sdk::ErrorKind::Transport => {
+            ChannelError::Transport(claw_channel_sdk::TransportErrorKind::Connection)
+        }
+        claw_provider_sdk::ErrorKind::Protocol => {
+            ChannelError::Protocol(claw_channel_sdk::ProtocolErrorKind::MalformedResponse)
+        }
+        _ => ChannelError::RemoteRejected { status: 503 },
+    }
+}
+
+fn channel_port_error(error: &ChannelError) -> PortError {
+    let kind = match error {
+        ChannelError::InvalidMessage(_)
+        | ChannelError::Configuration(_)
+        | ChannelError::CredentialBinding(_)
+        | ChannelError::Protocol(_) => PortErrorKind::InvalidRequest,
+        ChannelError::RateLimited { .. }
+        | ChannelError::Transport(_)
+        | ChannelError::RemoteRejected { .. }
+        | ChannelError::Authentication
+        | ChannelError::Credential(_)
+        | ChannelError::NotConnected { .. } => PortErrorKind::Unavailable,
+        ChannelError::Unsupported(_) => PortErrorKind::NotFound,
+        ChannelError::Lifecycle(_) => PortErrorKind::Internal,
+    };
+    PortError::new(kind, error.to_string())
+}
+
+fn stable_text_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 fn invalid(message: impl Into<String>) -> PortError {
     PortError::new(PortErrorKind::InvalidRequest, message)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::sync::{Arc, Mutex};
 
-    use claw_provider_sdk::SecretString;
+    use claw_provider_sdk::{CancelToken, SecretString};
     use claw_providers::github_copilot::DeviceAuthorization;
 
     use super::{
-        LegacyDeviceFlowAdapter, LegacyTeamsAdapter, PendingAuthorization, three_floats,
+        LegacyDeviceFlowAdapter, WhatsAppRequestGuard, official_origin, three_floats,
         valid_command_target,
     };
 
@@ -959,38 +1269,20 @@ mod tests {
     }
 
     #[test]
-    fn teams_adapter_starts_without_a_recorded_reply() {
-        struct NoMessages;
-        impl claw_http_api::LegacyChannelMessagePort for NoMessages {
-            fn process(
-                &self,
-                _message: claw_http_api::LegacyChannelMessage,
-                _cancellation: tokio_util::sync::CancellationToken,
-            ) -> claw_http_api::PortFuture<'_, Result<String, claw_http_api::PortError>>
-            {
-                Box::pin(async { Ok("reply".to_owned()) })
-            }
-        }
-        let adapter = LegacyTeamsAdapter::new(
-            std::sync::Arc::new(NoMessages),
-            claw_provider_sdk::http::HttpTransport::new().expect("transport"),
-            "app".to_owned(),
-            SecretString::new("password"),
-        );
-        assert_eq!(adapter.last_reply(), None);
+    fn official_channel_origin_is_exactly_scoped() {
+        let origin = official_origin("whatsapp", "account", "graph.facebook.com").expect("origin");
+        assert_eq!(origin.channel_id(), "whatsapp");
+        assert_eq!(origin.account_id(), "account");
     }
 
     #[test]
     fn device_instructions_are_reusable_and_contain_no_device_secret() {
-        let pending = PendingAuthorization {
-            authorization: DeviceAuthorization {
-                device_code: SecretString::new("secret-device-code"),
-                user_code: "ABCD-EFGH".to_owned(),
-                verification_uri: "https://github.com/login/device".to_owned(),
-                expires_in: 900,
-                interval: 5,
-            },
-            expires_at: Instant::now() + Duration::from_mins(15),
+        let pending = DeviceAuthorization {
+            device_code: SecretString::new("secret-device-code"),
+            user_code: "ABCD-EFGH".to_owned(),
+            verification_uri: "https://github.com/login/device".to_owned(),
+            expires_in: 900,
+            interval: 5,
         };
 
         let instructions = LegacyDeviceFlowAdapter::instructions_for(&pending);
@@ -998,5 +1290,17 @@ mod tests {
         assert!(instructions.contains("ABCD-EFGH"));
         assert!(instructions.contains("https://github.com/login/device"));
         assert!(!instructions.contains("secret-device-code"));
+    }
+
+    #[test]
+    fn dropped_whatsapp_request_cancels_transport_and_clears_slot() {
+        let cancel = CancelToken::new();
+        let slot = Arc::new(Mutex::new(Some(cancel.clone())));
+        drop(WhatsAppRequestGuard {
+            cancel: cancel.clone(),
+            slot: Arc::clone(&slot),
+        });
+        assert!(cancel.is_cancelled());
+        assert!(slot.lock().expect("request slot").is_none());
     }
 }
