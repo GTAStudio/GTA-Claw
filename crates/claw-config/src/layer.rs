@@ -4,6 +4,7 @@ use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::path::Path;
 
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::migration::{MigrationDiagnostic, MigrationError, apply_legacy_environment_layer};
@@ -250,6 +251,15 @@ impl ConfigLayers {
 }
 
 fn decode_envelope(value: &Value, source_name: &str) -> Result<EnvelopeWire, ConfigError> {
+    // See `domains::decode_openclaw_value`: the merged tree is decoded in place
+    // on the success path, and only a rejection pays for the
+    // `Value -> UTF-8 -> Value` round trip that gives `serde_json` a line and
+    // column to report.
+    EnvelopeWire::deserialize(value).or_else(|_| decode_envelope_located(value, source_name))
+}
+
+#[cold]
+fn decode_envelope_located(value: &Value, source_name: &str) -> Result<EnvelopeWire, ConfigError> {
     let bytes = serde_json::to_vec(value).map_err(ConfigError::from_serialize)?;
     let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
     serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {

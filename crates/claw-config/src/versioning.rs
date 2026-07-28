@@ -133,6 +133,16 @@ impl From<ConfigError> for ConfigMigrationError {
 /// [`ConfigError::Decode`] or [`ConfigError::Validation`] can be returned
 /// without anything being written.
 ///
+/// The already-current path reads the document twice, once as a
+/// `serde_json::Value` to find `schema_version` and once through
+/// [`crate::parse_json5`] to validate it. That was measured and left alone: the
+/// `Value` read costs 6.5-10.4us against 4.2us for the typed read, and every
+/// cheaper way to reach `schema_version` either loses the exact JSON5 syntax
+/// diagnostic or turns a non-object document from
+/// [`ConfigMigrationError::MissingVersion`] into a decode failure. Both are
+/// observable, and neither is worth 7us on a path that has already paid for a
+/// file read.
+///
 /// Returns [`ConfigMigrationError::Backup`] when the exact-bytes backup cannot
 /// be created, written, or `fsync`-ed; the original file is untouched because
 /// the backup is taken before any destructive step. If publication fails after

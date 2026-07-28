@@ -458,8 +458,15 @@ pub fn parse_role_document(
     Ok(plain_text_role(body, None))
 }
 
+/// Case-insensitive `json` substring test that does not allocate a lowercased
+/// copy of the header. Content types are short, so the win is the allocation,
+/// not the scan; the first-byte guard keeps the negative case (every header that
+/// is not JSON) at one comparison per position rather than four.
 fn names_json(content_type: &str) -> bool {
-    content_type.to_ascii_lowercase().contains("json")
+    content_type
+        .as_bytes()
+        .windows(4)
+        .any(|window| window[0].eq_ignore_ascii_case(&b'j') && window.eq_ignore_ascii_case(b"json"))
 }
 
 /// Normalizes the two paths `serde_path_to_error` reports for a failure that it
@@ -497,18 +504,22 @@ fn parse_json_role(body: &str) -> Result<RoleDocument, RoleJsonRejection> {
             message: error.to_string(),
         })?;
 
-    let Value::Object(members) = value else {
+    let Value::Object(mut members) = value else {
         return Err(RoleJsonRejection::NotAnObject);
     };
 
     let mut diagnostics = Vec::new();
-    let content = match members.get("content") {
+    // Taken out of the map rather than borrowed and cloned: the selected member
+    // is the whole system prompt, which the frozen contract lets run to
+    // `ROLE_DOCUMENT_MAX_BYTES`, so cloning it doubled the peak footprint of
+    // every JSON role fetch for nothing.
+    let content = match members.remove("content") {
         Some(Value::String(content)) => content,
         present => {
             if present.is_some() {
                 diagnostics.push(RoleDiagnostic::NonStringContentIgnored);
             }
-            match members.get("prompt") {
+            match members.remove("prompt") {
                 Some(Value::String(prompt)) => {
                     diagnostics.push(RoleDiagnostic::PromptAliasUsed);
                     prompt
@@ -521,8 +532,8 @@ fn parse_json_role(body: &str) -> Result<RoleDocument, RoleJsonRejection> {
         return Err(RoleJsonRejection::EmptyContent);
     }
 
-    let model = match members.get("model") {
-        Some(Value::String(model)) => Some(model.clone()),
+    let model = match members.remove("model") {
+        Some(Value::String(model)) => Some(model),
         Some(_) => {
             diagnostics.push(RoleDiagnostic::NonStringModelIgnored);
             None
@@ -531,7 +542,7 @@ fn parse_json_role(body: &str) -> Result<RoleDocument, RoleJsonRejection> {
     };
 
     Ok(RoleDocument {
-        content: content.clone(),
+        content,
         model,
         outcome: RoleDocumentOutcome::LoadedJson,
         diagnostics,
