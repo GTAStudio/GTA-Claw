@@ -366,8 +366,12 @@ usage: gta-claw-daemon [--probe | --check-config] [--config PATH] [--listen ADDR
 
 `--help` and `-h` are also accepted. Help is global: if either spelling appears anywhere, the daemon
 prints the usage line and exits successfully before creating the Tokio runtime, even if another
-argument is unknown or missing its value. Without help, unknown, incomplete, non-Unicode or
-incompatible arguments are rejected.
+argument is unknown or missing its value. Without help, option names must be Unicode and exactly
+match the supported flags; address values must be Unicode `SocketAddr` strings; and mode conflicts
+or missing values are rejected. Path values are raw OS strings, so non-Unicode paths are accepted.
+The parser does not recognize `--` and does not stop a path-valued option from consuming a following
+flag-like token as its path; for example, `--config --smoke` selects a file literally named
+`--smoke` rather than enabling smoke mode.
 
 ### 5.1 Health probe
 
@@ -386,10 +390,14 @@ Writes one health line and exits.
 gta-claw-daemon --check-config --config /etc/gta-claw/config.json5
 ```
 
-Loads configuration and runs the same static configuration, secret-reference, channel-coverage,
-state-directory and exposure checks used before startup, without opening listeners.
+Loads layered configuration and runs a subset of the non-network composition policy: listener
+exposure, state-directory resolution, proxy policy, admin-token resolution, update settings,
+legacy/channel settings, channel coverage and provider-auth configuration. It does not open
+listeners or prove that the state directory is writable, open the pairing/audit/goal stores, open
+the telemetry output, fetch the role, activate plugins, or initialize a provider.
 `--check-config` accepts `--config` and `--state-dir`; it cannot be combined with `--probe` or any
-listener, logging, TLS-assertion or smoke option.
+listener, logging, TLS-assertion or smoke option. Consequently, although the check calls the exposure
+policy, it cannot preflight proposed listener overrides or a routable deployment.
 
 ### 5.3 Serving
 
@@ -417,16 +425,27 @@ The complete option surface is:
 |---|---|
 | `--config PATH` | Loads strict JSON5 from `PATH`; otherwise uses `GTA_CLAW_CONFIG`, then the audited legacy-environment migration. |
 | `--listen ADDRESS` | Main HTTP bind. Default: `127.0.0.1:0` (an OS-assigned port). |
-| `--legacy-listen ADDRESS` | Legacy HTTP bind. Default: loopback on `core.server.port`. |
+| `--legacy-listen ADDRESS` | Legacy HTTP bind. Default: loopback on `core.server.port`. A routable bind requires both a trusted TLS frontend and proxy-level caller authentication plus a strict route allowlist; the daemon's TLS assertion alone is insufficient. |
 | `--gateway-listen ADDRESS` | Gateway bind. Default: `127.0.0.1:0`. |
 | `--mcp-listen ADDRESS` | MCP bind. Default: `127.0.0.1:0`; non-loopback addresses are always rejected. |
 | `--state-dir PATH` | State root; otherwise `GTA_CLAW_STATE_DIR`, then `$HOME/.gta-claw`. Pairings, security audit and goals are durable there, but sessions and turns are not. |
 | `--log-file PATH` | Writes ordinary telemetry to the file instead of standard error. |
-| `--tls-terminated-by-frontend` | Asserts that a trusted frontend terminates TLS. It does not enable TLS in the daemon; it only permits routable main HTTP, legacy HTTP or Gateway binds. |
+| `--tls-terminated-by-frontend` | Asserts that a trusted frontend terminates TLS. It does not enable TLS or add caller authentication; it only passes the daemon's bind policy for routable main HTTP, legacy HTTP or Gateway addresses. |
 | `--smoke` | Uses the deterministic local install-diagnostic provider. Every explicitly selected listener must remain loopback. |
 
+Do not expose the legacy listener merely by adding `--tls-terminated-by-frontend`. Legacy `/chat`
+has no application-level caller authentication. Setting `GTA_CLAW_ADMIN_TOKEN` does not change that:
+it supplies bearer authentication for the main API's protected model/tool routes, Admin RPC and MCP,
+and enables legacy `/admin/reload`, `/admin/system` and `/admin/exec`. The reload route requires the
+exact token, but the system and exec routes accept either that token or a loopback peer. A same-host
+reverse proxy therefore appears loopback to those two handlers. A frontend for a routable legacy
+bind must authenticate callers itself and forward only explicitly intended routes; block
+`/admin/*` unless the proxy enforces equivalent authorization, and do not forward `/chat` without a
+separate caller-authentication policy.
+
 On startup it installs the stop signal handlers before composition — so a supervisor stop during
-startup is still observed — and, after all required dependencies are live, prints:
+startup is still observed — and, after listeners and startup composition are live, prints these
+process and listener announcements:
 
 ```text
 ready protocol=1
@@ -434,12 +453,17 @@ healthy runtime=<os>-<arch>
 service http=<address> legacy=<address> gateway=<address> mcp=<address> provider=<name> config_generation=<n>
 ```
 
+These lines are not the dependency-readiness contract. Readiness is reported by `/ready`, `/readyz`
+and the `status` control response. The listener announcement may name `device-flow-pending`; until
+Device Flow activates the provider, provider dependency readiness remains false.
+
 It then serves until one of:
 
 - a supervisor stop signal — `SIGTERM` on Unix (what `systemd`, `docker stop` and `kubectl delete`
   send), or a console close / system shutdown on Windows,
 - an interrupt — `SIGINT` on Unix, Ctrl-C or Ctrl-Break on Windows,
-- the line `shutdown` on its control channel (standard input).
+- the line `shutdown` on its control channel (standard input),
+- a supervised HTTP/MCP/legacy ingress task exiting unexpectedly, reported as a runtime fault.
 
 Reaching the end of standard input is **not** a stop condition: a daemon started with stdin closed
 keeps serving. The same channel accepts `status` and `reload`; reload either reports the applied
@@ -448,10 +472,11 @@ generation and changed domains or a rejection while the previous generation keep
 On stop it prints one summary line:
 
 ```text
-stopped reason=<terminate|interrupt|control> clean=<bool> drained=<n> completed=<n> abandoned=<n> tasks=<terminated>/<spawned>
+stopped reason=<terminate|interrupt|control|runtime> clean=<bool> drained=<n> completed=<n> abandoned=<n> tasks=<terminated>/<spawned>
 ```
 
-If work was left behind, the process exits with an error describing how many tasks were abandoned.
+`reason=runtime` means supervised ingress failed or disappeared; the stop summary is still emitted
+after drain. If work was left behind or a runtime fault was recorded, the process exits with an error.
 The task counters are real: terminations are counted from a guard's `Drop`, so a task cancelled
 part-way through still counts, which makes `tasks=t/s` a genuine leak check.
 
@@ -584,8 +609,9 @@ The version 1 runtime envelope requires `schema_version` plus these `core` domai
 `channels`, `server`, `logging`, `sessions`, `copilot`, `legacy`, `updates`, `admin`, `network`.
 
 `gta-claw-daemon` loads this model from `--config PATH` or `GTA_CLAW_CONFIG`; when neither is set it
-uses the audited legacy-environment migration. `--check-config` validates the non-network
-composition without serving.
+uses the audited legacy-environment migration. `--check-config` validates the static subset listed
+in section 5.2 without serving; it is not a storage, telemetry, role, plugin or provider startup
+probe.
 
 ### 8.2 Selected environment variables
 
@@ -595,7 +621,7 @@ composition without serving.
 | `GTA_CLAW_GATEWAY_TOKEN` | `gta-claw-tui`, `gta-claw-daemon` | Shared Gateway token; the daemon uses it as the Gateway credential when set. |
 | `GTA_CLAW_CONFIG` | `gta-claw-daemon` | Config-file fallback when `--config` is absent. |
 | `GTA_CLAW_STATE_DIR` | `gta-claw-daemon` | State-root fallback when `--state-dir` is absent. |
-| `GTA_CLAW_ADMIN_TOKEN` | `gta-claw-daemon` | Enables protected HTTP routes with bearer authentication. |
+| `GTA_CLAW_ADMIN_TOKEN` | `gta-claw-daemon` | Supplies bearer authentication for the main API's protected model/tool routes, Admin RPC and MCP, and registers legacy `/admin/*`. It does not protect legacy `/chat`; legacy system/exec also trust a loopback peer. |
 | `NO_COLOR` | `gta-claw-tui` | Monochrome output. |
 | `TERM` | `gta-claw-tui` | `dumb` means non-interactive. |
 | `GTA_CLAW_CREDENTIALS_DIR` | `claw-provider-sdk` file secret store | Credential root override. Otherwise `$XDG_DATA_HOME/gta-claw/credentials`, else `$HOME` (or `%USERPROFILE%`) `/.local/share/gta-claw/credentials`. |
