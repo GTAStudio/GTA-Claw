@@ -804,11 +804,14 @@ fn read_pairing_file(path: &Path) -> Result<Vec<u8>, String> {
         return Err("gateway pairing file exceeds its byte limit".to_owned());
     }
 
-    let file = File::open(path).map_err(|error| safe_io("open", &error))?;
+    let file = open_pairing_read(path).map_err(|error| safe_io("open", &error))?;
     let opened = file
         .metadata()
         .map_err(|error| safe_io("inspect open file", &error))?;
-    if !opened.is_file() || opened.len() > MAX_PAIRING_FILE_BYTES as u64 {
+    if is_link_or_reparse(&opened)
+        || !opened.is_file()
+        || opened.len() > MAX_PAIRING_FILE_BYTES as u64
+    {
         return Err("gateway pairing file changed during open".to_owned());
     }
     let mut bytes = Vec::with_capacity(
@@ -823,6 +826,37 @@ fn read_pairing_file(path: &Path) -> Result<Vec<u8>, String> {
         return Err("gateway pairing file exceeds its byte limit".to_owned());
     }
     Ok(bytes)
+}
+
+#[cfg(unix)]
+fn open_pairing_read(path: &Path) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+
+    rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+#[cfg(windows)]
+fn open_pairing_read(path: &Path) -> io::Result<File> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_pairing_read(path: &Path) -> io::Result<File> {
+    File::open(path)
 }
 
 #[cfg(unix)]
@@ -1028,6 +1062,20 @@ mod tests {
             "gateway pairing file must not be a symlink or reparse point"
         );
         assert_eq!(fs::read(target).expect("target remains readable"), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_follow_open_refuses_a_final_component_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestRoot::new("no-follow-open");
+        let target = root.join("target.json");
+        let path = root.join("pairings.json");
+        fs::write(&target, document(Vec::new())).expect("target written");
+        symlink(&target, &path).expect("destination link created");
+
+        super::open_pairing_read(&path).expect_err("no-follow open refuses the link");
     }
 
     #[cfg(unix)]

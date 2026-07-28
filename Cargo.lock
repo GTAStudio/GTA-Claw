@@ -1388,6 +1388,7 @@ dependencies = [
  "gta-claw-updater",
  "json5",
  "jsonwebtoken",
+ "rustix",
  "secrecy",
  "semver",
  "serde",
