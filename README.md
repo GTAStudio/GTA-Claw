@@ -20,22 +20,26 @@ Two Cargo workspaces and one legacy service that is being retired:
 |---|---|
 | `crates/` + `apps/` (root workspace) | 31 library crates and 6 binaries. Edition 2024, `resolver = "3"`. |
 | `desktop/` (separate workspace) | `gta-claw-desktop`, a native Slint UI for Windows and macOS. |
-| `src/`, `Dockerfile`, `package.json`, `tsconfig.json` | The legacy Node/TypeScript service. Still the only fully composed production service; being deleted module by module. |
+| `src/`, `Dockerfile`, `package.json`, `tsconfig.json` | The legacy Node/TypeScript service. It remains during migration while the Rust daemon's named gaps and compatibility-evidence obligations are closed. |
 
 The root workspace excludes `desktop/` (`exclude = ["android", "desktop", "ios"]`), so a root
 `cargo build` never resolves Slint. CI asserts this with `cargo metadata`.
 
-**Status caveat, stated up front:** the Rust crates are substantially implemented and tested, but
-`gta-claw-daemon` is a composition root whose subsystem adapters are still deterministic stand-ins
-(see its crate docs and [`docs/PROGRESS.md`](docs/PROGRESS.md)). Do not read this README as a claim
-that a complete Rust production service ships today.
+**Status caveat, stated up front:** `gta-claw-daemon` is a real but partial production composition.
+Its `main` path binds the main HTTP API, legacy HTTP facade, Gateway and loopback MCP transports,
+and conditionally activates a GitHub Copilot provider and configured Teams, Telegram, Discord and
+WhatsApp channels. It is not complete parity: sessions and turns are process-memory only,
+interactive approval presentation is absent, `claw-tools`, skill dispatch and skill-migration
+evidence ingestion are not composed, and the bound service has not been replayed against
+`compat/legacy`. See
+[`docs/PROGRESS.md`](docs/PROGRESS.md).
 
 ## Rust migration ratchet
 
-The root Node service remains the load-bearing container runtime while its Rust replacement is
-completed. Repository policy permits only the exact audited legacy paths and rejects every new
-JavaScript/TypeScript source, package manifest, lockfile, dependency directory, or repository-owned
-Node workflow. The allowed surface may shrink but may not grow.
+The root Node service remains during the evidence-backed migration while the partial Rust production
+service is completed. Repository policy permits only the exact audited legacy paths and rejects
+every new JavaScript/TypeScript source, package manifest, lockfile, dependency directory, or
+repository-owned Node workflow. The allowed surface may shrink but may not grow.
 
 `crates/claw-repo-policy` enforces this as a test. It rejects new source files with the extensions
 `js`, `jsx`, `mjs`, `cjs`, `ts`, `tsx`, `mts`, `cts` and `node`; the manifests `package.json`,
@@ -58,8 +62,9 @@ components instead.
 
 ## Architecture
 
-Solid arrows are real Cargo dependencies. The dashed arrow is the composition seam: the daemon is
-what binds concrete adapters to the runtime's ports, and that binding is the work still outstanding.
+Solid arrows are real Cargo dependencies. The dashed arrow is the composition seam: the daemon now
+binds selected concrete adapters to the runtime's ports, while the named persistence, approval,
+`claw-tools`, skill-dispatch and compatibility-evidence gaps remain.
 
 ```mermaid
 flowchart TB
@@ -114,7 +119,7 @@ flowchart TB
   runtime --> app
   goals --> runtime
   plat --> app
-  daemon -.->|binds adapters to ports; stand-ins today| adapters
+  daemon -.->|binds selected adapters; gaps remain| adapters
 ```
 
 The direction is enforced by the manifests, not by convention: `claw-domain` depends on nothing in
@@ -188,7 +193,7 @@ independently testable units that a composition root adapts to a port.
 |---|---|
 | `gta-claw-cli` | `--version`, `--help`/`-h`, local `health`, a deliberately unsupported `send`, and `gateway health` — one real authenticated Gateway v4 connection, one `health` RPC, bounded shutdown, typed exit codes and an optional `--json` report. See [`apps/gta-claw-cli/README.md`](apps/gta-claw-cli/README.md). |
 | `gta-claw-tui` | A Crossterm terminal client over `claw-gateway-client` with Sessions, Workspace, Runs, Diff, Artifacts and Help screens, a command palette, and a non-TTY `--plain` snapshot mode. |
-| `gta-claw-daemon` | The composition root: `--probe` for a one-shot health line, otherwise serve until `SIGTERM`/`SIGINT` (or Windows Ctrl-C/Break/Close/Shutdown) or a `shutdown` line on the control channel, then report a provable drain summary. Its subsystem adapters are still stand-ins. |
+| `gta-claw-daemon` | A partial production composition: `--probe`, `--check-config`, or a serving mode that binds real HTTP, legacy HTTP, Gateway and MCP listeners; conditionally activates a provider and four configured channel transports; handles reload, status and shutdown control; and reports a provable drain summary. Sessions/turns remain in memory, approval presentation is silent, `claw-tools`, skill dispatch and skill-migration evidence ingestion are not composed, and compatibility evidence remains outstanding. |
 | `gta-claw-updater` | A standalone signed, resumable, rollback-safe updater. On Linux it refuses and defers to the system package manager. |
 | `gta-claw-android` | The Android client core: endpoint/credential intake, Gateway identity, attempt lifecycle. **No Android UI exists in this repository** — see [`apps/gta-claw-android/README.md`](apps/gta-claw-android/README.md). |
 | `gta-claw-ios` | The iOS client core, on the same terms. See [`apps/gta-claw-ios/README.md`](apps/gta-claw-ios/README.md). |
@@ -238,26 +243,30 @@ names rejected, secrets persisted only as validated environment or platform-stor
 and layered resolution in the order built-in → system → user → workspace → frozen legacy
 environment → command line.
 
-The variables the shipped Rust binaries actually read:
+Selected variables read by shipped Rust binaries:
 
 | Variable | Read by | Meaning |
 |---|---|---|
 | `GTA_CLAW_GATEWAY_URL` | `gta-claw-tui` | Gateway endpoint. Defaults to `ws://127.0.0.1:18789`; `--gateway` overrides it. |
-| `GTA_CLAW_GATEWAY_TOKEN` | `gta-claw-tui` | Shared Gateway token. |
+| `GTA_CLAW_GATEWAY_TOKEN` | `gta-claw-tui`, `gta-claw-daemon` | Shared Gateway token; the daemon uses it as the Gateway credential policy when set. |
+| `GTA_CLAW_CONFIG` | `gta-claw-daemon` | Configuration file fallback when `--config` is absent. |
+| `GTA_CLAW_STATE_DIR` | `gta-claw-daemon` | State-directory fallback when `--state-dir` is absent; otherwise `$HOME/.gta-claw`. |
+| `GTA_CLAW_ADMIN_TOKEN` | `gta-claw-daemon` | Enables protected HTTP routes with a bearer credential. |
 | `NO_COLOR` | `gta-claw-tui` | Monochrome rendering, same as `--no-color`. |
 | `TERM` | `gta-claw-tui` | `TERM=dumb` is treated as non-interactive. |
 | `GTA_CLAW_CREDENTIALS_DIR` | `claw-provider-sdk` file secret store | Overrides the credential root. Otherwise `$XDG_DATA_HOME/gta-claw/credentials`, else `$HOME`(or `%USERPROFILE%`)`/.local/share/gta-claw/credentials`. |
 | `CREDENTIALS_DIRECTORY` | `claw-provider-sdk` file secret store | The systemd credentials directory. |
 | `GTA_CLAW_ACPX_LEASE_ID`, `GTA_CLAW_ACPX_SESSION_KEY` | `claw-acp` | ACP extension lease and session key. |
 | `CODEX_HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `APPDATA`, `LOCALAPPDATA`, `HOME`, `USERPROFILE` | `claw-migrate`, `gta-claw-updater` | Source and state directory discovery. |
-| `GTA_CLAW_LOG` | `claw-observability` default | The tracing filter variable in `TelemetryConfig::default()`. No shipped binary installs that subscriber yet. |
+| `GTA_CLAW_LOG`, `GTA_CLAW_LOG_FORMAT` | `gta-claw-daemon` | Tracing filter and `human`/`json` format for the subscriber installed on the serving path; output goes to standard error unless `--log-file` is set. |
 
 `claw-provider-sdk`'s environment secret store derives a variable name from a credential key by
 uppercasing `SERVICE_ACCOUNT` and replacing non-alphanumeric characters with `_`. It is a store
 implementation, not a fixed list of documented variables.
 
-`.env.example`, `deploy/run.sh` and `deploy/conf/` belong to the **legacy Node service**, not to the
-Rust binaries. They are documented in the legacy obligations checklist and will be deleted with it.
+`.env.example`, `deploy/run.sh` and `deploy/conf/` are **legacy Node service** artifacts, not the
+authoritative Rust configuration surface. The daemon can translate the frozen subset of legacy
+process environment through its audited migration path; use typed JSON5 for new deployments.
 
 ## Continuous integration
 
