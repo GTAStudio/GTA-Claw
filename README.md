@@ -25,10 +25,12 @@ Two Cargo workspaces and one legacy service that is being retired:
 The root workspace excludes `desktop/` (`exclude = ["android", "desktop", "ios"]`), so a root
 `cargo build` never resolves Slint. CI asserts this with `cargo metadata`.
 
-**Status caveat, stated up front:** the Rust crates are substantially implemented and tested, but
-`gta-claw-daemon` is a composition root whose subsystem adapters are still deterministic stand-ins
-(see its crate docs and [`docs/PROGRESS.md`](docs/PROGRESS.md)). Do not read this README as a claim
-that a complete Rust production service ships today.
+**Status caveat, stated up front:** the Rust crates are substantially implemented and tested.
+`gta-claw-daemon` is the composition root and is the production service: it binds real HTTP, Legacy
+HTTP, Gateway WebSocket, and MCP transports, and conditionally activates configured providers and
+channels. Some internal limits remain (in-memory session state, silent approvals, Wasm skill
+execution not wired); see `apps/gta-claw-daemon/src/` and
+[`docs/usage-guide-en.md`](docs/usage-guide-en.md).
 
 ## Rust migration ratchet
 
@@ -188,7 +190,7 @@ independently testable units that a composition root adapts to a port.
 |---|---|
 | `gta-claw-cli` | `--version`, `--help`/`-h`, local `health`, a deliberately unsupported `send`, and `gateway health` — one real authenticated Gateway v4 connection, one `health` RPC, bounded shutdown, typed exit codes and an optional `--json` report. See [`apps/gta-claw-cli/README.md`](apps/gta-claw-cli/README.md). |
 | `gta-claw-tui` | A Crossterm terminal client over `claw-gateway-client` with Sessions, Workspace, Runs, Diff, Artifacts and Help screens, a command palette, and a non-TTY `--plain` snapshot mode. |
-| `gta-claw-daemon` | The composition root: `--probe` for a one-shot health line, otherwise serve until `SIGTERM`/`SIGINT` (or Windows Ctrl-C/Break/Close/Shutdown) or a `shutdown` line on the control channel, then report a provable drain summary. Its subsystem adapters are still stand-ins. |
+| `gta-claw-daemon` | The composition root and production service: binds HTTP, Legacy HTTP, Gateway WebSocket, and MCP transports; conditionally activates the GitHub Copilot provider and configured channels; reports a provable drain summary on stop. See remaining limits in [`docs/usage-guide-en.md`](docs/usage-guide-en.md#55-current-limits). |
 | `gta-claw-updater` | A standalone signed, resumable, rollback-safe updater. On Linux it refuses and defers to the system package manager. |
 | `gta-claw-android` | The Android client core: endpoint/credential intake, Gateway identity, attempt lifecycle. **No Android UI exists in this repository** — see [`apps/gta-claw-android/README.md`](apps/gta-claw-android/README.md). |
 | `gta-claw-ios` | The iOS client core, on the same terms. See [`apps/gta-claw-ios/README.md`](apps/gta-claw-ios/README.md). |

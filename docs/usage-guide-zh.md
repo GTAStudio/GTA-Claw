@@ -29,17 +29,22 @@ English version: [docs/usage-guide-en.md](usage-guide-en.md)
 
 请先读这一节，可以省下不少时间。
 
-Rust 工作空间**尚未**提供完整的 Agent 服务。`gta-claw-daemon` 是组装根，但它装配的各子系统适配器目前
-仍是确定性的占位实现。当前真正能做的事情是：
+`gta-claw-daemon` 是产品服务。其 `main()` 调用 `serve_production`，后者构建完整的
+`ProductionService` 组合：绑定真实的 HTTP、Legacy HTTP、Gateway WebSocket 和 MCP 传输，并按配置
+有条件地激活提供方与通道。当前在源码层面尚未实现的部分列于
+[§ 5.5](#55-当前限制)。
 
+当前真正能做的事情是：
+
+- **以产品服务模式运行守护进程**——绑定全部四个传输，通过配置或设备流程激活 GitHub Copilot 提供方，
+  并在凭据存在时启动已配置的通道（Telegram、Discord、Teams、WhatsApp）。
 - **连接到已有的 OpenClaw Gateway**——CLI 作为受限的诊断工具，TUI 作为交互式客户端，桌面客户端作为
   原生连接界面。
-- **运行守护进程的生命周期**，包括健康探针、信号处理，以及可验证的关停排空过程。
+- **运行守护进程的生命周期**，包括健康探针、配置校验、信号处理，以及可验证的关停排空过程。
 - **执行一次签名更新**，使用独立的更新器。
 
-目前没有任何 Rust 命令可以与模型提供方发起对话、从 URL 加载角色，或承接
-Teams / Telegram / Discord / WhatsApp 的流量。这些仍由 `src/` 下的遗留 Node 服务承担，并正在逐个模块
-删除——详见 [legacy-node-port-obligations.md](legacy-node-port-obligations.md)。
+`src/` 下的遗留 Node 服务正在逐个模块删除，Rust 所有权确认后即删除——详见
+[legacy-node-port-obligations.md](legacy-node-port-obligations.md)。
 
 ---
 
@@ -344,10 +349,15 @@ q / Ctrl-C        安全退出
 ## 5. `gta-claw-daemon`
 
 ```text
-usage: gta-claw-daemon [--probe]
+usage: gta-claw-daemon [--probe | --check-config] [--config PATH]
+                       [--listen ADDRESS] [--legacy-listen ADDRESS]
+                       [--gateway-listen ADDRESS] [--mcp-listen ADDRESS]
+                       [--state-dir PATH] [--log-file PATH]
+                       [--tls-terminated-by-frontend] [--smoke]
 ```
 
-其他任何参数都会被拒绝。
+`--help` 和 `-h` 打印上述文本并以 `0` 退出。无论位于命令行何处，它们都会被优先检测，位置不影响行为：
+例如 `--config x --help` 会直接回答该问题，而不会报错。
 
 ### 5.1 健康探针
 
@@ -355,39 +365,68 @@ usage: gta-claw-daemon [--probe]
 gta-claw-daemon --probe
 ```
 
-输出一行健康状态后退出。
+输出一行健康状态后以 `0` 退出。不打开任何监听器。
 
-### 5.2 提供服务
+### 5.2 配置校验
+
+```sh
+gta-claw-daemon --check-config
+gta-claw-daemon --check-config --config /etc/gta-claw/config.json5
+```
+
+加载配置，校验组合约束（暴露规则、代理策略、管理员令牌、通道设置、提供方认证），成功时打印
+`configuration valid source=<source>`。不打开任何监听器，也不联系提供方。
+
+### 5.3 提供服务
 
 ```sh
 gta-claw-daemon
+gta-claw-daemon --config /etc/gta-claw/config.json5
 ```
 
-启动时，它会**先**安装停止信号处理器，再启动任何子系统——这样即使监管进程在启动过程中要求停止，也能被
-观察到——随后打印：
+`main()` 调用 `serve_production`，后者调用 `ProductionService::start`（`production.rs`）。该函数按以下顺序
+构建完整的产品组合：
+
+1. 加载配置（通过 `--config` 或 `GTA_CLAW_CONFIG` 指定 JSON5 文件，两者均未设置时回退到遗留环境变量迁移）。
+2. 初始化遥测订阅者（输出到 stderr，或在提供 `--log-file` 时输出到指定文件）。
+3. 打开持久状态目录：gateway-pairings.json、security-audit.jsonl、goals/。
+4. 从配置加载角色文档。
+5. 发现并激活已签名的 Wasm 插件工具（策略来自 `GTA_CLAW_PLUGIN_POLICY`）。
+6. **激活提供方**——若配置中设置了 `github_pat` 则立即激活，若启用了设备流程且配置了通道则通过设备流程
+   激活，或在传入 `--smoke` 时使用烟雾诊断提供方。提供方激活是有条件的，可能推迟进行。
+7. **激活已配置的通道**——Telegram、Discord、Teams 和 WhatsApp 各自在配置了凭据和设置时才启动；
+   未配置时不启动。
+8. **同时绑定全部四个传输**：
+   - 主 HTTP/SSE API 绑定 `--listen`（默认 loopback:0）
+   - 兼容遗留 Node 的 HTTP 门面绑定 `--legacy-listen`（默认 loopback:配置端口）
+   - Gateway v4 WebSocket 服务器绑定 `--gateway-listen`（默认 loopback:0）
+   - MCP 回环 HTTP 端点绑定 `--mcp-listen`（默认 loopback:0；非回环地址会被拒绝）
+
+就绪后打印：
 
 ```text
 ready protocol=1
 healthy runtime=<os>-<arch>
+service http=<addr> legacy=<addr> gateway=<addr> mcp=<addr> provider=<name> config_generation=<n>
 ```
 
-之后持续提供服务，直到出现下列情况之一：
+之后持续提供服务，直到收到停止触发，并打印停止汇总行。
 
-- 监管进程发出的停止信号——Unix 上的 `SIGTERM`（`systemd`、`docker stop`、`kubectl delete` 发送的正是
-  它），或 Windows 上的控制台关闭 / 系统关机；
+控制通道（标准输入）接受 `shutdown`、`reload`、`status` 三行命令。标准输入到达末尾**不是**停止条件：
+以关闭的 stdin 启动的守护进程会继续提供服务。
+
+停止触发来源：
+
+- 监管进程发出的停止信号——Unix 上的 `SIGTERM`（`systemd`、`docker stop`、`kubectl delete` 发送），
+  或 Windows 上的控制台关闭 / 系统关机；
 - 中断信号——Unix 上的 `SIGINT`，Windows 上的 Ctrl-C 或 Ctrl-Break；
-- 控制通道（标准输入）上收到 `shutdown` 一行文本。
+- 控制通道上收到 `shutdown` 一行文本。
 
-标准输入到达末尾**不是**停止条件：以关闭的 stdin 启动的守护进程会继续提供服务。
-
-停止时打印一行汇总：
+停止汇总行：
 
 ```text
 stopped reason=<terminate|interrupt|control> clean=<bool> drained=<n> completed=<n> abandoned=<n> tasks=<terminated>/<spawned>
 ```
-
-如果仍有未完成的工作，进程会以错误退出，并说明有多少任务被放弃。任务计数是真实的：终止计数由守卫对象的
-`Drop` 累加，因此中途被取消的任务同样计入，这让 `tasks=t/s` 成为一次真正的泄漏检查，而不是"关停函数返回了"。
 
 手动停止：
 
@@ -395,10 +434,44 @@ stopped reason=<terminate|interrupt|control> clean=<bool> drained=<n> completed=
 printf 'shutdown\n' | gta-claw-daemon
 ```
 
-### 5.3 当前限制
+### 5.4 命令行选项
 
-守护进程装配的是各运行时子系统的确定性占位实现。它不会连接模型提供方，不承接聊天流量，也不会打开任何
-通道。当前请把它当作生命周期与关停能力的验证面，而不是产品服务。
+| 选项 | 适用模式 | 说明 |
+|---|---|---|
+| `--help`、`-h` | 任意 | 打印用法后以 `0` 退出。优先于所有其他参数检测。 |
+| `--probe` | — | 输出一行健康状态后退出。与 `--check-config` 互斥。 |
+| `--check-config` | — | 校验配置后退出。与 `--probe` 互斥。 |
+| `--config PATH` | 所有模式 | JSON5 配置文件路径。覆盖 `GTA_CLAW_CONFIG`。 |
+| `--state-dir PATH` | 所有模式 | 状态目录。覆盖 `GTA_CLAW_STATE_DIR`。 |
+| `--listen ADDRESS` | 仅 serve | 主 HTTP 监听地址。默认 loopback:0。 |
+| `--legacy-listen ADDRESS` | 仅 serve | Legacy HTTP 监听地址。默认 loopback:配置端口。 |
+| `--gateway-listen ADDRESS` | 仅 serve | Gateway WebSocket 监听地址。默认 loopback:0。 |
+| `--mcp-listen ADDRESS` | 仅 serve | MCP 监听地址。必须是回环地址。默认 loopback:0。 |
+| `--log-file PATH` | 仅 serve | 将遥测输出写入此文件，而非 stderr。 |
+| `--tls-terminated-by-frontend` | 仅 serve | 断言 TLS 由上游终止；允许 Gateway 绑定非回环地址。 |
+| `--smoke` | 仅 serve | 使用本地安装诊断提供方，而非真实提供方。 |
+
+仅限 serve 的选项（`--listen`、`--legacy-listen`、`--gateway-listen`、`--mcp-listen`、`--log-file`、
+`--smoke`、`--tls-terminated-by-frontend`）与 `--probe` 或 `--check-config` 同时使用时会被拒绝。
+`--probe` 与 `--check-config` 本身也互斥。
+
+### 5.5 当前限制
+
+以下限制存在于当前源码中，并非架构设计：
+
+- **会话与轮次仅在内存中保存。** `adapters/state.rs`（`MemoryPersistence`、`RuntimeStateStore`）
+  将所有会话和轮次仅保存在进程内存中。模块注释说明："Neither store is durable. … a restart
+  loses every session, turn and credential."（两个存储都不是持久化的，重启后所有会话、轮次和凭据
+  都会丢失。）持久化存储尚未实现。
+- **静默审批。** `claw-runtime/src/approval.rs` 提供了 `SilentApprovalPort`，在
+  `adapters/agent_runtime.rs` 中以 `approvals: Arc::new(SilentApprovalPort)` 接入。其 `present()`
+  和 `settle()` 方法无条件返回 `Ok(())`——所有审批请求都会被静默批准，不呈现给任何界面。
+- **Wasm 技能执行未接入。** `adapters/signed_plugins.rs` 通过 `wasm_skills()` 方法提供了
+  `PluginWasmSkillHost`（实现了 `WasmSkillHost`），但 `wasm_skills()` 未在运行时路径中被调用。
+  通过 `claw-skills` 桥接的 Wasm 技能调用尚未接入。
+- **证据、Watch 和 Webhook 路由已禁用。** `ProductionService::start` 为 watch-auth、watch-results
+  和 webhook 服务提供了 `DisabledExternalPorts`（源码注释："optional watch pairing and task-flow
+  webhook routes are disabled"）。
 
 `packaging/linux/systemd/gta-claw-daemon.service` 提供了一份经过评审的 `systemd` 单元文件，Debian 与 RPM
 打包原型会使用它。
@@ -494,21 +567,27 @@ gta-claw-updater \
 版本 1 的运行时信封要求提供 `schema_version`，以及下列 `core` 配置域：`auth`、`role`、`channels`、
 `server`、`logging`、`sessions`、`copilot`、`legacy`、`updates`、`admin`、`network`。
 
-**目前没有任何已发布的可执行程序会加载配置文件。** `claw-config` 是一层等待守护进程装配的库边界。
+**守护进程会加载配置文件**，通过 `--config` 或 `GTA_CLAW_CONFIG` 指定，两者均未设置时回退到遗留
+环境变量迁移。`claw-config` 库边界已完整接入产品组合。
 
 ### 8.2 可执行程序真正读取的环境变量
 
 | 变量 | 读取方 | 含义 |
 |---|---|---|
 | `GTA_CLAW_GATEWAY_URL` | `gta-claw-tui` | 默认 Gateway 端点（`ws://127.0.0.1:18789`）。 |
-| `GTA_CLAW_GATEWAY_TOKEN` | `gta-claw-tui` | 共享的 Gateway 令牌。 |
+| `GTA_CLAW_GATEWAY_TOKEN` | `gta-claw-tui`、`gta-claw-daemon` | 共享的 Gateway 令牌。TUI 无令牌参数；守护进程用于 Gateway WebSocket 监听器的静态凭据。 |
 | `NO_COLOR` | `gta-claw-tui` | 单色输出。 |
 | `TERM` | `gta-claw-tui` | 取值为 `dumb` 时视为非交互。 |
+| `GTA_CLAW_CONFIG` | `gta-claw-daemon` | JSON5 配置文件路径。被 `--config` 覆盖。 |
+| `GTA_CLAW_STATE_DIR` | `gta-claw-daemon` | 状态目录（gateway-pairings、audit、goals）。被 `--state-dir` 覆盖。回退到 `$HOME/.gta-claw`。 |
+| `GTA_CLAW_ADMIN_TOKEN` | `gta-claw-daemon` | 受保护 HTTP 路由的 Bearer 凭据。未设置时受保护路由被禁用。 |
+| `GTA_CLAW_LOG_FORMAT` | `gta-claw-daemon` | 遥测格式：`human`（默认）或 `json`。 |
+| `GTA_CLAW_LOG` | `gta-claw-daemon` | Tracing 过滤器覆盖（如 `debug`、`claw_runtime=trace`）。 |
+| `GTA_CLAW_PLUGIN_POLICY` | `gta-claw-daemon` | 已签名插件的激活策略。 |
 | `GTA_CLAW_CREDENTIALS_DIR` | `claw-provider-sdk` 文件密钥存储 | 覆盖凭据根目录。否则依次为 `$XDG_DATA_HOME/gta-claw/credentials`，再否则 `$HOME`（或 `%USERPROFILE%`）`/.local/share/gta-claw/credentials`。 |
 | `CREDENTIALS_DIRECTORY` | `claw-provider-sdk` 文件密钥存储 | systemd 的凭据目录。 |
 | `GTA_CLAW_ACPX_LEASE_ID`、`GTA_CLAW_ACPX_SESSION_KEY` | `claw-acp` | ACP 扩展的租约与会话密钥。 |
 | `CODEX_HOME`、`XDG_CONFIG_HOME`、`XDG_DATA_HOME`、`APPDATA`、`LOCALAPPDATA`、`HOME`、`USERPROFILE` | `claw-migrate`、`gta-claw-updater` | 源目录与状态目录的发现。 |
-| `GTA_CLAW_LOG` | `claw-observability` 的默认值 | `TelemetryConfig::default()` 中的 tracing 过滤器变量。目前没有任何已发布的可执行程序安装该订阅器。 |
 
 `.env.example`、`deploy/run.sh` 和 `deploy/conf/` 属于**遗留的 Node 服务**，它们不配置任何 Rust 可执行
 程序，请不要把它们当作 Rust 产品的参考。
@@ -556,9 +635,11 @@ gta-claw-updater \
 这里明确列出，免得有人去找并不存在的参数：
 
 - **没有 Rust 聊天命令。** `gta-claw-cli send` 是有意失败的。
-- **没有 Rust 生产服务。** 守护进程装配的是占位适配器。
-- **没有通道流量。** Teams、Telegram、Discord 和 WhatsApp 在 `claw-channels` 中只是注册表与认证元数据，
-  不是可用的传输实现。
+- **会话与轮次仅在内存中保存。** 守护进程的会话和轮次存储在进程内存中，重启后全部丢失。持久化存储尚未实现。
+- **静默审批。** 审批端口立即批准每个请求，没有任何审批界面。
+- **Wasm 技能执行未接入。** `PluginWasmSkillHost` 桥接在源码中存在，但未连接到运行时路径，Wasm 技能无法被调用。
+- **证据、Watch 和 Webhook 路由已禁用。** watch-auth、watch-results 和 webhook 服务在产品组合中使用了
+  `DisabledExternalPorts`。
 - **不支持从远程 URL 加载角色或技能。** 那是遗留设计，不会被移植。
 - **没有 JavaScript 技能。** 技能执行只有三种形式：原生 Rust、声明式 HTTP 端口，或 WebAssembly 组件。
   永远不会引入内嵌的 JavaScript 引擎。
