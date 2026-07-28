@@ -29,17 +29,19 @@ English version: [docs/usage-guide-en.md](usage-guide-en.md)
 
 请先读这一节，可以省下不少时间。
 
-Rust 工作空间**尚未**提供完整的 Agent 服务。`gta-claw-daemon` 是组装根，但它装配的各子系统适配器目前
-仍是确定性的占位实现。当前真正能做的事情是：
+Rust 工作空间仍有重要缺口，但 `gta-claw-daemon` 已不再是只验证生命周期的占位程序。它的正常入口会调用
+生产服务组装。当前真正能做的事情是：
 
 - **连接到已有的 OpenClaw Gateway**——CLI 作为受限的诊断工具，TUI 作为交互式客户端，桌面客户端作为
   原生连接界面。
-- **运行守护进程的生命周期**，包括健康探针、信号处理，以及可验证的关停排空过程。
+- **把守护进程作为网络服务运行**——它会绑定主 HTTP、兼容旧版的 HTTP、Gateway 与 MCP 传输；配置好认证后
+  使用 Copilot 提供方，并激活已配置的 Teams、Telegram、Discord 与 WhatsApp 通道路径。
+- **运行受监管的守护进程生命周期**，包括配置检查、健康探针、信号处理，以及可验证的关停排空过程。
 - **执行一次签名更新**，使用独立的更新器。
 
-目前没有任何 Rust 命令可以与模型提供方发起对话、从 URL 加载角色，或承接
-Teams / Telegram / Discord / WhatsApp 的流量。这些仍由 `src/` 下的遗留 Node 服务承担，并正在逐个模块
-删除——详见 [legacy-node-port-obligations.md](legacy-node-port-obligations.md)。
+这并不代表已经完整对齐旧服务。运行时会话与轮次仍保存在内存中；审批请求没有面向操作员的展示适配器；
+原生 `claw-tools`、内置 `claw-skills` 与独立的安全证据处理路径也尚未装配进守护进程。已签名的 WebAssembly
+插件工具与持久化目标工具可以实际执行，因此不能把这些较窄的缺口表述为“完全没有工具执行”。
 
 ---
 
@@ -344,10 +346,30 @@ q / Ctrl-C        安全退出
 ## 5. `gta-claw-daemon`
 
 ```text
-usage: gta-claw-daemon [--probe]
+usage: gta-claw-daemon [--probe | --check-config] [--config PATH] [--listen ADDRESS] [--legacy-listen ADDRESS] [--gateway-listen ADDRESS] [--mcp-listen ADDRESS] [--state-dir PATH] [--log-file PATH] [--tls-terminated-by-frontend] [--smoke]
 ```
 
-其他任何参数都会被拒绝。
+以上是 `production::USAGE` 的原文。程序还接受 `--help` 与 `-h`：无论它们出现在参数列表的什么位置，都会
+优先打印这段用法并成功退出。
+
+| 选项 | 当前行为 |
+|---|---|
+| `--help`、`-h` | 打印 `USAGE` 并成功退出。帮助参数优先于其他所有参数，包括非法或互斥的参数。 |
+| `--probe` | 输出本机进程健康状态后退出，不加载配置，也不打开监听器。 |
+| `--check-config` | 加载配置并执行启动前相同的非网络静态检查，然后输出 `configuration valid source=<source>`。可与 `--config`、`--state-dir` 一起使用，但不能与监听、日志、TLS 或 smoke 选项组合。 |
+| `--config PATH` | 从 `PATH` 加载严格的分层 JSON5。未指定时先读取 `GTA_CLAW_CONFIG`；仍未设置时使用经过审计的旧环境变量迁移结果。 |
+| `--listen ADDRESS` | 覆盖主 HTTP 监听地址。 |
+| `--legacy-listen ADDRESS` | 覆盖兼容 Node 旧接口的 HTTP 监听地址。 |
+| `--gateway-listen ADDRESS` | 覆盖 Gateway WebSocket 监听地址。 |
+| `--mcp-listen ADDRESS` | 覆盖 MCP HTTP 监听地址。MCP 始终只能绑定回环地址。 |
+| `--state-dir PATH` | 覆盖本地状态目录；否则依次使用 `GTA_CLAW_STATE_DIR` 与 `$HOME/.gta-claw`。目标、Gateway 配对与安全审计记录使用该目录，但运行时会话与轮次仍只在内存中。 |
+| `--log-file PATH` | 将普通遥测写入文件而不是标准错误。仅服务模式可用。 |
+| `--tls-terminated-by-frontend` | 仅在受信任前端负责 TLS 终止时，允许主 HTTP、旧版 HTTP 或 Gateway 绑定非回环地址。该选项本身不终止 TLS，也不会放宽 MCP 的回环限制。 |
+| `--smoke` | 使用本地安装诊断角色与提供方。仅服务模式可用，且所有显式监听地址都必须是回环地址。 |
+
+每个 `ADDRESS` 都按套接字地址解析。未覆盖时，主 HTTP、Gateway 与 MCP 绑定回环临时端口；旧版 HTTP
+绑定配置中服务端口对应的回环地址。`--probe` 与 `--check-config` 互斥。两种非服务模式在语法上都接受
+`--config` 与 `--state-dir`，但 `--probe` 不会使用它们。
 
 ### 5.1 健康探针
 
@@ -364,11 +386,12 @@ gta-claw-daemon
 ```
 
 启动时，它会**先**安装停止信号处理器，再启动任何子系统——这样即使监管进程在启动过程中要求停止，也能被
-观察到——随后打印：
+观察到。之后它构建生产依赖、绑定四种传输，并按配置激活提供方与通道，随后打印：
 
 ```text
 ready protocol=1
 healthy runtime=<os>-<arch>
+service http=<address> legacy=<address> gateway=<address> mcp=<address> provider=<name> config_generation=<n>
 ```
 
 之后持续提供服务，直到出现下列情况之一：
@@ -397,8 +420,15 @@ printf 'shutdown\n' | gta-claw-daemon
 
 ### 5.3 当前限制
 
-守护进程装配的是各运行时子系统的确定性占位实现。它不会连接模型提供方，不承接聊天流量，也不会打开任何
-通道。当前请把它当作生命周期与关停能力的验证面，而不是产品服务。
+网络与对话路径是真实的，但仍有以下边界：
+
+- `AgentRuntime` 使用 `RuntimeStateStore` 与 `MemoryContextEngine`，所以运行时会话、轮次与对话记忆会在
+  进程退出时丢失。目标存储、Gateway 配对存储与安全审计属于另外的持久化路径。
+- `RuntimePorts` 安装的是 `SilentApprovalPort`：审批生命周期存在，但该守护进程不会把请求展示给操作员。
+- 工具执行目前限于已激活的签名插件工具与持久化 `update_goal` 工具；原生 `claw-tools` 注册表尚未装配。
+- 内置 `claw-skills` 注册表目前只用于清点；其原生与声明式技能执行器未接入生产组装。签名插件宿主已有
+  Wasm 桥接，但生产组装没有把它安装为通用技能执行器。
+- 守护进程会写入持久化安全审计记录，但没有装配独立的安全证据处理路径。
 
 `packaging/linux/systemd/gta-claw-daemon.service` 提供了一份经过评审的 `systemd` 单元文件，Debian 与 RPM
 打包原型会使用它。
@@ -556,12 +586,10 @@ gta-claw-updater \
 这里明确列出，免得有人去找并不存在的参数：
 
 - **没有 Rust 聊天命令。** `gta-claw-cli send` 是有意失败的。
-- **没有 Rust 生产服务。** 守护进程装配的是占位适配器。
-- **没有通道流量。** Teams、Telegram、Discord 和 WhatsApp 在 `claw-channels` 中只是注册表与认证元数据，
-  不是可用的传输实现。
-- **不支持从远程 URL 加载角色或技能。** 那是遗留设计，不会被移植。
-- **没有 JavaScript 技能。** 技能执行只有三种形式：原生 Rust、声明式 HTTP 端口，或 WebAssembly 组件。
-  永远不会引入内嵌的 JavaScript 引擎。
+- **守护进程尚未完整对齐旧服务。** 它会承接真实的主 HTTP、旧版 HTTP、Gateway 与 MCP 流量，也可以运行
+  已配置的通道适配器；但会话与轮次仍在内存中，原生工具、内置技能、面向操作员的审批展示与证据路径仍不完整。
+- **守护进程尚未提供通用的内置技能执行。** 它支持远程角色文档，但没有装配内置的原生 / 声明式技能
+  执行器。不会加入 JavaScript 技能执行；支持的技能设计是原生 Rust、声明式 HTTP 或 WebAssembly。
 - **CLI 和桌面客户端都没有持久设备身份**，目前只支持临时身份。
 - **本仓库不包含 Android 或 iOS 应用**，也没有 Linux 桌面构建。
 

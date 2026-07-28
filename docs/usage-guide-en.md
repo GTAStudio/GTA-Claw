@@ -30,19 +30,23 @@ guide says so instead of describing it.
 
 Read this first; it will save you time.
 
-The Rust workspace does **not** yet ship a complete agent service. `gta-claw-daemon` is the
-composition root, and its subsystem adapters are still deterministic stand-ins. What works today is:
+The Rust workspace still has important gaps, but `gta-claw-daemon` is no longer a lifecycle-only
+stand-in. Its normal entry point calls the production service composition. What works today is:
 
 - **Connecting to an existing OpenClaw Gateway** — with the CLI as a bounded diagnostic, with the
   TUI as an interactive client, and with the desktop shell as a native connection surface.
-- **Running the daemon's lifecycle**, including its health probe, signal handling and provable
-  shutdown drain.
+- **Running the daemon as a network service** — it binds the main HTTP, legacy HTTP, Gateway and MCP
+  transports, uses an authenticated Copilot provider when configured, and activates configured
+  Teams, Telegram, Discord and WhatsApp channel paths.
+- **Running the daemon's supervised lifecycle**, including configuration checking, its health probe,
+  signal handling and provable shutdown drain.
 - **Applying a signed update** with the standalone updater.
 
-There is no Rust command that starts a chat with a model provider, loads a role from a URL, or
-serves Teams/Telegram/Discord/WhatsApp traffic. The legacy Node service in `src/` still owns those,
-and is being deleted module by module — see
-[legacy-node-port-obligations.md](legacy-node-port-obligations.md).
+This is not yet a claim of complete parity. Runtime sessions and turns are in memory, approval
+requests have no operator-facing presentation adapter, and the native `claw-tools`, bundled
+`claw-skills`, and separate security-evidence paths are not composed into the daemon. Signed
+WebAssembly plugin tools and the durable goal tool are executable, so those narrower gaps should not
+be described as an absence of all tool execution.
 
 ---
 
@@ -358,10 +362,31 @@ list, prints one rendered frame and exits. If the Gateway does not answer in tim
 ## 5. `gta-claw-daemon`
 
 ```text
-usage: gta-claw-daemon [--probe]
+usage: gta-claw-daemon [--probe | --check-config] [--config PATH] [--listen ADDRESS] [--legacy-listen ADDRESS] [--gateway-listen ADDRESS] [--mcp-listen ADDRESS] [--state-dir PATH] [--log-file PATH] [--tls-terminated-by-frontend] [--smoke]
 ```
 
-Any other argument is rejected.
+That is the exact `production::USAGE` string. `--help` and `-h` are also accepted: either one wins
+regardless of its position, prints the usage string and exits successfully.
+
+| Option | Current behavior |
+|---|---|
+| `--help`, `-h` | Prints `USAGE` and exits successfully. Help takes precedence over every other argument, including malformed or incompatible ones. |
+| `--probe` | Prints the native process health line and exits without loading configuration or opening listeners. |
+| `--check-config` | Loads configuration and runs the same non-network static checks used before startup, then prints `configuration valid source=<source>`. It may be combined with `--config` and `--state-dir`, but not with listener, log, TLS or smoke options. |
+| `--config PATH` | Loads strict layered JSON5 from `PATH`. Without it, `GTA_CLAW_CONFIG` is used when set; otherwise the audited legacy-environment migration supplies the configuration. |
+| `--listen ADDRESS` | Overrides the main HTTP bind. |
+| `--legacy-listen ADDRESS` | Overrides the Node-compatible legacy HTTP bind. |
+| `--gateway-listen ADDRESS` | Overrides the Gateway WebSocket bind. |
+| `--mcp-listen ADDRESS` | Overrides the MCP HTTP bind. MCP is always restricted to a loopback address. |
+| `--state-dir PATH` | Overrides local state location. Otherwise `GTA_CLAW_STATE_DIR`, then `$HOME/.gta-claw`, is used. Goals, Gateway pairings and security audit records use this directory, but runtime session/turn state remains in memory. |
+| `--log-file PATH` | Writes ordinary telemetry to the file instead of standard error. This is serve-only. |
+| `--tls-terminated-by-frontend` | Permits a non-loopback main HTTP, legacy HTTP or Gateway bind only when a trusted frontend terminates TLS. It does not terminate TLS itself and does not relax the MCP loopback rule. |
+| `--smoke` | Uses the local install-diagnostic role and provider. It is serve-only and every explicit listener must remain loopback. |
+
+Each `ADDRESS` is parsed as a socket address. Without overrides, main HTTP, Gateway and MCP bind
+loopback ephemeral ports; legacy HTTP binds loopback on the configured server port. `--probe` and
+`--check-config` are mutually exclusive. In either non-serving mode, `--config` and `--state-dir`
+are syntactically accepted; `--probe` does not use them.
 
 ### 5.1 Health probe
 
@@ -378,11 +403,13 @@ gta-claw-daemon
 ```
 
 On startup it installs the stop signal handlers *before* starting any subsystem — so a supervisor
-that stops the process mid-start is still observed — then prints:
+that stops the process mid-start is still observed. It builds the production dependencies, binds the
+four transports, conditionally activates the provider and configured channels, then prints:
 
 ```text
 ready protocol=1
 healthy runtime=<os>-<arch>
+service http=<address> legacy=<address> gateway=<address> mcp=<address> provider=<name> config_generation=<n>
 ```
 
 It then serves until one of:
@@ -413,9 +440,20 @@ printf 'shutdown\n' | gta-claw-daemon
 
 ### 5.3 Current limits
 
-The daemon composes deterministic stand-ins for the runtime subsystems. It does not connect to a
-model provider, serve chat traffic, or open a channel. Treat it today as a lifecycle and shutdown
-surface, not as the product service.
+The network and conversation paths are real, but these boundaries remain:
+
+- `AgentRuntime` uses `RuntimeStateStore` and `MemoryContextEngine`, so runtime sessions, turns and
+  conversation memory are lost when the process exits. The goal store, Gateway pairing store and
+  security audit are separate durable paths.
+- `RuntimePorts` installs `SilentApprovalPort`: approval lifecycle exists, but requests are not
+  presented to an operator by this daemon.
+- Tool execution is limited to activated signed-plugin tools plus the durable `update_goal` tool.
+  The native `claw-tools` registry is not composed.
+- The bundled `claw-skills` registry is counted for inventory, but its native/declarative skill
+  executors are not wired into production. A Wasm bridge exists for the signed plugin host, but the
+  production composition does not install it as a general skill executor.
+- The daemon writes durable security audit records, but it does not compose a distinct security
+  evidence handling path.
 
 A reviewed `systemd` unit exists at `packaging/linux/systemd/gta-claw-daemon.service` and is used by
 the Debian and RPM packaging prototypes.
@@ -586,12 +624,12 @@ plain mode.
 State this plainly so nobody hunts for a flag that does not exist:
 
 - **No Rust chat command.** `gta-claw-cli send` fails on purpose.
-- **No Rust production service.** The daemon composes stand-in adapters.
-- **No channel traffic.** Teams, Telegram, Discord and WhatsApp are registry and auth metadata in
-  `claw-channels`, not working transports.
-- **No role or skill loading from remote URLs.** That was the legacy design and is not being ported.
-- **No JavaScript skills.** Skill execution is native Rust, a declarative HTTP port, or a WebAssembly
-  component. An embedded JavaScript engine will never be added.
+- **The daemon is not complete parity.** It serves real HTTP, legacy HTTP, Gateway and MCP traffic
+  and can run configured channel adapters, but runtime sessions/turns are in memory and native tool,
+  bundled skill, operator approval-presentation and evidence paths remain incomplete.
+- **No general bundled-skill execution in the daemon.** Remote role documents are supported, but the
+  bundled native/declarative skill executors are not composed. JavaScript skill execution will not
+  be added; the supported skill designs are native Rust, declarative HTTP or WebAssembly.
 - **No durable device identity** for CLI or desktop; both are ephemeral-only today.
 - **No Android or iOS application** in this repository, and no Linux desktop build.
 

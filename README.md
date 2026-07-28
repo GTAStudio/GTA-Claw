@@ -20,15 +20,18 @@ Two Cargo workspaces and one legacy service that is being retired:
 |---|---|
 | `crates/` + `apps/` (root workspace) | 31 library crates and 6 binaries. Edition 2024, `resolver = "3"`. |
 | `desktop/` (separate workspace) | `gta-claw-desktop`, a native Slint UI for Windows and macOS. |
-| `src/`, `Dockerfile`, `package.json`, `tsconfig.json` | The legacy Node/TypeScript service. Still the only fully composed production service; being deleted module by module. |
+| `src/`, `Dockerfile`, `package.json`, `tsconfig.json` | The legacy Node/TypeScript service retained during the Rust migration; being deleted module by module. |
 
 The root workspace excludes `desktop/` (`exclude = ["android", "desktop", "ios"]`), so a root
 `cargo build` never resolves Slint. CI asserts this with `cargo metadata`.
 
-**Status caveat, stated up front:** the Rust crates are substantially implemented and tested, but
-`gta-claw-daemon` is a composition root whose subsystem adapters are still deterministic stand-ins
-(see its crate docs and [`docs/PROGRESS.md`](docs/PROGRESS.md)). Do not read this README as a claim
-that a complete Rust production service ships today.
+**Status caveat, stated up front:** `gta-claw-daemon` now has a real production composition. Its
+`main` path calls `serve_production`, which binds the main HTTP, legacy HTTP, Gateway and MCP
+transports and conditionally starts configured provider and channel adapters. Important gaps remain:
+runtime sessions and turns are process-memory state, approvals use a silent presentation adapter,
+and the daemon does not yet compose the native `claw-tools`, bundled `claw-skills`, or separate
+security-evidence handling paths. Signed WebAssembly plugin tools and the durable goal tool are
+already executable and should not be confused with those missing native paths.
 
 ## Rust migration ratchet
 
@@ -58,8 +61,9 @@ components instead.
 
 ## Architecture
 
-Solid arrows are real Cargo dependencies. The dashed arrow is the composition seam: the daemon is
-what binds concrete adapters to the runtime's ports, and that binding is the work still outstanding.
+Solid arrows are real Cargo dependencies. The dashed arrow is the composition seam where the daemon
+binds concrete adapters to runtime ports; some native tool, bundled skill, approval-presentation and
+evidence adapters remain uncomposed.
 
 ```mermaid
 flowchart TB
@@ -114,7 +118,7 @@ flowchart TB
   runtime --> app
   goals --> runtime
   plat --> app
-  daemon -.->|binds adapters to ports; stand-ins today| adapters
+  daemon -.->|binds production adapters; some native paths remain| adapters
 ```
 
 The direction is enforced by the manifests, not by convention: `claw-domain` depends on nothing in
@@ -188,7 +192,7 @@ independently testable units that a composition root adapts to a port.
 |---|---|
 | `gta-claw-cli` | `--version`, `--help`/`-h`, local `health`, a deliberately unsupported `send`, and `gateway health` — one real authenticated Gateway v4 connection, one `health` RPC, bounded shutdown, typed exit codes and an optional `--json` report. See [`apps/gta-claw-cli/README.md`](apps/gta-claw-cli/README.md). |
 | `gta-claw-tui` | A Crossterm terminal client over `claw-gateway-client` with Sessions, Workspace, Runs, Diff, Artifacts and Help screens, a command palette, and a non-TTY `--plain` snapshot mode. |
-| `gta-claw-daemon` | The composition root: `--probe` for a one-shot health line, otherwise serve until `SIGTERM`/`SIGINT` (or Windows Ctrl-C/Break/Close/Shutdown) or a `shutdown` line on the control channel, then report a provable drain summary. Its subsystem adapters are still stand-ins. |
+| `gta-claw-daemon` | The production composition root: `--probe` for a one-shot health line; `--check-config` for non-network validation; otherwise bind main HTTP, legacy HTTP, Gateway and loopback MCP transports, conditionally activate configured provider/channel adapters, and serve until a stop signal or control-channel shutdown before reporting a bounded drain summary. Runtime sessions/turns remain in memory, approvals are silent, and native tool, bundled skill and evidence paths are not yet composed; signed plugin tools and the durable goal tool are live. |
 | `gta-claw-updater` | A standalone signed, resumable, rollback-safe updater. On Linux it refuses and defers to the system package manager. |
 | `gta-claw-android` | The Android client core: endpoint/credential intake, Gateway identity, attempt lifecycle. **No Android UI exists in this repository** — see [`apps/gta-claw-android/README.md`](apps/gta-claw-android/README.md). |
 | `gta-claw-ios` | The iOS client core, on the same terms. See [`apps/gta-claw-ios/README.md`](apps/gta-claw-ios/README.md). |
