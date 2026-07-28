@@ -94,6 +94,10 @@ pub enum Reply {
         status: u16,
         /// `Content-Type` of the stream.
         content_type: String,
+        /// Delay before the response headers are written.
+        header_delay: Duration,
+        /// Delay between the response headers and the first body chunk.
+        body_delay: Duration,
         /// Chunks written in order, each flushed before the next.
         frames: Vec<Vec<u8>>,
         /// When true the server never writes the terminating chunk and instead
@@ -142,6 +146,8 @@ impl Reply {
         Self::Chunked {
             status: 200,
             content_type: "text/event-stream".to_owned(),
+            header_delay: Duration::ZERO,
+            body_delay: Duration::ZERO,
             frames: frames
                 .iter()
                 .map(|frame| frame.as_bytes().to_vec())
@@ -157,11 +163,33 @@ impl Reply {
         Self::Chunked {
             status: 200,
             content_type: "text/event-stream".to_owned(),
+            header_delay: Duration::ZERO,
+            body_delay: Duration::ZERO,
             frames: frames
                 .iter()
                 .map(|frame| frame.as_bytes().to_vec())
                 .collect(),
             hold_open: true,
+        }
+    }
+
+    /// A chunked JSON response with independent header and body delays.
+    #[must_use]
+    pub fn delayed_chunked_json(
+        header_delay: Duration,
+        body_delay: Duration,
+        frames: &[&str],
+    ) -> Self {
+        Self::Chunked {
+            status: 200,
+            content_type: "application/json".to_owned(),
+            header_delay,
+            body_delay,
+            frames: frames
+                .iter()
+                .map(|frame| frame.as_bytes().to_vec())
+                .collect(),
+            hold_open: false,
         }
     }
 }
@@ -170,6 +198,7 @@ impl Reply {
 struct ServerState {
     requests: Mutex<Vec<RecordedRequest>>,
     peer_closed: AtomicBool,
+    response_headers_written: AtomicUsize,
     frames_written: AtomicUsize,
 }
 
@@ -249,6 +278,12 @@ impl TestServer {
     #[must_use]
     pub fn frames_written(&self) -> usize {
         self.state.frames_written.load(Ordering::SeqCst)
+    }
+
+    /// Returns how many response header blocks the server managed to write.
+    #[must_use]
+    pub fn response_headers_written(&self) -> usize {
+        self.state.response_headers_written.load(Ordering::SeqCst)
     }
 
     /// Waits up to `timeout` for the client to close a held-open socket.
@@ -338,6 +373,9 @@ async fn serve(mut stream: TcpStream, reply: Reply, state: Arc<ServerState>) {
             if stream.write_all(head.as_bytes()).await.is_err() {
                 return;
             }
+            state
+                .response_headers_written
+                .fetch_add(1, Ordering::SeqCst);
             let _ = stream.write_all(&body).await;
             let _ = stream.flush().await;
             let _ = stream.shutdown().await;
@@ -345,16 +383,23 @@ async fn serve(mut stream: TcpStream, reply: Reply, state: Arc<ServerState>) {
         Reply::Chunked {
             status,
             content_type,
+            header_delay,
+            body_delay,
             frames,
             hold_open,
         } => {
+            tokio::time::sleep(header_delay).await;
             let head = format!(
                 "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
                 reason(status)
             );
-            if stream.write_all(head.as_bytes()).await.is_err() {
+            if stream.write_all(head.as_bytes()).await.is_err() || stream.flush().await.is_err() {
                 return;
             }
+            state
+                .response_headers_written
+                .fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(body_delay).await;
             for frame in frames {
                 let chunk = format!("{:x}\r\n", frame.len());
                 if stream.write_all(chunk.as_bytes()).await.is_err()

@@ -27,6 +27,7 @@ use http_body_util::{BodyExt as _, Full};
 use hyper::body::{Body as _, Incoming};
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
+use tokio::time::Instant;
 use url::Url;
 
 pub use self::proxy::{
@@ -712,7 +713,7 @@ impl HttpTransport {
         request: HttpRequest,
         cancel: &CancelToken,
     ) -> Result<HttpResponse, ProviderError> {
-        let deadline = request.timeout.unwrap_or(self.request_timeout);
+        let deadline = Instant::now() + request.timeout.unwrap_or(self.request_timeout);
         let response = self
             .dispatch(provider, operation, &request, deadline, cancel)
             .await?;
@@ -747,7 +748,7 @@ impl HttpTransport {
         // A streamed response has no total deadline, but both its handshake and
         // every silent interval are bounded so a dead upstream cannot retain a
         // connection forever.
-        let deadline = request.timeout.unwrap_or(self.request_timeout);
+        let deadline = Instant::now() + request.timeout.unwrap_or(self.request_timeout);
         let idle_timeout = request
             .stream_idle_timeout
             .unwrap_or(self.stream_idle_timeout);
@@ -776,7 +777,7 @@ impl HttpTransport {
         provider: &str,
         operation: Operation,
         request: &HttpRequest,
-        deadline: Duration,
+        deadline: Instant,
         cancel: &CancelToken,
     ) -> Result<http::Response<Incoming>, ProviderError> {
         let wire = self.build(provider, operation, request)?;
@@ -896,13 +897,16 @@ async fn collect_bounded(
 
 /// Races a future against the cancel token and a deadline.
 ///
+/// The deadline is absolute so callers can reuse it across successive phases
+/// without restoring time already spent in an earlier phase.
+///
 /// Cancellation wins over the deadline, and both win over the future, so a
 /// cancelled request never reports a timeout it did not have. Dropping the
 /// future is what actually aborts the in-flight exchange and closes the socket.
 async fn with_deadline<F>(
     provider: &str,
     operation: Operation,
-    deadline: Duration,
+    deadline: Instant,
     cancel: &CancelToken,
     cancelled_detail: &str,
     future: F,
@@ -910,6 +914,22 @@ async fn with_deadline<F>(
 where
     F: Future,
 {
+    if cancel.is_cancelled() {
+        return Err(ProviderError::new(
+            ErrorKind::Cancelled,
+            provider,
+            operation,
+            cancelled_detail,
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(ProviderError::new(
+            ErrorKind::Timeout,
+            provider,
+            operation,
+            "the request exceeded its deadline",
+        ));
+    }
     tokio::select! {
         biased;
         () = cancel.cancelled() => Err(ProviderError::new(
@@ -918,7 +938,7 @@ where
             operation,
             cancelled_detail,
         )),
-        () = tokio::time::sleep(deadline) => Err(ProviderError::new(
+        () = tokio::time::sleep_until(deadline) => Err(ProviderError::new(
             ErrorKind::Timeout,
             provider,
             operation,
@@ -1383,6 +1403,56 @@ mod tests {
             error.detail(),
             "the request was cancelled before a response arrived"
         );
+    }
+
+    #[tokio::test]
+    async fn work_that_finishes_before_the_deadline_returns_its_output() {
+        let output = with_deadline(
+            "test",
+            Operation::Complete,
+            Instant::now() + Duration::from_secs(1),
+            &CancelToken::new(),
+            "cancelled",
+            async { 42_u8 },
+        )
+        .await
+        .expect("the future completes before the deadline");
+
+        assert_eq!(output, 42);
+    }
+
+    #[tokio::test]
+    async fn the_deadline_wins_at_the_exact_boundary() {
+        let error = with_deadline(
+            "test",
+            Operation::Complete,
+            Instant::now(),
+            &CancelToken::new(),
+            "cancelled",
+            async { 42_u8 },
+        )
+        .await
+        .expect_err("an already-expired deadline wins over ready work");
+
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+        assert_eq!(error.detail(), "the request exceeded its deadline");
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_when_the_deadline_is_also_ready() {
+        let error = with_deadline(
+            "test",
+            Operation::Complete,
+            Instant::now(),
+            &CancelToken::cancelled_token(),
+            "cancelled at the boundary",
+            async { 42_u8 },
+        )
+        .await
+        .expect_err("cancellation has priority over an expired deadline");
+
+        assert_eq!(error.kind(), ErrorKind::Cancelled);
+        assert_eq!(error.detail(), "cancelled at the boundary");
     }
 
     #[test]

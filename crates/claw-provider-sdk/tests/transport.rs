@@ -132,6 +132,70 @@ async fn a_non_success_status_is_reported_with_its_body_and_retry_after() {
 }
 
 #[tokio::test]
+async fn a_buffered_exchange_shares_one_deadline_across_headers_and_body() {
+    let phase_delay = Duration::from_millis(500);
+    let request_timeout = Duration::from_millis(750);
+    assert!(phase_delay < request_timeout);
+    assert!(phase_delay + phase_delay > request_timeout);
+
+    let server = TestServer::start(vec![Reply::delayed_chunked_json(
+        phase_delay,
+        phase_delay,
+        &[r#"{"ok":true}"#],
+    )])
+    .await;
+
+    let error = transport()
+        .send(
+            "test",
+            Operation::Complete,
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions"))
+                .timeout(request_timeout),
+            &CancelToken::new(),
+        )
+        .await
+        .expect_err("the combined header and body time must exceed one deadline");
+
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert_eq!(error.detail(), "the request exceeded its deadline");
+    assert_eq!(
+        server.response_headers_written(),
+        1,
+        "the header phase completed within its standalone budget"
+    );
+    assert_eq!(
+        server.frames_written(),
+        0,
+        "the absolute deadline fired before the delayed body arrived"
+    );
+}
+
+#[tokio::test]
+async fn a_buffered_exchange_succeeds_when_all_phases_fit_one_deadline() {
+    let server = TestServer::start(vec![Reply::delayed_chunked_json(
+        Duration::from_millis(50),
+        Duration::from_millis(50),
+        &[r#"{"ok":true}"#],
+    )])
+    .await;
+
+    let response = transport()
+        .send(
+            "test",
+            Operation::Complete,
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions"))
+                .timeout(Duration::from_millis(500)),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("the complete exchange fits within the deadline");
+
+    assert_eq!(response.body(), br#"{"ok":true}"#);
+    assert_eq!(server.response_headers_written(), 1);
+    assert_eq!(server.frames_written(), 1);
+}
+
+#[tokio::test]
 async fn a_chunked_body_is_delivered_incrementally_rather_than_buffered() {
     let server = TestServer::start(vec![Reply::sse(&[
         "data: {\"n\":1}\n\n",
@@ -321,6 +385,8 @@ async fn a_body_larger_than_the_buffer_limit_is_refused_instead_of_being_held() 
     let server = TestServer::start(vec![Reply::Chunked {
         status: 200,
         content_type: "application/json".to_owned(),
+        header_delay: Duration::ZERO,
+        body_delay: Duration::ZERO,
         frames,
         hold_open: false,
     }])
