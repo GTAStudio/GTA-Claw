@@ -12,9 +12,8 @@ use claw_config::{ConfigDomain, ConfigSnapshot, ReloadManager, schema_json, to_j
 use claw_http_api::{
     AdminFailure, AdminPort, AdminSuccess, AuditPort, EmbeddingRequest, GenerationEvent,
     GenerationOutput, GenerationRequest, Model, PortError, PortErrorKind, PortFuture, ProviderPort,
-    ReadinessPort, ReadinessSnapshot, ToolDefinition as HttpToolDefinition, ToolInvocation,
-    ToolOutcome as HttpToolOutcome, ToolPort, Usage as HttpUsage, WatchAuthPort, WatchIdentity,
-    WatchResultPort, WebhookOutcome, WebhookPort,
+    ReadinessPort, ReadinessSnapshot, ToolDefinition as HttpToolDefinition, Usage as HttpUsage,
+    WatchAuthPort, WatchIdentity, WatchResultPort, WebhookOutcome, WebhookPort,
 };
 use claw_protocol::gateway::ConnectParams;
 use claw_provider_sdk::model::{
@@ -1406,34 +1405,11 @@ const fn audit_reason(reason: AuditReason) -> &'static str {
     }
 }
 
-/// Honest adapter for tool execution that has no thread-safe registry port yet.
+/// Fail-closed adapter for optional watch and task-flow routes with no configuration.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct UnavailableTools;
+pub struct DisabledExternalPorts;
 
-impl ToolPort for UnavailableTools {
-    fn list(&self) -> PortFuture<'_, Result<Vec<HttpToolDefinition>, PortError>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn invoke(
-        &self,
-        _invocation: ToolInvocation,
-        _cancellation: CancellationToken,
-    ) -> PortFuture<'_, Result<HttpToolOutcome, PortError>> {
-        Box::pin(async {
-            Err(PortError::new(
-                PortErrorKind::Unavailable,
-                "tool execution is not configured",
-            ))
-        })
-    }
-}
-
-/// Honest adapter for pairing, watch-node, and webhook ports not yet composable.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct UnavailableExternalPorts;
-
-impl WatchAuthPort for UnavailableExternalPorts {
+impl WatchAuthPort for DisabledExternalPorts {
     fn authenticate(
         &self,
         _connect: ConnectParams,
@@ -1441,30 +1417,25 @@ impl WatchAuthPort for UnavailableExternalPorts {
     ) -> PortFuture<'_, Result<WatchIdentity, PortError>> {
         Box::pin(async {
             Err(PortError::new(
-                PortErrorKind::Unavailable,
+                PortErrorKind::NotFound,
                 "watch-node pairing is not configured",
             ))
         })
     }
 }
 
-impl WatchResultPort for UnavailableExternalPorts {
+impl WatchResultPort for DisabledExternalPorts {
     fn handle(
         &self,
         _node_id: String,
         _result: Value,
         _cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<bool, PortError>> {
-        Box::pin(async {
-            Err(PortError::new(
-                PortErrorKind::Unavailable,
-                "watch-node result routing is not configured",
-            ))
-        })
+        Box::pin(async { Ok(false) })
     }
 }
 
-impl WebhookPort for UnavailableExternalPorts {
+impl WebhookPort for DisabledExternalPorts {
     fn invoke(
         &self,
         _route_id: String,
@@ -1473,8 +1444,8 @@ impl WebhookPort for UnavailableExternalPorts {
     ) -> PortFuture<'_, Result<WebhookOutcome, PortError>> {
         Box::pin(async {
             Err(PortError::new(
-                PortErrorKind::Unavailable,
-                "webhook execution is not configured",
+                PortErrorKind::NotFound,
+                "webhook route is not configured",
             ))
         })
     }
@@ -1535,6 +1506,7 @@ pub struct OperatorAdmin {
     readiness: Arc<DependencyReadiness>,
     diagnostics: Arc<Diagnostics>,
     inventory: OperatorInventory,
+    reload_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl OperatorAdmin {
@@ -1546,6 +1518,7 @@ impl OperatorAdmin {
         readiness: Arc<DependencyReadiness>,
         diagnostics: Arc<Diagnostics>,
         inventory: OperatorInventory,
+        reload_lock: Arc<tokio::sync::Mutex<()>>,
     ) -> Self {
         Self {
             config,
@@ -1553,6 +1526,7 @@ impl OperatorAdmin {
             readiness,
             diagnostics,
             inventory,
+            reload_lock,
         }
     }
 
@@ -1623,6 +1597,7 @@ impl AdminPort for OperatorAdmin {
                 )
                 .map_err(|_| admin_unavailable("configuration schema encoding failed"))?,
                 "config.apply" => {
+                    let _reload = self.reload_lock.lock().await;
                     let source = params
                         .as_ref()
                         .and_then(|value| value.get("source"))
@@ -1653,10 +1628,8 @@ impl AdminPort for OperatorAdmin {
                         });
                     }
                     return Err(AdminFailure {
-                        code: "UNAVAILABLE".to_owned(),
-                        message: format!(
-                            "{method} is catalogued but has no production adapter in this build"
-                        ),
+                        code: "NOT_CONFIGURED".to_owned(),
+                        message: format!("{method} is allowlisted but has no configured service"),
                         details: None,
                         retryable: Some(false),
                         retry_after_ms: None,

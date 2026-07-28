@@ -199,11 +199,36 @@ impl StatePort for RuntimeStateStore {
     }
 }
 
+impl RuntimeStateStore {
+    fn remove_session(&self, session_id: &SessionId) -> bool {
+        let mut data = self.data.lock().unwrap_or_else(PoisonError::into_inner);
+        let removed = data.sessions.remove(session_id.as_str()).is_some();
+        data.turns
+            .retain(|(stored, _), _| stored != session_id.as_str());
+        removed
+    }
+
+    fn retain_sessions(&self, retained: &BTreeSet<String>) {
+        let mut data = self.data.lock().unwrap_or_else(PoisonError::into_inner);
+        data.sessions
+            .retain(|session_id, _| retained.contains(session_id));
+        data.turns
+            .retain(|(session_id, _), _| retained.contains(session_id));
+    }
+
+    fn clear(&self) {
+        let mut data = self.data.lock().unwrap_or_else(PoisonError::into_inner);
+        data.sessions.clear();
+        data.turns.clear();
+    }
+}
+
 struct MemorySession {
     session: Session,
     budget: TokenBudget,
     latest_query: Option<String>,
     latest_record: Option<RecordId>,
+    record_ids: BTreeSet<RecordId>,
     used_tokens: usize,
     compacted_items: u32,
 }
@@ -285,6 +310,25 @@ impl MemoryContextEngine {
         data.retriever =
             KeywordRetriever::with_capacity(self.capacity).expect("validated memory capacity");
         data.report = MemoryReport::default();
+    }
+
+    fn remove_session(&self, session_id: &SessionId) -> bool {
+        let mut data = self.data.lock().unwrap_or_else(PoisonError::into_inner);
+        remove_memory_session(&mut data, session_id.as_str())
+    }
+
+    fn retain_sessions(&self, retained: &BTreeSet<String>) {
+        let mut data = self.data.lock().unwrap_or_else(PoisonError::into_inner);
+        let removed: Vec<String> = data
+            .sessions
+            .keys()
+            .filter(|session_id| !retained.contains(*session_id))
+            .cloned()
+            .collect();
+        for session_id in removed {
+            let _ = remove_memory_session(&mut data, &session_id);
+        }
+        drop(data);
     }
 
     fn state(entry: &MemorySession) -> ContextState {
@@ -402,6 +446,7 @@ impl MemoryContextEngine {
         if pinned {
             let _ = entry.session.pin(message_id);
         }
+        entry.record_ids.insert(record_id.clone());
         if let Some(query) = latest_query {
             entry.latest_query = Some(query);
             entry.latest_record = Some(record_id);
@@ -429,6 +474,7 @@ impl ContextEnginePort for MemoryContextEngine {
                 budget,
                 latest_query: None,
                 latest_record: None,
+                record_ids: BTreeSet::new(),
                 used_tokens: 0,
                 compacted_items: 0,
             });
@@ -620,6 +666,16 @@ impl ContextEnginePort for MemoryContextEngine {
             Ok(report)
         })
     }
+}
+
+fn remove_memory_session(data: &mut MemoryData, session_id: &str) -> bool {
+    let Some(removed) = data.sessions.remove(session_id) else {
+        return false;
+    };
+    for record_id in removed.record_ids {
+        let _ = data.retriever.remove(&record_id);
+    }
+    true
 }
 
 fn stable_hash(value: &str) -> u64 {
@@ -967,7 +1023,9 @@ impl ToolPort for AgentHttpTools {
 /// One composed agent runtime shared by HTTP and every channel.
 pub struct AgentRuntime {
     runtime: Arc<Runtime>,
+    admission: tokio::sync::RwLock<()>,
     provider: Arc<SwappableProvider>,
+    state: Arc<RuntimeStateStore>,
     memory: Arc<MemoryContextEngine>,
     goals: Arc<FileGoalStore>,
     model: String,
@@ -1006,7 +1064,7 @@ impl AgentRuntime {
                 provider: Arc::new(RuntimeProviderAdapter {
                     provider: Arc::clone(&provider),
                 }),
-                state,
+                state: state.clone() as Arc<dyn StatePort>,
                 tools: Arc::new(ToolPortBridge {
                     tools: plugin_tools,
                     active: Mutex::new(BTreeMap::new()),
@@ -1028,7 +1086,9 @@ impl AgentRuntime {
         ));
         Ok(Arc::new(Self {
             runtime,
+            admission: tokio::sync::RwLock::new(()),
             provider,
+            state,
             memory,
             goals,
             model,
@@ -1055,8 +1115,18 @@ impl AgentRuntime {
     /// Returns a synchronous channel conversation adapter.
     #[must_use]
     pub fn conversation(self: &Arc<Self>) -> RuntimeConversation {
+        self.conversation_with_cancellation(CancellationToken::new())
+    }
+
+    /// Returns a synchronous channel adapter linked to caller cancellation.
+    #[must_use]
+    pub fn conversation_with_cancellation(
+        self: &Arc<Self>,
+        cancellation: CancellationToken,
+    ) -> RuntimeConversation {
         RuntimeConversation {
             runtime: Arc::clone(self),
+            cancellation,
         }
     }
 
@@ -1085,10 +1155,14 @@ impl AgentRuntime {
                 self.provider.provider_generation(),
             )),
             "reset" => {
+                let _admission = self.admission.write().await;
                 let session_id = SessionId::new(conversation_id).map_err(|error| {
                     PortError::new(PortErrorKind::InvalidRequest, error.to_string())
                 })?;
-                let existed = self.runtime.destroy_session(&session_id).await;
+                let runtime_existed = self.runtime.destroy_session(&session_id).await;
+                let state_existed = self.state.remove_session(&session_id);
+                let memory_existed = self.memory.remove_session(&session_id);
+                let existed = runtime_existed || state_existed || memory_existed;
                 Ok(if existed {
                     "Conversation reset.".to_owned()
                 } else {
@@ -1104,8 +1178,10 @@ impl AgentRuntime {
 
     /// Reload-fences and terminally removes every owned conversation.
     pub async fn reload_sessions(&self) -> claw_runtime::SessionReloadReport {
+        let _admission = self.admission.write().await;
         let report = self.runtime.reload_sessions().await;
         self.memory.clear();
+        self.state.clear();
         report
     }
 
@@ -1121,6 +1197,7 @@ impl AgentRuntime {
     /// Runtime, memory, and goal health for operator status.
     #[must_use]
     pub fn operator_status(&self) -> Value {
+        self.reconcile_sessions();
         json!({
             "sessions": {
                 "managed": self.runtime.managed_session_ids().len(),
@@ -1146,11 +1223,19 @@ impl AgentRuntime {
     ) -> Result<String, PortError> {
         let session_id = SessionId::new(conversation_id)
             .map_err(|error| PortError::new(PortErrorKind::InvalidRequest, error.to_string()))?;
-        let mut turn = self
-            .runtime
-            .submit(&session_id, message)
-            .await
-            .map_err(|error| runtime_http_error(&error))?;
+        let admission = tokio::select! {
+            admission = self.admission.read() => admission,
+            () = cancellation.cancelled() => {
+                return Err(PortError::new(
+                    PortErrorKind::Unavailable,
+                    "request cancelled",
+                ));
+            }
+        };
+        self.reconcile_sessions();
+        let submitted = self.runtime.submit(&session_id, message).await;
+        drop(admission);
+        let mut turn = submitted.map_err(|error| runtime_http_error(&error))?;
         let mut cancelled = false;
         loop {
             tokio::select! {
@@ -1171,10 +1256,9 @@ impl AgentRuntime {
                 }
             }
         }
-        let outcome = turn
-            .join()
-            .await
-            .map_err(|error| runtime_http_error(&error))?;
+        let outcome = turn.join().await;
+        self.reconcile_sessions();
+        let outcome = outcome.map_err(|error| runtime_http_error(&error))?;
         if cancelled {
             return Err(PortError::new(
                 PortErrorKind::Unavailable,
@@ -1186,6 +1270,17 @@ impl AgentRuntime {
             .map(|message| message.text)
             .or_else(|| outcome.partial.map(|partial| partial.text))
             .ok_or_else(|| PortError::new(PortErrorKind::Internal, "runtime produced no message"))
+    }
+
+    fn reconcile_sessions(&self) {
+        let retained: BTreeSet<String> = self
+            .runtime
+            .managed_session_ids()
+            .into_iter()
+            .map(|session_id| session_id.as_str().to_owned())
+            .collect();
+        self.memory.retain_sessions(&retained);
+        self.state.retain_sessions(&retained);
     }
 }
 
@@ -1307,6 +1402,7 @@ impl LegacyChannelMessagePort for AgentRuntime {
 /// Synchronous channel dispatch over the shared asynchronous runtime.
 pub struct RuntimeConversation {
     runtime: Arc<AgentRuntime>,
+    cancellation: CancellationToken,
 }
 
 impl ConversationService for RuntimeConversation {
@@ -1317,7 +1413,7 @@ impl ConversationService for RuntimeConversation {
             tokio::runtime::Handle::current().block_on(self.runtime.chat(
                 conversation_id,
                 text,
-                CancellationToken::new(),
+                self.cancellation.clone(),
             ))
         })
     }
@@ -1366,7 +1462,7 @@ mod tests {
         let state = Arc::new(RuntimeStateStore::default());
         let session_id = SessionId::new("state-test").expect("session id");
         let snapshot = SessionSnapshot {
-            session_id,
+            session_id: session_id.clone(),
             turn: TurnId::FIRST,
             state: SessionState::Draft,
             pre_pause_state: None,
@@ -1375,6 +1471,8 @@ mod tests {
         };
         assert_eq!(state.save_session(snapshot.clone()).await, Ok(1));
         assert!(state.save_session(snapshot).await.is_err());
+        assert!(state.remove_session(&session_id));
+        assert_eq!(state.load_session(&session_id).await, Ok(None));
     }
 
     #[tokio::test]
@@ -1426,5 +1524,28 @@ mod tests {
             .await
             .expect("context remains usable");
         assert_eq!(assembled.messages.len(), 1);
+
+        assert!(memory.remove_session(&SessionId::new("memory-test").expect("session id")));
+        let replacement = SessionId::new("memory-replacement").expect("session id");
+        memory
+            .bootstrap(ContextBootstrap {
+                session_id: replacement.clone(),
+                reason: BootstrapReason::NewSession,
+                token_budget: 128,
+                at: Timestamp::from_millis(4),
+            })
+            .await
+            .expect("replacement bootstrap");
+        memory
+            .ingest(ContextIngest {
+                session_id: replacement,
+                turn: TurnId::FIRST,
+                item: ContextItem::UserInput {
+                    text: "capacity was released".to_owned(),
+                },
+                at: Timestamp::from_millis(5),
+            })
+            .await
+            .expect("replacement record");
     }
 }

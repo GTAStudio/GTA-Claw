@@ -15,7 +15,7 @@ use claw_channels::{
     DiscordCreateMessageRequest, DiscordGatewayRequest, DiscordPacketOutcome, DiscordTransport,
     DispatchInput, DispatchOutcome, OperatorDiagnostic, ProviderResponse, SystemClock,
     TelegramChannel, TelegramPollRequest, TelegramSendRequest, TelegramTransport,
-    dispatch_incoming,
+    dispatch_incoming, segment_outbound_text_iter,
 };
 use claw_provider_sdk::http::{
     Body, HttpRequest, HttpTransport, Method, ProxyPolicy, TransportConfig,
@@ -24,7 +24,7 @@ use claw_provider_sdk::{BoundSecret, CancelToken, Operation, Origin, SecretStrin
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -70,6 +70,29 @@ struct TerminationGuard(Arc<AtomicU64>);
 impl Drop for TerminationGuard {
     fn drop(&mut self) {
         self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct ChildTaskGuard(Option<JoinHandle<()>>);
+
+impl ChildTaskGuard {
+    const fn new(task: JoinHandle<()>) -> Self {
+        Self(Some(task))
+    }
+
+    async fn join(mut self) -> Result<(), tokio::task::JoinError> {
+        match self.0.take() {
+            Some(task) => task.await,
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for ChildTaskGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
     }
 }
 
@@ -251,6 +274,8 @@ impl ChannelSupervisor {
                 .ok_or_else(|| "Discord inbound capacity must be non-zero".to_owned())?;
             let reconnect_attempts = NonZeroU32::new(10)
                 .ok_or_else(|| "Discord reconnect attempts must be non-zero".to_owned())?;
+            let reply_transport = transport.clone();
+            let reply_origin = rest_origin.clone();
             let mut channel = DiscordChannel::new(
                 account,
                 settings.gateway_url,
@@ -294,6 +319,8 @@ impl ChannelSupervisor {
                 run_discord(
                     channel,
                     gateway_credential,
+                    reply_transport,
+                    reply_origin,
                     rest_credential,
                     events,
                     task_runtime,
@@ -590,6 +617,7 @@ enum DiscordEvent {
     Closed,
 }
 
+#[derive(Clone)]
 struct DiscordTransportAdapter {
     commands: mpsc::Sender<DiscordCommand>,
     transport: HttpTransport,
@@ -625,6 +653,38 @@ impl DiscordTransportAdapter {
             event_tx,
             event_rx,
         ))
+    }
+
+    fn create_message_raw(
+        &self,
+        bot_token: &str,
+        channel_id: &str,
+        content: &str,
+    ) -> Result<ProviderResponse, ChannelError> {
+        let url = Url::parse(&format!(
+            "https://discord.com/api/v10/channels/{channel_id}/messages"
+        ))
+        .map_err(|_| ChannelError::Protocol(claw_channel_sdk::ProtocolErrorKind::InvalidField))?;
+        let credential = BoundSecret::new(
+            Origin::of(&url).map_err(|_| ChannelError::Authentication)?,
+            SecretString::new(bot_token),
+        );
+        let body = serde_json::to_string(&json!({"content":content})).map_err(|_| {
+            ChannelError::Protocol(claw_channel_sdk::ProtocolErrorKind::InvalidField)
+        })?;
+        let http_request = HttpRequest::new(Method::Post, url)
+            .header("accept", "application/json")
+            .bound_secret_header("authorization", "Bot ", &credential)
+            .map_err(|_| ChannelError::Authentication)?
+            .body(Body::Json(body))
+            .timeout(Duration::from_secs(10));
+        let response = blocking_http(
+            &self.transport,
+            http_request,
+            Operation::Transport,
+            &self.request_cancel,
+        )?;
+        Ok(provider_response(&response))
     }
 }
 
@@ -675,32 +735,7 @@ impl DiscordTransport for DiscordTransportAdapter {
         &mut self,
         request: &DiscordCreateMessageRequest<'_>,
     ) -> Result<ProviderResponse, ChannelError> {
-        let url = Url::parse(&format!(
-            "https://discord.com/api/v{}/channels/{}/messages",
-            request.api_version(),
-            request.channel_id()
-        ))
-        .map_err(|_| ChannelError::Protocol(claw_channel_sdk::ProtocolErrorKind::InvalidField))?;
-        let credential = BoundSecret::new(
-            Origin::of(&url).map_err(|_| ChannelError::Authentication)?,
-            SecretString::new(request.bot_token()),
-        );
-        let body = serde_json::to_string(&json!({"content":request.content()})).map_err(|_| {
-            ChannelError::Protocol(claw_channel_sdk::ProtocolErrorKind::InvalidField)
-        })?;
-        let http_request = HttpRequest::new(Method::Post, url)
-            .header("accept", "application/json")
-            .bound_secret_header("authorization", "Bot ", &credential)
-            .map_err(|_| ChannelError::Authentication)?
-            .body(Body::Json(body))
-            .timeout(request.request_timeout());
-        let response = blocking_http(
-            &self.transport,
-            http_request,
-            Operation::Transport,
-            &self.request_cancel,
-        )?;
-        Ok(provider_response(&response))
+        self.create_message_raw(request.bot_token(), request.channel_id(), request.content())
     }
 }
 
@@ -776,6 +811,8 @@ async fn run_discord_socket(
 async fn run_discord(
     mut channel: DiscordChannel<DiscordTransportAdapter, SystemClock>,
     gateway_credential: ChannelCredential,
+    reply_transport: DiscordTransportAdapter,
+    reply_origin: claw_channel_sdk::ApprovedOrigin,
     rest_credential: ChannelCredential,
     mut events: mpsc::Receiver<DiscordEvent>,
     runtime: Arc<AgentRuntime>,
@@ -786,6 +823,20 @@ async fn run_discord(
     started: Instant,
 ) {
     let mut ready = Some(ready);
+    let (inbound_tx, inbound_rx) = mpsc::channel(64);
+    let dispatch_cancellation = cancellation.child_token();
+    let dispatch_task = ChildTaskGuard::new(tokio::spawn(run_discord_dispatch(
+        inbound_rx,
+        reply_transport,
+        reply_origin,
+        rest_credential,
+        Arc::clone(&runtime),
+        Arc::clone(&authentication),
+        Arc::clone(&diagnostics),
+        dispatch_cancellation.clone(),
+    )));
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             () = cancellation.cancelled() => break,
@@ -817,17 +868,15 @@ async fn run_discord(
                     Ok(_) => {}
                     Err(error) => diagnostics.record(format!("Discord event failed: {error}")),
                 }
-                if let Err(error) = drain_discord(
+                if let Err(error) = enqueue_discord(
                     &mut channel,
-                    &rest_credential,
-                    &runtime,
-                    &authentication,
+                    &inbound_tx,
                     &diagnostics,
-                ).await {
+                ) {
                     diagnostics.record(format!("Discord dispatch failed: {error}"));
                 }
             }
-            () = tokio::time::sleep(Duration::from_millis(250)) => {
+            _ = tick.tick() => {
                 if let Err(error) = channel.tick(
                     started.elapsed(),
                     &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
@@ -836,6 +885,11 @@ async fn run_discord(
                 }
             }
         }
+    }
+    dispatch_cancellation.cancel();
+    drop(inbound_tx);
+    if let Err(error) = dispatch_task.join().await {
+        diagnostics.record(format!("Discord dispatch task failed: {error}"));
     }
     let _ = channel.stop(&mut ChannelDiagnostics(Arc::clone(&diagnostics)));
     if let Some(ready) = ready {
@@ -862,11 +916,38 @@ async fn run_telegram(
             diagnostics.record(format!("Telegram poll failed: {error}"));
         }
         while let Ok(Some(message)) = channel.poll_inbound() {
-            match process_inbound(&message, &runtime, &authentication, &diagnostics).await {
+            match process_inbound(
+                &message,
+                &runtime,
+                &authentication,
+                &diagnostics,
+                cancellation.clone(),
+            )
+            .await
+            {
                 Ok(Some(reply)) => {
-                    let outbound = outbound(&message, reply);
-                    if let Err(error) = channel.send_outbound(&outbound, Some(&credential)) {
-                        diagnostics.record(format!("Telegram send failed: {error}"));
+                    let segments = match segment_outbound_text_iter("telegram", &reply) {
+                        Ok(segments) => segments,
+                        Err(error) => {
+                            diagnostics.record(format!("Telegram segmentation failed: {error}"));
+                            continue;
+                        }
+                    };
+                    for segment in segments {
+                        let segment = match segment {
+                            Ok(segment) => segment.into_owned(),
+                            Err(error) => {
+                                diagnostics
+                                    .record(format!("Telegram segmentation failed: {error}"));
+                                break;
+                            }
+                        };
+                        if let Err(error) =
+                            channel.send_outbound(&outbound(&message, segment), Some(&credential))
+                        {
+                            diagnostics.record(format!("Telegram send failed: {error}"));
+                            break;
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -881,20 +962,110 @@ async fn run_telegram(
     let _ = channel.stop(&mut ChannelDiagnostics(diagnostics));
 }
 
-async fn drain_discord(
+fn enqueue_discord(
     channel: &mut DiscordChannel<DiscordTransportAdapter, SystemClock>,
-    credential: &ChannelCredential,
-    runtime: &Arc<AgentRuntime>,
-    authentication: &Arc<RwLock<Option<String>>>,
+    inbound: &mpsc::Sender<InboundMessage>,
     diagnostics: &Arc<Diagnostics>,
 ) -> Result<(), ChannelError> {
     while let Some(message) = channel.poll_inbound()? {
-        if let Some(reply) = process_inbound(&message, runtime, authentication, diagnostics).await?
-        {
-            channel.send_outbound(&outbound(&message, reply), Some(credential))?;
+        if inbound.try_send(message).is_err() {
+            diagnostics.record("Discord inbound dispatch queue is full");
+            return Err(ChannelError::RateLimited {
+                retry_after: Duration::from_millis(250),
+            });
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_discord_dispatch(
+    mut inbound: mpsc::Receiver<InboundMessage>,
+    transport: DiscordTransportAdapter,
+    origin: claw_channel_sdk::ApprovedOrigin,
+    credential: ChannelCredential,
+    runtime: Arc<AgentRuntime>,
+    authentication: Arc<RwLock<Option<String>>>,
+    diagnostics: Arc<Diagnostics>,
+    cancellation: CancellationToken,
+) {
+    loop {
+        let message = tokio::select! {
+            () = cancellation.cancelled() => return,
+            message = inbound.recv() => message,
+        };
+        let Some(message) = message else {
+            return;
+        };
+        match process_inbound(
+            &message,
+            &runtime,
+            &authentication,
+            &diagnostics,
+            cancellation.clone(),
+        )
+        .await
+        {
+            Ok(Some(reply)) => {
+                if let Err(error) =
+                    send_discord_reply(&transport, &origin, &credential, &message, &reply)
+                {
+                    diagnostics.record(format!("Discord reply failed: {error}"));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => diagnostics.record(format!("Discord dispatch failed: {error}")),
+        }
+    }
+}
+
+fn send_discord_reply(
+    transport: &DiscordTransportAdapter,
+    origin: &claw_channel_sdk::ApprovedOrigin,
+    credential: &ChannelCredential,
+    message: &InboundMessage,
+    reply: &str,
+) -> Result<(), ChannelError> {
+    let route =
+        message
+            .conversation_id
+            .strip_prefix("discord:")
+            .ok_or(ChannelError::Configuration(
+                claw_channel_sdk::ConfigurationError::ConversationScopeMismatch,
+            ))?;
+    let (channel_id, _sender_id) = route.split_once(':').ok_or(ChannelError::Configuration(
+        claw_channel_sdk::ConfigurationError::ConversationScopeMismatch,
+    ))?;
+    let segments = segment_outbound_text_iter("discord", reply).map_err(|_| {
+        ChannelError::Configuration(
+            claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
+        )
+    })?;
+    credential
+        .expose_for_origin(
+            "discord",
+            "default",
+            CredentialKind::Token,
+            origin,
+            |bot_token| -> Result<(), ChannelError> {
+                for segment in segments {
+                    let segment = segment.map_err(|_| {
+                        ChannelError::Configuration(
+                            claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
+                        )
+                    })?;
+                    let response =
+                        transport.create_message_raw(bot_token, channel_id, segment.as_ref())?;
+                    if !(200..300).contains(&response.status()) {
+                        return Err(ChannelError::RemoteRejected {
+                            status: response.status(),
+                        });
+                    }
+                }
+                Ok(())
+            },
+        )
+        .map_err(ChannelError::CredentialBinding)?
 }
 
 async fn process_inbound(
@@ -902,13 +1073,14 @@ async fn process_inbound(
     runtime: &Arc<AgentRuntime>,
     authentication: &Arc<RwLock<Option<String>>>,
     diagnostics: &Arc<Diagnostics>,
+    cancellation: CancellationToken,
 ) -> Result<Option<String>, ChannelError> {
     let text = message.text.as_deref().unwrap_or_default();
     let instructions = authentication
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
-    let mut conversation = runtime.conversation();
+    let mut conversation = runtime.conversation_with_cancellation(cancellation);
     let outcome = dispatch_incoming(
         runtime.authenticated().then_some(&mut conversation),
         instructions.as_deref().map_or(

@@ -5,10 +5,13 @@ use std::fmt::{self, Display, Formatter};
 use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use axum::extract::{Request, State};
+use axum::middleware::Next;
+use axum::response::Response;
 use claw_channels::{ExchangeSupport, ImplementationStatus, descriptor, exchange_support};
 use claw_config::{
     ConfigLayerKind, ConfigLayers, ConfigSnapshot, LogLevel, MigrationDiagnostic, ResolvedConfig,
@@ -50,9 +53,9 @@ use url::Url;
 use crate::adapters::agent_runtime::{AgentRuntime, RuntimeModelTools};
 use crate::adapters::channels::{ChannelSupervisor, DiscordSettings, TelegramSettings};
 use crate::adapters::http_api::{
-    AppliedReload, ConfigController, DependencyReadiness, Diagnostics, DurableSecurityAudit,
-    ModelToolCatalog, OperatorAdmin, OperatorInventory, OperatorRuntimeStatus,
-    ProviderHistoryConfig, SmokeProvider, SwappableProvider, UnavailableExternalPorts,
+    AppliedReload, ConfigController, DependencyReadiness, Diagnostics, DisabledExternalPorts,
+    DurableSecurityAudit, ModelToolCatalog, OperatorAdmin, OperatorInventory,
+    OperatorRuntimeStatus, ProviderHistoryConfig, SmokeProvider, SwappableProvider,
     copilot_request_timeout_ms, updates_enabled,
 };
 use crate::adapters::legacy::{
@@ -64,6 +67,7 @@ use crate::adapters::updater::UpdateMonitor;
 
 /// Whole-process shutdown ceiling.
 pub const PRODUCTION_STOP_DEADLINE: Duration = Duration::from_secs(10);
+const PLUGIN_ACTIVATION_CANCEL_GRACE: Duration = Duration::from_secs(2);
 const DEFAULT_GATEWAY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const DEFAULT_MCP: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const USAGE: &str = "usage: gta-claw-daemon [--probe | --check-config] [--config PATH] \
@@ -463,6 +467,37 @@ pub struct BoundAddresses {
     pub mcp: SocketAddr,
 }
 
+#[derive(Clone, Default)]
+struct RequestAccounting {
+    active: Arc<AtomicU64>,
+    completed: Arc<AtomicU64>,
+}
+
+impl RequestAccounting {
+    fn completed(&self) -> u64 {
+        self.completed.load(Ordering::Acquire)
+    }
+}
+
+struct RequestCompletionGuard(RequestAccounting);
+
+impl Drop for RequestCompletionGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+        self.0.completed.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+async fn account_request(
+    State(accounting): State<RequestAccounting>,
+    request: Request,
+    next: Next,
+) -> Response {
+    accounting.active.fetch_add(1, Ordering::AcqRel);
+    let _guard = RequestCompletionGuard(accounting);
+    next.run(request).await
+}
+
 struct CopilotDeviceActivator {
     provider: Arc<SwappableProvider>,
     proxy: ProxyPolicy,
@@ -488,16 +523,8 @@ impl DeviceTokenActivator for CopilotDeviceActivator {
     }
 }
 
-struct ReloadGuard<'a>(&'a AtomicBool);
-
-impl Drop for ReloadGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
 struct DaemonLegacyReload {
-    in_progress: AtomicBool,
+    reload_lock: Arc<tokio::sync::Mutex<()>>,
     config: Arc<ConfigController>,
     provider: Arc<SwappableProvider>,
     runtime: Arc<AgentRuntime>,
@@ -512,14 +539,9 @@ impl LegacyReloadPort for DaemonLegacyReload {
         cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<LegacyReloadResult, LegacyReloadError>> {
         Box::pin(async move {
-            if self
-                .in_progress
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
+            let Ok(_reload) = self.reload_lock.try_lock() else {
                 return Err(LegacyReloadError::InProgress);
-            }
-            let _guard = ReloadGuard(&self.in_progress);
+            };
             let snapshot = self.config.snapshot().map_err(|error| {
                 self.diagnostics
                     .record(format!("legacy reload snapshot failed: {error}"));
@@ -569,8 +591,10 @@ pub struct ProductionService {
     readiness: Arc<DependencyReadiness>,
     serving: ServingStateHandle,
     config: Arc<ConfigController>,
+    reload_lock: Arc<tokio::sync::Mutex<()>>,
     config_path: Option<PathBuf>,
     diagnostics: Arc<Diagnostics>,
+    requests: RequestAccounting,
     http_shutdown: CancellationToken,
     http_tasks: JoinSet<(&'static str, io::Result<()>)>,
     gateway: Option<ServerHandle>,
@@ -756,8 +780,11 @@ impl ProductionService {
             "skill inventory classified"
         );
         let plugin_diagnostics = Arc::clone(&diagnostics);
-        let mut plugin_task =
-            tokio::task::spawn_blocking(move || SignedPluginRuntime::activate(&plugin_diagnostics));
+        let plugin_cancellation = claw_plugin_host::CancellationToken::new();
+        let task_cancellation = plugin_cancellation.clone();
+        let mut plugin_task = tokio::task::spawn_blocking(move || {
+            SignedPluginRuntime::activate(&plugin_diagnostics, task_cancellation)
+        });
         let plugins = tokio::select! {
             result = &mut plugin_task => {
                 result
@@ -765,7 +792,19 @@ impl ProductionService {
                     .map_err(|error| ProductionError::message("plugins", error))?
             }
             () = startup_cancellation.cancelled() => {
-                plugin_task.abort();
+                plugin_cancellation.cancel();
+                if tokio::time::timeout(
+                    PLUGIN_ACTIVATION_CANCEL_GRACE,
+                    &mut plugin_task,
+                )
+                .await
+                .is_err()
+                {
+                    plugin_task.abort();
+                    diagnostics.record(
+                        "plugin activation did not stop within the cancellation grace period",
+                    );
+                }
                 return Err(startup_cancelled());
             }
         };
@@ -846,6 +885,7 @@ impl ProductionService {
             Arc::clone(&provider),
             Arc::clone(&diagnostics),
         ));
+        let reload_lock = Arc::new(tokio::sync::Mutex::new(()));
         let agent_runtime = AgentRuntime::new(
             Arc::clone(&provider),
             Arc::clone(&plugin_tools),
@@ -973,7 +1013,7 @@ impl ProductionService {
             "channel lifecycles are live"
         );
         let reload = Arc::new(DaemonLegacyReload {
-            in_progress: AtomicBool::new(false),
+            reload_lock: Arc::clone(&reload_lock),
             config: Arc::clone(&config),
             provider: Arc::clone(&provider),
             runtime: Arc::clone(&agent_runtime),
@@ -1000,9 +1040,10 @@ impl ProductionService {
                 plugin_activation,
                 Arc::clone(&agent_runtime) as Arc<dyn OperatorRuntimeStatus>,
             ),
+            Arc::clone(&reload_lock),
         ));
         let admin_token = admin_token(&loaded.snapshot)?;
-        let external = Arc::new(UnavailableExternalPorts);
+        let external = Arc::new(DisabledExternalPorts);
         let services = ApiServices {
             provider: Arc::clone(&provider) as Arc<dyn claw_http_api::ProviderPort>,
             readiness: Arc::clone(&readiness) as Arc<dyn claw_http_api::ReadinessPort>,
@@ -1013,8 +1054,7 @@ impl ProductionService {
             webhooks: external,
             audit,
         };
-        diagnostics
-            .record("watch/webhooks are unavailable until their public ports are composable");
+        diagnostics.record("optional watch pairing and task-flow webhook routes are disabled");
 
         let serving = ServingStateHandle::starting();
         if admin_token.is_none() {
@@ -1137,10 +1177,15 @@ impl ProductionService {
         let gateway = gateway.start();
         readiness.set("gateway", true);
         let http_shutdown = CancellationToken::new();
+        let requests = RequestAccounting::default();
         let mut http_tasks = JoinSet::new();
         let main_shutdown = http_shutdown.clone();
         let main_router = api
             .router()
+            .layer(axum::middleware::from_fn_with_state(
+                requests.clone(),
+                account_request,
+            ))
             .into_make_service_with_connect_info::<SocketAddr>();
         http_tasks.spawn(async move {
             (
@@ -1153,6 +1198,10 @@ impl ProductionService {
         let mcp_shutdown = http_shutdown.clone();
         let mcp_router = api
             .mcp_router()
+            .layer(axum::middleware::from_fn_with_state(
+                requests.clone(),
+                account_request,
+            ))
             .into_make_service_with_connect_info::<SocketAddr>();
         http_tasks.spawn(async move {
             (
@@ -1165,6 +1214,10 @@ impl ProductionService {
         let legacy_shutdown = http_shutdown.clone();
         let legacy_router = legacy_api
             .router()
+            .layer(axum::middleware::from_fn_with_state(
+                requests.clone(),
+                account_request,
+            ))
             .into_make_service_with_connect_info::<SocketAddr>();
         http_tasks.spawn(async move {
             (
@@ -1211,8 +1264,10 @@ impl ProductionService {
             readiness,
             serving,
             config,
+            reload_lock,
             config_path: loaded.path,
             diagnostics,
+            requests,
             http_shutdown,
             http_tasks,
             gateway: Some(gateway),
@@ -1267,6 +1322,7 @@ impl ProductionService {
     /// Returns a `reload`-stage error when no file was configured, the file
     /// cannot be read, or the candidate is rejected and rolled back.
     pub async fn reload(&self) -> Result<AppliedReload, ProductionError> {
+        let _reload = self.reload_lock.lock().await;
         let path = self.config_path.as_ref().ok_or_else(|| {
             ProductionError::message(
                 "reload",
@@ -1314,6 +1370,7 @@ impl ProductionService {
     /// Quiesces ingress and joins every task within the process stop budget.
     pub async fn stop(mut self, fault: Option<String>) -> ProductionStopSummary {
         let started = Instant::now();
+        let completed_before_drain = self.requests.completed();
         self.serving.begin_draining();
         self.readiness.set("http", false);
         self.readiness.set("legacy-http", false);
@@ -1335,19 +1392,6 @@ impl ProductionService {
                 stage = "shutdown",
                 subsystem = "gateway",
                 "quiesce deadline expired"
-            );
-        }
-
-        let channel_report = self.channels.shutdown(remaining(started)).await;
-        abandoned = abandoned.saturating_add(channel_report.abandoned);
-        let updater_spawned = u64::from(self.updater.is_enabled());
-        let updater_joined = self.updater.shutdown(remaining(started)).await;
-        if !updater_joined {
-            abandoned = abandoned.saturating_add(1);
-            warn!(
-                stage = "shutdown",
-                subsystem = "updater",
-                "update check deadline expired"
             );
         }
 
@@ -1376,6 +1420,23 @@ impl ProductionService {
                 subsystem = "http",
                 outstanding,
                 "forced HTTP task cancellation"
+            );
+        }
+        let completed_during_drain = self
+            .requests
+            .completed()
+            .saturating_sub(completed_before_drain);
+
+        let channel_report = self.channels.shutdown(remaining(started)).await;
+        abandoned = abandoned.saturating_add(channel_report.abandoned);
+        let updater_spawned = u64::from(self.updater.is_enabled());
+        let updater_joined = self.updater.shutdown(remaining(started)).await;
+        if !updater_joined {
+            abandoned = abandoned.saturating_add(1);
+            warn!(
+                stage = "shutdown",
+                subsystem = "updater",
+                "update check deadline expired"
             );
         }
 
@@ -1467,20 +1528,27 @@ impl ProductionService {
         let mut gateway_joined = false;
         if let Some(gateway) = self.gateway.take() {
             let mut task = tokio::spawn(gateway.shutdown());
-            if tokio::time::timeout(remaining(started), &mut task)
-                .await
-                .is_ok()
-            {
-                gateway_joined = true;
-            } else {
-                task.abort();
-                let _ = task.await;
-                abandoned = abandoned.saturating_add(1);
-                warn!(
-                    stage = "shutdown",
-                    subsystem = "gateway",
-                    "forced gateway cancellation"
-                );
+            match tokio::time::timeout(remaining(started), &mut task).await {
+                Ok(Ok(())) => gateway_joined = true,
+                Ok(Err(error)) => {
+                    abandoned = abandoned.saturating_add(1);
+                    warn!(
+                        stage = "shutdown",
+                        subsystem = "gateway",
+                        error = %error,
+                        "gateway shutdown task failed"
+                    );
+                }
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    abandoned = abandoned.saturating_add(1);
+                    warn!(
+                        stage = "shutdown",
+                        subsystem = "gateway",
+                        "forced gateway cancellation"
+                    );
+                }
             }
         }
 
@@ -1514,7 +1582,7 @@ impl ProductionService {
         ProductionStopSummary {
             clean,
             drained: 4,
-            completed: 0,
+            completed: u32::try_from(completed_during_drain).unwrap_or(u32::MAX),
             abandoned,
             spawned,
             terminated,

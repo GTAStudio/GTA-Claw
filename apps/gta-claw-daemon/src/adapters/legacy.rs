@@ -1,6 +1,6 @@
 //! Concrete adapters consumed by the legacy HTTP compatibility facade.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::process::{Command as BlockingCommand, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,16 +14,19 @@ use claw_channel_sdk::{
 use claw_channels::{
     AuthenticationPrompt, DiagnosticLevel, DiagnosticSink, OperatorDiagnostic, SystemClock,
     TeamsAction, TeamsActivityHandler, TeamsActivityOutcome, WhatsAppChannel, WhatsAppSendRequest,
-    WhatsAppTransport, segment_outbound_text,
+    WhatsAppTransport, segment_outbound_text_iter,
 };
 use claw_http_api::{
     LegacyAdminAction, LegacyDeviceFlowPort, LegacyExecResult, LegacyHostAdminPort, LegacyOsInfo,
-    LegacyProcessInfo, LegacyProcessMemory, LegacySystemInfo, LegacyTeamsPort, LegacyWhatsAppPort,
-    PortError, PortErrorKind, PortFuture,
+    LegacyProcessInfo, LegacyProcessMemory, LegacySystemInfo, LegacyTeamsPort,
+    LegacyTeamsRequestContext, LegacyWhatsAppPort, PortError, PortErrorKind, PortFuture,
 };
 use claw_provider_sdk::http::{Body, HttpRequest, HttpTransport, Method};
 use claw_provider_sdk::{BoundSecret, CancelToken, Operation, Origin, SecretString};
 use claw_providers::{DeviceFlow, DeviceFlowSession};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -36,6 +39,10 @@ use super::agent_runtime::AgentRuntime;
 use super::http_api::Diagnostics;
 
 const ADMIN_OUTPUT_LIMIT: usize = 1024 * 1024;
+const TEAMS_OPENID_CONFIGURATION: &str =
+    "https://login.botframework.com/v1/.well-known/openidconfiguration";
+const TEAMS_JWT_CACHE_TTL: Duration = Duration::from_hours(1);
+const TEAMS_JWT_DOCUMENT_LIMIT: usize = 1024 * 1024;
 
 /// Activates a provider from a GitHub OAuth token obtained by Device Flow.
 pub trait DeviceTokenActivator: Send + Sync {
@@ -326,6 +333,7 @@ pub struct LegacyTeamsAdapter {
     app_id: String,
     app_password: SecretString,
     token: AsyncMutex<Option<CachedTeamsToken>>,
+    jwt_keys: AsyncMutex<Option<CachedTeamsJwtKeys>>,
     replies: Mutex<VecDeque<String>>,
 }
 
@@ -338,6 +346,49 @@ enum PendingTeamsDispatch {
 struct CachedTeamsToken {
     token: SecretString,
     expires_at: Instant,
+}
+
+struct CachedTeamsJwtKeys {
+    issuer: String,
+    keys: BTreeMap<String, TeamsRsaKey>,
+    expires_at: Instant,
+}
+
+#[derive(Clone)]
+struct TeamsRsaKey {
+    modulus: String,
+    exponent: String,
+    endorsements: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct TeamsOpenIdConfiguration {
+    issuer: String,
+    jwks_uri: String,
+}
+
+#[derive(Deserialize)]
+struct TeamsJwkSet {
+    keys: Vec<TeamsJwk>,
+}
+
+#[derive(Deserialize)]
+struct TeamsJwk {
+    kid: String,
+    kty: String,
+    n: String,
+    e: String,
+    #[serde(default)]
+    alg: Option<String>,
+    #[serde(rename = "use", default)]
+    usage: Option<String>,
+    #[serde(default)]
+    endorsements: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct TeamsClaims {
+    serviceurl: String,
 }
 
 impl LegacyTeamsAdapter {
@@ -372,6 +423,7 @@ impl LegacyTeamsAdapter {
             app_id,
             app_password,
             token: AsyncMutex::new(None),
+            jwt_keys: AsyncMutex::new(None),
             replies: Mutex::new(VecDeque::with_capacity(16)),
         }))
     }
@@ -390,10 +442,13 @@ impl LegacyTeamsAdapter {
 impl LegacyTeamsPort for LegacyTeamsAdapter {
     fn handle_activity(
         &self,
+        context: LegacyTeamsRequestContext,
         mut activity: Value,
         cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<(), PortError>> {
         Box::pin(async move {
+            self.verify_teams_request(&context, &activity, cancellation.clone())
+                .await?;
             if let Some(sender) = activity.get_mut("from").and_then(Value::as_object_mut)
                 && !sender.contains_key("id")
             {
@@ -422,7 +477,9 @@ impl LegacyTeamsPort for LegacyTeamsAdapter {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
-            let mut conversation = self.runtime.conversation();
+            let mut conversation = self
+                .runtime
+                .conversation_with_cancellation(cancellation.clone());
             let pending = {
                 let mut handler = self.handler.lock().map_err(|_| {
                     PortError::new(PortErrorKind::Internal, "Teams state unavailable")
@@ -465,9 +522,12 @@ impl LegacyTeamsPort for LegacyTeamsAdapter {
                         .channel_command(conversation_id, &command)
                         .await?;
                     let mut actions = Vec::new();
-                    for segment in segment_outbound_text("msteams", &reply)
+                    for segment in segment_outbound_text_iter("msteams", &reply)
                         .map_err(|error| invalid(format!("Teams command segmentation: {error}")))?
                     {
+                        let segment = segment.map_err(|error| {
+                            invalid(format!("Teams command segmentation: {error}"))
+                        })?;
                         actions.push(TeamsAction::Reply(segment.into_owned()));
                     }
                     actions
@@ -499,6 +559,188 @@ impl LegacyTeamsPort for LegacyTeamsAdapter {
 }
 
 impl LegacyTeamsAdapter {
+    async fn verify_teams_request(
+        &self,
+        context: &LegacyTeamsRequestContext,
+        activity: &Value,
+        cancellation: CancellationToken,
+    ) -> Result<(), PortError> {
+        let authorization = context
+            .authorization()
+            .ok_or_else(|| invalid("Teams bearer authorization is required"))?;
+        let token = authorization.bearer_token();
+        let header =
+            decode_header(token).map_err(|_| invalid("Teams bearer token header is invalid"))?;
+        if header.alg != Algorithm::RS256 {
+            return Err(invalid("Teams bearer token algorithm is not RS256"));
+        }
+        let key_id = header
+            .kid
+            .as_deref()
+            .ok_or_else(|| invalid("Teams bearer token key id is missing"))?;
+        let (issuer, key) = self.teams_signing_key(key_id, cancellation).await?;
+        let decoding_key = DecodingKey::from_rsa_components(&key.modulus, &key.exponent)
+            .map_err(|_| invalid("Teams signing key is invalid"))?;
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_audience(&[self.app_id.as_str()]);
+        validation.set_issuer(&[issuer.as_str()]);
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        validation.validate_nbf = true;
+        validation.leeway = 60;
+        let claims = decode::<TeamsClaims>(token, &decoding_key, &validation)
+            .map_err(|_| invalid("Teams bearer token verification failed"))?
+            .claims;
+        if activity.get("channelId").and_then(Value::as_str) != Some("msteams") {
+            return Err(invalid("Teams activity channel is not msteams"));
+        }
+        if !key
+            .endorsements
+            .iter()
+            .any(|endorsement| endorsement == "msteams")
+        {
+            return Err(invalid("Teams signing key is not endorsed for msteams"));
+        }
+        let service_url = activity
+            .get("serviceUrl")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("Teams activity has no service URL"))?;
+        if claims.serviceurl.trim_end_matches('/') != service_url.trim_end_matches('/') {
+            return Err(invalid(
+                "Teams bearer token service URL does not match the activity",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn teams_signing_key(
+        &self,
+        key_id: &str,
+        cancellation: CancellationToken,
+    ) -> Result<(String, TeamsRsaKey), PortError> {
+        let mut cached = self.jwt_keys.lock().await;
+        if cached
+            .as_ref()
+            .is_some_and(|keys| Instant::now() >= keys.expires_at)
+        {
+            *cached = None;
+        }
+        if let Some(keys) = cached.as_ref()
+            && let Some(key) = keys.keys.get(key_id)
+        {
+            return Ok((keys.issuer.clone(), key.clone()));
+        }
+        if cached.is_some() {
+            return Err(invalid("Teams bearer token key id is unknown"));
+        }
+        let loaded = self.load_teams_jwt_keys(cancellation).await?;
+        let key = loaded
+            .keys
+            .get(key_id)
+            .cloned()
+            .ok_or_else(|| invalid("Teams bearer token key id is unknown"))?;
+        let issuer = loaded.issuer.clone();
+        *cached = Some(loaded);
+        drop(cached);
+        Ok((issuer, key))
+    }
+
+    async fn load_teams_jwt_keys(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<CachedTeamsJwtKeys, PortError> {
+        let metadata_url = Url::parse(TEAMS_OPENID_CONFIGURATION)
+            .map_err(|_| invalid("Teams OpenID URL is invalid"))?;
+        let metadata: TeamsOpenIdConfiguration = self
+            .fetch_teams_json(metadata_url, cancellation.clone())
+            .await?;
+        if metadata.issuer.trim().is_empty() {
+            return Err(invalid("Teams OpenID issuer is missing"));
+        }
+        let keys_url =
+            Url::parse(&metadata.jwks_uri).map_err(|_| invalid("Teams JWKS URL is invalid"))?;
+        if keys_url.scheme() != "https"
+            || keys_url.host_str() != Some("login.botframework.com")
+            || keys_url.username() != ""
+            || keys_url.password().is_some()
+        {
+            return Err(invalid("Teams JWKS URL is not a trusted Bot Framework URL"));
+        }
+        let document: TeamsJwkSet = self.fetch_teams_json(keys_url, cancellation).await?;
+        let keys: BTreeMap<String, TeamsRsaKey> = document
+            .keys
+            .into_iter()
+            .filter(|key| {
+                key.kty == "RSA"
+                    && key
+                        .alg
+                        .as_deref()
+                        .is_none_or(|algorithm| algorithm == "RS256")
+                    && key.usage.as_deref().is_none_or(|usage| usage == "sig")
+                    && !key.kid.is_empty()
+                    && !key.n.is_empty()
+                    && !key.e.is_empty()
+            })
+            .take(128)
+            .map(|key| {
+                (
+                    key.kid,
+                    TeamsRsaKey {
+                        modulus: key.n,
+                        exponent: key.e,
+                        endorsements: key.endorsements,
+                    },
+                )
+            })
+            .collect();
+        if keys.is_empty() {
+            return Err(invalid("Teams JWKS contains no usable signing keys"));
+        }
+        Ok(CachedTeamsJwtKeys {
+            issuer: metadata.issuer,
+            keys,
+            expires_at: Instant::now()
+                .checked_add(TEAMS_JWT_CACHE_TTL)
+                .unwrap_or_else(Instant::now),
+        })
+    }
+
+    async fn fetch_teams_json<T: DeserializeOwned>(
+        &self,
+        url: Url,
+        cancellation: CancellationToken,
+    ) -> Result<T, PortError> {
+        let request = HttpRequest::new(Method::Get, url)
+            .header("accept", "application/json")
+            .timeout(Duration::from_secs(15));
+        let sdk_cancel = CancelToken::new();
+        let response = tokio::select! {
+            result = self.transport.send(
+                "msteams-jwt",
+                Operation::Authorize,
+                request,
+                &sdk_cancel,
+            ) => result.map_err(|error| provider_port_error(&error))?,
+            () = cancellation.cancelled() => {
+                sdk_cancel.cancel();
+                return Err(PortError::new(PortErrorKind::Unavailable, "request cancelled"));
+            }
+        };
+        if !response.is_success() {
+            return Err(PortError::new(
+                PortErrorKind::Unavailable,
+                format!(
+                    "Teams identity endpoint returned HTTP {}",
+                    response.status()
+                ),
+            ));
+        }
+        if response.body().len() > TEAMS_JWT_DOCUMENT_LIMIT {
+            return Err(invalid("Teams identity document exceeds its byte limit"));
+        }
+        serde_json::from_slice(response.body())
+            .map_err(|_| invalid("Teams identity document is invalid"))
+    }
+
     async fn send_action(
         &self,
         service_url: &str,
@@ -813,17 +1055,33 @@ impl LegacyWhatsAppPort for GraphWhatsAppAdapter {
                 slot: Arc::clone(&self.request_cancel),
             };
             let credential = self.credential.clone();
-            let outbound = OutboundMessage {
-                correlation_key: format!("legacy-{:016x}", stable_text_hash(&text)),
-                account_id: self.account_id.clone(),
-                conversation_id: format!("whatsapp:{to}"),
-                text: Some(text),
-                attachments: Vec::new(),
-                reply_to: None,
-            };
+            let account_id = self.account_id.clone();
             let mut task = tokio::task::spawn_blocking(move || {
                 let mut channel = channel;
-                channel.send_outbound(&outbound, Some(&credential))
+                let segments = segment_outbound_text_iter("whatsapp", &text)
+                    .map_err(|error| invalid(format!("WhatsApp segmentation failed: {error}")))?;
+                for (index, segment) in segments.enumerate() {
+                    let segment = segment.map_err(|error| {
+                        invalid(format!("WhatsApp segmentation failed: {error}"))
+                    })?;
+                    channel
+                        .send_outbound(
+                            &OutboundMessage {
+                                correlation_key: format!(
+                                    "legacy-{:016x}-{index}",
+                                    stable_text_hash(&text)
+                                ),
+                                account_id: account_id.clone(),
+                                conversation_id: format!("whatsapp:{to}"),
+                                text: Some(segment.into_owned()),
+                                attachments: Vec::new(),
+                                reply_to: None,
+                            },
+                            Some(&credential),
+                        )
+                        .map_err(|error| channel_port_error(&error))?;
+                }
+                Ok::<(), PortError>(())
             });
             tokio::select! {
                 result = &mut task => {
@@ -831,8 +1089,7 @@ impl LegacyWhatsAppPort for GraphWhatsAppAdapter {
                         .map_err(|_| PortError::new(
                             PortErrorKind::Internal,
                             "WhatsApp transport task failed",
-                        ))?
-                        .map_err(|error| channel_port_error(&error))?;
+                        ))??;
                     Ok(())
                 }
                 () = cancellation.cancelled() => {

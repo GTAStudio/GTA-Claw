@@ -1,8 +1,9 @@
 //! Signed plugin discovery, activation, tool publication, and skill dispatch.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -13,11 +14,12 @@ use claw_plugin_api::capability::{CapabilityGrant, CapabilitySet};
 use claw_plugin_api::policy::OperatorPolicy;
 use claw_plugin_api::registry::DeliveryClass;
 use claw_plugin_api::trust::{Ed25519Verifier, IdentityBinding, TrustPolicy};
-use claw_plugin_host::services::DenyAllDns;
+use claw_plugin_host::services::SystemDnsResolver;
 use claw_plugin_host::{
-    ActivationOutcome, DenyAllHttp, DiscardEvents, EmptyConfig, HostError, HostServices,
-    InMemoryStore, LogRecord, LogSink, OsRandom, PluginHost, PluginToolInvocation, SystemClock,
-    ToolRegistration, ToolSink,
+    ActivationControl, ActivationOutcome, ControlledActivationOutcome, DiscardEvents, EmptyConfig,
+    HostError, HostServices, InMemoryStore, LogRecord, LogSink, OsRandom, PinnedHttpTransport,
+    PinnedHttpTransportConfig, PluginHost, PluginToolInvocation, SystemClock, ToolRegistration,
+    ToolSink,
 };
 use claw_skills::{WasmHostError, WasmHostErrorKind, WasmSkillHost, WasmSkillInvocation};
 use serde_json::{Value, json};
@@ -30,6 +32,8 @@ use super::http_api::{Diagnostics, ModelToolCatalog};
 const PLUGIN_POLICY_ENV: &str = "GTA_CLAW_PLUGIN_POLICY";
 const PROVIDER_TOOL_NAME_BYTES: usize = 64;
 const PLUGIN_INVOCATION_GRACE: Duration = Duration::from_secs(2);
+const PLUGIN_ACTIVATION_DEADLINE: Duration = Duration::from_secs(30);
+const PLUGIN_ACTIVATION_CANDIDATES: usize = 1024;
 
 /// Stable ordered startup report exposed to operators.
 #[derive(Clone, Debug, Default)]
@@ -405,6 +409,7 @@ pub struct SignedPluginRuntime {
     host: Arc<Mutex<PluginHost>>,
     tools: Arc<PluginToolSurface>,
     summary: PluginActivationSummary,
+    shutdown: AtomicBool,
 }
 
 impl SignedPluginRuntime {
@@ -414,22 +419,26 @@ impl SignedPluginRuntime {
     ///
     /// Returns a safe configuration diagnostic when the policy environment is
     /// malformed or the Wasmtime host cannot be built.
-    pub fn activate(diagnostics: &Arc<Diagnostics>) -> Result<Self, String> {
+    pub fn activate(
+        diagnostics: &Arc<Diagnostics>,
+        cancellation: claw_plugin_host::CancellationToken,
+    ) -> Result<Self, String> {
         let (trust, verifier, operator) = plugin_policy_from_environment()?;
         let tools = PluginToolSurface::new(Arc::clone(diagnostics));
+        let http = PinnedHttpTransport::new(PinnedHttpTransportConfig::new())
+            .map_err(|error| error.to_string())?;
         let services = HostServices::deny_all()
             .with_logs(Arc::new(PluginLogs(Arc::clone(diagnostics))))
             .with_config(Arc::new(EmptyConfig))
             .with_store(Arc::new(InMemoryStore::new()))
-            .with_http(Arc::new(DenyAllHttp))
-            .with_dns(Arc::new(DenyAllDns))
+            .with_http(Arc::new(http))
+            .with_dns(Arc::new(SystemDnsResolver))
             .with_clock(Arc::new(SystemClock))
             .with_random(Arc::new(OsRandom))
             .with_tools(Arc::clone(&tools) as Arc<dyn ToolSink>)
             .with_events(Arc::new(DiscardEvents));
-        diagnostics.record(
-            "plugin HTTP and DNS host services are immediate-deny until a pinned synchronous transport is configured",
-        );
+        diagnostics
+            .record("plugin HTTP and DNS use pinned transport and bounded system resolution");
         let host = PluginHost::builder()
             .trust_policy(trust)
             .operator_policy(operator)
@@ -439,15 +448,34 @@ impl SignedPluginRuntime {
             .map_err(|error| error.to_string())?;
         let host = Arc::new(Mutex::new(host));
         tools.attach(&host);
+        let candidate_limit = NonZeroUsize::new(PLUGIN_ACTIVATION_CANDIDATES)
+            .ok_or_else(|| "plugin activation candidate limit must be non-zero".to_owned())?;
+        let control = ActivationControl::new(
+            candidate_limit,
+            Instant::now() + PLUGIN_ACTIVATION_DEADLINE,
+            cancellation,
+        )
+        .map_err(|error| error.to_string())?;
         let report = host
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .activate_discovered();
+            .activate_discovered_with_control(&control);
         let summary = activation_summary(&report, diagnostics);
+        if let Some(terminal) = report.terminal() {
+            let reason = controlled_terminal_label(terminal);
+            let _ = host
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .shutdown();
+            return Err(format!(
+                "plugin activation stopped before completion: {reason}"
+            ));
+        }
         Ok(Self {
             host,
             tools,
             summary,
+            shutdown: AtomicBool::new(false),
         })
     }
 
@@ -477,6 +505,12 @@ impl SignedPluginRuntime {
     /// Deactivates every plugin in reverse activation order.
     #[must_use]
     pub fn shutdown_host(&self) -> PluginShutdownSummary {
+        if self.shutdown.swap(true, Ordering::AcqRel) {
+            return PluginShutdownSummary {
+                attempted: 0,
+                failed: 0,
+            };
+        }
         let report = self
             .host
             .lock()
@@ -490,6 +524,12 @@ impl SignedPluginRuntime {
                 .filter(|outcome| outcome.result.is_err())
                 .count(),
         }
+    }
+}
+
+impl Drop for SignedPluginRuntime {
+    fn drop(&mut self) {
+        let _ = self.shutdown_host();
     }
 }
 
@@ -516,43 +556,84 @@ pub struct PluginInvocationReport {
 }
 
 fn activation_summary(
-    report: &claw_plugin_host::ActivationReport,
+    report: &claw_plugin_host::ControlledActivationReport,
     diagnostics: &Diagnostics,
 ) -> PluginActivationSummary {
     let outcomes = report
         .outcomes()
         .iter()
         .map(|outcome| match outcome {
-            ActivationOutcome::Activated(plugin) => {
-                diagnostics.record(format!("plugin activated: {}", plugin.id));
-                json!({
-                    "outcome":"activated",
-                    "id":plugin.id,
-                    "directory":plugin.directory,
-                    "componentSha256":plugin.component_sha256,
-                    "signingKeyId":plugin.signing_key_id,
-                })
+            ControlledActivationOutcome::Candidate(outcome) => {
+                activation_outcome_json(outcome, diagnostics)
             }
-            ActivationOutcome::Failed(failure) => {
+            ControlledActivationOutcome::Cancelled => {
+                diagnostics.record("plugin activation cancelled");
+                json!({"outcome":"cancelled"})
+            }
+            ControlledActivationOutcome::DeadlineExceeded => {
+                diagnostics.record("plugin activation deadline exceeded");
+                json!({"outcome":"deadline_exceeded"})
+            }
+            ControlledActivationOutcome::CandidateLimitReached { limit } => {
                 diagnostics.record(format!(
-                    "plugin activation failed at {:?}: {}",
-                    failure.stage, failure.error
+                    "plugin activation candidate limit reached: {limit}"
                 ));
-                json!({
-                    "outcome":"failed",
-                    "path":failure.path,
-                    "pluginId":failure.plugin_id,
-                    "stage":format!("{:?}", failure.stage).to_ascii_lowercase(),
-                    "error":failure.error.to_string(),
-                    "cleanupError":failure.cleanup_error.as_ref().map(ToString::to_string),
-                })
+                json!({"outcome":"candidate_limit_reached","limit":limit.get()})
             }
         })
         .collect();
     PluginActivationSummary {
         outcomes,
         activated: report.activated_count(),
-        failed: report.failure_count(),
+        failed: report
+            .outcomes()
+            .iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome,
+                    ControlledActivationOutcome::Candidate(candidate)
+                        if matches!(candidate.as_ref(), ActivationOutcome::Failed(_))
+                ) || outcome.is_terminal()
+            })
+            .count(),
+    }
+}
+
+fn activation_outcome_json(outcome: &ActivationOutcome, diagnostics: &Diagnostics) -> Value {
+    match outcome {
+        ActivationOutcome::Activated(plugin) => {
+            diagnostics.record(format!("plugin activated: {}", plugin.id));
+            json!({
+                "outcome":"activated",
+                "id":plugin.id,
+                "directory":plugin.directory,
+                "componentSha256":plugin.component_sha256,
+                "signingKeyId":plugin.signing_key_id,
+            })
+        }
+        ActivationOutcome::Failed(failure) => {
+            diagnostics.record(format!(
+                "plugin activation failed at {:?}: {}",
+                failure.stage, failure.error
+            ));
+            json!({
+                "outcome":"failed",
+                "path":failure.path,
+                "pluginId":failure.plugin_id,
+                "stage":format!("{:?}", failure.stage).to_ascii_lowercase(),
+                "error":failure.error.to_string(),
+                "cleanupError":failure.cleanup_error.as_ref().map(ToString::to_string),
+            })
+        }
+    }
+}
+
+const fn controlled_terminal_label(outcome: &ControlledActivationOutcome) -> &'static str {
+    match outcome {
+        ControlledActivationOutcome::Cancelled => "cancelled",
+        ControlledActivationOutcome::DeadlineExceeded => "deadline exceeded",
+        ControlledActivationOutcome::CandidateLimitReached { .. } => "candidate limit reached",
+        ControlledActivationOutcome::Candidate(_) => "candidate",
     }
 }
 

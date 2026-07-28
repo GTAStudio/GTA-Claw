@@ -372,11 +372,14 @@ fn legacy_conditional_channel_routes_use_composed_adapters() {
             r#"{"type":"message","text":"from teams","conversation":{"id":"teams-1"},"from":{"name":"Ada"}}"#,
         ),
     );
-    assert!(teams.starts_with("HTTP/1.1 200"), "{teams}");
+    assert!(
+        teams.starts_with("HTTP/1.1 500"),
+        "unauthenticated Teams activity must be refused: {teams}"
+    );
     let health = request(daemon.legacy, "GET", "/health", None, None);
     assert!(health.contains(r#""teams":true"#), "{health}");
     assert!(health.contains(r#""whatsapp":true"#), "{health}");
-    assert!(health.contains(r#""sessions":1"#), "{health}");
+    assert!(health.contains(r#""sessions":0"#), "{health}");
 
     let verified = request(
         daemon.legacy,

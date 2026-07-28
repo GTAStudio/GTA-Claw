@@ -467,8 +467,14 @@ pub async fn serve_production(
         }
     };
     if reload_deferred {
-        writeln!(output, "{}", reload_line(&service).await)?;
-        output.flush()?;
+        let reload_write =
+            writeln!(output, "{}", reload_line(&service).await).and_then(|()| output.flush());
+        if let Err(error) = reload_write {
+            let _ = service
+                .stop(Some(format!("supervisor output failed: {error}")))
+                .await;
+            return Err(Box::new(error));
+        }
     }
     let addresses = service.addresses();
 
