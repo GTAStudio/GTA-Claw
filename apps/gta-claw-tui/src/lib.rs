@@ -12,8 +12,9 @@ use crossterm::terminal as crossterm_terminal;
 use tokio::sync::mpsc;
 use url::Url;
 
-/// Redaction-safe diagnostics and the destination rules that keep them off the
-/// drawn terminal.
+// This module carries its own `//!` documentation. An outer `///` here would
+// make rustdoc resolve the links inside that `//!` block against this scope
+// instead of the module's own, which silently breaks every one of them.
 pub mod diagnostics;
 /// Asynchronous Gateway adapter and bounded UI channels.
 pub mod gateway;

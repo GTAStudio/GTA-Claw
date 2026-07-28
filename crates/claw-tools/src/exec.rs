@@ -555,7 +555,7 @@ impl ExecPolicy {
     /// Two suspicions about this path were checked and neither survives. The
     /// allowlist is a `BTreeMap`, so a lookup is a handful of comparisons and
     /// never a scan; and although `validate_program_name` does run twice here,
-    /// once below and once inside [`Self::program`], one spawn-and-wait of
+    /// once below and once inside `Self::program`, one spawn-and-wait of
     /// `/bin/echo` on this machine costs 3.4 ms, so the duplicated scan of a
     /// name that is at most a few dozen bytes — like the per-call rebuild of
     /// the environment map in `ExecTool::invoke` — is far below a thousandth

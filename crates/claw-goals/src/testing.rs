@@ -110,7 +110,7 @@ impl GoalStorePort for ConflictOnceStore {
 
 /// Runs a future to completion on the calling thread.
 ///
-/// [`GoalStorePort`](claw_application::ports::goal::GoalStorePort) is asynchronous, but a local
+/// [`claw_application::ports::goal::GoalStorePort`] is asynchronous, but a local
 /// filesystem adapter never yields: the futures it returns are already complete. Busy-polling is
 /// therefore not a spin — the first poll returns `Ready` — and it keeps a durable-store consumer
 /// from having to link an executor just to read a goal back.

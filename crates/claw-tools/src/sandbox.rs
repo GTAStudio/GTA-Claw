@@ -428,7 +428,7 @@ impl Sandbox {
     ///   leaf is confirmed to be a regular file *before* `open`, without
     ///   which a FIFO left in the workspace would block the open forever.
     /// * Collapsing the two `canonicalize` calls on the open path — one in
-    ///   [`Sandbox::pin_ancestors`] before the open, one on the leaf after —
+    ///   `Sandbox::pin_ancestors` before the open, one on the leaf after —
     ///   would save about 10 µs. They stay: they answer the same question at
     ///   two different moments, which is the entire point of checking after
     ///   the handle exists.
