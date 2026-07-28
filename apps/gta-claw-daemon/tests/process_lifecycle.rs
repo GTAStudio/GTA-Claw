@@ -151,20 +151,31 @@ fn an_unsupported_argument_is_refused_with_the_usage_line() {
         "an unsupported argument must be a plain start-up failure"
     );
     assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        format!("gta-claw-daemon: {USAGE}\n").as_bytes()
+    );
+}
 
-    let message = String::from_utf8(output.stderr).expect("stderr is UTF-8");
-    assert!(
-        message.starts_with("gta-claw-daemon: usage:"),
-        "unexpected diagnostic prefix: {message:?}"
-    );
-    assert!(
-        !message.contains("Error:"),
-        "the diagnostic leaked the main Result wrapper: {message:?}"
-    );
-    assert!(
-        !message.contains("Custom {"),
-        "the diagnostic leaked the io::Error debug form: {message:?}"
-    );
+#[test]
+fn missing_values_are_refused_with_exact_diagnostics() {
+    for (flag, requirement) in [
+        ("--config", "requires a path"),
+        ("--listen", "requires an address"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
+            .arg(flag)
+            .output()
+            .expect("daemon starts");
+
+        assert_eq!(output.status.code(), Some(1), "{flag}");
+        assert!(output.stdout.is_empty(), "{flag}");
+        assert_eq!(
+            output.stderr,
+            format!("gta-claw-daemon: {flag} {requirement}\n{USAGE}\n").as_bytes(),
+            "{flag}"
+        );
+    }
 }
 
 /// An argument that is not valid Unicode must be refused, not panic.
