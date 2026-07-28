@@ -30,7 +30,8 @@ pub use mutation::{
     DEFAULT_GATEWAY_PORT, MutationField, MutationRejection, TypedMutation, ValueType,
 };
 pub use recovery::{
-    ConfigCondition, Crestodian, RecoveryAction, RecoveryAssessment, RecoveryReport, StateCondition,
+    ConfigCondition, Crestodian, RecoveryAction, RecoveryAssessment, RecoveryGuidance,
+    RecoveryReport, StateCondition,
 };
 pub use rescue::{
     PendingOperation, RescueAuditEvent, RescueAuditKind, RescueAuditSink, RescueAuthorizationError,
@@ -44,5 +45,7 @@ pub use ring::{
     parse_operation, ring_zero_tool_descriptor, ring_zero_tool_schema,
 };
 pub use runtime::CrestodianRuntime;
-pub use setup::{GuidedSetup, SetupAnswers, SetupField, SetupQuestion, SetupReport};
+pub use setup::{
+    GuidedSetup, SetupAnswers, SetupConstraint, SetupField, SetupQuestion, SetupReport,
+};
 pub use state::{CRESTODIAN_STATE_SCHEMA_VERSION, CrestodianState};

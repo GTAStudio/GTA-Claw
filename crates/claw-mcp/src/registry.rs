@@ -39,7 +39,7 @@ pub struct RegistryBearer {
 impl RegistryBearer {
     /// Wraps a bearer token with the exact binding used to authorize it.
     #[must_use]
-    pub fn new(binding: CredentialBinding, token: SecretString) -> Self {
+    pub const fn new(binding: CredentialBinding, token: SecretString) -> Self {
         Self { binding, token }
     }
 
@@ -136,8 +136,23 @@ impl RegistryAuthPort for NoRegistryAuth {
 /// Persistent storage port for MCP server configurations.
 pub trait RegistryStore: Send + Sync + 'static {
     /// Loads all configured servers.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`McpError`] the backing store reports — typically
+    /// [`McpError::Io`] when the configuration file cannot be read and
+    /// [`McpError::Json`] when it is present but not a valid server list. An
+    /// empty store is `Ok(vec![])`, not an error.
     fn load(&self) -> Result<Vec<ServerConfig>>;
     /// Atomically replaces all configured servers.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`McpError`] the backing store reports — typically
+    /// [`McpError::Io`] when the configuration cannot be written or the
+    /// atomic rename fails, and [`McpError::Json`] when a configuration cannot
+    /// be serialized. An implementation must leave the previous configuration
+    /// intact when it returns an error.
     fn save(&self, servers: &[ServerConfig]) -> Result<()>;
 }
 
@@ -407,6 +422,17 @@ impl fmt::Debug for McpRegistry {
 
 impl McpRegistry {
     /// Loads a registry from persistent configuration.
+    ///
+    /// No server is started here; call [`McpRegistry::start_enabled`] for that.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's error when the persisted configuration cannot be
+    /// read, [`McpError::DuplicateServer`] when two entries share a name, and
+    /// [`McpError::Protocol`] when an entry fails validation — blank name, zero
+    /// connect or request timeout, empty stdio command, a remote URL that is
+    /// neither HTTP nor HTTPS, an OAuth profile on a stdio transport, or an
+    /// OAuth profile on a cleartext non-loopback URL.
     pub fn load(
         store: Arc<dyn RegistryStore>,
         auth: Arc<dyn RegistryAuthPort>,
@@ -457,6 +483,11 @@ impl McpRegistry {
     }
 
     /// Shows one server configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] when no server is configured under
+    /// `name`.
     pub async fn show(&self, name: &str) -> Result<ServerConfig> {
         let entry = self.entry(name).await?;
         let config = entry.lock().await.config.clone();
@@ -464,6 +495,16 @@ impl McpRegistry {
     }
 
     /// Adds a new server configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when the configuration fails validation
+    /// (see [`McpRegistry::load`] for the exact rules), [`McpError::Url`] when a
+    /// remote URL cannot be parsed, and [`McpError::DuplicateServer`] when the
+    /// name is already configured. Returns the store's error when the updated
+    /// set cannot be persisted — the server is registered in memory in that
+    /// case, so the caller should surface the failure rather than assume the
+    /// change survived a restart.
     pub async fn add(&self, config: ServerConfig) -> Result<()> {
         let _operation = self.operations.lock().await;
         config.validate()?;
@@ -490,6 +531,18 @@ impl McpRegistry {
     }
 
     /// Replaces an existing server configuration.
+    ///
+    /// The running connection is stopped first, and credentials are discarded
+    /// when the replacement points at a different OAuth binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when the replacement fails validation,
+    /// [`McpError::UnknownServer`] when the name is not configured,
+    /// [`McpError::Url`] when a remote URL cannot be parsed, and the transport
+    /// or authentication error when stopping the old connection or logging out
+    /// of the superseded binding fails. Returns the store's error when the
+    /// updated set cannot be persisted.
     pub async fn set(&self, config: ServerConfig) -> Result<()> {
         let _operation = self.operations.lock().await;
         self.set_inner(config).await
@@ -520,6 +573,12 @@ impl McpRegistry {
     }
 
     /// Updates selected fields of an existing server configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] when the name is not configured, and
+    /// otherwise the same errors as [`McpRegistry::set`] — the patched
+    /// configuration is validated, applied, and persisted as a whole.
     pub async fn configure(&self, name: &str, patch: ServerConfigPatch) -> Result<ServerConfig> {
         let _operation = self.operations.lock().await;
         let mut config = self.show(name).await?;
@@ -543,6 +602,13 @@ impl McpRegistry {
     }
 
     /// Removes a configured server and stops its process or transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] when the name is not configured, the
+    /// transport error when the running connection cannot be shut down cleanly
+    /// (the server is then left registered and marked unhealthy), and the
+    /// store's error when the reduced set cannot be persisted.
     pub async fn unset(&self, name: &str) -> Result<ServerConfig> {
         let _operation = self.operations.lock().await;
         self.stop_inner(name).await?;
@@ -558,6 +624,12 @@ impl McpRegistry {
     }
 
     /// Enables and starts a configured server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] when the name is not configured, the
+    /// store's error when the enabled flag cannot be persisted, and otherwise
+    /// the same start-up errors as [`McpRegistry::start`].
     pub async fn enable(&self, name: &str) -> Result<ServerStatus> {
         let _operation = self.operations.lock().await;
         {
@@ -571,6 +643,12 @@ impl McpRegistry {
     }
 
     /// Disables and stops a configured server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] when the name is not configured, the
+    /// transport error when the running connection cannot be shut down cleanly,
+    /// and the store's error when the disabled flag cannot be persisted.
     pub async fn disable(&self, name: &str) -> Result<ServerStatus> {
         let _operation = self.operations.lock().await;
         self.stop_inner(name).await?;
@@ -585,6 +663,23 @@ impl McpRegistry {
     }
 
     /// Starts one configured server and performs initialize negotiation.
+    ///
+    /// Starting an already-running server is a no-op that returns its status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] when the name is not configured and
+    /// [`McpError::Lifecycle`] when the configuration is disabled. When an OAuth
+    /// profile is attached, returns the authentication port's error, or
+    /// [`McpError::Protocol`] when the returned credential is bound to a
+    /// different origin than the configured URL. Otherwise returns the
+    /// transport's connect error: [`McpError::Io`] when a stdio child cannot be
+    /// spawned, [`McpError::Http`] when a remote endpoint is unreachable,
+    /// [`McpError::Timeout`] when initialize exceeds `connect_timeout_ms`, and
+    /// [`McpError::Protocol`] when the server speaks an unimplemented protocol
+    /// version or writes a malformed frame. A failed start leaves the entry in
+    /// [`ServerState::Unhealthy`] with the message in
+    /// [`ServerStatus::last_error`].
     pub async fn start(&self, name: &str) -> Result<ServerStatus> {
         let _operation = self.operations.lock().await;
         self.start_inner(name).await
@@ -592,54 +687,74 @@ impl McpRegistry {
 
     async fn start_inner(&self, name: &str) -> Result<ServerStatus> {
         let handle = self.entry(name).await?;
-        let mut entry = handle.lock().await;
-        if !entry.config.enabled {
-            entry.state = ServerState::Disabled;
-            return Err(McpError::Lifecycle(format!(
-                "MCP server is disabled: {name}"
-            )));
-        }
-        if entry.client.is_some() {
-            return status_from_entry(&entry);
-        }
-        entry.state = ServerState::Starting;
-        entry.last_error = None;
-        let config = entry.config.clone();
-        let binding = config.credential_binding()?;
-        let bearer = if let Some(binding) = binding.as_ref() {
-            match self.auth.bearer_token(binding).await {
-                Ok(token) => match token.into_token_for(binding) {
-                    Ok(token) => Some(token),
-                    Err(error) => {
-                        entry.state = ServerState::Unhealthy;
-                        entry.last_error = Some(error.to_string());
-                        return Err(error);
-                    }
-                },
-                Err(error) => {
-                    entry.state = ServerState::Unhealthy;
-                    entry.last_error = Some(error.to_string());
-                    return Err(error);
-                }
+        let config = {
+            let mut entry = handle.lock().await;
+            if !entry.config.enabled {
+                entry.state = ServerState::Disabled;
+                return Err(McpError::Lifecycle(format!(
+                    "MCP server is disabled: {name}"
+                )));
             }
-        } else {
-            None
+            if entry.client.is_some() {
+                return Ok(status_from_entry(&entry));
+            }
+            entry.state = ServerState::Starting;
+            entry.last_error = None;
+            entry.config.clone()
+        };
+        // Authentication and initialize negotiation can take as long as
+        // `connect_timeout_ms`. Every path into this function already holds the
+        // registry-wide `operations` lock, so no other start or stop can race
+        // the entry while it is unlocked here — and `list`, `status` and
+        // `doctor` stay responsive instead of blocking behind one slow server.
+        let binding = config.credential_binding()?;
+        let bearer = match Self::bearer_for(self.auth.as_ref(), binding.as_ref()).await {
+            Ok(bearer) => bearer,
+            Err(error) => return Err(Self::mark_unhealthy(&handle, error).await),
         };
         match self.connect(&config, bearer).await {
             Ok(client) => {
+                let mut entry = handle.lock().await;
                 entry.client = Some(client);
                 entry.state = ServerState::Healthy;
-                status_from_entry(&entry)
+                let status = status_from_entry(&entry);
+                drop(entry);
+                Ok(status)
             }
-            Err(error) => {
-                entry.state = ServerState::Unhealthy;
-                entry.last_error = Some(error.to_string());
-                Err(error)
-            }
+            Err(error) => Err(Self::mark_unhealthy(&handle, error).await),
         }
     }
 
+    async fn bearer_for(
+        auth: &dyn RegistryAuthPort,
+        binding: Option<&CredentialBinding>,
+    ) -> Result<Option<SecretString>> {
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+        auth.bearer_token(binding)
+            .await?
+            .into_token_for(binding)
+            .map(Some)
+    }
+
+    async fn mark_unhealthy(handle: &Arc<Mutex<RegistryEntry>>, error: McpError) -> McpError {
+        let mut entry = handle.lock().await;
+        entry.state = ServerState::Unhealthy;
+        entry.last_error = Some(error.to_string());
+        error
+    }
+
     /// Stops one configured server and waits for transport cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] when the name is not configured,
+    /// [`McpError::Lifecycle`] when the peer does not finish shutting down
+    /// within the client's five-second budget, and [`McpError::Join`] when the
+    /// service worker panicked. A failed stop leaves the entry in
+    /// [`ServerState::Unhealthy`]; the stdio child is still killed by the
+    /// transport's process guard.
     pub async fn stop(&self, name: &str) -> Result<ServerStatus> {
         let _operation = self.operations.lock().await;
         self.stop_inner(name).await
@@ -660,10 +775,17 @@ impl McpRegistry {
         } else {
             ServerState::Disabled
         };
-        status_from_entry(&entry)
+        let status = status_from_entry(&entry);
+        drop(entry);
+        Ok(status)
     }
 
     /// Stops and starts one configured server.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stop error from [`McpRegistry::stop`] without attempting the
+    /// restart, or otherwise the start error from [`McpRegistry::start`].
     pub async fn restart(&self, name: &str) -> Result<ServerStatus> {
         let _operation = self.operations.lock().await;
         self.stop_inner(name).await?;
@@ -671,26 +793,52 @@ impl McpRegistry {
     }
 
     /// Returns current runtime status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] when no server is configured under
+    /// `name`. A configured server that is stopped or unhealthy is reported in
+    /// the returned status, not as an error.
     pub async fn status(&self, name: &str) -> Result<ServerStatus> {
         let entry = self.entry(name).await?;
-        let status = status_from_entry(&*entry.lock().await)?;
+        let status = status_from_entry(&*entry.lock().await);
         Ok(status)
     }
 
     /// Returns negotiated server capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] when the name is not configured and
+    /// [`McpError::Lifecycle`] when the server is not currently running or its
+    /// transport completed initialize without recording a result.
     pub async fn capabilities(&self, name: &str) -> Result<Arc<ServerInfo>> {
-        let entry = self.entry(name).await?;
-        let entry = entry.lock().await;
+        let handle = self.entry(name).await?;
+        let entry = handle.lock().await;
         let client = entry
             .client
             .as_ref()
             .ok_or_else(|| McpError::Lifecycle(format!("MCP server is not running: {name}")))?;
-        client.server_info().ok_or_else(|| {
+        let server_info = client.server_info();
+        drop(entry);
+        server_info.ok_or_else(|| {
             McpError::Lifecycle(format!("MCP server has no initialize result: {name}"))
         })
     }
 
     /// Refreshes and returns the server's tool catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] when the name is not configured,
+    /// [`McpError::Lifecycle`] when the server is not running,
+    /// [`McpError::Timeout`] when it does not answer `tools/list` within
+    /// `request_timeout_ms`, and [`McpError::Service`] when the transport has
+    /// closed or the server replies with a JSON-RPC error.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "`client` borrows out of the guard, and holding it for the round trip is what stops a concurrent `stop` from closing the transport mid-request"
+    )]
     pub async fn tools(&self, name: &str) -> Result<ListToolsResult> {
         let entry = self.entry(name).await?;
         let entry = entry.lock().await;
@@ -702,6 +850,16 @@ impl McpRegistry {
     }
 
     /// Probes a server, temporarily connecting when it is not already running.
+    ///
+    /// A server that was not already running is stopped again afterwards, even
+    /// when the probe fails, so a probe never leaks a child process.
+    ///
+    /// # Errors
+    ///
+    /// Returns the start error from [`McpRegistry::start`] or the catalog error
+    /// from [`McpRegistry::tools`]. When a temporary connection also fails to
+    /// shut down, returns [`McpError::Lifecycle`] carrying both the probe
+    /// failure and the cleanup failure so neither cause is lost.
     pub async fn probe(&self, name: &str) -> Result<ServerStatus> {
         let _operation = self.operations.lock().await;
         self.probe_inner(name).await
@@ -714,7 +872,9 @@ impl McpRegistry {
         };
         let status = self.start_inner(name).await?;
         let tools = self.tools(name).await;
-        if !originally_running {
+        if originally_running {
+            tools?;
+        } else {
             if matches!(&tools, Err(McpError::Timeout(_))) {
                 // The timeout queues an MCP cancellation notification. Give the
                 // external server a bounded window to consume it before teardown.
@@ -730,8 +890,6 @@ impl McpRegistry {
                 });
             }
             cleanup?;
-        } else {
-            tools?;
         }
         Ok(status)
     }
@@ -773,6 +931,13 @@ impl McpRegistry {
     }
 
     /// Starts OAuth login for one configured server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] when the name is not configured,
+    /// [`McpError::Protocol`] when the server has no OAuth profile or its
+    /// profile cannot be bound to the configured URL, [`McpError::Url`] when
+    /// that URL cannot be parsed, and otherwise the authentication port's error.
     pub async fn login(&self, name: &str) -> Result<Url> {
         let config = self.show(name).await?;
         let binding = config.credential_binding()?.ok_or_else(|| {
@@ -782,6 +947,13 @@ impl McpRegistry {
     }
 
     /// Completes OAuth login for one configured server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] when the name is not configured and
+    /// [`McpError::Protocol`] when the server has no OAuth profile. Otherwise
+    /// returns the authentication port's error, which for a mismatched `state`
+    /// or an expired `code` is the authorization server's rejection.
     pub async fn complete_login(&self, name: &str, code: &str, state: &str) -> Result<()> {
         let config = self.show(name).await?;
         let binding = config.credential_binding()?.ok_or_else(|| {
@@ -791,6 +963,14 @@ impl McpRegistry {
     }
 
     /// Logs out one configured server and stops its authenticated connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] when the name is not configured, the
+    /// transport error when the authenticated connection cannot be shut down
+    /// (credentials are then left in place), [`McpError::Protocol`] when the
+    /// server has no OAuth profile, and otherwise the authentication port's
+    /// error.
     pub async fn logout(&self, name: &str) -> Result<()> {
         let _operation = self.operations.lock().await;
         self.stop_inner(name).await?;
@@ -802,6 +982,17 @@ impl McpRegistry {
     }
 
     /// Reloads persistent configuration, stopping all existing connections first.
+    ///
+    /// The in-memory set is replaced only after the whole persisted document
+    /// validates, so a bad configuration file leaves the previous set intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport error when a running connection cannot be shut
+    /// down, the store's error when the configuration cannot be read,
+    /// [`McpError::DuplicateServer`] when the document contains two entries with
+    /// the same name, and [`McpError::Protocol`] or [`McpError::Url`] when an
+    /// entry fails validation.
     pub async fn reload(&self) -> Result<()> {
         let _operation = self.operations.lock().await;
         let names = self
@@ -927,14 +1118,14 @@ impl McpRegistry {
     }
 }
 
-fn status_from_entry(entry: &RegistryEntry) -> Result<ServerStatus> {
-    Ok(ServerStatus {
+fn status_from_entry(entry: &RegistryEntry) -> ServerStatus {
+    ServerStatus {
         name: entry.config.name.clone(),
         state: entry.state,
         last_error: entry.last_error.clone(),
         server_info: entry.client.as_ref().and_then(McpClient::server_info),
         child_pid: entry.client.as_ref().and_then(McpClient::child_pid),
-    })
+    }
 }
 
 #[cfg(test)]

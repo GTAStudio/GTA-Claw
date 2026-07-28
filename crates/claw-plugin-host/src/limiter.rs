@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use claw_plugin_api::limits::ResourceLimits;
 
+const MEMORY_CEILING: u8 = 1;
+const TABLE_CEILING: u8 = 1 << 1;
+
 /// Enforces the manifest's memory, table and instance ceilings.
 ///
 /// Wasmtime consults this on every growth request, so a memory bomb is stopped
@@ -15,8 +18,8 @@ pub(crate) struct InstanceLimiter {
     memories: u32,
     tables: u32,
     peak_memory_bytes: usize,
-    hit_memory_ceiling: bool,
-    hit_table_ceiling: bool,
+    ceiling_flags: u8,
+    call_ceiling_flags: u8,
 }
 
 impl InstanceLimiter {
@@ -26,9 +29,13 @@ impl InstanceLimiter {
             memories: 0,
             tables: 0,
             peak_memory_bytes: 0,
-            hit_memory_ceiling: false,
-            hit_table_ceiling: false,
+            ceiling_flags: 0,
+            call_ceiling_flags: 0,
         }
+    }
+
+    pub(crate) const fn begin_call(&mut self) {
+        self.call_ceiling_flags = 0;
     }
 
     pub(crate) const fn peak_memory_bytes(&self) -> usize {
@@ -36,11 +43,15 @@ impl InstanceLimiter {
     }
 
     pub(crate) const fn hit_memory_ceiling(&self) -> bool {
-        self.hit_memory_ceiling
+        self.ceiling_flags & MEMORY_CEILING != 0
     }
 
     pub(crate) const fn hit_table_ceiling(&self) -> bool {
-        self.hit_table_ceiling
+        self.ceiling_flags & TABLE_CEILING != 0
+    }
+
+    pub(crate) const fn hit_resource_ceiling_during_call(&self) -> bool {
+        self.call_ceiling_flags != 0
     }
 }
 
@@ -55,7 +66,8 @@ impl wasmtime::ResourceLimiter for InstanceLimiter {
         if allowed {
             self.peak_memory_bytes = self.peak_memory_bytes.max(desired);
         } else {
-            self.hit_memory_ceiling = true;
+            self.ceiling_flags |= MEMORY_CEILING;
+            self.call_ceiling_flags |= MEMORY_CEILING;
         }
         Ok(allowed)
     }
@@ -68,7 +80,8 @@ impl wasmtime::ResourceLimiter for InstanceLimiter {
     ) -> wasmtime::Result<bool> {
         let allowed = u64::try_from(desired).unwrap_or(u64::MAX) <= self.limits.max_table_elements;
         if !allowed {
-            self.hit_table_ceiling = true;
+            self.ceiling_flags |= TABLE_CEILING;
+            self.call_ceiling_flags |= TABLE_CEILING;
         }
         Ok(allowed)
     }

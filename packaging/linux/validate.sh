@@ -7,6 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 source "$SCRIPT_DIR/lib/build-manifest.sh"
 source "$SCRIPT_DIR/lib/oci-validation.sh"
+source "$SCRIPT_DIR/lib/native-validation.sh"
+source "$SCRIPT_DIR/lib/lifecycle-validation.sh"
 
 require_linux
 adopt_safe_output_root
@@ -40,21 +42,12 @@ for artifact in \
 done
 verify_sha256_manifest "$artifact_dir" "$artifact_dir/SHA256SUMS"
 
-validate_archive_entries "$tar_artifact" gzip
-tar -tzf "$tar_artifact" | grep -Fx "$base_name/bin/$LINUX_DAEMON_NAME" >/dev/null
-tar -tzf "$tar_artifact" | grep -Fx "$base_name/bin/$LINUX_CLI_NAME" >/dev/null
-tar -tzf "$tar_artifact" | grep -Fx "$base_name/provenance.json" >/dev/null
-tar -tzf "$tar_artifact" | grep -Fx "$base_name/sbom.spdx.json" >/dev/null
-tar -tzf "$tar_artifact" |
-  grep -Fx "$base_name/share/doc/gta-claw/build-manifest.json" >/dev/null
-if tar -tzf "$tar_artifact" |
-  grep -Eiq '(^|/)(node(js)?|npm|npx|pnpm|bun)(/|$)|\.(js|mjs|cjs|node)$'; then
-  die "native archive contains a JavaScript runtime or package-manager file"
-fi
-if tar --numeric-owner -tvzf "$tar_artifact" |
-  awk '$2 != "0/0" { bad = 1 } END { exit !bad }'; then
-  die "native archive contains non-root ownership"
-fi
+validate_published_native_archive \
+  "$tar_artifact" \
+  "$arch" \
+  "$work_dir/published-native-validation" \
+  "$BUILD_MANIFEST" \
+  "$BUILD_PUBLIC_KEY_FINGERPRINT"
 
 [[ "$(dpkg-deb --field "$deb_artifact" Architecture)" == "$deb_architecture" ]] ||
   die "Debian architecture mismatch"
@@ -77,10 +70,8 @@ for script in postinst prerm postrm; do
     "$LINUX_DIR/debian/$script" \
     <(dpkg-deb --ctrl-tarfile "$deb_artifact" | tar -xOf - "./$script") ||
     die "Debian maintainer script differs from reviewed source: $script"
-  if grep -Eq '\|\|[[:space:]]*(true|:)' "$LINUX_DIR/debian/$script"; then
-    die "Debian maintainer script swallows a lifecycle failure: $script"
-  fi
 done
+validate_debian_lifecycle_contract "$LINUX_DIR/debian"
 if awk 'substr($1, 1, 1) !~ /^[-d]$/ { bad = 1 } END { exit !bad }' \
   <<<"$deb_contents"; then
   die "Debian payload contains a link or special entry"
@@ -108,22 +99,7 @@ fi
 rpm -qp --requires "$rpm_artifact" | grep -Fx "glibc >= $BUILD_GLIBC_REQUIREMENT" >/dev/null ||
   die "RPM glibc dependency does not match ELF-derived requirement"
 rpm_scripts="$(rpm -qp --scripts "$rpm_artifact")"
-for contract in \
-  'systemctl daemon-reload' \
-  'systemctl preset gta-claw-daemon.service' \
-  'systemctl restart gta-claw-daemon.service' \
-  'systemctl is-active --quiet gta-claw-daemon.service' \
-  'systemctl disable --now gta-claw-daemon.service'; do
-  grep -F "$contract" <<<"$rpm_scripts" >/dev/null ||
-    die "RPM lifecycle script contract missing: $contract"
-done
-if grep -Eiq '(^|[[:space:]])(curl|wget|nc|bash -c|sh -c|eval)([[:space:]]|$)' \
-  <<<"$rpm_scripts"; then
-  die "RPM lifecycle script contains network or dynamic execution"
-fi
-if grep -Eq '\|\|[[:space:]]*(true|:)' <<<"$rpm_scripts"; then
-  die "RPM lifecycle script swallows a lifecycle failure"
-fi
+validate_rpm_lifecycle_contract "$rpm_scripts"
 rpm_payload_listing="$(rpm -qplv "$rpm_artifact")"
 if awk 'substr($1, 1, 1) !~ /^[-d]$/ { bad = 1 } END { exit !bad }' \
   <<<"$rpm_payload_listing"; then

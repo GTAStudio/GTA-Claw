@@ -299,7 +299,7 @@ jobs:
         run: |
           readonly rustup_bin="/home/runner/.cargo/bin/rustup"
           [[ -x "$rustup_bin" ]]
-          "$rustup_bin" toolchain install 1.97.0 \
+          "$rustup_bin" toolchain install 1.97.1 \
             --profile minimal \
             --no-self-update
 
@@ -372,17 +372,17 @@ jobs:
               HOME=/home/runner \
               RUSTUP_HOME=/home/runner/.rustup \
               PATH=/usr/bin:/bin \
-              "$rustup_bin" which --toolchain 1.97.0 cargo
+              "$rustup_bin" which --toolchain 1.97.1 cargo
           )"
           rustc_bin="$(
             /usr/bin/env -i \
               HOME=/home/runner \
               RUSTUP_HOME=/home/runner/.rustup \
               PATH=/usr/bin:/bin \
-              "$rustup_bin" which --toolchain 1.97.0 rustc
+              "$rustup_bin" which --toolchain 1.97.1 rustc
           )"
-          [[ "$cargo_bin" == /home/runner/.rustup/toolchains/1.97.0-*/bin/cargo ]]
-          [[ "$rustc_bin" == /home/runner/.rustup/toolchains/1.97.0-*/bin/rustc ]]
+          [[ "$cargo_bin" == /home/runner/.rustup/toolchains/1.97.1-*/bin/cargo ]]
+          [[ "$rustc_bin" == /home/runner/.rustup/toolchains/1.97.1-*/bin/rustc ]]
           [[ -x "$cargo_bin" && -x "$rustc_bin" ]]
           cargo_version="$(
             /bin/bash "$metadata_script" \

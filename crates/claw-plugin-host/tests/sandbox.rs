@@ -367,7 +367,7 @@ fn config_reads_are_scoped_to_the_granted_keys() {
     let config = InMemoryConfig::new();
     config.set(PROBE_ID, "k", "v");
 
-    let other_key: BTreeSet<String> = ["other".to_owned()].into_iter().collect();
+    let other_key = BTreeSet::from(["other".to_owned()]);
     let dir = install_probe(
         root.path(),
         "probe",
@@ -488,7 +488,7 @@ fn event_grants_are_scoped_to_the_granted_kinds() {
     let root = support::tempdir();
     let recorder = RecordingSink::new();
     // The probe emits `heartbeat`; grant only `message`.
-    let kinds: BTreeSet<EventKind> = [EventKind::Message].into_iter().collect();
+    let kinds = BTreeSet::from([EventKind::Message]);
     let dir = install_probe(
         root.path(),
         "probe",
@@ -529,7 +529,7 @@ fn event_grants_are_scoped_to_the_granted_kinds() {
 fn granted_calls_actually_reach_the_host_services() {
     let root = support::tempdir();
     let recorder = RecordingSink::new();
-    let kinds: BTreeSet<EventKind> = [EventKind::Heartbeat].into_iter().collect();
+    let kinds = BTreeSet::from([EventKind::Heartbeat]);
     let dir = install_probe(
         root.path(),
         "probe",

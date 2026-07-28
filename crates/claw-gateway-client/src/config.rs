@@ -174,6 +174,10 @@ impl Default for ReconnectPolicy {
 }
 
 /// Complete configuration for one reconnecting Gateway client.
+///
+/// The [`Debug`] rendering is deliberately non-exhaustive: the endpoint is
+/// reduced to its host and TLS flag, the credential is redacted, and the
+/// declaration vectors are summarized by count.
 pub struct GatewayClientConfig {
     /// WebSocket endpoint. Only `ws` and `wss` are accepted.
     pub url: Url,
@@ -205,7 +209,7 @@ pub struct GatewayClientConfig {
     pub timeouts: ClientTimeouts,
     /// Reconnect policy.
     pub reconnect: ReconnectPolicy,
-    /// Explicit break-glass opt-in for non-loopback plaintext WebSockets.
+    /// Explicit break-glass opt-in for non-loopback plaintext `WebSockets`.
     pub allow_insecure_remote_ws: bool,
 }
 
@@ -247,7 +251,7 @@ impl GatewayClientConfig {
         }
         if self.url.scheme() == "ws"
             && !self.allow_insecure_remote_ws
-            && !is_loopback_host(self.url.host())
+            && !self.url.host().is_some_and(|host| is_loopback_host(&host))
         {
             return Err(ConfigurationError::InsecureRemoteWebSocket);
         }
@@ -318,17 +322,15 @@ impl Debug for GatewayClientConfig {
             .field("timeouts", &self.timeouts)
             .field("reconnect", &self.reconnect)
             .field("allow_insecure_remote_ws", &self.allow_insecure_remote_ws)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
-fn is_loopback_host(host: Option<Host<&str>>) -> bool {
+fn is_loopback_host(host: &Host<&str>) -> bool {
     match host {
-        Some(Host::Domain("localhost")) => true,
-        Some(Host::Ipv4(address)) => address.is_loopback(),
-        Some(Host::Ipv6(address)) => address.is_loopback(),
-        Some(Host::Domain(_)) => false,
-        None => false,
+        Host::Domain(domain) => *domain == "localhost",
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => address.is_loopback(),
     }
 }
 

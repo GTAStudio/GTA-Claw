@@ -72,7 +72,7 @@ pub enum CrestodianError {
     /// A write failed and restoring exact original bytes also encountered errors.
     Rollback {
         /// Original operation failure.
-        operation: Box<CrestodianError>,
+        operation: Box<Self>,
         /// Every restoration failure.
         restore_failures: Vec<RestoreFailure>,
     },

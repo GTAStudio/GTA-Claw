@@ -27,6 +27,28 @@ pub enum SetupField {
     TeamsPasswordEnvironment,
 }
 
+/// Machine-readable validation guidance for one setup answer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupConstraint {
+    /// The answer must exactly match this frozen value.
+    Exact(&'static str),
+    /// The answer must be an absolute HTTP(S) URL.
+    AbsoluteHttpUrl,
+    /// The answer is an optional filesystem path.
+    OptionalPath,
+    /// The answer is a boolean choice.
+    Boolean,
+    /// The answer is required when another boolean field is enabled.
+    RequiredWhen(SetupField),
+    /// The answer must match a frozen value when another field is enabled.
+    ExactWhen {
+        /// Required value.
+        value: &'static str,
+        /// Enabling field.
+        field: SetupField,
+    },
+}
+
 /// One deterministic guided setup prompt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SetupQuestion {
@@ -38,6 +60,8 @@ pub struct SetupQuestion {
     pub required: bool,
     /// Whether the answer itself contains secret bytes.
     pub secret: bool,
+    /// Constraint a UI can enforce before submitting the complete answer set.
+    pub constraint: SetupConstraint,
 }
 
 /// Typed answers accepted by first-run setup.
@@ -94,36 +118,45 @@ impl GuidedSetup {
                 prompt: "GitHub token environment variable",
                 required: true,
                 secret: false,
+                constraint: SetupConstraint::Exact("GITHUB_TOKEN"),
             },
             SetupQuestion {
                 field: SetupField::RoleSourceUrl,
                 prompt: "Role source URL",
                 required: true,
                 secret: false,
+                constraint: SetupConstraint::AbsoluteHttpUrl,
             },
             SetupQuestion {
                 field: SetupField::Workspace,
                 prompt: "Initial workspace",
                 required: false,
                 secret: false,
+                constraint: SetupConstraint::OptionalPath,
             },
             SetupQuestion {
                 field: SetupField::EnableTeams,
                 prompt: "Enable Microsoft Teams",
                 required: true,
                 secret: false,
+                constraint: SetupConstraint::Boolean,
             },
             SetupQuestion {
                 field: SetupField::TeamsAppId,
                 prompt: "Microsoft Teams application ID",
                 required: false,
                 secret: false,
+                constraint: SetupConstraint::RequiredWhen(SetupField::EnableTeams),
             },
             SetupQuestion {
                 field: SetupField::TeamsPasswordEnvironment,
                 prompt: "Microsoft Teams password environment variable",
                 required: false,
                 secret: false,
+                constraint: SetupConstraint::ExactWhen {
+                    value: "MicrosoftAppPassword",
+                    field: SetupField::EnableTeams,
+                },
             },
         ]
     }
@@ -132,6 +165,24 @@ impl GuidedSetup {
     ///
     /// An empty existing config is considered interrupted first-run state and is
     /// restored exactly if publishing auxiliary state fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrestodianError::AlreadyConfigured`] when the configuration
+    /// path already holds non-empty bytes, so setup never overwrites an
+    /// authored configuration. Returns [`CrestodianError::InvalidAnswer`],
+    /// naming the field, for a GitHub token variable that is not a valid
+    /// environment name or is not the frozen `GITHUB_TOKEN`, an empty role
+    /// source URL, an empty workspace, a missing Teams application ID while
+    /// Teams is enabled, a Teams password variable other than
+    /// `MicrosoftAppPassword`, or answers the legacy environment migration
+    /// itself refuses. Returns [`CrestodianError::Io`] when an existing file
+    /// cannot be read or a parent directory cannot be created, and
+    /// [`CrestodianError::Config`] when the configuration cannot be written
+    /// atomically. If the state write fails after the configuration was already
+    /// published, both paths are restored to their exact previous bytes and the
+    /// original failure is returned as-is, or wrapped in
+    /// [`CrestodianError::Rollback`] listing every restoration that also failed.
     pub fn apply(&self, answers: &SetupAnswers) -> Result<SetupReport, CrestodianError> {
         let previous_config = read_optional_file(&self.config_path)?;
         if previous_config
@@ -198,10 +249,10 @@ impl GuidedSetup {
             ("AGENT_ROLE_URL", answers.role_source_url.as_str()),
             ("ENABLE_TEAMS", teams),
         ];
-        if let Some(app_id) = &answers.teams_app_id {
-            environment.push(("MicrosoftAppId", app_id.as_str()));
-        }
-        if answers.teams_password_environment.is_some() {
+        if answers.enable_teams {
+            if let Some(app_id) = answers.teams_app_id.as_deref() {
+                environment.push(("MicrosoftAppId", app_id));
+            }
             environment.push((
                 "MicrosoftAppPassword",
                 "__present_in_platform_environment__",
@@ -266,30 +317,7 @@ pub(crate) fn restore_paths<const N: usize>(
 ) -> Vec<RestoreFailure> {
     let mut failures = Vec::new();
     for (path, original) in paths {
-        let result = match original {
-            Some(bytes) => {
-                if let Err(error) = ensure_parent_directory(path) {
-                    Err(error.to_string())
-                } else {
-                    write_bytes_atomically(path, bytes)
-                        .map(|_| ())
-                        .map_err(|error| error.to_string())
-                }
-            }
-            None => match fs::remove_file(path) {
-                Ok(()) => Ok(()),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) =>
-                {
-                    Ok(())
-                }
-                Err(error) => Err(error.to_string()),
-            },
-        };
-        if let Err(message) = result {
+        if let Err(message) = restore_path(path, original) {
             failures.push(RestoreFailure {
                 path: path.to_owned(),
                 message,
@@ -297,4 +325,32 @@ pub(crate) fn restore_paths<const N: usize>(
         }
     }
     failures
+}
+
+/// Puts one path back exactly as it was, byte for byte or absent.
+///
+/// The rollback deliberately drops the [`claw_config::WriteWarning`] values the
+/// republication may raise: this runs while an operation is already failing, its
+/// result is folded into a [`RestoreFailure`] list that carries only a path and
+/// a message, and there is no caller here to hand a durability caveat to. Losing
+/// them is the price of not losing the original bytes.
+fn restore_path(path: &Path, original: Option<&[u8]>) -> Result<(), String> {
+    let Some(bytes) = original else {
+        return match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        };
+    };
+    ensure_parent_directory(path).map_err(|error| error.to_string())?;
+    let restored = write_bytes_atomically(path, bytes).map_err(|error| error.to_string())?;
+    drop(restored.warnings);
+    Ok(())
 }

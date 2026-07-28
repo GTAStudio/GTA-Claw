@@ -1,5 +1,8 @@
 //! MCP client facade spanning stdio, streamable HTTP, and legacy SSE transports.
-#![allow(deprecated)]
+#![expect(
+    deprecated,
+    reason = "rmcp deprecates MCP sampling and logging per SEP-2577, but this client must keep speaking both to servers that still use them"
+)]
 
 use std::{
     collections::HashMap, ffi::OsString, fmt, future::Future, io, path::PathBuf, pin::Pin,
@@ -65,7 +68,7 @@ pub trait SamplingPort: Send + Sync + 'static {
     }
 
     /// Creates a model response for an MCP sampling request.
-    fn create_message<'a>(&'a self, request: CreateMessageRequestParams) -> SamplingFuture<'a>;
+    fn create_message(&self, request: CreateMessageRequestParams) -> SamplingFuture<'_>;
 }
 
 /// Rejects sampling requests unless the application installs a sampling port.
@@ -73,7 +76,7 @@ pub trait SamplingPort: Send + Sync + 'static {
 pub struct RejectSampling;
 
 impl SamplingPort for RejectSampling {
-    fn create_message<'a>(&'a self, _request: CreateMessageRequestParams) -> SamplingFuture<'a> {
+    fn create_message(&self, _request: CreateMessageRequestParams) -> SamplingFuture<'_> {
         Box::pin(async {
             Err(rmcp::ErrorData::method_not_found::<
                 rmcp::model::CreateMessageRequestMethod,
@@ -256,7 +259,7 @@ impl fmt::Debug for HttpClientConfig {
 impl HttpClientConfig {
     /// Creates a streamable HTTP client configuration.
     #[must_use]
-    pub fn new(endpoint: Url) -> Self {
+    pub const fn new(endpoint: Url) -> Self {
         Self {
             endpoint,
             bearer_token: None,
@@ -353,6 +356,18 @@ impl fmt::Debug for McpClient {
 
 impl McpClient {
     /// Connects to a child MCP server over stdio.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when `max_frame_bytes` is zero, when the
+    /// child writes a frame that is malformed, not UTF-8, or larger than
+    /// `max_frame_bytes`, when the child exits mid-frame, when the initialize
+    /// response omits `serverInfo`, or when the child selects a protocol version
+    /// this crate does not implement. Returns [`McpError::Io`] when the program
+    /// cannot be spawned or its standard streams were not piped,
+    /// [`McpError::Timeout`] when initialize negotiation exceeds
+    /// `connect_timeout`, and [`McpError::ClientInitialize`] when the child
+    /// rejects the initialize request itself.
     pub async fn connect_stdio(
         config: StdioClientConfig,
         sampling: Arc<dyn SamplingPort>,
@@ -416,6 +431,16 @@ impl McpClient {
     }
 
     /// Connects to an MCP server using streamable HTTP.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when a bearer token is paired with an
+    /// endpoint that is neither HTTPS nor a literal-loopback HTTP URL (which
+    /// would leak the token in clear text), when the initialize response omits
+    /// `serverInfo`, or when the server selects an unimplemented protocol
+    /// version. Returns [`McpError::Http`] when TLS setup or the HTTP exchange
+    /// fails, [`McpError::Timeout`] when initialize exceeds `connect_timeout`,
+    /// and [`McpError::ClientInitialize`] when the server rejects initialize.
     pub async fn connect_http(
         config: HttpClientConfig,
         sampling: Arc<dyn SamplingPort>,
@@ -448,6 +473,17 @@ impl McpClient {
     }
 
     /// Connects to a legacy MCP HTTP+SSE server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when an `Authorization` header is paired
+    /// with an endpoint that is neither HTTPS nor a literal-loopback HTTP URL,
+    /// when the SSE transport cannot be built (unusable endpoint or header
+    /// value), when the server never sends its `endpoint` event, when the
+    /// initialize response omits `serverInfo`, or when the server selects an
+    /// unimplemented protocol version. Returns [`McpError::Timeout`] when
+    /// initialize exceeds the configured request timeout and
+    /// [`McpError::ClientInitialize`] when the server rejects initialize.
     pub async fn connect_sse(
         config: LegacySseConfig,
         sampling: Arc<dyn SamplingPort>,
@@ -491,6 +527,13 @@ impl McpClient {
     }
 
     /// Lists tools advertised by the server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Timeout`] when the server does not answer `tools/list`
+    /// within the configured request timeout, and [`McpError::Service`] when the
+    /// transport is already closed, the server replies with a JSON-RPC error, or
+    /// it answers with a result that is not a tool listing.
     pub async fn list_tools(&self) -> Result<ListToolsResult, McpError> {
         match self
             .cancellable_request(ClientRequest::ListToolsRequest(ListToolsRequest::default()))
@@ -502,6 +545,17 @@ impl McpClient {
     }
 
     /// Calls one server tool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Timeout`] when the tool does not finish within the
+    /// configured request timeout — the request is cancelled on the wire first,
+    /// and the grace period for that cancellation is included. Returns
+    /// [`McpError::Service`] when the transport is already closed, the server
+    /// rejects the call with a JSON-RPC error (unknown tool, invalid arguments),
+    /// or it answers with a result that is not a tool result. A tool that runs to
+    /// completion but reports failure is an `Ok` [`CallToolResult`] with
+    /// `is_error` set, not an error here.
     pub async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -518,6 +572,14 @@ impl McpClient {
     }
 
     /// Lists server resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Timeout`] when the server does not answer
+    /// `resources/list` within the configured request timeout, and
+    /// [`McpError::Service`] when the transport is already closed, the server
+    /// replies with a JSON-RPC error (typically because it does not advertise the
+    /// resources capability), or it answers with a result of another type.
     pub async fn list_resources(&self) -> Result<ListResourcesResult, McpError> {
         match self
             .cancellable_request(ClientRequest::ListResourcesRequest(
@@ -531,6 +593,13 @@ impl McpClient {
     }
 
     /// Lists server resource templates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Timeout`] when the server does not answer
+    /// `resources/templates/list` within the configured request timeout, and
+    /// [`McpError::Service`] when the transport is already closed, the server
+    /// replies with a JSON-RPC error, or it answers with a result of another type.
     pub async fn list_resource_templates(&self) -> Result<ListResourceTemplatesResult, McpError> {
         match self
             .cancellable_request(ClientRequest::ListResourceTemplatesRequest(
@@ -544,6 +613,14 @@ impl McpClient {
     }
 
     /// Reads a server resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Timeout`] when the server does not answer
+    /// `resources/read` within the configured request timeout, and
+    /// [`McpError::Service`] when the transport is already closed, the server
+    /// replies with a JSON-RPC error (unknown or unreadable URI), or it answers
+    /// with a result that is not resource contents.
     pub async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
@@ -560,6 +637,14 @@ impl McpClient {
     }
 
     /// Subscribes to a server resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Timeout`] when the server does not acknowledge
+    /// `resources/subscribe` within the configured request timeout, and
+    /// [`McpError::Service`] when the transport is already closed, the server
+    /// replies with a JSON-RPC error (unknown URI, or subscriptions unsupported),
+    /// or it answers with anything other than an empty result.
     pub async fn subscribe(&self, request: SubscribeRequestParams) -> Result<(), McpError> {
         match self
             .cancellable_request(ClientRequest::SubscribeRequest(SubscribeRequest::new(
@@ -573,6 +658,14 @@ impl McpClient {
     }
 
     /// Unsubscribes from a server resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Timeout`] when the server does not acknowledge
+    /// `resources/unsubscribe` within the configured request timeout, and
+    /// [`McpError::Service`] when the transport is already closed, the server
+    /// replies with a JSON-RPC error (no such subscription), or it answers with
+    /// anything other than an empty result.
     pub async fn unsubscribe(&self, request: UnsubscribeRequestParams) -> Result<(), McpError> {
         match self
             .cancellable_request(ClientRequest::UnsubscribeRequest(UnsubscribeRequest::new(
@@ -586,6 +679,14 @@ impl McpClient {
     }
 
     /// Lists server prompts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Timeout`] when the server does not answer
+    /// `prompts/list` within the configured request timeout, and
+    /// [`McpError::Service`] when the transport is already closed, the server
+    /// replies with a JSON-RPC error (typically because it does not advertise the
+    /// prompts capability), or it answers with a result of another type.
     pub async fn list_prompts(&self) -> Result<ListPromptsResult, McpError> {
         match self
             .cancellable_request(ClientRequest::ListPromptsRequest(
@@ -599,6 +700,14 @@ impl McpClient {
     }
 
     /// Gets a server prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Timeout`] when the server does not answer
+    /// `prompts/get` within the configured request timeout, and
+    /// [`McpError::Service`] when the transport is already closed, the server
+    /// replies with a JSON-RPC error (unknown prompt or missing required
+    /// argument), or it answers with a result that is not a prompt.
     pub async fn get_prompt(
         &self,
         request: GetPromptRequestParams,
@@ -615,6 +724,14 @@ impl McpClient {
     }
 
     /// Requests server-side argument completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Timeout`] when the server does not answer
+    /// `completion/complete` within the configured request timeout, and
+    /// [`McpError::Service`] when the transport is already closed, the server
+    /// replies with a JSON-RPC error (typically because it does not advertise the
+    /// completions capability), or it answers with a result of another type.
     pub async fn complete(
         &self,
         request: CompleteRequestParams,
@@ -631,6 +748,14 @@ impl McpClient {
     }
 
     /// Gracefully closes the transport and waits for worker cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Join`] when the service worker task panicked or was
+    /// cancelled, and [`McpError::Lifecycle`] when the worker did not finish
+    /// within the five-second shutdown budget. A stdio child that ignores the
+    /// closed pipe is still killed by the transport's process guard, so a
+    /// [`McpError::Lifecycle`] here reports a slow shutdown, not a leaked child.
     pub async fn close(mut self) -> Result<(), McpError> {
         let closed = self
             .service
@@ -703,7 +828,7 @@ where
     Ok(service)
 }
 
-fn service_error_to_mcp(error: ServiceError) -> McpError {
+const fn service_error_to_mcp(error: ServiceError) -> McpError {
     McpError::Service(error)
 }
 

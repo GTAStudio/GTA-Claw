@@ -51,7 +51,7 @@ impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             ticket_ttl: Duration::from_secs(30),
-            session_ttl: Duration::from_secs(120),
+            session_ttl: Duration::from_mins(2),
             max_payload_bytes: 1 << 20,
             allowlist: DEFAULT_WORKER_METHOD_ALLOWLIST
                 .iter()
@@ -211,6 +211,9 @@ impl Error for WorkerError {}
 
 #[derive(Debug, Default)]
 struct RegistryState {
+    /// Bounded by [`WorkerRegistry::reclaim_stale_tickets`]: an entry lives for its
+    /// `ticket_ttl` plus one more `ticket_ttl` of diagnostic grace, so the table holds only
+    /// what was issued in that window rather than everything ever issued.
     tickets: HashMap<String, WorkerTicket>,
     sessions: HashMap<WorkerId, WorkerSession>,
     next_fence: u64,
@@ -258,6 +261,11 @@ impl WorkerRegistry {
 
     /// Issues a single-use admission ticket.
     ///
+    /// Issuing is also when the table is swept: a ticket that expired more than one `ticket_ttl`
+    /// ago is reclaimed here, so the registry holds only the tickets issued inside that window
+    /// instead of every ticket it ever minted. See [`WorkerRegistry::retained_tickets`] for why
+    /// the sweep waits rather than reclaiming at expiry.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkerError::DeadlineOverflow`] when the ticket deadline cannot be represented.
@@ -277,7 +285,9 @@ impl WorkerRegistry {
             expires_at,
         };
         let mut state = self.lock();
+        Self::reclaim_stale_tickets(&mut state, issued_at, self.config.ticket_ttl);
         state.tickets.insert(ticket.secret.clone(), ticket.clone());
+        drop(state);
         Ok(ticket)
     }
 
@@ -306,21 +316,25 @@ impl WorkerRegistry {
             .checked_add(self.config.session_ttl)
             .ok_or(WorkerError::DeadlineOverflow)?;
 
+        // Every refusal releases the lock before it builds its error, so a rejected admission
+        // never makes a live worker wait on identifier cloning.
         let mut state = self.lock();
         // A ticket is single use: it is removed whether or not it turns out to be valid, so a
         // leaked secret cannot be replayed after the first attempt.
-        let ticket = state
-            .tickets
-            .remove(secret)
-            .ok_or(WorkerError::UnknownTicket)?;
+        let Some(ticket) = state.tickets.remove(secret) else {
+            drop(state);
+            return Err(WorkerError::UnknownTicket);
+        };
 
         if &ticket.worker_id != worker_id {
+            drop(state);
             return Err(WorkerError::TicketWorkerMismatch {
                 expected: ticket.worker_id,
                 presented: worker_id.clone(),
             });
         }
         if now >= ticket.expires_at {
+            drop(state);
             return Err(WorkerError::TicketExpired {
                 expired_at: ticket.expires_at,
             });
@@ -336,6 +350,7 @@ impl WorkerRegistry {
             last_sequence: 0,
         };
         state.sessions.insert(worker_id.clone(), session.clone());
+        drop(state);
         Ok(session)
     }
 
@@ -356,9 +371,12 @@ impl WorkerRegistry {
             .ok_or(WorkerError::DeadlineOverflow)?;
 
         let mut state = self.lock();
-        let session = Self::live_session_mut(&mut state, worker_id, fence, now)?;
-        session.expires_at = expires_at;
-        Ok(session.clone())
+        let beaten = Self::live_session_mut(&mut state, worker_id, fence, now).map(|session| {
+            session.expires_at = expires_at;
+            session.clone()
+        });
+        drop(state);
+        beaten
     }
 
     /// Accepts one worker call, enforcing fencing, expiry, the allowlist, replay and size limits.
@@ -381,21 +399,25 @@ impl WorkerRegistry {
 
         let now = self.clock.now();
         let mut state = self.lock();
-        let session = Self::live_session_mut(&mut state, &call.worker_id, call.fence, now)?;
-
-        if call.sequence <= session.last_sequence {
-            return Err(WorkerError::ReplayDetected {
-                last: session.last_sequence,
-                presented: call.sequence,
+        let accepted = Self::live_session_mut(&mut state, &call.worker_id, call.fence, now)
+            .and_then(|session| {
+                if call.sequence <= session.last_sequence {
+                    return Err(WorkerError::ReplayDetected {
+                        last: session.last_sequence,
+                        presented: call.sequence,
+                    });
+                }
+                session.last_sequence = call.sequence;
+                Ok(session.clone())
             });
-        }
-        session.last_sequence = call.sequence;
-        Ok(session.clone())
+        drop(state);
+        accepted
     }
 
     /// Removes a worker session, for example when its transport closes.
     ///
     /// Returns the evicted session when one existed.
+    #[must_use]
     pub fn evict(&self, worker_id: &WorkerId) -> Option<WorkerSession> {
         self.lock().sessions.remove(worker_id)
     }
@@ -405,35 +427,74 @@ impl WorkerRegistry {
     pub fn session(&self, worker_id: &WorkerId) -> Option<WorkerSession> {
         let now = self.clock.now();
         let mut state = self.lock();
-        let expired = state
+        let live = state
             .sessions
             .get(worker_id)
-            .is_some_and(|session| now >= session.expires_at);
-        if expired {
+            .filter(|session| now < session.expires_at)
+            .cloned();
+        if live.is_none() {
             state.sessions.remove(worker_id);
-            return None;
         }
-        state.sessions.get(worker_id).cloned()
+        drop(state);
+        live
     }
 
     /// Returns every live session, ordered by fence.
     #[must_use]
     pub fn sessions(&self) -> Vec<WorkerSession> {
         let now = self.clock.now();
-        let mut state = self.lock();
-        state.sessions.retain(|_, session| now < session.expires_at);
-        let mut sessions: Vec<WorkerSession> = state.sessions.values().cloned().collect();
+        // The sweep and the clone-out need the lock; the sort does not.
+        let mut sessions: Vec<WorkerSession> = {
+            let mut state = self.lock();
+            state.sessions.retain(|_, session| now < session.expires_at);
+            state.sessions.values().cloned().collect()
+        };
         sessions.sort_by_key(|session| session.fence);
         sessions
     }
 
     /// Returns the number of tickets that have been issued but not redeemed or expired.
+    ///
+    /// Counting is destructive: every ticket found expired is dropped here rather than kept for
+    /// the grace window [`WorkerRegistry::retained_tickets`] describes, so a redemption after this
+    /// call is refused with [`WorkerError::UnknownTicket`] instead of
+    /// [`WorkerError::TicketExpired`]. Use `retained_tickets` to observe without sweeping.
     #[must_use]
     pub fn outstanding_tickets(&self) -> usize {
         let now = self.clock.now();
         let mut state = self.lock();
         state.tickets.retain(|_, ticket| now < ticket.expires_at);
         state.tickets.len()
+    }
+
+    /// Returns how many tickets the registry is holding, expired ones included.
+    ///
+    /// This is deliberately larger than [`WorkerRegistry::outstanding_tickets`] for a while. An
+    /// expired ticket is kept past its deadline so that a worker presenting it is refused with
+    /// [`WorkerError::TicketExpired`], which tells it to ask for a new ticket, rather than with
+    /// [`WorkerError::UnknownTicket`], which is the answer to a forged secret. Dropping the entry
+    /// at `expires_at` would erase that distinction; keeping it forever would grow this table for
+    /// as long as the process lives. One further `ticket_ttl` of grace is long enough that no
+    /// worker can still be mid-handshake with the ticket, and short enough that the table's size
+    /// is a function of the recent issue rate rather than of uptime.
+    ///
+    /// Unlike `outstanding_tickets`, this observes without sweeping.
+    #[must_use]
+    pub fn retained_tickets(&self) -> usize {
+        self.lock().tickets.len()
+    }
+
+    /// Drops tickets that expired more than `grace` ago.
+    ///
+    /// A deadline that cannot be represented is kept: an unrepresentable reclamation point is not
+    /// a reason to forget a ticket a worker may still hold.
+    fn reclaim_stale_tickets(state: &mut RegistryState, now: Timestamp, grace: Duration) {
+        state.tickets.retain(|_, ticket| {
+            ticket
+                .expires_at
+                .checked_add(grace)
+                .is_none_or(|reclaim_at| now < reclaim_at)
+        });
     }
 
     fn live_session_mut<'state>(
@@ -468,6 +529,6 @@ impl WorkerRegistry {
     fn lock(&self) -> MutexGuard<'_, RegistryState> {
         self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }

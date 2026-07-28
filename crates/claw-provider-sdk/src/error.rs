@@ -13,30 +13,164 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const MAX_DETAIL_CHARS: usize = 512;
 
 /// Closed classification of provider failures.
+///
+/// # Choosing a variant
+///
+/// Every failure in this crate lands in exactly one variant, and the variant —
+/// not the HTTP status, and not the message — is what the reliability policies
+/// act on. The upstream conditions map like this:
+///
+/// | Variant | Upstream condition | Retryable | Trips the circuit |
+/// | --- | --- | --- | --- |
+/// | [`Authentication`](Self::Authentication) | HTTP 401/403, a rejected or expired key, a refresh that failed | no | no |
+/// | [`RateLimit`](Self::RateLimit) | HTTP 429, usually with `Retry-After` | yes | no |
+/// | [`Quota`](Self::Quota) | HTTP 402, or a 403/429 whose body names an exhausted billing quota | no | no |
+/// | [`Transport`](Self::Transport) | DNS, TCP, TLS or proxy failure; a body that stopped mid-response | yes | yes |
+/// | [`Protocol`](Self::Protocol) | a response arrived but breaks the wire contract: unparseable HTTP, malformed JSON, an event for a block that never started | no | yes |
+/// | [`Server`](Self::Server) | HTTP 5xx | yes | yes |
+/// | [`InvalidRequest`](Self::InvalidRequest) | HTTP 4xx that is none of the above, and any request this crate refuses to build | no | no |
+/// | [`Cancelled`](Self::Cancelled) | the caller's [`CancelToken`](crate::CancelToken) fired | no | no |
+/// | [`Timeout`](Self::Timeout) | HTTP 408, or the request deadline elapsed | yes | yes |
+/// | [`CircuitOpen`](Self::CircuitOpen) | the breaker refused to admit the call | no | no |
+/// | [`Unsupported`](Self::Unsupported) | the provider does not implement the operation | no | no |
+///
+/// `Quota` is deliberately not retryable and `RateLimit` is: the first says the
+/// account is out of budget, the second says the account went too fast.
+/// `Protocol` is not retryable but does trip the circuit, because replaying the
+/// same request gets the same broken response while a provider that is speaking
+/// its own protocol wrong is unhealthy. `CircuitOpen` is not retryable because
+/// the breaker owns its own recovery schedule; retrying inside a request would
+/// fight it.
+///
+/// The two predicates are [`ErrorKind::is_retryable`] and
+/// [`ErrorKind::trips_circuit`], and the table above is asserted in the tests.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ErrorKind {
     /// Credentials are missing, malformed, expired or rejected.
+    ///
+    /// Retrying cannot help: the caller must supply a different credential.
     Authentication,
     /// The caller exceeded a request-rate limit and may retry later.
+    ///
+    /// Carries [`ProviderError::retry_after`] when the response named one.
     RateLimit,
     /// A hard billing or usage quota is exhausted; retrying will not help.
     Quota,
     /// Connection, TLS or socket-level failure before a complete response.
+    ///
+    /// Retryable, and counts toward opening the circuit.
     Transport,
     /// A response was received but violates the provider wire contract.
+    ///
+    /// Not retryable — the same request produces the same broken response — but
+    /// it does count toward opening the circuit.
     Protocol,
     /// The provider reported an internal failure (HTTP 5xx).
+    ///
+    /// Retryable, and counts toward opening the circuit.
     Server,
     /// The request itself is invalid and must be changed before retrying.
     InvalidRequest,
     /// The caller cancelled the operation.
+    ///
+    /// Never retried: the caller asked to stop.
     Cancelled,
     /// The operation exceeded its deadline.
+    ///
+    /// Retryable, and counts toward opening the circuit.
     Timeout,
     /// The circuit breaker for this provider is open.
+    ///
+    /// Not retried by the request-level policy, which would only fight the
+    /// breaker's own recovery schedule.
     CircuitOpen,
     /// The provider does not implement the requested operation.
     Unsupported,
+}
+
+/// Stable user-facing classification of a provider failure.
+///
+/// [`ErrorKind`] is intentionally detailed enough for reliability policy. This
+/// coarser classification is safe to render directly in a client without
+/// exposing an upstream response body or credential-bearing diagnostic.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FailureClass {
+    /// The credential is absent, expired, or rejected.
+    Authentication,
+    /// The provider asked the caller to reduce request rate.
+    RateLimited,
+    /// The account has exhausted a billing or usage quota.
+    Quota,
+    /// The provider cannot currently serve the request.
+    Unavailable,
+    /// The provider returned bytes that violate its protocol.
+    InvalidResponse,
+    /// The caller must change the request before trying again.
+    InvalidRequest,
+    /// The caller or host stopped the operation.
+    Cancelled,
+    /// The selected provider does not implement the operation.
+    Unsupported,
+}
+
+impl FailureClass {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 8] = [
+        Self::Authentication,
+        Self::RateLimited,
+        Self::Quota,
+        Self::Unavailable,
+        Self::InvalidResponse,
+        Self::InvalidRequest,
+        Self::Cancelled,
+        Self::Unsupported,
+    ];
+
+    /// Returns the stable wire-safe identifier of this classification.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::RateLimited => "rate_limited",
+            Self::Quota => "quota",
+            Self::Unavailable => "unavailable",
+            Self::InvalidResponse => "invalid_response",
+            Self::InvalidRequest => "invalid_request",
+            Self::Cancelled => "cancelled",
+            Self::Unsupported => "unsupported",
+        }
+    }
+
+    /// Returns a secret-free message suitable for an end user.
+    #[must_use]
+    pub const fn user_message(self) -> &'static str {
+        match self {
+            Self::Authentication => {
+                "Provider authentication failed. Sign in again or update the credential."
+            }
+            Self::RateLimited => {
+                "The provider is rate limiting requests. Retry after the indicated delay."
+            }
+            Self::Quota => {
+                "The provider account has no remaining quota. Check its plan or billing."
+            }
+            Self::Unavailable => "The provider is temporarily unavailable. Try again shortly.",
+            Self::InvalidResponse => {
+                "The provider returned an invalid response. Try another model or provider."
+            }
+            Self::InvalidRequest => {
+                "The provider rejected this request. Check the model and request options."
+            }
+            Self::Cancelled => "The provider request was cancelled.",
+            Self::Unsupported => "The selected provider does not support this operation.",
+        }
+    }
+}
+
+impl Display for FailureClass {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 impl ErrorKind {
@@ -98,6 +232,23 @@ impl ErrorKind {
             Self::Transport | Self::Server | Self::Timeout | Self::Protocol
         )
     }
+
+    /// Returns the stable classification a user interface should present.
+    #[must_use]
+    pub const fn failure_class(self) -> FailureClass {
+        match self {
+            Self::Authentication => FailureClass::Authentication,
+            Self::RateLimit => FailureClass::RateLimited,
+            Self::Quota => FailureClass::Quota,
+            Self::Transport | Self::Server | Self::Timeout | Self::CircuitOpen => {
+                FailureClass::Unavailable
+            }
+            Self::Protocol => FailureClass::InvalidResponse,
+            Self::InvalidRequest => FailureClass::InvalidRequest,
+            Self::Cancelled => FailureClass::Cancelled,
+            Self::Unsupported => FailureClass::Unsupported,
+        }
+    }
 }
 
 impl Display for ErrorKind {
@@ -109,6 +260,10 @@ impl Display for ErrorKind {
 /// Provider operation that produced a failure.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Operation {
+    /// Provider construction, credential warm-up, and initial readiness probe.
+    Startup,
+    /// Lightweight provider reachability and credential probe.
+    Ping,
     /// Non-streaming chat completion.
     Complete,
     /// Streaming chat completion.
@@ -128,6 +283,8 @@ impl Operation {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Startup => "startup",
+            Self::Ping => "ping",
             Self::Complete => "complete",
             Self::StreamCompletion => "stream_completion",
             Self::Embed => "embed",
@@ -247,6 +404,18 @@ impl ProviderError {
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         self.kind.is_retryable()
+    }
+
+    /// Returns the stable classification a user interface should present.
+    #[must_use]
+    pub const fn failure_class(&self) -> FailureClass {
+        self.kind.failure_class()
+    }
+
+    /// Returns a secret-free message suitable for an end user.
+    #[must_use]
+    pub const fn user_message(&self) -> &'static str {
+        self.failure_class().user_message()
     }
 
     /// Classifies an HTTP status code into the error taxonomy.
@@ -379,7 +548,7 @@ fn parse_imf_fixdate(value: &str) -> Option<u64> {
     if day == 0 || day > 31 || hour > 23 || minute > 59 || second > 60 || year < 1970 {
         return None;
     }
-    let days = days_from_civil(i64::from(year), month, i64::from(day))?;
+    let days = days_from_civil(i64::from(year), month, i64::from(day));
     let seconds = days
         .checked_mul(86_400)?
         .checked_add(i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))?;
@@ -395,15 +564,17 @@ fn parse_fixed_number(value: &str) -> Option<u32> {
 
 /// Days since 1970-01-01 for a proleptic Gregorian civil date.
 ///
-/// This is Howard Hinnant's `days_from_civil` algorithm.
-fn days_from_civil(year: i64, month: u32, day: i64) -> Option<i64> {
+/// This is Howard Hinnant's `days_from_civil` algorithm. The caller has already
+/// bounded `year`, `month` and `day` to a calendar range, so every intermediate
+/// fits in `i64` without checking.
+fn days_from_civil(year: i64, month: u32, day: i64) -> i64 {
     let month = i64::from(month);
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
     let year_of_era = year - era * 400;
     let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    Some(era * 146_097 + day_of_era - 719_468)
+    era * 146_097 + day_of_era - 719_468
 }
 
 #[cfg(test)]
@@ -462,6 +633,59 @@ mod tests {
     }
 
     #[test]
+    fn user_facing_classification_is_exhaustive_stable_and_secret_free() {
+        let classes = ErrorKind::ALL
+            .into_iter()
+            .map(ErrorKind::failure_class)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            classes,
+            vec![
+                FailureClass::Authentication,
+                FailureClass::RateLimited,
+                FailureClass::Quota,
+                FailureClass::Unavailable,
+                FailureClass::InvalidResponse,
+                FailureClass::Unavailable,
+                FailureClass::InvalidRequest,
+                FailureClass::Cancelled,
+                FailureClass::Unavailable,
+                FailureClass::Unavailable,
+                FailureClass::Unsupported,
+            ]
+        );
+
+        let mut identifiers = Vec::new();
+        for class in FailureClass::ALL {
+            assert!(!class.user_message().is_empty());
+            assert!(
+                class
+                    .as_str()
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            );
+            assert!(!identifiers.contains(&class.as_str()));
+            identifiers.push(class.as_str());
+        }
+
+        let error = ProviderError::new(
+            ErrorKind::Authentication,
+            "github-copilot",
+            Operation::Startup,
+            "rejected secret-token-value",
+        );
+        assert_eq!(error.failure_class(), FailureClass::Authentication);
+        assert!(!error.user_message().contains("secret-token-value"));
+    }
+
+    #[test]
+    fn lifecycle_operation_identifiers_are_distinct() {
+        assert_eq!(Operation::Startup.as_str(), "startup");
+        assert_eq!(Operation::Ping.as_str(), "ping");
+        assert_ne!(Operation::Startup, Operation::Ping);
+    }
+
+    #[test]
     fn error_kind_identifiers_are_unique_and_snake_case() {
         let mut seen = Vec::new();
         for kind in ErrorKind::ALL {
@@ -503,10 +727,7 @@ mod tests {
     #[test]
     fn retry_after_accepts_delay_seconds() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        assert_eq!(
-            parse_retry_after("120", now),
-            Some(Duration::from_secs(120))
-        );
+        assert_eq!(parse_retry_after("120", now), Some(Duration::from_mins(2)));
         assert_eq!(parse_retry_after("  0 ", now), Some(Duration::ZERO));
         assert_eq!(parse_retry_after("-5", now), None);
         assert_eq!(parse_retry_after("", now), None);

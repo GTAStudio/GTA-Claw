@@ -7,13 +7,17 @@
 //! `hyper` is driven directly rather than through `reqwest` because every
 //! rustls feature `reqwest` 0.13 exposes hard-depends on
 //! `rustls-platform-verifier`, which pulls a CDLA-Permissive-2.0 crate and a
-//! second `windows-sys` major line into the graph. See [`tls`] for the detail.
+//! second `windows-sys` major line into the graph. See the private `tls`
+//! module for the detail.
 
+pub mod proxy;
 mod tls;
 
 use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
+use std::sync::{Arc, Once};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -25,11 +29,25 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use url::Url;
 
+pub use self::proxy::{
+    DirectReason, NoProxy, ProxyDecision, ProxyDiagnostic, ProxyRules, ProxyScheme, ProxySource,
+    ProxyUrl, ProxyUrlError,
+};
 use self::tls::{TlsConnectorService, TlsSetupError};
 use crate::cancel::CancelToken;
 use crate::error::{ErrorKind, Operation, ProviderError, parse_retry_after};
 use crate::origin::{BoundApiKey, BoundSecret, OriginError};
 use crate::secret::{REDACTED, SecretString, is_sensitive_header};
+
+/// The largest response body [`HttpTransport::send`] will hold in memory.
+///
+/// Provider error documents and completion responses are kilobytes; 64 MiB is
+/// far above any legitimate payload and far below what would exhaust a host.
+/// A body that crosses it fails with [`ErrorKind::Protocol`] rather than
+/// growing the buffer, so a hostile or broken upstream cannot turn a single
+/// request into unbounded memory. Streaming responses are unaffected: they are
+/// delivered chunk by chunk and never accumulate here.
+pub const MAX_BUFFERED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// HTTP methods used by provider APIs.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -98,7 +116,7 @@ impl Body {
 
     /// Returns the body bytes.
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
+    pub const fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Empty => &[],
             Self::Json(text) | Self::Form(text) => text.as_bytes(),
@@ -111,7 +129,7 @@ impl Body {
 /// No header value is ever rendered. An earlier version redacted only a fixed
 /// list of well-known credential header names, which leaked the key of any
 /// provider that authenticates through a header outside that list — and
-/// [`AuthStyle`](crate::model::AuthStyle) lets a provider name any header it
+/// `claw-providers`' `AuthStyle` lets a provider name any header it
 /// likes. Header *names* are still shown because they are what makes a request
 /// log useful, and they are not secret.
 #[derive(Clone)]
@@ -121,6 +139,7 @@ pub struct HttpRequest {
     headers: Vec<Header>,
     body: Body,
     timeout: Option<Duration>,
+    stream_idle_timeout: Option<Duration>,
 }
 
 /// A header and whether its value is credential material.
@@ -145,6 +164,7 @@ impl Debug for HttpRequest {
             .field("headers", &headers)
             .field("body_bytes", &self.body.as_bytes().len())
             .field("timeout", &self.timeout)
+            .field("stream_idle_timeout", &self.stream_idle_timeout)
             .finish()
     }
 }
@@ -152,13 +172,14 @@ impl Debug for HttpRequest {
 impl HttpRequest {
     /// Starts a request.
     #[must_use]
-    pub fn new(method: Method, url: Url) -> Self {
+    pub const fn new(method: Method, url: Url) -> Self {
         Self {
             method,
             url,
             headers: Vec::new(),
             body: Body::Empty,
             timeout: None,
+            stream_idle_timeout: None,
         }
     }
 
@@ -278,6 +299,13 @@ impl HttpRequest {
         self
     }
 
+    /// Sets how long a streaming response may remain silent between body chunks.
+    #[must_use]
+    pub const fn stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_idle_timeout = Some(timeout);
+        self
+    }
+
     /// Returns the method.
     #[must_use]
     pub const fn method_of(&self) -> Method {
@@ -358,7 +386,7 @@ impl Debug for HttpResponse {
 impl HttpResponse {
     /// Builds a response.
     #[must_use]
-    pub fn new(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> Self {
+    pub const fn new(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> Self {
         Self {
             status,
             headers,
@@ -407,6 +435,8 @@ pub struct HttpStream {
     chunks: Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> + Send>>,
 }
 
+/// The `chunks` stream is omitted: it is an opaque boxed future chain with no
+/// useful representation, and polling it to describe it would consume the body.
 impl Debug for HttpStream {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         let names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
@@ -414,7 +444,7 @@ impl Debug for HttpStream {
             .debug_struct("HttpStream")
             .field("status", &self.status)
             .field("header_names", &names)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -463,13 +493,18 @@ pub enum TlsPolicy {
 
 /// Where the transport should look for an HTTP proxy.
 ///
-/// Only `https` destinations are proxied, and only through a `CONNECT` tunnel,
-/// so a proxy never sees request headers. Loopback is never proxied regardless
-/// of policy.
+/// This is the configuration; [`ProxyRules`] is what it resolves to. Only
+/// `https` destinations are proxied, and only through a `CONNECT` tunnel, so a
+/// proxy never sees request headers. Loopback is never proxied regardless of
+/// policy.
 #[derive(Clone, Default, Eq, PartialEq)]
 pub enum ProxyPolicy {
-    /// Read `ALL_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` from the
-    /// environment, matching the conventions `curl` uses.
+    /// Read the proxy from the environment.
+    ///
+    /// [`proxy::PROXY_VARIABLES`] is consulted in the order the legacy Node
+    /// client used — `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`,
+    /// `ALL_PROXY`, `all_proxy` — and `NO_PROXY`/`no_proxy` supplies the bypass
+    /// list.
     #[default]
     FromEnvironment,
     /// Never use a proxy, whatever the environment says.
@@ -481,6 +516,23 @@ pub enum ProxyPolicy {
         /// Comma-separated hosts that must bypass the proxy.
         no_proxy: Option<String>,
     },
+}
+
+impl ProxyPolicy {
+    /// Resolves the policy into the rules a transport applies per connection.
+    ///
+    /// Resolution never fails. A proxy URL that cannot be parsed leaves rules
+    /// that connect directly and carry a [`ProxyDiagnostic`] saying so, which
+    /// is the legacy continue-without-proxy behavior with the URL kept out of
+    /// the message.
+    #[must_use]
+    pub fn rules(&self) -> ProxyRules {
+        match self {
+            Self::FromEnvironment => ProxyRules::from_environment(),
+            Self::Disabled => ProxyRules::disabled(),
+            Self::Explicit { url, no_proxy } => ProxyRules::explicit(url, no_proxy.as_deref()),
+        }
+    }
 }
 
 impl Debug for ProxyPolicy {
@@ -509,6 +561,8 @@ pub struct TransportConfig {
     pub user_agent: String,
     /// Deadline for a complete non-streaming exchange.
     pub request_timeout: Duration,
+    /// Maximum silence allowed between chunks of a streaming response.
+    pub stream_idle_timeout: Duration,
     /// Deadline for establishing a connection.
     pub connect_timeout: Duration,
     /// Idle pool timeout for keep-alive connections.
@@ -523,9 +577,10 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             user_agent: concat!("gta-claw/", env!("CARGO_PKG_VERSION")).to_owned(),
-            request_timeout: Duration::from_secs(120),
+            request_timeout: Duration::from_mins(2),
+            stream_idle_timeout: Duration::from_mins(2),
             connect_timeout: Duration::from_secs(15),
-            pool_idle_timeout: Duration::from_secs(60),
+            pool_idle_timeout: Duration::from_mins(1),
             tls_policy: TlsPolicy::RequireHttps,
             proxy_policy: ProxyPolicy::FromEnvironment,
         }
@@ -538,19 +593,25 @@ pub struct HttpTransport {
     client: HyperClient<TlsConnectorService, Full<Bytes>>,
     tls_policy: TlsPolicy,
     proxy_policy: ProxyPolicy,
+    proxy_rules: Arc<ProxyRules>,
     user_agent: String,
     request_timeout: Duration,
+    stream_idle_timeout: Duration,
 }
 
+/// The hyper `client` is omitted: it holds the connection pool and its own
+/// `Debug` would leak pool internals into provider logs.
 impl Debug for HttpTransport {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HttpTransport")
             .field("tls_policy", &self.tls_policy)
             .field("proxy_policy", &self.proxy_policy)
+            .field("proxy_rules", &self.proxy_rules)
             .field("user_agent", &self.user_agent)
             .field("request_timeout", &self.request_timeout)
-            .finish()
+            .field("stream_idle_timeout", &self.stream_idle_timeout)
+            .finish_non_exhaustive()
     }
 }
 
@@ -573,7 +634,16 @@ impl HttpTransport {
     /// usable root certificate, or when the RING provider rejects the
     /// requested TLS versions.
     pub fn with_config(config: &TransportConfig) -> Result<Self, ProviderError> {
-        let connector = TlsConnectorService::new(config.connect_timeout, &config.proxy_policy)
+        // A proxy the operator configured and is not getting is a
+        // security-relevant surprise, so it is reported rather than left to be
+        // inferred from traffic. The flag is process-wide because the legacy
+        // client announced this once at startup, not once per client.
+        static PROXY_ANNOUNCED: Once = Once::new();
+
+        let proxy_rules = Arc::new(config.proxy_policy.rules());
+        proxy_rules.announce(&PROXY_ANNOUNCED, &mut io::stderr().lock());
+
+        let connector = TlsConnectorService::new(config.connect_timeout, Arc::clone(&proxy_rules))
             .map_err(|error| {
                 let detail = match error {
                     TlsSetupError::NoRoots => {
@@ -592,8 +662,10 @@ impl HttpTransport {
             client,
             tls_policy: config.tls_policy,
             proxy_policy: config.proxy_policy.clone(),
+            proxy_rules,
             user_agent: config.user_agent.clone(),
             request_timeout: config.request_timeout,
+            stream_idle_timeout: config.stream_idle_timeout,
         })
     }
 
@@ -609,10 +681,26 @@ impl HttpTransport {
         &self.proxy_policy
     }
 
+    /// Returns the resolved proxy rules.
+    ///
+    /// This is how a caller sees what the policy actually became:
+    /// [`ProxyRules::proxy`] is the proxy in force, [`ProxyRules::diagnostics`]
+    /// lists what could not be used, and [`ProxyRules::fell_back_to_direct`]
+    /// reports the case where a proxy was configured and traffic is going
+    /// direct anyway.
+    #[must_use]
+    pub fn proxy_rules(&self) -> &ProxyRules {
+        &self.proxy_rules
+    }
+
     /// Sends a request and buffers the whole response.
     ///
     /// Cancelling `cancel` drops the in-flight request, which closes the
     /// connection.
+    ///
+    /// The buffered body is capped at [`MAX_BUFFERED_RESPONSE_BYTES`]; the
+    /// deadline bounds how long a response may take, but only this bounds how
+    /// much memory a hostile or broken upstream can make the client hold.
     ///
     /// # Errors
     ///
@@ -638,11 +726,10 @@ impl HttpTransport {
             deadline,
             cancel,
             "the request was cancelled while the body was being read",
-            response.into_body().collect(),
+            collect_bounded(provider, operation, response.into_body()),
         )
-        .await?
-        .map_err(|error| classify_hyper(provider, operation, &error))?;
-        Ok(HttpResponse::new(status, headers, body.to_bytes().to_vec()))
+        .await??;
+        Ok(HttpResponse::new(status, headers, body))
     }
 
     /// Sends a request and returns the response body as a chunk stream.
@@ -657,21 +744,25 @@ impl HttpTransport {
         request: HttpRequest,
         cancel: &CancelToken,
     ) -> Result<HttpStream, ProviderError> {
-        // A streamed response has no overall deadline: the point of streaming
-        // is that the body arrives over an open-ended window. The headers still
-        // must arrive within one.
+        // A streamed response has no total deadline, but both its handshake and
+        // every silent interval are bounded so a dead upstream cannot retain a
+        // connection forever.
         let deadline = request.timeout.unwrap_or(self.request_timeout);
+        let idle_timeout = request
+            .stream_idle_timeout
+            .unwrap_or(self.stream_idle_timeout);
         let response = self
             .dispatch(provider, operation, &request, deadline, cancel)
             .await?;
         let status = response.status().as_u16();
         let headers = collect_headers(response.headers());
-        let chunks = CancellableChunks {
-            inner: response.into_body(),
-            cancel: cancel.clone(),
-            provider: provider.to_owned(),
+        let chunks = CancellableChunks::new(
+            response.into_body(),
+            cancel,
+            provider,
             operation,
-        };
+            idle_timeout,
+        );
         Ok(HttpStream {
             status,
             headers,
@@ -764,6 +855,45 @@ impl HttpTransport {
     }
 }
 
+/// Reads a body into memory, refusing to hold more than
+/// [`MAX_BUFFERED_RESPONSE_BYTES`].
+///
+/// `Body::collect` grows without a ceiling, so a hostile or broken upstream
+/// could stream until the process ran out of memory; the request deadline
+/// bounds time, not bytes.
+async fn collect_bounded(
+    provider: &str,
+    operation: Operation,
+    mut body: Incoming,
+) -> Result<Vec<u8>, ProviderError> {
+    // `size_hint` is upstream-supplied, so it only sizes the first allocation.
+    let hinted = usize::try_from(body.size_hint().lower()).unwrap_or(0);
+    let mut buffer = Vec::with_capacity(hinted.min(MAX_BUFFERED_RESPONSE_BYTES));
+    while let Some(frame) = body
+        .frame()
+        .await
+        .transpose()
+        .map_err(|error| classify_hyper(provider, operation, &error))?
+    {
+        // Trailers carry no body bytes.
+        let Ok(chunk) = frame.into_data() else {
+            continue;
+        };
+        if buffer.len() + chunk.len() > MAX_BUFFERED_RESPONSE_BYTES {
+            return Err(ProviderError::new(
+                ErrorKind::Protocol,
+                provider,
+                operation,
+                format!(
+                    "the response body exceeded the {MAX_BUFFERED_RESPONSE_BYTES} byte buffer limit"
+                ),
+            ));
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer)
+}
+
 /// Races a future against the cancel token and a deadline.
 ///
 /// Cancellation wins over the deadline, and both win over the future, so a
@@ -798,11 +928,46 @@ where
     }
 }
 
+/// The body half of [`HttpStream`], wired so that cancellation is observed even
+/// while a poll is parked.
+///
+/// `poll_frame` on a silent upstream parks the task with only the connection's
+/// waker registered. Polling `cancelled` on every wakeup registers this task
+/// with the token as well, so [`CancelToken::cancel`] from another task wakes
+/// this one instead of leaving it parked until the TCP layer notices.
+///
+/// The stream is fused: it yields the cancellation error at most once and then
+/// ends, so a caller that keeps polling after an error terminates instead of
+/// spinning on an endless tail of identical errors.
 struct CancellableChunks {
     inner: Incoming,
-    cancel: CancelToken,
+    cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
+    idle: Pin<Box<tokio::time::Sleep>>,
+    idle_timeout: Duration,
     provider: String,
     operation: Operation,
+    done: bool,
+}
+
+impl CancellableChunks {
+    fn new(
+        inner: Incoming,
+        cancel: &CancelToken,
+        provider: &str,
+        operation: Operation,
+        idle_timeout: Duration,
+    ) -> Self {
+        let token = cancel.clone();
+        Self {
+            inner,
+            cancelled: Box::pin(async move { token.cancelled().await }),
+            idle: Box::pin(tokio::time::sleep(idle_timeout)),
+            idle_timeout,
+            provider: provider.to_owned(),
+            operation,
+            done: false,
+        }
+    }
 }
 
 impl Stream for CancellableChunks {
@@ -813,7 +978,11 @@ impl Stream for CancellableChunks {
         context: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if this.cancel.is_cancelled() {
+        if this.done {
+            return Poll::Ready(None);
+        }
+        if this.cancelled.as_mut().poll(context).is_ready() {
+            this.done = true;
             return Poll::Ready(Some(Err(ProviderError::new(
                 ErrorKind::Cancelled,
                 &this.provider,
@@ -821,17 +990,37 @@ impl Stream for CancellableChunks {
                 "the response body was cancelled",
             ))));
         }
+        if this.idle.as_mut().poll(context).is_ready() {
+            this.done = true;
+            return Poll::Ready(Some(Err(ProviderError::new(
+                ErrorKind::Timeout,
+                &this.provider,
+                this.operation,
+                "the streaming response exceeded its idle deadline",
+            ))));
+        }
         loop {
             return match Pin::new(&mut this.inner).poll_frame(context) {
                 Poll::Pending => Poll::Pending,
-                Poll::Ready(None) => Poll::Ready(None),
-                Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(classify_hyper(
-                    &this.provider,
-                    this.operation,
-                    &error,
-                )))),
+                Poll::Ready(None) => {
+                    this.done = true;
+                    Poll::Ready(None)
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    this.done = true;
+                    Poll::Ready(Some(Err(classify_hyper(
+                        &this.provider,
+                        this.operation,
+                        &error,
+                    ))))
+                }
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                    Ok(chunk) => Poll::Ready(Some(Ok(chunk))),
+                    Ok(chunk) => {
+                        this.idle
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + this.idle_timeout);
+                        Poll::Ready(Some(Ok(chunk)))
+                    }
                     // Trailers carry no body bytes, so keep polling rather than
                     // ending the stream early on a trailing metadata frame.
                     Err(_) => continue,
@@ -849,7 +1038,7 @@ pub fn is_loopback(url: &Url) -> bool {
     match url.host() {
         Some(url::Host::Ipv4(address)) => address.is_loopback(),
         Some(url::Host::Ipv6(address)) => address.is_loopback(),
-        Some(url::Host::Domain(domain)) => tls::is_loopback_host(domain),
+        Some(url::Host::Domain(domain)) => proxy::is_loopback_host(domain),
         None => false,
     }
 }
@@ -949,7 +1138,10 @@ pub fn error_from_response(
     now: std::time::SystemTime,
 ) -> ProviderError {
     let kind = ProviderError::kind_for_status(response.status());
-    let detail = extract_message(&response.text());
+    // `text` allocates a lossy copy of the whole body, so decode once and let
+    // both extractors read the same buffer.
+    let text = response.text();
+    let detail = extract_message(&text);
     let mut error =
         ProviderError::new(kind, provider, operation, detail).with_status(response.status());
     if let Some(retry_after) = response.header("retry-after")
@@ -957,7 +1149,7 @@ pub fn error_from_response(
     {
         error = error.with_retry_after(delay);
     }
-    if let Some(code) = extract_code(&response.text()) {
+    if let Some(code) = extract_code(&text) {
         error = error.with_upstream_code(code);
     }
     error
@@ -1289,9 +1481,10 @@ mod tests {
     fn transport_config_defaults_are_conservative() {
         let config = TransportConfig::default();
         assert_eq!(config.tls_policy, TlsPolicy::RequireHttps);
-        assert_eq!(config.request_timeout, Duration::from_secs(120));
+        assert_eq!(config.request_timeout, Duration::from_mins(2));
+        assert_eq!(config.stream_idle_timeout, Duration::from_mins(2));
         assert_eq!(config.connect_timeout, Duration::from_secs(15));
-        assert_eq!(config.pool_idle_timeout, Duration::from_secs(60));
+        assert_eq!(config.pool_idle_timeout, Duration::from_mins(1));
         assert!(config.user_agent.starts_with("gta-claw/"));
     }
 }

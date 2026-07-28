@@ -49,7 +49,7 @@ impl Default for AdminRpcLimits {
         Self {
             body_bytes: 1024 * 1024,
             body_timeout: Duration::from_secs(30),
-            dispatch_timeout: Duration::from_secs(120),
+            dispatch_timeout: Duration::from_mins(2),
         }
     }
 }
@@ -141,18 +141,15 @@ impl AdminRpcService {
 
     /// Handles one request end to end, independently of any router.
     pub async fn handle(&self, request: Request) -> Response {
-        let caller = match self.inner.authenticator.authenticate(request.headers()) {
-            Ok(caller) => caller,
-            Err(_) => {
-                let rejection = AdminRpcError::Unauthenticated.to_response("");
-                return rejected_response(
-                    request,
-                    self.inner.limits.body_bytes,
-                    self.inner.limits.body_timeout,
-                    rejection,
-                )
-                .await;
-            }
+        let Ok(caller) = self.inner.authenticator.authenticate(request.headers()) else {
+            let rejection = AdminRpcError::Unauthenticated.to_response("");
+            return rejected_response(
+                request,
+                self.inner.limits.body_bytes,
+                self.inner.limits.body_timeout,
+                rejection,
+            )
+            .await;
         };
         let value = match read_json_value(
             request,
@@ -214,7 +211,7 @@ impl AdminRpcService {
         if method == COMMANDS_LIST_METHOD {
             return admin_rpc_response(
                 StatusCode::OK,
-                json!({"id":id,"ok":true,"payload":{"methods":self.inner.policy.methods()}}),
+                &json!({"id":id,"ok":true,"payload":{"methods":self.inner.policy.methods()}}),
             );
         }
         let params = object.get("params").cloned();
@@ -247,7 +244,7 @@ fn success_response(id: &str, success: AdminSuccess) -> Response {
     if let Some(meta) = success.meta {
         body["meta"] = meta;
     }
-    admin_rpc_response(StatusCode::OK, body)
+    admin_rpc_response(StatusCode::OK, &body)
 }
 
 fn dispatch_failure_response(id: &str, failure: AdminFailure) -> Response {

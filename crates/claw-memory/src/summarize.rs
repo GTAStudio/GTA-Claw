@@ -25,6 +25,14 @@ pub struct SummaryRequest<'a> {
 /// Produces replacement text for a run of messages.
 pub trait Summarizer {
     /// Returns summary text for the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SummaryError::NothingToSummarize`] when the request carries
+    /// no messages, [`SummaryError::EmptySummary`] when the implementation
+    /// cannot produce usable text within `max_tokens`, and
+    /// [`SummaryError::Backend`] when a host summarizer — a model call, for
+    /// instance — fails or is unavailable.
     fn summarize(&mut self, request: &SummaryRequest<'_>) -> Result<String, SummaryError>;
 }
 
@@ -48,7 +56,14 @@ impl Default for SummarizationPolicy {
 
 impl SummarizationPolicy {
     /// Creates a policy, validating the percentages.
-    pub fn new(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SummaryError::InvalidPolicy`] when `trigger_percent` or
+    /// `summary_token_share_percent` is zero or above one hundred: a zero
+    /// trigger would compact on every turn and a zero share would leave the
+    /// summarizer no room to say anything.
+    pub const fn new(
         trigger_percent: u8,
         keep_recent: usize,
         summary_token_share_percent: u8,
@@ -81,7 +96,10 @@ impl SummarizationPolicy {
     /// Returns the token budget a summary may occupy.
     #[must_use]
     pub const fn summary_tokens(self, budget: TokenBudget) -> usize {
-        budget.available() * self.summary_token_share_percent as usize / 100
+        budget
+            .available()
+            .saturating_mul(self.summary_token_share_percent as usize)
+            / 100
     }
 }
 
@@ -102,6 +120,15 @@ pub struct SummarizationPlan {
 ///
 /// Anchors are never part of a plan: system and pinned messages survive
 /// compaction verbatim.
+///
+/// # Cost
+///
+/// The trigger is "does the history already cost more than `trigger_percent`
+/// of the budget", and the running total only grows, so counting stops at the
+/// message that crosses the threshold. Past that point the walk is a predicate
+/// per message, which makes the token work proportional to the *budget* rather
+/// than to the conversation — the difference between a session that is a little
+/// over the trigger and one that has been running all day.
 #[must_use]
 pub fn plan_summarization<C: TokenCounter + ?Sized>(
     session: &Session,
@@ -109,31 +136,47 @@ pub fn plan_summarization<C: TokenCounter + ?Sized>(
     counter: &C,
     policy: SummarizationPolicy,
 ) -> Option<SummarizationPlan> {
-    let used: usize = session
-        .messages()
-        .iter()
-        .map(|message| counter.count_message(message))
-        .sum();
-    let threshold = budget.available() * policy.trigger_percent() as usize / 100;
-    if used <= threshold {
+    let threshold = budget
+        .available()
+        .saturating_mul(policy.trigger_percent() as usize)
+        / 100;
+    let mut used = 0_usize;
+    let mut over_threshold = false;
+    let mut compactable = 0_usize;
+    for message in session.messages() {
+        if !message.is_anchor() {
+            compactable += 1;
+        }
+        if !over_threshold {
+            used = used.saturating_add(counter.count_message(message));
+            over_threshold = used > threshold;
+        }
+    }
+    if !over_threshold {
         return None;
     }
-    let compactable: Vec<&Message> = session
-        .messages()
-        .iter()
-        .filter(|message| !message.is_anchor())
-        .collect();
-    if compactable.len() <= policy.keep_recent() {
+    if compactable <= policy.keep_recent() {
         return None;
     }
-    let cut = compactable.len() - policy.keep_recent();
-    let run = &compactable[..cut];
-    let first = run.first()?.id;
-    let last = run.last()?.id;
+    let cut = compactable - policy.keep_recent();
+
+    // The run is the oldest `cut` non-anchor messages, so its bounds are the
+    // first and the `cut`-th of them. Naming them directly avoids gathering a
+    // reference to every compactable message in the session just to index twice.
+    let mut ordinary = session
+        .messages()
+        .iter()
+        .filter(|message| !message.is_anchor());
+    let first = ordinary.next()?.id;
+    let last = if cut == 1 {
+        first
+    } else {
+        ordinary.nth(cut - 2)?.id
+    };
     Some(SummarizationPlan {
         first,
         last,
-        message_count: run.len(),
+        message_count: cut,
         max_tokens: policy.summary_tokens(budget).max(1),
     })
 }
@@ -142,6 +185,18 @@ pub fn plan_summarization<C: TokenCounter + ?Sized>(
 ///
 /// Returns the summary that was absorbed, or `None` when compaction was not
 /// due. On any summarizer failure the session is left untouched.
+///
+/// # Errors
+///
+/// Propagates whatever the [`Summarizer`] reports — [`SummaryError::Backend`]
+/// for a failed host summarizer, for instance — and returns
+/// [`SummaryError::EmptySummary`] when it produces only whitespace, since a
+/// blank summary would erase the run it replaces. Returns
+/// [`SummaryError::Session`] when the session refuses the result: the summary
+/// text is over [`crate::session::MAX_MESSAGE_BYTES`]
+/// ([`SessionError::MessageTooLong`]), or the session already holds
+/// [`crate::session::MAX_SUMMARIES`] summaries
+/// ([`SessionError::TooManySummaries`]) and cannot be compacted again.
 pub fn compact<C: TokenCounter + ?Sized, S: Summarizer>(
     session: &mut Session,
     budget: TokenBudget,
@@ -153,24 +208,9 @@ pub fn compact<C: TokenCounter + ?Sized, S: Summarizer>(
     let Some(plan) = plan_summarization(session, budget, counter, policy) else {
         return Ok(None);
     };
-    let run: Vec<Message> = session
-        .messages()
-        .iter()
-        .filter(|message| {
-            !message.is_anchor()
-                && message.id.get() >= plan.first.get()
-                && message.id.get() <= plan.last.get()
-        })
-        .cloned()
-        .collect();
-    if run.is_empty() {
+    let Some(text) = summarize_run(session, plan, summarizer)? else {
         return Ok(None);
-    }
-    let text = summarizer.summarize(&SummaryRequest {
-        session: session.id(),
-        messages: &run,
-        max_tokens: plan.max_tokens,
-    })?;
+    };
     if text.trim().is_empty() {
         return Err(SummaryError::EmptySummary);
     }
@@ -184,6 +224,75 @@ pub fn compact<C: TokenCounter + ?Sized, S: Summarizer>(
         .absorb(summary.clone())
         .map_err(SummaryError::Session)?;
     Ok(Some(summary))
+}
+
+/// Hands the planned run to the summarizer, or `None` when the plan covers
+/// nothing.
+///
+/// The session borrow is confined to this call so the caller can mutate the
+/// session as soon as the replacement text exists.
+fn summarize_run<S: Summarizer>(
+    session: &Session,
+    plan: SummarizationPlan,
+    summarizer: &mut S,
+) -> Result<Option<String>, SummaryError> {
+    let messages = session.messages();
+    // The ordinary run is contiguous and is borrowed straight out of the
+    // session, so compaction does not clone the history it is about to
+    // replace for a summarizer that may refuse it. Only a run split by an
+    // anchor has to be gathered into a new allocation.
+    let borrowed = contiguous_run(messages, plan);
+    let gathered: Vec<Message> = if borrowed.is_none() {
+        messages
+            .iter()
+            .filter(|message| covered(message, plan))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let run: &[Message] = borrowed.unwrap_or(&gathered);
+    if run.is_empty() {
+        return Ok(None);
+    }
+    summarizer
+        .summarize(&SummaryRequest {
+            session: session.id(),
+            messages: run,
+            max_tokens: plan.max_tokens,
+        })
+        .map(Some)
+}
+
+/// Returns the planned run as a borrowed slice when it is already contiguous.
+///
+/// It is, unless an anchor sits inside it: anchors survive compaction and so
+/// split the run. Borrowing is what keeps compaction from cloning the whole
+/// history it is about to replace, for a summarizer that may refuse it.
+fn contiguous_run(messages: &[Message], plan: SummarizationPlan) -> Option<&[Message]> {
+    let mut first: Option<usize> = None;
+    let mut last = 0_usize;
+    for (index, message) in messages.iter().enumerate() {
+        if !covered(message, plan) {
+            continue;
+        }
+        match first {
+            None => {
+                first = Some(index);
+                last = index;
+            }
+            Some(_) if last + 1 == index => last = index,
+            Some(_) => return None,
+        }
+    }
+    Some(&messages[first?..=last])
+}
+
+/// Reports whether compaction would replace this message.
+const fn covered(message: &Message, plan: SummarizationPlan) -> bool {
+    !message.is_anchor()
+        && message.id.get() >= plan.first.get()
+        && message.id.get() <= plan.last.get()
 }
 
 /// A deterministic extractive summarizer used offline and in tests.
@@ -207,7 +316,12 @@ impl Default for ExtractiveSummarizer {
 
 impl ExtractiveSummarizer {
     /// Creates a summarizer with an explicit per-message character bound.
-    pub fn new(characters_per_message: usize) -> Result<Self, SummaryError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SummaryError::InvalidPolicy`] when `characters_per_message`
+    /// is zero, which would make every extracted line empty.
+    pub const fn new(characters_per_message: usize) -> Result<Self, SummaryError> {
         if characters_per_message == 0 {
             return Err(SummaryError::InvalidPolicy);
         }
@@ -327,6 +441,23 @@ mod tests {
         }
     }
 
+    /// Records exactly which messages the run handed to the summarizer.
+    #[derive(Default)]
+    struct RecordingSummarizer {
+        seen: Vec<u64>,
+    }
+
+    impl Summarizer for RecordingSummarizer {
+        fn summarize(&mut self, request: &SummaryRequest<'_>) -> Result<String, SummaryError> {
+            self.seen = request
+                .messages
+                .iter()
+                .map(|message| message.id.get())
+                .collect();
+            Ok("compacted".to_owned())
+        }
+    }
+
     fn counter() -> HeuristicTokenCounter {
         HeuristicTokenCounter::new(4, 0).expect("valid density")
     }
@@ -424,6 +555,55 @@ mod tests {
             vec![0, 9, 10, 11, 12]
         );
         assert_eq!(session.summaries().len(), 1);
+    }
+
+    /// A pinned message inside the planned run splits it: the run is no longer
+    /// a contiguous slice of the session, and the anchor must still be
+    /// excluded from what the summarizer sees and from what compaction
+    /// removes.
+    #[test]
+    fn an_anchor_inside_the_run_splits_it_and_is_never_summarized() {
+        let policy = SummarizationPolicy::new(50, 4, 10).expect("valid policy");
+        let tight = TokenBudget::new(60, 0).expect("valid budget");
+
+        let mut contiguous = loaded_session();
+        let mut recorder = RecordingSummarizer::default();
+        compact(
+            &mut contiguous,
+            tight,
+            &counter(),
+            policy,
+            &mut recorder,
+            777,
+        )
+        .expect("compacted")
+        .expect("a summary was due");
+        assert_eq!(recorder.seen, (1..=8).collect::<Vec<u64>>());
+
+        let mut split = loaded_session();
+        assert!(split.pin(MessageId::new(5)));
+        let mut recorder = RecordingSummarizer::default();
+        let summary = compact(&mut split, tight, &counter(), policy, &mut recorder, 778)
+            .expect("compacted")
+            .expect("a summary was due");
+        assert_eq!(
+            recorder.seen,
+            vec![1, 2, 3, 4, 6, 7, 8],
+            "the pinned message is excluded from the run it interrupts"
+        );
+        assert_eq!(
+            (summary.first, summary.last),
+            (MessageId::new(1), MessageId::new(8))
+        );
+        assert_eq!(
+            split
+                .messages()
+                .iter()
+                .map(|message| message.id.get())
+                .collect::<Vec<_>>(),
+            vec![0, 5, 9, 10, 11, 12],
+            "both anchors survive compaction verbatim"
+        );
     }
 
     #[test]

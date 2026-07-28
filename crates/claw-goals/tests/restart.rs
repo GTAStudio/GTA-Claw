@@ -287,3 +287,79 @@ fn a_model_tool_goal_and_an_operator_goal_share_one_durable_history_across_a_res
         ]
     );
 }
+
+/// Returns the single goal record file under `root`.
+#[cfg(unix)]
+fn only_goal_file(root: &std::path::Path) -> std::path::PathBuf {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("goals"))
+        .expect("the goals directory exists")
+        .map(|entry| entry.expect("readable").path())
+        .filter(|path| path.extension().is_some_and(|value| value == "json"))
+        .collect();
+    assert_eq!(files.len(), 1, "the test writes exactly one goal");
+    files.pop().expect("one goal file exists")
+}
+
+#[cfg(unix)]
+#[test]
+fn every_publication_is_a_rename_into_a_directory_that_was_then_synchronized() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = TempRoot::new("restart-fsync");
+    let session = session_id("fsync");
+    let durable = open_durable(root.path(), 1_000);
+
+    let goal = block_on(durable.service.start(&session, "the published objective")).expect("set");
+    // Setting a goal publishes the record and, because the goal is new to the session, the index.
+    assert_eq!(durable.store.synced_publications(), 2);
+    assert_eq!(durable.store.unsynced_publications(), 0);
+
+    let record_path = only_goal_file(root.path());
+    let published = std::fs::read(&record_path).expect("read the record");
+    let published_inode = std::fs::metadata(&record_path).expect("metadata").ino();
+
+    // A second name for the same inode. An in-place rewrite would change what this link sees; a
+    // temporary-file-then-rename can only ever leave it holding the exact previous bytes.
+    let witness = root.path().join("witness.json");
+    std::fs::hard_link(&record_path, &witness).expect("hard link the published record");
+
+    block_on(durable.service.record_progress(&goal.goal_id, "a step")).expect("progress");
+
+    assert_eq!(
+        std::fs::read(&witness).expect("read witness"),
+        published,
+        "the previous record bytes must survive intact, so the write was never in place"
+    );
+    assert_ne!(
+        std::fs::metadata(&record_path).expect("metadata").ino(),
+        published_inode,
+        "a published record must be a renamed replacement, not a rewritten original"
+    );
+    assert_eq!(
+        durable.store.synced_publications(),
+        3,
+        "the directory entry of every published file must be flushed, or the rename can be lost"
+    );
+    assert_eq!(
+        durable.store.unsynced_publications(),
+        0,
+        "a healthy store must report no unresolved durability caveat"
+    );
+
+    // The directory sync is a durability step, not a visibility one: the goal still reads back
+    // from a freshly opened store.
+    let reopened = open_durable(root.path(), 100_000);
+    assert_eq!(
+        block_on(reopened.service.active(&session))
+            .expect("the store answers")
+            .expect("the goal survived")
+            .progress
+            .len(),
+        1
+    );
+    assert_eq!(
+        reopened.store.synced_publications(),
+        0,
+        "a store that has published nothing has synchronized nothing"
+    );
+}

@@ -59,6 +59,8 @@ pub struct HttpLimits {
     pub watch_idle_timeout: Duration,
     /// Maximum watch queue events.
     pub watch_queue_events: usize,
+    /// Maximum simultaneously retained watch sessions.
+    pub watch_sessions: usize,
     /// Maximum watch queue bytes.
     pub watch_queue_bytes: usize,
     /// Maximum individual watch event bytes.
@@ -76,14 +78,29 @@ impl Default for HttpLimits {
             mcp_body_bytes: 1024 * 1024,
             webhook_body_bytes: 256 * 1024,
             body_timeout: Duration::from_secs(30),
-            operation_timeout: Duration::from_secs(120),
+            operation_timeout: Duration::from_mins(2),
             stream_buffer: 16,
             heartbeat_interval: Duration::from_secs(15),
             watch_poll_timeout: Duration::from_secs(20),
             watch_idle_timeout: Duration::from_secs(75),
             watch_queue_events: 32,
+            watch_sessions: 1_024,
             watch_queue_bytes: 512 * 1024,
             watch_event_bytes: 64 * 1024,
+        }
+    }
+}
+
+impl HttpLimits {
+    pub(crate) fn body_limit_for_path(&self, path: &str) -> usize {
+        match path {
+            "/v1/embeddings" => self.embeddings_body_bytes,
+            "/tools/invoke" => self.tools_body_bytes,
+            "/api/v1/admin/rpc" => self.admin_body_bytes,
+            "/mcp" => self.mcp_body_bytes,
+            _ if path.starts_with("/api/nodes/watch/") => self.watch_body_bytes,
+            _ if path.starts_with("/plugins/webhooks/") => self.webhook_body_bytes,
+            _ => self.openai_body_bytes,
         }
     }
 }
@@ -91,7 +108,7 @@ impl Default for HttpLimits {
 /// Complete HTTP adapter configuration.
 #[derive(Clone, Debug)]
 pub struct ApiConfig {
-    /// Bearer credentials for OpenAI, tools, models, and admin surfaces.
+    /// Bearer credentials for `OpenAI`, tools, models, and admin surfaces.
     pub authenticator: BearerAuthenticator,
     /// MCP owner bearer token authenticator.
     pub mcp_owner_authenticator: BearerAuthenticator,

@@ -10,6 +10,12 @@ const BASE64_ALPHABET: &[u8; 64] =
 
 /// Computes the SHA-1 digest of `input`.
 #[must_use]
+#[expect(
+    clippy::many_single_char_names,
+    reason = "a..e are the working variable names RFC 3174 section 6.1 gives the SHA-1 \
+              compression function; renaming them would break a line-by-line audit \
+              against the published algorithm"
+)]
 pub fn sha1(input: &[u8]) -> [u8; 20] {
     let mut state: [u32; 5] = [
         0x6745_2301,
@@ -136,10 +142,15 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
     let mut accumulator = 0u32;
     let mut bits = 0u32;
     for character in trimmed.bytes() {
+        // `position` over a 64-entry table can only yield 0..=63, so the
+        // conversion never actually rejects; keeping it fallible means an
+        // unexpected alphabet size fails the decode closed rather than
+        // truncating a sextet.
         let value = BASE64_ALPHABET
             .iter()
-            .position(|&entry| entry == character)?;
-        accumulator = (accumulator << 6) | value as u32;
+            .position(|&entry| entry == character)
+            .and_then(|index| u32::try_from(index).ok())?;
+        accumulator = (accumulator << 6) | value;
         bits += 6;
         if bits >= 8 {
             bits -= 8;

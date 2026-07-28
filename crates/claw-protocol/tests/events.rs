@@ -77,7 +77,7 @@ fn borrow(names: &[String]) -> Vec<&str> {
     names.iter().map(String::as_str).collect()
 }
 
-fn state_version() -> StateVersion {
+const fn state_version() -> StateVersion {
     StateVersion {
         presence: NonNegativeInteger::new(3),
         health: NonNegativeInteger::new(5),
@@ -264,7 +264,7 @@ fn event_catalog_drift_is_detected_for_every_mutated_pinned_row() {
         Err(EventCatalogDrift::DuplicateName { name }) if name == names[0]
     ));
 
-    let mut reordered = names.clone();
+    let mut reordered = names;
     reordered.swap(0, 1);
     assert!(matches!(
         verify_pinned_events(borrow(&reordered)),

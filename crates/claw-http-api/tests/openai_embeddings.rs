@@ -151,7 +151,7 @@ async fn embedding_usage_is_pinned_as_a_known_constant_zero() {
     }
 }
 
-/// Provider policy is pinned: only OpenClaw routing identifiers are accepted.
+/// Provider policy is pinned: only `OpenClaw` routing identifiers are accepted.
 #[tokio::test]
 async fn embedding_provider_policy_accepts_only_openclaw_identifiers() {
     let server = spawn(script(json!({
@@ -252,6 +252,103 @@ async fn embedding_input_limits_are_enforced_before_the_provider() {
         .await;
     assert_eq!(response.status, 200);
     assert_eq!(server.runtime.embedding_request().input.len(), 128);
+}
+
+/// `dimensions` is bounded before it reaches the provider.
+///
+/// An unbounded width is not a wire-contract question but a liveness one: the
+/// provider allocates `dimensions` floats per input, so a single request asking
+/// for more than the host has takes down every other request sharing it. The
+/// bound is asserted programmatically because a fixture pinning an 8193-wide
+/// request would obscure the contract it is meant to pin.
+#[tokio::test]
+async fn embedding_dimensions_are_bounded_before_the_provider() {
+    let refused = [
+        ("one past the bound", json!(8_193)),
+        ("far past the bound", json!(1_000_000)),
+        ("larger than any allocation", json!(u64::MAX)),
+        ("a huge float", json!(1e300)),
+    ];
+
+    for (name, dimensions) in refused {
+        let server = spawn(script(json!({ "embed": { "kind": "dimensioned" } }))).await;
+        let response = server
+            .send(&RequestSpec::post(
+                "/v1/embeddings",
+                "operator-token",
+                json!({ "model": "openclaw", "input": "hi", "dimensions": dimensions }),
+            ))
+            .await;
+
+        assert_eq!(response.status, 400, "{name} was not refused");
+        let observed = observe(&response);
+        assert_eq!(
+            observed["body"]["error"]["type"], "invalid_request_error",
+            "{name} must use the same error class as every other bad parameter"
+        );
+        assert_eq!(
+            observed["body"]["error"]["message"], "Dimensions too large (max 8192).",
+            "{name}"
+        );
+        assert!(
+            server.runtime.embedding_requests().is_empty(),
+            "{name} still reached the embedding provider"
+        );
+    }
+
+    // The bound is inclusive, so the refusals above are a limit rather than a
+    // blanket rejection of wide requests.
+    let server = spawn(script(json!({ "embed": { "kind": "dimensioned" } }))).await;
+    let response = server
+        .send(&RequestSpec::post(
+            "/v1/embeddings",
+            "operator-token",
+            json!({ "model": "openclaw", "input": "hi", "dimensions": 8_192 }),
+        ))
+        .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        server.runtime.embedding_request().dimensions,
+        Some(8_192),
+        "the widest accepted width must still reach the provider"
+    );
+}
+
+/// A width below one means "provider default", however it is spelled.
+///
+/// `0` was already ignored, but `0.5` used to floor into `Some(0)` and produce a
+/// zero-width vector, so the same intent reached the provider two different ways.
+#[tokio::test]
+async fn embedding_dimensions_below_one_all_mean_the_provider_default() {
+    for dimensions in [json!(0), json!(0.5), json!(-1), json!(-0.5)] {
+        let server = spawn(script(json!({ "embed": { "kind": "dimensioned" } }))).await;
+        let response = server
+            .send(&RequestSpec::post(
+                "/v1/embeddings",
+                "operator-token",
+                json!({ "model": "openclaw", "input": "hi", "dimensions": dimensions }),
+            ))
+            .await;
+
+        assert_eq!(
+            response.status, 200,
+            "dimensions {dimensions} was not accepted"
+        );
+        assert_eq!(
+            server.runtime.embedding_request().dimensions,
+            None,
+            "dimensions {dimensions} must reach the provider as its own default"
+        );
+        let observed = observe(&response);
+        assert_eq!(
+            observed["body"]["data"][0]["embedding"]
+                .as_array()
+                .expect("vector")
+                .len(),
+            3,
+            "dimensions {dimensions} must not produce a zero-width vector"
+        );
+    }
 }
 
 /// An empty input list is accepted, which is pinned as a known difference.

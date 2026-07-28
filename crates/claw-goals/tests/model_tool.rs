@@ -5,10 +5,14 @@
 //! These tests drive that exact path, [`parse_goal_action`](claw_runtime::parse_goal_action)
 //! followed by the goal service, over the durable store, using the JSON a provider would emit.
 
+use std::sync::Arc;
+
 use claw_application::model::goal::GoalStatus;
-use claw_goals::testing::{TempRoot, block_on, open_durable, session_id};
-use claw_goals::{ToolInvocationError, invoke_goal_tool};
-use claw_runtime::{GoalError, GoalToolError};
+use claw_goals::testing::{
+    ConflictOnceStore, FixedClock, TempRoot, block_on, open_durable, session_id,
+};
+use claw_goals::{FileGoalStore, ToolInvocationError, invoke_goal_tool};
+use claw_runtime::{GoalConfig, GoalError, GoalService, GoalToolError};
 
 #[test]
 fn a_goal_the_model_set_is_recovered_after_a_restart() {
@@ -36,6 +40,29 @@ fn a_goal_the_model_set_is_recovered_after_a_restart() {
     assert_eq!(recovered.status, GoalStatus::Active);
     assert_eq!(recovered.revision, 1);
     assert!(recovered.progress.is_empty());
+}
+
+#[test]
+fn the_model_tool_retries_a_conflict_without_losing_the_action() {
+    let root = TempRoot::new("tool-conflict");
+    let session = session_id("tool-conflict");
+    let file_store = Arc::new(FileGoalStore::open(root.path()).expect("store opens"));
+    let conflicting = Arc::new(ConflictOnceStore::new(file_store.clone()));
+    let service = GoalService::new(
+        conflicting,
+        Arc::new(FixedClock::new(1_000)),
+        GoalConfig::default(),
+    );
+
+    let outcome = block_on(invoke_goal_tool(
+        &service,
+        &session,
+        "{\"action\":\"set\",\"objective\":\"keep the model action\"}",
+    ))
+    .expect("the bounded retry succeeds");
+
+    assert_eq!(outcome.record.objective, "keep the model action");
+    assert_eq!(file_store.accepted_writes(), 1);
 }
 
 #[test]

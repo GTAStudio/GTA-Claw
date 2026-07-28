@@ -91,6 +91,10 @@ pub struct MigrationPlan {
     source_digests: Vec<(PathBuf, String)>,
 }
 
+/// The plan's `Debug` output is deliberately a redacted summary: the operation
+/// list and the recorded source digests are reported as counts so that neither a
+/// migrated secret nor the full inventory of a user's profile can reach a log
+/// line through a plan.
 impl Debug for MigrationPlan {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter
@@ -100,16 +104,49 @@ impl Debug for MigrationPlan {
             .field("source_root", &self.source_root)
             .field("target_root", &self.target_root)
             .field("operation_count", &self.operations.len())
-            .finish()
+            .field("source_digest_count", &self.source_digests.len())
+            .finish_non_exhaustive()
     }
 }
 
 impl MigrationPlan {
     /// Number of planned mutations.
     #[must_use]
-    pub fn operation_count(&self) -> usize {
+    pub const fn operation_count(&self) -> usize {
         self.operations.len()
     }
+
+    /// Builds a non-frozen summary for guided dry-run output.
+    #[must_use]
+    pub fn report(&self) -> MigrationReport<'_> {
+        let mut operation_kinds = BTreeMap::new();
+        for operation in &self.operations {
+            *operation_kinds.entry(operation.kind()).or_insert(0) += 1;
+        }
+        MigrationReport {
+            provider_id: self.provider_id,
+            operation_count: self.operations.len(),
+            operation_kinds,
+            result: &self.result,
+        }
+    }
+}
+
+/// Diagnostics-oriented migration plan summary.
+///
+/// This report is additive and intentionally separate from the frozen
+/// [`MigrationResult`] serialization emitted by [`MigrationPlan`].
+#[derive(Debug, Serialize)]
+pub struct MigrationReport<'a> {
+    /// Provider that produced the plan.
+    pub provider_id: &'static str,
+    /// Total planned mutations.
+    pub operation_count: usize,
+    /// Planned mutation counts grouped by stable kind label.
+    pub operation_kinds: BTreeMap<&'static str, usize>,
+    /// Frozen migration result and its diagnostics.
+    #[serde(flatten)]
+    pub result: &'a MigrationResult,
 }
 
 /// Secret bytes whose formatters are always redacted.
@@ -169,16 +206,46 @@ impl Error for SecretStoreError {}
 /// Reversible secret persistence port used by apply and rollback.
 pub trait SecretStore {
     /// Returns an existing value so rollback can restore it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SecretStoreError`] when the platform keyring cannot be
+    /// reached or unlocked — for example a locked login keychain, a headless
+    /// session with no secret service running, or a denied access prompt. Apply
+    /// refuses to continue in that case, because without a readable prior value
+    /// rollback could not restore the credential it is about to replace.
     fn get(&mut self, id: &str) -> Result<Option<SecretValue>, SecretStoreError>;
     /// Persists a value and returns a safe reference suitable for configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SecretStoreError`] when the secret could not be written to
+    /// the platform keyring — the store is locked, unavailable, out of space, or
+    /// rejected the entry. Apply treats this as fatal and rolls back, so the
+    /// plaintext is never written to a configuration file that the keyring does
+    /// not actually back. Unlock the keyring and re-run the migration.
     fn put(&mut self, id: &str, value: SecretValue) -> Result<String, SecretStoreError>;
     /// Removes an entry that did not exist before apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SecretStoreError`] when the keyring entry could not be
+    /// deleted during rollback. Rollback reports it rather than hiding it: the
+    /// filesystem is still restored, but the migrated credential remains in the
+    /// keyring and has to be removed by hand.
     fn remove(&mut self, id: &str) -> Result<(), SecretStoreError>;
 }
 
 /// Artifact signature port.
 pub trait ArtifactSigner {
     /// Signs a lowercase artifact digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MigrationError::Signing`] when `sha256` is not 64 lowercase
+    /// hexadecimal characters, or when the signing key is unavailable or refuses
+    /// the operation. A plan is only ever emitted with a valid signature, so a
+    /// failure here aborts planning instead of producing an unsigned manifest.
     fn sign(&self, sha256: &str) -> Result<ArtifactSignature, MigrationError>;
 }
 
@@ -230,14 +297,65 @@ pub trait MigrationProvider {
     /// Stable provider identifier.
     fn id(&self) -> &'static str;
     /// Detects source state without mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MigrationError::Io`] when a candidate directory exists but
+    /// cannot be listed, typically because the profile is owned by another user
+    /// or is on an unmounted volume. A profile that is simply absent is not an
+    /// error: it is reported as [`Detection::found`] being `false`.
     fn detect(
         &self,
         paths: &dyn PlatformPaths,
         source: Option<&Path>,
     ) -> Result<Detection, MigrationError>;
     /// Produces a side-effect-free plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MigrationError::SourceNotFound`] when no state for this
+    /// provider exists at the searched root — pass an explicit source if the
+    /// tool keeps its configuration somewhere non-standard.
+    /// [`MigrationError::InvalidInput`] names the one source file that is
+    /// malformed (unparseable JSON, or an environment line that is not
+    /// `KEY=VALUE`); repair or remove that file and plan again.
+    /// [`MigrationError::Symlink`] and [`MigrationError::Io`] report a source
+    /// tree that cannot be read safely, and [`MigrationError::Contract`] or
+    /// [`MigrationError::Signing`] mean the plan itself could not be signed and
+    /// validated.
+    ///
+    /// A refusal that is expected — an existing target without `overwrite`, or
+    /// an executable legacy artifact — is *not* an error. It is returned as an
+    /// `Ok` plan whose status is [`MigrationStatus::Failed`] carrying the
+    /// `TARGET_EXISTS`, `NO_MIGRATABLE_STATE`, or
+    /// `EXECUTABLE_ARTIFACT_REQUIRES_PORT` diagnostic, so the reason survives
+    /// serialization into the frozen result contract.
     fn plan(&self, context: &PlanContext<'_>) -> Result<MigrationPlan, MigrationError>;
     /// Applies a previously reviewed plan transactionally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MigrationError::ProviderMismatch`] when `plan` came from a
+    /// different provider, and [`MigrationError::PlanNotApplicable`] when it is
+    /// not a successful plan with at least one operation — only a reviewed,
+    /// validated plan may be applied.
+    /// [`MigrationError::Conflict`] means a target already exists and
+    /// `overwrite` was not requested; review the file and re-run with overwrite
+    /// if replacing it is intended. [`MigrationError::InvalidInput`] means the
+    /// source changed between the dry run and apply, so the reviewed plan no
+    /// longer describes what would be written; re-plan.
+    /// [`MigrationError::UnsafeTarget`] and [`MigrationError::Symlink`] mean the
+    /// target path escapes the migration root or passes through a symbolic link,
+    /// and [`MigrationError::BackupVerification`] means a verified backup of an
+    /// existing target could not be taken — in all three cases nothing has been
+    /// written.
+    ///
+    /// [`MigrationError::ApplyFailed`] is the only variant that can be raised
+    /// after writing began. It carries the original reason and, in
+    /// `rollback_error`, the reason automatic restoration did not finish. If
+    /// `rollback_error` is `None` the target was restored to its pre-apply state;
+    /// if it is `Some`, the verified backup directory named by the receipt must
+    /// be restored by hand.
     fn apply(
         &self,
         context: &mut ApplyContext<'_>,
@@ -249,6 +367,19 @@ pub trait MigrationProvider {
         apply_plan(context, plan)
     }
     /// Restores the pre-apply filesystem and secret-store state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MigrationError::ProviderMismatch`] when `receipt` came from a
+    /// different provider. [`MigrationError::Conflict`] means a target changed
+    /// after apply — a concurrent edit, or a file whose post-apply state could
+    /// not be read — and rollback refuses to overwrite work it did not make;
+    /// restore that path from the receipt's backup directory yourself.
+    /// [`MigrationError::BackupVerification`] means a backup no longer matches
+    /// the digest recorded when it was taken, so it is not trustworthy enough to
+    /// restore. [`MigrationError::SecretStore`] means the platform keyring
+    /// entries could not be restored or removed even though the filesystem was;
+    /// unlock the keyring and remove the migrated entries by hand.
     fn rollback(
         &self,
         context: &mut ApplyContext<'_>,
@@ -356,7 +487,7 @@ impl MigrationOperation {
         }
     }
 
-    fn kind(&self) -> &'static str {
+    const fn kind(&self) -> &'static str {
         match self {
             Self::CopyPath { .. } => "copy",
             Self::AppendFile { .. } => "append",
@@ -425,10 +556,15 @@ pub enum MigrationError {
     Signing(String),
     /// Apply failed and attempted rollback.
     ApplyFailed {
-        /// Secret-free failure reason.
-        reason: String,
-        /// Rollback failure, if restoration was incomplete.
-        rollback_error: Option<String>,
+        /// Original typed apply failure.
+        cause: Box<Self>,
+        /// Every rollback failure encountered while restoring independent entries.
+        rollback_errors: Vec<String>,
+    },
+    /// Rollback attempted every independent entry but some restorations failed.
+    RollbackFailed {
+        /// Secret-free failures in rollback order.
+        errors: Vec<String>,
     },
     /// Receipt or plan belongs to a different provider.
     ProviderMismatch,
@@ -486,15 +622,25 @@ impl Display for MigrationError {
             Self::SecretStore(error) => write!(formatter, "secret store failed: {error}"),
             Self::Signing(reason) => write!(formatter, "artifact signing failed: {reason}"),
             Self::ApplyFailed {
-                reason,
-                rollback_error,
+                cause,
+                rollback_errors,
             } => {
-                write!(formatter, "migration apply failed: {reason}")?;
-                if let Some(rollback_error) = rollback_error {
-                    write!(formatter, "; rollback failed: {rollback_error}")?;
+                write!(formatter, "migration apply failed: {cause}")?;
+                if !rollback_errors.is_empty() {
+                    write!(
+                        formatter,
+                        "; rollback failed: {}",
+                        rollback_errors.join("; ")
+                    )?;
                 }
                 Ok(())
             }
+            Self::RollbackFailed { errors } => write!(
+                formatter,
+                "rollback completed with {} failure(s): {}",
+                errors.len(),
+                errors.join("; ")
+            ),
             Self::ProviderMismatch => formatter.write_str("migration provider mismatch"),
             Self::PlanNotApplicable => {
                 formatter.write_str("only a validated migrated plan may be applied")
@@ -516,6 +662,7 @@ impl Error for MigrationError {
             Self::Io { source, .. } => Some(source),
             Self::Contract(error) => Some(error),
             Self::SecretStore(error) => Some(error),
+            Self::ApplyFailed { cause, .. } => Some(cause.as_ref()),
             _ => None,
         }
     }
@@ -680,7 +827,7 @@ fn apply_plan(
     for operation in &plan.operations {
         ensure_target_within(context.target_root, operation.target())?;
         ensure_no_symlink_ancestors(context.target_root, operation.target())?;
-        if operation.target().exists()
+        if path_is_occupied(operation.target())
             && !context.overwrite
             && !matches!(operation, MigrationOperation::AppendFile { .. })
         {
@@ -700,13 +847,12 @@ fn apply_plan(
     let apply_result = apply_operations(context, &plan.operations, &mut receipt)
         .and_then(|()| verify_source_digests(plan));
     if let Err(error) = apply_result {
-        let reason = error.to_string();
-        let rollback_error = rollback_receipt(context, &receipt)
+        let rollback_errors = rollback_receipt(context, &receipt)
             .err()
-            .map(|rollback| rollback.to_string());
+            .map_or_else(Vec::new, rollback_failure_messages);
         return Err(MigrationError::ApplyFailed {
-            reason,
-            rollback_error,
+            cause: Box::new(error),
+            rollback_errors,
         });
     }
     Ok(receipt)
@@ -833,10 +979,8 @@ fn record_applied_state(receipt: &mut ApplyReceipt, target: &Path) {
             || entry.target.starts_with(target)
             || target.starts_with(&entry.target)
     }) {
-        backup.applied = Some(if backup.target.exists() {
-            digest_path(&backup.target)
-                .map(AppliedState::Digest)
-                .unwrap_or(AppliedState::Unknown)
+        backup.applied = Some(if path_is_occupied(&backup.target) {
+            digest_path(&backup.target).map_or(AppliedState::Unknown, AppliedState::Digest)
         } else {
             AppliedState::Absent
         });
@@ -848,7 +992,7 @@ fn rollback_receipt(
     receipt: &ApplyReceipt,
 ) -> Result<(), MigrationError> {
     verify_rollback_state(receipt)?;
-    let mut first_error = None;
+    let mut errors = Vec::new();
     for undo in receipt.secrets.iter().rev() {
         let result = if let Some(previous) = &undo.previous {
             context
@@ -858,10 +1002,8 @@ fn rollback_receipt(
         } else {
             context.secret_store.remove(&undo.id)
         };
-        if let Err(error) = result
-            && first_error.is_none()
-        {
-            first_error = Some(MigrationError::SecretStore(error));
+        if let Err(error) = result {
+            errors.push(format!("secret {}: {error}", undo.id));
         }
     }
     for backup in receipt.backups.iter().rev() {
@@ -869,17 +1011,26 @@ fn rollback_receipt(
             continue;
         }
         let result = restore_backup(backup);
-        if let Err(error) = result
-            && first_error.is_none()
-        {
-            first_error = Some(error);
+        if let Err(error) = result {
+            errors.push(error.to_string());
         }
 
         if backup.backup.is_none() {
             cleanup_empty_parents(&backup.target, context.target_root);
         }
     }
-    first_error.map_or(Ok(()), Err)
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(MigrationError::RollbackFailed { errors })
+    }
+}
+
+fn rollback_failure_messages(error: MigrationError) -> Vec<String> {
+    match error {
+        MigrationError::RollbackFailed { errors } => errors,
+        other => vec![other.to_string()],
+    }
 }
 
 fn verify_rollback_state(receipt: &ApplyReceipt) -> Result<(), MigrationError> {
@@ -888,12 +1039,12 @@ fn verify_rollback_state(receipt: &ApplyReceipt) -> Result<(), MigrationError> {
             continue;
         };
         match applied {
-            AppliedState::Absent if backup.target.exists() => {
+            AppliedState::Absent if path_is_occupied(&backup.target) => {
                 return Err(MigrationError::Conflict(backup.target.clone()));
             }
             AppliedState::Absent => {}
             AppliedState::Digest(expected) => {
-                if !backup.target.exists() || digest_path(&backup.target)? != *expected {
+                if !path_is_occupied(&backup.target) || digest_path(&backup.target)? != *expected {
                     return Err(MigrationError::Conflict(backup.target.clone()));
                 }
             }
@@ -938,7 +1089,7 @@ fn backup_targets(
             continue;
         }
 
-        if target.exists() {
+        if path_is_occupied(target) {
             reject_symlink(target)?;
             let backup = backup_dir.join("items").join(entries.len().to_string());
             copy_path(target, &backup)?;
@@ -969,11 +1120,11 @@ fn verify_targets_unchanged(backups: &[BackupEntry]) -> Result<(), MigrationErro
     for backup in backups {
         match &backup.digest {
             Some(expected) => {
-                if !backup.target.exists() || digest_path(&backup.target)? != *expected {
+                if !path_is_occupied(&backup.target) || digest_path(&backup.target)? != *expected {
                     return Err(MigrationError::Conflict(backup.target.clone()));
                 }
             }
-            None if backup.target.exists() => {
+            None if path_is_occupied(&backup.target) => {
                 return Err(MigrationError::Conflict(backup.target.clone()));
             }
             None => {}
@@ -1006,7 +1157,8 @@ fn write_backup_manifest(receipt: &ApplyReceipt) -> Result<(), MigrationError> {
 
 fn restore_backup(entry: &BackupEntry) -> Result<(), MigrationError> {
     if let Some(backup) = &entry.backup {
-        if digest_path(backup)? != entry.digest.clone().unwrap_or_default() {
+        let expected = entry.digest.as_deref().unwrap_or_default();
+        if digest_path(backup)? != expected {
             return Err(MigrationError::BackupVerification(backup.clone()));
         }
         create_parent(&entry.target)?;
@@ -1021,7 +1173,7 @@ fn restore_backup(entry: &BackupEntry) -> Result<(), MigrationError> {
             .with_file_name(format!(".{file_name}.rollback-{sequence}"));
         remove_path_if_exists(&temporary)?;
         copy_path(backup, &temporary)?;
-        if digest_path(&temporary)? != entry.digest.clone().unwrap_or_default() {
+        if digest_path(&temporary)? != expected {
             return Err(MigrationError::BackupVerification(temporary));
         }
         remove_path_if_exists(&entry.target)?;
@@ -1049,8 +1201,19 @@ fn cleanup_empty_parents(target: &Path, root: &Path) {
     }
 }
 
+/// Reports whether anything at all occupies `path`.
+///
+/// Unlike [`Path::exists`] this does not follow symbolic links, so a link whose
+/// destination is missing still counts as occupied. Every safety decision in
+/// this module — conflict detection, backup selection, and removal — uses this
+/// definition, because a dangling link is a real object that a later write would
+/// otherwise silently follow out of the migration root.
+fn path_is_occupied(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
 fn replace_target_if_needed(target: &Path, overwrite: bool) -> Result<(), MigrationError> {
-    if target.exists() {
+    if path_is_occupied(target) {
         if !overwrite {
             return Err(MigrationError::Conflict(target.to_path_buf()));
         }
@@ -1063,7 +1226,7 @@ fn append_file(source: &Path, target: &Path, heading: &str) -> Result<(), Migrat
     reject_symlink(source)?;
     let content = read_bytes(source)?;
     create_parent(target)?;
-    let mut existing = if target.exists() {
+    let mut existing = if path_is_occupied(target) {
         reject_symlink(target)?;
         read_bytes(target)?
     } else {
@@ -1312,14 +1475,17 @@ fn route_secret(
             "secret store returned an invalid reference",
         )));
     }
-
-    fn valid_secret_reference(reference: &str) -> bool {
-        (reference.starts_with("keyring://") || reference.starts_with("service://"))
-            && reference.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'/' | b'.' | b'_' | b'-')
-            })
-    }
     Ok(reference)
+}
+
+/// Rejects anything an adapter returns that is not an opaque store handle, so a
+/// store that echoes the plaintext back cannot get it written into a migrated
+/// configuration file.
+fn valid_secret_reference(reference: &str) -> bool {
+    (reference.starts_with("keyring://") || reference.starts_with("service://"))
+        && reference.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'/' | b'.' | b'_' | b'-')
+        })
 }
 
 fn secret_identifier(namespace: &str, pointer: &str) -> String {
@@ -1487,24 +1653,45 @@ fn ensure_target_within(root: &Path, target: &Path) -> Result<(), MigrationError
     Ok(())
 }
 
+/// Rejects a target whose root, directories, or final component is a symbolic
+/// link.
+///
+/// A *dangling* link matters as much as a live one: `Path::exists` follows links
+/// and reports `false` for a link whose destination is missing, so checking
+/// existence would wave one through and let `fs::write` follow it and create the
+/// file wherever the link points — outside the migration root, and without a
+/// backup. Presence is therefore tested with `symlink_metadata`, which describes
+/// the link itself.
 fn ensure_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), MigrationError> {
     let relative = target
         .strip_prefix(root)
         .map_err(|_| MigrationError::UnsafeTarget(target.to_path_buf()))?;
     let mut current = root.to_path_buf();
-    if current.exists() {
-        reject_symlink(&current)?;
-    }
+    reject_symlink_if_present(&current)?;
     for component in relative.components() {
         let Component::Normal(part) = component else {
             continue;
         };
         current.push(part);
-        if current.exists() {
-            reject_symlink(&current)?;
-        }
+        reject_symlink_if_present(&current)?;
     }
     Ok(())
+}
+
+/// Rejects `path` when it is a symbolic link, tolerating a path that is absent.
+fn reject_symlink_if_present(path: &Path) -> Result<(), MigrationError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(MigrationError::Symlink(path.to_path_buf()))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(MigrationError::Io {
+            action: "inspect",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn copy_path(source: &Path, target: &Path) -> Result<(), MigrationError> {

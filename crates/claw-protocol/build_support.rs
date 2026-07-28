@@ -27,6 +27,10 @@ pub(crate) const EXPECTED_SCOPES: usize = 6;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "this struct mirrors the validator-owned inventory document one-to-one; `inventory_id` is the frozen JSON key and renaming the Rust field would only move the mismatch into a serde attribute"
+)]
 pub(crate) struct Inventory {
     pub(crate) schema_version: u8,
     pub(crate) inventory_id: String,
@@ -261,7 +265,7 @@ fn canonical_digest(inventory: &Inventory) -> Result<String, RegistrySourceError
     Ok(sha256_hex(format!("[{}]", rows.join(",")).as_bytes()))
 }
 
-fn require(condition: bool, message: &'static str) -> Result<(), RegistrySourceError> {
+const fn require(condition: bool, message: &'static str) -> Result<(), RegistrySourceError> {
     if condition {
         Ok(())
     } else {

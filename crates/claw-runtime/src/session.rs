@@ -64,7 +64,7 @@ impl TurnStateMachine {
     /// Returns [`StateMachineError::InconsistentSnapshot`] when `pre_pause_state` does not match
     /// `state`: a paused turn must carry a pausable pre-pause state, and every other state must
     /// carry none.
-    pub fn restore(
+    pub const fn restore(
         state: SessionState,
         pre_pause_state: Option<SessionState>,
     ) -> Result<Self, StateMachineError> {

@@ -5,7 +5,8 @@ mod common;
 use claw_config::{ConfigSnapshot, load_file, parse_json5, to_json5};
 use claw_crestodian::{
     CRESTODIAN_STATE_SCHEMA_VERSION, ConfigCondition, Crestodian, CrestodianError, CrestodianState,
-    GuidedSetup, RecoveryAction, SetupAnswers, SetupField, StateCondition,
+    GuidedSetup, RecoveryAction, RecoveryGuidance, SetupAnswers, SetupConstraint, SetupField,
+    StateCondition,
 };
 
 const VALID: &str = r#"
@@ -35,7 +36,18 @@ fn guided_setup_has_closed_typed_questions_and_persists_only_secret_references()
     assert_eq!(questions[0].prompt, "GitHub token environment variable");
     assert!(questions[0].required);
     assert!(!questions[0].secret);
+    assert_eq!(
+        questions[0].constraint,
+        SetupConstraint::Exact("GITHUB_TOKEN")
+    );
     assert_eq!(questions[5].field, SetupField::TeamsPasswordEnvironment);
+    assert_eq!(
+        questions[5].constraint,
+        SetupConstraint::ExactWhen {
+            value: "MicrosoftAppPassword",
+            field: SetupField::EnableTeams,
+        }
+    );
 
     let directory = common::TestDirectory::create();
     let config_path = directory.path().join("config/config.json5");
@@ -74,6 +86,27 @@ fn guided_setup_has_closed_typed_questions_and_persists_only_secret_references()
         serde_json::from_slice(&std::fs::read(state_path).expect("read state"))
             .expect("state JSON");
     assert_eq!(state, report.state);
+}
+
+#[test]
+fn disabled_teams_answers_do_not_leave_credential_scaffolding() {
+    let directory = common::TestDirectory::create();
+    let config_path = directory.path().join("config.json5");
+    let state_path = directory.path().join("crestodian.json");
+    let report = GuidedSetup::new(&config_path, &state_path)
+        .apply(&SetupAnswers {
+            github_token_environment: "GITHUB_TOKEN".to_owned(),
+            role_source_url: "https://roles.example.test/setup.json".to_owned(),
+            workspace: None,
+            enable_teams: false,
+            teams_app_id: Some("ignored-app-id".to_owned()),
+            teams_password_environment: Some("ignored-password-name".to_owned()),
+        })
+        .expect("disabled Teams answers are ignored");
+    let persisted = to_json5(&report.config).expect("serialize");
+
+    assert!(!persisted.contains("ignored-app-id"));
+    assert!(!persisted.contains("MicrosoftAppPassword"));
 }
 
 #[test]
@@ -196,6 +229,11 @@ fn corrupt_and_interrupted_files_are_backed_up_then_recovered() {
     );
     assert_eq!(report.interrupted_artifact_backups.len(), 1);
     assert_eq!(
+        report.warnings,
+        Vec::new(),
+        "a recovery reported as successful must also report full write durability"
+    );
+    assert_eq!(
         std::fs::read(&report.interrupted_artifact_backups[0]).expect("orphan backup"),
         interrupted_bytes
     );
@@ -203,6 +241,27 @@ fn corrupt_and_interrupted_files_are_backed_up_then_recovered() {
         std::fs::read(&interrupted_path).expect("orphan source retained"),
         interrupted_bytes
     );
+}
+
+#[test]
+fn a_state_file_with_a_torn_tail_is_corrupt_rather_than_healthy() {
+    let directory = common::TestDirectory::create();
+    let config_path = directory.path().join("config.json5");
+    let state_path = directory.path().join("crestodian.json");
+    std::fs::write(&config_path, VALID).expect("write valid config");
+    let healthy = br#"{"schema_version":1,"setup_completed":true,"workspace":null,"last_recovery_unix_ms":null}"#;
+    let mut torn = healthy.to_vec();
+    torn.extend_from_slice(br#"{"schema_version":1,"setup_"#);
+    std::fs::write(&state_path, &torn).expect("write torn state");
+
+    let assessment = Crestodian::new(&config_path, &state_path).inspect();
+
+    assert_eq!(assessment.config, ConfigCondition::Healthy);
+    match assessment.state {
+        StateCondition::Corrupt { diagnostic } => assert!(!diagnostic.is_empty()),
+        other => panic!("a state file with a torn tail must be corrupt, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&state_path).expect("state preserved"), torn);
 }
 
 #[test]
@@ -231,6 +290,7 @@ fn incompatible_config_and_state_are_detected_without_mutation() {
             supported: CRESTODIAN_STATE_SCHEMA_VERSION,
         }
     );
+    assert_eq!(assessment.guidance(), RecoveryGuidance::UseCompatibleBuild);
     assert_eq!(
         std::fs::read(&config_path).expect("config preserved"),
         future_config.as_bytes()
@@ -239,6 +299,47 @@ fn incompatible_config_and_state_are_detected_without_mutation() {
         std::fs::read(&state_path).expect("state preserved"),
         future_state
     );
+}
+
+#[test]
+fn missing_files_are_guided_to_setup_without_allocating_an_empty_backup() {
+    let directory = common::TestDirectory::create();
+    let config_path = directory.path().join("config.json5");
+    let state_path = directory.path().join("crestodian.json");
+    let crestodian = Crestodian::new(&config_path, &state_path);
+    let assessment = crestodian.inspect();
+    assert_eq!(assessment.guidance(), RecoveryGuidance::RunGuidedSetup);
+
+    let report = crestodian
+        .recover(&baseline(), 42)
+        .expect("create missing files");
+    assert_eq!(report.config_action, RecoveryAction::Created);
+    assert_eq!(report.state_action, RecoveryAction::Created);
+    assert_eq!(report.backup_directory, None);
+    assert!(
+        std::fs::read_dir(directory.path())
+            .expect("read directory")
+            .all(|entry| {
+                !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".crestodian-recovery-")
+            })
+    );
+}
+
+#[test]
+fn non_directory_path_components_are_reported_as_missing() {
+    let directory = common::TestDirectory::create();
+    let blocker = directory.path().join("not-a-directory");
+    std::fs::write(&blocker, b"blocker").expect("write blocker");
+    let assessment =
+        Crestodian::new(blocker.join("config.json5"), blocker.join("state.json")).inspect();
+
+    assert_eq!(assessment.config, ConfigCondition::Missing);
+    assert_eq!(assessment.state, StateCondition::Missing);
+    assert_eq!(assessment.guidance(), RecoveryGuidance::RunGuidedSetup);
 }
 
 #[test]

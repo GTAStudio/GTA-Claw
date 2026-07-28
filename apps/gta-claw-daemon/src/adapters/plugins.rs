@@ -9,6 +9,15 @@
 //! installing a capability on the linker once at start-up and having every
 //! later instance inherit it, including instances created after the grant that
 //! justified it had expired.
+//!
+//! It is only that shape, though: no component is compiled, linked or run here.
+//! This stands in for `claw-plugin-host` until it lands.
+//!
+//! # Lock poisoning
+//!
+//! The accessors below unwrap the live-instance lock, so each panics if a
+//! previous holder panicked while holding it. An operator should restart the
+//! daemon and investigate the *first* panic in the log.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -35,6 +44,11 @@ impl PerActivationPluginHost {
     }
 
     /// Returns how many instances are currently live.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the live-instance lock is poisoned; see the module note on
+    /// lock poisoning.
     #[must_use]
     pub fn live_instances(&self) -> usize {
         self.live.lock().expect("uncontended").len()
@@ -47,6 +61,11 @@ impl PerActivationPluginHost {
     }
 
     /// Returns the capabilities installed on a live instance, if it exists.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the live-instance lock is poisoned; see the module note on
+    /// lock poisoning.
     #[must_use]
     pub fn capabilities_of(&self, instance: &PluginInstance) -> Option<CapabilitySet> {
         self.live

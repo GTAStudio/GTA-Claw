@@ -14,7 +14,8 @@ use std::time::Duration;
 use claw_provider_sdk::cancel::CancelToken;
 use claw_provider_sdk::error::{ErrorKind, Operation};
 use claw_provider_sdk::http::{
-    Body, HttpRequest, HttpTransport, Method, ProxyPolicy, TlsPolicy, TransportConfig,
+    Body, DirectReason, HttpRequest, HttpTransport, MAX_BUFFERED_RESPONSE_BYTES, Method,
+    ProxyDecision, ProxyPolicy, ProxyScheme, ProxyUrl, TlsPolicy, TransportConfig,
 };
 use claw_provider_sdk::secret::SecretString;
 use futures_util::StreamExt as _;
@@ -219,6 +220,127 @@ async fn cancelling_an_in_flight_stream_closes_the_socket() {
     assert!(
         server.wait_for_peer_close(Duration::from_secs(5)).await,
         "the server never observed the client close the connection"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_wakes_a_read_already_parked_on_a_silent_upstream() {
+    // The interesting case is not "cancel, then poll" but "park, then cancel":
+    // a task blocked inside the body read has only the connection's waker
+    // registered, so unless the chunk stream also registers itself with the
+    // token, `cancel()` from another task leaves this one parked indefinitely.
+    let server = TestServer::start(vec![Reply::sse_hold(&["data: {\"n\":1}\n\n"])]).await;
+    let transport = transport();
+    let cancel = CancelToken::new();
+
+    let stream = transport
+        .send_streaming(
+            "test",
+            Operation::StreamCompletion,
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions")),
+            &cancel,
+        )
+        .await
+        .expect("stream must open");
+    let mut chunks = stream.into_chunks();
+    let first = chunks.next().await.expect("a first chunk arrives");
+    assert!(!first.expect("the first chunk decodes").is_empty());
+
+    // The server holds the socket open without writing, so this parks.
+    let parked = tokio::spawn(async move {
+        let item = chunks.next().await;
+        // The stream is fused: the cancellation error is terminal, so a caller
+        // that keeps polling terminates instead of spinning on repeats of it.
+        let after = chunks.next().await;
+        (item, after)
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancel.cancel();
+
+    let (item, after) = tokio::time::timeout(Duration::from_secs(5), parked)
+        .await
+        .expect("the parked read is woken by cancellation")
+        .expect("the reader task does not panic");
+    let error = item
+        .expect("a terminal item is produced")
+        .expect_err("cancellation surfaces as an error");
+    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert!(after.is_none(), "the stream ends after the terminal error");
+}
+
+#[tokio::test]
+async fn a_silent_stream_hits_its_idle_deadline_and_closes_the_socket() {
+    let server = TestServer::start(vec![Reply::sse_hold(&["data: {\"n\":1}\n\n"])]).await;
+    let stream = transport()
+        .send_streaming(
+            "test",
+            Operation::StreamCompletion,
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions"))
+                .stream_idle_timeout(Duration::from_millis(50)),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("stream must open");
+    let mut chunks = stream.into_chunks();
+    chunks
+        .next()
+        .await
+        .expect("the first chunk arrives")
+        .expect("the first chunk decodes");
+
+    let error = tokio::time::timeout(Duration::from_secs(2), chunks.next())
+        .await
+        .expect("the idle deadline wakes the parked reader")
+        .expect("the timeout is emitted as one terminal item")
+        .expect_err("silence is a timeout");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert_eq!(error.operation(), Operation::StreamCompletion);
+    assert_eq!(
+        error.detail(),
+        "the streaming response exceeded its idle deadline"
+    );
+    assert_eq!(chunks.next().await, None);
+    drop(chunks);
+
+    assert!(
+        server.wait_for_peer_close(Duration::from_secs(5)).await,
+        "timing out the stream must close the TCP connection"
+    );
+}
+
+#[tokio::test]
+async fn a_body_larger_than_the_buffer_limit_is_refused_instead_of_being_held() {
+    // The request deadline bounds how long an upstream may take, not how many
+    // bytes it may send, so without a byte ceiling one response could exhaust
+    // the host. Frames are 4 MiB so the server writes just past the limit
+    // rather than materializing a second copy of it.
+    const FRAME_BYTES: usize = 4 * 1024 * 1024;
+    let frame = vec![b'a'; FRAME_BYTES];
+    let frames = vec![frame; MAX_BUFFERED_RESPONSE_BYTES / FRAME_BYTES + 1];
+    let server = TestServer::start(vec![Reply::Chunked {
+        status: 200,
+        content_type: "application/json".to_owned(),
+        frames,
+        hold_open: false,
+    }])
+    .await;
+
+    let error = transport()
+        .send(
+            "test",
+            Operation::Complete,
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions")),
+            &CancelToken::new(),
+        )
+        .await
+        .expect_err("an oversized body is refused");
+
+    assert_eq!(error.kind(), ErrorKind::Protocol);
+    assert!(
+        error.detail().contains("buffer limit"),
+        "the detail names the limit: {}",
+        error.detail()
     );
 }
 
@@ -676,5 +798,162 @@ async fn a_transport_debug_reports_its_proxy_policy_without_the_url() {
     assert!(
         rendered.contains(r#"url: "<redacted>""#),
         "the transport must report that a proxy is configured: {rendered}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Proxy policy: precedence is unit-tested in `http::proxy` against an injected
+// variable lookup, because `std::env::set_var` is `unsafe` in edition 2024 and
+// this workspace forbids `unsafe`. What is proved here is the part only a
+// socket can prove: that the resolved policy actually decides where the bytes
+// go.
+// ---------------------------------------------------------------------------
+
+/// Builds a transport that tunnels through `proxy_url` with a short connect
+/// deadline, for the cases that are expected to stall rather than answer.
+fn impatient_proxied_transport(proxy_url: String) -> HttpTransport {
+    HttpTransport::with_config(&TransportConfig {
+        tls_policy: TlsPolicy::AllowLoopbackPlaintext,
+        proxy_policy: ProxyPolicy::Explicit {
+            url: proxy_url,
+            no_proxy: None,
+        },
+        connect_timeout: Duration::from_millis(500),
+        ..TransportConfig::default()
+    })
+    .expect("build transport")
+}
+
+#[tokio::test]
+async fn a_malformed_proxy_url_continues_without_a_proxy_and_reports_why() {
+    // The legacy client logged the failure and carried on with no proxy. The
+    // behaviour is preserved; the disclosure is not, because the legacy log
+    // line printed the URL with its userinfo intact.
+    let proxy = TestProxy::start(200).await;
+    let transport = proxied_transport(
+        "socks5://corp-user:corp-secret@proxy.invalid:1080".to_owned(),
+        None,
+    );
+
+    let rules = transport.proxy_rules();
+    assert!(
+        rules.fell_back_to_direct(),
+        "a rejected proxy URL must be visible, not silent"
+    );
+    assert!(rules.proxy().is_none());
+    assert_eq!(
+        rules.intercept("api.example.com", 443),
+        ProxyDecision::Direct(DirectReason::Unusable)
+    );
+
+    let reported = rules
+        .diagnostics()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        reported.contains("continuing without a proxy"),
+        "the fallback must be stated: {reported}"
+    );
+    assert!(
+        !reported.contains("corp-secret") && !reported.contains("corp-user"),
+        "the proxy credential must not reach a diagnostic: {reported}"
+    );
+
+    let kind = attempt_proxied_request(&transport, "https://api.invalid/v1/models").await;
+    assert_eq!(kind, ErrorKind::Transport);
+    assert_eq!(
+        proxy.tunnels().await.len(),
+        0,
+        "an unusable proxy must not be contacted"
+    );
+}
+
+#[tokio::test]
+async fn a_wildcard_bypass_entry_stops_every_tunnel() {
+    let proxy = TestProxy::start(200).await;
+    let transport = proxied_transport(proxy.url(None), Some("*".to_owned()));
+
+    assert_eq!(
+        transport.proxy_rules().intercept("api.example.com", 443),
+        ProxyDecision::Direct(DirectReason::Bypassed)
+    );
+    let kind = attempt_proxied_request(&transport, "https://api.invalid/v1/models").await;
+    assert_eq!(kind, ErrorKind::Transport);
+    assert_eq!(
+        proxy.tunnels().await.len(),
+        0,
+        "a wildcard bypass must not be tunnelled"
+    );
+}
+
+#[tokio::test]
+async fn a_dot_suffix_bypass_entry_covers_subdomains() {
+    let proxy = TestProxy::start(200).await;
+    let transport = proxied_transport(proxy.url(None), Some(".invalid".to_owned()));
+
+    let kind = attempt_proxied_request(&transport, "https://api.invalid/v1/models").await;
+    assert_eq!(kind, ErrorKind::Transport);
+    assert_eq!(
+        proxy.tunnels().await.len(),
+        0,
+        "a subdomain of a bypassed suffix must not be tunnelled"
+    );
+}
+
+#[tokio::test]
+async fn an_https_proxy_hop_is_negotiated_with_tls_rather_than_in_the_clear() {
+    // The test proxy speaks plaintext, so declaring it `https` must produce a
+    // TLS handshake it cannot answer. The assertion that matters is the
+    // negative one: no `CONNECT` request line — and therefore no proxy
+    // credential — was written in the clear to a port declared as TLS.
+    let proxy = TestProxy::start(200).await;
+    let address = proxy.url(None).replace("http://", "https://");
+    let transport = impatient_proxied_transport(address);
+    assert_eq!(
+        transport
+            .proxy_rules()
+            .proxy()
+            .map(ProxyUrl::scheme)
+            .expect("the https proxy URL must resolve"),
+        ProxyScheme::Https,
+        "the policy must have selected the proxy, or this proves nothing"
+    );
+
+    let kind = attempt_proxied_request(&transport, "https://api.example.com/v1/models").await;
+    assert_eq!(kind, ErrorKind::Transport);
+    assert_eq!(
+        proxy.tunnels().await.len(),
+        0,
+        "a plaintext CONNECT must never be written to an https proxy"
+    );
+}
+
+#[tokio::test]
+async fn the_transport_reports_the_proxy_it_resolved() {
+    let proxy = TestProxy::start(200).await;
+    let transport = proxied_transport(proxy.url(Some("corp-user:corp-secret")), None);
+    let rules = transport.proxy_rules();
+
+    assert!(rules.diagnostics().is_empty());
+    assert!(!rules.fell_back_to_direct());
+    assert!(rules.proxy().is_some_and(ProxyUrl::has_credentials));
+    assert_eq!(
+        rules
+            .intercept("api.example.com", 443)
+            .proxy()
+            .map(ProxyUrl::authority),
+        rules.proxy().map(ProxyUrl::authority)
+    );
+    assert_eq!(
+        rules.intercept("127.0.0.1", 8080),
+        ProxyDecision::Direct(DirectReason::Loopback)
+    );
+
+    let rendered = format!("{rules:?} {}", rules.proxy().expect("a proxy is in force"));
+    assert!(
+        !rendered.contains("corp-secret") && !rendered.contains("corp-user"),
+        "the resolved rules must not print proxy credentials: {rendered}"
     );
 }

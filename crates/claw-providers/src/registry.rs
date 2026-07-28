@@ -5,12 +5,22 @@
 //! rather than generated from the inventory, so
 //! [`frozen_inventory`](../../tests/frozen_inventory.rs) can compare the two
 //! independently.
+//!
+//! # Why the index is built by the compiler
+//!
+//! Resolving an identifier is the most frequent thing this crate does: every
+//! request that names a provider goes through it. The lookup index is therefore
+//! a `const` permutation of [`PROVIDERS`] sorted by identifier, so
+//! [`ProviderRegistry::get`] is a binary search over static memory — no lazy
+//! initialisation, no heap map to allocate on first use, and no pointer
+//! chasing between map nodes. Sorting in `const` also promotes a duplicated
+//! identifier from "a silently shorter map" to a compile error.
 
-use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::fmt::{self, Debug, Formatter};
 
 use claw_provider_sdk::model::{AuthMode, CapabilitySet};
 
+use crate::FROZEN_PROVIDER_COUNT;
 use crate::descriptor::{
     ANTHROPIC_CAPABILITIES, COPILOT_CAPABILITIES, ImplementationStatus, OPENAI_CAPABILITIES,
     ProviderDescriptor, ProviderFamily,
@@ -33,8 +43,10 @@ macro_rules! provider_table {
         $id:literal, $plugin:literal, $dir:literal, $name:literal,
         $family:ident, $status:ident, [$($auth:ident),+ $(,)?], $base:expr
     );* $(;)?) => {
-        /// Every provider in the frozen upstream inventory, in inventory order.
-        pub static PROVIDERS: &[ProviderDescriptor] = &[
+        /// The descriptor table as a `const`, so the lookup index below can be
+        /// sorted at compile time. A `static` cannot be read in `const`
+        /// context, which is why the two items are separate.
+        const PROVIDER_TABLE: &[ProviderDescriptor] = &[
             $(ProviderDescriptor {
                 record_id: concat!("provider:", $id),
                 id: $id,
@@ -51,6 +63,9 @@ macro_rules! provider_table {
                 ),
             }),*
         ];
+
+        /// Every provider in the frozen upstream inventory, in inventory order.
+        pub static PROVIDERS: &[ProviderDescriptor] = PROVIDER_TABLE;
     };
 }
 
@@ -222,41 +237,123 @@ provider_table! {
         GoogleGemini, RegistrationOnly, [GoogleServiceAccount], None;
 }
 
+/// Byte-wise `<` over two identifiers, usable in `const` context.
+///
+/// `str`'s own ordering compares the UTF-8 bytes lexicographically, so this
+/// produces exactly the ordering [`str::cmp`] does at run time — which is what
+/// lets the compile-time permutation and the run-time binary search agree.
+const fn id_is_less(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let mut index = 0;
+    while index < left.len() && index < right.len() {
+        if left[index] != right[index] {
+            return left[index] < right[index];
+        }
+        index += 1;
+    }
+    left.len() < right.len()
+}
+
+/// Indices into [`PROVIDERS`], ordered by identifier.
+///
+/// Built by insertion sort in `const` context: 78 rows are sorted once by the
+/// compiler and the result is baked into the binary. The final pass rejects
+/// duplicates, so two rows sharing an identifier stop the build instead of
+/// producing a registry that silently answers for only one of them.
+const fn indices_sorted_by_id() -> [usize; FROZEN_PROVIDER_COUNT] {
+    assert!(
+        PROVIDER_TABLE.len() == FROZEN_PROVIDER_COUNT,
+        "the provider table must hold exactly FROZEN_PROVIDER_COUNT rows"
+    );
+    let mut order = [0; FROZEN_PROVIDER_COUNT];
+    let mut index = 0;
+    while index < FROZEN_PROVIDER_COUNT {
+        order[index] = index;
+        index += 1;
+    }
+
+    let mut index = 1;
+    while index < FROZEN_PROVIDER_COUNT {
+        let mut slot = index;
+        while slot > 0
+            && id_is_less(
+                PROVIDER_TABLE[order[slot]].id,
+                PROVIDER_TABLE[order[slot - 1]].id,
+            )
+        {
+            let earlier = order[slot - 1];
+            order[slot - 1] = order[slot];
+            order[slot] = earlier;
+            slot -= 1;
+        }
+        index += 1;
+    }
+
+    let mut index = 1;
+    while index < FROZEN_PROVIDER_COUNT {
+        assert!(
+            id_is_less(
+                PROVIDER_TABLE[order[index - 1]].id,
+                PROVIDER_TABLE[order[index]].id,
+            ),
+            "two providers share an identifier"
+        );
+        index += 1;
+    }
+    order
+}
+
+/// The compile-time lookup index. See the module documentation.
+///
+/// A `static` rather than a `const` so the index exists exactly once in the
+/// binary instead of being re-materialised at each use site.
+static BY_ID: [usize; FROZEN_PROVIDER_COUNT] = indices_sorted_by_id();
+
 /// Immutable lookup over [`PROVIDERS`].
-#[derive(Debug)]
+///
+/// The registry owns no state: every method reads the compile-time table, so
+/// the type exists to give the lookups a name rather than to hold data.
 pub struct ProviderRegistry {
-    by_id: BTreeMap<&'static str, &'static ProviderDescriptor>,
+    _private: (),
+}
+
+impl Debug for ProviderRegistry {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderRegistry")
+            .field("providers", &PROVIDERS.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProviderRegistry {
     /// Returns the process-wide registry.
     #[must_use]
-    pub fn global() -> &'static Self {
-        static REGISTRY: OnceLock<ProviderRegistry> = OnceLock::new();
-        REGISTRY.get_or_init(|| Self {
-            by_id: PROVIDERS
-                .iter()
-                .map(|descriptor| (descriptor.id, descriptor))
-                .collect(),
-        })
+    pub const fn global() -> &'static Self {
+        static REGISTRY: ProviderRegistry = ProviderRegistry { _private: () };
+        &REGISTRY
     }
 
     /// Returns the number of registered providers.
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.by_id.len()
+    pub const fn len(&self) -> usize {
+        PROVIDERS.len()
     }
 
     /// Returns `true` when nothing is registered, which never happens.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
+    pub const fn is_empty(&self) -> bool {
+        PROVIDERS.is_empty()
     }
 
     /// Looks a provider up by its frozen identifier.
+    ///
+    /// The identifier must be spelled exactly as the inventory spells it;
+    /// trimming and case folding belong to [`crate::alias`].
     #[must_use]
     pub fn get(&self, id: &str) -> Option<&'static ProviderDescriptor> {
-        self.by_id.get(id).copied()
+        lookup(id)
     }
 
     /// Iterates in frozen inventory order.
@@ -267,40 +364,48 @@ impl ProviderRegistry {
     /// Returns every provider whose identifiers sort ascending.
     #[must_use]
     pub fn ids(&self) -> Vec<&'static str> {
-        self.by_id.keys().copied().collect()
+        BY_ID.iter().map(|&index| PROVIDERS[index].id).collect()
     }
 
-    /// Returns every provider with the given implementation status.
+    /// Returns every provider with the given implementation status, sorted by
+    /// identifier.
     #[must_use]
     pub fn with_status(&self, status: ImplementationStatus) -> Vec<&'static ProviderDescriptor> {
-        let mut matches: Vec<_> = self
-            .by_id
-            .values()
-            .copied()
+        sorted_by_id()
             .filter(|descriptor| descriptor.status == status)
-            .collect();
-        matches.sort_unstable_by_key(|descriptor| descriptor.id);
-        matches
+            .collect()
     }
 
-    /// Returns every provider in the given dialect family.
+    /// Returns every provider in the given dialect family, sorted by
+    /// identifier.
     #[must_use]
     pub fn with_family(&self, family: ProviderFamily) -> Vec<&'static ProviderDescriptor> {
-        let mut matches: Vec<_> = self
-            .by_id
-            .values()
-            .copied()
+        sorted_by_id()
             .filter(|descriptor| descriptor.family == family)
-            .collect();
-        matches.sort_unstable_by_key(|descriptor| descriptor.id);
-        matches
+            .collect()
     }
 }
 
+/// Iterates the descriptors in identifier order.
+fn sorted_by_id() -> impl Iterator<Item = &'static ProviderDescriptor> {
+    BY_ID.iter().map(|&index| &PROVIDERS[index])
+}
+
+/// Returns the position of a provider in frozen inventory order.
+pub(crate) fn inventory_index(id: &str) -> Option<usize> {
+    BY_ID
+        .binary_search_by(|&index| PROVIDERS[index].id.cmp(id))
+        .ok()
+        .map(|slot| BY_ID[slot])
+}
+
 /// Looks a provider up in the global registry.
+///
+/// This is a binary search over a compile-time index; it allocates nothing and
+/// initialises nothing.
 #[must_use]
 pub fn lookup(id: &str) -> Option<&'static ProviderDescriptor> {
-    ProviderRegistry::global().get(id)
+    inventory_index(id).map(|index| &PROVIDERS[index])
 }
 
 #[cfg(test)]

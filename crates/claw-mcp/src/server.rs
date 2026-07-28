@@ -1,5 +1,8 @@
 //! GTA-Claw MCP server adapter.
-#![allow(deprecated)]
+#![expect(
+    deprecated,
+    reason = "rmcp deprecates MCP sampling per SEP-2577, but this server must keep offering it to clients that still request it"
+)]
 
 use std::future::{Future, ready};
 use std::sync::Arc;
@@ -168,11 +171,18 @@ pub struct GtaMcpServer<B> {
 impl<B> GtaMcpServer<B> {
     /// Creates an MCP server from a GTA-Claw backend.
     #[must_use]
-    pub fn new(backend: Arc<B>) -> Self {
+    pub const fn new(backend: Arc<B>) -> Self {
         Self { backend }
     }
 
     /// Requests model sampling from a connected client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`rmcp::service::ServiceError`] when the client declined the
+    /// `sampling/createMessage` request with a JSON-RPC error (usually because it
+    /// never advertised the sampling capability), when the connection closed
+    /// before the client answered, or when the peer's request timeout elapsed.
     pub async fn sample(
         context: &OperationContext,
         request: CreateMessageRequestParams,
@@ -181,18 +191,37 @@ impl<B> GtaMcpServer<B> {
     }
 
     /// Announces that the tool list changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::McpError::Service`] when the notification cannot be
+    /// handed to the transport — the peer has disconnected or the service worker
+    /// has already shut down. Notifications carry no reply, so a successful send
+    /// only means the bytes were queued.
     pub async fn notify_tools_changed(context: &OperationContext) -> Result<()> {
         context.peer.notify_tool_list_changed().await?;
         Ok(())
     }
 
     /// Announces that the resource list changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::McpError::Service`] when the peer has disconnected
+    /// or the service worker has already shut down, so the notification could not
+    /// be queued on the transport.
     pub async fn notify_resources_changed(context: &OperationContext) -> Result<()> {
         context.peer.notify_resource_list_changed().await?;
         Ok(())
     }
 
     /// Announces that the prompt list changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::McpError::Service`] when the peer has disconnected
+    /// or the service worker has already shut down, so the notification could not
+    /// be queued on the transport.
     pub async fn notify_prompts_changed(context: &OperationContext) -> Result<()> {
         context.peer.notify_prompt_list_changed().await?;
         Ok(())
@@ -314,6 +343,16 @@ impl<B: McpBackend> ServerHandler for GtaMcpServer<B> {
 }
 
 /// Serves a GTA-Claw MCP backend over protocol-only standard IO.
+///
+/// # Errors
+///
+/// Returns [`crate::error::McpError::ServerInitialize`] when the client's
+/// initialize request is rejected or standard input closes before it arrives.
+/// Once serving, returns [`crate::error::McpError::Io`] when a client frame is
+/// malformed JSON, is not UTF-8, or exceeds
+/// [`crate::framing::DEFAULT_MAX_FRAME_BYTES`], and
+/// [`crate::error::McpError::Join`] when the service worker panicked. A clean
+/// end-of-input on stdin is a normal shutdown, not an error.
 pub async fn serve_stdio<B: McpBackend>(backend: Arc<B>) -> Result<()> {
     let running = GtaMcpServer::new(backend)
         .serve(BoundedIoTransport::<RoleServer>::new(

@@ -4,19 +4,29 @@
 //! `tests/fixtures/probe-guest.wat` is assembled by `wat` at test time and
 //! handed to Wasmtime unchanged.
 
-#![allow(dead_code, unreachable_pub)]
+#![expect(
+    dead_code,
+    unreachable_pub,
+    reason = "this module is compiled separately into every integration test binary, so each \
+              binary sees the helpers the other binaries use as unused `pub` items; splitting it \
+              per binary would duplicate the fixtures the tests are meant to share"
+)]
 
 pub mod qa;
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use claw_plugin_api::capability::{CapabilityGrant, CapabilitySet};
 use claw_plugin_api::limits::ResourceLimits;
-use claw_plugin_api::manifest::{ComponentRef, MANIFEST_VERSION, PluginManifest};
+use claw_plugin_api::manifest::{
+    ComponentRef, MANIFEST_VERSION, ManifestSignature, PluginManifest, SignatureAlgorithm,
+};
 use claw_plugin_api::policy::OperatorPolicy;
 use claw_plugin_api::registry::DeliveryClass;
-use claw_plugin_api::trust::{IdentityBinding, TrustPolicy, component_sha256};
+use claw_plugin_api::trust::{IdentityBinding, TrustPolicy, component_sha256, signing_payload};
+use ed25519_dalek::{Signer, SigningKey};
 
 /// The component text every fixture is derived from.
 pub const PROBE_WAT: &str = include_str!("../fixtures/probe-guest.wat");
@@ -30,6 +40,32 @@ pub const PROBE_VERSION: &str = "0.1.0";
 #[must_use]
 pub fn probe_component() -> Vec<u8> {
     wat::parse_str(PROBE_WAT).expect("the probe fixture must assemble")
+}
+
+/// Assembles a probe whose no-op tool returns an empty JSON object.
+#[must_use]
+pub fn probe_component_returning_json() -> Vec<u8> {
+    let source = probe_wat_lf();
+    let text = source.replacen(
+        "(data (i32.const 1048) \"ok\")",
+        "(data (i32.const 1048) \"{}\")",
+        1,
+    );
+    assert_ne!(text, source, "the JSON response must have been inserted");
+    wat::parse_str(&text).expect("the JSON probe fixture must assemble")
+}
+
+/// Assembles a probe whose unknown-tool error exceeds the fixture id length.
+#[must_use]
+pub fn probe_component_with_oversized_error() -> Vec<u8> {
+    let source = probe_wat_lf();
+    let text = source.replacen(
+        "(i32.store (i32.const 268) (i32.const 13))",
+        "(i32.store (i32.const 268) (i32.const 30))",
+        1,
+    );
+    assert_ne!(text, source, "the oversized error must have been inserted");
+    wat::parse_str(&text).expect("the oversized-error probe fixture must assemble")
 }
 
 /// A self-deleting directory beneath the system temporary directory.
@@ -286,15 +322,41 @@ pub fn probe_component_registering_tools(count: u32) -> Vec<u8> {
         // Each name is two bytes: `t` followed by a distinct letter, written
         // into scratch memory (between the answer buffer and the literals, so
         // it cannot collide with a `cabi_realloc` allocation) before the call.
-        body.push_str(&format!(
+        write!(
+            body,
             "          (i32.store8 (i32.const 640) (i32.const 116))\n          (i32.store8 (i32.const 641) (i32.const {}))\n          (call $h-tools\n            (i32.const 640) (i32.const 2)\n            (i32.const 1108) (i32.const 10)\n            (i32.const 1120) (i32.const 2)\n            (i32.const 288))\n",
             97 + index
-        ));
+        )
+        .expect("writing to a `String` cannot fail");
     }
     body.push_str("          (return (call $answer (i32.const 288) (i32.const 4)))))\n");
     let text = source.replacen(anchor, &format!("{body}{anchor}"), 1);
     assert_ne!(text, source, "the tool loop must be inserted");
     wat::parse_str(&text).expect("the tool-quota fixture must assemble")
+}
+
+/// Assembles a probe that registers one tool and then spins during activation.
+#[must_use]
+pub fn probe_component_registering_tool_then_spinning_on_activate() -> Vec<u8> {
+    let source = probe_wat_lf();
+    let original = concat!(
+        "    (func (export \"activate\") (result i32)\n",
+        "      (i32.store8 (i32.const 192) (i32.const 0))\n",
+        "      (i32.const 192))\n",
+    );
+    let replacement = concat!(
+        "    (func (export \"activate\") (result i32)\n",
+        "      (call $h-tools\n",
+        "        (i32.const 1052) (i32.const 5)\n",
+        "        (i32.const 1108) (i32.const 10)\n",
+        "        (i32.const 1120) (i32.const 2)\n",
+        "        (i32.const 288))\n",
+        "      (loop $activate-spin (br $activate-spin))\n",
+        "      (i32.const 192))\n",
+    );
+    let text = source.replacen(original, replacement, 1);
+    assert_ne!(text, source, "the activation loop must be inserted");
+    wat::parse_str(&text).expect("the activation-loop fixture must assemble")
 }
 
 /// A manifest describing `component` with no capabilities and default limits.
@@ -316,6 +378,25 @@ pub fn manifest_for(component: &[u8]) -> PluginManifest {
         capabilities: Vec::new(),
         limits: ResourceLimits::default(),
         signature: None,
+    }
+}
+
+/// Signs a manifest with the host contract's canonical Ed25519 payload.
+#[must_use]
+pub fn sign_manifest(manifest: &PluginManifest, key: &SigningKey, key_id: &str) -> PluginManifest {
+    let payload = signing_payload(manifest).expect("the fixture manifest must serialize");
+    let signature = key.sign(&payload);
+    let mut value = String::with_capacity(128);
+    for byte in signature.to_bytes() {
+        write!(value, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    PluginManifest {
+        signature: Some(ManifestSignature {
+            algorithm: SignatureAlgorithm::Ed25519,
+            key_id: key_id.to_owned(),
+            value,
+        }),
+        ..manifest.clone()
     }
 }
 
@@ -368,7 +449,7 @@ pub fn install_probe_named(
 ) -> PathBuf {
     let component = probe_component_named(id);
     let mut manifest = manifest_for(&component);
-    manifest.id = id.to_owned();
+    id.clone_into(&mut manifest.id);
     manifest.capabilities = grants;
     install(root, directory, &component, &manifest)
 }

@@ -1,7 +1,7 @@
 //! The single ring-zero authority tool that wraps every typed operation.
 //!
 //! A Crestodian session runs the ordinary agent loop restricted to exactly one
-//! OpenClaw authority tool, `crestodian`. Normal agent sessions never receive
+//! `OpenClaw` authority tool, `crestodian`. Normal agent sessions never receive
 //! it, and a backend that cannot prove the restriction fails closed before any
 //! inference happens rather than running with an unbounded native tool set.
 
@@ -12,13 +12,13 @@ use serde_json::{Map, Value, json};
 
 use crate::mutation::{MutationField, MutationRejection, TypedMutation};
 
-/// Stable name of the only OpenClaw authority tool a Crestodian session may call.
+/// Stable name of the only `OpenClaw` authority tool a Crestodian session may call.
 pub const RING_ZERO_TOOL: &str = "crestodian";
 
 /// Codex's inert native planning utility, tolerated beside the authority tool.
 ///
 /// It can update the model's temporary checklist but cannot write files or
-/// OpenClaw configuration, so it carries no authority of its own.
+/// `OpenClaw` configuration, so it carries no authority of its own.
 pub const CODEX_PLANNER_TOOL: &str = "update_plan";
 
 /// Longest attacker-chosen fragment echoed back into a refusal.
@@ -316,6 +316,15 @@ pub struct RingZeroSession {
 
 impl RingZeroSession {
     /// Opens a ring-zero run, failing closed before any inference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RingZeroDenial::NormalAgentSession`] when an ordinary agent
+    /// session asks for the custodian surface, and
+    /// [`RingZeroDenial::BackendCannotRestrictTools`] when the backend has
+    /// always-on native tools or declares a tool-selection contract this build
+    /// does not recognise, because neither can prove the single-tool
+    /// restriction.
     pub fn open(
         session: SessionKind,
         backend: BackendToolContract,
@@ -342,6 +351,14 @@ impl RingZeroSession {
     }
 
     /// Validates one tool invocation and returns the typed operation it names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RingZeroDenial::ToolNotAllowed`] for a tool outside this run's
+    /// allow-list, [`RingZeroDenial::InertTool`] when the allowed but
+    /// authority-free Codex planner is invoked as an authority tool, and
+    /// [`RingZeroDenial::Arguments`] carrying the [`OperationRejection`] when
+    /// the payload fails the closed argument schema.
     pub fn invoke(
         &self,
         tool: &str,
@@ -360,6 +377,18 @@ impl RingZeroSession {
 }
 
 /// Parses a ring-zero payload into a typed operation under a closed schema.
+///
+/// # Errors
+///
+/// Returns [`OperationRejection::NotAnObject`] when `arguments` is not a JSON
+/// object, [`OperationRejection::UnknownField`] for an argument outside the
+/// closed schema, [`OperationRejection::UnknownOperation`] for an operation name
+/// outside the closed set, [`OperationRejection::UnexpectedField`] for an
+/// argument the named operation does not accept,
+/// [`OperationRejection::MissingField`] for a required argument that is absent
+/// or null, [`OperationRejection::TypeMismatch`] when a required argument is not
+/// a string, and [`OperationRejection::Mutation`] when the typed mutation
+/// surface refuses the requested write.
 pub fn parse_operation(arguments: &Value) -> Result<CrestodianOperation, OperationRejection> {
     let object = arguments
         .as_object()
@@ -425,11 +454,13 @@ fn required_text<'a>(
         .get(field)
         .filter(|value| !value.is_null())
         .ok_or(OperationRejection::MissingField { name: field })?;
-    value.as_str().ok_or(OperationRejection::TypeMismatch {
-        field,
-        expected: "string",
-        found: json_shape(value),
-    })
+    value
+        .as_str()
+        .ok_or_else(|| OperationRejection::TypeMismatch {
+            field,
+            expected: "string",
+            found: json_shape(value),
+        })
 }
 
 /// Maps a validated operation name onto its `'static` spelling.

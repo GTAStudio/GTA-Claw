@@ -271,6 +271,57 @@ fn compaction_replaces_the_oldest_run_and_never_touches_an_anchor() {
 }
 
 #[test]
+fn a_persisted_session_compacts_exactly_as_the_live_one_did() {
+    // Deserialization re-applies the session's bounds, so it has to be an
+    // identity on anything the write path produced: a stored conversation
+    // must compact into the same summary over the same run, or restoring a
+    // session would silently change what the model is shown next.
+    let live = conversation();
+    let encoded = serde_json::to_string(&live).expect("serialized");
+    let mut restored: Session = serde_json::from_str(&encoded).expect("deserialized");
+    assert_eq!(restored, live, "restoring a valid session changes nothing");
+    assert_eq!(
+        serde_json::to_string(&restored).expect("serialized"),
+        encoded,
+        "re-encoding a restored session is byte-identical"
+    );
+
+    let budget = TokenBudget::new(100, 0).expect("valid budget");
+    let policy = SummarizationPolicy::new(50, 2, 10).expect("valid policy");
+    let mut live = live;
+    let mut live_summarizer = RecordingSummarizer {
+        calls: Vec::new(),
+        answer: "the user asked twice".to_owned(),
+    };
+    let mut restored_summarizer = RecordingSummarizer {
+        calls: Vec::new(),
+        answer: "the user asked twice".to_owned(),
+    };
+    let from_live = compact(
+        &mut live,
+        budget,
+        &counter(),
+        policy,
+        &mut live_summarizer,
+        2_000,
+    )
+    .expect("compaction succeeds");
+    let from_restored = compact(
+        &mut restored,
+        budget,
+        &counter(),
+        policy,
+        &mut restored_summarizer,
+        2_000,
+    )
+    .expect("compaction succeeds");
+
+    assert_eq!(from_restored, from_live, "the same run was summarized");
+    assert_eq!(restored_summarizer.calls, live_summarizer.calls);
+    assert_eq!(restored, live, "the sessions stayed identical");
+}
+
+#[test]
 fn a_failing_summarizer_leaves_the_session_exactly_as_it_was() {
     struct FailingSummarizer;
 
@@ -342,6 +393,15 @@ fn assembly_splits_the_budget_and_hands_back_what_retrieval_did_not_use() {
 
     assert_eq!(context.retrieved.len(), 2);
     assert_eq!(context.dropped_retrieved, 1);
+    assert_eq!(
+        context
+            .truncation
+            .retrieved
+            .iter()
+            .map(RecordId::as_str)
+            .collect::<Vec<_>>(),
+        vec!["note-2"]
+    );
     assert_eq!(
         context.retrieved[0].record.id,
         RecordId::new("note-0").expect("valid")
@@ -424,6 +484,9 @@ fn the_assembled_context_serializes_every_part_it_carries() {
     assert_eq!(json["remaining_tokens"], 46);
     assert_eq!(json["dropped_messages"], 0);
     assert_eq!(json["dropped_retrieved"], 0);
+    assert_eq!(json["truncation"]["messages"], serde_json::json!([]));
+    assert_eq!(json["truncation"]["retrieved"], serde_json::json!([]));
+    assert_eq!(json["truncation"]["unexamined_retrieved"], 0);
     let messages = json["messages"].as_array().expect("an array of messages");
     assert_eq!(messages.len(), 5);
     assert_eq!(messages[0]["role"], "system");
@@ -504,9 +567,15 @@ fn the_hashing_model_is_stable_across_instances_and_orderings() {
 #[test]
 fn keyword_retrieval_is_ordered_and_bounded() {
     let mut retriever = KeywordRetriever::new();
-    retriever.insert(record("r1", "s", "the gateway protocol is frozen", 10));
-    retriever.insert(record("r2", "s", "the gateway is open", 20));
-    retriever.insert(record("r3", "s", "unrelated content", 30));
+    retriever
+        .insert(record("r1", "s", "the gateway protocol is frozen", 10))
+        .expect("indexed");
+    retriever
+        .insert(record("r2", "s", "the gateway is open", 20))
+        .expect("indexed");
+    retriever
+        .insert(record("r3", "s", "unrelated content", 30))
+        .expect("indexed");
     let query = RetrievalQuery::new("gateway protocol", 10).expect("valid query");
     let hits = retriever.retrieve(&query).expect("retrieved");
     let identities: Vec<&str> = hits.iter().map(|hit| hit.record.id.as_str()).collect();

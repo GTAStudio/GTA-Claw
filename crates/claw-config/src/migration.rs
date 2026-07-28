@@ -36,10 +36,44 @@ pub struct ManualMapping {
 }
 
 /// A non-fatal migration diagnostic.
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MigrationDiagnostic {
     /// A present value belongs to deploy, build, CI, or an intentionally absent runtime.
     ManualRequired(ManualMapping),
+    /// A recognized runtime variable was applied to the typed configuration.
+    Applied {
+        /// Exact canonical or alias name selected from the supplied environment.
+        legacy_env: &'static str,
+        /// Frozen destination key updated by the mapping.
+        target: &'static str,
+    },
+    /// A supplied name is outside the frozen mapping and was ignored.
+    IgnoredUnknown {
+        /// Exact caller-supplied name.
+        name: String,
+    },
+}
+
+impl Display for MigrationDiagnostic {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ManualRequired(mapping) => write!(
+                formatter,
+                "{} -> {}: manual action required ({})",
+                mapping.legacy_env, mapping.target, mapping.reason
+            ),
+            Self::Applied { legacy_env, target } => {
+                write!(formatter, "{legacy_env} -> {target}: applied")
+            }
+            Self::IgnoredUnknown { name } => {
+                write!(
+                    formatter,
+                    "{name}: ignored because it is not in the frozen mapping"
+                )
+            }
+        }
+    }
 }
 
 /// Result of converting supplied audited environment entries.
@@ -118,6 +152,19 @@ impl Error for MigrationError {
 /// are detected before equal values are deduplicated. Secret values are used
 /// only to determine presence; the output stores an [`SecretRef`] to the
 /// selected environment name.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::DuplicateVariable`] when the same name appears
+/// twice with different values, [`MigrationError::AliasConflict`] when a
+/// canonical name and one of its frozen aliases both carry different nonempty
+/// values for the same target, and [`MigrationError::InvalidValue`] naming the
+/// legacy variable and its target when a value fails its audited conversion, for
+/// example a non-boolean flag, an out-of-range integer, an unknown log level, an
+/// empty `AGENT_ROLE_URL`, or a secret whose environment name is not a valid
+/// [`SecretRef`]. Returns [`MigrationError::Config`] when the fully converted
+/// candidate still fails whole-document validation, which is how cross-field
+/// rules such as an enabled channel missing its credentials are reported.
 pub fn migrate_legacy_environment<'a>(
     variables: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<MigrationResult, MigrationError> {
@@ -185,7 +232,7 @@ fn apply_mappings(
                 if value.is_empty() {
                     return Err(invalid(mapping, "must not be empty"));
                 }
-                wire.core.role.source_url = value.to_owned();
+                value.clone_into(&mut wire.core.role.source_url);
             }
             MappingId::EnabledSkills => {
                 wire.core.legacy.skills.source_urls = split_trimmed(value);
@@ -297,11 +344,16 @@ fn apply_mappings(
             | MappingId::DockerhubToken
             | MappingId::DockerhubImage => unreachable!("handled as manual mapping"),
         }
+        diagnostics.push(MigrationDiagnostic::Applied {
+            legacy_env: name,
+            target: mapping.target,
+        });
     }
 
     if !explicit_device_flow && (infer_device_from_existing_client || explicit_device_client_id) {
         wire.core.auth.github.device.enabled = wire.core.auth.github.device.client_id.is_some();
     }
+    append_unknown_diagnostics(variables, &mut diagnostics);
 
     Ok((wire, diagnostics))
 }
@@ -309,9 +361,28 @@ fn apply_mappings(
 pub(crate) fn apply_legacy_environment_layer<'a>(
     base: EnvelopeWire,
     variables: impl IntoIterator<Item = (&'a str, &'a str)>,
-) -> Result<EnvelopeWire, MigrationError> {
+) -> Result<(EnvelopeWire, Vec<MigrationDiagnostic>), MigrationError> {
     let variables = collect_variables(variables)?;
-    apply_mappings(&variables, base, false).map(|(wire, _)| wire)
+    apply_mappings(&variables, base, false)
+}
+
+fn append_unknown_diagnostics(
+    variables: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<MigrationDiagnostic>,
+) {
+    let known_names: BTreeSet<_> = LEGACY_MAPPINGS
+        .iter()
+        .flat_map(|mapping| {
+            std::iter::once(mapping.legacy_env).chain(mapping.aliases.iter().copied())
+        })
+        .collect();
+    diagnostics.extend(
+        variables
+            .keys()
+            .filter(|name| !known_names.contains(name.as_str()))
+            .cloned()
+            .map(|name| MigrationDiagnostic::IgnoredUnknown { name }),
+    );
 }
 
 fn collect_variables<'a>(
@@ -415,10 +486,9 @@ fn parse_integer_prefix(value: &str) -> IntegerPrefix {
     if end == start_digits {
         return IntegerPrefix::Missing;
     }
-    match value[..end].parse() {
-        Ok(value) => IntegerPrefix::Parsed(value),
-        Err(_) => IntegerPrefix::Overflow,
-    }
+    value[..end]
+        .parse()
+        .map_or(IntegerPrefix::Overflow, IntegerPrefix::Parsed)
 }
 
 pub(crate) fn parse_legacy_integer(

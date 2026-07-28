@@ -1,0 +1,55 @@
+[package]
+name = "gta-claw-android-shell"
+description = "Native Slint Android shell for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+claw-platform.workspace = true
+gta-claw-android.workspace = true
+slint.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+skia-safe.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.android]
+package = "com.gtastudio.gtaclaw"
+apk_name = "gta-claw-android"
+build_targets = [
+  "aarch64-linux-android",
+  "x86_64-linux-android",
+]
+strip = "strip"
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 36
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[package.metadata.android.application]
+label = "GTA Claw"
+theme = "@android:style/Theme.Material.Light.NoActionBar"
+uses_cleartext_traffic = true
+
+[package.metadata.android.application.activity]
+config_changes = "orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|uiMode"
+exported = true
+launch_mode = "singleTop"
+orientation = "unspecified"
+resizeable_activity = true

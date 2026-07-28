@@ -8,14 +8,18 @@
 
 use claw_memory::budget::{Admission, plan_truncation};
 use claw_memory::retrieval::{
-    KeywordRetriever, MAX_QUERY_BYTES, MAX_RETRIEVAL_LIMIT, MemoryRecord, RecordKind,
-    RetrievalError, RetrievalQuery, Retriever,
+    KeywordRetriever, MAX_KEYWORD_RECORD_TERMS, MAX_QUERY_BYTES, MAX_RECORD_BYTES, MAX_RECORD_TAGS,
+    MAX_RETRIEVAL_LIMIT, MAX_TAG_BYTES, MemoryRecord, RecordError, RecordKind, RetrievalCoverage,
+    RetrievalError, RetrievalQuery, Retriever, VectorRetriever,
 };
 use claw_memory::session::{
     MAX_MESSAGE_BYTES, MAX_MESSAGES, MAX_SUMMARIES, MessageId, Role, Session, SessionError,
     SessionId, Summary,
 };
-use claw_memory::vector::{Embedding, ExactVectorIndex, RecordId, VectorError, VectorIndex};
+use claw_memory::store::{InMemoryMemoryStore, MemoryStore, StoreError};
+use claw_memory::vector::{
+    Embedding, ExactVectorIndex, HashingEmbeddingModel, RecordId, VectorError, VectorIndex,
+};
 use claw_memory::{HeuristicTokenCounter, TokenBudget};
 use std::collections::BTreeSet;
 
@@ -121,6 +125,70 @@ fn a_session_stops_accepting_summaries_at_the_retained_summary_bound() {
 }
 
 #[test]
+fn a_persisted_document_cannot_restore_a_session_past_its_bounds() {
+    // Every bound above is enforced on the write path. Deserialization is the
+    // one way into a `Session` that skips it, so a stored or transmitted
+    // document is exactly where an unbounded history would come back in.
+    let mut messages = vec![
+        "{\"id\":0,\"role\":\"system\",\"content\":\"rules\",\
+         \"unix_millis\":1,\"pinned\":false}"
+            .to_owned(),
+    ];
+    for ordinal in 1..=MAX_MESSAGES {
+        let id = ordinal as u64;
+        messages.push(format!(
+            "{{\"id\":{id},\"role\":\"user\",\"content\":\"x\",\
+             \"unix_millis\":{id},\"pinned\":false}}"
+        ));
+    }
+    let summaries: Vec<String> = (0..=MAX_SUMMARIES)
+        .map(|ordinal| {
+            let first = ordinal as u64;
+            format!(
+                "{{\"first\":{first},\"last\":{first},\"text\":\"compacted\",\
+                 \"unix_millis\":1}}"
+            )
+        })
+        .collect();
+    let document = format!(
+        "{{\"id\":\"restored\",\"messages\":[{}],\"summaries\":[{}],\"next_ordinal\":0}}",
+        messages.join(","),
+        summaries.join(",")
+    );
+
+    let restored: Session = serde_json::from_str(&document)
+        .expect("an over-bound document loads rather than failing an existing save");
+    assert_eq!(
+        restored.len(),
+        MAX_MESSAGES,
+        "the retained-message bound holds after loading"
+    );
+    assert_eq!(
+        restored.summaries().len(),
+        MAX_SUMMARIES,
+        "the retained-summary bound holds after loading"
+    );
+    assert_eq!(
+        restored.messages()[0].id,
+        MessageId::new(0),
+        "the anchor is never what gets shed"
+    );
+    assert_eq!(
+        restored.last().map(|message| message.id),
+        Some(MessageId::new(MAX_MESSAGES as u64)),
+        "the newest message survives"
+    );
+
+    // The restored session is a working session, not just a bounded one: the
+    // next append is refused at the bound exactly as it would have been.
+    let mut restored = restored;
+    assert_eq!(
+        restored.append(Role::User, "one too many", 9_999).err(),
+        Some(SessionError::TooManyMessages)
+    );
+}
+
+#[test]
 fn a_retrieval_query_past_the_byte_bound_is_refused_before_tokenization() {
     let at_bound = RetrievalQuery::new(&"q".repeat(MAX_QUERY_BYTES), 5);
     assert_eq!(
@@ -145,6 +213,125 @@ fn a_retrieval_limit_past_the_result_bound_is_refused() {
     );
 }
 
+#[test]
+fn memory_record_bounds_are_enforced_before_storage_or_indexing() {
+    let at_bound = record("at-bound", &"x".repeat(MAX_RECORD_BYTES), 1);
+    assert_eq!(at_bound.validate(), Ok(()));
+
+    let oversized = record("oversized", &"x".repeat(MAX_RECORD_BYTES + 1), 2);
+    assert_eq!(oversized.validate(), Err(RecordError::TextTooLong));
+
+    let mut store = InMemoryMemoryStore::default();
+    assert_eq!(
+        store.put_record(oversized.clone()),
+        Err(StoreError::RecordTooLarge)
+    );
+
+    let mut keyword = KeywordRetriever::new();
+    assert_eq!(
+        keyword.insert(oversized.clone()),
+        Err(RetrievalError::InvalidRecord(RecordError::TextTooLong))
+    );
+
+    let mut vector = VectorRetriever::new(
+        HashingEmbeddingModel::new(8).expect("valid model"),
+        ExactVectorIndex::new(8).expect("valid index"),
+    );
+    assert_eq!(
+        vector.insert(oversized),
+        Err(RetrievalError::InvalidRecord(RecordError::TextTooLong))
+    );
+    assert!(keyword.is_empty());
+    assert!(vector.is_empty());
+}
+
+#[test]
+fn record_tag_count_and_size_are_bounded() {
+    let mut too_many = record("too-many-tags", "body", 1);
+    too_many.tags = (0..=MAX_RECORD_TAGS)
+        .map(|index| format!("tag-{index}"))
+        .collect();
+    assert_eq!(too_many.validate(), Err(RecordError::TooManyTags));
+
+    let mut oversized = record("oversized-tag", "body", 2);
+    oversized.tags.insert("x".repeat(MAX_TAG_BYTES + 1));
+    assert_eq!(oversized.validate(), Err(RecordError::TagTooLong));
+
+    let mut store = InMemoryMemoryStore::default();
+    assert_eq!(store.put_record(too_many), Err(StoreError::TooManyTags));
+    assert_eq!(store.put_record(oversized), Err(StoreError::TagTooLong));
+}
+
+#[test]
+fn keyword_records_with_unbounded_lexical_indexes_are_refused() {
+    let text = (0..=MAX_KEYWORD_RECORD_TERMS)
+        .map(|index| format!("term{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(text.len() < MAX_RECORD_BYTES);
+    let mut retriever = KeywordRetriever::new();
+    assert_eq!(
+        retriever.insert(record("many-terms", &text, 1)),
+        Err(RetrievalError::TooManyRecordTerms)
+    );
+    assert!(retriever.is_empty());
+}
+
+#[test]
+fn retrieval_reports_when_the_result_limit_hides_matches() {
+    let mut retriever = KeywordRetriever::with_capacity(3).expect("valid capacity");
+    for index in 0..3_u64 {
+        retriever
+            .insert(record(&format!("r{index}"), "common", index))
+            .expect("indexed");
+    }
+
+    let limited = RetrievalQuery::new("common", 2).expect("valid query");
+    let report = retriever.retrieve_with_report(&limited).expect("retrieved");
+    assert_eq!(report.items.len(), 2);
+    assert_eq!(report.examined_records, 3);
+    assert_eq!(report.matched_records, 3);
+    assert_eq!(report.coverage, RetrievalCoverage::Partial);
+    assert!(!report.is_complete());
+
+    let complete = RetrievalQuery::new("common", 3).expect("valid query");
+    let report = retriever
+        .retrieve_with_report(&complete)
+        .expect("retrieved");
+    assert_eq!(report.items.len(), 3);
+    assert_eq!(report.coverage, RetrievalCoverage::Complete);
+    assert!(report.is_complete());
+}
+
+#[test]
+fn vector_retrieval_reports_when_its_candidate_window_is_not_exhaustive() {
+    let mut retriever = VectorRetriever::new(
+        HashingEmbeddingModel::new(16).expect("valid model"),
+        ExactVectorIndex::with_capacity(16, 5).expect("valid index"),
+    );
+    for index in 0..5_u64 {
+        retriever
+            .insert(record(&format!("r{index}"), "identical common text", index))
+            .expect("indexed");
+    }
+
+    let limited = RetrievalQuery::new("identical common text", 1).expect("valid query");
+    let report = retriever.retrieve_with_report(&limited).expect("retrieved");
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(report.examined_records, 4);
+    assert_eq!(report.matched_records, 4);
+    assert_eq!(report.coverage, RetrievalCoverage::Partial);
+
+    let complete = RetrievalQuery::new("identical common text", 5).expect("valid query");
+    let report = retriever
+        .retrieve_with_report(&complete)
+        .expect("retrieved");
+    assert_eq!(report.items.len(), 5);
+    assert_eq!(report.examined_records, 5);
+    assert_eq!(report.matched_records, 5);
+    assert_eq!(report.coverage, RetrievalCoverage::Complete);
+}
+
 /// The keyword retriever keeps a bounded working set instead of cloning every
 /// match, so this proves the bounded implementation still returns the globally
 /// best results and not merely the first ones it happened to see.
@@ -155,15 +342,23 @@ fn a_bounded_keyword_working_set_still_returns_the_globally_best_matches() {
     // would clone all sixty. Records are inserted worst-first so a naive
     // truncation would keep the wrong ones.
     for ordinal in 0..60_u64 {
-        retriever.insert(record(
-            &format!("weak-{ordinal:03}"),
-            "alpha filler text",
-            2_000 + ordinal,
-        ));
+        retriever
+            .insert(record(
+                &format!("weak-{ordinal:03}"),
+                "alpha filler text",
+                2_000 + ordinal,
+            ))
+            .expect("indexed");
     }
-    retriever.insert(record("strong-a", "alpha beta gamma", 3_000));
-    retriever.insert(record("strong-b", "alpha beta gamma", 3_001));
-    retriever.insert(record("middle", "alpha beta", 3_002));
+    retriever
+        .insert(record("strong-a", "alpha beta gamma", 3_000))
+        .expect("indexed");
+    retriever
+        .insert(record("strong-b", "alpha beta gamma", 3_001))
+        .expect("indexed");
+    retriever
+        .insert(record("middle", "alpha beta", 3_002))
+        .expect("indexed");
 
     let query = RetrievalQuery::new("alpha beta gamma", 3).expect("valid query");
     let hits = retriever.retrieve(&query).expect("retrieval succeeds");
@@ -316,4 +511,61 @@ fn a_window_of_only_tool_results_is_dropped_entirely_and_costs_nothing() {
     // System body of 16 characters is 4 tokens, plus 2 for the six-character
     // role name, and nothing else was admitted.
     assert_eq!(plan.used_tokens(), 6);
+}
+
+/// The keyword corpus is the same attacker-influenced record set the vector
+/// index holds, so it carries the same bound rather than relying on whoever
+/// owns it to stop inserting.
+#[test]
+fn a_full_keyword_corpus_refuses_new_records_but_still_accepts_replacements() {
+    let mut retriever = KeywordRetriever::with_capacity(2).expect("valid retriever");
+    assert_eq!(retriever.capacity(), 2);
+
+    retriever
+        .insert(record("first", "alpha", 1))
+        .expect("the first record fits");
+    retriever
+        .insert(record("second", "beta", 2))
+        .expect("the second record fits");
+
+    assert_eq!(
+        retriever.insert(record("third", "gamma", 3)).err(),
+        Some(RetrievalError::RetrieverFull)
+    );
+    assert_eq!(retriever.len(), 2, "the refused record was never indexed");
+    assert!(
+        retriever
+            .retrieve(&RetrievalQuery::new("gamma", 5).expect("valid query"))
+            .expect("retrieval succeeds")
+            .is_empty(),
+        "a record the retriever refused must not be searchable"
+    );
+
+    retriever
+        .insert(record("first", "delta", 4))
+        .expect("replacing an indexed record does not grow the corpus");
+    assert_eq!(retriever.len(), 2);
+
+    assert!(retriever.remove(&RecordId::new("second").expect("valid identifier")));
+    retriever
+        .insert(record("third", "gamma", 5))
+        .expect("removal is the eviction path, and it frees a slot");
+    assert_eq!(retriever.len(), 2);
+}
+
+#[test]
+fn a_retriever_with_no_capacity_is_refused_at_construction() {
+    assert_eq!(
+        KeywordRetriever::with_capacity(0).err(),
+        Some(RetrievalError::EmptyCapacity)
+    );
+}
+
+#[test]
+fn the_default_keyword_and_vector_bounds_are_the_same_number() {
+    assert_eq!(
+        KeywordRetriever::new().capacity(),
+        ExactVectorIndex::new(2).expect("valid index").capacity(),
+        "the two holders of the same records must not disagree about how many is too many"
+    );
 }

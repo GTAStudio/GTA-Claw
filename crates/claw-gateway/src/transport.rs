@@ -29,6 +29,10 @@ const WEBSOCKET_KEY_BYTES: usize = 16;
 const MAX_UPGRADE_HEADERS: usize = 64;
 
 /// A stream that replays bytes read past the end of the HTTP upgrade.
+///
+/// The prefix is freed as soon as it has been fully replayed. It can be up to
+/// `max_http_upgrade_bytes` and the wrapper lives for the whole connection, so
+/// keeping it would be a per-connection allocation held for no reason.
 #[derive(Debug)]
 pub struct ReplayStream<S> {
     prefix: Vec<u8>,
@@ -58,6 +62,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for ReplayStream<S> {
             let count = available.len().min(buffer.remaining());
             buffer.put_slice(&available[..count]);
             self.offset += count;
+            if self.offset == self.prefix.len() {
+                self.prefix = Vec::new();
+                self.offset = 0;
+            }
+            // A zero-capacity `buffer` yields zero bytes here rather than
+            // touching `inner`, which callers must not read as end of stream.
             return Poll::Ready(Ok(()));
         }
         Pin::new(&mut self.inner).poll_read(context, buffer)
@@ -252,9 +262,8 @@ pub async fn accept(
             .await;
         }
         let mut chunk = [0_u8; 1024];
-        let count = match stream.read(&mut chunk).await {
-            Ok(count) => count,
-            Err(_) => return Err(HandshakeError::UnexpectedEof),
+        let Ok(count) = stream.read(&mut chunk).await else {
+            return Err(HandshakeError::UnexpectedEof);
         };
         if count == 0 {
             return Err(HandshakeError::UnexpectedEof);
@@ -363,7 +372,7 @@ impl MessageReader {
             let frame = socket
                 .read_frame(&mut |_| async { Ok::<(), std::io::Error>(()) })
                 .await
-                .map_err(|error| map_read_error(error, limit))?;
+                .map_err(|error| map_read_error(&error, limit))?;
             if let Some(inbound) = self.consume(frame, limit)? {
                 return Ok(inbound);
             }
@@ -455,7 +464,7 @@ fn validate_utf8(bytes: Vec<u8>) -> Result<Vec<u8>, WireError> {
     }
 }
 
-fn map_read_error(error: WebSocketError, limit: usize) -> WireError {
+const fn map_read_error(error: &WebSocketError, limit: usize) -> WireError {
     match error {
         WebSocketError::FrameTooLarge => WireError::MessageTooLarge {
             limit,
@@ -495,7 +504,11 @@ pub async fn write_text(socket: &mut ServerWrite, bytes: Vec<u8>) -> Result<(), 
 ///
 /// Returns [`WireError::Write`] when the peer half is gone, or
 /// [`WireError::Protocol`] when the payload exceeds the control-frame limit.
-pub async fn write_ping(socket: &mut ServerWrite, payload: Vec<u8>) -> Result<(), WireError> {
+pub async fn write_ping(
+    socket: &mut ServerWrite,
+    payload: impl AsRef<[u8]>,
+) -> Result<(), WireError> {
+    let payload = payload.as_ref();
     if payload.len() > MAX_CONTROL_PAYLOAD_BYTES {
         return Err(WireError::Protocol("oversized control frame"));
     }
@@ -504,7 +517,7 @@ pub async fn write_ping(socket: &mut ServerWrite, payload: Vec<u8>) -> Result<()
             true,
             OpCode::Ping,
             None,
-            Payload::Owned(payload),
+            Payload::Borrowed(payload),
         ))
         .await
         .map_err(|_| WireError::Write)?;
@@ -880,22 +893,22 @@ mod tests {
     #[test]
     fn read_errors_map_to_typed_wire_errors() {
         assert_eq!(
-            map_read_error(WebSocketError::FrameTooLarge, 64),
+            map_read_error(&WebSocketError::FrameTooLarge, 64),
             WireError::MessageTooLarge {
                 limit: 64,
                 actual: 65
             }
         );
         assert_eq!(
-            map_read_error(WebSocketError::ConnectionClosed, 64),
+            map_read_error(&WebSocketError::ConnectionClosed, 64),
             WireError::Closed
         );
         assert_eq!(
-            map_read_error(WebSocketError::UnexpectedEOF, 64),
+            map_read_error(&WebSocketError::UnexpectedEOF, 64),
             WireError::Closed
         );
         assert_eq!(
-            map_read_error(WebSocketError::InvalidCloseCode, 64),
+            map_read_error(&WebSocketError::InvalidCloseCode, 64),
             WireError::Protocol("invalid close code")
         );
     }

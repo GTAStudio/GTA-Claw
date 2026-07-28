@@ -6,7 +6,7 @@
 //! and a base URL taken from configuration. TLS authenticates whichever host
 //! the configuration names — it does not prove that host is the one the
 //! credential belongs to. So any input that can influence configuration could
-//! keep `provider = openai`, keep the stored OpenAI key, point `base_url` at an
+//! keep `provider = openai`, keep the key stored for it, point `base_url` at an
 //! attacker's HTTPS origin, and the next completion would ship the key there.
 //! The same shape applied to the GitHub Copilot token-exchange and API URLs,
 //! where the credential at risk is a long-lived GitHub OAuth token.
@@ -115,10 +115,11 @@ impl Origin {
                 });
             }
         }
-        let text = match url.port() {
-            Some(port) => format!("{scheme}://{}:{port}", host.to_ascii_lowercase()),
-            None => format!("{scheme}://{}", host.to_ascii_lowercase()),
-        };
+        let host = host.to_ascii_lowercase();
+        let text = url.port().map_or_else(
+            || format!("{scheme}://{host}"),
+            |port| format!("{scheme}://{host}:{port}"),
+        );
         Ok(Self { text })
     }
 

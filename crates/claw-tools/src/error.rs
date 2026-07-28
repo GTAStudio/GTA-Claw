@@ -94,13 +94,12 @@ impl ToolError {
     pub const fn audit_reason(&self) -> AuditReason {
         match self {
             Self::UnknownTool | Self::DuplicateTool => AuditReason::UnknownTool,
-            Self::Schema(_) => AuditReason::ValidationRejected,
+            Self::Schema(_) | Self::Patch(_) => AuditReason::ValidationRejected,
             Self::Permission(_) => AuditReason::PolicyRejected,
             Self::Sandbox(SandboxError::FileTooLarge | SandboxError::DirectoryTooLarge) => {
                 AuditReason::LimitExceeded
             }
             Self::Sandbox(_) => AuditReason::SandboxRejected,
-            Self::Patch(_) => AuditReason::ValidationRejected,
             Self::Execution(_) | Self::Network(_) | Self::Audit(_) => AuditReason::ExecutionFailed,
         }
     }

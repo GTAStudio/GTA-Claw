@@ -36,7 +36,33 @@ $env:GTA_CLAW_WIX = 'D:\tools\wix.exe'
 The package scripts perform no network access. Provision Rust targets, locked
 Cargo sources, the Windows SDK, both MSVC architecture components, and the
 pinned WiX CLI before invoking them. This separates online acquisition from an
-offline-capable reproducible build.
+offline-capable reproducible build. Packaging fails before Cargo starts unless
+the active `rustc` and `cargo` both match the repository's exact Rust 1.97.1
+pin. Completed output directories are replaced transactionally: a failed
+package or bundle run removes its partial work and preserves the previous
+validated output.
+
+## Install, upgrade, repair, and remove
+
+The MSI is per-machine and therefore requires elevation. Its default install
+includes both features; unattended deployment can select either feature:
+
+```powershell
+msiexec /i .\gta-claw-<version>-windows-x64-signed.msi /qn
+msiexec /i .\gta-claw-<version>-windows-x64-signed.msi /qn ADDLOCAL=GTAClaw,Gui
+msiexec /i .\gta-claw-<version>-windows-x64-signed.msi /qn ADDLOCAL=GTAClaw,Headless
+msiexec /fa .\gta-claw-<version>-windows-x64-signed.msi /qn
+msiexec /x .\gta-claw-<version>-windows-x64-signed.msi /qn
+```
+
+A newer MSI of the same architecture performs a rollback-safe major upgrade,
+migrates the selected features, and removes the older product. Downgrades are
+rejected; rerunning the same-version package enters standard MSI maintenance
+rather than a major upgrade. Modify, Repair, and Remove entries remain
+available in Windows Apps settings, and no installed component is permanent.
+x64 and arm64 use distinct upgrade identities and cannot replace one another.
+MSIX install, update, rollback, and removal remain managed by Windows package
+deployment.
 
 ## Published-byte validation
 
@@ -55,7 +81,7 @@ offline-capable reproducible build.
   Slint/JavaScript markers. `cargo tree --offline` separately proves that the
   entire headless dependency graph contains no Slint crate.
 - SBOM and provenance subjects must hash the exact published bytes, and the
-  directory checksum manifest must verify.
+  per-artifact and directory checksum manifests must verify.
 
 ## Signing
 

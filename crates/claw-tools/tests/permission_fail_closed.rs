@@ -50,7 +50,7 @@ fn workspace() -> (TempTree, Sandbox) {
     (tree, sandbox)
 }
 
-fn read_grant() -> GrantRequest {
+const fn read_grant() -> GrantRequest {
     GrantRequest {
         capability: Capability::FilesystemRead,
         scope: GrantScope::PathPrefix(String::new()),

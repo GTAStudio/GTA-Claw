@@ -3,10 +3,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use claw_config::{ConfigError, ConfigSnapshot, load_file, write_file};
+use claw_config::{ConfigError, ConfigSnapshot, WriteWarning, parse_json5, write_file};
 
 use crate::setup::{read_optional_file, restore_paths};
-use crate::state::{CrestodianState, ensure_parent_directory, read_state, write_state};
+use crate::state::{CrestodianState, decode_state, ensure_parent_directory, write_state};
 use crate::{CRESTODIAN_STATE_SCHEMA_VERSION, CrestodianError};
 
 static RECOVERY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -62,6 +62,41 @@ pub struct RecoveryAssessment {
     pub state: StateCondition,
 }
 
+/// Operator-facing next step derived from a recovery assessment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryGuidance {
+    /// Both files are healthy.
+    NoAction,
+    /// Neither file exists, so guided first-run setup is the clearest path.
+    RunGuidedSetup,
+    /// Corrupt or partially missing state can be rebuilt from a known-good config.
+    RecoverFromBaseline,
+    /// A newer schema must be handled by a compatible build rather than overwritten.
+    UseCompatibleBuild,
+}
+
+impl RecoveryAssessment {
+    /// Returns the safest operator action for this assessment.
+    #[must_use]
+    pub const fn guidance(&self) -> RecoveryGuidance {
+        if matches!(self.config, ConfigCondition::Incompatible { .. })
+            || matches!(self.state, StateCondition::Incompatible { .. })
+        {
+            RecoveryGuidance::UseCompatibleBuild
+        } else if matches!(self.config, ConfigCondition::Healthy)
+            && matches!(self.state, StateCondition::Healthy)
+        {
+            RecoveryGuidance::NoAction
+        } else if matches!(self.config, ConfigCondition::Missing)
+            && matches!(self.state, StateCondition::Missing)
+        {
+            RecoveryGuidance::RunGuidedSetup
+        } else {
+            RecoveryGuidance::RecoverFromBaseline
+        }
+    }
+}
+
 /// One recovery mutation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecoveryAction {
@@ -89,6 +124,14 @@ pub struct RecoveryReport {
     pub backup_directory: Option<PathBuf>,
     /// Backups of orphaned atomic-write temporary files.
     pub interrupted_artifact_backups: Vec<PathBuf>,
+    /// Non-fatal atomic-write warnings raised while republishing.
+    ///
+    /// A [`WriteWarning::DirectorySyncFailed`] here means a replacement was
+    /// published by rename but its directory entry could not be synchronized,
+    /// so recovery completed without being able to promise the result survives
+    /// a power cut. It is reported rather than swallowed because the caller is
+    /// the only one that can decide whether that is acceptable.
+    pub warnings: Vec<WriteWarning>,
 }
 
 /// Setup and recovery owner for caller-selected paths.
@@ -122,12 +165,35 @@ impl Crestodian {
     /// Original bytes and orphaned atomic-write artifacts are copied and flushed
     /// before any replacement. If a later write fails, every earlier mutation is
     /// restored to its exact original bytes.
+    ///
+    /// A successful recovery still reports every non-fatal atomic-write warning
+    /// in [`RecoveryReport::warnings`], so a directory that could not be synced
+    /// is visible to the caller instead of being swallowed by the success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrestodianError::UnsafePath`] when the configuration or state
+    /// path exists but is not a regular file, and [`CrestodianError::Io`] when
+    /// no unique recovery directory can be allocated, an original file or an
+    /// orphaned atomic-write artifact cannot be read, or a backup cannot be
+    /// written, `fsync`-ed, and published into a synced directory. Returns
+    /// [`CrestodianError::Config`] when the baseline itself cannot be written
+    /// atomically. If the state write fails after the configuration was already
+    /// replaced, both files are restored to their exact original bytes and the
+    /// original failure is returned as-is, or wrapped in
+    /// [`CrestodianError::Rollback`] listing every restoration that also failed.
+    /// Nothing is ever replaced before its backup is durable.
     pub fn recover(
         &self,
         baseline: &ConfigSnapshot,
         unix_millis: u64,
     ) -> Result<RecoveryReport, CrestodianError> {
-        let before = self.inspect();
+        let original_config = read_recoverable_file(&self.config_path)?;
+        let original_state = read_recoverable_file(&self.state_path)?;
+        let before = RecoveryAssessment {
+            config: inspect_config_bytes(&self.config_path, original_config.as_deref()),
+            state: inspect_state_bytes(&self.state_path, original_state.as_deref()),
+        };
         let repair_config = !matches!(before.config, ConfigCondition::Healthy);
         let repair_state = !matches!(before.state, StateCondition::Healthy);
         if !repair_config && !repair_state {
@@ -137,63 +203,73 @@ impl Crestodian {
                 state_action: RecoveryAction::Unchanged,
                 backup_directory: None,
                 interrupted_artifact_backups: Vec::new(),
+                warnings: Vec::new(),
             });
         }
 
-        let original_config = if repair_config {
-            read_recoverable_file(&self.config_path)?
-        } else {
-            None
-        };
-        let original_state = if repair_state {
-            read_recoverable_file(&self.state_path)?
-        } else {
-            None
-        };
-        let backup_directory = create_backup_directory(&self.config_path)?;
-        let config_backup = original_config
-            .as_deref()
-            .map(|bytes| backup_bytes(&backup_directory, "config.original", bytes))
+        let interrupted_artifacts = read_interrupted_artifacts(&self.config_path)?;
+        let needs_backup = repair_config && original_config.is_some()
+            || repair_state && original_state.is_some()
+            || !interrupted_artifacts.is_empty();
+        let backup_directory = needs_backup
+            .then(|| create_backup_directory(&self.config_path))
             .transpose()?;
-        let state_backup = original_state
-            .as_deref()
-            .map(|bytes| backup_bytes(&backup_directory, "state.original", bytes))
-            .transpose()?;
-        let interrupted_artifact_backups =
-            backup_interrupted_artifacts(&self.config_path, &backup_directory)?;
+        let config_backup = match (&backup_directory, repair_config) {
+            (Some(directory), true) => original_config
+                .as_deref()
+                .map(|bytes| backup_bytes(directory, "config.original", bytes))
+                .transpose()?,
+            _ => None,
+        };
+        let state_backup = match (&backup_directory, repair_state) {
+            (Some(directory), true) => original_state
+                .as_deref()
+                .map(|bytes| backup_bytes(directory, "state.original", bytes))
+                .transpose()?,
+            _ => None,
+        };
+        let interrupted_artifact_backups = match &backup_directory {
+            Some(directory) => backup_interrupted_artifacts(&interrupted_artifacts, directory)?,
+            None => Vec::new(),
+        };
 
-        let config_action = action(original_config.as_ref(), config_backup);
-        let state_action = action(original_state.as_ref(), state_backup);
-        let mut config_mutated = false;
-        if repair_config {
+        let config_action = action(config_backup);
+        let state_action = action(state_backup);
+        let mut warnings = Vec::new();
+        let config_mutated = if repair_config {
             ensure_parent_directory(&self.config_path)?;
-            write_file(&self.config_path, baseline)?;
-            config_mutated = true;
-        }
+            warnings.extend(write_file(&self.config_path, baseline)?.warnings);
+            true
+        } else {
+            false
+        };
         if repair_state {
             let state = CrestodianState {
                 last_recovery_unix_ms: Some(unix_millis),
                 ..CrestodianState::default()
             };
-            if let Err(operation) = write_state(&self.state_path, &state) {
-                let mut restore_failures = Vec::new();
-                if config_mutated {
+            match write_state(&self.state_path, &state) {
+                Ok(outcome) => warnings.extend(outcome.warnings),
+                Err(operation) => {
+                    let mut restore_failures = Vec::new();
+                    if config_mutated {
+                        restore_failures.extend(restore_paths([(
+                            self.config_path.as_path(),
+                            original_config.as_deref(),
+                        )]));
+                    }
                     restore_failures.extend(restore_paths([(
-                        self.config_path.as_path(),
-                        original_config.as_deref(),
+                        self.state_path.as_path(),
+                        original_state.as_deref(),
                     )]));
+                    if restore_failures.is_empty() {
+                        return Err(operation);
+                    }
+                    return Err(CrestodianError::Rollback {
+                        operation: Box::new(operation),
+                        restore_failures,
+                    });
                 }
-                restore_failures.extend(restore_paths([(
-                    self.state_path.as_path(),
-                    original_state.as_deref(),
-                )]));
-                if restore_failures.is_empty() {
-                    return Err(operation);
-                }
-                return Err(CrestodianError::Rollback {
-                    operation: Box::new(operation),
-                    restore_failures,
-                });
             }
         }
         Ok(RecoveryReport {
@@ -208,18 +284,36 @@ impl Crestodian {
             } else {
                 RecoveryAction::Unchanged
             },
-            backup_directory: Some(backup_directory),
+            backup_directory,
             interrupted_artifact_backups,
+            warnings,
         })
     }
 }
 
 fn inspect_config(path: &Path) -> ConfigCondition {
-    match load_file(path) {
-        Ok(_) => ConfigCondition::Healthy,
-        Err(ConfigError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-            ConfigCondition::Missing
+    match read_recoverable_file(path) {
+        Ok(bytes) => inspect_config_bytes(path, bytes.as_deref()),
+        Err(error) => ConfigCondition::Corrupt {
+            diagnostic: error.to_string(),
+        },
+    }
+}
+
+fn inspect_config_bytes(path: &Path, bytes: Option<&[u8]>) -> ConfigCondition {
+    let Some(bytes) = bytes else {
+        return ConfigCondition::Missing;
+    };
+    let source = match std::str::from_utf8(bytes) {
+        Ok(source) => source,
+        Err(error) => {
+            return ConfigCondition::Corrupt {
+                diagnostic: format!("{}: invalid UTF-8: {error}", path.display()),
+            };
         }
+    };
+    match parse_json5(source, &path.display().to_string()) {
+        Ok(_) => ConfigCondition::Healthy,
         Err(ConfigError::UnsupportedVersion { found, supported }) => {
             ConfigCondition::Incompatible { found, supported }
         }
@@ -230,7 +324,19 @@ fn inspect_config(path: &Path) -> ConfigCondition {
 }
 
 fn inspect_state(path: &Path) -> StateCondition {
-    match read_state(path) {
+    match read_recoverable_file(path) {
+        Ok(bytes) => inspect_state_bytes(path, bytes.as_deref()),
+        Err(error) => StateCondition::Corrupt {
+            diagnostic: error.to_string(),
+        },
+    }
+}
+
+fn inspect_state_bytes(path: &Path, bytes: Option<&[u8]>) -> StateCondition {
+    let Some(bytes) = bytes else {
+        return StateCondition::Missing;
+    };
+    match decode_state(path, bytes) {
         Ok(state) if state.schema_version == CRESTODIAN_STATE_SCHEMA_VERSION => {
             StateCondition::Healthy
         }
@@ -238,12 +344,6 @@ fn inspect_state(path: &Path) -> StateCondition {
             found: state.schema_version,
             supported: CRESTODIAN_STATE_SCHEMA_VERSION,
         },
-        Err(CrestodianError::Io { source, .. })
-            if source.kind() == io::ErrorKind::NotFound
-                || source.kind() == io::ErrorKind::NotADirectory =>
-        {
-            StateCondition::Missing
-        }
         Err(error) => StateCondition::Corrupt {
             diagnostic: error.to_string(),
         },
@@ -312,10 +412,9 @@ fn backup_bytes(directory: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, C
     Ok(path)
 }
 
-fn backup_interrupted_artifacts(
+fn read_interrupted_artifacts(
     config_path: &Path,
-    backup_directory: &Path,
-) -> Result<Vec<PathBuf>, CrestodianError> {
+) -> Result<Vec<(String, Vec<u8>)>, CrestodianError> {
     let parent = config_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -325,13 +424,16 @@ fn backup_interrupted_artifacts(
         .and_then(|name| name.to_str())
         .unwrap_or("config");
     let prefix = format!(".{file_name}.gta-claw.tmp.");
-    let mut sources = fs::read_dir(parent)
-        .map_err(|source| CrestodianError::io(parent, source))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| CrestodianError::io(parent, source))?;
-    sources.sort_by_key(|entry| entry.file_name());
-    let mut backups = Vec::new();
-    for (index, entry) in sources.into_iter().enumerate() {
+    let mut sources = match fs::read_dir(parent) {
+        Ok(sources) => sources
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| CrestodianError::io(parent, source))?,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(CrestodianError::io(parent, source)),
+    };
+    sources.sort_by_key(fs::DirEntry::file_name);
+    let mut artifacts = Vec::new();
+    for entry in sources {
         let name = entry.file_name();
         let Some(name_text) = name.to_str() else {
             continue;
@@ -346,21 +448,35 @@ fn backup_interrupted_artifacts(
         }
         let bytes =
             fs::read(entry.path()).map_err(|source| CrestodianError::io(entry.path(), source))?;
+        artifacts.push((name_text.to_owned(), bytes));
+    }
+    Ok(artifacts)
+}
+
+fn backup_interrupted_artifacts(
+    artifacts: &[(String, Vec<u8>)],
+    backup_directory: &Path,
+) -> Result<Vec<PathBuf>, CrestodianError> {
+    let mut backups = Vec::new();
+    for (index, (name, bytes)) in artifacts.iter().enumerate() {
         backups.push(backup_bytes(
             backup_directory,
-            &format!("interrupted-{index}-{name_text}"),
-            &bytes,
+            &format!("interrupted-{index}-{name}"),
+            bytes,
         )?);
     }
     Ok(backups)
 }
 
-fn action(original: Option<&Vec<u8>>, backup: Option<PathBuf>) -> RecoveryAction {
-    match (original, backup) {
-        (None, None) => RecoveryAction::Created,
-        (Some(_), Some(backup_path)) => RecoveryAction::Replaced { backup_path },
-        _ => unreachable!("backup state follows original file presence"),
-    }
+/// Classifies one recovered path from the backup its original bytes produced.
+///
+/// A backup exists exactly when the path held bytes worth preserving, so the
+/// backup alone decides between a creation and a replacement. Deriving the
+/// action from one value keeps the two from ever disagreeing.
+fn action(backup: Option<PathBuf>) -> RecoveryAction {
+    backup.map_or(RecoveryAction::Created, |backup_path| {
+        RecoveryAction::Replaced { backup_path }
+    })
 }
 
 #[cfg(unix)]

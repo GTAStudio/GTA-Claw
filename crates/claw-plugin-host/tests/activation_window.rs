@@ -73,7 +73,7 @@ fn deactivate_keeps_cleanup_logging_and_loses_everything_else() {
             max_message_bytes: 4096,
         }),
         CapabilityGrant::Events(EventsGrant {
-            emit_kinds: [EventKind::Heartbeat].into_iter().collect(),
+            emit_kinds: std::iter::once(EventKind::Heartbeat).collect(),
             max_payload_bytes: 4096,
         }),
     ];

@@ -102,6 +102,12 @@ impl DeviceDirectory {
     /// Returns `true` when a pairing was actually removed. The generation is
     /// only bumped for a real removal, so repeatedly revoking an unpaired
     /// device cannot be used to force every live connection to re-validate.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "revoking is the point of the call and the bool only reports whether the device \
+                  was paired to begin with; forcing every caller to bind it would be noise, as \
+                  it is for `BTreeMap::remove`"
+    )]
     pub fn revoke(&self, device_wire_id: &str) -> bool {
         let mut grants = self.write();
         let removed = grants.remove(device_wire_id).is_some();

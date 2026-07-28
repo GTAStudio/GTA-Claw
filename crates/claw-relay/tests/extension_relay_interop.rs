@@ -839,7 +839,7 @@ fn disconnect_releases_sessions_targets_and_pending_commands() {
         })]
     );
 
-    let dropped = bridge.disconnect_extension();
+    let dropped = bridge.disconnect_extension(extension);
     assert_eq!(
         dropped,
         vec![
@@ -869,7 +869,7 @@ fn disconnect_releases_sessions_targets_and_pending_commands() {
     assert_eq!(bridge.identity(), None);
     assert_eq!(bridge.targets(), Vec::new());
     assert_eq!(bridge.shared_tabs(), Vec::new());
-    assert_eq!(bridge.disconnect_extension(), Vec::new());
+    assert_eq!(bridge.disconnect_extension(extension), Vec::new());
     assert_eq!(
         serve_discovery(
             &endpoint,

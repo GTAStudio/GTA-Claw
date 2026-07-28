@@ -77,9 +77,8 @@ try {
         $allowedFiles[$name] = $true
         $allowedFiles["$name.spdx.json"] = $true
         $allowedFiles["$name.provenance.json"] = $true
-        if (Test-Path -LiteralPath "$($artifact.FullName).sha256" -PathType Leaf) {
-            $allowedFiles["$name.sha256"] = $true
-        }
+        $allowedFiles["$name.sha256"] = $true
+        Test-ArtifactHash $artifact.FullName
         $signatureMode = 'unsigned'
         if ($name -match '-signed\.') {
             $signatureMode = 'signed'

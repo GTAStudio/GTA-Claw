@@ -73,6 +73,10 @@ impl AdminMethodPolicy {
     /// registry does not define it, and
     /// [`AdminRpcError::MethodNotOperatorSurface`] when its classification is
     /// not an operator scope.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the 144-byte `Result` comes from `Dispatch(AdminFailure)`, a variant this function cannot return; boxing that payload would shrink it to 32 bytes but change a published enum, `dispatch_failure_response`, and the frozen error-class inventory in `tests/admin_rpc.rs`"
+    )]
     pub fn required_scope(&self, method: &str) -> Result<Scope, AdminRpcError> {
         if !self.allows(method) {
             return Err(AdminRpcError::MethodNotAllowlisted {

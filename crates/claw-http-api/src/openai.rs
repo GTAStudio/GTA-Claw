@@ -28,7 +28,54 @@ use crate::ports::{
     GenerationRequest, InputMedia, InputMediaKind, InputMediaSource, PortError, PortErrorKind,
     ToolCall, ToolChoice, Usage,
 };
-use crate::state::ApiState;
+use crate::state::{ApiState, unix_seconds};
+
+/// Largest embedding width `POST /v1/embeddings` will ask a provider to build.
+///
+/// Nothing upstream bounds this: the route has no configured maximum, and the
+/// routing identifiers it exposes (`openclaw`, `openclaw/<agentId>`) declare no
+/// dimensionality to derive one from, so the ceiling is pinned here. 8192 is the
+/// widest vector `claw-memory` will store, and matches the per-input character
+/// cap this module already enforces; it is also far above the widest embedding
+/// any current model emits (3072). Without it a single request can ask for
+/// `usize::MAX` floats per input, and the provider allocating them takes down
+/// every other request sharing the host.
+const MAX_EMBEDDING_DIMENSIONS: u16 = 8_192;
+
+/// Largest provider output one streaming request may retain before it is refused.
+///
+/// Both streaming coordinators hold part of the provider response in memory:
+/// `/v1/chat/completions` withholds every delta while an output constraint is
+/// pending, and `/v1/responses` must retain the whole message because
+/// `response.output_text.done` and the terminal `response.completed` resource
+/// carry it in full. Neither is optional — the first is what makes constraint
+/// enforcement meaningful, the second is the Responses wire contract — but
+/// nothing else bounds the buffer: the body limits cap the *request*, and
+/// `stream_buffer` caps only the in-flight channel. Without a ceiling a single
+/// caller can set `max_tokens` and let one broken or hostile upstream grow that
+/// buffer until the process dies, taking every other in-flight request with it.
+///
+/// 8 MiB is far above any honest response. The widest published output ceiling
+/// is around 128k tokens and even CJK- or emoji-dense text stays under six UTF-8
+/// bytes per token, so a complete maximal response is well under 1 MiB.
+const MAX_STREAM_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Bytes of provider output one requested output token is allowed to expand to.
+///
+/// A request carrying `max_tokens`/`max_output_tokens` has already stated its
+/// own bound, so the buffer is sized from the request rather than from the
+/// absolute ceiling. The factor is an order of magnitude above any real
+/// tokenizer ratio, so a provider that honours the requested limit is never
+/// refused; one that ignores it by a factor of sixty is already failing
+/// [`enforce_output_constraints`].
+const STREAM_OUTPUT_BYTES_PER_TOKEN: usize = 64;
+
+/// Smallest per-request output buffer, whatever the request asked for.
+///
+/// A very small `max_tokens` would otherwise derive a buffer of a few hundred
+/// bytes — exactly the range where the token-to-byte ratio is least predictable
+/// and where bounding the buffer saves no memory worth having.
+const MIN_STREAM_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -109,12 +156,13 @@ pub(crate) async fn models(
     .map_err(|_| provider_api_error(PortError::new(PortErrorKind::Timeout, "request timed out")))?
     .map_err(provider_api_error)?;
     let data = model_ids(&state)
-        .into_iter()
+        .iter()
+        .map(String::as_str)
         .map(model_object)
         .collect::<Vec<_>>();
     Ok(json_response(
         StatusCode::OK,
-        json!({"object": "list", "data": data}),
+        &json!({"object": "list", "data": data}),
     ))
 }
 
@@ -151,7 +199,7 @@ pub(crate) async fn model(
             "invalid_request_error",
         ));
     }
-    Ok(json_response(StatusCode::OK, model_object(id)))
+    Ok(json_response(StatusCode::OK, &model_object(&id)))
 }
 
 fn model_ids(state: &ApiState) -> Vec<String> {
@@ -175,7 +223,7 @@ fn model_ids(state: &ApiState) -> Vec<String> {
     ids
 }
 
-fn model_object(id: String) -> Value {
+fn model_object(id: &str) -> Value {
     json!({
         "id": id,
         "object": "model",
@@ -220,11 +268,7 @@ pub(crate) async fn embeddings(
     validate_model(&state, &model)?;
     let input = embedding_inputs(body.input)?;
     validate_embedding_inputs(&input)?;
-    let dimensions = body
-        .dimensions
-        .and_then(|value| value.as_f64())
-        .filter(|value| value.is_finite() && *value > 0.0 && *value <= usize::MAX as f64)
-        .map(|value| value.floor() as usize);
+    let dimensions = embedding_dimensions(body.dimensions.as_ref())?;
     let base64 = matches!(
         body.encoding_format.as_ref().and_then(Value::as_str),
         Some("base64")
@@ -263,7 +307,7 @@ pub(crate) async fn embeddings(
         .collect::<Vec<_>>();
     Ok(json_response(
         StatusCode::OK,
-        json!({
+        &json!({
             "object": "list",
             "data": data,
             "model": model,
@@ -344,7 +388,7 @@ pub(crate) async fn chat(
             .unwrap_or(false);
     let _user = body.user;
     if stream {
-        return Ok(chat_stream(state, generation, include_usage));
+        return Ok(chat_stream(&state, generation, include_usage));
     }
     let cancellation = CancellationToken::new();
     let _cancel_on_drop = CancelOnDrop::new(&cancellation);
@@ -363,7 +407,7 @@ pub(crate) async fn chat(
     enforce_output_constraints(&generation, &mut output)?;
     Ok(json_response(
         StatusCode::OK,
-        chat_completion(&generation, output, state.unix_seconds()),
+        &chat_completion(&generation, &output, unix_seconds()),
     ))
 }
 
@@ -454,7 +498,7 @@ pub(crate) async fn responses(
     );
     if body.stream.unwrap_or(false) {
         return Ok(responses_stream(
-            state,
+            &state,
             generation,
             response_id,
             output_item_id,
@@ -478,7 +522,7 @@ pub(crate) async fn responses(
                 &response_id,
                 &generation.model,
                 error,
-                state.unix_seconds(),
+                unix_seconds(),
             ));
         }
         Err(_) => {
@@ -486,13 +530,12 @@ pub(crate) async fn responses(
                 &response_id,
                 &generation.model,
                 PortError::new(PortErrorKind::Timeout, "request timed out"),
-                state.unix_seconds(),
+                unix_seconds(),
             ));
         }
     };
     if let Err(error) = enforce_tool_choice(&tool_choice, &generation.tools, &output.tool_calls) {
         return Ok(constrained_response_failure(
-            &state,
             &response_id,
             &generation.model,
             output.usage,
@@ -501,7 +544,6 @@ pub(crate) async fn responses(
     }
     if let Err(error) = enforce_output_constraints(&generation, &mut output) {
         return Ok(constrained_response_failure(
-            &state,
             &response_id,
             &generation.model,
             output.usage,
@@ -516,19 +558,19 @@ pub(crate) async fn responses(
     };
     Ok(json_response(
         StatusCode::OK,
-        response_resource(
+        &response_resource(
             &response_id,
             &generation.model,
             status,
-            items,
+            &items,
             output.usage,
             None,
-            state.unix_seconds(),
+            unix_seconds(),
         ),
     ))
 }
 
-fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool) -> Response {
+fn chat_stream(state: &ApiState, request: GenerationRequest, include_usage: bool) -> Response {
     let capacity = state.inner.config.limits.stream_buffer.max(1);
     let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, Infallible>>(capacity);
     let (provider_tx, mut provider_rx) = mpsc::channel::<GenerationEvent>(capacity);
@@ -536,7 +578,7 @@ fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool)
     let provider_cancellation = cancellation.clone();
     let provider = state.inner.services.provider.clone();
     let operation_timeout = state.inner.config.limits.operation_timeout;
-    let created = state.unix_seconds();
+    let created = unix_seconds();
     let stream_request = request.clone();
     let coordinator_cancellation = cancellation.clone();
     tokio::spawn(async move {
@@ -553,8 +595,8 @@ fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool)
             json_event(chat_chunk(
                 &request,
                 created,
-                json!({"role": "assistant"}),
-                Value::Null,
+                &json!({"role": "assistant"}),
+                &Value::Null,
             )),
             &cancellation,
         )
@@ -563,16 +605,25 @@ fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool)
             return;
         }
         let mut tool_calls = Vec::new();
-        let mut buffered_text = Vec::new();
+        let mut buffered_text = String::new();
         let buffer_until_validation = generation_requires_output_validation(&request);
+        let mut budget = StreamBudget::new(&request);
         while let Some(event) = provider_rx.recv().await {
+            if !budget.admits(retained_bytes(&event, buffer_until_validation)) {
+                cancellation.cancel();
+                let error = oversized_stream_error();
+                if send_event(&sse_tx, json_event(error.body), &cancellation).await {
+                    let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
+                }
+                return;
+            }
             let value = match event {
                 GenerationEvent::Text(text) => {
                     if buffer_until_validation {
-                        buffered_text.push(text);
+                        buffered_text.push_str(&text);
                         continue;
                     }
-                    chat_chunk(&request, created, json!({"content": text}), Value::Null)
+                    chat_chunk(&request, created, &json!({"content": text}), &Value::Null)
                 }
                 GenerationEvent::ToolCall(call) => {
                     if let Err(error) = enforce_tool_choice(
@@ -620,8 +671,8 @@ fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool)
                     return;
                 }
                 let mut output = GenerationOutput {
-                    text: buffered_text.concat(),
-                    tool_calls: tool_calls.clone(),
+                    text: buffered_text,
+                    tool_calls,
                     usage,
                 };
                 if let Err(error) = enforce_output_constraints(&request, &mut output) {
@@ -637,8 +688,8 @@ fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool)
                             json_event(chat_chunk(
                                 &request,
                                 created,
-                                json!({"content":output.text}),
-                                Value::Null,
+                                &json!({"content":output.text}),
+                                &Value::Null,
                             )),
                             &cancellation,
                         )
@@ -661,14 +712,14 @@ fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool)
                         }
                     }
                 }
-                let finish = if tool_calls.is_empty() {
+                let finish = if output.tool_calls.is_empty() {
                     "stop"
                 } else {
                     "tool_calls"
                 };
                 if !send_event(
                     &sse_tx,
-                    json_event(chat_chunk(&request, created, json!({}), json!(finish))),
+                    json_event(chat_chunk(&request, created, &json!({}), &json!(finish))),
                     &cancellation,
                 )
                 .await
@@ -711,7 +762,7 @@ fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool)
 }
 
 fn responses_stream(
-    state: ApiState,
+    state: &ApiState,
     request: GenerationRequest,
     response_id: String,
     item_id: String,
@@ -723,7 +774,7 @@ fn responses_stream(
     let provider_cancellation = cancellation.clone();
     let provider = state.inner.services.provider.clone();
     let operation_timeout = state.inner.config.limits.operation_timeout;
-    let created = state.unix_seconds();
+    let created = unix_seconds();
     let stream_request = request.clone();
     let state_for_ids = state.clone();
     let coordinator_cancellation = cancellation.clone();
@@ -733,7 +784,7 @@ fn responses_stream(
             &response_id,
             &request.model,
             "in_progress",
-            Vec::new(),
+            &[],
             Usage::default(),
             None,
             created,
@@ -780,7 +831,27 @@ fn responses_stream(
         let mut text = String::new();
         let mut calls = Vec::new();
         let buffer_until_validation = generation_requires_output_validation(&request);
+        let mut budget = StreamBudget::new(&request);
         while let Some(event) = provider_rx.recv().await {
+            // Unlike chat, this coordinator retains every delta whether or not
+            // it forwards it, because the terminal events carry the whole text.
+            if !budget.admits(retained_bytes(&event, true)) {
+                cancellation.cancel();
+                let error = oversized_stream_error();
+                send_response_failure(
+                    &sse_tx,
+                    &response_id,
+                    &request.model,
+                    PortError::new(
+                        PortErrorKind::Unavailable,
+                        constraint_error_message(&error).to_owned(),
+                    ),
+                    Usage::default(),
+                    created,
+                )
+                .await;
+                return;
+            }
             match event {
                 GenerationEvent::Text(delta) => {
                     text.push_str(&delta);
@@ -991,7 +1062,7 @@ fn responses_stream(
             &response_id,
             &request.model,
             status,
-            output,
+            &output,
             usage,
             None,
             created,
@@ -1037,13 +1108,13 @@ async fn send_chat_tool_call(
         json_event(chat_chunk(
             request,
             created,
-            json!({"tool_calls":[{
+            &json!({"tool_calls":[{
                 "index":index,
                 "id":call.id,
                 "type":"function",
                 "function":{"name":call.name,"arguments":""}
             }]}),
-            Value::Null,
+            &Value::Null,
         )),
         cancellation,
     )
@@ -1058,11 +1129,11 @@ async fn send_chat_tool_call(
             json_event(chat_chunk(
                 request,
                 created,
-                json!({"tool_calls":[{
+                &json!({"tool_calls":[{
                     "index":index,
                     "function":{"arguments":delta}
                 }]}),
-                Value::Null,
+                &Value::Null,
             )),
             cancellation,
         )
@@ -1113,7 +1184,7 @@ async fn send_response_failure(
         response_id,
         model,
         "failed",
-        Vec::new(),
+        &[],
         usage,
         Some((code, message)),
         created,
@@ -1184,7 +1255,7 @@ fn named_event(name: &'static str, value: Value) -> Event {
         .expect("JSON value is serializable")
 }
 
-fn chat_completion(request: &GenerationRequest, output: GenerationOutput, created: u64) -> Value {
+fn chat_completion(request: &GenerationRequest, output: &GenerationOutput, created: u64) -> Value {
     let (message, finish_reason) = if output.tool_calls.is_empty() {
         (json!({"role": "assistant", "content": output.text}), "stop")
     } else {
@@ -1227,11 +1298,11 @@ fn response_failure(response_id: &str, model: &str, error: PortError, created: u
         .unwrap_or("internal error");
     json_response(
         api.status,
-        response_resource(
+        &response_resource(
             response_id,
             model,
             "failed",
-            Vec::new(),
+            &[],
             Usage::default(),
             Some((code, message)),
             created,
@@ -1242,8 +1313,8 @@ fn response_failure(response_id: &str, model: &str, error: PortError, created: u
 fn chat_chunk(
     request: &GenerationRequest,
     created: u64,
-    delta: Value,
-    finish_reason: Value,
+    delta: &Value,
+    finish_reason: &Value,
 ) -> Value {
     json!({
         "id": request.request_id,
@@ -1315,7 +1386,7 @@ fn response_resource(
     id: &str,
     model: &str,
     status: &str,
-    output: Vec<Value>,
+    output: &[Value],
     usage: Usage,
     error: Option<(&str, &str)>,
     created: u64,
@@ -1348,6 +1419,47 @@ fn embedding_inputs(input: Option<Value>) -> Result<Vec<String>, ApiError> {
             "invalid_request_error",
         )),
     }
+}
+
+/// Resolves the optional `dimensions` request field into a provider width.
+///
+/// A value that cannot be a width at all — absent, `null`, non-numeric,
+/// negative, or below one — keeps its long-standing meaning of "let the provider
+/// choose", so `0` and `0.5` now take the same path instead of `0.5` flooring
+/// into a zero-width vector. A well-formed width above
+/// [`MAX_EMBEDDING_DIMENSIONS`] is the only shape that is refused, because it is
+/// the only one that can exhaust the host.
+///
+/// # Errors
+///
+/// Returns a `400` [`ApiError::openai`] with type `invalid_request_error` when
+/// the requested width exceeds [`MAX_EMBEDDING_DIMENSIONS`], matching how the
+/// route already refuses an oversized `input`.
+fn embedding_dimensions(dimensions: Option<&Value>) -> Result<Option<usize>, ApiError> {
+    let Some(requested) = dimensions.and_then(Value::as_f64) else {
+        return Ok(None);
+    };
+    if !requested.is_finite() || requested < 1.0 {
+        return Ok(None);
+    }
+    // `MAX_EMBEDDING_DIMENSIONS` converts to `f64` exactly, so this comparison
+    // is exact and rejects every larger value — including infinities-adjacent
+    // magnitudes like `1e300` — before anything is converted to an integer.
+    let width = requested.floor();
+    if width > f64::from(MAX_EMBEDDING_DIMENSIONS) {
+        return Err(ApiError::openai(
+            StatusCode::BAD_REQUEST,
+            format!("Dimensions too large (max {MAX_EMBEDDING_DIMENSIONS})."),
+            "invalid_request_error",
+        ));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the checks above prove `width` is an integral `f64` in `1..=MAX_EMBEDDING_DIMENSIONS`, which every `usize` represents exactly, so neither truncation nor a sign change is reachable"
+    )]
+    let width = width as usize;
+    Ok(Some(width))
 }
 
 fn validate_embedding_inputs(input: &[String]) -> Result<(), ApiError> {
@@ -1449,7 +1561,7 @@ fn chat_prompt(messages: Option<&Value>) -> Result<ParsedPrompt, ApiError> {
         if active_user_index == Some((index, "user")) {
             let active_media = chat_media(object.get("content"))?;
             if content.is_empty() && !active_media.is_empty() {
-                content = "User sent image(s) with no text.".to_owned();
+                "User sent image(s) with no text.".clone_into(&mut content);
             }
             media = active_media;
         }
@@ -1506,9 +1618,9 @@ fn responses_prompt(input: &Value) -> Result<ParsedPrompt, ApiError> {
                             .iter()
                             .any(|input| input.kind == InputMediaKind::Image)
                         {
-                            text = "User sent image(s) with no text.".to_owned();
+                            "User sent image(s) with no text.".clone_into(&mut text);
                         } else if !item_media.is_empty() {
-                            text = "User sent file(s) with no text.".to_owned();
+                            "User sent file(s) with no text.".clone_into(&mut text);
                         }
                     }
                     media.extend(item_media);
@@ -2149,8 +2261,7 @@ fn enforce_tool_choice(
         ));
     }
     let satisfied = match choice {
-        ToolChoice::Auto => true,
-        ToolChoice::None => true,
+        ToolChoice::Auto | ToolChoice::None => true,
         ToolChoice::Required => !calls.is_empty(),
         ToolChoice::Function(name) => calls.iter().any(|call| call.name == *name),
     };
@@ -2168,16 +2279,85 @@ fn enforce_tool_choice(
     }
 }
 
-fn tool_choice_requires_validation(choice: &ToolChoice) -> bool {
+const fn tool_choice_requires_validation(choice: &ToolChoice) -> bool {
     !matches!(choice, ToolChoice::Auto)
 }
 
-fn generation_requires_output_validation(request: &GenerationRequest) -> bool {
+const fn generation_requires_output_validation(request: &GenerationRequest) -> bool {
     tool_choice_requires_validation(&request.tool_choice)
         || request.max_tokens.is_some()
         || request.max_tool_calls.is_some()
         || request.stop.is_some()
         || request.response_format.is_some()
+}
+
+/// The ceiling on provider output one streaming request may retain.
+///
+/// A request that states `max_tokens` bounds its own legitimate response, so the
+/// ceiling is derived from it; anything else gets the absolute ceiling.
+fn stream_output_limit(request: &GenerationRequest) -> usize {
+    request
+        .max_tokens
+        .and_then(|tokens| usize::try_from(tokens).ok())
+        .and_then(|tokens| tokens.checked_mul(STREAM_OUTPUT_BYTES_PER_TOKEN))
+        .map_or(MAX_STREAM_OUTPUT_BYTES, |bytes| {
+            bytes.clamp(MIN_STREAM_OUTPUT_BYTES, MAX_STREAM_OUTPUT_BYTES)
+        })
+}
+
+/// Remaining bytes of provider output one streaming coordinator may still hold.
+///
+/// The coordinators differ in *what* they retain — chat keeps text only while a
+/// constraint is pending, Responses always keeps it, both always keep tool calls
+/// — so the budget only counts bytes and the caller decides which ones it is
+/// about to store.
+struct StreamBudget {
+    remaining: usize,
+}
+
+impl StreamBudget {
+    /// Opens a budget sized for one request.
+    fn new(request: &GenerationRequest) -> Self {
+        Self {
+            remaining: stream_output_limit(request),
+        }
+    }
+
+    /// Charges `bytes` against the budget, reporting whether they still fit.
+    ///
+    /// A refusal leaves the budget unchanged, so the caller can only ever hold
+    /// the bytes it was granted.
+    const fn admits(&mut self, bytes: usize) -> bool {
+        let Some(remaining) = self.remaining.checked_sub(bytes) else {
+            return false;
+        };
+        self.remaining = remaining;
+        true
+    }
+}
+
+/// Bytes one provider event adds to what a coordinator keeps until the stream ends.
+///
+/// Chat forwards text deltas immediately unless a constraint is pending, so
+/// `retains_text` is what that coordinator decided; both coordinators retain
+/// every tool call, because the terminal framing and the final tool-choice check
+/// are computed from the complete list.
+const fn retained_bytes(event: &GenerationEvent, retains_text: bool) -> usize {
+    match event {
+        GenerationEvent::Text(text) => {
+            if retains_text {
+                text.len()
+            } else {
+                0
+            }
+        }
+        GenerationEvent::ToolCall(call) => call.id.len() + call.name.len() + call.arguments.len(),
+    }
+}
+
+/// The upstream fault reported when a provider overruns the retained-output ceiling.
+fn oversized_stream_error() -> ApiError {
+    output_constraint_error("The provider exceeded the maximum buffered response size.")
 }
 
 fn enforce_output_constraints(
@@ -2239,7 +2419,6 @@ fn constraint_error_message(error: &ApiError) -> &str {
 }
 
 fn constrained_response_failure(
-    state: &ApiState,
     response_id: &str,
     model: &str,
     usage: Usage,
@@ -2247,14 +2426,14 @@ fn constrained_response_failure(
 ) -> Response {
     json_response(
         StatusCode::BAD_GATEWAY,
-        response_resource(
+        &response_resource(
             response_id,
             model,
             "failed",
-            Vec::new(),
+            &[],
             usage,
             Some(("api_error", constraint_error_message(error))),
-            state.unix_seconds(),
+            unix_seconds(),
         ),
     )
 }
@@ -2364,5 +2543,82 @@ fn provider_api_error(error: PortError) -> ApiError {
             "internal error",
             "api_error",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GenerationRequest, MAX_STREAM_OUTPUT_BYTES, MIN_STREAM_OUTPUT_BYTES,
+        STREAM_OUTPUT_BYTES_PER_TOKEN, ToolChoice, stream_output_limit,
+    };
+
+    /// A request carrying nothing but the output token bound under test.
+    fn request(max_tokens: Option<u64>) -> GenerationRequest {
+        GenerationRequest {
+            model: "openclaw".to_owned(),
+            prompt: String::new(),
+            instructions: None,
+            media: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: ToolChoice::Auto,
+            max_tokens,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            stop: None,
+            response_format: None,
+            request_id: String::new(),
+            session_id: String::new(),
+        }
+    }
+
+    /// A request that states no output bound falls back to the absolute ceiling.
+    ///
+    /// This is the branch every unconstrained `/v1/responses` stream takes, and
+    /// the one no wire test can reach without moving eight megabytes.
+    #[test]
+    fn an_unbounded_request_gets_the_absolute_ceiling() {
+        assert_eq!(stream_output_limit(&request(None)), MAX_STREAM_OUTPUT_BYTES);
+    }
+
+    /// A stated bound sizes the buffer instead of the absolute ceiling.
+    #[test]
+    fn a_stated_token_bound_sizes_the_buffer() {
+        const TOKENS: u64 = 32_768;
+        const EXPECTED: usize = 32_768 * STREAM_OUTPUT_BYTES_PER_TOKEN;
+
+        assert_eq!(stream_output_limit(&request(Some(TOKENS))), EXPECTED);
+    }
+
+    /// A tiny bound still gets the floor, where the byte ratio is least predictable.
+    #[test]
+    fn a_tiny_token_bound_still_gets_the_floor() {
+        for tokens in [1, 16, 512] {
+            assert_eq!(
+                stream_output_limit(&request(Some(tokens))),
+                MIN_STREAM_OUTPUT_BYTES,
+                "a {tokens}-token request must keep the floor"
+            );
+        }
+    }
+
+    /// A bound a caller cannot honestly mean is clamped rather than trusted.
+    ///
+    /// `u64::MAX` also proves the derivation cannot overflow into a small or
+    /// panicking limit, which is the one way this ceiling could be turned into
+    /// the defect it exists to prevent.
+    #[test]
+    fn an_absurd_token_bound_is_clamped_to_the_ceiling() {
+        for tokens in [u64::from(u32::MAX), u64::MAX] {
+            assert_eq!(
+                stream_output_limit(&request(Some(tokens))),
+                MAX_STREAM_OUTPUT_BYTES,
+                "a {tokens}-token request must not raise the ceiling"
+            );
+        }
     }
 }

@@ -12,6 +12,13 @@ component StepMarker {
     in property <int> number;
     in property <string> label;
     in property <int> current-step;
+    in property <int> total-steps: 3;
+
+    accessible-role: text;
+    accessible-label: "Step " + root.number + " of " + root.total-steps + ", " + root.label + ", "
+        + (root.number < root.current-step
+            ? "completed"
+            : (root.number == root.current-step ? "current step" : "not started"));
 
     HorizontalLayout {
         spacing: Metrics.space-2;
@@ -66,7 +73,7 @@ component PermissionRow {
 
     content := HorizontalLayout {
         spacing: Metrics.space-3;
-        alignment: center;
+        cross-axis-alignment: center;
 
         VerticalLayout {
             spacing: Metrics.space-1;
@@ -109,10 +116,13 @@ export component FirstRunSurface inherits FocusScope {
 
     accessible-role: main;
     accessible-label: root.stage == 0
-        ? "Welcome to GTA Claw"
+        ? @tr("Welcome to GTA Claw")
         : (root.stage == 1
-            ? "Device authorization"
-            : "Workspace trust");
+            ? @tr("Account authorization availability")
+            : @tr("Workspace trust availability"));
+
+    // Created on demand, so take focus to keep the Escape shortcut live.
+    init => { root.focus(); }
 
     key-pressed(event) => {
         if (event.text == Key.Escape && root.stage > 0) {
@@ -133,12 +143,14 @@ export component FirstRunSurface inherits FocusScope {
             background: DesignTokens.surface-pane;
             border-width: 1px;
             border-color: DesignTokens.border-default;
+            accessible-role: banner;
+            accessible-label: "GTA Claw setup, step " + (root.stage + 1) + " of 3";
 
             HorizontalLayout {
                 padding-left: Metrics.space-6;
                 padding-right: Metrics.space-6;
                 spacing: Metrics.space-3;
-                alignment: center;
+                cross-axis-alignment: center;
 
                 Rectangle {
                     width: Metrics.control-large;
@@ -170,7 +182,7 @@ export component FirstRunSurface inherits FocusScope {
                     }
 
                     Text {
-                        text: "Native agent workspace";
+                        text: @tr("Native Gateway client");
                         color: DesignTokens.text-muted;
                         font-size: Metrics.type-caption;
                         accessible-role: none;
@@ -204,15 +216,19 @@ export component FirstRunSurface inherits FocusScope {
                     horizontal-stretch: 0;
                     min-height: step-row.min-height;
 
+                    accessible-role: list;
+                    accessible-label: "Setup steps";
+                    accessible-item-count: 3;
+
                     step-row := HorizontalLayout {
                         spacing: root.narrow-layout ? Metrics.space-3 : Metrics.space-8;
                         alignment: center;
 
-                        StepMarker { number: 1; label: "Welcome"; current-step: root.stage + 1; }
+                        StepMarker { number: 1; label: @tr("Welcome"); current-step: root.stage + 1; }
                         Divider { horizontal-stretch: 1; }
-                        StepMarker { number: 2; label: "Authorize"; current-step: root.stage + 1; }
+                        StepMarker { number: 2; label: @tr("Account"); current-step: root.stage + 1; }
                         Divider { horizontal-stretch: 1; }
-                        StepMarker { number: 3; label: "Trust"; current-step: root.stage + 1; }
+                        StepMarker { number: 3; label: @tr("Workspace"); current-step: root.stage + 1; }
                     }
                 }
 
@@ -222,7 +238,7 @@ export component FirstRunSurface inherits FocusScope {
                     accessible-name: "Welcome";
 
                     Text {
-                        text: "Work with agents, without losing the thread";
+                        text: @tr("Connect this desktop app to a Gateway");
                         color: DesignTokens.text-primary;
                         font-size: Metrics.type-display;
                         font-weight: 850;
@@ -231,7 +247,7 @@ export component FirstRunSurface inherits FocusScope {
                     }
 
                     Text {
-                        text: "GTA Claw brings runs, review, files, schedules, and extensions into one calm native workspace. Activity is summarized for auditability; hidden reasoning is never displayed.";
+                        text: @tr("The wired desktop path performs a bounded Gateway connection, authentication, protocol negotiation, and health probe. Account authorization and workspace trust are not composed yet.");
                         color: DesignTokens.text-secondary;
                         font-size: Metrics.type-body;
                         wrap: word-wrap;
@@ -241,27 +257,27 @@ export component FirstRunSurface inherits FocusScope {
                     Divider { }
 
                     PermissionRow {
-                        title: "Focused work queue";
-                        detail: "See what is running, blocked, or waiting for you.";
-                        value: "Local-first";
+                        title: @tr("Gateway diagnostic");
+                        detail: @tr("Connect with an endpoint and optional pre-authorized session token.");
+                        value: @tr("Available");
                     }
                     PermissionRow {
-                        title: "Review before execution";
-                        detail: "Commands, permissions, and diffs stay explicit.";
-                        value: "Auditable";
+                        title: @tr("Account authorization");
+                        detail: @tr("No desktop device-authorization flow is wired.");
+                        value: @tr("Unavailable");
                     }
                     PermissionRow {
-                        title: "Native performance";
-                        detail: "Pure Rust and Slint with no web runtime.";
-                        value: "npm-free";
+                        title: @tr("Workspace trust");
+                        detail: @tr("No trusted-path store or workspace selector is wired.");
+                        value: @tr("Unavailable");
                     }
 
                     HorizontalLayout {
                         alignment: end;
 
                         PrimaryButton {
-                            text: "Continue";
-                            accessible-name: "Continue to device authorization";
+                            text: @tr("Review setup limits");
+                            accessible-name: @tr("Review unavailable account authorization");
                             clicked => { root.stage-requested(1); }
                         }
                     }
@@ -270,10 +286,10 @@ export component FirstRunSurface inherits FocusScope {
                 if (root.stage == 1) : Card {
                     width: min(900px, parent.width);
                     horizontal-stretch: 0;
-                    accessible-name: "Device authorization";
+                    accessible-name: @tr("Account authorization availability");
 
                     Text {
-                        text: "Authorize this device";
+                        text: @tr("Account authorization isn't available");
                         color: DesignTokens.text-primary;
                         font-size: Metrics.type-display;
                         font-weight: 850;
@@ -281,7 +297,7 @@ export component FirstRunSurface inherits FocusScope {
                     }
 
                     Text {
-                        text: "Use the one-time code in your browser. GTA Claw stores no account password, and the code expires after 10 minutes.";
+                        text: @tr("This desktop client has no device-authorization backend. No browser flow was started and no one-time code was issued.");
                         color: DesignTokens.text-secondary;
                         font-size: Metrics.type-body;
                         wrap: word-wrap;
@@ -289,22 +305,22 @@ export component FirstRunSurface inherits FocusScope {
                     }
 
                     Rectangle {
-                        min-height: max(112px, Metrics.control-large + 2 * Metrics.space-6);
-                        background: DesignTokens.surface-subtle;
+                        min-height: max(96px, unavailable-account-copy.min-height + 2 * Metrics.space-4);
+                        background: DesignTokens.warning-surface;
                         border-width: 1px;
-                        border-color: DesignTokens.border-default;
+                        border-color: DesignTokens.warning;
                         border-radius: Metrics.radius-large;
                         accessible-role: text;
-                        accessible-label: "Device code G T A C dash 7 K 2 M";
+                        accessible-label: unavailable-account-copy.text;
 
-                        Text {
-                            text: "GTAC-7K2M";
+                        unavailable-account-copy := Text {
+                            x: Metrics.space-4;
+                            y: Metrics.space-4;
+                            width: parent.width - 2 * Metrics.space-4;
+                            text: @tr("To continue, use a pre-authorized Gateway session token or configure authorization outside this desktop app, then proceed to the connection step.");
                             color: DesignTokens.text-primary;
-                            font-size: 30px;
-                            font-weight: 850;
-                            letter-spacing: 4px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                            font-size: Metrics.type-small;
+                            wrap: word-wrap;
                             accessible-role: none;
                         }
                     }
@@ -314,12 +330,13 @@ export component FirstRunSurface inherits FocusScope {
                         alignment: end;
 
                         SecondaryButton {
-                            text: "Back";
+                            text: @tr("Back");
+                            accessible-name: @tr("Back to welcome");
                             clicked => { root.stage-requested(0); }
                         }
                         PrimaryButton {
-                            text: "I authorized this device";
-                            accessible-name: "Continue to workspace trust";
+                            text: @tr("Continue without account authorization");
+                            accessible-name: @tr("Review unavailable workspace trust");
                             clicked => { root.stage-requested(2); }
                         }
                     }
@@ -328,10 +345,10 @@ export component FirstRunSurface inherits FocusScope {
                 if (root.stage == 2) : Card {
                     width: min(900px, parent.width);
                     horizontal-stretch: 0;
-                    accessible-name: "Workspace trust";
+                    accessible-name: @tr("Workspace trust availability");
 
                     Text {
-                        text: "Trust this workspace";
+                        text: @tr("Workspace trust isn't available");
                         color: DesignTokens.text-primary;
                         font-size: Metrics.type-display;
                         font-weight: 850;
@@ -339,7 +356,7 @@ export component FirstRunSurface inherits FocusScope {
                     }
 
                     Text {
-                        text: "Trust applies only to the selected directory. Destructive commands and connector writes still require explicit review.";
+                        text: @tr("This desktop client has no workspace selector or trust store. No directory was selected and no file or command permission was granted.");
                         color: DesignTokens.text-secondary;
                         font-size: Metrics.type-body;
                         wrap: word-wrap;
@@ -347,59 +364,40 @@ export component FirstRunSurface inherits FocusScope {
                     }
 
                     Rectangle {
-                        min-height: max(64px, Metrics.control-large + 2 * Metrics.space-2);
-                        background: DesignTokens.accent-surface;
+                        min-height: max(96px, unavailable-workspace-copy.min-height + 2 * Metrics.space-4);
+                        background: DesignTokens.warning-surface;
                         border-width: 1px;
-                        border-color: DesignTokens.accent;
+                        border-color: DesignTokens.warning;
                         border-radius: Metrics.radius-medium;
-                        accessible-role: region;
-                        accessible-label: "Selected workspace GTA-Claw at C:\\work\\GTA-Claw";
+                        accessible-role: text;
+                        accessible-label: unavailable-workspace-copy.text;
 
-                        HorizontalLayout {
-                            padding: Metrics.space-3;
-                            spacing: Metrics.space-3;
-                            alignment: center;
-
-                            Text {
-                                text: "R";
-                                color: DesignTokens.accent;
-                                font-size: Metrics.type-title;
-                                font-weight: 850;
-                                accessible-role: none;
-                            }
-                            VerticalLayout {
-                                spacing: 0px;
-                                Text {
-                                    text: "GTA-Claw";
-                                    color: DesignTokens.text-primary;
-                                    font-size: Metrics.type-small;
-                                    font-weight: 750;
-                                    accessible-role: none;
-                                }
-                                Text {
-                                    text: "C:\\work\\GTA-Claw";
-                                    color: DesignTokens.text-muted;
-                                    font-size: Metrics.type-caption;
-                                    accessible-role: none;
-                                }
-                            }
+                        unavailable-workspace-copy := Text {
+                            x: Metrics.space-4;
+                            y: Metrics.space-4;
+                            width: parent.width - 2 * Metrics.space-4;
+                            text: @tr("Continue only to run the Gateway diagnostic. Configure workspace trust through a supported host workflow before allowing workspace access.");
+                            color: DesignTokens.text-primary;
+                            font-size: Metrics.type-small;
+                            wrap: word-wrap;
+                            accessible-role: none;
                         }
                     }
 
                     PermissionRow {
-                        title: "Read files";
-                        detail: "Inspect source, configuration, and repository metadata.";
-                        value: "Allowed";
+                        title: @tr("Trusted path");
+                        detail: @tr("No workspace path is loaded.");
+                        value: @tr("Unavailable");
                     }
                     PermissionRow {
-                        title: "Write files";
-                        detail: "Create reviewed changes inside this workspace.";
-                        value: "Allowed";
+                        title: @tr("File access");
+                        detail: @tr("No read or write grant was created.");
+                        value: @tr("Unavailable");
                     }
                     PermissionRow {
-                        title: "Run commands";
-                        detail: "Bounded commands with policy and approval checks.";
-                        value: "Ask";
+                        title: @tr("Command execution");
+                        detail: @tr("No workspace command policy was created.");
+                        value: @tr("Unavailable");
                     }
 
                     HorizontalLayout {
@@ -407,12 +405,13 @@ export component FirstRunSurface inherits FocusScope {
                         alignment: end;
 
                         SecondaryButton {
-                            text: "Back";
+                            text: @tr("Back");
+                            accessible-name: @tr("Back to account authorization");
                             clicked => { root.stage-requested(1); }
                         }
                         PrimaryButton {
-                            text: "Trust and connect";
-                            accessible-name: "Trust workspace and configure Gateway";
+                            text: @tr("Continue to Gateway connection");
+                            accessible-name: @tr("Continue to the wired Gateway diagnostic");
                             clicked => { root.stage-requested(3); }
                         }
                     }

@@ -25,7 +25,7 @@ pub(crate) async fn live(State(state): State<ApiState>) -> Response {
     } else {
         json!({"ok":true,"status":"live","phase":serving.phase()})
     };
-    no_store(json_response(StatusCode::OK, body))
+    no_store(json_response(StatusCode::OK, &body))
 }
 
 pub(crate) async fn ready(State(state): State<ApiState>, request: Request) -> Response {
@@ -58,7 +58,7 @@ pub(crate) async fn ready(State(state): State<ApiState>, request: Request) -> Re
     } else {
         json!({"ready":ready})
     };
-    no_store(json_response(status, body))
+    no_store(json_response(status, &body))
 }
 
 fn no_store(mut response: Response) -> Response {

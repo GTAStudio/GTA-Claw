@@ -12,7 +12,7 @@ const BACKEND: &str = "macos-keychain";
 /// Each [`CredentialKey`] maps to one generic password item. The service and
 /// account are percent-encoded on the way to the platform so that every native
 /// backend addresses a key the same way; see
-/// [`native`](super::native) for why the encoding exists.
+/// the private `native` module for why the encoding exists.
 pub struct AppleKeychainStore {
     inner: NativeKeyringStore,
 }

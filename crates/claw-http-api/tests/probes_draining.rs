@@ -346,7 +346,9 @@ async fn get(server: &Server, path: &str, token: Option<&str>) -> HttpResponse {
         server.address
     );
     if let Some(token) = token {
-        head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        head.push_str("Authorization: Bearer ");
+        head.push_str(token);
+        head.push_str("\r\n");
     }
     head.push_str("\r\n");
     stream

@@ -33,7 +33,7 @@ struct SequentialSecretSource {
 }
 
 impl SequentialSecretSource {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             next: AtomicU64::new(1),
         }
@@ -273,7 +273,7 @@ fn admission_refuses_a_second_ticket_whose_identity_collides_with_a_live_one() {
     assert_eq!(
         controller.issue(&worker_id, TTL_MS, MethodAllowlist::worker_protocol()),
         Err(claw_worker::IssueError::TicketIdCollision {
-            ticket_id: first.ticket.ticket_id.clone()
+            ticket_id: first.ticket.ticket_id
         })
     );
 }

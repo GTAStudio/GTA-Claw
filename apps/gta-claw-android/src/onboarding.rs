@@ -9,11 +9,16 @@ use std::time::Duration;
 
 use claw_gateway_client::{
     ConfigurationError, ConnectionInfo, ConnectionState, GatewayClientError, ProtocolFailure,
-    TransportFailure,
+    ReadyConnection, TransportFailure,
 };
 use claw_protocol::gateway::ConnectErrorDetailCode;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use url::{Host, Url};
+
+use crate::platform::{
+    AppLifecycle, ConnectionBlocker, IdentityFailure, IdentityPersistence, NetworkStatus,
+    PlatformCapabilities,
+};
 
 /// Largest accepted endpoint text, in bytes.
 pub const MAX_ENDPOINT_BYTES: usize = 2048;
@@ -84,6 +89,23 @@ impl SubmissionRejection {
             ),
         }
     }
+
+    const fn diagnostic(self) -> (DiagnosticCode, RemedyKind) {
+        match self {
+            Self::EmptyEndpoint => (DiagnosticCode::EndpointRequired, RemedyKind::EnterEndpoint),
+            Self::EndpointTooLong
+            | Self::MalformedEndpoint
+            | Self::UnsupportedScheme
+            | Self::MissingHost
+            | Self::CredentialBearingEndpoint => {
+                (DiagnosticCode::EndpointInvalid, RemedyKind::EditEndpoint)
+            }
+            Self::InsecureRemoteEndpoint => {
+                (DiagnosticCode::EndpointInsecure, RemedyKind::EditEndpoint)
+            }
+            Self::TokenTooLong => (DiagnosticCode::TokenInvalid, RemedyKind::EditToken),
+        }
+    }
 }
 
 impl Display for SubmissionRejection {
@@ -138,6 +160,24 @@ impl ConnectRequest {
     /// carried through to [`Self::allow_insecure_remote_ws`] and is the single
     /// value the Gateway configuration is built from, so the checkbox in the UI
     /// and the transport decision can never disagree.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`SubmissionRejection`] naming the first policy the input
+    /// broke, checked in this order: a blank endpoint
+    /// ([`EmptyEndpoint`](SubmissionRejection::EmptyEndpoint)), an endpoint
+    /// over [`MAX_ENDPOINT_BYTES`]
+    /// ([`EndpointTooLong`](SubmissionRejection::EndpointTooLong)), a token
+    /// over [`MAX_TOKEN_BYTES`]
+    /// ([`TokenTooLong`](SubmissionRejection::TokenTooLong)), text `url::Url`
+    /// cannot parse ([`MalformedEndpoint`](SubmissionRejection::MalformedEndpoint)),
+    /// a scheme other than `ws` or `wss`
+    /// ([`UnsupportedScheme`](SubmissionRejection::UnsupportedScheme)), a URL
+    /// with no host ([`MissingHost`](SubmissionRejection::MissingHost)), a URL
+    /// carrying userinfo, a password, a query string or a fragment
+    /// ([`CredentialBearingEndpoint`](SubmissionRejection::CredentialBearingEndpoint)),
+    /// and plaintext `ws://` to a non-loopback host without the opt-in
+    /// ([`InsecureRemoteEndpoint`](SubmissionRejection::InsecureRemoteEndpoint)).
     pub fn prepare(
         endpoint: &str,
         token: &str,
@@ -175,7 +215,7 @@ impl ConnectRequest {
         {
             return Err(SubmissionRejection::CredentialBearingEndpoint);
         }
-        if url.scheme() == "ws" && !allow_insecure_remote_ws && !is_loopback(url.host()) {
+        if url.scheme() == "ws" && !allow_insecure_remote_ws && !is_loopback(&url) {
             return Err(SubmissionRejection::InsecureRemoteEndpoint);
         }
 
@@ -218,7 +258,7 @@ impl ConnectRequest {
     pub fn transport_posture(&self) -> TransportPosture {
         if self.url.scheme() == "wss" {
             TransportPosture::Encrypted
-        } else if is_loopback(self.url.host()) {
+        } else if is_loopback(&self.url) {
             TransportPosture::PlaintextLoopback
         } else {
             TransportPosture::PlaintextRemote
@@ -229,6 +269,23 @@ impl ConnectRequest {
     #[must_use]
     pub fn into_parts(self) -> (Url, Option<SecretString>, bool) {
         (self.url, self.token, self.allow_insecure_remote_ws)
+    }
+
+    /// Copies the request into a fresh transport attempt.
+    ///
+    /// The controller retains the original request while an Android activity is
+    /// backgrounded or a network is unavailable. `SecretString` deliberately
+    /// does not implement `Clone`, so the copy is explicit and remains wrapped
+    /// before and after this boundary.
+    #[must_use]
+    pub(crate) fn transport_parts(&self) -> (Url, Option<SecretString>, bool) {
+        (
+            self.url.clone(),
+            self.token
+                .as_ref()
+                .map(|token| SecretString::from(token.expose_secret().to_owned())),
+            self.allow_insecure_remote_ws,
+        )
     }
 }
 
@@ -253,15 +310,16 @@ impl Debug for ConnectRequest {
 }
 
 fn endpoint_authority(url: &Url) -> String {
+    let scheme = url.scheme();
     let host = url.host_str().unwrap_or("<unknown>");
-    match url.port() {
-        Some(port) => format!("{}://{host}:{port}", url.scheme()),
-        None => format!("{}://{host}", url.scheme()),
-    }
+    url.port().map_or_else(
+        || format!("{scheme}://{host}"),
+        |port| format!("{scheme}://{host}:{port}"),
+    )
 }
 
-fn is_loopback(host: Option<Host<&str>>) -> bool {
-    match host {
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
         Some(Host::Domain("localhost")) => true,
         Some(Host::Ipv4(address)) => address.is_loopback(),
         Some(Host::Ipv6(address)) => address.is_loopback(),
@@ -272,6 +330,7 @@ fn is_loopback(host: Option<Host<&str>>) -> bool {
 /// A non-secret summary of one authenticated Gateway connection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadySummary {
+    connection_epoch: u64,
     protocol: u64,
     server_version: String,
     role: String,
@@ -284,12 +343,30 @@ impl ReadySummary {
     #[must_use]
     pub fn from_info(info: &ConnectionInfo) -> Self {
         Self {
+            connection_epoch: 0,
             protocol: info.protocol.get(),
             server_version: info.server_version.clone(),
             role: info.role.clone(),
             scopes: info.scopes.to_vec(),
             max_payload_bytes: info.max_payload_bytes,
         }
+    }
+
+    /// Projects an authenticated lifecycle, including its process-local epoch.
+    #[must_use]
+    pub fn from_connection(connection: &ReadyConnection) -> Self {
+        let mut summary = Self::from_info(&connection.info);
+        summary.connection_epoch = connection.epoch.get();
+        summary
+    }
+
+    /// Returns the process-local connection epoch.
+    ///
+    /// A value of zero is used only by [`Self::from_info`], whose input predates
+    /// lifecycle epochs. Live controller snapshots always carry a non-zero value.
+    #[must_use]
+    pub const fn connection_epoch(&self) -> u64 {
+        self.connection_epoch
     }
 
     /// Returns the negotiated protocol version.
@@ -323,9 +400,128 @@ impl ReadySummary {
     }
 }
 
+/// Stable diagnostic identity for one operator-facing condition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticCode {
+    /// A caller supplied an unclassified custom error.
+    Unknown,
+    /// No Gateway endpoint was supplied.
+    EndpointRequired,
+    /// The Gateway endpoint is malformed or unsupported.
+    EndpointInvalid,
+    /// A remote plaintext endpoint needs explicit handling.
+    EndpointInsecure,
+    /// The supplied token is invalid for local input policy.
+    TokenInvalid,
+    /// The controller command queue is saturated.
+    ControllerBusy,
+    /// The controller task has stopped.
+    ControllerStopped,
+    /// The platform cannot supply an identity.
+    IdentityUnavailable,
+    /// Device-backed identity storage is locked.
+    IdentityLocked,
+    /// Android invalidated the stored identity.
+    IdentityInvalidated,
+    /// No usable network is available.
+    NetworkUnavailable,
+    /// Android has not validated Internet access.
+    ///
+    /// This is diagnostic only: an isolated local network may still carry a
+    /// reachable Gateway.
+    NetworkUnvalidated,
+    /// The app is backgrounded.
+    AppBackgrounded,
+    /// The Gateway cannot be reached.
+    GatewayUnreachable,
+    /// A connection lifecycle operation timed out.
+    GatewayTimeout,
+    /// The live socket dropped.
+    ConnectionDropped,
+    /// The Gateway closed the connection.
+    GatewayClosed,
+    /// Authentication needs a token.
+    AuthenticationRequired,
+    /// Authentication was rejected.
+    AuthenticationRejected,
+    /// Authentication is rate limited.
+    AuthenticationRateLimited,
+    /// The Gateway requires an authentication mode this client cannot provide.
+    UnsupportedAuthentication,
+    /// Pairing must be completed elsewhere.
+    PairingRequired,
+    /// The requested read-only authorization was not granted.
+    AuthorizationMismatch,
+    /// The device must be registered.
+    DeviceRegistrationRequired,
+    /// The phone clock is outside the accepted signature window.
+    ClockIncorrect,
+    /// The app and Gateway protocol versions do not overlap.
+    ProtocolMismatch,
+    /// A protocol rule was violated.
+    ProtocolFailure,
+    /// Event continuity was lost.
+    ResyncRequired,
+    /// Local bounded queues are saturated.
+    Backpressure,
+    /// A request was made without a ready connection.
+    NotReady,
+    /// A request exceeded its response timeout.
+    RequestTimeout,
+    /// Bounded shutdown expired.
+    ShutdownTimeout,
+    /// The bounded reconnect budget is exhausted.
+    ReconnectExhausted,
+    /// A request belonged to a superseded connection.
+    ConnectionChanged,
+    /// The app constructed an invalid client configuration.
+    ClientConfiguration,
+    /// The operation was cancelled.
+    Cancelled,
+    /// The peer selected an unsupported WebSocket extension.
+    UnsupportedExtension,
+}
+
+/// Concrete action a shell can bind to a remedy affordance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemedyKind {
+    /// No operator action is required.
+    None,
+    /// Enter a Gateway endpoint.
+    EnterEndpoint,
+    /// Edit the endpoint.
+    EditEndpoint,
+    /// Edit or replace the token.
+    EditToken,
+    /// Check connectivity or captive-portal state.
+    CheckNetwork,
+    /// Wait before another attempt.
+    Wait,
+    /// Retry the retained connection request.
+    Retry,
+    /// Update the app or Gateway.
+    UpdateSoftware,
+    /// Ask the Gateway administrator to change configuration or authorization.
+    ContactAdministrator,
+    /// Register this device on the Gateway.
+    RegisterDevice,
+    /// Complete pairing from another client.
+    PairElsewhere,
+    /// Correct the phone clock.
+    CheckClock,
+    /// Restart the application.
+    RestartApp,
+    /// Bring the application to the foreground.
+    BringToForeground,
+    /// Report an application defect.
+    ReportBug,
+}
+
 /// An operator-facing failure with a concrete corrective action.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserError {
+    diagnostic: DiagnosticCode,
+    remedy: RemedyKind,
     message: String,
     action: String,
 }
@@ -334,7 +530,20 @@ impl UserError {
     /// Creates an error from an already operator-facing pair.
     #[must_use]
     pub fn new(message: impl Into<String>, action: impl Into<String>) -> Self {
+        Self::diagnostic(DiagnosticCode::Unknown, RemedyKind::Retry, message, action)
+    }
+
+    /// Creates a classified operator-facing error.
+    #[must_use]
+    pub fn diagnostic(
+        diagnostic: DiagnosticCode,
+        remedy: RemedyKind,
+        message: impl Into<String>,
+        action: impl Into<String>,
+    ) -> Self {
         Self {
+            diagnostic,
+            remedy,
             message: message.into(),
             action: action.into(),
         }
@@ -344,7 +553,35 @@ impl UserError {
     #[must_use]
     pub fn from_rejection(rejection: SubmissionRejection) -> Self {
         let (message, action) = rejection.user_error();
-        Self::new(message, action)
+        let (diagnostic, remedy) = rejection.diagnostic();
+        Self::diagnostic(diagnostic, remedy, message, action)
+    }
+
+    /// Translates a closed platform identity failure.
+    #[must_use]
+    pub fn from_identity_failure(error: IdentityFailure) -> Self {
+        match error {
+            IdentityFailure::RandomnessUnavailable | IdentityFailure::Unavailable => {
+                Self::diagnostic(
+                    DiagnosticCode::IdentityUnavailable,
+                    RemedyKind::RestartApp,
+                    "This device could not provide a secure identity.",
+                    "Restart the app. If it keeps failing, this device cannot connect safely.",
+                )
+            }
+            IdentityFailure::StorageLocked => Self::diagnostic(
+                DiagnosticCode::IdentityLocked,
+                RemedyKind::Retry,
+                "The device identity is temporarily locked.",
+                "Unlock the device, then retry.",
+            ),
+            IdentityFailure::StorageInvalidated => Self::diagnostic(
+                DiagnosticCode::IdentityInvalidated,
+                RemedyKind::RegisterDevice,
+                "Android invalidated this app's stored identity.",
+                "Create a new device identity, register it on the Gateway, then retry.",
+            ),
+        }
     }
 
     /// Translates a transport failure without reproducing any secret material.
@@ -359,31 +596,47 @@ impl UserError {
                 Self::from_authentication(failure.detail_code(), failure.device_retry_recommended())
             }
             GatewayClientError::Protocol(protocol) => Self::from_protocol(protocol),
-            GatewayClientError::Backpressure(_) => Self::new(
+            GatewayClientError::Backpressure(_) => Self::diagnostic(
+                DiagnosticCode::Backpressure,
+                RemedyKind::Wait,
                 "The app is sending faster than this connection allows.",
                 "Wait a moment, then retry.",
             ),
             GatewayClientError::NotReady | GatewayClientError::DisconnectedNotReplayed => {
-                Self::new(
+                Self::diagnostic(
+                    DiagnosticCode::NotReady,
+                    RemedyKind::Retry,
                     "The connection is not ready.",
                     "Reconnect before sending requests.",
                 )
             }
-            GatewayClientError::Cancelled => {
-                Self::new("The connection was stopped.", "Connect again when ready.")
-            }
-            GatewayClientError::ConnectionChanged { .. } => Self::new(
+            GatewayClientError::Cancelled => Self::diagnostic(
+                DiagnosticCode::Cancelled,
+                RemedyKind::Retry,
+                "The connection was stopped.",
+                "Connect again when ready.",
+            ),
+            GatewayClientError::ConnectionChanged { .. } => Self::diagnostic(
+                DiagnosticCode::ConnectionChanged,
+                RemedyKind::Retry,
                 "The connection was replaced before this request completed.",
                 "Retry on the current connection.",
             ),
-            GatewayClientError::RequestTimedOut(_) => {
-                Self::new("The Gateway did not answer in time.", "Retry the request.")
-            }
-            GatewayClientError::ShutdownTimedOut => Self::new(
+            GatewayClientError::RequestTimedOut(_) => Self::diagnostic(
+                DiagnosticCode::RequestTimeout,
+                RemedyKind::Retry,
+                "The Gateway did not answer in time.",
+                "Retry the request.",
+            ),
+            GatewayClientError::ShutdownTimedOut => Self::diagnostic(
+                DiagnosticCode::ShutdownTimeout,
+                RemedyKind::Retry,
                 "Shutting the connection down took too long.",
                 "The app released it anyway; reconnect when ready.",
             ),
-            GatewayClientError::ReconnectExhausted => Self::new(
+            GatewayClientError::ReconnectExhausted => Self::diagnostic(
+                DiagnosticCode::ReconnectExhausted,
+                RemedyKind::CheckNetwork,
                 "Reconnect attempts ran out.",
                 "Check the network and the Gateway address, then connect again.",
             ),
@@ -412,12 +665,16 @@ impl UserError {
     ) -> Self {
         let Some(detail) = detail else {
             return if device_retry_recommended {
-                Self::new(
+                Self::diagnostic(
+                    DiagnosticCode::AuthenticationRejected,
+                    RemedyKind::Retry,
                     "The Gateway rejected this device.",
                     "The server asked for a fresh device token. Reconnect to request one.",
                 )
             } else {
-                Self::new(
+                Self::diagnostic(
+                    DiagnosticCode::AuthenticationRejected,
+                    RemedyKind::EditToken,
                     "The Gateway rejected this device.",
                     "Check the token, then try again.",
                 )
@@ -431,48 +688,70 @@ impl UserError {
             ConnectErrorDetailCode::AuthTailscaleIdentityMissing
             | ConnectErrorDetailCode::AuthTailscaleProxyMissing
             | ConnectErrorDetailCode::AuthTailscaleWhoisFailed
-            | ConnectErrorDetailCode::AuthTailscaleIdentityMismatch => Self::new(
+            | ConnectErrorDetailCode::AuthTailscaleIdentityMismatch => Self::diagnostic(
+                DiagnosticCode::UnsupportedAuthentication,
+                RemedyKind::ContactAdministrator,
                 "This Gateway authenticates callers through Tailscale.",
                 "This Android build cannot present a Tailscale identity, so it cannot connect to \
                  this server. Use a Gateway that accepts token or device authentication.",
             ),
-            ConnectErrorDetailCode::PairingRequired => Self::new(
+            ConnectErrorDetailCode::PairingRequired => Self::diagnostic(
+                DiagnosticCode::PairingRequired,
+                RemedyKind::PairElsewhere,
                 "This Gateway requires the device to be paired first.",
                 "This build has no pairing screen, so the pairing has to be completed from \
                  another client before this device can connect.",
             ),
-            ConnectErrorDetailCode::AuthRateLimited => Self::new(
+            ConnectErrorDetailCode::AuthRateLimited => Self::diagnostic(
+                DiagnosticCode::AuthenticationRateLimited,
+                RemedyKind::Wait,
                 "The Gateway is rate limiting authentication attempts.",
                 "Wait before trying again. Repeated attempts usually extend the limit.",
             ),
             ConnectErrorDetailCode::AuthRequired | ConnectErrorDetailCode::AuthTokenMissing => {
-                Self::new(
+                Self::diagnostic(
+                    DiagnosticCode::AuthenticationRequired,
+                    RemedyKind::EditToken,
                     "This Gateway requires a token and none was sent.",
                     "Enter the Gateway token, then connect again.",
                 )
             }
             ConnectErrorDetailCode::AuthTokenMismatch
-            | ConnectErrorDetailCode::AuthBootstrapTokenInvalid => Self::new(
+            | ConnectErrorDetailCode::AuthBootstrapTokenInvalid => Self::diagnostic(
+                DiagnosticCode::AuthenticationRejected,
+                RemedyKind::EditToken,
                 "The Gateway did not accept this token.",
                 "Check the token for a typo or an expiry, then connect again.",
             ),
-            ConnectErrorDetailCode::AuthTokenNotConfigured => Self::new(
+            ConnectErrorDetailCode::AuthTokenNotConfigured => Self::diagnostic(
+                DiagnosticCode::UnsupportedAuthentication,
+                RemedyKind::ContactAdministrator,
                 "This Gateway is not configured to accept tokens.",
                 "Ask whoever runs the Gateway which authentication it expects.",
             ),
             ConnectErrorDetailCode::AuthPasswordMissing
             | ConnectErrorDetailCode::AuthPasswordMismatch
-            | ConnectErrorDetailCode::AuthPasswordNotConfigured => Self::new(
+            | ConnectErrorDetailCode::AuthPasswordNotConfigured => Self::diagnostic(
+                DiagnosticCode::UnsupportedAuthentication,
+                RemedyKind::ContactAdministrator,
                 "This Gateway expects password authentication.",
                 "This build only sends a token, so it cannot authenticate here. Use a Gateway \
                  that accepts token or device authentication.",
             ),
-            ConnectErrorDetailCode::AuthScopeMismatch => Self::new(
+            ConnectErrorDetailCode::AuthScopeMismatch => Self::diagnostic(
+                DiagnosticCode::AuthorizationMismatch,
+                RemedyKind::ContactAdministrator,
                 "The Gateway would not grant the permissions this app asked for.",
                 "This app requests read-only operator access. Ask for that grant on the Gateway, \
                  then connect again.",
             ),
-            ConnectErrorDetailCode::AuthDeviceTokenMismatch => Self::new(
+            ConnectErrorDetailCode::AuthDeviceTokenMismatch => Self::diagnostic(
+                DiagnosticCode::AuthenticationRejected,
+                if device_retry_recommended {
+                    RemedyKind::Retry
+                } else {
+                    RemedyKind::RegisterDevice
+                },
                 "The Gateway did not recognise this device's token.",
                 if device_retry_recommended {
                     "The server asked for a fresh device token. Reconnect to request one."
@@ -488,32 +767,44 @@ impl UserError {
             | ConnectErrorDetailCode::DeviceAuthInvalid
             | ConnectErrorDetailCode::DeviceAuthDeviceIdMismatch
             | ConnectErrorDetailCode::DeviceAuthPublicKeyInvalid
-            | ConnectErrorDetailCode::DeviceAuthSignatureInvalid => Self::new(
+            | ConnectErrorDetailCode::DeviceAuthSignatureInvalid => Self::diagnostic(
+                DiagnosticCode::DeviceRegistrationRequired,
+                RemedyKind::RegisterDevice,
                 "The Gateway rejected this device's identity.",
                 "This app generates a new identity each time it starts, so a Gateway that only \
                  admits known devices will refuse it until this one is registered.",
             ),
-            ConnectErrorDetailCode::DeviceAuthSignatureExpired => Self::new(
+            ConnectErrorDetailCode::DeviceAuthSignatureExpired => Self::diagnostic(
+                DiagnosticCode::ClockIncorrect,
+                RemedyKind::CheckClock,
                 "The Gateway judged this device's signature to be out of date.",
                 "Check that the phone's clock and time zone are correct, then connect again.",
             ),
             ConnectErrorDetailCode::DeviceAuthNonceRequired
-            | ConnectErrorDetailCode::DeviceAuthNonceMismatch => Self::new(
+            | ConnectErrorDetailCode::DeviceAuthNonceMismatch => Self::diagnostic(
+                DiagnosticCode::AuthenticationRejected,
+                RemedyKind::Retry,
                 "The Gateway's authentication challenge did not match the reply.",
                 "Connect again to start a fresh challenge.",
             ),
             ConnectErrorDetailCode::ProtocolMismatch
-            | ConnectErrorDetailCode::ClientVersionMismatch => Self::new(
+            | ConnectErrorDetailCode::ClientVersionMismatch => Self::diagnostic(
+                DiagnosticCode::ProtocolMismatch,
+                RemedyKind::UpdateSoftware,
                 "This app and the Gateway do not speak a common protocol version.",
                 "Update whichever of the app and the Gateway is older.",
             ),
             // Emitted for browser Control UI callers. This client is not one, so
             // seeing it means the Gateway took us for something we are not.
-            ConnectErrorDetailCode::ControlUiOriginNotAllowed => Self::new(
+            ConnectErrorDetailCode::ControlUiOriginNotAllowed => Self::diagnostic(
+                DiagnosticCode::EndpointInvalid,
+                RemedyKind::EditEndpoint,
                 "The Gateway answered as though this app were a web page.",
                 "Check that the address points at a Gateway endpoint and not at a Control UI one.",
             ),
-            ConnectErrorDetailCode::AuthUnauthorized => Self::new(
+            ConnectErrorDetailCode::AuthUnauthorized => Self::diagnostic(
+                DiagnosticCode::AuthenticationRejected,
+                RemedyKind::ContactAdministrator,
                 "The Gateway refused this connection.",
                 "Check the token and that this device is allowed to connect, then try again.",
             ),
@@ -531,14 +822,18 @@ impl UserError {
             ConfigurationError::InsecureRemoteWebSocket => {
                 Self::from_rejection(SubmissionRejection::InsecureRemoteEndpoint)
             }
-            ConfigurationError::WorkerProtocolUnsupported => Self::new(
+            ConfigurationError::WorkerProtocolUnsupported => Self::diagnostic(
+                DiagnosticCode::ClientConfiguration,
+                RemedyKind::ReportBug,
                 "Worker connections are not supported by this app.",
                 "Use an operator Gateway address.",
             ),
             ConfigurationError::InvalidProtocolRange
             | ConfigurationError::InvalidResourceLimit
             | ConfigurationError::InvalidTimeout
-            | ConfigurationError::InvalidReconnectPolicy => Self::new(
+            | ConfigurationError::InvalidReconnectPolicy => Self::diagnostic(
+                DiagnosticCode::ClientConfiguration,
+                RemedyKind::ReportBug,
                 "The app built an invalid connection configuration.",
                 "This is a bug in the app; please report it.",
             ),
@@ -547,23 +842,33 @@ impl UserError {
 
     fn from_transport(error: TransportFailure) -> Self {
         match error {
-            TransportFailure::Connect => Self::new(
+            TransportFailure::Connect => Self::diagnostic(
+                DiagnosticCode::GatewayUnreachable,
+                RemedyKind::CheckNetwork,
                 "Could not reach the Gateway.",
                 "Check the address and this device's network, then retry.",
             ),
-            TransportFailure::TimedOut => Self::new(
+            TransportFailure::TimedOut => Self::diagnostic(
+                DiagnosticCode::GatewayTimeout,
+                RemedyKind::CheckNetwork,
                 "The Gateway did not respond in time.",
                 "Check the network, then retry.",
             ),
-            TransportFailure::PeerClosed { .. } | TransportFailure::Closed => Self::new(
+            TransportFailure::PeerClosed { .. } | TransportFailure::Closed => Self::diagnostic(
+                DiagnosticCode::GatewayClosed,
+                RemedyKind::Retry,
                 "The Gateway closed the connection.",
                 "Connect again when the server is available.",
             ),
-            TransportFailure::Read | TransportFailure::Write => Self::new(
+            TransportFailure::Read | TransportFailure::Write => Self::diagnostic(
+                DiagnosticCode::ConnectionDropped,
+                RemedyKind::CheckNetwork,
                 "The connection dropped mid-transfer.",
                 "Retry; mobile networks drop sockets when the app is backgrounded.",
             ),
-            TransportFailure::UnsupportedExtension => Self::new(
+            TransportFailure::UnsupportedExtension => Self::diagnostic(
+                DiagnosticCode::UnsupportedExtension,
+                RemedyKind::UpdateSoftware,
                 "The Gateway negotiated an unsupported WebSocket extension.",
                 "Upgrade the Gateway or this app.",
             ),
@@ -572,20 +877,28 @@ impl UserError {
 
     fn from_protocol(error: &ProtocolFailure) -> Self {
         match error {
-            ProtocolFailure::HelloProtocol { .. } => Self::new(
+            ProtocolFailure::HelloProtocol { .. } => Self::diagnostic(
+                DiagnosticCode::ProtocolMismatch,
+                RemedyKind::UpdateSoftware,
                 "This app and the Gateway do not share a protocol version.",
                 "Upgrade whichever side is older.",
             ),
             ProtocolFailure::HandshakeRejected(_)
-            | ProtocolFailure::HelloAuthenticationMismatch => Self::new(
+            | ProtocolFailure::HelloAuthenticationMismatch => Self::diagnostic(
+                DiagnosticCode::AuthenticationRejected,
+                RemedyKind::ContactAdministrator,
                 "The Gateway refused the handshake.",
                 "Check the token and this device's authorization.",
             ),
-            ProtocolFailure::ResyncRequired(_) => Self::new(
+            ProtocolFailure::ResyncRequired(_) => Self::diagnostic(
+                DiagnosticCode::ResyncRequired,
+                RemedyKind::Retry,
                 "Event continuity was lost.",
                 "Reconnect to rebuild state from a fresh snapshot.",
             ),
-            _ => Self::new(
+            _ => Self::diagnostic(
+                DiagnosticCode::ProtocolFailure,
+                RemedyKind::Retry,
                 "The Gateway sent something this app could not accept.",
                 "Reconnect; if it repeats, report the Gateway version.",
             ),
@@ -602,6 +915,18 @@ impl UserError {
     #[must_use]
     pub fn action(&self) -> &str {
         &self.action
+    }
+
+    /// Returns the stable diagnostic identity.
+    #[must_use]
+    pub const fn diagnostic_code(&self) -> DiagnosticCode {
+        self.diagnostic
+    }
+
+    /// Returns the action category a shell can bind to.
+    #[must_use]
+    pub const fn remedy_kind(&self) -> RemedyKind {
+        self.remedy
     }
 }
 
@@ -636,7 +961,7 @@ impl AttemptUpdate {
         match state {
             ConnectionState::Starting | ConnectionState::Connecting => Self::Connecting,
             ConnectionState::Authenticating => Self::Authenticating,
-            ConnectionState::Ready(ready) => Self::Ready(ReadySummary::from_info(&ready.info)),
+            ConnectionState::Ready(ready) => Self::Ready(ReadySummary::from_connection(ready)),
             ConnectionState::Reconnecting { attempt, delay } => Self::Reconnecting {
                 attempt: *attempt,
                 delay: *delay,
@@ -673,9 +998,33 @@ pub enum StatusKind {
     Danger,
 }
 
+/// Stable connection phase suitable for direct shell binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionPhase {
+    /// No connection has been requested.
+    Idle,
+    /// A request is retained until the app returns to the foreground.
+    Suspended,
+    /// A request is retained until Android reports usable connectivity.
+    WaitingForNetwork,
+    /// A socket is opening.
+    Connecting,
+    /// The Gateway handshake is running.
+    Authenticating,
+    /// The connection is authenticated.
+    Ready,
+    /// The transport is inside its bounded reconnect policy.
+    Reconnecting,
+    /// The attempt stopped with an actionable failure.
+    Failed,
+    /// The operator explicitly disconnected.
+    Disconnected,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Phase {
     Idle,
+    Blocked(ConnectionBlocker),
     Connecting,
     Authenticating,
     Ready(Box<ReadySummary>),
@@ -688,11 +1037,16 @@ enum Phase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ViewModel {
     generation: u64,
+    revision: u64,
     phase: Phase,
     endpoint: String,
     identity: Option<String>,
     token_offered: bool,
     posture: Option<TransportPosture>,
+    request_retained: bool,
+    lifecycle: AppLifecycle,
+    network: NetworkStatus,
+    platform_capabilities: PlatformCapabilities,
 }
 
 impl Default for ViewModel {
@@ -704,18 +1058,30 @@ impl Default for ViewModel {
 impl ViewModel {
     /// Creates the initial idle state.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        Self::with_platform(PlatformCapabilities::default())
+    }
+
+    /// Creates idle state with explicit platform capability facts.
+    #[must_use]
+    pub const fn with_platform(platform_capabilities: PlatformCapabilities) -> Self {
         Self {
             generation: 0,
+            revision: 0,
             phase: Phase::Idle,
             endpoint: String::new(),
             identity: None,
             token_offered: false,
             posture: None,
+            request_retained: false,
+            lifecycle: AppLifecycle::Foreground,
+            network: NetworkStatus::Unknown,
+            platform_capabilities,
         }
     }
 
-    /// Returns whether a new attempt may start now.    #[must_use]
+    /// Returns whether a new attempt may start now.
+    #[must_use]
     pub const fn can_start_connection(&self) -> bool {
         matches!(self.phase, Phase::Idle | Phase::Failed(_) | Phase::Stopped)
     }
@@ -725,13 +1091,32 @@ impl ViewModel {
     /// Every later [`Self::apply`] carrying an older generation is discarded, so
     /// a late update from an abandoned attempt cannot overwrite the live one.
     pub fn begin(&mut self, request: &ConnectRequest) -> u64 {
+        self.prepare_attempt(request, Phase::Connecting);
+        self.generation
+    }
+
+    /// Retains a request that cannot run until a platform blocker clears.
+    pub fn defer(&mut self, request: &ConnectRequest, blocker: ConnectionBlocker) -> u64 {
+        self.prepare_attempt(request, Phase::Blocked(blocker));
+        self.generation
+    }
+
+    /// Supersedes a live attempt and renders why its retained request is paused.
+    pub fn suspend(&mut self, blocker: ConnectionBlocker) {
         self.generation = self.generation.wrapping_add(1);
-        self.phase = Phase::Connecting;
+        self.phase = Phase::Blocked(blocker);
+        self.touch();
+    }
+
+    fn prepare_attempt(&mut self, request: &ConnectRequest, phase: Phase) {
+        self.generation = self.generation.wrapping_add(1);
+        self.phase = phase;
         self.endpoint = request.endpoint_display();
         self.identity = None;
         self.token_offered = request.has_token();
         self.posture = Some(request.transport_posture());
-        self.generation
+        self.request_retained = true;
+        self.touch();
     }
 
     /// Returns the generation currently owning the view.
@@ -740,31 +1125,96 @@ impl ViewModel {
         self.generation
     }
 
+    /// Updates platform environment facts, returning whether binding state changed.
+    pub fn set_environment(&mut self, lifecycle: AppLifecycle, network: NetworkStatus) -> bool {
+        if self.lifecycle == lifecycle && self.network == network {
+            return false;
+        }
+        self.lifecycle = lifecycle;
+        self.network = network;
+        self.touch();
+        true
+    }
+
+    /// Returns the current lifecycle fact.
+    #[must_use]
+    pub const fn lifecycle(&self) -> AppLifecycle {
+        self.lifecycle
+    }
+
+    /// Returns the current connectivity fact.
+    #[must_use]
+    pub const fn network(&self) -> NetworkStatus {
+        self.network
+    }
+
+    /// Updates platform capability facts, returning whether binding state changed.
+    pub fn set_platform_capabilities(&mut self, capabilities: PlatformCapabilities) -> bool {
+        if self.platform_capabilities == capabilities {
+            return false;
+        }
+        self.platform_capabilities = capabilities;
+        self.touch();
+        true
+    }
+
     /// Applies one update, ignoring any update from a superseded attempt.
     ///
-    /// Returns whether the update was accepted.
+    /// Returns whether the update changed binding state. Duplicate live updates
+    /// and every stale update return `false`.
     pub fn apply(&mut self, generation: u64, update: AttemptUpdate) -> bool {
         if generation != self.generation {
             return false;
         }
-        match update {
-            AttemptUpdate::IdentityCreated(identity) => self.identity = Some(identity),
-            AttemptUpdate::Connecting => self.phase = Phase::Connecting,
-            AttemptUpdate::Authenticating => self.phase = Phase::Authenticating,
-            AttemptUpdate::Ready(summary) => self.phase = Phase::Ready(Box::new(summary)),
-            AttemptUpdate::Reconnecting { attempt, delay } => {
-                self.phase = Phase::Reconnecting { attempt, delay };
+        let changed = match update {
+            AttemptUpdate::IdentityCreated(identity) => {
+                if self.identity.as_deref() == Some(identity.as_str()) {
+                    false
+                } else {
+                    self.identity = Some(identity);
+                    true
+                }
             }
-            AttemptUpdate::Failed(error) => self.phase = Phase::Failed(error),
-            AttemptUpdate::Stopped => self.phase = Phase::Stopped,
+            AttemptUpdate::Connecting => self.replace_phase(Phase::Connecting),
+            AttemptUpdate::Authenticating => self.replace_phase(Phase::Authenticating),
+            AttemptUpdate::Ready(summary) => self.replace_phase(Phase::Ready(Box::new(summary))),
+            AttemptUpdate::Reconnecting { attempt, delay } => {
+                self.replace_phase(Phase::Reconnecting { attempt, delay })
+            }
+            AttemptUpdate::Failed(error) => self.replace_phase(Phase::Failed(error)),
+            AttemptUpdate::Stopped => self.replace_phase(Phase::Stopped),
+        };
+        if changed {
+            self.touch();
         }
-        true
+        changed
     }
 
     /// Marks the attempt stopped without waiting for the transport to report it.
-    pub fn request_stop(&mut self) {
+    ///
+    /// Returns whether binding state changed.
+    pub fn request_stop(&mut self) -> bool {
+        if matches!(self.phase, Phase::Stopped) && !self.request_retained {
+            return false;
+        }
         self.generation = self.generation.wrapping_add(1);
         self.phase = Phase::Stopped;
+        self.request_retained = false;
+        self.touch();
+        true
+    }
+
+    fn replace_phase(&mut self, phase: Phase) -> bool {
+        if self.phase == phase {
+            false
+        } else {
+            self.phase = phase;
+            true
+        }
+    }
+
+    const fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Renders the current state for the UI layer.
@@ -776,6 +1226,21 @@ impl ViewModel {
                 "Enter a Gateway address to begin.".to_owned(),
                 "Idle".to_owned(),
                 StatusKind::Neutral,
+            ),
+            Phase::Blocked(ConnectionBlocker::Background) => (
+                "Connection paused".to_owned(),
+                "The app is in the background. The retained connection will resume in the \
+                 foreground."
+                    .to_owned(),
+                "Paused".to_owned(),
+                StatusKind::Warning,
+            ),
+            Phase::Blocked(ConnectionBlocker::NetworkUnavailable) => (
+                "Waiting for network".to_owned(),
+                "The retained connection will resume when Android reports a usable network."
+                    .to_owned(),
+                "Offline".to_owned(),
+                StatusKind::Warning,
             ),
             Phase::Connecting => (
                 "Connecting".to_owned(),
@@ -823,12 +1288,67 @@ impl ViewModel {
             Phase::Ready(summary) => Some(summary.as_ref()),
             _ => None,
         };
+        let retry = match self.phase {
+            Phase::Reconnecting { attempt, delay } => Some(RetrySnapshot::new(attempt, delay)),
+            _ => None,
+        };
+        let remedy = match &self.phase {
+            Phase::Blocked(ConnectionBlocker::Background) => Some(RemedySnapshot::new(
+                DiagnosticCode::AppBackgrounded,
+                RemedyKind::BringToForeground,
+                "Return to the app to resume the connection.",
+            )),
+            Phase::Blocked(ConnectionBlocker::NetworkUnavailable) => Some(RemedySnapshot::new(
+                DiagnosticCode::NetworkUnavailable,
+                RemedyKind::CheckNetwork,
+                "Connect this device to Wi-Fi or cellular data.",
+            )),
+            Phase::Reconnecting { .. } => Some(RemedySnapshot::new(
+                DiagnosticCode::ConnectionDropped,
+                RemedyKind::Wait,
+                "The app is retrying automatically within a bounded budget.",
+            )),
+            Phase::Failed(error) => Some(RemedySnapshot::from_error(error)),
+            Phase::Idle
+            | Phase::Connecting
+            | Phase::Authenticating
+            | Phase::Ready(_)
+            | Phase::Stopped => None,
+        };
+        let phase = match self.phase {
+            Phase::Idle => ConnectionPhase::Idle,
+            Phase::Blocked(ConnectionBlocker::Background) => ConnectionPhase::Suspended,
+            Phase::Blocked(ConnectionBlocker::NetworkUnavailable) => {
+                ConnectionPhase::WaitingForNetwork
+            }
+            Phase::Connecting => ConnectionPhase::Connecting,
+            Phase::Authenticating => ConnectionPhase::Authenticating,
+            Phase::Ready(_) => ConnectionPhase::Ready,
+            Phase::Reconnecting { .. } => ConnectionPhase::Reconnecting,
+            Phase::Failed(_) => ConnectionPhase::Failed,
+            Phase::Stopped => ConnectionPhase::Disconnected,
+        };
+        let pending_connection = matches!(
+            self.phase,
+            Phase::Blocked(_)
+                | Phase::Connecting
+                | Phase::Authenticating
+                | Phase::Ready(_)
+                | Phase::Reconnecting { .. }
+        );
 
         ViewSnapshot {
+            revision: self.revision,
+            phase,
             title,
             detail,
             status_label,
             status_kind,
+            lifecycle: self.lifecycle,
+            network: self.network,
+            network_summary: self.network.summary(),
+            platform_capabilities: self.platform_capabilities,
+            platform_notice: self.platform_capabilities.notice(),
             endpoint_summary: if self.endpoint.is_empty() {
                 "No Gateway selected".to_owned()
             } else {
@@ -849,28 +1369,29 @@ impl ViewModel {
                     }
                 },
             ),
+            connection_epoch: ready
+                .map(ReadySummary::connection_epoch)
+                .filter(|epoch| *epoch != 0),
             identity_summary: self
                 .identity
                 .clone()
                 .unwrap_or_else(|| "not generated".to_owned()),
-            credential_notice: CREDENTIAL_NOTICE.to_owned(),
+            credential_notice: credential_notice(self.platform_capabilities).to_owned(),
             transport_notice: self.posture.map_or_else(
                 || "No connection has been attempted yet.".to_owned(),
                 |posture| posture.notice().to_owned(),
             ),
+            pending_connection,
             token_offered: self.token_offered,
             busy: matches!(
                 self.phase,
                 Phase::Connecting | Phase::Authenticating | Phase::Reconnecting { .. }
             ),
             can_connect: self.can_start_connection(),
-            can_disconnect: matches!(
-                self.phase,
-                Phase::Connecting
-                    | Phase::Authenticating
-                    | Phase::Ready(_)
-                    | Phase::Reconnecting { .. }
-            ),
+            can_disconnect: pending_connection,
+            can_retry: self.request_retained && matches!(self.phase, Phase::Failed(_)),
+            retry,
+            remedy,
             error: match &self.phase {
                 Phase::Failed(error) => Some(error.clone()),
                 _ => None,
@@ -879,33 +1400,127 @@ impl ViewModel {
     }
 }
 
-/// Stated plainly because this app implements no credential storage at all.
+/// Portable default for a core with no platform identity store.
 ///
 /// `GatewayClient::take_issued_device_tokens` hands back device tokens, and this
-/// app deliberately drops them. Claiming anything else here would be a fabricated
-/// summary of a policy that no code enforces.
+/// core deliberately drops them even when a shell supplies a durable identity.
 pub const CREDENTIAL_NOTICE: &str = "Session only. No token or device key is written to this device, so every launch \
      re-authenticates from scratch.";
 
+const DEVICE_BACKED_CREDENTIAL_NOTICE: &str = "The platform retains the device identity. Shared and issued Gateway \
+     tokens remain in memory only.";
+
+const fn credential_notice(capabilities: PlatformCapabilities) -> &'static str {
+    match capabilities.identity_persistence() {
+        IdentityPersistence::SessionOnly => CREDENTIAL_NOTICE,
+        IdentityPersistence::DeviceBacked => DEVICE_BACKED_CREDENTIAL_NOTICE,
+    }
+}
+
+/// Structured bounded-retry state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetrySnapshot {
+    attempt: u32,
+    delay_millis: u64,
+}
+
+impl RetrySnapshot {
+    fn new(attempt: u32, delay: Duration) -> Self {
+        Self {
+            attempt,
+            delay_millis: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Returns the one-based retry attempt.
+    #[must_use]
+    pub const fn attempt(self) -> u32 {
+        self.attempt
+    }
+
+    /// Returns the selected retry delay in milliseconds.
+    #[must_use]
+    pub const fn delay_millis(self) -> u64 {
+        self.delay_millis
+    }
+}
+
+/// Structured operator remedy suitable for binding to an action.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemedySnapshot {
+    diagnostic: DiagnosticCode,
+    kind: RemedyKind,
+    action: String,
+}
+
+impl RemedySnapshot {
+    fn new(diagnostic: DiagnosticCode, kind: RemedyKind, action: impl Into<String>) -> Self {
+        Self {
+            diagnostic,
+            kind,
+            action: action.into(),
+        }
+    }
+
+    fn from_error(error: &UserError) -> Self {
+        Self::new(error.diagnostic_code(), error.remedy_kind(), error.action())
+    }
+
+    /// Returns the stable diagnostic identity.
+    #[must_use]
+    pub const fn diagnostic_code(&self) -> DiagnosticCode {
+        self.diagnostic
+    }
+
+    /// Returns the action category.
+    #[must_use]
+    pub const fn kind(&self) -> RemedyKind {
+        self.kind
+    }
+
+    /// Returns the operator-facing action text.
+    #[must_use]
+    pub fn action(&self) -> &str {
+        &self.action
+    }
+}
+
 /// An immutable projection of [`ViewModel`] for the UI layer.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "these are independent facts a toolkit binds directly to controls and indicators; \
+              they are derived from the closed phase rather than forming another state machine"
+)]
 pub struct ViewSnapshot {
+    revision: u64,
+    phase: ConnectionPhase,
     title: String,
     detail: String,
     status_label: String,
     status_kind: StatusKind,
+    lifecycle: AppLifecycle,
+    network: NetworkStatus,
+    network_summary: String,
+    platform_capabilities: PlatformCapabilities,
+    platform_notice: String,
     endpoint_summary: String,
     server_summary: String,
     protocol_summary: String,
     role_summary: String,
     scopes_summary: String,
+    connection_epoch: Option<u64>,
     identity_summary: String,
     credential_notice: String,
     transport_notice: String,
+    pending_connection: bool,
     token_offered: bool,
     busy: bool,
     can_connect: bool,
     can_disconnect: bool,
+    can_retry: bool,
+    retry: Option<RetrySnapshot>,
+    remedy: Option<RemedySnapshot>,
     error: Option<UserError>,
 }
 
@@ -927,6 +1542,8 @@ snapshot_string_accessors!(
     title,
     detail,
     status_label,
+    network_summary,
+    platform_notice,
     endpoint_summary,
     server_summary,
     protocol_summary,
@@ -938,10 +1555,52 @@ snapshot_string_accessors!(
 );
 
 impl ViewSnapshot {
+    /// Returns the monotonically changing binding revision.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Returns the stable connection phase.
+    #[must_use]
+    pub const fn phase(&self) -> ConnectionPhase {
+        self.phase
+    }
+
     /// Returns the coarse status phase.
     #[must_use]
     pub const fn status_kind(&self) -> StatusKind {
         self.status_kind
+    }
+
+    /// Returns the latest application lifecycle fact.
+    #[must_use]
+    pub const fn lifecycle(&self) -> AppLifecycle {
+        self.lifecycle
+    }
+
+    /// Returns the latest connectivity fact.
+    #[must_use]
+    pub const fn network(&self) -> NetworkStatus {
+        self.network
+    }
+
+    /// Returns the platform capabilities in effect.
+    #[must_use]
+    pub const fn platform_capabilities(&self) -> PlatformCapabilities {
+        self.platform_capabilities
+    }
+
+    /// Returns the process-local ready epoch, when authenticated.
+    #[must_use]
+    pub const fn connection_epoch(&self) -> Option<u64> {
+        self.connection_epoch
+    }
+
+    /// Returns whether a connection intent is retained.
+    #[must_use]
+    pub const fn pending_connection(&self) -> bool {
+        self.pending_connection
     }
 
     /// Returns whether the attempt was made with a shared token.
@@ -968,6 +1627,24 @@ impl ViewSnapshot {
         self.can_disconnect
     }
 
+    /// Returns whether the retained request can be retried without re-entering it.
+    #[must_use]
+    pub const fn can_retry(&self) -> bool {
+        self.can_retry
+    }
+
+    /// Returns bounded retry details, when the transport is backing off.
+    #[must_use]
+    pub const fn retry(&self) -> Option<RetrySnapshot> {
+        self.retry
+    }
+
+    /// Returns the current structured remedy.
+    #[must_use]
+    pub const fn remedy(&self) -> Option<&RemedySnapshot> {
+        self.remedy.as_ref()
+    }
+
     /// Returns the current operator-facing failure, when there is one.
     #[must_use]
     pub const fn error(&self) -> Option<&UserError> {
@@ -983,8 +1660,12 @@ mod tests {
     use claw_protocol::gateway::{ConnectErrorDetailCode, ProtocolVersion};
 
     use super::{
-        AttemptUpdate, ConnectRequest, ReadySummary, StatusKind, SubmissionRejection,
-        TransportPosture, UserError, ViewModel,
+        AttemptUpdate, ConnectRequest, ConnectionPhase, DiagnosticCode, ReadySummary, RemedyKind,
+        StatusKind, SubmissionRejection, TransportPosture, UserError, ViewModel,
+    };
+    use crate::platform::{
+        AppLifecycle, ConnectionBlocker, DiscoveryReadiness, IdentityFailure, IdentityPersistence,
+        NetworkStatus, PlatformCapabilities,
     };
 
     /// Every detail code the frozen registry can carry.
@@ -1060,8 +1741,7 @@ mod tests {
         assert_eq!(
             request.endpoint_display(),
             "wss://gateway.example.com:8443",
-            "bare hosts must default to wss, got {:?}",
-            request
+            "bare hosts must default to wss, got {request:?}"
         );
     }
 
@@ -1301,6 +1981,94 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_live_updates_do_not_advance_the_binding_revision() {
+        let mut model = ViewModel::new();
+        let generation = model.begin(
+            &ConnectRequest::prepare("wss://gateway.example.com", "", false).expect("valid"),
+        );
+        let revision = model.snapshot().revision();
+
+        let changed = model.apply(generation, AttemptUpdate::Connecting);
+
+        assert!(
+            !changed,
+            "the model already begins in Connecting, so a duplicate update must be coalesced"
+        );
+        assert_eq!(
+            model.snapshot().revision(),
+            revision,
+            "a duplicate update must not trigger shell rebinding"
+        );
+        assert!(
+            model.apply(generation, AttemptUpdate::Authenticating),
+            "a real phase change must be accepted"
+        );
+        assert_eq!(
+            model.snapshot().revision(),
+            revision + 1,
+            "one real phase change must advance the revision exactly once"
+        );
+    }
+
+    #[test]
+    fn a_network_blocker_supersedes_the_socket_and_exposes_a_typed_remedy() {
+        let mut model = ViewModel::new();
+        let generation = model.begin(
+            &ConnectRequest::prepare("wss://gateway.example.com", "", false).expect("valid"),
+        );
+        model.set_environment(AppLifecycle::Foreground, NetworkStatus::Unavailable);
+        model.suspend(ConnectionBlocker::NetworkUnavailable);
+
+        let snapshot = model.snapshot();
+
+        assert_eq!(snapshot.phase(), ConnectionPhase::WaitingForNetwork);
+        assert_eq!(snapshot.network(), NetworkStatus::Unavailable);
+        assert!(
+            snapshot.pending_connection() && snapshot.can_disconnect() && !snapshot.busy(),
+            "an offline request is retained and cancellable without claiming network work: \
+             {snapshot:?}"
+        );
+        let remedy = snapshot
+            .remedy()
+            .expect("waiting for a network must expose a remedy");
+        assert_eq!(remedy.diagnostic_code(), DiagnosticCode::NetworkUnavailable);
+        assert_eq!(remedy.kind(), RemedyKind::CheckNetwork);
+        assert!(
+            !model.apply(
+                generation,
+                AttemptUpdate::Ready(ReadySummary::from_info(&ready_info("operator", &["read"])))
+            ),
+            "the superseded socket must not overwrite the offline snapshot"
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_is_available_without_parsing_rendered_text() {
+        let mut model = ViewModel::new();
+        let generation = model.begin(
+            &ConnectRequest::prepare("wss://gateway.example.com", "", false).expect("valid"),
+        );
+        model.apply(
+            generation,
+            AttemptUpdate::Reconnecting {
+                attempt: 2,
+                delay: std::time::Duration::from_millis(1_250),
+            },
+        );
+
+        let snapshot = model.snapshot();
+        let retry = snapshot.retry().expect("reconnect state must carry timing");
+
+        assert_eq!(snapshot.phase(), ConnectionPhase::Reconnecting);
+        assert_eq!(retry.attempt(), 2);
+        assert_eq!(retry.delay_millis(), 1_250);
+        assert_eq!(
+            snapshot.remedy().map(super::RemedySnapshot::kind),
+            Some(RemedyKind::Wait)
+        );
+    }
+
+    #[test]
     fn ready_snapshot_reports_the_scopes_the_gateway_actually_granted() {
         let mut model = ViewModel::new();
         let generation = model.begin(
@@ -1377,6 +2145,56 @@ mod tests {
     }
 
     #[test]
+    fn device_backed_platform_facts_change_the_notice_without_claiming_token_storage() {
+        let capabilities =
+            PlatformCapabilities::new(IdentityPersistence::DeviceBacked, DiscoveryReadiness::Ready);
+        let mut model = ViewModel::new();
+        let revision = model.snapshot().revision();
+        assert!(
+            model.set_platform_capabilities(capabilities),
+            "changed platform facts must trigger binding"
+        );
+        assert!(
+            !model.set_platform_capabilities(capabilities),
+            "duplicate platform facts must be coalesced"
+        );
+        let snapshot = model.snapshot();
+
+        assert_eq!(snapshot.platform_capabilities(), capabilities);
+        assert_eq!(snapshot.revision(), revision + 1);
+        assert!(
+            snapshot
+                .credential_notice()
+                .contains("retains the device identity"),
+            "the shell must not describe a device-backed identity as session-only: {snapshot:?}"
+        );
+        assert!(
+            snapshot
+                .credential_notice()
+                .contains("tokens remain in memory only"),
+            "identity persistence must not imply token persistence: {snapshot:?}"
+        );
+    }
+
+    #[test]
+    fn platform_identity_failures_have_distinct_non_secret_remedies() {
+        let locked = UserError::from_identity_failure(IdentityFailure::StorageLocked);
+        let invalidated = UserError::from_identity_failure(IdentityFailure::StorageInvalidated);
+
+        assert_eq!(locked.diagnostic_code(), DiagnosticCode::IdentityLocked);
+        assert_eq!(locked.remedy_kind(), RemedyKind::Retry);
+        assert_eq!(
+            invalidated.diagnostic_code(),
+            DiagnosticCode::IdentityInvalidated
+        );
+        assert_eq!(invalidated.remedy_kind(), RemedyKind::RegisterDevice);
+        assert!(
+            !format!("{locked:?} {invalidated:?}").contains("key material"),
+            "closed platform errors must not reproduce facility internals"
+        );
+    }
+
+    #[test]
     fn transient_states_map_onto_operator_facing_phases() {
         let cases = [
             (ConnectionState::Starting, AttemptUpdate::Connecting),
@@ -1416,7 +2234,9 @@ mod tests {
         };
         assert_eq!(
             error,
-            UserError::new(
+            UserError::diagnostic(
+                DiagnosticCode::ReconnectExhausted,
+                RemedyKind::CheckNetwork,
                 "Reconnect attempts ran out.",
                 "Check the network and the Gateway address, then connect again."
             ),
@@ -1460,7 +2280,16 @@ mod tests {
             &ConnectRequest::prepare("wss://gateway.example.com", "", false).expect("valid"),
         );
 
-        model.request_stop();
+        assert!(
+            model.request_stop(),
+            "the first stop must supersede the live attempt"
+        );
+        let stopped_revision = model.snapshot().revision();
+        assert!(
+            !model.request_stop(),
+            "a duplicate stop must not trigger another binding update"
+        );
+        assert_eq!(model.snapshot().revision(), stopped_revision);
         let accepted = model.apply(
             generation,
             AttemptUpdate::Ready(ReadySummary::from_info(&ready_info("operator", &["read"]))),

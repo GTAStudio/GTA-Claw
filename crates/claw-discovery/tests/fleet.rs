@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use claw_discovery::fleet_cli::{
-    BACKUP_MOUNT_TARGET, CellOperation, CellSpec, ContainerCli, DATA_MOUNT_TARGET, FleetPlanError,
-    ImageRef, LABEL_CELL, MemberRole, MemberSpec, PlanPolicy,
+    BACKUP_MOUNT_TARGET, CellOperation, CellSpec, CommandPlan, ContainerCli, DATA_MOUNT_TARGET,
+    FleetPlanError, ImageRef, LABEL_CELL, MemberRole, MemberSpec, PlanPolicy,
 };
 
 const IMAGE: &str = "ghcr.io/gtastudio/claw-cell@sha256:\
@@ -55,8 +55,8 @@ fn spec() -> CellSpec {
     }
 }
 
-fn lines(plans: &[claw_discovery::fleet_cli::CommandPlan]) -> Vec<String> {
-    plans.iter().map(|plan| plan.to_line()).collect()
+fn lines(plans: &[CommandPlan]) -> Vec<String> {
+    plans.iter().map(CommandPlan::to_line).collect()
 }
 
 #[test]

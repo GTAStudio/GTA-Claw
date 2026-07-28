@@ -10,18 +10,55 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
 /// Inclusive maximum embedding dimensionality accepted by this crate.
 const MAX_DIMENSIONS: usize = 8192;
 
 /// Default maximum number of records one in-crate index will hold.
-const DEFAULT_INDEX_CAPACITY: usize = 100_000;
+pub(crate) const DEFAULT_INDEX_CAPACITY: usize = 100_000;
 
 /// A dense embedding with a validated dimensionality.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// [`Deserialize`] runs the same validation as [`Embedding::new`], so a
+/// stored vector cannot reintroduce a zero or non-finite direction that would
+/// make every score computed against it meaningless.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Embedding {
     values: Vec<f32>,
+    /// The magnitude, computed once by the constructor that already had to
+    /// compute it to reject the zero vector.
+    ///
+    /// Cosine similarity is the inner loop of every exact search, and it needs
+    /// both magnitudes. Recomputing them there made a search over `n` records
+    /// walk the query vector `n` times and each stored vector twice, so a
+    /// scoring pass touched three times the floats it had to. The value stored
+    /// here is the one [`Embedding::new`] computed, from the same components in
+    /// the same order, so scores are bit-for-bit what they were.
+    ///
+    /// It is not part of the wire shape: it is derived from `values`, and
+    /// [`Deserialize`] reconstructs it by running the same validation the
+    /// constructor does.
+    #[serde(skip)]
+    norm: f32,
+}
+
+/// The wire shape of an [`Embedding`], before it is validated.
+#[derive(Deserialize)]
+#[serde(rename = "Embedding")]
+struct RawEmbedding {
+    values: Vec<f32>,
+}
+
+impl<'de> Deserialize<'de> for Embedding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawEmbedding::deserialize(deserializer)?;
+        Self::new(raw.values).map_err(de::Error::custom)
+    }
 }
 
 impl Embedding {
@@ -30,6 +67,14 @@ impl Embedding {
     /// Non-finite components and the zero vector are refused: cosine
     /// similarity is undefined for both, and silently coercing them would
     /// make retrieval order depend on floating-point accidents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::EmptyEmbedding`] for no components,
+    /// [`VectorError::TooManyDimensions`] past the crate's dimensionality
+    /// ceiling, [`VectorError::NonFiniteComponent`] when any component is
+    /// `NaN` or infinite, and [`VectorError::ZeroEmbedding`] when the
+    /// magnitude is zero and the direction is therefore undefined.
     pub fn new(values: Vec<f32>) -> Result<Self, VectorError> {
         if values.is_empty() {
             return Err(VectorError::EmptyEmbedding);
@@ -44,7 +89,7 @@ impl Embedding {
         if norm == 0.0 || !norm.is_finite() {
             return Err(VectorError::ZeroEmbedding);
         }
-        Ok(Self { values })
+        Ok(Self { values, norm })
     }
 
     /// Returns the components.
@@ -55,11 +100,16 @@ impl Embedding {
 
     /// Returns the dimensionality.
     #[must_use]
-    pub fn dimensions(&self) -> usize {
+    pub const fn dimensions(&self) -> usize {
         self.values.len()
     }
 
     /// Returns the cosine similarity with another embedding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::DimensionMismatch`] when the two embeddings have
+    /// different dimensionalities, which makes their dot product meaningless.
     pub fn cosine_similarity(&self, other: &Self) -> Result<f32, VectorError> {
         if self.values.len() != other.values.len() {
             return Err(VectorError::DimensionMismatch);
@@ -70,7 +120,7 @@ impl Embedding {
             .zip(other.values.iter())
             .map(|(left, right)| left * right)
             .sum();
-        Ok(dot / (norm(&self.values) * norm(&other.values)))
+        Ok(dot / (self.norm * other.norm))
     }
 }
 
@@ -84,6 +134,16 @@ pub trait EmbeddingModel {
     fn dimensions(&self) -> usize;
 
     /// Embeds one text fragment.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`VectorError`] when the model cannot produce a usable
+    /// vector: [`VectorError::EmptyEmbedding`] or
+    /// [`VectorError::TooManyDimensions`] when the configured dimensionality
+    /// is unusable, [`VectorError::NonFiniteComponent`] or
+    /// [`VectorError::ZeroEmbedding`] when the text yields a degenerate
+    /// vector, and [`VectorError::DimensionMismatch`] when a host model
+    /// returns a width other than the one it advertises.
     fn embed(&mut self, text: &str) -> Result<Embedding, VectorError>;
 }
 
@@ -99,7 +159,13 @@ pub struct HashingEmbeddingModel {
 
 impl HashingEmbeddingModel {
     /// Creates a model with an explicit dimensionality.
-    pub fn new(dimensions: usize) -> Result<Self, VectorError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::EmptyEmbedding`] when `dimensions` is zero and
+    /// [`VectorError::TooManyDimensions`] when it exceeds the crate's
+    /// dimensionality ceiling.
+    pub const fn new(dimensions: usize) -> Result<Self, VectorError> {
         if dimensions == 0 {
             return Err(VectorError::EmptyEmbedding);
         }
@@ -138,11 +204,14 @@ impl EmbeddingModel for HashingEmbeddingModel {
     }
 }
 
-fn tokenize(text: &str) -> Vec<String> {
+/// Streams the lowercase alphanumeric tokens of `text`.
+///
+/// The tokens are yielded lazily so hashing a message body never materialises
+/// a second copy of it as a vector of owned tokens.
+fn tokenize(text: &str) -> impl Iterator<Item = String> {
     text.split(|character: char| !character.is_alphanumeric())
         .filter(|token| !token.is_empty())
         .map(str::to_lowercase)
-        .collect()
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -155,11 +224,21 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// A stable record identifier used by the index and the store.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+///
+/// [`Deserialize`] runs the same validation as [`RecordId::new`], so a stored
+/// identifier cannot reintroduce one the constructor would have refused.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct RecordId(String);
 
 impl RecordId {
     /// Validates and creates a record identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::InvalidRecordId`] when `value` is empty, longer
+    /// than 256 bytes, or contains anything outside ASCII alphanumerics, `-`,
+    /// `_`, `.` and `:`, so an identifier is always safe as a storage key and
+    /// in a log line.
     pub fn new(value: &str) -> Result<Self, VectorError> {
         if value.is_empty() || value.len() > 256 {
             return Err(VectorError::InvalidRecordId);
@@ -187,6 +266,16 @@ impl Display for RecordId {
     }
 }
 
+impl<'de> Deserialize<'de> for RecordId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(de::Error::custom)
+    }
+}
+
 /// One scored index hit.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ScoredMatch {
@@ -202,12 +291,28 @@ pub trait VectorIndex {
     fn dimensions(&self) -> usize;
 
     /// Inserts or replaces one embedding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::DimensionMismatch`] when the embedding's width
+    /// is not the one the index accepts, and [`VectorError::IndexFull`] when
+    /// adding a record that is not already present would take the index past
+    /// its capacity. Replacing an existing record is never refused for
+    /// capacity, so a full index stays usable rather than becoming read-only.
     fn upsert(&mut self, id: RecordId, embedding: Embedding) -> Result<(), VectorError>;
 
     /// Removes one embedding, reporting whether it existed.
     fn remove(&mut self, id: &RecordId) -> bool;
 
     /// Returns the highest-scoring records, best first.
+    ///
+    /// A `limit` of zero is not an error: it returns no matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::DimensionMismatch`] when the query's width is
+    /// not the one the index accepts, so a mis-shaped query is refused rather
+    /// than scored against an incompatible corpus.
     fn search(&self, query: &Embedding, limit: usize) -> Result<Vec<ScoredMatch>, VectorError>;
 
     /// Returns the number of indexed records.
@@ -228,6 +333,7 @@ pub trait VectorIndex {
 pub struct ExactVectorIndex {
     dimensions: usize,
     capacity: usize,
+    // Bounded by `capacity` in `upsert`; `remove` is the eviction path.
     entries: BTreeMap<RecordId, Embedding>,
 }
 
@@ -237,12 +343,25 @@ impl ExactVectorIndex {
     /// The index is capacity-bounded because every record it holds can come
     /// from attacker-influenced text: an unbounded index is an unbounded
     /// allocation reachable from ordinary agent output.
-    pub fn new(dimensions: usize) -> Result<Self, VectorError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::EmptyEmbedding`] when `dimensions` is zero and
+    /// [`VectorError::TooManyDimensions`] when it exceeds the crate's
+    /// dimensionality ceiling.
+    pub const fn new(dimensions: usize) -> Result<Self, VectorError> {
         Self::with_capacity(dimensions, DEFAULT_INDEX_CAPACITY)
     }
 
     /// Creates an empty index with an explicit record capacity.
-    pub fn with_capacity(dimensions: usize, capacity: usize) -> Result<Self, VectorError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VectorError::EmptyEmbedding`] when `dimensions` is zero,
+    /// [`VectorError::TooManyDimensions`] when it exceeds the crate's
+    /// dimensionality ceiling, and [`VectorError::EmptyCapacity`] when
+    /// `capacity` is zero, which would make the index refuse every record.
+    pub const fn with_capacity(dimensions: usize, capacity: usize) -> Result<Self, VectorError> {
         if dimensions == 0 {
             return Err(VectorError::EmptyEmbedding);
         }
@@ -303,24 +422,30 @@ impl VectorIndex for ExactVectorIndex {
         }
         // Only the running best `limit` matches are retained, so the working
         // set is bounded by the caller's limit rather than by the index size.
+        // A candidate's identifier is cloned only once it has displaced
+        // something, so a scan over a large index does not allocate a string
+        // per record it looks at and then throws away.
         let mut best: Vec<ScoredMatch> = Vec::with_capacity(limit.min(self.entries.len()));
         for (id, embedding) in &self.entries {
-            let candidate = ScoredMatch {
-                id: id.clone(),
-                score: query.cosine_similarity(embedding)?,
-            };
+            let score = query.cosine_similarity(embedding)?;
             if best.len() == limit {
                 let worst = best.last().expect("a full buffer has a last element");
-                if !ranks_before(&candidate, worst) {
+                if !ranks_before(score, id, worst) {
                     continue;
                 }
                 best.pop();
             }
             let position = best
                 .iter()
-                .position(|existing| ranks_before(&candidate, existing))
+                .position(|existing| ranks_before(score, id, existing))
                 .unwrap_or(best.len());
-            best.insert(position, candidate);
+            best.insert(
+                position,
+                ScoredMatch {
+                    id: id.clone(),
+                    score,
+                },
+            );
         }
         Ok(best)
     }
@@ -331,9 +456,9 @@ impl VectorIndex for ExactVectorIndex {
 }
 
 /// Orders two matches by descending score, then by ascending identifier.
-fn ranks_before(candidate: &ScoredMatch, existing: &ScoredMatch) -> bool {
-    match existing.score.total_cmp(&candidate.score) {
-        Ordering::Equal => candidate.id < existing.id,
+fn ranks_before(score: f32, id: &RecordId, existing: &ScoredMatch) -> bool {
+    match existing.score.total_cmp(&score) {
+        Ordering::Equal => *id < existing.id,
         Ordering::Less => true,
         Ordering::Greater => false,
     }
@@ -388,6 +513,45 @@ mod tests {
 
     fn embedding(values: &[f32]) -> Embedding {
         Embedding::new(values.to_vec()).expect("valid embedding")
+    }
+
+    #[test]
+    fn a_stored_embedding_is_validated_when_it_is_read_back() {
+        let original = embedding(&[0.5, -0.25, 1.0]);
+        let encoded = serde_json::to_string(&original).expect("serialized");
+        let restored: Embedding = serde_json::from_str(&encoded).expect("deserialized");
+        assert_eq!(restored, original, "a valid embedding is restored as-is");
+        assert_eq!(
+            serde_json::to_string(&restored).expect("serialized"),
+            encoded
+        );
+
+        for degenerate in [
+            "{\"values\":[]}",
+            "{\"values\":[0.0,0.0]}",
+            "{\"values\":[1.0,null]}",
+        ] {
+            assert!(
+                serde_json::from_str::<Embedding>(degenerate).is_err(),
+                "restored a degenerate embedding from {degenerate}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_record_identifier_is_validated_when_it_is_read_back() {
+        assert_eq!(
+            serde_json::from_str::<RecordId>("\"rec-1\"").expect("valid identifier"),
+            id("rec-1")
+        );
+        for bad in ["\"\"", "\"a b\"", "\"a/b\""] {
+            let error = serde_json::from_str::<RecordId>(bad)
+                .expect_err("an identifier the constructor refuses cannot be restored");
+            assert!(
+                error.to_string().contains("record identifier"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]

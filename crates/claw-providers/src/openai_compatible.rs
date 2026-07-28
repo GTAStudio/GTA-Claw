@@ -1,6 +1,6 @@
-//! The OpenAI `chat/completions` dialect.
+//! The `OpenAI` `chat/completions` dialect.
 //!
-//! This module implements the wire protocol shared by OpenAI and the many
+//! This module implements the wire protocol shared by `OpenAI` and the many
 //! services that reproduce it: chat completions (buffered and streamed),
 //! function calling, embeddings and model listing.
 //!
@@ -22,7 +22,9 @@ use claw_provider_sdk::model::{
     ToolCall, ToolChoice, Usage,
 };
 use claw_provider_sdk::origin::{BoundApiKey, Origin, OriginApproval, OriginError};
-use claw_provider_sdk::provider::{BoxFuture, Provider, RequestContext};
+use claw_provider_sdk::provider::{
+    BoxFuture, Provider, ProviderPhase, ProviderStatus, RequestContext,
+};
 use claw_provider_sdk::secret::ApiKey;
 use claw_provider_sdk::sse::{SseDecoder, SseEvent};
 use claw_provider_sdk::stream::{CompletionStream, StreamEvent, ToolCallAssembler};
@@ -74,7 +76,7 @@ pub struct OpenAiConfig {
     pub capabilities: CapabilitySet,
     /// Whether to ask for usage accounting in streamed responses.
     ///
-    /// OpenAI only reports token usage in a stream when
+    /// `OpenAI` only reports token usage in a stream when
     /// `stream_options.include_usage` is set. Many compatible services reject
     /// the unknown field, so this defaults to `false` everywhere except
     /// `openai` itself.
@@ -234,17 +236,19 @@ impl OpenAiCompatible {
                 })
             })
             .transpose()?;
-        let base_url = match (base_url, registered.clone()) {
-            (Some(url), _) => url,
-            (None, Some(default)) => default,
-            (None, None) => {
-                return Err(ProviderError::new(
+        // The operator's endpoint wins; the registered default is only cloned
+        // when it is actually the one being used, because `registered` is still
+        // needed below to build the trust set.
+        let base_url = match base_url {
+            Some(url) => url,
+            None => registered.clone().ok_or_else(|| {
+                ProviderError::new(
                     ErrorKind::InvalidRequest,
                     id,
                     Operation::Authorize,
                     "this provider ships no default endpoint, so a base URL is required",
-                ));
-            }
+                )
+            })?,
         };
 
         // The set of origins this provider may present its credential to: the
@@ -405,6 +409,21 @@ impl OpenAiCompatible {
             "this provider does not advertise the requested capability",
         ))
     }
+
+    async fn probe(
+        &self,
+        operation: Operation,
+        phase: ProviderPhase,
+        context: &RequestContext,
+    ) -> Result<ProviderStatus, ProviderError> {
+        let url = self.endpoint("models")?;
+        self.runtime
+            .execute(operation, context.cancel(), || {
+                self.request(Method::Get, url.clone())
+            })
+            .await?;
+        Ok(ProviderStatus::new(self.id.clone(), phase))
+    }
 }
 
 impl Provider for OpenAiCompatible {
@@ -414,6 +433,20 @@ impl Provider for OpenAiCompatible {
 
     fn capabilities(&self) -> CapabilitySet {
         self.capabilities
+    }
+
+    fn startup<'a>(
+        &'a self,
+        context: &'a RequestContext,
+    ) -> BoxFuture<'a, Result<ProviderStatus, ProviderError>> {
+        Box::pin(self.probe(Operation::Startup, ProviderPhase::Started, context))
+    }
+
+    fn ping<'a>(
+        &'a self,
+        context: &'a RequestContext,
+    ) -> BoxFuture<'a, Result<ProviderStatus, ProviderError>> {
+        Box::pin(self.probe(Operation::Ping, ProviderPhase::Reachable, context))
     }
 
     fn complete<'a>(
@@ -426,15 +459,18 @@ impl Provider for OpenAiCompatible {
             validate(self.id.as_str(), request, Operation::Complete)?;
             let url = self.endpoint("chat/completions")?;
             let body = encode_completion(request, false, false)?;
-            let response = self
-                .runtime
-                .execute(Operation::Complete, context.cancel(), || {
-                    Ok(self
-                        .request(Method::Post, url.clone())?
-                        .body(Body::Json(body.clone())))
-                })
-                .await?;
-            decode_completion(self.id.as_str(), response.body())
+            self.runtime
+                .execute_decoded(
+                    Operation::Complete,
+                    context.cancel(),
+                    || {
+                        Ok(self
+                            .request(Method::Post, url.clone())?
+                            .body(Body::Json(body.clone())))
+                    },
+                    |response| decode_completion(self.id.as_str(), response.body()),
+                )
+                .await
         })
     }
 
@@ -449,7 +485,8 @@ impl Provider for OpenAiCompatible {
             let url = self.endpoint("chat/completions")?;
             let body = encode_completion(request, true, self.stream_usage)?;
             let cancel = context.cancel().clone();
-            let stream = self
+            let provider = self.id.as_str().to_owned();
+            let events = self
                 .runtime
                 .execute_streaming(Operation::StreamCompletion, &cancel, || {
                     Ok(self
@@ -457,12 +494,9 @@ impl Provider for OpenAiCompatible {
                         .replace_header("accept", "text/event-stream")
                         .body(Body::Json(body.clone())))
                 })
-                .await?;
-            Ok(CompletionStream::new(
-                self.id.as_str(),
-                cancel,
-                event_stream(self.id.as_str().to_owned(), stream.into_chunks()),
-            ))
+                .await?
+                .decode(move |chunks| event_stream(provider, chunks));
+            Ok(CompletionStream::new(self.id.as_str(), cancel, events))
         })
     }
 
@@ -483,15 +517,18 @@ impl Provider for OpenAiCompatible {
             })?;
             let url = self.endpoint("embeddings")?;
             let body = encode_embeddings(request)?;
-            let response = self
-                .runtime
-                .execute(Operation::Embed, context.cancel(), || {
-                    Ok(self
-                        .request(Method::Post, url.clone())?
-                        .body(Body::Json(body.clone())))
-                })
-                .await?;
-            decode_embeddings(self.id.as_str(), response.body())
+            self.runtime
+                .execute_decoded(
+                    Operation::Embed,
+                    context.cancel(),
+                    || {
+                        Ok(self
+                            .request(Method::Post, url.clone())?
+                            .body(Body::Json(body.clone())))
+                    },
+                    |response| decode_embeddings(self.id.as_str(), response.body()),
+                )
+                .await
         })
     }
 
@@ -502,13 +539,14 @@ impl Provider for OpenAiCompatible {
         Box::pin(async move {
             self.check_capability(Capability::ModelListing, Operation::ListModels)?;
             let url = self.endpoint("models")?;
-            let response = self
-                .runtime
-                .execute(Operation::ListModels, context.cancel(), || {
-                    self.request(Method::Get, url.clone())
-                })
-                .await?;
-            decode_models(self.id.as_str(), response.body())
+            self.runtime
+                .execute_decoded(
+                    Operation::ListModels,
+                    context.cancel(),
+                    || self.request(Method::Get, url.clone()),
+                    |response| decode_models(self.id.as_str(), response.body()),
+                )
+                .await
         })
     }
 }
@@ -564,7 +602,7 @@ struct WireCompletionRequest<'a> {
     clippy::trivially_copy_pass_by_ref,
     reason = "serde's skip_serializing_if requires a predicate taking a reference"
 )]
-fn is_false(value: &bool) -> bool {
+const fn is_false(value: &bool) -> bool {
     !*value
 }
 
@@ -732,7 +770,7 @@ fn encode_content(parts: &[ContentPart]) -> WireContent<'_> {
     )
 }
 
-/// Encodes a completion request as an OpenAI `chat/completions` document.
+/// Encodes a completion request as an `OpenAI` `chat/completions` document.
 ///
 /// # Errors
 ///
@@ -926,7 +964,7 @@ fn protocol_error(provider: &str, operation: Operation, detail: &str) -> Provide
     ProviderError::new(ErrorKind::Protocol, provider, operation, detail)
 }
 
-/// Maps an OpenAI `finish_reason` onto the portable enumeration.
+/// Maps an `OpenAI` `finish_reason` onto the portable enumeration.
 #[must_use]
 pub fn finish_reason(raw: &str) -> FinishReason {
     match raw {
@@ -1074,7 +1112,7 @@ struct WireModelList {
 
 /// Decodes a `models` response.
 ///
-/// The OpenAI model catalogue publishes no capability, context-window or
+/// The `OpenAI` model catalogue publishes no capability, context-window or
 /// display-name metadata, so every returned [`ModelDescriptor`] carries only an
 /// identifier and an empty capability set. Nothing is inferred.
 ///
@@ -1157,7 +1195,7 @@ struct WireStreamChunk {
     usage: Option<WireUsage>,
 }
 
-/// Turns OpenAI stream chunks into portable [`StreamEvent`] values.
+/// Turns `OpenAI` stream chunks into portable [`StreamEvent`] values.
 ///
 /// The decoder is a pure state machine over already-framed SSE events, so it can
 /// be driven directly from a recorded byte fixture.
@@ -1263,16 +1301,14 @@ impl OpenAiStreamDecoder {
         let mut events = Vec::new();
         let pending = self.assembler.len();
         for index in 0..pending {
-            match self.assembler.complete(index) {
-                Ok(event) => events.push(event),
-                Err(_) => {
-                    events.push(StreamEvent::Completed {
-                        finish_reason: FinishReason::Other("incomplete_tool_call".to_owned()),
-                        usage: self.usage,
-                    });
-                    return events;
-                }
-            }
+            let Ok(event) = self.assembler.complete(index) else {
+                events.push(StreamEvent::Completed {
+                    finish_reason: FinishReason::Other("incomplete_tool_call".to_owned()),
+                    usage: self.usage,
+                });
+                return events;
+            };
+            events.push(event);
         }
         let finish = self.finish_reason.clone().unwrap_or(if pending > 0 {
             FinishReason::ToolCalls
@@ -1342,7 +1378,7 @@ struct StreamState {
     exhausted: bool,
 }
 
-fn event_stream(provider: String, chunks: ChunkStream) -> EventStream {
+pub(crate) fn event_stream(provider: String, chunks: ChunkStream) -> EventStream {
     let state = StreamState {
         chunks,
         sse: SseDecoder::new(),

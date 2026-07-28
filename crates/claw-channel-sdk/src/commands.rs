@@ -78,6 +78,24 @@ impl Error for CommandParseError {}
 /// Parsing is deliberately total and side effect free: it neither knows nor
 /// asks which commands a channel supports, so an unknown command is a
 /// successful parse and a failed [`CommandRegistry::resolve`].
+///
+/// # Errors
+///
+/// - [`CommandParseError::NotACommand`] when the text, once trimmed, does not
+///   start with [`COMMAND_PREFIX`]. Ordinary conversation text lands here.
+/// - [`CommandParseError::EmptyName`] when the prefix stands alone or is
+///   followed immediately by the `@` mention separator.
+/// - [`CommandParseError::InvalidName`] when the name is longer than
+///   [`MAX_COMMAND_NAME_CHARS`] characters or, after ASCII lowercasing, holds a
+///   byte outside `a-z0-9_-`. A non-ASCII name such as `/naïve` fails here.
+/// - [`CommandParseError::InvalidMention`] when the `@` suffix is empty, longer
+///   than [`MAX_COMMAND_MENTION_CHARS`] characters, or holds a byte outside
+///   `a-z0-9_-.`.
+/// - [`CommandParseError::InvalidArgument`] when one whitespace-separated
+///   argument is longer than [`MAX_COMMAND_ARGUMENT_CHARS`] characters or
+///   contains a control character.
+/// - [`CommandParseError::TooManyArguments`] when more than
+///   [`MAX_COMMAND_ARGUMENTS`] arguments follow the name.
 pub fn parse_command(text: &str) -> Result<CommandInvocation, CommandParseError> {
     let trimmed = text.trim();
     let body = trimmed
@@ -213,6 +231,19 @@ impl CommandRegistry {
     /// Validates and publishes a command table.
     ///
     /// An empty table is legal and means the channel offers no commands at all.
+    ///
+    /// # Errors
+    ///
+    /// - [`CommandRegistryError::InvalidName`] when a declared name is empty,
+    ///   longer than [`MAX_COMMAND_NAME_CHARS`] characters, or holds a byte
+    ///   outside `a-z0-9_-`. Declared names are matched verbatim against
+    ///   already-lowercased parse output, so an uppercase declaration would be
+    ///   unreachable rather than merely unusual.
+    /// - [`CommandRegistryError::DuplicateName`] when two entries declare the
+    ///   same name, which would make resolution depend on declaration order.
+    /// - [`CommandRegistryError::InvalidArity`] when `min_arguments` exceeds
+    ///   `max_arguments`, or `max_arguments` exceeds [`MAX_COMMAND_ARGUMENTS`]
+    ///   and therefore more arguments than the parser will ever produce.
     pub fn new(specs: &'static [CommandSpec]) -> Result<Self, CommandRegistryError> {
         for (index, spec) in specs.iter().enumerate() {
             if spec.name.is_empty()
@@ -247,6 +278,19 @@ impl CommandRegistry {
     /// `bot_mention` is the account's own addressable name, when it has one. An
     /// invocation carrying a different mention is rejected rather than executed,
     /// so two bots in one group conversation do not both answer.
+    ///
+    /// # Errors
+    ///
+    /// - [`CommandDispatchError::ForeignMention`] when the invocation names a
+    ///   bot other than `bot_mention`, including when this account has no
+    ///   addressable name at all and therefore cannot be the one addressed.
+    /// - [`CommandDispatchError::UnknownCommand`] when this channel offers no
+    ///   command with that name. A channel with an empty table returns this for
+    ///   every invocation.
+    /// - [`CommandDispatchError::MissingArguments`] when fewer than
+    ///   `min_arguments` arguments were supplied.
+    /// - [`CommandDispatchError::TooManyArguments`] when more than
+    ///   `max_arguments` arguments were supplied.
     pub fn resolve(
         &self,
         invocation: &CommandInvocation,

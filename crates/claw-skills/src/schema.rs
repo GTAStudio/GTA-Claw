@@ -114,6 +114,21 @@ impl JsonType {
 /// Supported keywords are `type`, `properties`, `required`,
 /// `additionalProperties`, `items`, `enum`, `minLength`, `maxLength`,
 /// `minimum`, and `maximum`. Annotation keywords are ignored.
+///
+/// # Errors
+///
+/// Returns the first [`SchemaError`], carrying the JSON path of the offending
+/// node and one of: [`SchemaErrorKind::ExpectedObject`] when a schema node — the
+/// root, a `properties` entry, or `items` — is not a JSON object;
+/// [`SchemaErrorKind::UnsupportedType`] when `type` names something outside the
+/// supported JSON types; [`SchemaErrorKind::InvalidKeywordType`] when
+/// `type`, `properties`, `required`, `additionalProperties`, `minimum` or
+/// `maximum` has the wrong JSON value type;
+/// [`SchemaErrorKind::InvalidLengthBound`] when `minLength` or `maxLength` is
+/// not a non-negative integer; [`SchemaErrorKind::DuplicateRequiredProperty`]
+/// when `required` names the same property twice; and
+/// [`SchemaErrorKind::EmptyEnum`] when `enum` is present but empty, which would
+/// otherwise reject every input.
 pub fn validate_schema(schema: &Value) -> Result<(), SchemaError> {
     validate_schema_at(schema, "$")
 }
@@ -247,6 +262,19 @@ fn validate_number_keyword(
 }
 
 /// Validates one input document against a previously untrusted schema.
+///
+/// # Errors
+///
+/// Returns [`ParameterValidationError::InvalidSchema`] when `schema` itself is
+/// rejected by [`validate_schema`] — the schema is checked first, so a bad
+/// schema is never reported as if the caller's input were at fault.
+///
+/// Returns [`ParameterValidationError::Violations`] with every mismatch found,
+/// not just the first: a wrong JSON type, a missing `required` property, an
+/// undeclared property while `additionalProperties` is `false`, a value outside
+/// `enum`, a string outside `minLength`/`maxLength`, or a number outside
+/// `minimum`/`maximum`. Each violation names the JSON path of the value that
+/// failed.
 pub fn validate_parameters(
     schema: &Value,
     parameters: &Value,

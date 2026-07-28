@@ -31,7 +31,7 @@ pub const BUNDLED_BASELINE_SHA: &str = "b43e832fcc8000ed7287c7accc54e381db607f85
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillClassification {
-    /// Skill shipped by upstream OpenClaw itself.
+    /// Skill shipped by upstream `OpenClaw` itself.
     OfficialIntegration,
 }
 

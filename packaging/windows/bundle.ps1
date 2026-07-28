@@ -33,15 +33,12 @@ if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
 Assert-ChildPath -Parent $ownedRoot -Child $OutputRoot | Out-Null
 Assert-NoReparsePathComponents -Root $ownedRoot -Path $OutputRoot
-if (Test-Path -LiteralPath $OutputRoot) {
-    Remove-OwnedDirectory -OwnedRoot $ownedRoot -Path $OutputRoot
-}
-[System.IO.Directory]::CreateDirectory($OutputRoot) | Out-Null
-Assert-NoReparsePathComponents -Root $ownedRoot -Path $OutputRoot
+$publishedOutputRoot = $OutputRoot
 
 Initialize-MsvcEnvironment x64 | Out-Null
 $makeAppx = Find-WindowsSdkTool 'makeappx.exe'
 $version = Get-CanonicalVersion $repoRoot
+Assert-RustToolchain $repoRoot
 $innerSignature = 'unsigned'
 if ($ReleaseMode) {
     $innerSignature = 'signed'
@@ -51,6 +48,11 @@ $inputs = @(
     [pscustomobject]@{ Path = (Assert-PlainFile $X64Msix); Architecture = 'x64' },
     [pscustomobject]@{ Path = (Assert-PlainFile $Arm64Msix); Architecture = 'arm64' }
 )
+$outputTransaction = Start-OwnedDirectoryTransaction `
+    -OwnedRoot $ownedRoot `
+    -Destination $publishedOutputRoot
+$OutputRoot = $outputTransaction.WorkPath
+try {
 $inspectionRoot = Join-Path $OutputRoot '.inspection'
 foreach ($input in $inputs) {
     Test-MsixPackage `
@@ -113,4 +115,9 @@ $inventory = [ordered]@{
     artifact = [System.IO.Path]::GetFileName($bundle)
 }
 Write-Utf8File -Path (Join-Path $OutputRoot 'artifacts.json') -Content (($inventory | ConvertTo-Json -Depth 5) + "`n")
-Write-Host "Created and inspected MSIXBundle '$bundle'."
+    Complete-OwnedDirectoryTransaction $outputTransaction
+} catch {
+    Undo-OwnedDirectoryTransaction $outputTransaction
+    throw
+}
+Write-Host "Created and inspected MSIXBundle '$(Join-Path $publishedOutputRoot ([System.IO.Path]::GetFileName($bundle)))'."

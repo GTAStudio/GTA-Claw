@@ -3,7 +3,11 @@
 //! Every helper here is rooted in a temporary directory. Nothing in this module
 //! reads or writes a real user profile, so the provider fixtures can never touch
 //! `~/.claude`, `~/.codex` or `~/.hermes` on the machine running the suite.
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "this module is compiled into each integration-test binary separately, so a \
+helper used by only claude.rs, codex.rs or hermes.rs is genuinely unused in the others"
+)]
 
 use std::collections::BTreeMap;
 use std::fs;

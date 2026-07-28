@@ -136,7 +136,7 @@ fn a_trapping_plugin_loses_its_tools_immediately() {
     let root = support::tempdir();
     let mut grants = tools_grant(4);
     grants.push(CapabilityGrant::Events(EventsGrant {
-        emit_kinds: [EventKind::Heartbeat].into_iter().collect(),
+        emit_kinds: std::iter::once(EventKind::Heartbeat).collect(),
         max_payload_bytes: 1024,
     }));
     let dir = support::install_probe(root.path(), "probe", grants.clone());
@@ -200,4 +200,30 @@ fn unloading_withdraws_every_tool_the_plugin_advertised() {
         "an unloaded plugin must not stay advertised"
     );
     assert_eq!(host.registered_tools(&id), None);
+}
+
+#[test]
+fn dropping_a_host_withdraws_tools_without_running_guest_code() {
+    let root = support::tempdir();
+    let grants = tools_grant(4);
+    let dir = support::install_probe(root.path(), "probe", grants.clone());
+    let recorder = RecordingSink::new();
+
+    {
+        let mut host = PluginHost::builder()
+            .trust_policy(unsigned_core_policy(root.path()))
+            .operator_policy(probe_ceiling(grants))
+            .services(HostServices::deny_all().with_tools(Arc::new(recorder.clone())))
+            .build()
+            .expect("host");
+        let id = host.load(&dir).expect("load");
+        host.activate(&id).expect("activate");
+        assert_eq!(host.invoke_tool(&id, "k", "{}").expect("register"), ALLOWED);
+        assert_eq!(recorder.tools().len(), 1);
+    }
+
+    assert!(
+        recorder.tools().is_empty(),
+        "Drop must not leave externally registered plugin tools behind"
+    );
 }

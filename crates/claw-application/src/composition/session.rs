@@ -230,7 +230,7 @@ impl CapabilitySet {
 
     /// Returns whether the set is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }
@@ -269,7 +269,7 @@ pub struct RuntimeSettings {
 impl RuntimeSettings {
     /// Creates settings.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         listen: Vec<SocketAddr>,
         default_provider: ProviderName,
         default_model: ModelName,
@@ -429,7 +429,7 @@ pub struct AssembledContext {
 impl AssembledContext {
     /// Creates a context from ordered items.
     #[must_use]
-    pub fn new(items: Vec<String>, truncated: bool) -> Self {
+    pub const fn new(items: Vec<String>, truncated: bool) -> Self {
         Self { items, truncated }
     }
 
@@ -467,7 +467,7 @@ impl ProviderBinding {
     /// [`EgressGuard::resolve`](super::egress::EgressGuard::resolve) rather than
     /// from anywhere else.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         name: ProviderName,
         origin: ResolvedEndpoint,
         credential: CredentialName,
@@ -526,7 +526,7 @@ pub struct CredentialLease {
 impl CredentialLease {
     /// Releases `secret` for use against `origin` only.
     #[must_use]
-    pub fn new(name: CredentialName, origin: ResolvedEndpoint, secret: SecretString) -> Self {
+    pub const fn new(name: CredentialName, origin: ResolvedEndpoint, secret: SecretString) -> Self {
         Self {
             name,
             origin,

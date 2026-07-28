@@ -159,6 +159,12 @@ impl EnvPolicy {
     }
 
     /// Inherits one named variable from this process, when it is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError::EnvironmentRejected`] when `name` is empty,
+    /// longer than 256 bytes, or contains anything other than ASCII
+    /// alphanumerics and `_`.
     pub fn inherit(&mut self, name: &str) -> Result<(), ExecutionError> {
         validate_env_name(name)?;
         self.inherited.insert(name.to_owned());
@@ -166,6 +172,12 @@ impl EnvPolicy {
     }
 
     /// Sets one variable to a fixed value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError::EnvironmentRejected`] when `name` fails the
+    /// same check [`EnvPolicy::inherit`] applies, or when `value` contains a
+    /// NUL byte, which no operating system can carry through `execve`.
     pub fn set(&mut self, name: &str, value: &str) -> Result<(), ExecutionError> {
         validate_env_name(name)?;
         if value.contains('\0') {
@@ -179,6 +191,13 @@ impl EnvPolicy {
     ///
     /// On Windows this is `SystemRoot`, without which most executables fail to
     /// initialize. On other platforms it is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError::EnvironmentRejected`] if a platform-minimum
+    /// name fails the check in [`EnvPolicy::inherit`]. The only names used here
+    /// are `SystemRoot` and `windir`, both of which pass, so this is a
+    /// structural possibility rather than a reachable one.
     pub fn with_platform_minimum(mut self) -> Result<Self, ExecutionError> {
         if cfg!(windows) {
             self.inherit("SystemRoot")?;
@@ -300,6 +319,14 @@ impl ArgvPolicy {
     }
 
     /// Checks one argument vector against this policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError::TooManyArguments`] when `argv` holds more
+    /// entries than the policy allows, [`ExecutionError::ArgumentRejected`]
+    /// when an entry contains a NUL byte or exceeds the per-argument byte
+    /// bound, and [`ExecutionError::ArgumentNotAllowed`] when the program was
+    /// narrowed with [`ArgvPolicy::exactly`] and the entry is outside that set.
     pub fn check(&self, argv: &[String]) -> Result<(), ExecutionError> {
         if argv.len() > self.max_arguments {
             return Err(ExecutionError::TooManyArguments);
@@ -335,13 +362,13 @@ struct ExecutableIdentity {
 }
 
 impl ExecutableIdentity {
-    fn of(metadata: &std::fs::Metadata) -> Result<Self, ExecutionError> {
+    fn of(metadata: &std::fs::Metadata) -> Self {
         let modified_millis = metadata
             .modified()
             .ok()
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |elapsed| elapsed.as_millis());
-        Ok(Self {
+        Self {
             length: metadata.len(),
             modified_millis,
             #[cfg(unix)]
@@ -350,7 +377,7 @@ impl ExecutableIdentity {
             inode: std::os::unix::fs::MetadataExt::ino(metadata),
             #[cfg(unix)]
             mode: std::os::unix::fs::MetadataExt::mode(metadata),
-        })
+        }
     }
 }
 
@@ -409,6 +436,10 @@ impl ExecPolicy {
     /// always the exact file the operator named. The file must additionally be
     /// a real, canonical, non-link regular file that is neither an interpreter
     /// nor a script, and it must not live anywhere the agent can write.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same refusals as [`ExecPolicy::allow_program_with_argv`].
     pub fn allow_program(
         &mut self,
         name: &str,
@@ -418,6 +449,24 @@ impl ExecPolicy {
     }
 
     /// Allows one program name with a narrowed argument policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError::ProgramNameRejected`] when `name` is not a
+    /// bare identifier, [`ExecutionError::ProgramPathNotAbsolute`] when
+    /// `executable` is relative,
+    /// [`ExecutionError::InterpretedProgramForbidden`] when it carries an
+    /// extension Windows hands to a command interpreter or its first two bytes
+    /// are `#!`, [`ExecutionError::ExecutableIsAnInterpreter`] when its file
+    /// stem names a shell, interpreter or launcher,
+    /// [`ExecutionError::ExecutableNotFound`] when it cannot be stat-ed or
+    /// canonicalized, [`ExecutionError::ExecutableIsALink`] when it is a
+    /// symbolic link or reparse point, [`ExecutionError::ExecutableNotAFile`]
+    /// when it is not a regular file,
+    /// [`ExecutionError::ExecutablePathNotCanonical`] when it differs from its
+    /// own canonical path, and [`ExecutionError::ExecutableInsideWritableRoot`]
+    /// when it lives under the directory declared by
+    /// [`ExecPolicy::with_writable_root`].
     pub fn allow_program_with_argv(
         &mut self,
         name: &str,
@@ -460,7 +509,7 @@ impl ExecPolicy {
         self.programs.insert(
             name.to_owned(),
             AllowedProgram {
-                identity: ExecutableIdentity::of(&metadata)?,
+                identity: ExecutableIdentity::of(&metadata),
                 executable: canonical,
                 argv,
             },
@@ -477,7 +526,7 @@ impl ExecPolicy {
 
     /// Replaces the default deadline.
     #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
@@ -496,6 +545,23 @@ impl ExecPolicy {
     }
 
     /// Resolves an allowlisted name to its bound executable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError::ProgramNameRejected`] when `name` is not a
+    /// bare identifier and [`ExecutionError::ProgramNotAllowed`] when it is not
+    /// on the operator allowlist.
+    ///
+    /// Two suspicions about this path were checked and neither survives. The
+    /// allowlist is a `BTreeMap`, so a lookup is a handful of comparisons and
+    /// never a scan; and although `validate_program_name` does run twice here,
+    /// once below and once inside `Self::program`, one spawn-and-wait of
+    /// `/bin/echo` on this machine costs 3.4 ms, so the duplicated scan of a
+    /// name that is at most a few dozen bytes — like the per-call rebuild of
+    /// the environment map in `ExecTool::invoke` — is far below a thousandth
+    /// of an invocation. Neither was changed: the cost of `exec` is the child
+    /// process, and every syscall on the way to it belongs to proving the
+    /// executable is still the file that was allowlisted.
     pub fn resolve_program(&self, name: &str) -> Result<&Path, ExecutionError> {
         validate_program_name(name)?;
         self.program(name)
@@ -540,7 +606,7 @@ fn open_verified_executable(program: &AllowedProgram) -> Result<File, ExecutionE
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(ExecutionError::ExecutableChanged);
     }
-    if ExecutableIdentity::of(&metadata)? != program.identity {
+    if ExecutableIdentity::of(&metadata) != program.identity {
         return Err(ExecutionError::ExecutableChanged);
     }
     // Re-read the first bytes through the same handle: a file that became a
@@ -640,15 +706,27 @@ impl CancellationToken {
         Self::default()
     }
 
+    /// Reuses a flag shared with another runtime boundary.
+    #[must_use]
+    pub const fn from_shared_flag(cancelled: Arc<AtomicBool>) -> Self {
+        Self { cancelled }
+    }
+
+    /// Returns the shared flag backing this token.
+    #[must_use]
+    pub fn shared_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
     /// Requests cancellation of every process observing this token.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.cancelled.store(true, Ordering::Release);
     }
 
     /// Reports whether cancellation was requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -687,7 +765,7 @@ impl Eq for CancellationTokenHandle {}
 impl ProcessExecTool {
     /// Creates the tool from an operator policy.
     #[must_use]
-    pub fn new(policy: ExecPolicy) -> Self {
+    pub const fn new(policy: ExecPolicy) -> Self {
         Self {
             policy,
             cancellation: None,
@@ -706,19 +784,19 @@ impl ProcessExecTool {
     pub const fn policy(&self) -> &ExecPolicy {
         &self.policy
     }
+}
 
-    fn working_directory(
-        &self,
-        arguments: &Arguments,
-        context: &ToolContext<'_>,
-    ) -> Result<ResolvedPath, ToolError> {
-        match arguments.text("cwd") {
-            Some(raw) => {
-                let relative = context.sandbox.relative(raw)?;
-                Ok(context.sandbox.resolve_directory(&relative)?)
-            }
-            None => Ok(context.sandbox.resolve_root()),
+/// Resolves the `cwd` argument into a directory inside the workspace root.
+fn working_directory(
+    arguments: &Arguments,
+    context: &ToolContext<'_>,
+) -> Result<ResolvedPath, ToolError> {
+    match arguments.text("cwd") {
+        Some(raw) => {
+            let relative = context.sandbox.relative(raw)?;
+            Ok(context.sandbox.resolve_directory(&relative)?)
         }
+        None => Ok(context.sandbox.resolve_root()),
     }
 }
 
@@ -763,11 +841,12 @@ impl Tool for ProcessExecTool {
         let program = self.policy.program(name)?;
         let argv = arguments.text_list("args").unwrap_or_default();
         program.argv.check(argv)?;
-        let cwd = self.working_directory(arguments, context)?;
-        let timeout = match arguments.count("timeout_ms") {
-            Some(requested) => Duration::from_millis(requested).min(self.policy.timeout),
-            None => self.policy.timeout,
-        };
+        let cwd = working_directory(arguments, context)?;
+        let timeout = arguments
+            .count("timeout_ms")
+            .map_or(self.policy.timeout, |requested| {
+                Duration::from_millis(requested).min(self.policy.timeout)
+            });
 
         // Identity is proven here, immediately before the spawn, and the handle
         // is held until the child exists so the file cannot be replaced inside
@@ -793,7 +872,7 @@ impl Tool for ProcessExecTool {
         // including an unwind, terminates the whole tree.
         let guard = ChildGuard::new(child);
         drop(pinned);
-        let cancellation = self.cancellation.as_ref().map(|handle| handle.0.clone());
+        let cancellation = self.cancellation.as_ref().map(|handle| &handle.0);
         let outcome = supervise(guard, timeout, self.policy.max_output_bytes, cancellation)?;
 
         let rendered = if outcome.stderr.is_empty() {
@@ -839,7 +918,7 @@ fn supervise(
     mut guard: ChildGuard,
     timeout: Duration,
     max_output_bytes: usize,
-    cancellation: Option<CancellationToken>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<ProcessOutcome, ToolError> {
     let stdout = guard.child_mut().stdout.take();
     let stderr = guard.child_mut().stderr.take();
@@ -857,10 +936,7 @@ fn supervise(
                 break None;
             }
         }
-        if cancellation
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
             expiry = Some(ExecutionError::Cancelled);
             break None;
         }
@@ -923,7 +999,7 @@ impl ChildGuard {
     }
 
     /// Borrows the supervised child.
-    fn child_mut(&mut self) -> &mut Child {
+    const fn child_mut(&mut self) -> &mut Child {
         &mut self.child
     }
 
@@ -1079,26 +1155,38 @@ fn process_table() -> Vec<(u32, u32)> {
 }
 
 /// Parses `pid ppid` pairs, ignoring anything that is not a pair of integers.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(
+    all(windows, not(test)),
+    expect(
+        dead_code,
+        reason = "the process-table sweep is the Unix arm of terminate_tree; Windows terminates the whole tree with taskkill /T, but the parser is still exercised by unit tests on every platform"
+    )
+)]
 fn parse_process_table(listing: &str) -> Vec<(u32, u32)> {
     listing
         .lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let pid = fields.next()?.parse::<u32>().ok()?;
-            let ppid = fields.next()?.parse::<u32>().ok()?;
-            Some((pid, ppid))
+            let parent = fields.next()?.parse::<u32>().ok()?;
+            Some((pid, parent))
         })
         .collect()
 }
 
 /// Returns every transitive descendant of `root`, in breadth-first order.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(
+    all(windows, not(test)),
+    expect(
+        dead_code,
+        reason = "the process-table sweep is the Unix arm of terminate_tree; Windows terminates the whole tree with taskkill /T, but the traversal is still exercised by unit tests on every platform"
+    )
+)]
 fn descendants(table: &[(u32, u32)], root: u32) -> Vec<u32> {
     let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for (pid, ppid) in table {
-        if *pid != *ppid {
-            children.entry(*ppid).or_default().push(*pid);
+    for (pid, parent) in table {
+        if *pid != *parent {
+            children.entry(*parent).or_default().push(*pid);
         }
     }
     let mut seen: BTreeSet<u32> = BTreeSet::new();
@@ -1373,8 +1461,10 @@ mod tests {
     fn cancellation_tokens_share_state() {
         let token = CancellationToken::new();
         let clone = token.clone();
+        let bridged = CancellationToken::from_shared_flag(token.shared_flag());
         assert!(!clone.is_cancelled());
-        token.cancel();
+        bridged.cancel();
+        assert!(token.is_cancelled());
         assert!(clone.is_cancelled());
     }
 

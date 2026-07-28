@@ -38,7 +38,7 @@ async fn an_idle_runtime_suspends_immediately_and_refuses_new_work() {
         .prepare(request(
             "lease-a",
             Duration::from_secs(10),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         ))
         .await
         .expect("an idle runtime suspends");
@@ -95,7 +95,7 @@ async fn a_prepare_waits_for_in_flight_work_and_completes_when_the_permit_drops(
                 .prepare(request(
                     "lease-b",
                     Duration::from_secs(30),
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 ))
                 .await
         })
@@ -140,7 +140,7 @@ async fn work_that_never_finishes_makes_the_drain_time_out_and_the_runtime_stays
                 .prepare(request(
                     "lease-c",
                     Duration::from_secs(30),
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 ))
                 .await
         })
@@ -177,7 +177,7 @@ async fn a_second_prepare_is_refused_while_one_is_draining() {
                 .prepare(request(
                     "lease-d",
                     Duration::from_secs(30),
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 ))
                 .await
         })
@@ -191,7 +191,7 @@ async fn a_second_prepare_is_refused_while_one_is_draining() {
         .prepare(request(
             "lease-e",
             Duration::from_secs(30),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         ))
         .await
         .expect_err("only one prepare owns the handshake");
@@ -217,7 +217,7 @@ async fn a_second_prepare_is_refused_while_the_runtime_is_suspended() {
         .prepare(request(
             "lease-f",
             Duration::from_secs(1),
-            Duration::from_secs(600),
+            Duration::from_mins(10),
         ))
         .await
         .expect("the idle runtime suspends");
@@ -226,7 +226,7 @@ async fn a_second_prepare_is_refused_while_the_runtime_is_suspended() {
         .prepare(request(
             "lease-g",
             Duration::from_secs(1),
-            Duration::from_secs(600),
+            Duration::from_mins(10),
         ))
         .await
         .expect_err("a suspended runtime refuses another prepare");
@@ -254,7 +254,7 @@ async fn only_the_owning_lease_may_resume() {
         .prepare(request(
             "lease-h",
             Duration::from_secs(1),
-            Duration::from_secs(600),
+            Duration::from_mins(10),
         ))
         .await
         .expect("the idle runtime suspends");
@@ -281,7 +281,7 @@ async fn an_expired_lease_releases_the_runtime_so_a_crashed_host_cannot_wedge_it
         .prepare(request(
             "lease-j",
             Duration::from_secs(1),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         ))
         .await
         .expect("the idle runtime suspends");
@@ -326,7 +326,7 @@ async fn permits_dropped_out_of_order_still_drain_the_runtime() {
                 .prepare(request(
                     "lease-k",
                     Duration::from_secs(30),
-                    Duration::from_secs(600),
+                    Duration::from_mins(10),
                 ))
                 .await
         })
@@ -380,7 +380,7 @@ async fn a_prepare_dropped_while_draining_rolls_the_runtime_back_to_active() {
     let mut preparing = Box::pin(controller.prepare(request(
         "lease-abandoned",
         Duration::from_secs(30),
-        Duration::from_secs(300),
+        Duration::from_mins(5),
     )));
 
     // One poll commits the `Draining` transition and parks on the drain.
@@ -434,7 +434,7 @@ async fn a_prepare_dropped_while_draining_rolls_the_runtime_back_to_active() {
         .prepare(request(
             "lease-after",
             Duration::from_secs(30),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
         ))
         .await
         .expect("a fresh suspension is accepted");
@@ -458,7 +458,7 @@ async fn a_prepare_dropped_after_the_drain_timed_out_keeps_the_timeout_outcome()
     let mut preparing = Box::pin(controller.prepare(request(
         "lease-timeout",
         Duration::from_secs(30),
-        Duration::from_secs(300),
+        Duration::from_mins(5),
     )));
     assert!(
         poll_once(&mut preparing).is_pending(),

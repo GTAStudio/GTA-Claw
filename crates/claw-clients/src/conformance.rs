@@ -286,7 +286,7 @@ impl Error for AttachmentError {}
 /// Returns the [`AttachmentError`] naming the proof that was absent, or
 /// [`AttachmentError::GatewaySurface`] / [`AttachmentError::TransportMismatch`]
 /// when the surface does not use this transport at all.
-pub fn attach(
+pub const fn attach(
     surface_id: SurfaceId,
     evidence: AttachmentEvidence,
 ) -> Result<AttachmentOutcome, AttachmentError> {
@@ -325,7 +325,7 @@ pub fn attach(
 }
 
 /// One suite run against a surface.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SmokeReport {
     /// Surface that was exercised.
     pub surface: SurfaceId,
@@ -628,6 +628,26 @@ pub fn run_smoke(surface_id: SurfaceId) -> Result<SmokeReport, SmokeFailure> {
             surface_id,
             SmokeStep::EventDelivery,
             format!("event {rejected:?} was not rejected"),
+        ));
+    }
+    if delivery.close() != 0 || !delivery.is_closed() {
+        return Err(SmokeFailure::new(
+            surface_id,
+            SmokeStep::EventDelivery,
+            "drained event queue did not close cleanly".to_owned(),
+        ));
+    }
+    let post_close_kind = contract
+        .events
+        .first()
+        .copied()
+        .or(rejected_event)
+        .unwrap_or(SessionEventKind::Chat);
+    if delivery.push(post_close_kind, "{}") != Err(DeliveryError::Closed) {
+        return Err(SmokeFailure::new(
+            surface_id,
+            SmokeStep::EventDelivery,
+            "closed event queue accepted another event".to_owned(),
         ));
     }
 

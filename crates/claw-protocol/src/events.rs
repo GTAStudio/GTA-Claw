@@ -28,7 +28,7 @@ pub fn event_names() -> impl Iterator<Item = &'static str> {
 
 /// Returns the number of generated core events.
 #[must_use]
-pub fn event_count() -> usize {
+pub const fn event_count() -> usize {
     core_events().len()
 }
 

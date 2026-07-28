@@ -9,8 +9,22 @@
 //! line, headers, an optional `Content-Length` body, and either a
 //! `Content-Length` response or a `Transfer-Encoding: chunked` response.
 
-#![allow(dead_code, unreachable_pub)]
+#![expect(
+    dead_code,
+    reason = "`addr`, `frames_written` and `wait_for_requests` are the fixture's \
+              observation API; today's wire tests reach the same facts through \
+              `base_url` and `requests`, and deleting an accessor because one \
+              test binary happens not to call it would keep re-deleting and \
+              re-adding the same three methods"
+)]
+#![expect(
+    unreachable_pub,
+    reason = "this file is a `mod support;` inside an integration-test binary, not \
+              a library module, so `pub` marks the fixture's intended surface even \
+              though no downstream crate can reach it"
+)]
 
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -321,9 +335,9 @@ async fn serve(mut stream: TcpStream, reply: Reply, state: Arc<ServerState>) {
         } => {
             let mut head = format!("HTTP/1.1 {status} {}\r\n", reason(status));
             for (name, value) in headers {
-                head.push_str(&format!("{name}: {value}\r\n"));
+                let _ = write!(head, "{name}: {value}\r\n");
             }
-            head.push_str(&format!("content-length: {}\r\n", body.len()));
+            let _ = write!(head, "content-length: {}\r\n", body.len());
             head.push_str("connection: close\r\n\r\n");
             if stream.write_all(head.as_bytes()).await.is_err() {
                 return;

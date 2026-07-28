@@ -1,13 +1,15 @@
 //! End-to-end and mutation-based conformance harness tests.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use claw_conformance::{
-    ClaimLevel, ConformanceError, Contract, Evidence, FeatureClaim, ImplementationPointer,
-    InventoryClaim, ParityStatus, Registry, ViolationCode, discover_claim_files, generate_report,
+    ClaimLevel, ConformanceError, Contract, Evidence, EvidenceGap, EvidenceState, EvidenceTotals,
+    FeatureClaim, ImplementationPointer, InventoryClaim, ParityStatus, Registry, ViolationCode,
+    discover_claim_files, generate_report,
 };
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -104,8 +106,11 @@ fn install_fixture_workspace(root: &Path, crate_name: &str, targets: &[(&str, &s
     .expect("write fixture lockfile");
     let test_targets = targets
         .iter()
-        .map(|(name, path)| format!("\n[[test]]\nname = \"{name}\"\npath = \"{path}\"\n"))
-        .collect::<String>();
+        .fold(String::new(), |mut buffer, (name, path)| {
+            write!(buffer, "\n[[test]]\nname = \"{name}\"\npath = \"{path}\"\n")
+                .expect("writing to String cannot fail");
+            buffer
+        });
     for (_, path) in targets {
         let target_path = crate_root.join(path);
         fs::create_dir_all(target_path.parent().expect("fixture target parent"))
@@ -258,10 +263,12 @@ fn install_transition_evidence(root: &Path) {
             let relative = path
                 .strip_prefix(&format!("{package_path}/"))
                 .expect("artifact path belongs to package");
-            manifest.push_str(&format!(
+            write!(
+                manifest,
                 "\n[[test]]\nname = \"ledger-evidence-{index}\"\npath = \"{}\"\n",
                 relative.replace('\\', "/")
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
         fs::write(manifest_path, manifest).expect("write evidence manifest");
         members.insert(package_path.clone());
@@ -292,9 +299,11 @@ fn install_transition_evidence(root: &Path) {
          version = 4\n",
     );
     for package in package_names {
-        lock.push_str(&format!(
+        write!(
+            lock,
             "\n[[package]]\nname = \"{package}\"\nversion = \"0.0.0\"\n"
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
     fs::write(root.join("Cargo.lock"), lock).expect("write transitioned fixture lockfile");
 }
@@ -590,6 +599,15 @@ fn zero_registry_reports_the_honest_baseline() {
     assert_eq!(report.totals.total, 47);
     assert_eq!(report.totals.registered, 0);
     assert_eq!(
+        report.totals.evidence,
+        EvidenceTotals {
+            measured: 0,
+            verified: 0,
+            partial: 0,
+            missing: 47,
+        }
+    );
+    assert_eq!(
         report
             .ledgers
             .iter()
@@ -597,6 +615,16 @@ fn zero_registry_reports_the_honest_baseline() {
             .map(|feature| feature.status)
             .collect::<Vec<_>>(),
         vec![ParityStatus::Unimplemented; 47]
+    );
+    assert!(
+        report
+            .ledgers
+            .iter()
+            .flat_map(|ledger| &ledger.features)
+            .all(|feature| {
+                feature.evidence_state == EvidenceState::Missing
+                    && feature.evidence_gap == Some(EvidenceGap::NoClaim)
+            })
     );
     assert_eq!(
         report
@@ -653,6 +681,48 @@ fn fabricated_evidence_free_claim_is_rejected() {
 }
 
 #[test]
+fn programmatic_claim_evidence_is_bounded_before_filesystem_work() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test("missing.rs", "missing"); 1025],
+        ))
+        .expect("register oversized claim");
+
+    let error = generate_report(&contract, &registry, repository_root())
+        .expect_err("oversized evidence list must fail");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(
+        error.message(),
+        "claim has 1025 evidence artifacts and exceeds the 1024-artifact limit"
+    );
+}
+
+#[test]
+fn metadata_registration_cannot_smuggle_behavior_evidence() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::new(
+            "gateway.protocol.v4",
+            ClaimLevel::Registered,
+            vec![Evidence::test("crates/demo/tests/protocol.rs", "forged")],
+        ))
+        .expect("register metadata claim");
+
+    let error = generate_report(&contract, &registry, repository_root())
+        .expect_err("metadata-only evidence must fail");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(
+        error.message(),
+        "metadata-only registration must not carry behavior evidence"
+    );
+}
+
+#[test]
 fn metadata_registration_never_inflates_implementation() {
     let contract = Contract::load(upstream_root()).expect("load frozen contract");
     let mut registry = Registry::new();
@@ -675,6 +745,8 @@ fn metadata_registration_never_inflates_implementation() {
         .find(|feature| feature.feature_id == "gateway.protocol.v4")
         .expect("feature report");
     assert_eq!(feature.status, ParityStatus::Unimplemented);
+    assert_eq!(feature.evidence_state, EvidenceState::Missing);
+    assert_eq!(feature.evidence_gap, Some(EvidenceGap::RegistrationOnly));
     assert!(feature.registered);
     assert_eq!(feature.evidence_count, 0);
     let providers = report
@@ -685,6 +757,7 @@ fn metadata_registration_never_inflates_implementation() {
     assert_eq!(providers.fully_implemented, 0);
     assert_eq!(providers.registered, 1);
     assert_eq!(providers.total, 78);
+    assert_eq!(providers.evidence.missing, 78);
 }
 
 #[test]
@@ -735,6 +808,83 @@ fn claim_manifest_uses_structured_test_evidence_and_non_evidential_pointers() {
     assert_eq!(report.totals.implemented, 1);
     assert_eq!(report.totals.partial, 0);
     assert_eq!(report.totals.unimplemented, 46);
+    assert_eq!(report.totals.evidence.measured, 0);
+    assert_eq!(report.totals.evidence.verified, 1);
+    let feature = report
+        .ledgers
+        .iter()
+        .flat_map(|ledger| &ledger.features)
+        .find(|feature| feature.feature_id == "gateway.protocol.v4")
+        .expect("implemented feature");
+    assert_eq!(feature.evidence_state, EvidenceState::Verified);
+    assert_eq!(feature.evidence_gap, Some(EvidenceGap::RuntimeMeasurement));
+    let human = report.to_human_table();
+    assert!(human.contains("Evidence state: 0 measured, 1 verified, 0 partial, 46 missing"));
+    assert!(human.contains("measured requires runtime execution attestation"));
+}
+
+#[test]
+fn report_separates_verified_partial_missing_and_unmeasured_behavior() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let tests = fixture.root.join("crates").join("demo").join("tests");
+    fs::create_dir_all(&tests).expect("create evidence directory");
+    fs::write(
+        tests.join("protocol.rs"),
+        "#[test]\nfn shared_evidence() {}\n",
+    )
+    .expect("write shared evidence");
+    let evidence = vec![Evidence::test(
+        "crates/demo/tests/protocol.rs",
+        "shared_evidence",
+    )];
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            evidence.clone(),
+        ))
+        .expect("register verified claim");
+    registry
+        .register_feature(FeatureClaim::partial(
+            "gateway.protocol.node-v3-window",
+            evidence,
+        ))
+        .expect("register partial claim");
+
+    let report =
+        generate_report(&contract, &registry, &fixture.root).expect("generate evidence report");
+    assert_eq!(
+        report.totals.evidence,
+        EvidenceTotals {
+            measured: 0,
+            verified: 1,
+            partial: 1,
+            missing: 45,
+        }
+    );
+    let features = report
+        .ledgers
+        .iter()
+        .flat_map(|ledger| &ledger.features)
+        .map(|feature| (feature.feature_id.as_str(), feature))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        features["gateway.protocol.v4"].evidence_state,
+        EvidenceState::Verified
+    );
+    assert_eq!(
+        features["gateway.protocol.v4"].evidence_gap,
+        Some(EvidenceGap::RuntimeMeasurement)
+    );
+    assert_eq!(
+        features["gateway.protocol.node-v3-window"].evidence_state,
+        EvidenceState::Partial
+    );
+    assert_eq!(
+        features["gateway.protocol.node-v3-window"].evidence_gap,
+        Some(EvidenceGap::PartialCoverage)
+    );
 }
 
 #[test]

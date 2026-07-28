@@ -15,7 +15,9 @@ use std::fmt::{self, Display, Formatter};
 
 use claw_application::model::goal::GoalRecord;
 use claw_domain::SessionId;
-use claw_runtime::{GoalError, GoalService, GoalToolError, parse_goal_action};
+use claw_runtime::{GoalAction, GoalError, GoalService, GoalToolError, parse_goal_action};
+
+use crate::retry::{retry_conflicts, start_with_conflict_recovery};
 
 /// A goal-tool call that the model must correct.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,7 +86,14 @@ pub async fn invoke_goal_tool(
     arguments: &str,
 ) -> Result<GoalToolOutcome, ToolInvocationError> {
     let action = parse_goal_action(arguments)?;
-    let record = service.apply(session_id, &action).await?;
+    let record = match &action {
+        GoalAction::Set { objective } => {
+            start_with_conflict_recovery(service, session_id, objective).await?
+        }
+        GoalAction::Progress { .. } | GoalAction::Close { .. } => {
+            retry_conflicts(|| Box::pin(service.apply(session_id, &action))).await?
+        }
+    };
     Ok(GoalToolOutcome { record })
 }
 

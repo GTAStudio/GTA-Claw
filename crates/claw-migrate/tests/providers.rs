@@ -1,4 +1,8 @@
-#![allow(missing_docs)]
+#![expect(
+    missing_docs,
+    reason = "an integration-test binary publishes no API and has no downstream consumers; \
+what each fixture pins is stated by its test name and inline comments"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -7,8 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use claw_migrate::{
     ApplyContext, ClaudeMigrationProvider, CodexMigrationProvider, DetectionConfidence,
-    Ed25519ArtifactSigner, HermesMigrationProvider, HostPlatform, MigrationProvider,
-    MigrationStatus, PlanContext, SecretStore, SecretStoreError, SecretValue, SystemPlatformPaths,
+    Ed25519ArtifactSigner, HermesMigrationProvider, HostPlatform, MigrationError,
+    MigrationProvider, MigrationStatus, PlanContext, SecretStore, SecretStoreError, SecretValue,
+    SystemPlatformPaths,
 };
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -47,11 +52,16 @@ impl Drop for TestDir {
 #[derive(Default)]
 struct MemorySecretStore {
     values: BTreeMap<String, SecretValue>,
+    fail_get: bool,
     fail_put: bool,
+    fail_remove: bool,
 }
 
 impl SecretStore for MemorySecretStore {
     fn get(&mut self, id: &str) -> Result<Option<SecretValue>, SecretStoreError> {
+        if self.fail_get {
+            return Err(SecretStoreError::new("injected get failure"));
+        }
         Ok(self.values.get(id).cloned())
     }
 
@@ -64,6 +74,11 @@ impl SecretStore for MemorySecretStore {
     }
 
     fn remove(&mut self, id: &str) -> Result<(), SecretStoreError> {
+        if self.fail_remove {
+            return Err(SecretStoreError::new(format!(
+                "injected remove failure for {id}"
+            )));
+        }
         self.values.remove(id);
         Ok(())
     }
@@ -167,6 +182,15 @@ fn claude_plan_apply_and_rollback_are_side_effect_free_then_reversible() {
     assert_eq!(plan.result.status, MigrationStatus::Migrated);
     assert_eq!(plan.result.exit_code, 0);
     assert_eq!(plan.operation_count(), 6);
+    let report = plan.report();
+    assert_eq!(report.provider_id, "claude");
+    assert_eq!(report.operation_count, 6);
+    assert_eq!(report.operation_kinds.get("append"), Some(&1));
+    assert_eq!(report.operation_kinds.get("json-config"), Some(&2));
+    assert_eq!(report.operation_kinds.get("manifest"), Some(&1));
+    let report_value = serde_json::to_value(report).expect("serialize guided report");
+    assert_eq!(report_value["status"], "migrated");
+    assert_eq!(report_value["provider_id"], "claude");
     assert_eq!(
         plan_keys(&plan),
         BTreeSet::from([
@@ -582,6 +606,7 @@ fn secret_store_failure_rolls_back_without_plaintext_output() {
     let mut secrets = MemorySecretStore {
         values: BTreeMap::new(),
         fail_put: true,
+        ..MemorySecretStore::default()
     };
     let mut apply = ApplyContext {
         target_root: &target,
@@ -606,6 +631,118 @@ fn secret_store_failure_rolls_back_without_plaintext_output() {
             .exists()
     );
     assert_eq!(secrets.values, BTreeMap::new());
+}
+
+#[test]
+fn secret_store_get_failure_preserves_typed_cause_without_writing() {
+    let root = TestDir::new("secret-get-failure");
+    let source = root.join("codex-home");
+    let target = root.join("target");
+    write(
+        &source.join("config.toml"),
+        "api_key = \"must-never-leak\"\n",
+    );
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+    let plan = CodexMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&source),
+            target_root: &target,
+            overwrite: false,
+            signer: &signer,
+        })
+        .expect("plan secret migration");
+    let mut secrets = MemorySecretStore {
+        fail_get: true,
+        ..MemorySecretStore::default()
+    };
+    let mut apply = ApplyContext {
+        target_root: &target,
+        backup_root: &root.join("backup"),
+        overwrite: false,
+        secret_store: &mut secrets,
+    };
+
+    let error = CodexMigrationProvider
+        .apply(&mut apply, &plan)
+        .expect_err("get failure is fail closed");
+    match error {
+        MigrationError::ApplyFailed {
+            cause,
+            rollback_errors,
+        } => {
+            assert!(matches!(*cause, MigrationError::SecretStore(_)));
+            assert!(rollback_errors.is_empty());
+        }
+        other => panic!("expected typed apply failure, got {other}"),
+    }
+    assert!(secrets.values.is_empty());
+    assert!(
+        !target
+            .join("config")
+            .join("migrations")
+            .join("codex")
+            .join("config.toml")
+            .exists()
+    );
+}
+
+#[test]
+fn rollback_reports_every_secret_store_failure() {
+    let root = TestDir::new("rollback-secret-failures");
+    let source = root.join("codex-home");
+    let target = root.join("target");
+    write(
+        &source.join("config.toml"),
+        "api_key = \"first\"\n[mcp.servers.local.env]\nREGION = \"second\"\n",
+    );
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+    let plan = CodexMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&source),
+            target_root: &target,
+            overwrite: false,
+            signer: &signer,
+        })
+        .expect("plan two secrets");
+    let mut secrets = MemorySecretStore::default();
+    let receipt = {
+        let mut apply = ApplyContext {
+            target_root: &target,
+            backup_root: &root.join("backup"),
+            overwrite: false,
+            secret_store: &mut secrets,
+        };
+        CodexMigrationProvider
+            .apply(&mut apply, &plan)
+            .expect("apply two secrets")
+    };
+    assert_eq!(secrets.values.len(), 2);
+    secrets.fail_remove = true;
+    let mut rollback = ApplyContext {
+        target_root: &target,
+        backup_root: &root.join("backup"),
+        overwrite: false,
+        secret_store: &mut secrets,
+    };
+
+    let error = CodexMigrationProvider
+        .rollback(&mut rollback, &receipt)
+        .expect_err("both removals fail");
+    match error {
+        MigrationError::RollbackFailed { errors } => {
+            assert_eq!(errors.len(), 2);
+            assert!(
+                errors
+                    .iter()
+                    .all(|error| error.contains("secret codex-config-"))
+            );
+        }
+        other => panic!("expected aggregate rollback failure, got {other}"),
+    }
 }
 
 #[test]
@@ -769,6 +906,9 @@ fn codex_default_discovery_imports_cli_and_desktop_config_together() {
             .apply(&mut apply, &plan)
             .expect("apply combined Codex sources")
     };
+    // The imported document keeps the member order of the user's original
+    // Codex config (`theme` before `api_token`) instead of re-sorting it, so a
+    // migrated file stays diff-comparable against the source it came from.
     assert_eq!(
         fs::read_to_string(
             target
@@ -778,7 +918,7 @@ fn codex_default_discovery_imports_cli_and_desktop_config_together() {
                 .join("desktop.json"),
         )
         .expect("read desktop config"),
-        "{\n  \"api_token\": \"keyring://gta-claw/codex-desktop-9de92caff5340b4d\",\n  \"theme\": \"dark\"\n}"
+        "{\n  \"theme\": \"dark\",\n  \"api_token\": \"keyring://gta-claw/codex-desktop-9de92caff5340b4d\"\n}"
     );
     assert_eq!(secrets.values.len(), 1);
     let mut rollback = ApplyContext {
@@ -938,4 +1078,59 @@ fn rollback_restores_preexisting_secret_value() {
         secrets.values.get(secret_id).expect("restored").expose(),
         b"original-secret"
     );
+}
+
+/// A symbolic link whose destination does not exist is reported as absent by
+/// `Path::exists`, so a target guard that followed links would treat the path as
+/// free space and let `fs::write` create the file wherever the link points.
+#[cfg(unix)]
+#[test]
+fn apply_refuses_a_dangling_symlink_planted_at_a_target() {
+    let root = TestDir::new("symlink-escape");
+    let source = root.join("codex-home");
+    let target = root.join("target");
+    let escape = root.join("outside").join("stolen.toml");
+    write(&source.join("config.toml"), "model = \"gpt-5\"\n");
+    fs::create_dir_all(escape.parent().expect("escape parent")).expect("create escape parent");
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+    let plan = CodexMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&source),
+            target_root: &target,
+            overwrite: true,
+            signer: &signer,
+        })
+        .expect("plan migration");
+
+    let planted = target
+        .join("config")
+        .join("migrations")
+        .join("codex")
+        .join("config.toml");
+    fs::create_dir_all(planted.parent().expect("planted parent")).expect("create planted parent");
+    std::os::unix::fs::symlink(&escape, &planted).expect("plant dangling symlink");
+    assert!(!planted.exists(), "a dangling link must look absent");
+
+    let mut secrets = MemorySecretStore::default();
+    let mut apply = ApplyContext {
+        target_root: &target,
+        backup_root: &root.join("backup"),
+        overwrite: true,
+        secret_store: &mut secrets,
+    };
+    let error = CodexMigrationProvider
+        .apply(&mut apply, &plan)
+        .expect_err("a symbolic link at a migration target must be refused");
+    assert_eq!(
+        error.to_string(),
+        format!("migration refuses symbolic link: {}", planted.display())
+    );
+    assert!(
+        !escape.exists(),
+        "apply followed the planted link and wrote outside the migration root"
+    );
+    assert!(!root.join("backup").exists());
+    assert_eq!(secrets.values, BTreeMap::new());
 }

@@ -41,7 +41,7 @@ pub use goal_tool::{
 };
 pub use runtime::{
     CommandOutcome, Runtime, RuntimeConfig, RuntimeError, RuntimeEvent, RuntimeEventKind,
-    RuntimePorts, TurnHandle, TurnOutcome,
+    RuntimeFailureClass, RuntimePorts, SessionReloadReport, TurnHandle, TurnOutcome,
 };
 pub use session::{StateMachineError, TurnStateMachine};
 pub use stream::{StreamAssembler, StreamError, StreamEvent, StreamPayload};

@@ -1,4 +1,4 @@
-//! Offline ClawHub marketplace lifecycle for plugins and skills.
+//! Offline `ClawHub` marketplace lifecycle for plugins and skills.
 //!
 //! Upstream sources at
 //! `openclaw/openclaw@b43e832fcc8000ed7287c7accc54e381db607f85`:
@@ -49,7 +49,7 @@ use std::fmt::{self, Display, Formatter};
 /// Longest accepted package name.
 pub const MAX_PACKAGE_NAME_BYTES: usize = 64;
 
-/// Validated ClawHub package name.
+/// Validated `ClawHub` package name.
 ///
 /// Upstream package names are lowercase ASCII kebab identifiers. The
 /// constructor is the only way to build one, so an unvalidated name cannot
@@ -343,7 +343,7 @@ impl Display for RiskFlag {
     }
 }
 
-/// One published ClawHub release.
+/// One published `ClawHub` release.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Release {
     /// Validated package name.
@@ -665,7 +665,7 @@ pub struct InstallRequest {
 impl InstallRequest {
     /// Builds a request for the newest published version.
     #[must_use]
-    pub fn latest(name: PackageName) -> Self {
+    pub const fn latest(name: PackageName) -> Self {
         Self {
             name,
             version: None,
@@ -675,7 +675,7 @@ impl InstallRequest {
 
     /// Builds a request for one exact version.
     #[must_use]
-    pub fn exact(name: PackageName, version: Version) -> Self {
+    pub const fn exact(name: PackageName, version: Version) -> Self {
         Self {
             name,
             version: Some(version),
@@ -705,7 +705,7 @@ pub struct UpdateRequest {
 impl UpdateRequest {
     /// Builds an update to the newest published version.
     #[must_use]
-    pub fn latest(name: PackageName) -> Self {
+    pub const fn latest(name: PackageName) -> Self {
         Self {
             name,
             version: None,
@@ -715,7 +715,7 @@ impl UpdateRequest {
 
     /// Builds an update to one exact version.
     #[must_use]
-    pub fn exact(name: PackageName, version: Version) -> Self {
+    pub const fn exact(name: PackageName, version: Version) -> Self {
         Self {
             name,
             version: Some(version),
@@ -783,7 +783,7 @@ pub struct InstalledPackage {
     pub attestation: Attestation,
 }
 
-/// Every way a ClawHub lifecycle operation can be refused.
+/// Every way a `ClawHub` lifecycle operation can be refused.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClawHubError {
     /// The registry publishes no release under this name.
@@ -964,7 +964,7 @@ impl Display for ClawHubError {
 
 impl Error for ClawHubError {}
 
-/// ClawHub lifecycle over an injected registry and trust policy.
+/// `ClawHub` lifecycle over an injected registry and trust policy.
 #[derive(Clone, Debug)]
 pub struct ClawHub<R, T> {
     registry: R,

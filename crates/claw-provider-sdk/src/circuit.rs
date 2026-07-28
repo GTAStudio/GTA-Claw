@@ -1,6 +1,6 @@
 //! Circuit breaker that stops hammering an unhealthy provider.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::error::{ErrorKind, Operation, ProviderError};
@@ -47,6 +47,13 @@ struct BreakerState {
     consecutive_successes: u32,
     opened_at_millis: u64,
     probes_in_flight: u32,
+    probe_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PermitAdmission {
+    probe: bool,
+    probe_epoch: u64,
 }
 
 /// A per-provider circuit breaker.
@@ -74,6 +81,7 @@ impl CircuitBreaker {
                 consecutive_successes: 0,
                 opened_at_millis: 0,
                 probes_in_flight: 0,
+                probe_epoch: 0,
             }),
         }
     }
@@ -81,7 +89,7 @@ impl CircuitBreaker {
     /// Returns the state the breaker would report at `now_millis`.
     #[must_use]
     pub fn state(&self, now_millis: u64) -> CircuitState {
-        let mut inner = self.inner.lock().expect("circuit breaker mutex");
+        let mut inner = self.lock();
         Self::refresh(&mut inner, &self.config, now_millis);
         inner.state
     }
@@ -97,27 +105,74 @@ impl CircuitBreaker {
         operation: Operation,
         now_millis: u64,
     ) -> Result<CircuitPermit<'_>, ProviderError> {
-        let mut inner = self.inner.lock().expect("circuit breaker mutex");
+        let probe = self.admit(operation, now_millis)?;
+        Ok(CircuitPermit {
+            breaker: self,
+            admission: probe,
+            reported: false,
+        })
+    }
+
+    /// Asks permission to issue a request and returns an owned permit.
+    ///
+    /// Owned permits can travel with a streaming body and report its terminal
+    /// outcome after the call that opened it has returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same rejection as [`CircuitBreaker::acquire`].
+    pub fn acquire_owned(
+        self: &Arc<Self>,
+        operation: Operation,
+        now_millis: u64,
+    ) -> Result<OwnedCircuitPermit, ProviderError> {
+        let probe = self.admit(operation, now_millis)?;
+        Ok(OwnedCircuitPermit {
+            breaker: Arc::clone(self),
+            admission: probe,
+            reported: false,
+        })
+    }
+
+    fn admit(
+        &self,
+        operation: Operation,
+        now_millis: u64,
+    ) -> Result<PermitAdmission, ProviderError> {
+        let mut inner = self.lock();
         Self::refresh(&mut inner, &self.config, now_millis);
-        match inner.state {
-            CircuitState::Closed => Ok(CircuitPermit { breaker: self }),
+        let admitted = match inner.state {
+            CircuitState::Closed => Ok(PermitAdmission {
+                probe: false,
+                probe_epoch: inner.probe_epoch,
+            }),
             CircuitState::HalfOpen => {
                 if inner.probes_in_flight >= self.config.half_open_probes {
-                    Err(self.rejection(operation, "half-open probe budget exhausted"))
+                    Err("half-open probe budget exhausted")
                 } else {
                     inner.probes_in_flight += 1;
-                    Ok(CircuitPermit { breaker: self })
+                    Ok(PermitAdmission {
+                        probe: true,
+                        probe_epoch: inner.probe_epoch,
+                    })
                 }
             }
-            CircuitState::Open => {
-                Err(self.rejection(operation, "circuit is open after repeated failures"))
-            }
+            CircuitState::Open => Err("circuit is open after repeated failures"),
+        };
+        // The error is built outside the critical section: allocating and
+        // sanitizing a `ProviderError` under the breaker lock would serialize
+        // every caller of an unhealthy provider behind that allocation, which is
+        // exactly when the most callers arrive.
+        drop(inner);
+        match admitted {
+            Ok(probe) => Ok(probe),
+            Err(detail) => Err(self.rejection(operation, detail)),
         }
     }
 
     /// Records a successful call.
     pub fn record_success(&self, now_millis: u64) {
-        let mut inner = self.inner.lock().expect("circuit breaker mutex");
+        let mut inner = self.lock();
         inner.consecutive_failures = 0;
         inner.probes_in_flight = inner.probes_in_flight.saturating_sub(1);
         match inner.state {
@@ -143,7 +198,7 @@ impl CircuitBreaker {
     /// Only failures for which [`ErrorKind::trips_circuit`] holds affect the
     /// breaker; client-side mistakes are ignored.
     pub fn record_failure(&self, kind: ErrorKind, now_millis: u64) {
-        let mut inner = self.inner.lock().expect("circuit breaker mutex");
+        let mut inner = self.lock();
         inner.probes_in_flight = inner.probes_in_flight.saturating_sub(1);
         if !kind.trips_circuit() {
             return;
@@ -167,8 +222,87 @@ impl CircuitBreaker {
         }
     }
 
+    /// Locks the breaker, recovering from a poisoned mutex.
+    ///
+    /// Nothing inside a critical section can panic, so poisoning can only come
+    /// from a panic elsewhere in the process. Refusing to serve every later
+    /// request because of that would turn one unrelated panic into a permanent
+    /// provider outage.
+    fn lock(&self) -> std::sync::MutexGuard<'_, BreakerState> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn rejection(&self, operation: Operation, detail: &str) -> ProviderError {
         ProviderError::new(ErrorKind::CircuitOpen, &self.provider, operation, detail)
+    }
+
+    fn permit_success(&self, admission: PermitAdmission, now_millis: u64) {
+        let mut inner = self.lock();
+        if admission.probe
+            && inner.state == CircuitState::HalfOpen
+            && inner.probe_epoch == admission.probe_epoch
+        {
+            inner.probes_in_flight = inner.probes_in_flight.saturating_sub(1);
+            inner.consecutive_failures = 0;
+            inner.consecutive_successes = inner.consecutive_successes.saturating_add(1);
+            if inner.consecutive_successes >= self.config.success_threshold {
+                inner.state = CircuitState::Closed;
+                inner.consecutive_successes = 0;
+                inner.probes_in_flight = 0;
+            }
+        } else if !admission.probe
+            && inner.state == CircuitState::Closed
+            && inner.probe_epoch == admission.probe_epoch
+        {
+            inner.consecutive_failures = 0;
+            inner.consecutive_successes = 0;
+        } else {
+            // A result admitted in an older state cannot participate in the
+            // current half-open recovery epoch.
+            let _ = now_millis;
+        }
+    }
+
+    fn permit_failure(&self, admission: PermitAdmission, kind: ErrorKind, now_millis: u64) {
+        let mut inner = self.lock();
+        if admission.probe {
+            if inner.state != CircuitState::HalfOpen || inner.probe_epoch != admission.probe_epoch {
+                return;
+            }
+            inner.probes_in_flight = inner.probes_in_flight.saturating_sub(1);
+            if !kind.trips_circuit() {
+                return;
+            }
+            inner.consecutive_successes = 0;
+            inner.state = CircuitState::Open;
+            inner.opened_at_millis = now_millis;
+            inner.probes_in_flight = 0;
+            return;
+        }
+
+        if inner.state != CircuitState::Closed
+            || inner.probe_epoch != admission.probe_epoch
+            || !kind.trips_circuit()
+        {
+            return;
+        }
+        inner.consecutive_successes = 0;
+        inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
+        if inner.consecutive_failures >= self.config.failure_threshold {
+            inner.state = CircuitState::Open;
+            inner.opened_at_millis = now_millis;
+            inner.consecutive_failures = 0;
+        }
+    }
+
+    fn abandon_probe(&self, admission: PermitAdmission) {
+        let mut inner = self.lock();
+        if admission.probe
+            && inner.state == CircuitState::HalfOpen
+            && inner.probe_epoch == admission.probe_epoch
+        {
+            inner.probes_in_flight = inner.probes_in_flight.saturating_sub(1);
+        }
     }
 
     fn refresh(inner: &mut BreakerState, config: &CircuitBreakerConfig, now_millis: u64) {
@@ -179,6 +313,7 @@ impl CircuitBreaker {
                 inner.state = CircuitState::HalfOpen;
                 inner.probes_in_flight = 0;
                 inner.consecutive_successes = 0;
+                inner.probe_epoch = inner.probe_epoch.saturating_add(1);
             }
         }
     }
@@ -187,22 +322,64 @@ impl CircuitBreaker {
 /// Proof that the circuit admitted one call.
 ///
 /// The permit exists to make the admit/report pairing explicit at call sites; it
-/// carries no drop behaviour, because success and failure must be reported
-/// distinctly.
 #[derive(Debug)]
 pub struct CircuitPermit<'a> {
     breaker: &'a CircuitBreaker,
+    admission: PermitAdmission,
+    reported: bool,
 }
 
 impl CircuitPermit<'_> {
     /// Reports a successful call.
-    pub fn success(self, now_millis: u64) {
-        self.breaker.record_success(now_millis);
+    pub fn success(mut self, now_millis: u64) {
+        self.reported = true;
+        self.breaker.permit_success(self.admission, now_millis);
     }
 
     /// Reports a failed call.
-    pub fn failure(self, kind: ErrorKind, now_millis: u64) {
-        self.breaker.record_failure(kind, now_millis);
+    pub fn failure(mut self, kind: ErrorKind, now_millis: u64) {
+        self.reported = true;
+        self.breaker
+            .permit_failure(self.admission, kind, now_millis);
+    }
+}
+
+impl Drop for CircuitPermit<'_> {
+    fn drop(&mut self) {
+        if !self.reported {
+            self.breaker.abandon_probe(self.admission);
+        }
+    }
+}
+
+/// Owned proof that a circuit admitted one potentially long-lived call.
+#[derive(Debug)]
+pub struct OwnedCircuitPermit {
+    breaker: Arc<CircuitBreaker>,
+    admission: PermitAdmission,
+    reported: bool,
+}
+
+impl OwnedCircuitPermit {
+    /// Reports a successful call.
+    pub fn success(mut self, now_millis: u64) {
+        self.reported = true;
+        self.breaker.permit_success(self.admission, now_millis);
+    }
+
+    /// Reports a failed call.
+    pub fn failure(mut self, kind: ErrorKind, now_millis: u64) {
+        self.reported = true;
+        self.breaker
+            .permit_failure(self.admission, kind, now_millis);
+    }
+}
+
+impl Drop for OwnedCircuitPermit {
+    fn drop(&mut self) {
+        if !self.reported {
+            self.breaker.abandon_probe(self.admission);
+        }
     }
 }
 
@@ -215,7 +392,7 @@ mod tests {
             "openai",
             CircuitBreakerConfig {
                 failure_threshold: 3,
-                open_duration: Duration::from_millis(1_000),
+                open_duration: Duration::from_secs(1),
                 half_open_probes: 1,
                 success_threshold: 2,
             },
@@ -300,6 +477,67 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::CircuitOpen);
         assert_eq!(error.detail(), "half-open probe budget exhausted");
         first.success(1_004);
+    }
+
+    #[test]
+    fn dropping_an_unreported_half_open_probe_releases_the_budget() {
+        let breaker = breaker();
+        for step in 0..3 {
+            breaker.record_failure(ErrorKind::Transport, step);
+        }
+        let probe = breaker.acquire(Operation::Ping, 1_002).expect("probe");
+        assert!(
+            breaker.acquire(Operation::Ping, 1_002).is_err(),
+            "the only probe slot is held"
+        );
+        drop(probe);
+        assert!(
+            breaker.acquire(Operation::Ping, 1_002).is_ok(),
+            "abandoning a probe must not wedge half-open recovery"
+        );
+    }
+
+    #[test]
+    fn a_stale_closed_call_cannot_complete_a_half_open_probe() {
+        let breaker = CircuitBreaker::new(
+            "openai",
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                open_duration: Duration::from_secs(1),
+                half_open_probes: 1,
+                success_threshold: 1,
+            },
+        );
+        let stale = breaker
+            .acquire(Operation::StreamCompletion, 0)
+            .expect("admitted while closed");
+        let stale_failure = breaker
+            .acquire(Operation::Complete, 0)
+            .expect("also admitted before the outage");
+        breaker.record_failure(ErrorKind::Server, 0);
+        assert_eq!(breaker.state(0), CircuitState::Open);
+
+        assert_eq!(breaker.state(1_000), CircuitState::HalfOpen);
+        let probe = breaker.acquire(Operation::Ping, 1_000).expect("real probe");
+        stale.success(1_000);
+        assert_eq!(
+            breaker.state(1_000),
+            CircuitState::HalfOpen,
+            "the pre-outage stream is not the recovery probe"
+        );
+        assert!(
+            breaker.acquire(Operation::Ping, 1_000).is_err(),
+            "the real probe still owns the only probe slot"
+        );
+
+        probe.success(1_001);
+        assert_eq!(breaker.state(1_001), CircuitState::Closed);
+        stale_failure.failure(ErrorKind::Server, 1_002);
+        assert_eq!(
+            breaker.state(1_002),
+            CircuitState::Closed,
+            "a pre-outage failure cannot reopen a recovered circuit"
+        );
     }
 
     #[test]

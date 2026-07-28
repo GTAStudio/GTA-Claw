@@ -107,11 +107,7 @@ fn host_with(
     PluginHost::builder()
         .trust_policy(unsigned_core_policy(root))
         .operator_policy(probe_ceiling(http_grant()))
-        .services(
-            HostServices::deny_all()
-                .with_dns(dns)
-                .with_http(transport.clone()),
-        )
+        .services(HostServices::deny_all().with_dns(dns).with_http(transport))
         .build()
         .expect("host")
 }

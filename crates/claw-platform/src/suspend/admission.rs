@@ -269,6 +269,16 @@ impl WorkAdmission {
     }
 
     /// Admits one root request or timer tick, or refuses it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`AdmissionRefusal`] carrying
+    /// [`RefusalReason::GatewayRestarting`] when the host has been marked
+    /// draining for restart, and [`RefusalReason::GatewaySuspending`] when a
+    /// cooperative suspension holds the fence in `Preparing` or `Prepared`.
+    /// Nothing is queued in either case: the caller is expected to answer its
+    /// own peer with a retryable error carrying the refusal's
+    /// [`retry_after_ms`](AdmissionRefusal::retry_after_ms).
     pub fn try_begin_root_work(self: &Arc<Self>) -> Result<RootWorkLease, AdmissionRefusal> {
         let mut state = self.state();
         if let Some(refusal) = state.refusal() {
@@ -364,6 +374,7 @@ impl SuspendLease {
     /// Promotes an inspected host from `Preparing` to `Prepared`.
     ///
     /// Returns `false` when the lease was superseded during preparation.
+    #[must_use = "a false commit means the fence now belongs to someone else"]
     pub fn commit(&self) -> bool {
         self.admission.transition(
             self.generation,
@@ -373,6 +384,11 @@ impl SuspendLease {
     }
 
     /// Reopens admission from `Preparing` after a refused preparation.
+    ///
+    /// Returns `false` when the lease was superseded, in which case the fence
+    /// is already owned by a restart drain or a later suspension and must not
+    /// be reopened on this lease's behalf.
+    #[must_use = "a false rollback means the fence now belongs to someone else"]
     pub fn rollback(&self) -> bool {
         self.admission.transition(
             self.generation,
@@ -382,6 +398,11 @@ impl SuspendLease {
     }
 
     /// Reopens admission from `Prepared` after a resume or an expiry.
+    ///
+    /// Returns `false` when the lease was superseded, in which case the fence
+    /// is already owned by a restart drain or a later suspension and must not
+    /// be reopened on this lease's behalf.
+    #[must_use = "a false release means the fence now belongs to someone else"]
     pub fn release(&self) -> bool {
         self.admission.transition(
             self.generation,
@@ -407,7 +428,7 @@ impl Drop for SuspendLease {
         // must not stay closed on its behalf. Both transitions are generation
         // fenced, so a superseded lease still changes nothing.
         if !self.release() {
-            self.rollback();
+            let _ = self.rollback();
         }
     }
 }

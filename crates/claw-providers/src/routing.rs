@@ -16,7 +16,7 @@
 //! * When nothing qualifies, routing fails with
 //!   [`RouteError::NoProviderAvailable`] rather than picking anything.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -25,7 +25,7 @@ use claw_provider_sdk::model::{Capability, CapabilitySet};
 use crate::alias::AliasTable;
 use crate::config::ResolvedProvider;
 use crate::descriptor::ProviderDescriptor;
-use crate::registry::PROVIDERS;
+use crate::registry::{self, PROVIDERS};
 
 /// What a caller needs from a provider.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,7 +48,7 @@ impl<'a> RouteRequest<'a> {
 
     /// Returns the request with the given preferences applied.
     #[must_use]
-    pub fn preferring(mut self, preferred: &'a [&'a str]) -> Self {
+    pub const fn preferring(mut self, preferred: &'a [&'a str]) -> Self {
         self.preferred = preferred;
         self
     }
@@ -193,34 +193,33 @@ impl RoutingTable {
     /// same frozen identifier — which includes one written as an alias and one
     /// written canonically, the case an operator is least likely to spot.
     pub fn new(providers: Vec<ResolvedProvider>) -> Result<Self, DuplicateProvider> {
-        let order: BTreeMap<&'static str, usize> = PROVIDERS
-            .iter()
-            .enumerate()
-            .map(|(index, descriptor)| (descriptor.id, index))
-            .collect();
-        let mut seen: Vec<&'static str> = Vec::with_capacity(providers.len());
+        let mut seen: BTreeSet<&'static str> = BTreeSet::new();
         for provider in &providers {
-            if seen.contains(&provider.descriptor.id) {
+            if !seen.insert(provider.descriptor.id) {
                 return Err(DuplicateProvider {
                     provider: provider.descriptor.id,
                 });
             }
-            seen.push(provider.descriptor.id);
         }
         let mut entries = providers;
-        entries.sort_by_key(|provider| order[provider.descriptor.id]);
+        // Unregistered rows cannot occur — a `ResolvedProvider` is only built
+        // from a registry descriptor — but ordering them last is a defined
+        // outcome, where indexing a lookup table would be a panic.
+        entries.sort_by_key(|provider| {
+            registry::inventory_index(provider.descriptor.id).unwrap_or(usize::MAX)
+        });
         Ok(Self { entries })
     }
 
     /// Returns the number of configured providers, enabled or not.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Returns `true` when nothing is configured.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -246,7 +245,18 @@ impl RoutingTable {
     ///
     /// # Errors
     ///
-    /// See [`RouteError`].
+    /// * [`RouteError::EmptyRequirement`] — the request requires no capability,
+    ///   which would match every configured provider.
+    /// * [`RouteError::UnknownPreference`] — a preferred name is neither a
+    ///   frozen identifier nor a known alias.
+    /// * [`RouteError::PreferenceNotConfigured`] — every stated preference
+    ///   failed and the first failure was a provider that is absent from this
+    ///   table or configured but disabled.
+    /// * [`RouteError::PreferenceLacksCapability`] — every stated preference
+    ///   failed and the first failure was a configured, enabled provider that
+    ///   does not advertise all the required capabilities.
+    /// * [`RouteError::NoProviderAvailable`] — no preference was stated and no
+    ///   enabled provider advertises all the required capabilities.
     pub fn route(&self, request: &RouteRequest<'_>) -> Result<Route<'_>, RouteError> {
         self.route_with(request, AliasTable::builtin())
     }
@@ -255,7 +265,9 @@ impl RoutingTable {
     ///
     /// # Errors
     ///
-    /// See [`RouteError`].
+    /// The same failures as [`RoutingTable::route`], except that
+    /// [`RouteError::UnknownPreference`] is decided against `aliases` rather
+    /// than the built-in table.
     pub fn route_with(
         &self,
         request: &RouteRequest<'_>,

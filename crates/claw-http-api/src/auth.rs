@@ -114,24 +114,13 @@ pub(crate) struct AuthMiddlewareState {
     pub(crate) limits: HttpLimits,
 }
 
-impl AuthMiddlewareState {
-    fn body_limit(&self, path: &str) -> usize {
-        match path {
-            "/v1/embeddings" => self.limits.embeddings_body_bytes,
-            "/tools/invoke" => self.limits.tools_body_bytes,
-            "/api/v1/admin/rpc" => self.limits.admin_body_bytes,
-            _ => self.limits.openai_body_bytes,
-        }
-    }
-}
-
 pub(crate) async fn require_bearer(
     State(state): State<AuthMiddlewareState>,
     mut request: Request,
     next: Next,
 ) -> Response {
     let Some(principal) = state.authenticator.authenticate_headers(request.headers()) else {
-        let body_limit = state.body_limit(request.uri().path());
+        let body_limit = state.limits.body_limit_for_path(request.uri().path());
         return rejected_response(
             request,
             body_limit,
@@ -187,19 +176,5 @@ pub(crate) fn authorize_scope(
         Ok(())
     } else {
         Err(ApiError::forbidden(required_scope.as_str()))
-    }
-}
-
-pub(crate) const fn protocol_scope_to_security(
-    scope: claw_protocol::gateway::OperatorScope,
-) -> Scope {
-    use claw_protocol::gateway::OperatorScope as ProtocolScope;
-    match scope {
-        ProtocolScope::Admin => Scope::OperatorAdmin,
-        ProtocolScope::Read => Scope::OperatorRead,
-        ProtocolScope::Write => Scope::OperatorWrite,
-        ProtocolScope::Approvals => Scope::OperatorApprovals,
-        ProtocolScope::Pairing => Scope::OperatorPairing,
-        ProtocolScope::TalkSecrets => Scope::OperatorTalkSecrets,
     }
 }

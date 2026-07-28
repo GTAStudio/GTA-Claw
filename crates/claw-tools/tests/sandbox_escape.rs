@@ -579,7 +579,7 @@ fn a_parent_swapped_concurrently_never_truncates_a_file_outside_the_root() {
     let flips = Arc::new(AtomicUsize::new(0));
     let flipper_stop = Arc::clone(&stop);
     let flipper_count = Arc::clone(&flips);
-    let flip_target = parent.clone();
+    let flip_target = parent;
     let flip_stash = tree.join("workspace/flipstash");
     let flip_source = outside.clone();
     let flipper = thread::spawn(move || {
@@ -631,9 +631,7 @@ fn a_parent_swapped_concurrently_never_truncates_a_file_outside_the_root() {
         "ORIGINAL-OUTSIDE-CONTENT"
     );
     assert!(
-        fs::symlink_metadata(outside.join("target.txt"))
-            .map(|metadata| metadata.len())
-            .unwrap_or(0)
+        fs::symlink_metadata(outside.join("target.txt")).map_or(0, |metadata| metadata.len())
             == u64::try_from("ORIGINAL-OUTSIDE-CONTENT".len()).expect("small"),
         "the outside file was truncated"
     );

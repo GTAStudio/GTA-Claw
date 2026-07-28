@@ -7,6 +7,7 @@ use claw_gateway_client::{AuthorizationExpectation, ClientMetadata, GatewayClien
 use claw_security::authorization::{Role, Scope, ScopeSet};
 use claw_security::identity::DeviceIdentity;
 
+use crate::connection_policy::IosConnectionPolicy;
 use crate::credential::IosCredential;
 use crate::endpoint::{EndpointSummary, GatewayEndpoint};
 use crate::identity::IosClientIdentity;
@@ -26,6 +27,7 @@ pub struct IosGatewayProfile {
     identity: IosClientIdentity,
     device: Arc<DeviceIdentity>,
     requested_scopes: ScopeSet,
+    connection_policy: IosConnectionPolicy,
 }
 
 impl IosGatewayProfile {
@@ -43,6 +45,7 @@ impl IosGatewayProfile {
             identity,
             device,
             requested_scopes: ScopeSet::EMPTY,
+            connection_policy: IosConnectionPolicy::MOBILE_DEFAULT,
         }
     }
 
@@ -55,6 +58,19 @@ impl IosGatewayProfile {
     pub fn requesting(mut self, scopes: impl IntoIterator<Item = Scope>) -> Self {
         self.requested_scopes = ScopeSet::from_scopes(scopes);
         self
+    }
+
+    /// Applies a validated mobile timeout and reconnect policy.
+    #[must_use]
+    pub const fn with_connection_policy(mut self, policy: IosConnectionPolicy) -> Self {
+        self.connection_policy = policy;
+        self
+    }
+
+    /// Returns the policy this profile will apply to the transport.
+    #[must_use]
+    pub const fn connection_policy(&self) -> IosConnectionPolicy {
+        self.connection_policy
     }
 
     /// Returns display text for the endpoint that cannot carry a credential.
@@ -95,6 +111,7 @@ impl IosGatewayProfile {
         config.scopes = self.requested_scopes;
         config.authorization_expectation = AuthorizationExpectation::RequestedRole;
         config.client = self.identity.metadata();
+        self.connection_policy.apply(&mut config);
         config
     }
 }
@@ -108,6 +125,7 @@ impl std::fmt::Debug for IosGatewayProfile {
             .field("identity", &self.identity)
             .field("device", &"[REDACTED]")
             .field("requested_scopes", &self.requested_scopes)
+            .field("connection_policy", &self.connection_policy)
             .finish()
     }
 }
@@ -144,8 +162,9 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use claw_gateway_client::GatewayCredential;
+    use claw_gateway_client::{GatewayCredential, ReconnectPolicy};
     use claw_platform::NativeSystemProbe;
     use claw_protocol::gateway::{ClientId, ClientMode};
     use claw_protocol::{ClientCommand, RuntimeDescriptor, ServerEvent};
@@ -155,6 +174,7 @@ mod tests {
     use rand_chacha::rand_core::SeedableRng;
 
     use super::{IosClientCore, IosGatewayProfile};
+    use crate::connection_policy::{IosConnectionPolicy, IosRetryPolicy, IosTimeoutPolicy};
     use crate::credential::IosCredential;
     use crate::device::UnobservedDeviceProbe;
     use crate::endpoint::GatewayEndpoint;
@@ -219,6 +239,43 @@ mod tests {
             "a mobile client must not enable the plaintext break-glass, config url was {}",
             config.url
         );
+    }
+
+    #[test]
+    fn every_profile_applies_the_bounded_mobile_connection_policy() {
+        let config = profile().into_client_config();
+
+        assert_eq!(config.timeouts.connect, Duration::from_secs(8));
+        assert_eq!(config.timeouts.authentication, Duration::from_secs(8));
+        assert_eq!(config.timeouts.request, Duration::from_secs(20));
+        assert_eq!(config.timeouts.shutdown, Duration::from_secs(2));
+        assert_eq!(
+            config.reconnect,
+            ReconnectPolicy::Bounded {
+                max_attempts: 4,
+                initial_delay: Duration::from_millis(500),
+                max_delay: Duration::from_secs(8),
+                max_jitter: Duration::from_millis(250),
+            }
+        );
+    }
+
+    #[test]
+    fn a_validated_no_retry_policy_reaches_the_transport() {
+        let timeouts = IosTimeoutPolicy::new(
+            Duration::from_secs(3),
+            Duration::from_secs(4),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .expect("timeouts are bounded");
+        let policy = IosConnectionPolicy::new(timeouts, IosRetryPolicy::Never);
+        let profile = profile().with_connection_policy(policy);
+
+        assert_eq!(profile.connection_policy(), policy);
+        let config = profile.into_client_config();
+        assert_eq!(config.timeouts.connect, Duration::from_secs(3));
+        assert_eq!(config.reconnect, ReconnectPolicy::Never);
     }
 
     #[test]

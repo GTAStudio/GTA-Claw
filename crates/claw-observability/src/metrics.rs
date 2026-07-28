@@ -97,6 +97,13 @@ impl std::error::Error for MetricError {}
 /// dropping observations.
 pub trait MetricsExporter: Send + Sync {
     /// Records one metrics update.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricError`] when the implementation cannot durably accept
+    /// the observation, for example when its transport rejects the write or its
+    /// internal state is inconsistent. Implementations must not swallow such a
+    /// failure, because a dropped observation is invisible to the caller.
     fn record(&self, event: MetricEvent) -> Result<(), MetricError>;
 }
 
@@ -123,6 +130,11 @@ impl Metrics {
     }
 
     /// Increments a counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricError`] when `name` is empty or only whitespace, or when
+    /// the configured exporter rejects the observation.
     pub fn increment_counter(
         &self,
         name: impl Into<String>,
@@ -137,6 +149,11 @@ impl Metrics {
     }
 
     /// Sets a gauge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricError`] when `name` is empty or only whitespace, or when
+    /// the configured exporter rejects the observation.
     pub fn set_gauge(
         &self,
         name: impl Into<String>,
@@ -151,6 +168,11 @@ impl Metrics {
     }
 
     /// Observes a histogram sample.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricError`] when `name` is empty or only whitespace, or when
+    /// the configured exporter rejects the observation.
     pub fn observe_histogram(
         &self,
         name: impl Into<String>,
@@ -194,54 +216,178 @@ pub struct MetricsSnapshot {
     pub histograms: BTreeMap<String, Vec<f64>>,
 }
 
+/// Retention limits for [`InMemoryMetricsExporter`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MetricsLimits {
+    /// Largest number of distinct label combinations retained for one metric.
+    pub max_series_per_metric: usize,
+    /// Largest number of series retained across one metric kind.
+    ///
+    /// This keeps dynamically generated metric names from bypassing
+    /// [`Self::max_series_per_metric`].
+    pub max_total_series_per_kind: usize,
+    /// Largest number of raw samples retained for one histogram series.
+    pub max_histogram_samples_per_series: usize,
+}
+
+impl Default for MetricsLimits {
+    fn default() -> Self {
+        Self {
+            max_series_per_metric: 4096,
+            max_total_series_per_kind: 16_384,
+            max_histogram_samples_per_series: 8192,
+        }
+    }
+}
+
+/// Current retained series counts, grouped by metric name.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MetricsCardinality {
+    /// Counter series retained for each metric name.
+    pub counters: BTreeMap<String, usize>,
+    /// Gauge series retained for each metric name.
+    pub gauges: BTreeMap<String, usize>,
+    /// Histogram series retained for each metric name.
+    pub histograms: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Default)]
+struct SeriesMap<T> {
+    values: BTreeMap<MetricKey, T>,
+    counts_by_name: BTreeMap<String, usize>,
+}
+
 #[derive(Debug, Default)]
 struct InMemoryState {
-    counters: BTreeMap<MetricKey, u64>,
-    gauges: BTreeMap<MetricKey, f64>,
-    histograms: BTreeMap<MetricKey, Vec<f64>>,
+    counters: SeriesMap<u64>,
+    gauges: SeriesMap<f64>,
+    histograms: SeriesMap<Vec<f64>>,
+}
+
+/// One observation, separated from its already-normalized [`MetricKey`].
+enum Sample {
+    Counter(u64),
+    Gauge(f64),
+    Histogram(f64),
 }
 
 /// Thread-safe in-memory exporter intended for tests and local diagnostics.
-#[derive(Debug, Default)]
+///
+/// Retention is bounded on both axes. The default permits at most 4096 distinct
+/// label combinations for each metric name, 16384 total series for each metric
+/// kind, and 8192 samples for each histogram series. Per-name accounting keeps
+/// one busy metric from immediately consuming every other metric's capacity,
+/// while the total bound rejects unbounded metric names. Exceeding a bound is
+/// reported as a [`MetricError`] rather than growing without limit.
+#[derive(Debug)]
 pub struct InMemoryMetricsExporter {
     state: Mutex<InMemoryState>,
+    limits: MetricsLimits,
+}
+
+impl Default for InMemoryMetricsExporter {
+    fn default() -> Self {
+        Self::with_limits(MetricsLimits::default())
+    }
 }
 
 impl InMemoryMetricsExporter {
+    /// Creates an exporter with explicit retention limits.
+    #[must_use]
+    pub fn with_limits(limits: MetricsLimits) -> Self {
+        Self {
+            state: Mutex::new(InMemoryState::default()),
+            limits,
+        }
+    }
+
+    /// Returns the configured retention limits.
+    #[must_use]
+    pub const fn limits(&self) -> MetricsLimits {
+        self.limits
+    }
+
     /// Returns a deterministic snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricError`] with `metrics exporter lock poisoned` when a
+    /// thread panicked while recording, because the accumulated values can no
+    /// longer be trusted to be complete.
     pub fn snapshot(&self) -> Result<MetricsSnapshot, MetricError> {
         let state = self
             .state
             .lock()
             .map_err(|_| MetricError("metrics exporter lock poisoned".to_owned()))?;
         Ok(MetricsSnapshot {
-            counters: render_map(&state.counters),
-            gauges: render_map(&state.gauges),
-            histograms: render_map(&state.histograms),
+            counters: render_map(&state.counters.values),
+            gauges: render_map(&state.gauges.values),
+            histograms: render_map(&state.histograms.values),
+        })
+    }
+
+    /// Returns retained series counts without cloning metric values or samples.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricError`] with `metrics exporter lock poisoned` when a
+    /// thread panicked while recording.
+    pub fn cardinality(&self) -> Result<MetricsCardinality, MetricError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MetricError("metrics exporter lock poisoned".to_owned()))?;
+        Ok(MetricsCardinality {
+            counters: state.counters.counts_by_name.clone(),
+            gauges: state.gauges.counts_by_name.clone(),
+            histograms: state.histograms.counts_by_name.clone(),
         })
     }
 }
 
+fn reject_new_series(
+    counts_by_name: &BTreeMap<String, usize>,
+    total_retained: usize,
+    key: &MetricKey,
+    metric_kind: &str,
+    limits: MetricsLimits,
+) -> Result<(), MetricError> {
+    let retained = counts_by_name.get(&key.name).copied().unwrap_or_default();
+    if retained >= limits.max_series_per_metric {
+        return Err(MetricError(format!(
+            "{metric_kind} metric `{}` reached its limit of \
+             {} retained series; rejected a new label set",
+            key.name, limits.max_series_per_metric,
+        )));
+    }
+    if total_retained >= limits.max_total_series_per_kind {
+        return Err(MetricError(format!(
+            "{metric_kind} metrics reached their total limit of {} retained series; \
+             rejected new series for `{}`",
+            limits.max_total_series_per_kind, key.name,
+        )));
+    }
+    Ok(())
+}
+
+fn insert_new_series<T>(series: &mut SeriesMap<T>, key: MetricKey, value: T) {
+    let metric_name = key.name.clone();
+    series.values.insert(key, value);
+    *series.counts_by_name.entry(metric_name).or_default() += 1;
+}
+
 impl MetricsExporter for InMemoryMetricsExporter {
     fn record(&self, event: MetricEvent) -> Result<(), MetricError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| MetricError("metrics exporter lock poisoned".to_owned()))?;
-        match event {
+        // Sorting the labels only normalizes the key, so it happens before the
+        // lock is taken instead of widening the critical section.
+        let (key, sample) = match event {
             MetricEvent::Counter {
                 name,
                 value,
                 mut labels,
             } => {
                 labels.sort();
-                let current = state
-                    .counters
-                    .entry(MetricKey { name, labels })
-                    .or_default();
-                *current = current.checked_add(value).ok_or_else(|| {
-                    MetricError("counter overflow while recording metric".to_owned())
-                })?;
+                (MetricKey { name, labels }, Sample::Counter(value))
             }
             MetricEvent::Gauge {
                 name,
@@ -249,7 +395,7 @@ impl MetricsExporter for InMemoryMetricsExporter {
                 mut labels,
             } => {
                 labels.sort();
-                state.gauges.insert(MetricKey { name, labels }, value);
+                (MetricKey { name, labels }, Sample::Gauge(value))
             }
             MetricEvent::Histogram {
                 name,
@@ -257,13 +403,75 @@ impl MetricsExporter for InMemoryMetricsExporter {
                 mut labels,
             } => {
                 labels.sort();
-                state
-                    .histograms
-                    .entry(MetricKey { name, labels })
-                    .or_default()
-                    .push(value);
+                (MetricKey { name, labels }, Sample::Histogram(value))
+            }
+        };
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MetricError("metrics exporter lock poisoned".to_owned()))?;
+        match sample {
+            Sample::Counter(value) => {
+                if let Some(current) = state.counters.values.get_mut(&key) {
+                    *current = current.checked_add(value).ok_or_else(|| {
+                        MetricError(format!("counter metric `{}` overflowed", key.name))
+                    })?;
+                } else {
+                    reject_new_series(
+                        &state.counters.counts_by_name,
+                        state.counters.values.len(),
+                        &key,
+                        "counter",
+                        self.limits,
+                    )?;
+                    insert_new_series(&mut state.counters, key, value);
+                }
+            }
+            Sample::Gauge(value) => {
+                if let Some(current) = state.gauges.values.get_mut(&key) {
+                    *current = value;
+                } else {
+                    reject_new_series(
+                        &state.gauges.counts_by_name,
+                        state.gauges.values.len(),
+                        &key,
+                        "gauge",
+                        self.limits,
+                    )?;
+                    insert_new_series(&mut state.gauges, key, value);
+                }
+            }
+            Sample::Histogram(value) => {
+                if let Some(samples) = state.histograms.values.get_mut(&key) {
+                    if samples.len() >= self.limits.max_histogram_samples_per_series {
+                        return Err(MetricError(format!(
+                            "histogram metric `{}` reached its limit of {} retained samples \
+                             for one series; rejected the sample",
+                            key.name, self.limits.max_histogram_samples_per_series,
+                        )));
+                    }
+                    samples.push(value);
+                } else {
+                    reject_new_series(
+                        &state.histograms.counts_by_name,
+                        state.histograms.values.len(),
+                        &key,
+                        "histogram",
+                        self.limits,
+                    )?;
+                    if self.limits.max_histogram_samples_per_series == 0 {
+                        return Err(MetricError(format!(
+                            "histogram metric `{}` has a retained sample limit of 0; \
+                             rejected the sample",
+                            key.name,
+                        )));
+                    }
+                    insert_new_series(&mut state.histograms, key, vec![value]);
+                }
             }
         }
+        drop(state);
         Ok(())
     }
 }
@@ -290,9 +498,12 @@ fn render_key(key: &MetricKey) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use super::{InMemoryMetricsExporter, Label, Metrics, MetricsSnapshot};
+    use super::{
+        InMemoryMetricsExporter, Label, Metrics, MetricsCardinality, MetricsLimits, MetricsSnapshot,
+    };
 
     #[test]
     fn in_memory_exporter_tracks_all_metric_kinds() {
@@ -318,18 +529,12 @@ mod tests {
 
         let snapshot = exporter.snapshot().expect("snapshot");
         let expected = MetricsSnapshot {
-            counters: [("provider.requests{provider=openai}".to_owned(), 5)]
-                .into_iter()
-                .collect(),
-            gauges: [("provider.in_flight{provider=openai}".to_owned(), 4.0)]
-                .into_iter()
-                .collect(),
-            histograms: [(
+            counters: BTreeMap::from([("provider.requests{provider=openai}".to_owned(), 5)]),
+            gauges: BTreeMap::from([("provider.in_flight{provider=openai}".to_owned(), 4.0)]),
+            histograms: BTreeMap::from([(
                 "provider.latency_ms{provider=openai}".to_owned(),
                 vec![12.5, 25.0],
-            )]
-            .into_iter()
-            .collect(),
+            )]),
         };
         assert_eq!(snapshot, expected);
     }
@@ -355,9 +560,179 @@ mod tests {
             .expect("counter");
         assert_eq!(
             exporter.snapshot().expect("snapshot").counters,
-            [("provider.requests{apiKey=[REDACTED]}".to_owned(), 1)]
-                .into_iter()
-                .collect()
+            BTreeMap::from([("provider.requests{apiKey=[REDACTED]}".to_owned(), 1)])
+        );
+    }
+
+    #[test]
+    fn per_metric_series_limits_are_independent_and_bounded() {
+        let exporter = Arc::new(InMemoryMetricsExporter::with_limits(MetricsLimits {
+            max_series_per_metric: 2,
+            max_total_series_per_kind: 4,
+            max_histogram_samples_per_series: 3,
+        }));
+        let metrics = Metrics::new(exporter.clone());
+        for metric_name in ["gateway.requests", "provider.requests"] {
+            for index in 0..2 {
+                metrics
+                    .increment_counter(
+                        metric_name,
+                        1,
+                        vec![Label::new("provider", format!("p-{index}"))],
+                    )
+                    .expect("series below the per-metric bound");
+            }
+        }
+
+        let error = metrics
+            .increment_counter(
+                "gateway.requests",
+                1,
+                vec![Label::new("provider", "p-overflow")],
+            )
+            .expect_err("a new series past this metric's bound must fail");
+        assert_eq!(
+            error.to_string(),
+            "counter metric `gateway.requests` reached its limit of 2 retained series; \
+             rejected a new label set"
+        );
+
+        // Existing series keep recording after their metric reaches the bound.
+        metrics
+            .increment_counter("gateway.requests", 1, vec![Label::new("provider", "p-0")])
+            .expect("existing series still records");
+        let snapshot = exporter.snapshot().expect("snapshot");
+        assert_eq!(snapshot.counters.len(), 4);
+        assert_eq!(snapshot.counters["gateway.requests{provider=p-0}"], 2);
+        assert_eq!(
+            exporter.cardinality().expect("cardinality"),
+            MetricsCardinality {
+                counters: BTreeMap::from([
+                    ("gateway.requests".to_owned(), 2),
+                    ("provider.requests".to_owned(), 2),
+                ]),
+                gauges: BTreeMap::new(),
+                histograms: BTreeMap::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn generated_metric_names_cannot_bypass_the_total_bound() {
+        let exporter = Arc::new(InMemoryMetricsExporter::with_limits(MetricsLimits {
+            max_series_per_metric: 2,
+            max_total_series_per_kind: 3,
+            max_histogram_samples_per_series: 1,
+        }));
+        let metrics = Metrics::new(exporter.clone());
+        for name in ["requests.a", "requests.b", "requests.c"] {
+            metrics
+                .increment_counter(name, 1, Vec::new())
+                .expect("series below the total bound");
+        }
+
+        let error = metrics
+            .increment_counter("requests.d", 1, Vec::new())
+            .expect_err("new metric name must not bypass the total bound");
+        assert_eq!(
+            error.to_string(),
+            "counter metrics reached their total limit of 3 retained series; \
+             rejected new series for `requests.d`"
+        );
+        metrics
+            .increment_counter("requests.a", 1, Vec::new())
+            .expect("existing series still records at the total bound");
+        let snapshot = exporter.snapshot().expect("snapshot");
+        assert_eq!(snapshot.counters.len(), 3);
+        assert_eq!(snapshot.counters["requests.a"], 2);
+    }
+
+    #[test]
+    fn metric_kinds_have_independent_series_limits() {
+        let exporter = Arc::new(InMemoryMetricsExporter::with_limits(MetricsLimits {
+            max_series_per_metric: 1,
+            max_total_series_per_kind: 1,
+            max_histogram_samples_per_series: 1,
+        }));
+        let metrics = Metrics::new(exporter.clone());
+        for index in 0..2 {
+            let label = vec![Label::new("state", format!("state-{index}"))];
+            let result = metrics.increment_counter("gateway.activity", 1, label.clone());
+            if index == 0 {
+                result.expect("first counter series");
+            } else {
+                result.expect_err("second counter series exceeds the bound");
+            }
+        }
+        metrics
+            .set_gauge(
+                "gateway.activity",
+                1.0,
+                vec![Label::new("state", "state-1")],
+            )
+            .expect("gauge capacity is independent");
+        metrics
+            .observe_histogram(
+                "gateway.activity",
+                1.0,
+                vec![Label::new("state", "state-2")],
+            )
+            .expect("histogram capacity is independent");
+
+        let cardinality = exporter.cardinality().expect("cardinality");
+        assert_eq!(cardinality.counters["gateway.activity"], 1);
+        assert_eq!(cardinality.gauges["gateway.activity"], 1);
+        assert_eq!(cardinality.histograms["gateway.activity"], 1);
+    }
+
+    #[test]
+    fn zero_series_limit_rejects_without_retaining_data() {
+        let exporter = Arc::new(InMemoryMetricsExporter::with_limits(MetricsLimits {
+            max_series_per_metric: 0,
+            max_total_series_per_kind: 1,
+            max_histogram_samples_per_series: 1,
+        }));
+        let metrics = Metrics::new(exporter.clone());
+        let error = metrics
+            .increment_counter(
+                "gateway.requests",
+                1,
+                vec![Label::new("provider", "openai")],
+            )
+            .expect_err("zero limit rejects the first series");
+        assert_eq!(
+            error.to_string(),
+            "counter metric `gateway.requests` reached its limit of 0 retained series; \
+             rejected a new label set"
+        );
+        assert!(exporter.snapshot().expect("snapshot").counters.is_empty());
+    }
+
+    #[test]
+    fn histogram_sample_retention_is_bounded() {
+        let exporter = Arc::new(InMemoryMetricsExporter::with_limits(MetricsLimits {
+            max_series_per_metric: 2,
+            max_total_series_per_kind: 2,
+            max_histogram_samples_per_series: 3,
+        }));
+        let metrics = Metrics::new(exporter.clone());
+        for _ in 0..3 {
+            metrics
+                .observe_histogram("provider.latency_ms", 1.0, Vec::new())
+                .expect("sample below the bound");
+        }
+
+        let error = metrics
+            .observe_histogram("provider.latency_ms", 1.0, Vec::new())
+            .expect_err("a sample past the bound must fail");
+        assert_eq!(
+            error.to_string(),
+            "histogram metric `provider.latency_ms` reached its limit of 3 retained samples \
+             for one series; rejected the sample"
+        );
+        assert_eq!(
+            exporter.snapshot().expect("snapshot").histograms["provider.latency_ms"].len(),
+            3
         );
     }
 }

@@ -22,11 +22,13 @@ component FocusableClickArea {
 
     focus-scope := FocusScope {
         width: 0px;
-        enabled: root.enabled;
+        focus-on-tab-navigation: root.enabled;
 
         key-pressed(event) => {
             if (event.text == " " || event.text == "\n") {
-                touch-area.clicked();
+                if (root.enabled) {
+                    touch-area.clicked();
+                }
                 return accept;
             }
             return reject;
@@ -45,9 +47,16 @@ component FocusRing inherits Rectangle {
 export component ActionButton {
     in property <string> text: "Action";
     in property <string> accessible-name: root.text;
+    in property <string> description: "";
     in property <bool> enabled: true;
+    in property <bool> checkable: false;
+    in property <bool> checked: false;
+    in property <bool> compact: false;
     in property <ButtonTone> tone: ButtonTone.secondary;
     callback clicked;
+    callback focus-received;
+    callback focus-changed(bool);
+    out property <bool> has-focus: interaction.has-focus;
 
     private property <color> base-background: root.tone == ButtonTone.primary
         ? DesignTokens.accent
@@ -61,10 +70,19 @@ export component ActionButton {
     horizontal-stretch: 0;
     vertical-stretch: 0;
     forward-focus: interaction;
+    changed has-focus => {
+        root.focus-changed(root.has-focus);
+        if (root.has-focus) {
+            root.focus-received();
+        }
+    }
 
     accessible-role: button;
     accessible-label: root.accessible-name;
+    accessible-description: root.description;
     accessible-enabled: root.enabled;
+    accessible-checkable: root.checkable;
+    accessible-checked: root.checkable && root.checked;
     accessible-action-default => {
         if (root.enabled) {
             interaction.clicked();
@@ -87,12 +105,15 @@ export component ActionButton {
         border-color: root.enabled ? DesignTokens.border-strong : DesignTokens.border-default;
         border-radius: Metrics.radius-medium;
 
-        animate background, border-color { duration: Metrics.motion-fast; }
+        animate background, border-color {
+            duration: Metrics.motion-fast;
+            enabled: Metrics.motion-enabled;
+        }
     }
 
     content := HorizontalLayout {
-        padding-left: Metrics.space-4;
-        padding-right: Metrics.space-4;
+        padding-left: root.compact ? Metrics.space-2 : Metrics.space-4;
+        padding-right: root.compact ? Metrics.space-2 : Metrics.space-4;
         padding-top: Metrics.space-2;
         padding-bottom: Metrics.space-2;
         alignment: center;
@@ -118,7 +139,7 @@ export component ActionButton {
         y: -Metrics.focus-offset;
         width: parent.width + 2 * Metrics.focus-offset;
         height: parent.height + 2 * Metrics.focus-offset;
-        active: interaction.has-focus && root.enabled;
+        active: interaction.has-focus;
     }
 }
 
@@ -164,12 +185,19 @@ export component ToolbarIconButton {
     in property <bool> checkable: false;
     in property <bool> checked: false;
     callback clicked;
+    callback focus-received;
+    out property <bool> has-focus: interaction.has-focus;
 
     width: Metrics.control-medium;
     height: Metrics.control-medium;
     horizontal-stretch: 0;
     vertical-stretch: 0;
     forward-focus: interaction;
+    changed has-focus => {
+        if (root.has-focus) {
+            root.focus-received();
+        }
+    }
 
     accessible-role: button;
     accessible-label: root.accessible-name;
@@ -180,6 +208,12 @@ export component ToolbarIconButton {
         if (root.enabled) {
             interaction.clicked();
         }
+    }
+
+    // Icon-only controls carry no visible label; the tooltip surfaces the same
+    // string that assistive technology reads out.
+    Tooltip {
+        text: @markdown("\{root.accessible-name}");
     }
 
     Rectangle {
@@ -211,7 +245,7 @@ export component ToolbarIconButton {
         y: -Metrics.focus-offset;
         width: parent.width + 2 * Metrics.focus-offset;
         height: parent.height + 2 * Metrics.focus-offset;
-        active: interaction.has-focus && root.enabled;
+        active: interaction.has-focus;
     }
 }
 
@@ -223,9 +257,16 @@ export component NavigationItem {
     in property <bool> selected: false;
     in property <bool> enabled: true;
     callback clicked;
+    callback focus-received;
+    out property <bool> has-focus: interaction.has-focus;
 
     min-height: max(Metrics.control-large, content.min-height);
     forward-focus: interaction;
+    changed has-focus => {
+        if (root.has-focus) {
+            root.focus-received();
+        }
+    }
 
     accessible-role: button;
     accessible-label: root.accessible-name;
@@ -314,7 +355,7 @@ export component NavigationItem {
         y: -Metrics.focus-offset;
         width: parent.width + 2 * Metrics.focus-offset;
         height: parent.height + 2 * Metrics.focus-offset;
-        active: interaction.has-focus && root.enabled;
+        active: interaction.has-focus;
     }
 }
 
@@ -326,13 +367,21 @@ export component TextField {
     in property <InputType> input-type: InputType.text;
     in property <bool> enabled: true;
     in property <bool> read-only: false;
+    in property <bool> focus-on-init: false;
+    in property <bool> intercept-vertical-navigation: false;
     out property <bool> has-focus: field.has-focus;
     callback edited(string);
     callback accepted;
+    callback vertical-navigation-requested(int);
 
     min-width: 180px;
     min-height: field.min-height + (root.label == "" ? 0px : Metrics.line-caption + Metrics.space-1);
     forward-focus: field;
+    init => {
+        if (root.focus-on-init) {
+            field.focus();
+        }
+    }
 
     VerticalLayout {
         spacing: Metrics.space-1;
@@ -353,6 +402,17 @@ export component TextField {
             accessible-label: root.accessible-name;
             edited(value) => { root.edited(value); }
             accepted => { root.accepted(); }
+            key-pressed(event) => {
+                if (root.intercept-vertical-navigation && event.text == Key.UpArrow) {
+                    root.vertical-navigation-requested(-1);
+                    return accept;
+                }
+                if (root.intercept-vertical-navigation && event.text == Key.DownArrow) {
+                    root.vertical-navigation-requested(1);
+                    return accept;
+                }
+                return reject;
+            }
         }
     }
 }
@@ -408,6 +468,9 @@ export component ResettableTextField {
     in property <bool> preserve-focus-on-reset: false;
     out property <bool> has-focus: false;
     callback accepted;
+    // Fired synchronously so an enclosing (possibly conditional) component can
+    // mirror the focus state without reaching into this instance by id.
+    callback focus-changed(bool);
 
     min-width: 180px;
     min-height: Metrics.control-medium + (root.label == "" ? 0px : Metrics.line-caption + Metrics.space-1);
@@ -428,7 +491,10 @@ export component ResettableTextField {
         focus-requested: focus-proxy.has-focus;
         focus-on-init: root.preserve-focus-on-reset;
         accepted => { root.accepted(); }
-        focus-state-changed(focused) => { root.has-focus = focused; }
+        focus-state-changed(focused) => {
+            root.has-focus = focused;
+            root.focus-changed(focused);
+        }
     }
 
     if (root.reset-selector) : ResettableTextFieldInstance {
@@ -440,7 +506,10 @@ export component ResettableTextField {
         focus-requested: focus-proxy.has-focus;
         focus-on-init: root.preserve-focus-on-reset;
         accepted => { root.accepted(); }
-        focus-state-changed(focused) => { root.has-focus = focused; }
+        focus-state-changed(focused) => {
+            root.has-focus = focused;
+            root.focus-changed(focused);
+        }
     }
 }
 
@@ -546,6 +615,9 @@ export component SecureTextField {
     in property <bool> preserve-focus-on-reset: false;
     out property <bool> has-focus: false;
     callback accepted;
+    // Fired synchronously so an enclosing (possibly conditional) component can
+    // mirror the focus state without reaching into this instance by id.
+    callback focus-changed(bool);
 
     min-width: 180px;
     min-height: Metrics.control-medium + (root.label == "" ? 0px : Metrics.line-caption + Metrics.space-1);
@@ -576,7 +648,10 @@ export component SecureTextField {
             focus-requested: focus-proxy.has-focus;
             focus-on-init: root.preserve-focus-on-reset;
             accepted => { root.accepted(); }
-            focus-state-changed(focused) => { root.has-focus = focused; }
+            focus-state-changed(focused) => {
+                root.has-focus = focused;
+                root.focus-changed(focused);
+            }
         }
 
         if (root.reset-selector) : odd-instance := SecureEditorInstance {
@@ -587,7 +662,10 @@ export component SecureTextField {
             focus-requested: focus-proxy.has-focus;
             focus-on-init: root.preserve-focus-on-reset;
             accepted => { root.accepted(); }
-            focus-state-changed(focused) => { root.has-focus = focused; }
+            focus-state-changed(focused) => {
+                root.has-focus = focused;
+                root.focus-changed(focused);
+            }
         }
     }
 }
@@ -655,6 +733,7 @@ export component StatusBadge {
         : (root.kind == StatusKind.warning
             ? "Warning"
             : (root.kind == StatusKind.danger ? "Danger" : (root.kind == StatusKind.info ? "Information" : "Status")));
+    in property <string> accessible-name: root.semantic-label + ": " + root.text + ", symbol " + root.icon-text;
     private property <color> semantic-color: root.kind == StatusKind.success
         ? DesignTokens.success
         : (root.kind == StatusKind.warning
@@ -671,7 +750,7 @@ export component StatusBadge {
     horizontal-stretch: 0;
     vertical-stretch: 0;
     accessible-role: AccessibleRole.text;
-    accessible-label: root.semantic-label + ": " + root.text + ", symbol " + root.icon-text;
+    accessible-label: root.accessible-name;
     accessible-live-region: polite;
 
     Rectangle {
@@ -820,15 +899,25 @@ export component EmptyStatePanel {
 export component ModalSheetShell {
     in property <string> title: "Dialog";
     in property <string> dismiss-label: "Close";
+    in property <bool> focus-close-on-init: true;
+    in property <bool> compact-content: false;
     callback dismiss-requested;
 
+    min-width: 0px;
+    min-height: 0px;
     forward-focus: dialog-focus;
     accessible-role: region;
     accessible-label: root.title;
 
     dialog-focus := FocusScope {
+        width: 100%;
+        height: 100%;
         focus-on-tab-navigation: false;
-        init => { close-button.focus(); }
+        init => {
+            if (root.focus-close-on-init) {
+                close-button.focus();
+            }
+        }
         key-pressed(event) => {
             if (event.text == Key.Escape) {
                 root.dismiss-requested();
@@ -863,11 +952,11 @@ export component ModalSheetShell {
         }
 
         VerticalLayout {
-            padding: Metrics.space-4;
-            spacing: Metrics.space-4;
+            padding: root.compact-content ? Metrics.space-2 : Metrics.space-4;
+            spacing: root.compact-content ? Metrics.space-2 : Metrics.space-4;
 
             HorizontalLayout {
-                alignment: center;
+                cross-axis-alignment: center;
 
                 Text {
                     text: root.title;
@@ -997,6 +1086,7 @@ export component LoadingIndicator {
     min-height: Metrics.control-small;
     accessible-role: progress-indicator;
     accessible-label: root.accessible-name;
+    accessible-live-region: AccessibleLiveness.polite;
     accessible-value: root.indeterminate ? "" : clamp(root.progress, 0.0, 1.0);
     accessible-value-minimum: 0.0;
     accessible-value-maximum: 1.0;

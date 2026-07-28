@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::cancel::CancelToken;
 use crate::error::{ErrorKind, Operation, ProviderError};
 
 /// Largest concurrency limit a provider may be configured with.
@@ -40,8 +41,8 @@ pub struct ConcurrencyLimiter {
 impl ConcurrencyLimiter {
     /// Builds a limiter with a shared default limit and per-provider overrides.
     ///
-    /// Every limit is clamped into `1..=`[`MAX_CONCURRENCY`]. A duplicated
-    /// provider entry keeps the last value.
+    /// Every limit is clamped into the range `1..=MAX_CONCURRENCY`, see
+    /// [`MAX_CONCURRENCY`]. A duplicated provider entry keeps the last value.
     #[must_use]
     pub fn new(default_limit: usize, overrides: &[(&str, usize)]) -> Self {
         let mut table = BTreeMap::new();
@@ -80,6 +81,10 @@ impl ConcurrencyLimiter {
 
     /// Waits for a slot for `provider`.
     ///
+    /// The returned permit releases its slot when it is dropped, including on
+    /// the error and cancellation paths of whatever the caller does with it, so
+    /// a failed request never leaks concurrency.
+    ///
     /// # Errors
     ///
     /// Returns an [`ErrorKind::Transport`] error when the semaphore has been
@@ -90,15 +95,54 @@ impl ConcurrencyLimiter {
         operation: Operation,
     ) -> Result<ConcurrencyPermit, ProviderError> {
         let semaphore = Arc::clone(&self.slot(provider).semaphore);
-        match semaphore.acquire_owned().await {
-            Ok(permit) => Ok(ConcurrencyPermit { _permit: permit }),
-            Err(_) => Err(ProviderError::new(
+        let permit = semaphore.acquire_owned().await.map_err(|_closed| {
+            ProviderError::new(
                 ErrorKind::Transport,
                 provider,
                 operation,
                 "provider concurrency limiter is shut down",
-            )),
-        }
+            )
+        })?;
+        Ok(ConcurrencyPermit { _permit: permit })
+    }
+
+    /// Waits for a slot while observing caller cancellation.
+    ///
+    /// A cancelled waiter leaves the semaphore queue immediately instead of
+    /// consuming a newly released permit only to fail before transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Cancelled`] when `cancel` fires, or
+    /// [`ErrorKind::Transport`] when the limiter is shut down.
+    pub async fn acquire_cancellable(
+        &self,
+        provider: &str,
+        operation: Operation,
+        cancel: &CancelToken,
+    ) -> Result<ConcurrencyPermit, ProviderError> {
+        let semaphore = Arc::clone(&self.slot(provider).semaphore);
+        let acquired = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Err(ProviderError::new(
+                    ErrorKind::Cancelled,
+                    provider,
+                    operation,
+                    "cancelled while waiting for provider capacity",
+                ));
+            }
+            acquired = semaphore.acquire_owned() => acquired,
+        };
+        let permit = acquired.map_err(|_closed| {
+            ProviderError::new(
+                ErrorKind::Transport,
+                provider,
+                operation,
+                "provider concurrency limiter is shut down",
+            )
+        })?;
+        Ok(ConcurrencyPermit { _permit: permit })
     }
 }
 
@@ -215,5 +259,37 @@ mod tests {
         assert_eq!(limiter.available("anthropic"), 0);
         drop(openai);
         drop(anthropic);
+    }
+
+    #[tokio::test]
+    async fn cancellation_removes_a_waiter_without_consuming_capacity() {
+        let limiter = Arc::new(ConcurrencyLimiter::new(1, &[]));
+        let held = limiter
+            .acquire("openai", Operation::Complete)
+            .await
+            .expect("the only permit");
+        let cancel = CancelToken::new();
+        let waiter = tokio::spawn({
+            let limiter = Arc::clone(&limiter);
+            let cancel = cancel.clone();
+            async move {
+                limiter
+                    .acquire_cancellable("openai", Operation::Ping, &cancel)
+                    .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        let error = waiter
+            .await
+            .expect("waiter joins")
+            .expect_err("the waiter is cancelled");
+        assert_eq!(error.kind(), ErrorKind::Cancelled);
+        assert_eq!(error.operation(), Operation::Ping);
+        assert_eq!(limiter.in_flight("openai"), 1);
+
+        drop(held);
+        assert_eq!(limiter.available("openai"), 1);
     }
 }

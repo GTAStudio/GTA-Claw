@@ -73,7 +73,7 @@ fn every_frozen_channel_declares_a_command_surface_matching_its_inbound_support(
 
     assert_eq!(
         with_commands,
-        BTreeSet::from(["qa-channel"]),
+        BTreeSet::from(["discord", "msteams", "qa-channel", "telegram", "whatsapp"]),
         "the command surface must follow inbound support, not a hand-written list"
     );
     assert_eq!(
@@ -215,7 +215,7 @@ fn commands_are_unavailable_on_every_frozen_channel_that_cannot_receive_text() {
         }
     }
 
-    assert_eq!(refused, frozen_ids.len() - 1);
+    assert_eq!(refused, frozen_ids.len() - 5);
     assert_eq!(
         classify_inbound(&inbound("not-a-channel", "/help"), None),
         Err(RoutingError::UnknownChannel)
@@ -243,8 +243,8 @@ fn help_output_lists_exactly_the_commands_a_channel_offers() {
     assert_eq!(listed, expected);
     assert_eq!(listed.len(), 4);
     assert_eq!(
-        help_text("discord").expect("registered channel"),
-        "discord offers no commands."
+        help_text("slack").expect("registered channel"),
+        "slack offers no commands."
     );
     assert_eq!(
         help_text("not-a-channel"),

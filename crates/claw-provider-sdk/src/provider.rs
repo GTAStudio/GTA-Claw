@@ -17,6 +17,42 @@ use crate::stream::CompletionStream;
 /// dyn-compatible without pulling in a procedural-macro dependency.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Successful provider lifecycle probe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderStatus {
+    provider: ProviderId,
+    phase: ProviderPhase,
+}
+
+impl ProviderStatus {
+    /// Records a successful lifecycle probe.
+    #[must_use]
+    pub const fn new(provider: ProviderId, phase: ProviderPhase) -> Self {
+        Self { provider, phase }
+    }
+
+    /// Returns the provider that was probed.
+    #[must_use]
+    pub const fn provider(&self) -> &ProviderId {
+        &self.provider
+    }
+
+    /// Returns the lifecycle phase that completed.
+    #[must_use]
+    pub const fn phase(&self) -> ProviderPhase {
+        self.phase
+    }
+}
+
+/// Lifecycle phase represented by [`ProviderStatus`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderPhase {
+    /// Construction, credential warm-up, and initial readiness completed.
+    Started,
+    /// A reachability and credential probe completed.
+    Reachable,
+}
+
 /// Per-call context threaded through every provider operation.
 #[derive(Clone, Debug, Default)]
 pub struct RequestContext {
@@ -34,7 +70,7 @@ impl RequestContext {
 
     /// Creates a context bound to an existing cancellation token.
     #[must_use]
-    pub fn with_cancel(cancel: CancelToken) -> Self {
+    pub const fn with_cancel(cancel: CancelToken) -> Self {
         Self {
             cancel,
             idempotency_key: None,
@@ -86,6 +122,24 @@ pub trait Provider: Send + Sync {
 
     /// Returns the operations this provider actually implements.
     fn capabilities(&self) -> CapabilitySet;
+
+    /// Starts the provider and verifies that it is ready for traffic.
+    fn startup<'a>(
+        &'a self,
+        context: &'a RequestContext,
+    ) -> BoxFuture<'a, Result<ProviderStatus, ProviderError>> {
+        let _ = context;
+        Box::pin(async move { Err(self.unsupported(Operation::Startup)) })
+    }
+
+    /// Probes provider reachability and credential validity.
+    fn ping<'a>(
+        &'a self,
+        context: &'a RequestContext,
+    ) -> BoxFuture<'a, Result<ProviderStatus, ProviderError>> {
+        let _ = context;
+        Box::pin(async move { Err(self.unsupported(Operation::Ping)) })
+    }
 
     /// Runs a non-streaming completion.
     fn complete<'a>(
@@ -169,6 +223,12 @@ mod tests {
         let provider = MetadataOnly(ProviderId::new("venice").expect("valid"));
         let context = RequestContext::new();
         let request = request();
+
+        let startup = provider.startup(&context).await.expect_err("unsupported");
+        assert_eq!(startup.operation(), Operation::Startup);
+
+        let ping = provider.ping(&context).await.expect_err("unsupported");
+        assert_eq!(ping.operation(), Operation::Ping);
 
         let completion = provider
             .complete(&request, &context)
@@ -271,6 +331,14 @@ mod tests {
                 .kind(),
             ErrorKind::Unsupported
         );
+    }
+
+    #[test]
+    fn provider_status_names_the_provider_and_lifecycle_phase() {
+        let id = ProviderId::new("openai").expect("valid");
+        let status = ProviderStatus::new(id.clone(), ProviderPhase::Started);
+        assert_eq!(status.provider(), &id);
+        assert_eq!(status.phase(), ProviderPhase::Started);
     }
 
     #[test]

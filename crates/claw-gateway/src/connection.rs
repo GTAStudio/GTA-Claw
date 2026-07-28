@@ -124,13 +124,14 @@ pub async fn serve(
         Ok(Err(close)) => close,
         Ok(Ok((session, registration))) => {
             let (sender, mut inbound) = mpsc::channel(INBOUND_QUEUE_DEPTH);
-            let reader = tokio::spawn(read_loop(read, sender));
+            let reader = AbortOnDrop(tokio::spawn(read_loop(read, sender)));
             let outcome =
                 dispatch_loop(id, &services, &mut write, &mut inbound, session, shutdown).await;
             inbound.close();
-            reader.abort();
-            // Held across the await above on purpose: if this future is
-            // dropped there, `Drop` is what deregisters the connection.
+            // Both held across the await above on purpose: if this future is
+            // dropped there, `Drop` is what deregisters the connection and
+            // what stops the reader task.
+            drop(reader);
             drop(registration);
             outcome
         }
@@ -143,6 +144,24 @@ pub async fn serve(
     )
     .await;
     outcome
+}
+
+/// Aborts a spawned task when the guard is dropped.
+///
+/// `serve` runs inside a task the accept loop aborts at shutdown once the
+/// drain deadline passes. Dropping a bare [`JoinHandle`] *detaches* the task
+/// rather than stopping it, so a cancelled `serve` would leave the reader task
+/// alive holding the socket read half until the peer happened to write again.
+/// Tying the abort to `Drop` makes it happen on the cancellation path as well
+/// as the normal one, the same way [`ConnectionRegistration`] deregisters.
+///
+/// [`JoinHandle`]: tokio::task::JoinHandle
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Drains the authenticated read half into a bounded channel.
@@ -304,7 +323,7 @@ async fn dispatch_loop(
                     return ConnectionClose::Unresponsive;
                 }
                 unanswered_pings = unanswered_pings.saturating_add(1);
-                if let Err(error) = transport::write_ping(write, PING_PAYLOAD.to_vec()).await {
+                if let Err(error) = transport::write_ping(write, PING_PAYLOAD).await {
                     return ConnectionClose::Transport(error);
                 }
             }
@@ -392,14 +411,16 @@ async fn serve_request(
         ));
     };
     let request_id = request.id().clone();
-    let requested = request.method().as_str().to_owned();
 
-    let Some(method) = services.registry.canonical_name(&requested) else {
+    // Keyed by borrowed text: the registry is a `BTreeMap<&'static str, _>`, so
+    // only the identity that turns out *not* to be catalogued needs an owned
+    // copy, and that is the path that is about to end the request anyway.
+    let Some(method) = services.registry.canonical_name(request.method().as_str()) else {
         return respond_error(
             write,
             codec,
             &request_id,
-            &DispatchError::UnknownMethod(requested),
+            &DispatchError::UnknownMethod(request.method().as_str().to_owned()),
         )
         .await;
     };
@@ -589,7 +610,7 @@ async fn negotiate(
     };
     let event = resolve_core_event("connect.challenge")
         .expect("the frozen catalog always contains connect.challenge");
-    let payload = to_opaque(&challenge).map_err(handshake_failure)?;
+    let payload = to_opaque(&challenge).map_err(|error| handshake_failure(&error))?;
     let frame = Frame::Event(EventFrame::new(
         EventName::Core(event),
         OpaqueField::Value(payload),
@@ -598,7 +619,7 @@ async fn negotiate(
     ));
     let bytes = preauth
         .encode(&frame)
-        .map_err(|error| handshake_failure(error.into()))?;
+        .map_err(|error| handshake_failure(&error.into()))?;
     transport::write_text(write, bytes)
         .await
         .map_err(ConnectionClose::Transport)?;
@@ -657,7 +678,8 @@ async fn negotiate(
         .map(|device| device.id.as_str().to_owned())
         .unwrap_or_default();
 
-    let hello = build_hello(id, services, role, &scopes).map_err(handshake_failure)?;
+    let hello =
+        build_hello(id, services, role, &scopes).map_err(|error| handshake_failure(&error))?;
     negotiation
         .prepare_hello(hello)
         .map_err(|error| ConnectionClose::HandshakeRejected(error.to_string()))?;
@@ -665,7 +687,7 @@ async fn negotiate(
         .hello()
         .expect("a prepared hello is always readable")
         .clone();
-    let payload = to_opaque(&hello).map_err(handshake_failure)?;
+    let payload = to_opaque(&hello).map_err(|error| handshake_failure(&error))?;
     let frame = Frame::Response(ResponseFrame::new(
         request_id,
         true,
@@ -674,7 +696,7 @@ async fn negotiate(
     ));
     let bytes = preauth
         .encode(&frame)
-        .map_err(|error| handshake_failure(error.into()))?;
+        .map_err(|error| handshake_failure(&error.into()))?;
     transport::write_text(write, bytes)
         .await
         .map_err(ConnectionClose::Transport)?;
@@ -682,6 +704,8 @@ async fn negotiate(
         .mark_hello_sent()
         .and_then(|()| negotiation.mark_ready())
         .map_err(|error| ConnectionClose::HandshakeRejected(error.to_string()))?;
+
+    reclaim_stale_claims(services, role, &device_id).await;
 
     let registration = services.directory.register(ConnectionInfo {
         id,
@@ -710,8 +734,41 @@ async fn negotiate(
     ))
 }
 
-fn handshake_failure(error: EncodeError) -> ConnectionClose {
+fn handshake_failure(error: &EncodeError) -> ConnectionClose {
     ConnectionClose::HandshakeRejected(error.to_string())
+}
+
+/// Returns invocations a previous incarnation of this node claimed but never
+/// acknowledged to the pending set, so its new connection can pull them.
+///
+/// [`crate::store::GatewayStore::pull_pending`] hands work to a claimant that
+/// is expected to acknowledge it. Nothing acknowledges on the claimant's
+/// behalf when it dies, so without this the work is invisible to every later
+/// pull. Against a durable adapter that outlives the process it is invisible
+/// *forever*, and it keeps occupying the per-node bound, so a node that
+/// crashes often enough eventually cannot be sent anything at all.
+///
+/// Three deliberate restrictions:
+///
+/// * **Nodes only.** Operators have no pending queue.
+/// * **Only when no other connection for this device is live.** The same device
+///   may hold two connections; the reclaim runs before this one is registered,
+///   so an already-connected incarnation still owns its outstanding claims and
+///   is not undercut by a second connection arriving.
+/// * **A reclaim failure is not fatal.** The adapter is being asked to undo a
+///   claim, not to admit the connection. When it refuses, the connection is
+///   still served and the stale claims simply stay stranded, exactly as they
+///   were before this call existed; refusing the handshake instead would let a
+///   flaky adapter deny every node. The call happens inside the handshake, so
+///   a slow adapter is bounded by the configured handshake timeout.
+async fn reclaim_stale_claims(services: &ConnectionServices, role: Role, device_id: &str) {
+    if role != Role::Node || device_id.is_empty() {
+        return;
+    }
+    if services.directory.node(device_id).is_some() {
+        return;
+    }
+    let _ = services.store.reclaim_pending(device_id).await;
 }
 
 fn command_claims(params: &ConnectParams, role: Role) -> Vec<String> {
@@ -1383,5 +1440,36 @@ mod tests {
         assert!(directory.node(&wire_id).is_none());
 
         client.shutdown().await.ok();
+    }
+
+    /// A cancelled `serve` must stop its reader task, not detach it.
+    ///
+    /// `tokio::spawn` hands back a handle whose `Drop` *detaches* — it does not
+    /// abort. The reader task owns [`ServerRead`], which is one half of a
+    /// `tokio::io::split` over the `TcpStream`, so the socket is only closed
+    /// once both halves are gone. A `serve` future dropped at its await —
+    /// exactly what the accept loop does to connections still alive when the
+    /// drain deadline passes — would therefore leave a task parked on a read,
+    /// holding the file descriptor open until the peer happened to write
+    /// again. Cancellation must release the same resources a normal exit does.
+    #[tokio::test]
+    async fn dropping_the_reader_guard_ends_the_task_instead_of_detaching_it() {
+        let (sender, mut receiver) = mpsc::channel::<()>(1);
+        let guard = AbortOnDrop(tokio::spawn(async move {
+            let _held = sender;
+            std::future::pending::<()>().await;
+        }));
+
+        drop(guard);
+
+        // The channel closes only once the task is destroyed and drops the
+        // sender it captured. A merely detached task would stay parked on
+        // `pending` forever and this would time out instead.
+        let closed = timeout(std::time::Duration::from_secs(5), receiver.recv()).await;
+        assert_eq!(
+            closed.expect("an aborted task releases its captured state promptly"),
+            None,
+            "the reader task outlived its guard, so a cancelled connection would strand the socket"
+        );
     }
 }

@@ -186,7 +186,7 @@ mod tests {
         assert_eq!(limits.fuel, 1_000_000_000);
         assert_eq!(limits.wall_clock_timeout_ms, 5_000);
         assert_eq!(limits.max_host_call_concurrency, 8);
-        assert_eq!(limits.timeout(), Duration::from_millis(5_000));
+        assert_eq!(limits.timeout(), Duration::from_secs(5));
     }
 
     #[test]

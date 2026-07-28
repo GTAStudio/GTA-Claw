@@ -1,4 +1,4 @@
-//! Opt-in live contract check against an operator-supplied OpenClaw Gateway.
+//! Opt-in live contract check against an operator-supplied `OpenClaw` Gateway.
 
 use std::env;
 use std::sync::Arc;

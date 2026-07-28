@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::http::{HeaderValue, header};
@@ -35,6 +35,21 @@ pub(crate) async fn read_json_value(
     max_bytes: usize,
     body_timeout: Duration,
 ) -> Result<Value, ApiError> {
+    let bytes = read_body(request, max_bytes, body_timeout).await?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        ApiError::openai(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid JSON: {error}"),
+            "invalid_request_error",
+        )
+    })
+}
+
+async fn read_body(
+    request: Request,
+    max_bytes: usize,
+    body_timeout: Duration,
+) -> Result<Bytes, ApiError> {
     let bytes = timeout(body_timeout, to_bytes(request.into_body(), max_bytes))
         .await
         .map_err(|_| {
@@ -58,13 +73,7 @@ pub(crate) async fn read_json_value(
             "invalid_request_error",
         ));
     }
-    serde_json::from_slice(&bytes).map_err(|error| {
-        ApiError::openai(
-            StatusCode::BAD_REQUEST,
-            format!("Invalid JSON: {error}"),
-            "invalid_request_error",
-        )
-    })
+    Ok(bytes)
 }
 
 pub(crate) async fn drain_request_body(
@@ -125,22 +134,33 @@ pub(crate) async fn read_json<T: DeserializeOwned>(
     max_bytes: usize,
     body_timeout: Duration,
 ) -> Result<T, ApiError> {
-    let value = read_json_value(request, max_bytes, body_timeout).await?;
-    serde_json::from_value(value).map_err(|error| {
-        ApiError::openai(
-            StatusCode::BAD_REQUEST,
-            error.to_string(),
-            "invalid_request_error",
-        )
+    let bytes = read_body(request, max_bytes, body_timeout).await?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        let message = match error.classify() {
+            serde_json::error::Category::Data => without_json_location(&error),
+            serde_json::error::Category::Syntax
+            | serde_json::error::Category::Eof
+            | serde_json::error::Category::Io => format!("Invalid JSON: {error}"),
+        };
+        ApiError::openai(StatusCode::BAD_REQUEST, message, "invalid_request_error")
     })
+}
+
+fn without_json_location(error: &serde_json::Error) -> String {
+    let mut rendered = error.to_string();
+    let suffix = format!(" at line {} column {}", error.line(), error.column());
+    if rendered.ends_with(&suffix) {
+        rendered.truncate(rendered.len() - suffix.len());
+    }
+    rendered
 }
 
 pub(crate) fn json_body(value: &Value) -> Body {
     Body::from(serde_json::to_vec(value).expect("JSON value is serializable"))
 }
 
-pub(crate) fn json_response(status: StatusCode, value: Value) -> Response {
-    let mut response = (status, json_body(&value)).into_response();
+pub(crate) fn json_response(status: StatusCode, value: &Value) -> Response {
+    let mut response = (status, json_body(value)).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json; charset=utf-8"),

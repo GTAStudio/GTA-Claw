@@ -4,9 +4,8 @@
 //! `interop.migration.hermes`: config, models, memory, skills, secrets,
 //! credentials and safe exclusions. Discovery runs entirely through injected
 //! platform paths, so no test here reads a real `~/.hermes`.
-#![allow(missing_docs)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use claw_migrate::{
     ApplyContext, DetectionConfidence, HermesMigrationProvider, HostPlatform, MigrationProvider,
@@ -20,7 +19,7 @@ use common::{
     read, signer, write,
 };
 
-const CONFIG: &str = r#"default_model: openai/gpt-5
+const CONFIG: &str = r"default_model: openai/gpt-5
 small_model: openai/gpt-5-mini
 models:
   openai/gpt-5:
@@ -34,13 +33,13 @@ mcp_servers:
     command: safe-tool
     headers:
       X-Custom: hermes-header-plaintext
-"#;
+";
 
-const ENVIRONMENT: &str = r#"# Hermes provider credentials
+const ENVIRONMENT: &str = r"# Hermes provider credentials
 OPENAI_API_KEY=hermes-openai-plaintext
 GITHUB_TOKEN='hermes-github-plaintext'
 EMPTY_PLACEHOLDER=
-"#;
+";
 
 const AUTH: &str = r#"{"oauth":{"refresh":"hermes-auth-plaintext"}}"#;
 
@@ -405,7 +404,11 @@ fn hermes_excludes_plugins_and_mcp_tokens_instead_of_migrating_them() {
             "{excluded} reached the migration target: {migrated:?}"
         );
     }
-    assert!(!migrated.iter().any(|path| path.ends_with(".js")));
+    assert!(!migrated.iter().any(|path| {
+        Path::new(path)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("js"))
+    }));
     assert_eq!(
         leaks(&target, "hermes-mcp-token-plaintext"),
         Vec::<String>::new()

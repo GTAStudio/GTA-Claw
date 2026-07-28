@@ -1,6 +1,6 @@
 //! The context-engine service provider interface.
 //!
-//! Upstream OpenClaw describes the context engine as the component between raw session history
+//! Upstream `OpenClaw` describes the context engine as the component between raw session history
 //! and the prompt a provider is handed, with a fixed five-phase lifecycle: `bootstrap` opens a
 //! session, `ingest` offers items, `assemble` produces a prompt per provider round, `maintain`
 //! performs between-round upkeep, and `compact` sheds context under budget pressure. The port
@@ -14,7 +14,7 @@
 //! - [`suite`] is the reusable conformance harness. Any implementer — in this repository or in a
 //!   plug-in — calls [`verify_spi_conformance`] and gets back an [`SpiReport`] naming exactly
 //!   which requirements it failed and what the harness observed.
-//! - [`reference`] is a real engine that passes the suite, so the SPI has a working implementer
+//! - [`mod@reference`] is a real engine that passes the suite, so the SPI has a working implementer
 //!   and the suite has a subject that is meant to succeed.
 //!
 //! A conformance suite whose only subject passes is worthless, because it cannot distinguish an

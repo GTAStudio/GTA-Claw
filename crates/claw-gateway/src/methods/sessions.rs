@@ -60,6 +60,13 @@ fn render(record: &SessionRecord) -> Value {
 }
 
 /// Distinguishes an absent field from an explicit JSON `null`.
+#[expect(
+    clippy::option_option,
+    reason = "the outer layer is presence and the inner layer is the value: `None` leaves the \
+              title untouched while `Some(None)` clears it, which is the wire contract \
+              `sessions.patch` and `SessionPatch` already encode and a flattened option \
+              cannot express"
+)]
 fn explicit_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: Deserializer<'de>,
@@ -174,25 +181,24 @@ impl MethodHandler for Describe {
         Box::pin(async move {
             let request: IdParams = params_of(context.method, params)?;
             identity(context.method, "id", &request.id)?;
-            let record =
-                context
-                    .store
-                    .get_session(&request.id)
-                    .await?
-                    .ok_or(DispatchError::NotFound {
-                        kind: "session",
-                        id: request.id.clone(),
-                    })?;
-            Ok(json!({
-                "session": render(&record),
-                "subscribedSessions": context
+            let record = context
+                .store
+                .get_session(&request.id)
+                .await?
+                .ok_or_else(|| DispatchError::NotFound {
+                    kind: "session",
+                    id: request.id.clone(),
+                })?;
+            let subscribed_sessions = {
+                let filter = context
                     .filter
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .sessions()
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>(),
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                filter.sessions().iter().cloned().collect::<Vec<_>>()
+            };
+            Ok(json!({
+                "session": render(&record),
+                "subscribedSessions": subscribed_sessions,
             }))
         })
     }
@@ -203,6 +209,11 @@ impl MethodHandler for Describe {
 struct PatchParams {
     id: String,
     #[serde(default, deserialize_with = "explicit_option")]
+    #[expect(
+        clippy::option_option,
+        reason = "absent leaves the title alone, an explicit JSON null clears it; collapsing \
+                  the two would silently make `\"title\": null` a no-op"
+    )]
     title: Option<Option<String>>,
     #[serde(default)]
     archived: Option<bool>,
@@ -237,7 +248,7 @@ impl MethodHandler for Patch {
                     },
                 )
                 .await?
-                .ok_or(DispatchError::NotFound {
+                .ok_or_else(|| DispatchError::NotFound {
                     kind: "session",
                     id: request.id.clone(),
                 })?;
@@ -256,15 +267,14 @@ impl MethodHandler for Delete {
         Box::pin(async move {
             let request: IdParams = params_of(context.method, params)?;
             identity(context.method, "id", &request.id)?;
-            let record =
-                context
-                    .store
-                    .get_session(&request.id)
-                    .await?
-                    .ok_or(DispatchError::NotFound {
-                        kind: "session",
-                        id: request.id.clone(),
-                    })?;
+            let record = context
+                .store
+                .get_session(&request.id)
+                .await?
+                .ok_or_else(|| DispatchError::NotFound {
+                    kind: "session",
+                    id: request.id.clone(),
+                })?;
             let deleted = context.store.delete_session(&request.id).await?;
             if !deleted {
                 return Err(DispatchError::NotFound {
@@ -285,7 +295,7 @@ struct SubscriptionParams {
     sessions: Vec<String>,
 }
 
-fn group_identity(group: TopicGroup) -> &'static str {
+const fn group_identity(group: TopicGroup) -> &'static str {
     match group {
         TopicGroup::SessionLifecycle => "session-lifecycle",
         TopicGroup::SessionMessages => "session-messages",
@@ -310,7 +320,7 @@ impl MethodHandler for Subscribe {
                     .filter
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                filter.subscribe(self.group, request.sessions.clone());
+                filter.subscribe(self.group, request.sessions);
                 filter.sessions().iter().cloned().collect::<Vec<_>>()
             };
             Ok(json!({

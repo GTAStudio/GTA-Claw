@@ -8,7 +8,7 @@
 //! than quietly cached, which is the difference between wide-area DNS-SD and an
 //! open cache-poisoning channel.
 
-use std::net::IpAddr;
+use std::{collections::BTreeSet, net::IpAddr};
 
 use super::DnsSdError;
 use super::message::{
@@ -180,6 +180,8 @@ pub struct ResolvedService {
     pub instance: Name,
     /// Instance label decoded back to UTF-8 text when possible.
     pub instance_label: String,
+    /// Whether invalid UTF-8 bytes were replaced in [`ResolvedService::instance_label`].
+    pub instance_label_is_lossy: bool,
     /// SRV target host.
     pub host: Name,
     /// SRV port.
@@ -223,13 +225,12 @@ pub fn resolve_services(
     // A record outside the queried zone is never consulted, whichever section
     // it arrived in, and an expiring record is never used to resolve.
     let usable: Vec<&ResourceRecord> = message
-        .records()
-        .into_iter()
+        .iter_records()
         .filter(|record| record.name.is_within(zone) && record.ttl > 0)
         .collect();
 
     let mut instances: Vec<Name> = Vec::new();
-    for record in usable.iter() {
+    for record in &usable {
         let RecordData::Ptr(target) = &record.data else {
             continue;
         };
@@ -249,7 +250,7 @@ pub fn resolve_services(
     for instance in instances {
         let mut service: Option<(u16, u16, u16, Name)> = None;
         let mut txt: Option<TxtRecord> = None;
-        for record in usable.iter() {
+        for record in &usable {
             if record.name != instance {
                 continue;
             }
@@ -290,20 +291,21 @@ pub fn resolve_services(
 
         let mut v4 = Vec::new();
         let mut v6 = Vec::new();
-        for record in usable.iter() {
+        let mut seen = BTreeSet::new();
+        for record in &usable {
             if record.name != host {
                 continue;
             }
             match &record.data {
                 RecordData::A(address) => {
                     let address = IpAddr::V4(*address);
-                    if !v4.contains(&address) {
+                    if seen.insert(address) {
                         v4.push(address);
                     }
                 }
                 RecordData::Aaaa(address) => {
                     let address = IpAddr::V6(*address);
-                    if !v6.contains(&address) {
+                    if seen.insert(address) {
                         v6.push(address);
                     }
                 }
@@ -315,14 +317,19 @@ pub fn resolve_services(
         }
         v4.append(&mut v6);
 
-        let instance_label = instance
-            .labels()
-            .first()
-            .map(|label| String::from_utf8_lossy(label).into_owned())
-            .unwrap_or_default();
+        let (instance_label, instance_label_is_lossy) = instance.labels().first().map_or_else(
+            || (String::new(), false),
+            |label| {
+                std::str::from_utf8(label).map_or_else(
+                    |_| (String::from_utf8_lossy(label).into_owned(), true),
+                    |label| (label.to_owned(), false),
+                )
+            },
+        );
         resolved.push(ResolvedService {
             instance: instance.clone(),
             instance_label,
+            instance_label_is_lossy,
             host,
             port,
             priority,
@@ -345,7 +352,7 @@ pub fn addresses_for(message: &Message, host: &Name, zone: &Name) -> Vec<IpAddr>
         return Vec::new();
     }
     let mut out = Vec::new();
-    for record in message.records() {
+    for record in message.iter_records() {
         if record.name != *host || record.ttl == 0 || !record.name.is_within(zone) {
             continue;
         }

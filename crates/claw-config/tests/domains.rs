@@ -207,7 +207,7 @@ fn generated_schema_enforces_literal_false_and_secret_reference_patterns() {
     assert_eq!(validate_schema(&schema, &schema, &valid), Ok(()));
 
     for invalid in [
-        r#"{ cron: { sessionRetention: true } }"#,
+        r"{ cron: { sessionRetention: true } }",
         r#"{ gateway: { auth: { token: { source: "env", provider: "Default", id: "TOKEN" } } } }"#,
         r#"{ gateway: { auth: { token: { source: "env", provider: "default", id: "mixedCase" } } } }"#,
         r#"{ gateway: { auth: { token: { source: "file", provider: "default", id: "/bad/~2escape" } } } }"#,
@@ -575,7 +575,7 @@ fn domain_secret_references_enforce_source_specific_identifiers() {
     for source in [
         r#"{ gateway: { auth: { token: { source: "env", provider: "default", id: "TOKEN_1" } } } }"#,
         r#"{ gateway: { auth: { token: { source: "file", provider: "mounted", id: "/tokens/~0primary/~1id" } } } }"#,
-        r##"{ gateway: { auth: { token: { source: "exec", provider: "vault-1", id: "secret/path:#1" } } } }"##,
+        r#"{ gateway: { auth: { token: { source: "exec", provider: "vault-1", id: "secret/path:#1" } } } }"#,
     ] {
         parse_openclaw_json5(source, "valid-reference.json5").expect("valid secret reference");
     }
@@ -618,23 +618,23 @@ fn domain_secret_references_enforce_source_specific_identifiers() {
 fn false_only_and_object_only_unions_reject_broader_json_types() {
     for (source, expected_path) in [
         (
-            r#"{ cron: { sessionRetention: true } }"#,
+            r"{ cron: { sessionRetention: true } }",
             "cron.sessionRetention",
         ),
         (
-            r#"{ gateway: { http: { securityHeaders: { strictTransportSecurity: true } } } }"#,
+            r"{ gateway: { http: { securityHeaders: { strictTransportSecurity: true } } } }",
             "gateway.http.securityHeaders.strictTransportSecurity",
         ),
         (
-            r#"{ session: { maintenance: { resetArchiveRetention: true } } }"#,
+            r"{ session: { maintenance: { resetArchiveRetention: true } } }",
             "session.maintenance.resetArchiveRetention",
         ),
         (
-            r#"{ session: { maintenance: { maxDiskBytes: true } } }"#,
+            r"{ session: { maintenance: { maxDiskBytes: true } } }",
             "session.maintenance.maxDiskBytes",
         ),
         (
-            r#"{ messages: { usageTemplate: 42 } }"#,
+            r"{ messages: { usageTemplate: 42 } }",
             "messages.usageTemplate",
         ),
     ] {
@@ -685,7 +685,7 @@ fn source_domain_precedence_is_exhaustive_and_nested_objects_merge() {
         let mut layers = OpenClawConfigLayers::new();
         if mask & 1 != 0 {
             layers = layers
-                .with_system_json5(r#"{ gateway: { port: 10001, controlUi: { enabled: true } } }"#);
+                .with_system_json5(r"{ gateway: { port: 10001, controlUi: { enabled: true } } }");
         }
         if mask & 2 != 0 {
             layers = layers.with_user_json5(
@@ -694,7 +694,7 @@ fn source_domain_precedence_is_exhaustive_and_nested_objects_merge() {
         }
         if mask & 4 != 0 {
             layers = layers.with_workspace_json5(
-                r#"{ gateway: { port: 10003, controlUi: { toolTitles: true } } }"#,
+                r"{ gateway: { port: 10003, controlUi: { toolTitles: true } } }",
             );
         }
         if mask & 8 != 0 {
@@ -1076,7 +1076,7 @@ fn source_hot_reload_is_typed_transactional_and_tear_free() {
 
     let before_rejection = hub.snapshot().expect("snapshot before rejection");
     let error = hub
-        .reload_json5(r#"{ gateway: { port: 0 } }"#, "invalid")
+        .reload_json5(r"{ gateway: { port: 0 } }", "invalid")
         .expect_err("invalid candidate");
     match error {
         claw_config::ConfigHubError::Config(ConfigError::Validation { path, message }) => {
@@ -1140,7 +1140,7 @@ fn source_hot_reload_is_typed_transactional_and_tear_free() {
 #[test]
 fn slow_source_subscribers_receive_only_the_latest_bounded_change() {
     let initial =
-        parse_openclaw_json5(r#"{ gateway: { port: 10000 } }"#, "initial").expect("initial");
+        parse_openclaw_json5(r"{ gateway: { port: 10000 } }", "initial").expect("initial");
     let hub = OpenClawConfigHub::new(initial);
     let subscription = hub.subscribe().expect("subscribe");
 
@@ -1151,7 +1151,7 @@ fn slow_source_subscribers_receive_only_the_latest_bounded_change() {
             ""
         };
         hub.reload_json5(
-            &format!(r#"{{ gateway: {{ port: {port} }} {logging} }}"#),
+            &format!(r"{{ gateway: {{ port: {port} }} {logging} }}"),
             "coalesced",
         )
         .expect("publish");
@@ -1188,11 +1188,11 @@ fn slow_source_subscribers_receive_only_the_latest_bounded_change() {
 fn source_file_watcher_retains_last_known_good_bytes() {
     let directory = common::TestDirectory::create();
     let path = directory.path().join("openclaw.json5");
-    std::fs::write(&path, r#"{ gateway: { port: 18001 } }"#).expect("write initial source");
+    std::fs::write(&path, r"{ gateway: { port: 18001 } }").expect("write initial source");
     let mut watcher = OpenClawConfigFileWatcher::from_file(&path).expect("create watcher");
     let subscription = watcher.hub().subscribe().expect("subscribe");
 
-    std::fs::write(&path, r#"{ gateway: { port: 18002 } }"#).expect("write changed source");
+    std::fs::write(&path, r"{ gateway: { port: 18002 } }").expect("write changed source");
     let change = watcher.poll().expect("poll valid change").expect("change");
     assert_eq!(change.changed_domains, vec![OpenClawDomain::Gateway]);
     assert_eq!(
@@ -1216,7 +1216,7 @@ fn source_file_watcher_retains_last_known_good_bytes() {
         Some(18_002)
     );
 
-    std::fs::write(&path, r#"{ gateway: { port: 18003 } }"#).expect("repair source");
+    std::fs::write(&path, r"{ gateway: { port: 18003 } }").expect("repair source");
     let repaired = watcher
         .poll()
         .expect("poll repaired source")
@@ -1587,8 +1587,7 @@ fn validate_schema(root: &Value, schema: &Value, instance: &Value) -> Result<(),
         if !accepted {
             let label = expected
                 .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| expected.to_string());
+                .map_or_else(|| expected.to_string(), str::to_owned);
             return Err(format!("expected {label}"));
         }
     }

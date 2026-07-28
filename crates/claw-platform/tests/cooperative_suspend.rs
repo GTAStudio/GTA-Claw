@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use claw_platform::suspend::{
-    ActiveWorkCounts, ActiveWorkInspector, AdmissionPhase, BlockerKind, BusyReason, Clock,
+    ActiveWorkCounts, ActiveWorkInspector, AdmissionPhase, Blocker, BlockerKind, BusyReason, Clock,
     ManualClock, PrepareOutcome, RefusalReason, ResumeOutcome, RootWorkLease,
     SCHEDULER_RECOVERY_RETRY_MS, SUSPEND_CONTROL_METHODS, SUSPEND_RETRY_AFTER_MS, SUSPEND_TTL_MS,
     Scheduler, SchedulerError, StatusOutcome, SuspendCoordinator, SuspensionIds, TaskBlocker,
@@ -50,6 +50,7 @@ impl RecordingScheduler {
         let events = lock(&self.events);
         let paused = events.iter().filter(|event| **event == "pause").count();
         let resumed = events.iter().filter(|event| **event == "resume").count();
+        drop(events);
         paused > resumed
     }
 
@@ -305,7 +306,7 @@ fn prepare_reports_busy_with_every_blocker_while_work_is_in_flight() {
             assert_eq!(reason.as_str(), "active-work");
             assert_eq!(retry_after_ms, SUSPEND_RETRY_AFTER_MS);
             assert_eq!(active_count, 4);
-            let messages: Vec<&str> = blockers.iter().map(|blocker| blocker.message()).collect();
+            let messages: Vec<&str> = blockers.iter().map(Blocker::message).collect();
             assert_eq!(
                 messages,
                 vec![
@@ -695,11 +696,105 @@ fn a_scheduler_that_cannot_resume_holds_the_fence_closed_until_it_recovers() {
 }
 
 #[test]
+fn a_restart_stops_a_pending_scheduler_recovery_instead_of_restarting_the_host() {
+    let harness = harness();
+    let (suspension_id, _) = expect_ready(harness.coordinator.prepare("request-1"));
+    harness.scheduler.fail_next_resumes(1);
+    assert_eq!(
+        harness.coordinator.resume(&suspension_id),
+        ResumeOutcome::Recovering {
+            retry_after_ms: SCHEDULER_RECOVERY_RETRY_MS
+        }
+    );
+    assert!(harness.coordinator.is_recovering());
+
+    harness.admission.mark_restart_draining();
+    harness.clock.advance(SCHEDULER_RECOVERY_RETRY_MS);
+
+    assert!(
+        harness.coordinator.poll(),
+        "a superseded recovery is retired rather than left pending"
+    );
+    assert!(!harness.coordinator.is_recovering());
+    assert_eq!(
+        harness.scheduler.events(),
+        vec!["pause", "resume-failed"],
+        "a host being restarted must not have its scheduler restarted, and the retry \
+         must stop rather than poke a wedged scheduler for the rest of the process"
+    );
+    assert!(harness.scheduler.is_paused());
+    let refusal = harness
+        .admission
+        .try_begin_root_work()
+        .expect_err("a draining host refuses root work");
+    assert_eq!(refusal.reason(), RefusalReason::GatewayRestarting);
+
+    harness.clock.advance(SCHEDULER_RECOVERY_RETRY_MS);
+    assert!(harness.coordinator.poll());
+    assert_eq!(
+        harness.scheduler.events(),
+        vec!["pause", "resume-failed"],
+        "a retired recovery must not resume the scheduler on a later poll either"
+    );
+}
+
+#[test]
+fn a_refused_preparation_whose_scheduler_will_not_resume_still_reopens_the_fence() {
+    let harness = harness();
+    harness.inspector.set_counts(ActiveWorkCounts {
+        queue_size: 1,
+        ..ActiveWorkCounts::default()
+    });
+    harness.scheduler.fail_next_resumes(1);
+
+    let outcome = harness.coordinator.prepare("request-1");
+
+    assert_eq!(
+        outcome,
+        PrepareOutcome::Recovering {
+            retry_after_ms: SCHEDULER_RECOVERY_RETRY_MS
+        },
+        "a preparation that cannot restart the scheduler must not report busy"
+    );
+    assert!(harness.coordinator.is_recovering());
+    assert_eq!(
+        harness.admission.phase(),
+        AdmissionPhase::Preparing,
+        "the fence stays closed while the host cannot be driven"
+    );
+    assert!(harness.admission.try_begin_root_work().is_err());
+
+    harness.clock.advance(SCHEDULER_RECOVERY_RETRY_MS);
+
+    assert!(harness.coordinator.poll(), "the retry succeeds");
+    assert!(!harness.coordinator.is_recovering());
+    assert_eq!(
+        harness.admission.phase(),
+        AdmissionPhase::Accepting,
+        "a lease that never reached `prepared` still reopens the fence"
+    );
+    assert!(harness.admission.try_begin_root_work().is_ok());
+    assert_eq!(
+        harness.scheduler.events(),
+        vec!["pause", "resume-failed", "resume"]
+    );
+    assert!(!harness.scheduler.is_paused());
+}
+
+#[test]
 fn concurrent_preparations_hand_out_exactly_one_lease() {
     let harness = harness();
     let coordinator = &harness.coordinator;
 
     let outcomes: Vec<PrepareOutcome> = std::thread::scope(|scope| {
+        // The `collect` is load-bearing: it starts all eight threads before the
+        // first `join`. Feeding the `spawn` iterator straight into `join` would
+        // run one preparation at a time and the race this test exists to
+        // observe could never happen.
+        #[expect(
+            clippy::needless_collect,
+            reason = "collecting the handles is what makes the eight preparations concurrent"
+        )]
         let handles: Vec<_> = (0..8)
             .map(|index| scope.spawn(move || coordinator.prepare(&format!("request-{index}"))))
             .collect();

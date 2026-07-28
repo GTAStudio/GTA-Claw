@@ -5,11 +5,11 @@ use std::fmt::{self, Display, Formatter};
 
 use claw_domain::{DomainError, SessionId};
 
-/// Pinned Gateway core event catalog projections and fail-closed envelopes.
+// These modules carry their own `//!` documentation. An outer `///` here would
+// make rustdoc resolve the links inside those `//!` blocks against this scope
+// instead of the module's own, silently breaking every one of them.
 pub mod events;
-/// OpenClaw Gateway v4 wire contracts, negotiation, registries, and authorization.
 pub mod gateway;
-/// Pinned Gateway core method catalog projections and drift verification.
 pub mod methods;
 
 /// The protocol version implemented by this workspace.
@@ -92,6 +92,18 @@ impl Display for ServerEvent {
 }
 
 /// Parses the deliberately small command-line representation of the protocol.
+///
+/// # Errors
+///
+/// - [`ProtocolError::MissingCommand`] — `arguments` is empty.
+/// - [`ProtocolError::UnknownCommand`] — the first argument is neither `health`
+///   nor `send`.
+/// - [`ProtocolError::UnexpectedArgument`] — `health` was followed by an
+///   argument, which it never accepts.
+/// - [`ProtocolError::MissingArgument`] — `send` was given no session id, or no
+///   message text after the session id.
+/// - [`ProtocolError::Domain`] — the session id violates a
+///   [`SessionId`] invariant.
 pub fn parse_command<I, S>(arguments: I) -> Result<ClientCommand, ProtocolError>
 where
     I: IntoIterator<Item = S>,

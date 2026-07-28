@@ -13,7 +13,7 @@ use crate::platform::{HostPlatform, PlatformPaths};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ClaudeMigrationProvider;
 
-/// OpenAI Codex desktop and CLI migration provider.
+/// `OpenAI` Codex desktop and CLI migration provider.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CodexMigrationProvider;
 
@@ -31,9 +31,7 @@ impl MigrationProvider for ClaudeMigrationProvider {
         paths: &dyn PlatformPaths,
         source: Option<&Path>,
     ) -> Result<Detection, MigrationError> {
-        let root = source
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| paths.home_dir().join(".claude"));
+        let root = source.map_or_else(|| paths.home_dir().join(".claude"), Path::to_path_buf);
         let primary = [
             root.join("settings.json"),
             root.join("CLAUDE.md"),
@@ -199,9 +197,7 @@ impl MigrationProvider for HermesMigrationProvider {
         paths: &dyn PlatformPaths,
         source: Option<&Path>,
     ) -> Result<Detection, MigrationError> {
-        let root = source
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| paths.home_dir().join(".hermes"));
+        let root = source.map_or_else(|| paths.home_dir().join(".hermes"), Path::to_path_buf);
         let high = root.join("config.yaml").is_file()
             || root.join(".env").is_file()
             || root.join("auth.json").is_file();
@@ -298,7 +294,7 @@ fn finalize_plan(
         .join("config")
         .join("migrations")
         .join(format!("{provider_id}.json5"));
-    if manifest.exists() && !context.overwrite {
+    if path_is_occupied(&manifest) && !context.overwrite {
         return rejected_plan(
             provider_id,
             source_root,
@@ -363,7 +359,7 @@ fn build_claude_operations(
             ("settings.json", root.join("settings.json")),
             ("settings.local.json", root.join("settings.local.json")),
         ] {
-            add_json_transform(
+            add_claude_settings_transform(
                 &mut operations,
                 &file,
                 &target
@@ -372,8 +368,8 @@ fn build_claude_operations(
                     .join("claude")
                     .join(name),
                 &format!("claude-{name}"),
+                diagnostics,
             )?;
-            add_claude_manual_diagnostic(&file, diagnostics)?;
         }
         if let Some(home) = root.parent() {
             add_json_transform(
@@ -459,7 +455,7 @@ fn build_claude_operations(
         )?;
         for name in ["settings.json", "settings.local.json"] {
             let file = root.join(".claude").join(name);
-            add_json_transform(
+            add_claude_settings_transform(
                 &mut operations,
                 &file,
                 &target
@@ -468,8 +464,8 @@ fn build_claude_operations(
                     .join("claude")
                     .join(format!("project-{name}")),
                 &format!("claude-project-{name}"),
+                diagnostics,
             )?;
-            add_claude_manual_diagnostic(&file, diagnostics)?;
         }
         collect_skill_directories(
             &root.join(".claude").join("skills"),
@@ -741,9 +737,10 @@ fn build_hermes_operations(
 }
 
 fn claude_desktop_config(paths: &dyn PlatformPaths) -> PathBuf {
+    // Claude Desktop uses the same directory name on all three hosts; only the
+    // configuration root that contains it differs.
     let application = match paths.platform() {
-        HostPlatform::Windows | HostPlatform::MacOs => "Claude",
-        HostPlatform::Linux => "Claude",
+        HostPlatform::Windows | HostPlatform::MacOs | HostPlatform::Linux => "Claude",
     };
     paths
         .config_dir()
@@ -782,21 +779,9 @@ fn add_claude_exclusion_diagnostic(root: &Path, diagnostics: &mut Vec<Diagnostic
     ));
 }
 
-fn add_claude_manual_diagnostic(
-    path: &Path,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Result<(), MigrationError> {
-    if !path.is_file() {
-        return Ok(());
-    }
-    let text = read_text(path)?;
-    let value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|_| MigrationError::InvalidInput {
-            path: path.to_path_buf(),
-            reason: "JSON configuration is malformed".to_owned(),
-        })?;
+fn add_claude_manual_diagnostic(value: &serde_json::Value, diagnostics: &mut Vec<Diagnostic>) {
     let Some(object) = value.as_object() else {
-        return Ok(());
+        return;
     };
     for (key, code, message) in [
         (
@@ -829,7 +814,6 @@ fn add_claude_manual_diagnostic(
             "A Claude setting names an external credential command; it was preserved for review and is never executed.",
         ));
     }
-    Ok(())
 }
 
 fn add_copy_checked(
@@ -877,6 +861,26 @@ fn add_json_transform(
             namespace: namespace.to_owned(),
         });
     }
+    Ok(())
+}
+
+fn add_claude_settings_transform(
+    operations: &mut Vec<MigrationOperation>,
+    source: &Path,
+    target: &Path,
+    namespace: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<(), MigrationError> {
+    if !source.is_file() {
+        return Ok(());
+    }
+    let value = read_json(source)?;
+    operations.push(MigrationOperation::TransformJson {
+        source: source.to_path_buf(),
+        target: target.to_path_buf(),
+        namespace: namespace.to_owned(),
+    });
+    add_claude_manual_diagnostic(&value, diagnostics);
     Ok(())
 }
 
@@ -984,7 +988,7 @@ fn first_conflict(operations: &[MigrationOperation], overwrite: bool) -> Option<
         {
             return Some(operation.target());
         }
-        if operation.target().exists()
+        if path_is_occupied(operation.target())
             && !matches!(operation, MigrationOperation::AppendFile { .. })
         {
             return Some(operation.target());
@@ -993,14 +997,23 @@ fn first_conflict(operations: &[MigrationOperation], overwrite: bool) -> Option<
     None
 }
 
+/// Reports whether anything at all occupies `path`, without following symbolic
+/// links, so that a link whose destination is missing still counts as an
+/// existing target rather than free space.
+fn path_is_occupied(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
 fn validate_json(path: &Path) -> Result<(), MigrationError> {
+    read_json(path).map(|_| ())
+}
+
+fn read_json(path: &Path) -> Result<serde_json::Value, MigrationError> {
     let text = read_text(path)?;
-    serde_json::from_str::<serde_json::Value>(&text)
-        .map(|_| ())
-        .map_err(|_| MigrationError::InvalidInput {
-            path: path.to_path_buf(),
-            reason: "JSON configuration is malformed".to_owned(),
-        })
+    serde_json::from_str(&text).map_err(|_| MigrationError::InvalidInput {
+        path: path.to_path_buf(),
+        reason: "JSON configuration is malformed".to_owned(),
+    })
 }
 
 fn validate_text(path: &Path) -> Result<(), MigrationError> {

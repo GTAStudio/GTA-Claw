@@ -3,7 +3,10 @@
 //! Nothing here touches the operating system: time is a counter, the provider replays a script,
 //! and every store is a map behind a mutex. That keeps the concurrency tests reproducible.
 
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "this module is compiled separately into each integration-test binary, so a helper only one suite needs is genuinely unused in the others"
+)]
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -114,7 +117,7 @@ pub(crate) struct Round {
 
 impl Round {
     /// A round that replays `chunks` and then closes the stream.
-    pub(crate) fn new(chunks: Vec<ProviderChunk>) -> Self {
+    pub(crate) const fn new(chunks: Vec<ProviderChunk>) -> Self {
         Self {
             chunks,
             stall_at_end: false,
@@ -122,7 +125,7 @@ impl Round {
     }
 
     /// A round that replays `chunks` and then never produces anything again.
-    pub(crate) fn stalling(chunks: Vec<ProviderChunk>) -> Self {
+    pub(crate) const fn stalling(chunks: Vec<ProviderChunk>) -> Self {
         Self {
             chunks,
             stall_at_end: true,
@@ -241,6 +244,7 @@ impl StatePort for MemoryState {
             .map_or(0, |existing| existing.revision);
         if current != snapshot.revision {
             let held = snapshot.revision;
+            drop(data);
             return Box::pin(async move {
                 Err(PortError::Conflict(format!(
                     "expected revision {current}, caller held {held}"
@@ -254,6 +258,7 @@ impl StatePort for MemoryState {
         };
         data.history.push(stored.clone());
         data.sessions.insert(key, stored);
+        drop(data);
         Box::pin(async move { Ok(next) })
     }
 
@@ -282,6 +287,65 @@ impl StatePort for MemoryState {
             guard(&self.data).sessions.values().cloned().collect();
         sessions.sort_by(|left, right| left.session_id.as_str().cmp(right.session_id.as_str()));
         Box::pin(async move { Ok(sessions) })
+    }
+}
+
+/// A state adapter that parks session loads until a test opens its gate.
+pub(crate) struct GatedLoadState {
+    inner: Arc<MemoryState>,
+    gate: Arc<Gate>,
+    loads: AtomicUsize,
+}
+
+impl GatedLoadState {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryState::new(),
+            gate: Gate::new(),
+            loads: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn load_count(&self) -> usize {
+        self.loads.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn open(&self) {
+        self.gate.open();
+    }
+}
+
+impl StatePort for GatedLoadState {
+    fn load_session(
+        &self,
+        session_id: &SessionId,
+    ) -> PortFuture<'_, Result<Option<SessionSnapshot>, PortError>> {
+        let session_id = session_id.clone();
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            self.gate.wait().await;
+            self.inner.load_session(&session_id).await
+        })
+    }
+
+    fn save_session(&self, snapshot: SessionSnapshot) -> PortFuture<'_, Result<u64, PortError>> {
+        self.inner.save_session(snapshot)
+    }
+
+    fn save_turn(&self, record: TurnRecord) -> PortFuture<'_, Result<(), PortError>> {
+        self.inner.save_turn(record)
+    }
+
+    fn load_turn(
+        &self,
+        session_id: &SessionId,
+        turn: TurnId,
+    ) -> PortFuture<'_, Result<Option<TurnRecord>, PortError>> {
+        self.inner.load_turn(session_id, turn)
+    }
+
+    fn list_sessions(&self) -> PortFuture<'_, Result<Vec<SessionSnapshot>, PortError>> {
+        self.inner.list_sessions()
     }
 }
 
@@ -322,6 +386,7 @@ impl GoalStorePort for MemoryGoals {
         let expected = existing.map_or(1, |index| goals[index].revision.saturating_add(1));
         if record.revision != expected {
             let held = record.revision;
+            drop(goals);
             return Box::pin(async move {
                 Err(PortError::Conflict(format!(
                     "expected revision {expected}, caller held {held}"
@@ -332,6 +397,7 @@ impl GoalStorePort for MemoryGoals {
             Some(index) => goals[index] = record,
             None => goals.push(record),
         }
+        drop(goals);
         Box::pin(async move { Ok(()) })
     }
 
@@ -575,20 +641,32 @@ impl SimpleContext {
         guard(&self.data).bootstraps
     }
 
-    fn tokens(items: &[ContextItem]) -> u32 {
-        let bytes: usize = items
-            .iter()
-            .map(|item| match item {
-                ContextItem::UserInput { text }
-                | ContextItem::AssistantMessage { text }
-                | ContextItem::SystemNote { text } => text.len(),
-                ContextItem::GoalStatement { objective } => objective.len(),
-                ContextItem::ToolResult {
-                    tool_name, output, ..
-                } => tool_name.len() + output.len(),
-            })
-            .sum();
+    const fn item_bytes(item: &ContextItem) -> usize {
+        match item {
+            ContextItem::UserInput { text }
+            | ContextItem::AssistantMessage { text }
+            | ContextItem::SystemNote { text } => text.len(),
+            ContextItem::GoalStatement { objective } => objective.len(),
+            ContextItem::ToolResult {
+                tool_name, output, ..
+            } => tool_name.len() + output.len(),
+        }
+    }
+
+    /// Converts a byte total into the token count the engine reports.
+    ///
+    /// Tokens are floored, so they are only additive through this byte total: `compact` tracks
+    /// bytes and converts once per step rather than summing per-item token counts.
+    fn tokens_for(bytes: usize) -> u32 {
         u32::try_from(bytes / 4).unwrap_or(u32::MAX)
+    }
+
+    fn bytes(items: &[ContextItem]) -> usize {
+        items.iter().map(Self::item_bytes).sum()
+    }
+
+    fn tokens(items: &[ContextItem]) -> u32 {
+        Self::tokens_for(Self::bytes(items))
     }
 
     fn snapshot(data: &ContextData) -> ContextState {
@@ -612,6 +690,7 @@ impl ContextEnginePort for SimpleContext {
         data.budget = request.token_budget;
         data.bootstraps = data.bootstraps.saturating_add(1);
         let state = Self::snapshot(&data);
+        drop(data);
         Box::pin(async move { Ok(state) })
     }
 
@@ -619,6 +698,7 @@ impl ContextEnginePort for SimpleContext {
         let mut data = guard(&self.data);
         data.items.push(request.item);
         let state = Self::snapshot(&data);
+        drop(data);
         Box::pin(async move { Ok(state) })
     }
 
@@ -656,6 +736,7 @@ impl ContextEnginePort for SimpleContext {
             messages,
             state: Self::snapshot(&data),
         };
+        drop(data);
         Box::pin(async move { Ok(assembled) })
     }
 
@@ -665,6 +746,7 @@ impl ContextEnginePort for SimpleContext {
     ) -> PortFuture<'_, Result<ContextState, PortError>> {
         let data = guard(&self.data);
         let state = Self::snapshot(&data);
+        drop(data);
         Box::pin(async move { Ok(state) })
     }
 
@@ -673,14 +755,19 @@ impl ContextEnginePort for SimpleContext {
         request: ContextCompaction,
     ) -> PortFuture<'_, Result<CompactionReport, PortError>> {
         let mut data = guard(&self.data);
-        let before = Self::tokens(&data.items);
-        let mut removed = 0_u32;
-        while !data.items.is_empty()
-            && before.saturating_sub(Self::tokens(&data.items)) < request.reclaim_tokens
+        let mut kept_bytes = Self::bytes(&data.items);
+        let before = Self::tokens_for(kept_bytes);
+        // The victim prefix is decided in one pass and drained once: removing the front of the
+        // vector inside the loop is quadratic in the item count.
+        let mut removed = 0_usize;
+        while removed < data.items.len()
+            && before.saturating_sub(Self::tokens_for(kept_bytes)) < request.reclaim_tokens
         {
-            data.items.remove(0);
+            kept_bytes = kept_bytes.saturating_sub(Self::item_bytes(&data.items[removed]));
             removed = removed.saturating_add(1);
         }
+        data.items.drain(..removed);
+        let removed = u32::try_from(removed).unwrap_or(u32::MAX);
         data.compacted = data.compacted.saturating_add(removed);
         let after = Self::tokens(&data.items);
         let report = CompactionReport {
@@ -688,7 +775,62 @@ impl ContextEnginePort for SimpleContext {
             reclaimed_tokens: before.saturating_sub(after),
             state: Self::snapshot(&data),
         };
+        drop(data);
         Box::pin(async move { Ok(report) })
+    }
+}
+
+/// A context engine whose bootstrap never resolves.
+pub(crate) struct HangingBootstrapContext {
+    delegate: Arc<SimpleContext>,
+    entered: AtomicUsize,
+}
+
+impl HangingBootstrapContext {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            delegate: SimpleContext::new(),
+            entered: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn entered(&self) -> usize {
+        self.entered.load(Ordering::SeqCst)
+    }
+}
+
+impl ContextEnginePort for HangingBootstrapContext {
+    fn bootstrap(
+        &self,
+        _request: ContextBootstrap,
+    ) -> PortFuture<'_, Result<ContextState, PortError>> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::pending())
+    }
+
+    fn ingest(&self, request: ContextIngest) -> PortFuture<'_, Result<ContextState, PortError>> {
+        self.delegate.ingest(request)
+    }
+
+    fn assemble(
+        &self,
+        request: ContextAssembly,
+    ) -> PortFuture<'_, Result<AssembledContext, PortError>> {
+        self.delegate.assemble(request)
+    }
+
+    fn maintain(
+        &self,
+        request: ContextMaintenance,
+    ) -> PortFuture<'_, Result<ContextState, PortError>> {
+        self.delegate.maintain(request)
+    }
+
+    fn compact(
+        &self,
+        request: ContextCompaction,
+    ) -> PortFuture<'_, Result<CompactionReport, PortError>> {
+        self.delegate.compact(request)
     }
 }
 

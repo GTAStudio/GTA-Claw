@@ -97,12 +97,12 @@ pub struct RejectAllSignatures;
 
 impl SignatureVerifier for RejectAllSignatures {
     fn verify(&self, request: &VerificationRequest<'_>) -> Result<(), VerificationError> {
-        match &request.manifest.signature {
-            None => Ok(()),
-            Some(signature) => Err(VerificationError::NoVerifierConfigured {
-                algorithm: signature.algorithm,
-            }),
-        }
+        let Some(signature) = &request.manifest.signature else {
+            return Ok(());
+        };
+        Err(VerificationError::NoVerifierConfigured {
+            algorithm: signature.algorithm,
+        })
     }
 }
 
@@ -341,7 +341,7 @@ impl Default for TrustPolicy {
 impl TrustPolicy {
     /// A policy that refuses every component.
     #[must_use]
-    pub fn deny_all() -> Self {
+    pub const fn deny_all() -> Self {
         Self {
             roots: Vec::new(),
             require_signature: true,
@@ -361,7 +361,7 @@ impl TrustPolicy {
 
     /// Sets whether a manifest signature is mandatory.
     #[must_use]
-    pub fn require_signature(mut self, required: bool) -> Self {
+    pub const fn require_signature(mut self, required: bool) -> Self {
         self.require_signature = required;
         self
     }
@@ -387,7 +387,7 @@ impl TrustPolicy {
     /// those ids own persistent configuration and store namespaces that a
     /// component must not be able to claim merely by naming them.
     #[must_use]
-    pub fn require_identity_binding(mut self, required: bool) -> Self {
+    pub const fn require_identity_binding(mut self, required: bool) -> Self {
         self.require_identity_binding = required;
         self
     }
@@ -879,7 +879,7 @@ mod tests {
             Ok(())
         );
 
-        let mut signed = unsigned.clone();
+        let mut signed = unsigned;
         signed.signature = Some(ManifestSignature {
             algorithm: SignatureAlgorithm::Ed25519,
             key_id: "k1".to_owned(),

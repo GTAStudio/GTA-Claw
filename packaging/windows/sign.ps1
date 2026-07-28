@@ -69,8 +69,25 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
 if (Test-Path -LiteralPath $OutputPath) {
     throw "Refusing to overwrite signed output '$OutputPath'."
 }
+$outputFiles = @(
+    $OutputPath,
+    "$OutputPath.sha256",
+    "$OutputPath.spdx.json",
+    "$OutputPath.provenance.json"
+)
+foreach ($path in $outputFiles) {
+    if (Test-Path -LiteralPath $path) {
+        throw "Refusing to overwrite signed output or companion '$path'."
+    }
+}
+$checksumPath = Join-Path $sourceDirectory 'SHA256SUMS'
+$originalChecksumBytes = $null
+if (Test-Path -LiteralPath $checksumPath -PathType Leaf) {
+    $originalChecksumBytes = [System.IO.File]::ReadAllBytes($checksumPath)
+}
 
 $version = Get-CanonicalVersion $repoRoot
+Assert-RustToolchain $repoRoot
 $architecture = 'x64'
 if ([System.IO.Path]::GetFileName($source) -match 'windows-arm64') {
     $architecture = 'arm64'
@@ -79,6 +96,7 @@ $publisher = $certificate.Subject
 $makeAppx = Find-WindowsSdkTool 'makeappx.exe'
 $inspectionRoot = Join-Path $sourceDirectory '.sign-inspection'
 Initialize-MsvcEnvironment x64 | Out-Null
+try {
 if ($extension -eq '.msix') {
     Test-MsixPackage `
         -PackagePath $source `
@@ -114,7 +132,6 @@ $storeArguments = @('/sha1', $thumbprint, '/s', 'My')
 if ($CertificateStore -eq 'LocalMachine') {
     $storeArguments += '/sm'
 }
-try {
     Invoke-CheckedCommand -FilePath $signTool -Arguments (@(
         'sign', '/fd', 'SHA256', '/td', 'SHA256', '/tr', $TimestampUrl
     ) + $storeArguments + @($OutputPath))
@@ -172,8 +189,15 @@ try {
     Write-ArtifactSetChecksums $sourceDirectory | Out-Null
     Test-ArtifactSetChecksums $sourceDirectory
 } catch {
-    if (Test-Path -LiteralPath $OutputPath) {
-        Remove-Item -LiteralPath $OutputPath -Force
+    foreach ($path in $outputFiles) {
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Force
+        }
+    }
+    if ($null -ne $originalChecksumBytes) {
+        [System.IO.File]::WriteAllBytes($checksumPath, $originalChecksumBytes)
+    } elseif (Test-Path -LiteralPath $checksumPath) {
+        Remove-Item -LiteralPath $checksumPath -Force
     }
     throw
 } finally {

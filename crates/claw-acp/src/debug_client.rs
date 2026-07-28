@@ -23,20 +23,26 @@ use crate::{
     Error,
     error::{AcpInteropError, Result},
     protocol::{RpcPeer, decode, is_response_message, message_parts, read_message, response_id},
-    schema,
-    schema::{
+    schema::ProtocolVersion,
+    schema_v1,
+    schema_v1::{
         CancelNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock,
         InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
         LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse,
-        PromptRequest, PromptResponse, ProtocolVersion, RequestPermissionOutcome,
-        RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
-        ResumeSessionResponse, SessionConfigId, SessionConfigValueId, SessionId, SessionModeId,
-        SessionNotification, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-        SetSessionModeRequest, SetSessionModeResponse,
+        PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
+        RequestPermissionResponse, ResumeSessionRequest, ResumeSessionResponse, SessionConfigId,
+        SessionConfigValueId, SessionId, SessionModeId, SessionNotification,
+        SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+        SetSessionModeResponse,
     },
 };
 
 const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Wire bytes of streamed `session/update` notifications one run may buffer.
+///
+/// The notifications are kept until the run finishes, so without a budget an
+/// agent that streams forever would grow host memory until the process dies.
+const MAX_BUFFERED_NOTIFICATION_BYTES: usize = 32 * 1024 * 1024;
 
 /// Future returned by an ACP permission policy.
 pub type PermissionFuture<'a> = Pin<
@@ -46,7 +52,7 @@ pub type PermissionFuture<'a> = Pin<
 /// Policy for permission requests made by an ACP agent.
 pub trait PermissionPolicy: Send + Sync + 'static {
     /// Selects a permission outcome.
-    fn decide<'a>(&'a self, request: RequestPermissionRequest) -> PermissionFuture<'a>;
+    fn decide(&self, request: RequestPermissionRequest) -> PermissionFuture<'_>;
 }
 
 /// Permission policy that cancels every request.
@@ -54,7 +60,7 @@ pub trait PermissionPolicy: Send + Sync + 'static {
 pub struct DenyPermissions;
 
 impl PermissionPolicy for DenyPermissions {
-    fn decide<'a>(&'a self, _request: RequestPermissionRequest) -> PermissionFuture<'a> {
+    fn decide(&self, _request: RequestPermissionRequest) -> PermissionFuture<'_> {
         Box::pin(async {
             Ok(RequestPermissionResponse::new(
                 RequestPermissionOutcome::Cancelled,
@@ -96,7 +102,7 @@ impl DebugClientConfig {
             command: command.into(),
             arguments: Vec::new(),
             environment: BTreeMap::new(),
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
         }
     }
 }
@@ -212,6 +218,7 @@ async fn read_client_messages(
 ) -> std::result::Result<(), Error> {
     let result = async {
         let mut frame = Vec::new();
+        let mut buffered_notification_bytes = 0_usize;
         loop {
             let incoming = tokio::select! {
                 biased;
@@ -221,7 +228,8 @@ async fn read_client_messages(
             if !peer.is_connected() {
                 break;
             }
-            let message = match incoming {
+            let wire_bytes = frame.len();
+            let mut message = match incoming {
                 Ok(Some(message)) => message,
                 Ok(None) => break,
                 Err(error) => {
@@ -233,7 +241,7 @@ async fn read_client_messages(
             };
             if message.get("method").is_none() {
                 if is_response_message(&message) {
-                    let _ = peer.resolve_response(&message);
+                    let _ = peer.resolve_response(&mut message);
                 } else {
                     peer.respond::<serde_json::Value>(
                         response_id(&message),
@@ -243,7 +251,7 @@ async fn read_client_messages(
                 }
                 continue;
             }
-            let (method, params, id) = match message_parts(&message) {
+            let (method, params, id) = match message_parts(&mut message) {
                 Ok(parts) => parts,
                 Err(error) => {
                     peer.respond::<serde_json::Value>(response_id(&message), Err(error))
@@ -251,14 +259,28 @@ async fn read_client_messages(
                     continue;
                 }
             };
-            match (method, id) {
+            match (method.as_str(), id) {
                 ("session/update", None) => {
+                    buffered_notification_bytes =
+                        buffered_notification_bytes.saturating_add(wire_bytes);
+                    if buffered_notification_bytes > MAX_BUFFERED_NOTIFICATION_BYTES {
+                        let error = Error::invalid_request()
+                            .data("ACP session notifications exceeded their byte budget");
+                        let _ = peer
+                            .respond::<serde_json::Value>(
+                                serde_json::Value::Null,
+                                Err(error.clone()),
+                            )
+                            .await;
+                        return Err(error);
+                    }
+                    let notification = decode(params)?;
                     notifications
                         .lock()
                         .map_err(|_| {
                             Error::internal_error().data("debug notification lock poisoned")
                         })?
-                        .push(decode(params)?);
+                        .push(notification);
                 }
                 ("session/request_permission", Some(id)) => {
                     let result = decode(params).map(|request| permissions.decide(request));
@@ -376,6 +398,25 @@ impl DebugClient {
     }
 
     /// Executes initialize, setup, list, optional mode, prompt, and close operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpInteropError::Timeout`] when the whole scripted
+    /// interaction — including an `initialize` the agent never answers —
+    /// outlives [`DebugClientConfig::timeout`].
+    ///
+    /// Returns [`AcpInteropError::Protocol`] when the agent executable cannot
+    /// be spawned or its stdio was not piped, when the agent selects a
+    /// protocol version other than [`ProtocolVersion::V1`], when `request`
+    /// carries both `load_session` and `resume_session`, when the agent
+    /// answers a request with a JSON-RPC error or an undecodable result, when
+    /// the agent streams more notification bytes than one run may buffer, and
+    /// when the agent exits or closes its stdout while a request is still
+    /// outstanding.
+    ///
+    /// Returns [`AcpInteropError::Lifecycle`] when the killed process tree
+    /// does not exit within the cleanup deadline, or when a notification
+    /// handler panicked and poisoned the notification buffer.
     pub async fn run(&self, request: DebugRunRequest) -> Result<DebugRunResult> {
         let agent = ProcessTreeAcpAgent {
             command: self.config.command.clone(),
@@ -396,7 +437,7 @@ impl DebugClient {
                 .request(
                     "initialize",
                     InitializeRequest::new(ProtocolVersion::V1).client_info(
-                        schema::Implementation::new(
+                        schema_v1::Implementation::new(
                             "gta-claw-acp-debug",
                             env!("CARGO_PKG_VERSION"),
                         ),

@@ -16,7 +16,7 @@ use claw_protocol::gateway::{
     NegotiationState, RequestId, Role,
 };
 
-fn preauth() -> Codec {
+const fn preauth() -> Codec {
     Codec::preauthentication()
 }
 
@@ -102,7 +102,7 @@ fn hello_payload(role: &str) -> HelloOk {
         .expect("the hello payload decodes")
 }
 
-fn accepted(role: Role, device_proof: DeviceProofDecision) -> AuthenticationDecision {
+const fn accepted(role: Role, device_proof: DeviceProofDecision) -> AuthenticationDecision {
     AuthenticationDecision::Accepted {
         role,
         scopes: Vec::new(),
@@ -221,27 +221,26 @@ fn the_node_window_is_exactly_one_version_wide() {
 
     for (min, max, expected) in CASES {
         let (negotiation, outcome) = negotiate(min, max, "node-host", "node", Some("node"), true);
-        match expected {
-            Some(mode) => assert_eq!(
+        if let Some(mode) = expected {
+            assert_eq!(
                 outcome.expect("the range is inside the admitted set"),
                 mode,
                 "node range {min}..={max} selected the wrong compatibility path"
-            ),
-            None => {
-                let error = outcome.expect_err("the range is outside the admitted set");
-                assert!(
-                    matches!(error, NegotiationError::Rejected(_)),
-                    "node range {min}..={max} must fail as a typed rejection, got {error:?}"
-                );
-                assert_eq!(
-                    negotiation
-                        .rejection()
-                        .expect("the rejection is recorded")
-                        .code(),
-                    ConnectErrorDetailCode::ProtocolMismatch,
-                    "node range {min}..={max} must be refused as a protocol mismatch"
-                );
-            }
+            );
+        } else {
+            let error = outcome.expect_err("the range is outside the admitted set");
+            assert!(
+                matches!(error, NegotiationError::Rejected(_)),
+                "node range {min}..={max} must fail as a typed rejection, got {error:?}"
+            );
+            assert_eq!(
+                negotiation
+                    .rejection()
+                    .expect("the rejection is recorded")
+                    .code(),
+                ConnectErrorDetailCode::ProtocolMismatch,
+                "node range {min}..={max} must be refused as a protocol mismatch"
+            );
         }
     }
 }
@@ -357,6 +356,9 @@ fn the_window_refuses_a_role_it_did_not_admit() {
 
 #[test]
 fn the_probe_window_mirrors_the_node_window_but_needs_full_probe_identity() {
+    // Half a probe identity is not a probe.
+    const HALF: [(&str, &str); 2] = [("openclaw-probe", "cli"), ("cli", "probe")];
+
     let (mut probe, outcome) = negotiate(3, 3, "openclaw-probe", "probe", None, false);
     assert_eq!(
         outcome.expect("a probe product in probe mode may offer v3"),
@@ -367,8 +369,6 @@ fn the_probe_window_mirrors_the_node_window_but_needs_full_probe_identity() {
         .expect("a probe authenticates as an operator");
     assert_eq!(probe.state(), NegotiationState::Authenticated);
 
-    // Half a probe identity is not a probe.
-    const HALF: [(&str, &str); 2] = [("openclaw-probe", "cli"), ("cli", "probe")];
     for (id, mode) in HALF {
         let (negotiation, outcome) = negotiate(3, 3, id, mode, None, false);
         assert!(

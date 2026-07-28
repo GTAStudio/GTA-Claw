@@ -24,6 +24,19 @@ require_macos() {
   [[ "$(uname -s)" == "Darwin" ]] || die "this operation requires macOS"
 }
 
+assert_pinned_rust_toolchain() {
+  local rustc_version
+  local cargo_version
+  rustc_version="$(rustc --version 2>/dev/null)" ||
+    die "rustc is unavailable; install Rust $PINNED_RUST_VERSION with rustup"
+  cargo_version="$(cargo --version 2>/dev/null)" ||
+    die "cargo is unavailable; install Rust $PINNED_RUST_VERSION with rustup"
+  [[ "$rustc_version" == "rustc $PINNED_RUST_VERSION "* ]] ||
+    die "rustc $PINNED_RUST_VERSION is required (found: $rustc_version); run: rustup toolchain install $PINNED_RUST_VERSION"
+  [[ "$cargo_version" == "cargo $PINNED_RUST_VERSION "* ]] ||
+    die "cargo $PINNED_RUST_VERSION is required (found: $cargo_version); run: rustup toolchain install $PINNED_RUST_VERSION"
+}
+
 validate_bundle_id() {
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9-]*(\.[A-Za-z0-9][A-Za-z0-9-]*)+$ ]] ||
     die "invalid bundle identifier: $1"
@@ -257,11 +270,172 @@ safe_reset_dir() {
   ensure_output_directory "$path"
 }
 
+try_remove_output_directory() {
+  local path="$1"
+  local target
+  assert_output_path "$path"
+  [[ "$path" != "$OUTPUT_ROOT" ]] || die "refusing to remove OUTPUT_ROOT itself"
+  target="$(canonical_target_root)"
+  assert_no_symlink_components "$target" "$path"
+  [[ ! -L "$path" ]] || die "refusing to delete a symlink: $path"
+  rm -rf -- "$path" || return 1
+  assert_output_path "$path"
+  [[ ! -e "$path" && ! -L "$path" ]]
+}
+
+remove_output_directory() {
+  local path="$1"
+  try_remove_output_directory "$path" ||
+    die "failed to remove output directory: $path"
+}
+
+publish_output_directory() {
+  local candidate="$1"
+  local destination="$2"
+  local rollback="$destination.rollback"
+  local had_destination=0
+  for path in "$candidate" "$destination" "$rollback"; do
+    assert_output_path "$path"
+  done
+  [[ "$candidate" != "$destination" && "$candidate" != "$rollback" ]] ||
+    die "publication candidate must be distinct from its destination"
+  [[ -d "$candidate" && ! -L "$candidate" ]] ||
+    die "publication candidate is not a real directory: $candidate"
+
+  # Recover the only two states left by an interrupted directory rename.
+  if [[ -e "$rollback" || -L "$rollback" ]]; then
+    [[ -d "$rollback" && ! -L "$rollback" ]] ||
+      die "publication rollback path is not a real directory: $rollback"
+    if [[ -e "$destination" || -L "$destination" ]]; then
+      [[ -d "$destination" && ! -L "$destination" ]] ||
+        die "publication destination is not a real directory: $destination"
+      remove_output_directory "$rollback"
+    else
+      mv -- "$rollback" "$destination" ||
+        die "failed to restore interrupted publication at $destination"
+      note "restored the previous publication after an interrupted update"
+    fi
+  fi
+
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    [[ -d "$destination" && ! -L "$destination" ]] ||
+      die "publication destination is not a real directory: $destination"
+    mv -- "$destination" "$rollback" ||
+      die "failed to reserve the previous publication for rollback"
+    had_destination=1
+  fi
+  if ! mv -- "$candidate" "$destination"; then
+    if [[ "$had_destination" -eq 1 ]]; then
+      mv -- "$rollback" "$destination" ||
+        die "publication failed and the previous publication could not be restored"
+    fi
+    die "failed to publish validated output directory: $destination"
+  fi
+  if [[ "$had_destination" -eq 1 ]]; then
+    # The destination rename is the commit point. Cleanup cannot turn a
+    # successfully published candidate into a reported failure.
+    if ! (try_remove_output_directory "$rollback"); then
+      printf 'warning: published %s but could not confirm removal of previous output at %s; the next publication will retry any stale cleanup before replacing the destination\n' \
+        "$destination" "$rollback" >&2
+    fi
+  fi
+}
+
 reject_symlinks() {
   local root="$1"
   local link
   link="$(find "$root" -type l -print -quit)"
   [[ -z "$link" ]] || die "symlinks are not permitted in staged content: $link"
+}
+
+copy_app_bundle() {
+  local source="$1"
+  local destination="$2"
+  [[ -d "$source" && "$source" == *.app && ! -L "$source" ]] ||
+    die "invalid source app bundle: $source"
+  assert_output_path "$destination"
+  [[ ! -e "$destination" && ! -L "$destination" ]] ||
+    die "app copy destination already exists: $destination"
+  COPYFILE_DISABLE=1 ditto --noextattr --noqtn --noacl "$source" "$destination"
+  [[ -d "$destination" && ! -L "$destination" ]] ||
+    die "failed to copy app bundle to $destination"
+  reject_symlinks "$destination"
+}
+
+assert_flat_publication_allowlist() {
+  local root="$1"
+  local allowed="$2"
+  local entry
+  local name
+  local actual=""
+  local expected
+  [[ -d "$root" && ! -L "$root" ]] || die "invalid publication directory: $root"
+  while IFS= read -r -d '' entry; do
+    [[ -f "$entry" && ! -L "$entry" ]] ||
+      die "published macOS root contains a non-file entry: $(basename "$entry")"
+    name="$(basename "$entry")"
+    actual+="$name"$'\n'
+  done < <(find "$root" -mindepth 1 -maxdepth 1 -print0)
+  actual="$(sed '/^$/d' <<<"$actual" | LC_ALL=C sort)"
+  expected="$(sed '/^$/d' <<<"$allowed" | LC_ALL=C sort)"
+  [[ "$actual" == "$expected" ]] ||
+    die "published macOS root differs from its exact file allowlist"
+}
+
+write_pkg_component_plist() {
+  local output="$1"
+  assert_output_file_slot "$output"
+  cat >"$output" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+<dict>
+	<key>RootRelativeBundlePath</key>
+	<string>Applications/$APP_NAME.app</string>
+	<key>BundleIsRelocatable</key>
+	<false/>
+	<key>BundleIsVersionChecked</key>
+	<false/>
+	<key>BundleHasStrictIdentifier</key>
+	<true/>
+	<key>BundleOverwriteAction</key>
+	<string>upgrade</string>
+</dict>
+</array>
+</plist>
+EOF
+  plutil -lint "$output" >/dev/null || die "generated PKG component property list is invalid"
+}
+
+assert_expanded_pkg_install_contract() {
+  local expanded="$1"
+  local package_info
+  local package_infos=()
+  while IFS= read -r -d '' package_info; do
+    package_infos+=("$package_info")
+  done < <(find "$expanded" -type f -name PackageInfo -print0)
+  [[ "${#package_infos[@]}" -eq 1 ]] ||
+    die "PKG must contain exactly one component PackageInfo"
+  package_info="${package_infos[0]}"
+  grep -E '<pkg-info .*relocatable="false"' "$package_info" >/dev/null ||
+    die "PKG app must not relocate outside /Applications"
+  grep -E "identifier=\"$BUNDLE_ID\\.pkg\\.component\"" "$package_info" >/dev/null ||
+    die "PKG component identifier differs from the install contract"
+  grep -E 'install-location="/"' "$package_info" >/dev/null ||
+    die "PKG install location differs from the root contract"
+  awk -v id="$BUNDLE_ID" '
+    /<upgrade-bundle>/ { in_upgrade = 1; next }
+    /<\/upgrade-bundle>/ { in_upgrade = 0 }
+    in_upgrade && index($0, "id=\"" id "\"") { found = 1 }
+    END { exit !found }
+  ' "$package_info" || die "PKG does not replace an existing app during upgrade"
+  awk -v id="$BUNDLE_ID" '
+    /<strict-identifier>/ { in_strict = 1; next }
+    /<\/strict-identifier>/ { in_strict = 0 }
+    in_strict && index($0, "id=\"" id "\"") { found = 1 }
+    END { exit !found }
+  ' "$package_info" || die "PKG does not enforce the app bundle identifier during upgrade"
 }
 
 assert_no_javascript_payload() {
@@ -371,6 +545,7 @@ write_artifact_supply_chain() {
   local artifact="$1"
   local component_set="$2"
   local rust_targets="$3"
+  local package_inventory_cache="${4:-}"
   local artifact_name
   local artifact_hash
   local source_revision
@@ -410,21 +585,11 @@ write_artifact_supply_chain() {
       ;;
   esac
 
-  {
-    printf 'SPDXVersion: SPDX-2.3\n'
-    printf 'DataLicense: CC0-1.0\n'
-    printf 'SPDXID: SPDXRef-DOCUMENT\n'
-    printf 'DocumentName: %s SBOM\n' "$artifact_name"
-    printf 'DocumentNamespace: https://github.com/GTAStudio/GTA-Claw/releases/sbom/%s\n' "$artifact_hash"
-    printf 'Creator: Tool: GTA-Claw-macOS-Packaging\n'
-    printf 'Created: 2000-01-01T00:00:00Z\n'
-    printf 'DocumentDescribes: SPDXRef-Artifact\n\n'
-    printf 'FileName: ./%s\n' "$artifact_name"
-    printf 'SPDXID: SPDXRef-Artifact\n'
-    printf 'FileChecksum: SHA256: %s\n' "$artifact_hash"
-    printf 'LicenseConcluded: NOASSERTION\n'
-    printf 'CopyrightText: NOASSERTION\n'
-
+  normalized_packages=""
+  if [[ -n "$package_inventory_cache" && -f "$package_inventory_cache" &&
+    ! -L "$package_inventory_cache" ]]; then
+    normalized_packages="$(cat "$package_inventory_cache")"
+  else
     tree=""
     while IFS= read -r target_label; do
       case "$target_label" in
@@ -445,18 +610,41 @@ write_artifact_supply_chain() {
           --locked --offline --prefix none --format '{p}')"$'\n'
       fi
     done < <(tr ' ' '\n' <<<"$rust_targets" | sed '/^$/d')
-    normalized_packages=""
     while IFS= read -r package; do
       [[ "$package" =~ ^([^[:space:]]+)[[:space:]]v([^[:space:]]+) ]] || continue
       name="${BASH_REMATCH[1]}"
       version="${BASH_REMATCH[2]}"
       normalized_packages+="$name $version"$'\n'
     done <<<"$tree"
+    normalized_packages="$(sed '/^$/d' <<<"$normalized_packages" | LC_ALL=C sort -u)"
+    if [[ -n "$package_inventory_cache" ]]; then
+      assert_output_file_slot "$package_inventory_cache"
+      printf '%s\n' "$normalized_packages" >"$package_inventory_cache"
+    fi
+  fi
+  [[ -n "$normalized_packages" ]] ||
+    die "Cargo package inventory is empty for $artifact"
+
+  {
+    printf 'SPDXVersion: SPDX-2.3\n'
+    printf 'DataLicense: CC0-1.0\n'
+    printf 'SPDXID: SPDXRef-DOCUMENT\n'
+    printf 'DocumentName: %s SBOM\n' "$artifact_name"
+    printf 'DocumentNamespace: https://github.com/GTAStudio/GTA-Claw/releases/sbom/%s\n' "$artifact_hash"
+    printf 'Creator: Tool: GTA-Claw-macOS-Packaging\n'
+    printf 'Created: 2000-01-01T00:00:00Z\n'
+    printf 'DocumentDescribes: SPDXRef-Artifact\n\n'
+    printf 'FileName: ./%s\n' "$artifact_name"
+    printf 'SPDXID: SPDXRef-Artifact\n'
+    printf 'FileChecksum: SHA256: %s\n' "$artifact_hash"
+    printf 'LicenseConcluded: NOASSERTION\n'
+    printf 'CopyrightText: NOASSERTION\n'
+
     write_spdx_package_inventory "$normalized_packages"
   } >"$sbom"
 
   printf '%s\n' \
-    "{\"_type\":\"https://in-toto.io/Statement/v1\",\"subject\":[{\"name\":\"$artifact_name\",\"digest\":{\"sha256\":\"$artifact_hash\"}}],\"predicateType\":\"https://slsa.dev/provenance/v1\",\"predicate\":{\"buildDefinition\":{\"buildType\":\"https://github.com/GTAStudio/GTA-Claw/packaging/macos/v1\",\"externalParameters\":{\"componentSet\":\"$component_set\",\"profile\":\"release\",\"rustTargets\":\"$rust_targets\",\"offline\":true},\"internalParameters\":{},\"resolvedDependencies\":[$resolved_dependencies]},\"runDetails\":{\"builder\":{\"id\":\"https://github.com/GTAStudio/GTA-Claw/.github/workflows/macos-packaging.yml\"},\"metadata\":{\"invocationId\":\"$source_revision\"}}}}" \
+    "{\"_type\":\"https://in-toto.io/Statement/v1\",\"subject\":[{\"name\":\"$artifact_name\",\"digest\":{\"sha256\":\"$artifact_hash\"}}],\"predicateType\":\"https://slsa.dev/provenance/v1\",\"predicate\":{\"buildDefinition\":{\"buildType\":\"https://github.com/GTAStudio/GTA-Claw/packaging/macos/v1\",\"externalParameters\":{\"componentSet\":\"$component_set\",\"cargoProfile\":\"release\",\"rustTargets\":\"$rust_targets\"},\"internalParameters\":{},\"resolvedDependencies\":[$resolved_dependencies]},\"runDetails\":{\"builder\":{\"id\":\"https://github.com/GTAStudio/GTA-Claw/.github/workflows/macos-packaging.yml\"},\"metadata\":{\"invocationId\":\"$source_revision\"}}}}" \
     >"$provenance"
   test_artifact_supply_chain "$artifact"
 }

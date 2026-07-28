@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 claw-application.workspace = true
 claw-gateway-client.workspace = true
+claw-observability.workspace = true
 claw-platform.workspace = true
 claw-protocol.workspace = true
 claw-security.workspace = true
@@ -18,7 +19,7 @@ ring = "=0.17.14"
 secrecy = "=0.10.3"
 serde.workspace = true
 serde_json.workspace = true
-tokio = { version = "=1.52.3", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "=1.53.1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
 url = "=2.5.8"
 zeroize = "=1.9.0"
 
@@ -28,7 +29,7 @@ fastwebsockets = { version = "=0.10.0", default-features = false, features = ["u
 httparse = "=1.10.1"
 os_pipe = "=1.2.3"
 sha1 = "=0.11.0"
-tokio-util = { version = "=0.7.18", features = ["rt"] }
+tokio-util = { version = "=0.7.19", features = ["rt"] }
 
 [lints]
 workspace = true

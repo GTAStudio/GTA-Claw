@@ -5,31 +5,17 @@ use std::fmt::{self, Display, Formatter};
 
 use claw_protocol::{ClientCommand, PROTOCOL_VERSION, RuntimeDescriptor, ServerEvent};
 
-/// Process-wiring machinery for binaries that compose subsystems.
-///
-/// Gated behind the `composition` feature. Front-ends that link this crate
-/// only for [`Application`] and [`SystemProbe`] therefore do not inherit
-/// `claw-domain`, `secrecy` or `url`.
-///
-/// `test` is in the gate as well as the feature so that `cargo test -p
-/// claw-application` compiles and runs the composition suite instead of
-/// silently reporting success over 123 skipped tests. Under `cfg(test)` the
-/// three crates are supplied by dev-dependencies, which are not resolved into
-/// dependent lockfiles, so the gate costs consumers nothing.
+// Each module is gated so that front-ends linking this crate only for
+// `Application` and `SystemProbe` do not inherit `claw-domain`, `secrecy` or
+// `url`; the rationale is documented on the modules themselves. These are
+// deliberately plain comments rather than doc comments: an outer doc comment on
+// a `mod` declaration makes rustdoc resolve every link in that module's own
+// `//!` documentation against *this* module's scope instead of the module's,
+// which silently breaks all of them.
 #[cfg(any(feature = "composition", test))]
 pub mod composition;
-/// Domain model shared by the agent runtime's ports.
-///
-/// Gated behind the `runtime-ports` feature so that front-ends linking this
-/// crate only for [`Application`] and [`SystemProbe`] do not inherit
-/// `claw-domain`. `test` is in the gate as well so `cargo test -p
-/// claw-application` still compiles and runs the suite rather than reporting
-/// success over skipped tests.
 #[cfg(any(feature = "runtime-ports", test))]
 pub mod model;
-/// Port traits the agent runtime requires of its adapters.
-///
-/// Gated behind the `runtime-ports` feature; see [`model`].
 #[cfg(any(feature = "runtime-ports", test))]
 pub mod ports;
 
@@ -89,6 +75,23 @@ where
     }
 
     /// Executes one typed command.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplicationError::Unsupported`] for [`ClientCommand::Submit`],
+    /// because a bare `Application` is composed without a message transport:
+    /// there is nowhere to put the submitted turn. This is a wiring fault, not
+    /// a transient one — resending the same command cannot succeed, and the
+    /// caller has to be pointed at a composed daemon instead. Retrying is
+    /// pointless; the process should surface the error and carry on serving the
+    /// commands it can. [`ClientCommand::Health`] is answered from the
+    /// [`SystemProbe`] and never fails.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "this is the command-dispatch entry point: it takes ownership so that a \
+                  transport can move `Submit`'s payload out of the command instead of \
+                  cloning it, and `gta-claw-cli` and `gta-claw-ios` already call it by value"
+    )]
     pub fn handle(&self, command: ClientCommand) -> Result<ServerEvent, ApplicationError> {
         match command {
             ClientCommand::Health => Ok(self.health()),

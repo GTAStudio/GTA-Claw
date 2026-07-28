@@ -12,6 +12,12 @@ pub struct ExtensionId(String);
 
 impl ExtensionId {
     /// Parses a canonical 32-character Chrome extension ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EndpointError::InvalidExtensionId`] when the value is not
+    /// exactly 32 bytes drawn from `a`–`p`, the alphabet Chrome derives an
+    /// extension ID from.
     pub fn new(value: impl Into<String>) -> Result<Self, EndpointError> {
         let value = value.into();
         if value.len() == 32 && value.bytes().all(|byte| (b'a'..=b'p').contains(&byte)) {
@@ -34,6 +40,12 @@ pub struct RelayToken([u8; 32]);
 
 impl RelayToken {
     /// Decodes the exact 64-lowercase-hex token format used by upstream pairing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EndpointError::InvalidToken`] when the value is not exactly 64
+    /// characters long or carries anything outside `0`–`9` and `a`–`f`.
+    /// Uppercase hex is refused too, so one secret has exactly one encoding.
     pub fn from_hex(value: &str) -> Result<Self, EndpointError> {
         if value.len() != 64 {
             return Err(EndpointError::InvalidToken);
@@ -61,7 +73,7 @@ impl Debug for RelayToken {
     }
 }
 
-fn decode_hex(byte: u8) -> Option<u8> {
+const fn decode_hex(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -145,6 +157,14 @@ pub struct RelayEndpoint {
 
 impl RelayEndpoint {
     /// Creates an endpoint with explicit extension allowlist and resource bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EndpointError::EmptyExtensionAllowlist`] when no extension ID
+    /// was supplied, because an empty allowlist would admit nothing and hide the
+    /// misconfiguration behind a generic authentication failure at connect time.
+    /// Returns [`EndpointError::InvalidBound`] when `max_frame_bytes` or
+    /// `max_connections` is zero, which would make the endpoint unusable.
     pub fn new(
         token: RelayToken,
         allowed_extensions: impl IntoIterator<Item = ExtensionId>,
@@ -169,6 +189,13 @@ impl RelayEndpoint {
     }
 
     /// Authenticates and admits one upgrade.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`RelayEndpoint::negotiate`], which this
+    /// calls: a non-loopback `Host`, an unknown path, an exhausted connection
+    /// bound, a missing or forged extension origin, a subprotocol offer the
+    /// relay does not speak, or a secret that does not match the relay token.
     pub fn accept(&mut self, request: &UpgradeRequest) -> Result<ConnectionId, EndpointError> {
         self.negotiate(request).map(|accepted| accepted.connection)
     }
@@ -180,6 +207,32 @@ impl RelayEndpoint {
     /// and nothing else, and the CDP path — which Playwright dials with no
     /// subprotocol at all — refuses every offer. Selection never returns the
     /// token subprotocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EndpointError::NonLoopbackHost`] when the `Host` header does
+    /// not name loopback, [`EndpointError::ConnectionLimit`] when the endpoint
+    /// already holds `max_connections` connections,
+    /// [`EndpointError::UnknownPath`] for any path other than `/extension` or
+    /// `/cdp`, and [`EndpointError::ConnectionIdExhausted`] once the
+    /// process-local ordinal would wrap.
+    ///
+    /// On `/extension` it additionally returns
+    /// [`EndpointError::MissingExtensionOrigin`] or
+    /// [`EndpointError::ForgedOrigin`] for an absent or non-extension `Origin`,
+    /// [`EndpointError::UnknownExtension`] when the extension ID is not
+    /// allowlisted, [`EndpointError::MissingRelaySubprotocol`] when the relay
+    /// subprotocol was not offered, [`EndpointError::UnsupportedSubprotocol`]
+    /// when the offer carries a subprotocol the relay does not speak,
+    /// [`EndpointError::DuplicateTokenSubprotocol`] when two token
+    /// subprotocols were offered, and [`EndpointError::AuthenticationFailed`]
+    /// when the offered secret does not match.
+    ///
+    /// On `/cdp` it additionally returns
+    /// [`EndpointError::CdpOriginForbidden`] when a browser `Origin` is
+    /// present, [`EndpointError::UnsupportedSubprotocol`] for any subprotocol
+    /// offer at all, and [`EndpointError::AuthenticationFailed`] when the
+    /// `Authorization` credential is absent or does not match.
     pub fn negotiate(
         &mut self,
         request: &UpgradeRequest,
@@ -187,7 +240,7 @@ impl RelayEndpoint {
         if !is_loopback_authority(&request.host) {
             return Err(EndpointError::NonLoopbackHost);
         }
-        if self.connections.len() == self.max_connections {
+        if self.connections.len() >= self.max_connections {
             return Err(EndpointError::ConnectionLimit);
         }
         let (peer, subprotocol) = match request.path.as_str() {
@@ -221,6 +274,12 @@ impl RelayEndpoint {
     }
 
     /// Removes one connection without affecting any other connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EndpointError::UnknownConnection`] when the identity was never
+    /// admitted or has already been closed, so a double close is reported
+    /// rather than silently freeing a slot twice.
     pub fn close(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
         self.connections
             .remove(&id)

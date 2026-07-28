@@ -127,7 +127,7 @@ impl AnchoredContext {
 
     /// Returns the number of droppable items held.
     #[must_use]
-    pub fn item_count(&self) -> usize {
+    pub const fn item_count(&self) -> usize {
         self.items.len()
     }
 

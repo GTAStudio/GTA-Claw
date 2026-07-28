@@ -16,6 +16,18 @@ pub struct HostAllowlist {
 
 impl HostAllowlist {
     /// Validates and canonicalizes exact host entries.
+    ///
+    /// # Errors
+    ///
+    /// - [`TargetError::InvalidHost`] when an entry is neither a parsable IP
+    ///   literal nor a DNS name of one to 253 bytes with at least one dot and
+    ///   labels of one to 63 alphanumeric-or-hyphen bytes that neither start
+    ///   nor end with a hyphen.
+    /// - [`TargetError::BlockedHost`] when an entry is `localhost` or ends in
+    ///   `.localhost`.
+    /// - [`TargetError::BlockedAddress`] when an IP-literal entry is in a
+    ///   loopback, private, link-local, or otherwise special-use range;
+    ///   allowlisting one would defeat the point of the allowlist.
     pub fn new<I, S>(hosts: I) -> Result<Self, TargetError>
     where
         I: IntoIterator<Item = S>,
@@ -28,6 +40,7 @@ impl HostAllowlist {
         Ok(Self { hosts })
     }
 
+    #[must_use = "an ignored allowlist check silently admits an unlisted host"]
     fn contains(&self, host: &str) -> bool {
         self.hosts.contains(host)
     }
@@ -93,6 +106,17 @@ impl ValidatedTarget {
     ///
     /// Call this for every connection attempt, not only during configuration,
     /// so DNS rebinding cannot reuse a prior result.
+    ///
+    /// # Errors
+    ///
+    /// - [`ResolutionError::NoAddresses`] when `addresses` is empty; an empty
+    ///   answer is a refusal, never an implicit pass.
+    /// - [`ResolutionError::BlockedAddress`] when *any* answer is loopback,
+    ///   private, link-local, or otherwise special-use. Every address is
+    ///   checked, because a transport may fall back to any of them.
+    /// - [`ResolutionError::LiteralAddressMismatch`] when the target is an IP
+    ///   literal and an answer is a different address.
+    #[must_use = "an ignored resolution check leaves the connection open to DNS rebinding"]
     pub fn validate_resolution(&self, addresses: &[IpAddr]) -> Result<(), ResolutionError> {
         if addresses.is_empty() {
             return Err(ResolutionError::NoAddresses);
@@ -110,6 +134,31 @@ impl ValidatedTarget {
 }
 
 /// Parses, canonicalizes, and validates one HTTP(S) destination.
+///
+/// # Errors
+///
+/// - [`TargetError::InvalidUrl`] when `input` contains whitespace or control
+///   characters, has no `://`, or the URL parser rejects it.
+/// - [`TargetError::UnsupportedScheme`] for any scheme other than `http` or
+///   `https`, checked on the raw text as well as the parsed URL.
+/// - [`TargetError::MissingHost`] when the authority is empty.
+/// - [`TargetError::UserInfoForbidden`] when the authority carries `@` or the
+///   parsed URL has a username or password, which could disguise the real host.
+/// - [`TargetError::FragmentForbidden`] when the URL carries a fragment.
+/// - [`TargetError::AmbiguousIpLiteral`] when the authority is percent-encoded,
+///   or the host is a decimal/octal/hexadecimal shorthand for an address that
+///   is not a canonical dotted quad.
+/// - [`TargetError::InvalidHost`] when the DNS name fails the label rules, or
+///   an unbracketed authority contains more than one colon.
+/// - [`TargetError::BlockedHost`] when the host is `localhost` or ends in
+///   `.localhost`.
+/// - [`TargetError::BlockedAddress`] when an IP-literal host is loopback,
+///   private, link-local, or otherwise special-use.
+/// - [`TargetError::InvalidPort`] when the port text is empty, not all digits,
+///   zero, or the scheme has no default.
+/// - [`TargetError::HostNotAllowlisted`] when `policy` is
+///   [`TargetPolicy::ExactHosts`] and the canonical host is not an exact
+///   member; no suffix or subdomain matching is implied.
 pub fn validate_target(input: &str, policy: &TargetPolicy) -> Result<ValidatedTarget, TargetError> {
     validate_raw_authority(input)?;
     if input.chars().any(char::is_whitespace) || input.chars().any(char::is_control) {
@@ -163,6 +212,14 @@ pub fn validate_target(input: &str, policy: &TargetPolicy) -> Result<ValidatedTa
 /// Resolves and revalidates a redirect destination without performing I/O.
 ///
 /// The returned target still requires `validate_resolution` on every DNS answer.
+///
+/// # Errors
+///
+/// Returns [`TargetError::InvalidUrl`] when `current` no longer parses or when
+/// `location` cannot be joined onto it. Otherwise the joined destination is put
+/// through [`validate_target`] from scratch and can fail with any of its
+/// errors: a redirect gets no credit for the hop that produced it, so it cannot
+/// be used to reach a blocked address or an unlisted host.
 pub fn validate_redirect(
     current: &ValidatedTarget,
     location: &str,
@@ -291,6 +348,7 @@ fn validate_public_address(address: IpAddr) -> Result<(), TargetError> {
     }
 }
 
+#[must_use = "an ignored address check silently permits a private-range connection"]
 fn blocked_ipv4(address: Ipv4Addr) -> bool {
     let [a, b, c, _d] = address.octets();
     a == 0
@@ -309,6 +367,7 @@ fn blocked_ipv4(address: Ipv4Addr) -> bool {
         || a >= 224
 }
 
+#[must_use = "an ignored address check silently permits a private-range connection"]
 fn blocked_ipv6(address: Ipv6Addr) -> bool {
     let segments = address.segments();
     address.is_unspecified()

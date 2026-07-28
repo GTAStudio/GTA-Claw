@@ -5,9 +5,9 @@
 //! credentials and safe config. Every fixture is rooted in a temporary
 //! directory and drives discovery through injected platform paths, so no test
 //! here can read or write a real `~/.claude`.
-#![allow(missing_docs)]
 
 use std::fs;
+use std::path::Path;
 
 use claw_migrate::{
     ApplyContext, ClaudeMigrationProvider, DetectionConfidence, HostPlatform, MigrationProvider,
@@ -401,7 +401,11 @@ fn claude_excludes_plugins_and_runtime_state_instead_of_copying_them() {
             "{excluded} reached the migration target: {migrated:?}"
         );
     }
-    assert!(!migrated.iter().any(|path| path.ends_with(".js")));
+    assert!(!migrated.iter().any(|path| {
+        Path::new(path)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("js"))
+    }));
     assert_eq!(
         leaks(&target, "claude-snapshot-plaintext"),
         Vec::<String>::new()

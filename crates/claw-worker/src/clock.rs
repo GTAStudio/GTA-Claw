@@ -49,6 +49,11 @@ impl ManualClock {
     }
 
     /// Advances the clock and returns the new value, saturating at [`u64::MAX`].
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "advancing the shared counter is the point of the call; the new instant is a \
+                  convenience that callers who only need to move time legitimately drop"
+    )]
     pub fn advance(&self, millis: u64) -> u64 {
         let mut current = self.millis.load(Ordering::SeqCst);
         loop {

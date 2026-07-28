@@ -4,8 +4,6 @@
 //! against the public API a caller actually has, because the audit's point was
 //! that the previous design let ordinary configuration reach a bad outcome.
 
-#![allow(clippy::literal_string_with_formatting_args)]
-
 use claw_provider_sdk::error::ErrorKind;
 use claw_provider_sdk::http::{Body, HttpRequest, HttpResponse, Method};
 use claw_provider_sdk::origin::{
@@ -32,7 +30,7 @@ fn url(text: &str) -> Url {
 // ---------------------------------------------------------------------------
 
 /// The exact attack from HIGH 2: keep `provider = openai`, keep the stored
-/// OpenAI key, swap only the base URL.
+/// `OpenAI` key, swap only the base URL.
 #[test]
 fn an_openai_key_cannot_be_redirected_to_an_attacker_origin() {
     let error = OpenAiCompatible::from_registry(

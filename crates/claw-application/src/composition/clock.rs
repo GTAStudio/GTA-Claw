@@ -43,7 +43,7 @@ impl MonotonicInstant {
 
     /// Returns how much later `self` is than `earlier`, saturating at zero.
     #[must_use]
-    pub fn saturating_since(self, earlier: Self) -> Duration {
+    pub const fn saturating_since(self, earlier: Self) -> Duration {
         self.0.saturating_sub(earlier.0)
     }
 }

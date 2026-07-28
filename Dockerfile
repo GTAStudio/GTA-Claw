@@ -1,5 +1,5 @@
 # ---- Build Stage ----
-FROM node:20-bookworm-slim AS builder
+FROM node:26-bookworm-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   build-essential \
@@ -30,7 +30,7 @@ RUN npm run build 2>&1 || \
 RUN npm prune --omit=dev
 
 # ---- Production Stage ----
-FROM node:20-bookworm-slim
+FROM node:26-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   curl \
@@ -53,7 +53,7 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./
 
-# Required for isolated-vm on Node 20+
+# Required for isolated-vm on Node 26+
 ENV NODE_OPTIONS="--no-node-snapshot"
 ENV COPILOT_CLI_PATH="/usr/local/bin/copilot"
 

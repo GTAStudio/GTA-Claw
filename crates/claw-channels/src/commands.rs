@@ -10,8 +10,8 @@ use claw_channel_sdk::{
     InboundMessage, parse_command,
 };
 
-use crate::descriptor;
 use crate::routing::{RoutingError, supports_inbound};
+use crate::{ChannelDescriptor, descriptor};
 
 /// Commands offered on every inbound-capable official channel.
 ///
@@ -53,16 +53,34 @@ static NO_COMMANDS: [CommandSpec; 0] = [];
 ///
 /// A channel with no inbound implementation offers an empty surface rather than
 /// the common one, because it can never receive the text that would invoke it.
+///
+/// # Errors
+///
+/// Returns [`RoutingError::UnknownChannel`] when `channel_id` is not one of the
+/// 29 frozen official identifiers.
 pub fn command_surface(channel_id: &str) -> Result<&'static [CommandSpec], RoutingError> {
     let entry = descriptor(channel_id).ok_or(RoutingError::UnknownChannel)?;
-    Ok(if supports_inbound(entry) {
+    Ok(surface_of(entry))
+}
+
+fn surface_of(entry: &ChannelDescriptor) -> &'static [CommandSpec] {
+    if supports_inbound(entry) {
         &COMMON_COMMANDS
     } else {
         &NO_COMMANDS
-    })
+    }
 }
 
 /// Returns a validated command registry for one registered channel.
+///
+/// # Errors
+///
+/// - [`RoutingError::UnknownChannel`] when `channel_id` is not one of the 29
+///   frozen official identifiers.
+/// - [`RoutingError::InvalidCommandTable`] when this crate's own command table
+///   fails [`CommandRegistry::new`]. That is a defect in the table above, not
+///   in the caller's input, and it disables commands for the channel rather
+///   than answering them inconsistently.
 pub fn command_registry(channel_id: &str) -> Result<CommandRegistry, RoutingError> {
     CommandRegistry::new(command_surface(channel_id)?)
         .map_err(|_| RoutingError::InvalidCommandTable)
@@ -99,6 +117,21 @@ pub enum InboundOutcome {
 /// `bot_mention` is the addressable name of the account that received the
 /// message, when the provider has one. A `/help@other-bot` invocation is
 /// refused rather than executed.
+///
+/// # Errors
+///
+/// - [`RoutingError::InvalidMessage`] when the message fails common validation,
+///   carrying the exact reason.
+/// - [`RoutingError::UnknownChannel`] when the message names a channel that is
+///   not in the frozen registry.
+/// - [`RoutingError::InboundUnsupported`] when the named channel implements no
+///   inbound direction, so it can offer no commands and classify no text.
+/// - [`RoutingError::InvalidCommandTable`] when this crate's own command table
+///   is malformed.
+///
+/// A command this channel will not run is not an error: it is an
+/// [`InboundOutcome::RejectedCommand`] or [`InboundOutcome::MalformedCommand`],
+/// so the caller can answer the sender instead of dropping the message.
 pub fn classify_inbound(
     message: &InboundMessage,
     bot_mention: Option<&str>,
@@ -108,7 +141,8 @@ pub fn classify_inbound(
     if !supports_inbound(entry) {
         return Err(RoutingError::InboundUnsupported);
     }
-    let registry = command_registry(entry.id)?;
+    let registry =
+        CommandRegistry::new(surface_of(entry)).map_err(|_| RoutingError::InvalidCommandTable)?;
     let text = message.text.as_deref();
     let Some(body) = text.map(str::trim).filter(|body| body.starts_with('/')) else {
         return Ok(InboundOutcome::Conversation {
@@ -126,6 +160,12 @@ pub fn classify_inbound(
 }
 
 /// Renders the help reply for one registered channel.
+///
+/// # Errors
+///
+/// Returns [`RoutingError::UnknownChannel`] when `channel_id` is not one of the
+/// 29 frozen official identifiers. A registered channel that offers no commands
+/// renders a sentence saying so rather than failing.
 pub fn help_text(channel_id: &str) -> Result<String, RoutingError> {
     let specs = command_surface(channel_id)?;
     if specs.is_empty() {

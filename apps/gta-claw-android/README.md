@@ -48,6 +48,7 @@ is what the layering here is for.
 | `src/session.rs` | Attempt ownership (RAII), `GatewayClientConfig` construction |
 | `src/identity.rs` | Session device identity from the platform CSPRNG |
 | `src/controller.rs` | Tokio runtime owning one `GatewayClient`; composition against `claw-application` |
+| `src/platform.rs` | Shell-facing lifecycle/network facts and injectable identity/discovery capabilities |
 
 ## Dependencies
 
@@ -60,6 +61,53 @@ Randomness comes from `ring`'s `SystemRandom` rather than `getrandom`, matching
 no business in an Android dependency graph) and put a second major version of
 `getrandom` in the tree.
 
+## Mobile lifecycle, network and retry policy
+
+The controller retains connection intent separately from a live socket. A shell
+reports activity and connectivity through
+`ControllerHandle::{app_foregrounded, app_backgrounded, network_changed}` and
+updates discovery prerequisites through `discovery_readiness_changed`:
+
+- backgrounding cancels and joins the attempt, then retains the redacted request;
+- an unavailable default network does the same without spending transport retry
+  attempts;
+- foregrounding or restoring a validated network resumes a retained transient
+  attempt once;
+- a changed usable network generation replaces the old socket immediately;
+- duplicate callbacks and metering-only updates do not churn the socket; and
+- authentication, protocol and exhausted-retry failures never revive on an
+  unrelated lifecycle callback. The operator must call `retry`.
+
+`NetworkStatus::Unknown` permits connections so headless callers that have no
+Android connectivity adapter remain compatible. A real Android shell should
+report the initial default-network state and every subsequent change. Android's
+Internet-validation bit remains visible in the snapshot but does not gate a
+connection: an isolated local network can still carry a reachable Gateway.
+
+Every wait is bounded. TCP/TLS/WebSocket opening and authentication each receive
+12 seconds, ordinary requests receive 20 seconds, transport shutdown receives 3
+seconds, and controller-side task joining has a 5-second hard ceiling before
+abort. Transient reconnect uses at most three retries, starting at 750 ms,
+capped at 6 seconds before up to 250 ms of additive jitter. Offline and
+background time is outside that budget because no attempt runs then.
+
+## State a shell can bind directly
+
+`ViewSnapshot` retains the existing rendered strings and adds structured state:
+
+- `ConnectionPhase`, `StatusKind`, `AppLifecycle` and `NetworkStatus`;
+- a monotonic `revision`, process-local ready connection epoch, and explicit
+  pending/busy/control-enable flags;
+- `RetrySnapshot` with the one-based attempt and delay in milliseconds;
+- `RemedySnapshot` with a stable `DiagnosticCode`, `RemedyKind` and action text;
+  and
+- `PlatformCapabilities` describing identity durability and discovery readiness.
+
+The controller publishes only changed snapshots. Duplicate transport states,
+duplicate lifecycle/network reports and stale generations do not trigger a
+binding update. Attempt update delivery is bounded and cancellation-aware, so a
+full controller update queue cannot prevent background shutdown.
+
 ## Authorization
 
 The client requests `Role::Operator` with exactly `[Scope::OperatorRead]` and
@@ -68,9 +116,14 @@ other than what was asked for is rejected rather than accepted and ignored.
 
 ## Credentials and identity
 
-Nothing is persisted. The endpoint and token live in one `ConnectRequest`; the
-token moves into the transport's credential type and drops when the attempt ends.
-`onboarding::CREDENTIAL_NOTICE` states this rather than leaving it assumed.
+The portable implementation persists nothing. The endpoint and token live in
+one redacted `ConnectRequest`, retained in memory only while lifecycle or network
+suspension may resume it. Each transport attempt receives a fresh
+`SecretString`; disconnecting or dropping the controller releases the retained
+request. Issued device tokens are drained and dropped after every distinct ready
+connection epoch so reconnects cannot grow an unconsumed token buffer.
+`ViewSnapshot::credential_notice` states the active policy; `CREDENTIAL_NOTICE`
+is the portable session-only default.
 
 Every type that can carry the endpoint or the token has a hand-written `Debug`
 that redacts both, including the URL path — a path carries a token as easily as a
@@ -122,20 +175,25 @@ configuration through `validate_gateway_profile`, one confirms that adding
 `operator.pairing` is refused, and one reads the ceiling out of the surface
 contract and fails if this client ever silently widens to all of it.
 
-**No Android Keystore integration, and no SSH.** SSH is absent from this crate's
-dependency tree entirely, so its requirement for caller-provisioned key and
-`known_hosts` paths does not arise here. The identity this crate generates is
-held in memory for the life of the process and is never written anywhere, so
-there is nothing yet for a hardware-backed keystore to protect. That is a real
-omission for any future build that persists an identity, and it is deliberate
-only in the sense that persistence has not been implemented.
+**No built-in Android Keystore integration, and no SSH.** SSH is absent from this
+crate's dependency tree entirely, so its requirement for caller-provisioned key
+and `known_hosts` paths does not arise here. `AndroidController::start_with_platform`
+accepts a testable `PlatformFacilities` implementation and distinguishes
+session-only from device-backed identity claims plus locked, invalidated and
+unavailable storage failures. The default `PortablePlatformFacilities` still
+generates one process-local identity. The current shared `DeviceIdentity` cannot
+import a private key or delegate signing to a non-exportable Android key, so a
+real Keystore adapter still needs an external JNI shell and a future signer
+abstraction upstream; this crate does not pretend that the seam alone supplies
+persistence.
 
-**No discovery, and a warning about adding it.** There is no `mdns-sd` here and
-no dependency that pulls it. If discovery is added, note that Android requires
-`CHANGE_WIFI_MULTICAST_STATE` plus a held `WifiManager.MulticastLock`; without
-the lock, discovery returns an empty result set on many devices, which is
-indistinguishable from a quiet network. A missing permission or unheld lock must
-surface as a reported condition, never as zero results.
+**No discovery backend, and explicit preconditions for adding one.** There is no
+`mdns-sd` here and no dependency that pulls it. `DiscoveryReadiness` lets a
+future shell report manual-address-only, permission-required,
+multicast-lock-required, or ready without converting a platform failure into an
+empty result. Android requires `CHANGE_WIFI_MULTICAST_STATE` plus a held
+`WifiManager.MulticastLock`; without the lock, discovery returns an empty result
+set on many devices, which is indistinguishable from a quiet network.
 
 **All four of the above converge on one missing component.** Holding a multicast
 lock, reaching Android Keystore, and hosting an activity at all require JNI, and
@@ -163,20 +221,25 @@ cargo fmt --all -- --check
 Host unit tests cover input policy, redaction, the state machine's generation
 guard, attempt-slot release on future drop, identity generation and its failure
 path, the plaintext opt-in reaching the transport configuration, and the mapping
-from every Gateway handshake detail code to an operator-facing remedy.
+from every Gateway handshake detail code to an operator-facing remedy. They also
+cover foreground/background resume, offline gating, real versus cosmetic network
+changes, terminal-failure retry suppression, cancellation of a queue-blocked
+update, injected platform failures, structured retry/remedy snapshots and
+duplicate-update coalescing.
 
-Tests were run on **Windows 11 x86_64**, rustc/cargo 1.97.0. Local green is a
-property of that machine, not of the product.
+The current 69-test host suite and Clippy pass were run on **macOS
+aarch64-apple-darwin**, rustc/cargo 1.97.0. Local green is a property of that
+machine, not of the product.
 
 The crate cross-compiles for `aarch64-linux-android`, `armv7-linux-androideabi`
-and `x86_64-linux-android` against NDK 30.0.14904198 at API 24, and
-`cargo clippy --target aarch64-linux-android -- -D warnings` is clean. That is a
-compilation result only.
+and `x86_64-linux-android` against NDK 30.0.14904198 at API 24, and `cargo
+clippy -p gta-claw-android --target aarch64-linux-android --all-targets -- -D
+warnings` is clean. That is a compilation result only.
 
-**Nothing here has been executed on Android.** There is no emulator, AVD, system
-image or device on the machine that produced these results, and no CI job builds
-this crate for any Android target. Until a job runs against a real NDK in CI, no
-Android claim in this file should be treated as validated.
+**Nothing here has been executed on Android.** This work used host tests and NDK
+cross-compilation only; it did not launch an emulator or run on a device, and no
+CI job builds this crate for any Android target. Until a job runs against a real
+NDK in CI, no Android claim in this file should be treated as validated.
 
 **What a cross-compile does and does not prove.** A successful
 `cargo check`/`cargo clippy` for an Android target proves the Rust type-checks

@@ -904,7 +904,7 @@ fn search_results_pointing_at_private_space_are_dropped() {
     struct StubProvider;
 
     impl SearchProvider for StubProvider {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "stub"
         }
 
@@ -1323,7 +1323,7 @@ struct AdvancingClock {
 }
 
 impl AdvancingClock {
-    fn new(start: u64, step: u64) -> Self {
+    const fn new(start: u64, step: u64) -> Self {
         Self {
             start,
             step,

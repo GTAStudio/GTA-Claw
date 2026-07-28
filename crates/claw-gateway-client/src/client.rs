@@ -32,6 +32,14 @@ use crate::transport::{self, Inbound, MessageReader, WireFailure};
 const CONNECT_REQUEST_ID: &str = "gateway-connect";
 const INBOUND_QUEUE_CAPACITY: usize = 1;
 const MAX_ISSUED_DEVICE_TOKENS: usize = 16;
+/// Upper bound applied to the peer-derived read-idle watchdog.
+///
+/// The watchdog period is three server tick intervals, but `tickIntervalMs` is
+/// chosen entirely by the peer and is only constrained to be positive. Without
+/// this ceiling a server advertising an enormous interval would disable the
+/// client's only liveness check, so a silently dead socket could hold the
+/// connection, its epoch, and its correlation map open indefinitely.
+const MAX_IDLE_WATCHDOG: Duration = Duration::from_mins(10);
 
 /// Cloneable handle to one reconnecting Gateway transport task.
 #[derive(Clone)]
@@ -75,6 +83,16 @@ impl GatewayEventStream {
 
 impl GatewayClient {
     /// Starts a client using the production clock, Tokio sleeper, and jitter source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GatewayClientError::Configuration`] before any socket is opened
+    /// when the endpoint scheme is not `ws`/`wss`, the endpoint URL carries
+    /// credentials, a query, or a fragment, a remote plaintext `ws` endpoint was
+    /// requested without the break-glass opt-in, worker role/client/mode was
+    /// requested, the accepted protocol range is inverted, a queue bound is zero
+    /// or above the authenticated frame cap, a lifecycle timeout is zero, or the
+    /// bounded reconnect policy is inconsistent.
     pub fn start(
         config: GatewayClientConfig,
     ) -> Result<(Self, GatewayEventStream), GatewayClientError> {
@@ -82,6 +100,12 @@ impl GatewayClient {
     }
 
     /// Starts a client with injectable time and jitter for deterministic operation/tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GatewayClientError::Configuration`] for exactly the conditions
+    /// listed on [`GatewayClient::start`]; the injected runtime is never
+    /// validated and never fails.
     pub fn start_with_runtime(
         config: GatewayClientConfig,
         runtime: Arc<dyn ClientRuntime>,
@@ -99,6 +123,7 @@ impl GatewayClient {
         let outbound_bytes = Arc::new(Semaphore::new(config.limits.outbound_queue_bytes));
         let issued_device_tokens = Arc::new(Mutex::new(Vec::new()));
         let latest_device_token = Arc::new(Mutex::new(None));
+        let event_bytes = Arc::new(Semaphore::new(config.limits.event_queue_bytes));
         let inner = Arc::new(ClientInner {
             active: Arc::clone(&active),
             state: state_rx,
@@ -113,17 +138,20 @@ impl GatewayClient {
             runtime: Arc::clone(&runtime),
             issued_device_tokens: Arc::clone(&issued_device_tokens),
         });
-        let resources = SupervisorResources {
-            active,
-            events: event_tx,
-            states: state_tx,
-            cancellation,
-            tasks: tasks.clone(),
-            event_bytes: Arc::new(Semaphore::new(config.limits.event_queue_bytes)),
-            issued_device_tokens,
-            latest_device_token,
-        };
-        tasks.spawn(supervise(config, runtime, resources));
+        tasks.spawn(supervise(
+            config,
+            runtime,
+            SupervisorResources {
+                active,
+                events: event_tx,
+                states: state_tx,
+                cancellation,
+                tasks: tasks.clone(),
+                event_bytes,
+                issued_device_tokens,
+                latest_device_token,
+            },
+        ));
         Ok((Self { inner }, GatewayEventStream { receiver: event_rx }))
     }
 
@@ -148,10 +176,24 @@ impl GatewayClient {
     }
 
     /// Waits until authentication succeeds or a terminal state is reached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GatewayClientError::Authentication`] when the handshake was
+    /// rejected by the peer, [`GatewayClientError::Protocol`] when the hello
+    /// negotiated a protocol outside the pinned v4 window, when the granted role
+    /// or scopes did not match the request, when any other pinned protocol rule
+    /// was violated, or when sequenced event continuity was lost,
+    /// [`GatewayClientError::ReconnectExhausted`] when the bounded retry policy
+    /// ran out of attempts, and [`GatewayClientError::Cancelled`] when the client
+    /// was shut down or the supervisor stopped while waiting.
     pub async fn wait_ready(&self) -> Result<ReadyConnection, GatewayClientError> {
         let mut receiver = self.inner.state.clone();
         loop {
-            match receiver.borrow().clone() {
+            // The watch guard is released by the end of this statement so the
+            // supervisor can publish the next state while the match runs.
+            let state = receiver.borrow().clone();
+            match state {
                 ConnectionState::Ready(ready) => return Ok(ready),
                 ConnectionState::AuthenticationFailed(error) => {
                     return Err(GatewayClientError::Authentication(error));
@@ -183,6 +225,18 @@ impl GatewayClient {
     }
 
     /// Sends one typed, strictly encoded request without any automatic replay.
+    ///
+    /// # Errors
+    ///
+    /// See [`GatewayClient::request_with_timeout`]; this method only supplies the
+    /// configured default request timeout.
+    #[expect(
+        clippy::future_not_send,
+        reason = "`params: &T` is only `Send` when `T: Sync`, and adding that bound would \
+                  change a signature the CLI, TUI, Android, iOS, gateway and desktop crates \
+                  already call; every concrete instantiation used there is `Sync`, so the \
+                  monomorphized future is `Send` and spawnable"
+    )]
     pub async fn request<T>(
         &self,
         id: RequestId,
@@ -197,6 +251,18 @@ impl GatewayClient {
     }
 
     /// Sends one request only on the explicitly observed Ready epoch.
+    ///
+    /// # Errors
+    ///
+    /// See [`GatewayClient::request_with_timeout_for_epoch`]; this method only
+    /// supplies the configured default request timeout.
+    #[expect(
+        clippy::future_not_send,
+        reason = "`params: &T` is only `Send` when `T: Sync`, and adding that bound would \
+                  change a signature the CLI, TUI, Android, iOS, gateway and desktop crates \
+                  already call; every concrete instantiation used there is `Sync`, so the \
+                  monomorphized future is `Send` and spawnable"
+    )]
     pub async fn request_for_epoch<T>(
         &self,
         expected_epoch: ConnectionEpoch,
@@ -218,6 +284,34 @@ impl GatewayClient {
     }
 
     /// Sends one typed request with an explicit caller deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GatewayClientError::NotReady`] when no authenticated connection
+    /// is published, [`GatewayClientError::Backpressure`] when the in-flight,
+    /// serialization, outbound-byte, command-queue, or per-connection identifier
+    /// budget is already exhausted, [`GatewayClientError::Protocol`] when strict
+    /// encoding fails, when the encoded frame exceeds the server-advertised
+    /// payload policy, or when the identifier is already pending or completed on
+    /// this connection, [`GatewayClientError::ConnectionChanged`] when the socket
+    /// reconnected before the request was written or while it was outstanding,
+    /// [`GatewayClientError::Transport`] when the write or the connection failed
+    /// mid-request, [`GatewayClientError::RequestTimedOut`] when `timeout`
+    /// elapsed first (including a zero `timeout`), and
+    /// [`GatewayClientError::Cancelled`] when the client was shut down while the
+    /// request was outstanding.
+    ///
+    /// A response identifier the connection never issued is not reported here:
+    /// it fails the whole connection with
+    /// [`ProtocolFailure::UnknownResponse`](crate::ProtocolFailure::UnknownResponse)
+    /// and surfaces to this caller as [`GatewayClientError::ConnectionChanged`].
+    #[expect(
+        clippy::future_not_send,
+        reason = "`params: &T` is only `Send` when `T: Sync`, and adding that bound would \
+                  change a signature the CLI, TUI, Android, iOS, gateway and desktop crates \
+                  already call; every concrete instantiation used there is `Sync`, so the \
+                  monomorphized future is `Send` and spawnable"
+    )]
     pub async fn request_with_timeout<T>(
         &self,
         id: RequestId,
@@ -231,11 +325,25 @@ impl GatewayClient {
         let connection = self
             .active_connection()
             .ok_or(GatewayClientError::NotReady)?;
-        self.request_with_connection(connection, id, method, params, timeout)
-            .await
+        let prepared = self.prepare_request(&connection, &id, &method, params, timeout)?;
+        self.send_prepared_request(connection, id, prepared).await
     }
 
     /// Sends one deadline-bounded request only on the explicitly observed Ready epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns every condition listed on [`GatewayClient::request_with_timeout`],
+    /// and additionally [`GatewayClientError::ConnectionChanged`] instead of
+    /// [`GatewayClientError::NotReady`] when the live connection is absent or no
+    /// longer carries `expected_epoch`.
+    #[expect(
+        clippy::future_not_send,
+        reason = "`params: &T` is only `Send` when `T: Sync`, and adding that bound would \
+                  change a signature the CLI, TUI, Android, iOS, gateway and desktop crates \
+                  already call; every concrete instantiation used there is `Sync`, so the \
+                  monomorphized future is `Send` and spawnable"
+    )]
     pub async fn request_with_timeout_for_epoch<T>(
         &self,
         expected_epoch: ConnectionEpoch,
@@ -248,25 +356,30 @@ impl GatewayClient {
         T: Serialize + ?Sized,
     {
         let connection = self.connection_for_epoch(expected_epoch)?;
-        self.request_with_connection(connection, id, method, params, timeout)
-            .await
+        let prepared = self.prepare_request(&connection, &id, &method, params, timeout)?;
+        self.send_prepared_request(connection, id, prepared).await
     }
 
-    async fn request_with_connection<T>(
+    /// Performs every synchronous admission step: budget reservation, strict
+    /// encoding, and the server payload check.
+    ///
+    /// Keeping this stage out of the async body is what lets
+    /// [`GatewayClient::send_prepared_request`] hold no borrow of the caller's
+    /// parameters across an await point.
+    fn prepare_request<T>(
         &self,
-        connection: ActiveConnection,
-        id: RequestId,
-        method: GatewayMethodName,
+        connection: &ActiveConnection,
+        id: &RequestId,
+        method: &GatewayMethodName,
         params: &T,
         timeout: Duration,
-    ) -> Result<ResponseFrame, GatewayClientError>
+    ) -> Result<PreparedRequest, GatewayClientError>
     where
         T: Serialize + ?Sized,
     {
         if timeout.is_zero() {
-            return Err(GatewayClientError::RequestTimedOut(id));
+            return Err(GatewayClientError::RequestTimedOut(id.clone()));
         }
-        let expected_epoch = connection.epoch;
         let max_payload_bytes = connection.max_payload_bytes;
         let permit = Arc::clone(&self.inner.permits)
             .try_acquire_owned()
@@ -278,7 +391,7 @@ impl GatewayClient {
             .map_err(|_| {
                 GatewayClientError::Backpressure(BackpressureError::SerializationSaturated)
             })?;
-        let bytes = self.inner.codec.encode_request(&id, &method, params)?;
+        let bytes = self.inner.codec.encode_request(id, method, params)?;
         if bytes.len() > max_payload_bytes {
             return Err(GatewayClientError::Protocol(
                 ProtocolFailure::OutboundMessageTooLarge {
@@ -295,7 +408,27 @@ impl GatewayClient {
                 GatewayClientError::Backpressure(BackpressureError::CommandBytesSaturated)
             })?;
         drop(serialization_permit);
-        let deadline = tokio::time::Instant::now() + timeout;
+        Ok(PreparedRequest {
+            bytes,
+            deadline: tokio::time::Instant::now() + timeout,
+            permit,
+            byte_permit,
+        })
+    }
+
+    async fn send_prepared_request(
+        &self,
+        connection: ActiveConnection,
+        id: RequestId,
+        prepared: PreparedRequest,
+    ) -> Result<ResponseFrame, GatewayClientError> {
+        let expected_epoch = connection.epoch;
+        let PreparedRequest {
+            bytes,
+            deadline,
+            permit,
+            byte_permit,
+        } = prepared;
         tokio::select! {
             () = self.inner.cancellation.cancelled() => {
                 return Err(GatewayClientError::Cancelled);
@@ -317,8 +450,8 @@ impl GatewayClient {
                 bytes,
                 completion,
                 deadline,
-                _permit: permit,
-                _byte_permit: byte_permit,
+                permit,
+                byte_permit,
             })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => {
@@ -335,7 +468,7 @@ impl GatewayClient {
                         // before teardown; a following disconnect cannot invalidate it.
                         Ok(response.frame)
                     }
-                    Ok(Ok(Ok(_))) | Ok(Err(_)) => Err(Self::connection_changed(expected_epoch)),
+                    Ok(Ok(Ok(_)) | Err(_)) => Err(Self::connection_changed(expected_epoch)),
                     Ok(Ok(Err(error))) => Err(error),
                     Err(_) => Err(GatewayClientError::RequestTimedOut(id)),
                 }
@@ -375,6 +508,12 @@ impl GatewayClient {
     }
 
     /// Cancels pending work, performs a bounded close, and waits for every tracked task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GatewayClientError::ShutdownTimedOut`] when a tracked task was
+    /// still running after the configured shutdown timeout plus a 100 ms grace
+    /// period, which means the close handshake or a socket write did not finish.
     pub async fn shutdown(&self) -> Result<(), GatewayClientError> {
         self.inner.cancellation.cancel();
         self.inner.tasks.close();
@@ -396,6 +535,15 @@ impl Drop for GatewayClient {
     }
 }
 
+/// One request that already passed synchronous admission control and owns the
+/// budgets it reserved.
+struct PreparedRequest {
+    bytes: Vec<u8>,
+    deadline: tokio::time::Instant,
+    permit: OwnedSemaphorePermit,
+    byte_permit: OwnedSemaphorePermit,
+}
+
 enum Command {
     Request {
         epoch: ConnectionEpoch,
@@ -403,8 +551,8 @@ enum Command {
         bytes: Vec<u8>,
         completion: oneshot::Sender<Result<EpochResponse, GatewayClientError>>,
         deadline: tokio::time::Instant,
-        _permit: OwnedSemaphorePermit,
-        _byte_permit: OwnedSemaphorePermit,
+        permit: OwnedSemaphorePermit,
+        byte_permit: OwnedSemaphorePermit,
     },
 }
 
@@ -726,7 +874,7 @@ async fn authenticate(
     let connect_method = GatewayMethodName::Core(
         resolve_core_method("connect").expect("P02a registry contains connect"),
     );
-    let params = build_connect_params(config, runtime, &challenge.nonce)?;
+    let params = build_connect_params(config, runtime, &challenge.nonce);
     let bytes = preauth.encode_request(&connect_id, &connect_method, &params)?;
     transport::write_text(socket, bytes)
         .await
@@ -750,7 +898,7 @@ async fn authenticate(
             error.retryable == Some(true) && error.code.core() == Some(CoreErrorCode::Unavailable)
         }) || recovery
             .as_ref()
-            .is_some_and(|recovery| recovery.allows_retry())
+            .is_some_and(ConnectRecoveryProbe::allows_retry)
         {
             return Err(GatewayClientError::Transport(TransportFailure::Closed));
         }
@@ -759,7 +907,7 @@ async fn authenticate(
                 detail_code,
                 recovery
                     .as_ref()
-                    .is_some_and(|recovery| recovery.recommends_device_retry()),
+                    .is_some_and(ConnectRecoveryProbe::recommends_device_retry),
             ),
         ));
     }
@@ -875,7 +1023,7 @@ fn build_connect_params(
     config: &GatewayClientConfig,
     runtime: &dyn ClientRuntime,
     nonce: &ChallengeNonce,
-) -> Result<ConnectParams, GatewayClientError> {
+) -> ConnectParams {
     let role =
         Name::new(config.role.as_str(), PREAUTH_MAX_FRAME_BYTES).expect("closed role is valid");
     let scopes = config
@@ -918,7 +1066,7 @@ fn build_connect_params(
         signed_at: NonNegativeInteger::new(signed_at),
         nonce: nonce.clone(),
     };
-    Ok(ConnectParams {
+    ConnectParams {
         min_protocol: config.min_protocol,
         max_protocol: config.max_protocol,
         client: ClientInfo {
@@ -941,10 +1089,10 @@ fn build_connect_params(
         auth: wire_credentials(&config.credential),
         locale: None,
         user_agent: None,
-    })
+    }
 }
 
-fn signature_token(credential: &GatewayCredential) -> Option<&SecretString> {
+const fn signature_token(credential: &GatewayCredential) -> Option<&SecretString> {
     match credential {
         GatewayCredential::Token(token)
         | GatewayCredential::BootstrapToken(token)
@@ -1054,7 +1202,10 @@ async fn run_ready(
     };
     let mut cleanup = tokio::time::interval(Duration::from_millis(100));
     cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let watchdog_timeout = session.tick_interval.saturating_mul(3);
+    let watchdog_timeout = session
+        .tick_interval
+        .saturating_mul(3)
+        .min(MAX_IDLE_WATCHDOG);
     let watchdog = tokio::time::sleep(watchdog_timeout);
     tokio::pin!(watchdog);
     let result = loop {
@@ -1203,8 +1354,8 @@ async fn handle_command(
         bytes,
         mut completion,
         deadline,
-        _permit,
-        _byte_permit,
+        permit,
+        byte_permit,
     } = command;
     if epoch != context.epoch {
         let _ = completion.send(Err(GatewayClientError::ConnectionChanged {
@@ -1282,9 +1433,12 @@ async fn handle_command(
         id,
         PendingRequest {
             completion,
-            _permit,
+            _permit: permit,
         },
     );
+    // The encoded frame has left the command queue, so its byte budget is
+    // returned here rather than at an implicit end-of-scope drop.
+    drop(byte_permit);
     Ok(())
 }
 
@@ -1402,10 +1556,7 @@ impl CompletedIds {
     }
 
     fn remove(&mut self, id: &RequestId) -> bool {
-        if !self.ids.remove(id) {
-            return false;
-        }
-        true
+        self.ids.remove(id)
     }
 }
 

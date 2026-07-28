@@ -4,9 +4,10 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use claw_skills::{
-    HttpBridge, HttpBridgeError, HttpRequest, HttpResponse, NativeSkillHandler,
-    NativeSkillRegistry, ParameterValidationError, ParameterViolation, ParameterViolationKind,
-    SkillExecutionError, SkillRuntime, WasmHostError, WasmSkillHost, load_manifest,
+    CancellationToken, HttpBridge, HttpBridgeError, HttpRequest, HttpResponse, ManifestError,
+    NativeSkillHandler, NativeSkillRegistry, ParameterValidationError, ParameterViolation,
+    ParameterViolationKind, SkillExecutionError, SkillRuntime, WasmHostError, WasmSkillHost,
+    WasmSkillInvocation, load_manifest,
 };
 use serde_json::{Value, json};
 
@@ -39,15 +40,12 @@ struct CapturingWasm {
 }
 
 impl WasmSkillHost for CapturingWasm {
-    fn invoke(
-        &self,
-        plugin_id: &str,
-        export: &str,
-        parameters: Value,
-    ) -> Result<Value, WasmHostError> {
-        self.calls
-            .borrow_mut()
-            .push((plugin_id.to_owned(), export.to_owned(), parameters));
+    fn invoke(&mut self, invocation: WasmSkillInvocation<'_>) -> Result<Value, WasmHostError> {
+        self.calls.borrow_mut().push((
+            invocation.plugin_id.to_owned(),
+            invocation.tool.to_owned(),
+            invocation.parameters,
+        ));
         Ok(json!({"sandboxed": true}))
     }
 }
@@ -76,9 +74,9 @@ fn native_handler_runs_only_after_exact_parameter_validation() {
         }"#,
     )
     .expect("valid native manifest");
-    let (mut native, http, wasm) = ports();
+    let (mut native, http, mut wasm) = ports();
     assert_eq!(native.register("echo", Echo), Ok(()));
-    let runtime = SkillRuntime::new(&native, &http, &wasm);
+    let mut runtime = SkillRuntime::new(&native, &http, &mut wasm);
     assert_eq!(
         runtime.execute(&manifest, json!({"message":"hello"})),
         Ok(json!({"message":"hello"}))
@@ -119,8 +117,8 @@ fn declarative_http_bridge_receives_exact_request_and_decodes_json() {
         }"#,
     )
     .expect("valid HTTP manifest");
-    let (native, http, wasm) = ports();
-    let runtime = SkillRuntime::new(&native, &http, &wasm);
+    let (native, http, mut wasm) = ports();
+    let mut runtime = SkillRuntime::new(&native, &http, &mut wasm);
     assert_eq!(
         runtime.execute(&manifest, json!({})),
         Ok(json!({"status":"ok"}))
@@ -150,12 +148,14 @@ fn wasm_execution_is_delegated_to_the_sandbox_host_port() {
         }"#,
     )
     .expect("valid Wasm manifest");
-    let (native, http, wasm) = ports();
-    let runtime = SkillRuntime::new(&native, &http, &wasm);
-    assert_eq!(
-        runtime.execute(&manifest, json!([1, 2])),
-        Ok(json!({"sandboxed":true}))
-    );
+    let (native, http, mut wasm) = ports();
+    {
+        let mut runtime = SkillRuntime::new(&native, &http, &mut wasm);
+        assert_eq!(
+            runtime.execute(&manifest, json!([1, 2])),
+            Ok(json!({"sandboxed":true}))
+        );
+    }
     assert_eq!(
         wasm.calls.into_inner(),
         vec![("fixture-plugin".to_owned(), "run".to_owned(), json!([1, 2]))]
@@ -170,9 +170,14 @@ fn javascript_execution_kind_is_not_representable() {
         "parameters":{"type":"object"},
         "execution":{"kind":"javascript","source":"return true"}
     }"#;
-    assert_eq!(
-        load_manifest(javascript_manifest),
-        Err(claw_skills::ManifestError::MalformedJson)
+    let error = load_manifest(javascript_manifest).expect_err("JavaScript is not representable");
+    assert!(
+        matches!(error, ManifestError::MalformedJson { .. }),
+        "unexpected diagnostic: {error}"
+    );
+    assert!(
+        error.to_string().contains("unknown variant `javascript`"),
+        "diagnostic should name the unsupported kind: {error}"
     );
 }
 
@@ -195,8 +200,8 @@ fn get_parameters_are_percent_encoded_in_an_explicit_query_parameter() {
         }"#,
     )
     .expect("valid query manifest");
-    let (native, http, wasm) = ports();
-    let runtime = SkillRuntime::new(&native, &http, &wasm);
+    let (native, http, mut wasm) = ports();
+    let mut runtime = SkillRuntime::new(&native, &http, &mut wasm);
     assert_eq!(
         runtime.execute(&manifest, json!({"q":"rust skills"})),
         Ok(json!({"status":"ok"}))
@@ -211,6 +216,53 @@ fn get_parameters_are_percent_encoded_in_an_explicit_query_parameter() {
             body: Vec::new(),
         }]
     );
+}
+
+#[test]
+fn unknown_manifest_fields_are_rejected_with_source_coordinates() {
+    let json = r#"{
+        "id":"native-echo",
+        "description":"Echo validated input.",
+        "parameters":{"type":"object"},
+        "execution":{"kind":"native","handler":"echo"},
+        "javascript":"forbidden"
+    }"#;
+    let error = load_manifest(json).expect_err("the manifest model is closed");
+    let ManifestError::MalformedJson {
+        line,
+        column,
+        message,
+    } = error
+    else {
+        panic!("expected a JSON diagnostic");
+    };
+    assert!(line > 0);
+    assert!(column > 0);
+    assert!(message.contains("unknown field `javascript`"));
+}
+
+#[test]
+fn pre_cancelled_execution_never_reaches_a_backend() {
+    let manifest = load_manifest(
+        r#"{
+            "id":"wasm-example",
+            "description":"Invoke a sandboxed component.",
+            "parameters":{"type":"object","additionalProperties":false},
+            "execution":{"kind":"wasm","plugin_id":"fixture-plugin","export":"run"}
+        }"#,
+    )
+    .expect("valid Wasm manifest");
+    let (native, http, mut wasm) = ports();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    {
+        let mut runtime = SkillRuntime::new(&native, &http, &mut wasm);
+        assert_eq!(
+            runtime.execute_cancellable(&manifest, json!({}), &cancellation),
+            Err(SkillExecutionError::Cancelled)
+        );
+    }
+    assert!(wasm.calls.into_inner().is_empty());
 }
 
 #[test]

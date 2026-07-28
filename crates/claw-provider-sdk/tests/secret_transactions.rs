@@ -587,12 +587,14 @@ fn concurrent_threads_contending_for_one_key_produce_exactly_one_winner() {
         handle.join().expect("the thread finishes");
     }
 
-    let outcomes = outcomes.lock().expect("the mutex is usable");
-    let winners: Vec<usize> = outcomes
-        .iter()
-        .filter(|(_, won)| *won)
-        .map(|(index, _)| *index)
-        .collect();
+    let winners: Vec<usize> = {
+        let outcomes = outcomes.lock().expect("the mutex is usable");
+        outcomes
+            .iter()
+            .filter(|(_, won)| *won)
+            .map(|(index, _)| *index)
+            .collect()
+    };
     assert_eq!(
         winners.len(),
         1,

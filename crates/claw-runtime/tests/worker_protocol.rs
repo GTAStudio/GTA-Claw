@@ -301,7 +301,7 @@ fn a_session_expires_without_heartbeats_and_a_heartbeat_extends_it() {
         .expect("the heartbeat lands before the deadline");
     assert_eq!(beaten.expires_at, Timestamp::from_millis(239_000));
 
-    clock.advance(Duration::from_secs(120));
+    clock.advance(Duration::from_mins(2));
     assert_eq!(
         registry
             .dispatch(&call("w1", session.fence, 1, "node.event"))
@@ -367,5 +367,101 @@ fn expired_tickets_are_not_counted_as_outstanding() {
             .admit(&worker("w1"), "secret-1", WORKER_PROTOCOL_VERSION)
             .expect_err("a swept ticket is gone"),
         WorkerError::UnknownTicket
+    );
+}
+
+#[test]
+fn a_just_expired_ticket_is_still_held_so_its_refusal_names_the_reason() {
+    let clock = FakeClock::new(0);
+    let registry = registry(&clock, WorkerConfig::default());
+    registry
+        .issue_ticket(worker("w1"), "secret-1")
+        .expect("the ticket is issued");
+
+    // One TTL on, the ticket has lapsed. Issuing another one sweeps the table, and the lapsed
+    // ticket must survive that sweep: a worker that was slow to connect has to be told to ask for
+    // a new ticket, which is not the same answer as "that secret was never valid".
+    clock.advance(Duration::from_secs(30));
+    registry
+        .issue_ticket(worker("w2"), "secret-2")
+        .expect("the ticket is issued");
+    assert_eq!(
+        registry.retained_tickets(),
+        2,
+        "an expired ticket stays retained while it is still diagnosable"
+    );
+
+    assert_eq!(
+        registry
+            .admit(&worker("w1"), "secret-1", WORKER_PROTOCOL_VERSION)
+            .expect_err("a lapsed ticket is refused"),
+        WorkerError::TicketExpired {
+            expired_at: Timestamp::from_millis(30_000),
+        }
+    );
+    assert_eq!(
+        registry.outstanding_tickets(),
+        1,
+        "only the unexpired ticket is redeemable"
+    );
+}
+
+#[test]
+fn tickets_nobody_can_still_be_holding_are_reclaimed_so_the_table_stays_bounded() {
+    let clock = FakeClock::new(0);
+    let registry = registry(&clock, WorkerConfig::default());
+    for index in 0..8_u32 {
+        registry
+            .issue_ticket(worker("w1"), format!("secret-{index}"))
+            .expect("the ticket is issued");
+    }
+    assert_eq!(registry.retained_tickets(), 8);
+
+    // Two TTLs on, no handshake can still be holding any of them, so the next issue reclaims the
+    // lot. Without this the table would only ever grow, for as long as the process runs.
+    clock.advance(Duration::from_mins(1));
+    registry
+        .issue_ticket(worker("w2"), "fresh")
+        .expect("the ticket is issued");
+    assert_eq!(
+        registry.retained_tickets(),
+        1,
+        "only the ticket issued now survives the sweep"
+    );
+
+    assert_eq!(
+        registry
+            .admit(&worker("w1"), "secret-0", WORKER_PROTOCOL_VERSION)
+            .expect_err("a reclaimed ticket is gone"),
+        WorkerError::UnknownTicket,
+        "past the retention window a reclaimed ticket is indistinguishable from a forged one"
+    );
+    assert_eq!(
+        registry
+            .admit(&worker("w2"), "fresh", WORKER_PROTOCOL_VERSION)
+            .expect("the fresh ticket still admits")
+            .fence,
+        1
+    );
+}
+
+#[test]
+fn a_long_lived_registry_holds_only_the_tickets_issued_inside_the_retention_window() {
+    let clock = FakeClock::new(0);
+    let registry = registry(&clock, WorkerConfig::default());
+
+    // A week of issuing one unredeemed ticket a minute. The table must track the recent issue
+    // rate, not the uptime.
+    for minute in 0..10_080_u32 {
+        registry
+            .issue_ticket(worker("w1"), format!("secret-{minute}"))
+            .expect("the ticket is issued");
+        clock.advance(Duration::from_mins(1));
+    }
+
+    assert_eq!(
+        registry.retained_tickets(),
+        1,
+        "a ticket issued a minute ago is the only one inside the sixty-second retention window"
     );
 }

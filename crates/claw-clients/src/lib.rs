@@ -1,4 +1,4 @@
-//! Host-side compatibility contracts for the frozen OpenClaw client inventory.
+//! Host-side compatibility contracts for the frozen `OpenClaw` client inventory.
 //!
 //! GTA-Claw does not ship the upstream mobile applications, Control UI, or
 //! browser extension. This crate defines the authenticated connection profiles,
@@ -31,7 +31,7 @@
 //!
 //! ## Additional contracts in this crate
 //!
-//! - [`clawhub`] implements the offline ClawHub marketplace lifecycle: search,
+//! - [`clawhub`] implements the offline `ClawHub` marketplace lifecycle: search,
 //!   install, update, publish, risk acknowledgement, trust and uninstall.
 //! - [`conformance`] is the shared protocol-v4 connection compliance and
 //!   platform smoke suite that every inventoried surface is run through, plus
@@ -40,6 +40,7 @@
 pub mod clawhub;
 pub mod conformance;
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -207,7 +208,7 @@ pub enum ClientCapability {
     SpeechSynthesis,
     /// Provide local speech capture.
     SpeechCapture,
-    /// Relay explicitly allowed Chrome DevTools operations.
+    /// Relay explicitly allowed Chrome `DevTools` operations.
     ChromeDevtools,
 }
 
@@ -522,6 +523,16 @@ pub const fn surface(id: SurfaceId) -> &'static SurfaceContract {
 /// Operator scopes are subset-checked: the frozen profile is a ceiling, not an
 /// exact-request quota. A candidate may omit any ceiling scope, but may not add
 /// a scope outside it.
+///
+/// # Errors
+///
+/// Returns [`ConnectionError::ProtocolMismatch`] when `protocol` is not
+/// [`GATEWAY_PROTOCOL_VERSION`], [`ConnectionError::WrongTransport`] when the
+/// surface attaches locally instead of over the Gateway, and
+/// [`ConnectionError::ProfileNotAllowed`] when no frozen profile has the
+/// candidate's client identity, mode, role and device-identity requirement,
+/// when a [`Role::Node`] candidate carries any operator scope, or when the
+/// candidate requests a scope outside that profile's ceiling.
 pub fn validate_gateway_profile(
     surface_id: SurfaceId,
     candidate: GatewayProfile,
@@ -578,6 +589,12 @@ impl Display for ConnectionError {
 impl Error for ConnectionError {}
 
 /// Negotiates requested host features using an exact deny-by-default registry.
+///
+/// # Errors
+///
+/// Returns [`CapabilityError::NotAllowed`] carrying the first requested
+/// capability that the surface's frozen contract does not list. Nothing is
+/// granted when any single request is refused.
 pub fn negotiate_capabilities(
     surface_id: SurfaceId,
     requested: &[ClientCapability],
@@ -681,10 +698,17 @@ pub struct EventDelivery {
     max_payload_bytes: usize,
     next_sequence: u64,
     queue: VecDeque<DeliveredEvent>,
+    closed: bool,
 }
 
 impl EventDelivery {
     /// Creates one per-connection delivery queue with explicit nonzero bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::InvalidBound`] when `capacity` or
+    /// `max_payload_bytes` is zero, because a zero bound would make every
+    /// later `push` fail instead of bounding a working queue.
     pub fn new(
         surface: SurfaceId,
         capacity: usize,
@@ -699,15 +723,31 @@ impl EventDelivery {
             max_payload_bytes,
             next_sequence: 1,
             queue: VecDeque::with_capacity(capacity),
+            closed: false,
         })
     }
 
     /// Enqueues one authorized event without affecting any other connection.
-    pub fn push(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::Closed`] after terminal shutdown,
+    /// [`DeliveryError::EventNotAllowed`] when the surface's frozen contract
+    /// does not list `kind`, [`DeliveryError::QueueFull`] when this connection
+    /// already holds `capacity` undelivered events,
+    /// [`DeliveryError::PayloadTooLarge`] when the encoded payload exceeds
+    /// `max_payload_bytes`, and [`DeliveryError::SequenceExhausted`] when the
+    /// per-connection sequence counter reached [`u64::MAX`]. The event is not
+    /// queued in any of those cases. Borrowed payloads are validated before
+    /// allocation.
+    pub fn push<'a>(
         &mut self,
         kind: SessionEventKind,
-        payload: impl Into<String>,
+        payload: impl Into<Cow<'a, str>>,
     ) -> Result<u64, DeliveryError> {
+        if self.closed {
+            return Err(DeliveryError::Closed);
+        }
         if !surface(self.surface).events.contains(&kind) {
             return Err(DeliveryError::EventNotAllowed(kind));
         }
@@ -729,9 +769,27 @@ impl EventDelivery {
         self.queue.push_back(DeliveredEvent {
             sequence,
             kind,
-            payload,
+            payload: payload.into_owned(),
         });
         Ok(sequence)
+    }
+
+    /// Terminates this connection queue and discards undelivered events.
+    ///
+    /// Returns the number of discarded events. Shutdown is idempotent. A
+    /// reconnect must construct a new queue so its sequence starts from one and
+    /// no event from the previous connection can cross the lifecycle boundary.
+    pub fn close(&mut self) -> usize {
+        self.closed = true;
+        let discarded = self.queue.len();
+        self.queue.clear();
+        discarded
+    }
+
+    /// Reports whether terminal shutdown has occurred.
+    #[must_use]
+    pub const fn is_closed(&self) -> bool {
+        self.closed
     }
 
     /// Removes and returns the oldest pending event.
@@ -757,6 +815,8 @@ impl EventDelivery {
 pub enum DeliveryError {
     /// Queue and payload limits must be positive.
     InvalidBound,
+    /// The connection queue has completed terminal shutdown.
+    Closed,
     /// The surface does not consume this event class.
     EventNotAllowed(SessionEventKind),
     /// The per-connection queue is full.
@@ -776,6 +836,7 @@ impl Display for DeliveryError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidBound => formatter.write_str("event delivery bounds must be positive"),
+            Self::Closed => formatter.write_str("client event connection is closed"),
             Self::EventNotAllowed(kind) => write!(formatter, "event {kind:?} is not allowed"),
             Self::QueueFull => formatter.write_str("client event queue is full"),
             Self::PayloadTooLarge { actual, limit } => {
@@ -798,6 +859,10 @@ mod tests {
     use super::*;
 
     #[derive(Debug, Deserialize, Eq, PartialEq)]
+    #[expect(
+        clippy::struct_field_names,
+        reason = "these are the frozen inventory's JSON keys transcribed verbatim, so `inventory_id` must not be shortened to `id`; `InventoryItem::id` already means something else"
+    )]
     struct Inventory {
         schema_version: u64,
         inventory_id: String,
@@ -1244,6 +1309,24 @@ mod tests {
                 .expect("valid bounds")
                 .push(SessionEventKind::Chat, "{}"),
             Err(DeliveryError::EventNotAllowed(SessionEventKind::Chat))
+        );
+
+        assert_eq!(second.close(), 1);
+        assert!(second.is_closed());
+        assert!(second.is_empty());
+        assert_eq!(second.pop(), None);
+        assert_eq!(second.close(), 0, "shutdown must be idempotent");
+        assert_eq!(
+            second.push(SessionEventKind::Agent, "late"),
+            Err(DeliveryError::Closed)
+        );
+
+        let mut reconnected =
+            EventDelivery::new(SurfaceId::Cli, 1, 8).expect("fresh connection queue");
+        assert_eq!(
+            reconnected.push(SessionEventKind::Agent, String::from("fresh")),
+            Ok(1),
+            "a reconnect must not inherit the prior connection sequence"
         );
     }
 }

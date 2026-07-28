@@ -81,9 +81,20 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     Assert-ChildPath -Parent $ownedRoot -Child $OutputPath | Out-Null
     Assert-NoReparsePathComponents -Root $ownedRoot -Path $OutputPath
 }
-if (Test-Path -LiteralPath $OutputPath) {
-    Remove-Item -LiteralPath $OutputPath -Force
+$publishedOutputPath = $OutputPath
+$outputDirectory = Split-Path -Parent $publishedOutputPath
+$temporaryOutputPath = Join-Path $outputDirectory (
+    ".{0}.packaging-new.msi" -f [System.IO.Path]::GetFileNameWithoutExtension($publishedOutputPath)
+)
+$temporaryWixPdb = [System.IO.Path]::ChangeExtension($temporaryOutputPath, '.wixpdb')
+$temporaryHashPath = "$temporaryOutputPath.sha256"
+Assert-ChildPath -Parent $ownedRoot -Child $temporaryOutputPath | Out-Null
+foreach ($stalePath in @($temporaryOutputPath, $temporaryWixPdb, $temporaryHashPath)) {
+    if (Test-Path -LiteralPath $stalePath) {
+        Remove-Item -LiteralPath $stalePath -Force
+    }
 }
+$OutputPath = $temporaryOutputPath
 
 $productNamespace = [Guid]'DAD72B88-4094-5FD5-9494-D8C54C8DFE7D'
 $productCode = New-UuidV5 -Namespace $productNamespace -Name "$($arch.Name):$($version.Msi)"
@@ -105,6 +116,8 @@ $wixArguments = @(
     '-d', "UpgradeCode=$($arch.UpgradeCode)",
     '-o', $OutputPath
 ) + $componentDefines + @($source)
+$inspectionRoot = Join-Path $outputDirectory '.msi-inspection'
+try {
 Invoke-CheckedCommand -FilePath $WixPath -Arguments $wixArguments
 Assert-PlainFile $OutputPath | Out-Null
 $installer = New-Object -ComObject WindowsInstaller.Installer
@@ -146,18 +159,40 @@ $summary = $null
 [GC]::Collect()
 [GC]::WaitForPendingFinalizers()
 Set-NormalizedMsiStorageTimestamps $OutputPath
-$wixPdb = [System.IO.Path]::ChangeExtension($OutputPath, '.wixpdb')
+$wixPdb = $temporaryWixPdb
 if (Test-Path -LiteralPath $wixPdb -PathType Leaf) {
     Remove-Item -LiteralPath $wixPdb -Force
 }
 Test-MsiPackage `
     -PackagePath $OutputPath `
-    -InspectionRoot (Join-Path (Split-Path -Parent $OutputPath) '.msi-inspection') `
+    -InspectionRoot $inspectionRoot `
     -Architecture $Architecture `
     -SignatureMode unsigned `
     -ReleaseStatus $(if ($ReleaseMode) { 'release-candidate' } else { 'non-release' })
-Remove-OwnedDirectory `
-    -OwnedRoot (Split-Path -Parent $OutputPath) `
-    -Path (Join-Path (Split-Path -Parent $OutputPath) '.msi-inspection')
-Write-ArtifactHash $OutputPath | Out-Null
-Write-Host "Created and inspected unsigned MSI '$OutputPath'."
+Write-ArtifactHash `
+    -Path $temporaryOutputPath `
+    -HashPath $temporaryHashPath `
+    -ArtifactName ([System.IO.Path]::GetFileName($publishedOutputPath)) | Out-Null
+Test-ArtifactHash `
+    -Path $temporaryOutputPath `
+    -HashPath $temporaryHashPath `
+    -ArtifactName ([System.IO.Path]::GetFileName($publishedOutputPath))
+} catch {
+    foreach ($temporaryPath in @($temporaryOutputPath, $temporaryWixPdb, $temporaryHashPath)) {
+        if (Test-Path -LiteralPath $temporaryPath) {
+            Remove-Item -LiteralPath $temporaryPath -Force
+        }
+    }
+    throw
+} finally {
+    if (Test-Path -LiteralPath $inspectionRoot) {
+        Remove-OwnedDirectory -OwnedRoot $outputDirectory -Path $inspectionRoot
+    }
+}
+
+Publish-OwnedArtifactPair `
+    -OwnedRoot $ownedRoot `
+    -StagedArtifact $temporaryOutputPath `
+    -StagedHash $temporaryHashPath `
+    -DestinationArtifact $publishedOutputPath
+Write-Host "Created and inspected unsigned MSI '$publishedOutputPath'."

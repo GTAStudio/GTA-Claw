@@ -54,6 +54,14 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut response = (self.status, Json(self.body)).into_response();
+        if matches!(
+            self.status,
+            StatusCode::PAYLOAD_TOO_LARGE | StatusCode::REQUEST_TIMEOUT
+        ) {
+            response
+                .headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("close"));
+        }
         if let Some(allow) = self.allow {
             response
                 .headers_mut()

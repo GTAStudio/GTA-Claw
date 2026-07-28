@@ -1,4 +1,4 @@
-//! Acceptance coverage for the pinned OpenClaw Gateway v4 contract.
+//! Acceptance coverage for the pinned `OpenClaw` Gateway v4 contract.
 //!
 //! Wire citations:
 //! - `packages/gateway-protocol/src/schema/frames.ts#L35-L212`
@@ -24,7 +24,7 @@ use serde::Deserialize;
 
 const PINNED_SHA: &str = "b43e832fcc8000ed7287c7accc54e381db607f85";
 
-fn preauth() -> Codec {
+const fn preauth() -> Codec {
     Codec::preauthentication()
 }
 
@@ -174,12 +174,15 @@ fn decodes_full_hello_snapshot_fixture() {
     assert_eq!(hello.server.conn_id.as_str(), "conn-1");
     assert_eq!(hello.snapshot.state_version.presence.get(), 0);
     assert_eq!(hello.snapshot.health.as_json(), "null");
+    // The wire carries `1.5`; comparing bit patterns asserts the exact double
+    // survived decoding rather than merely landing close to it.
     assert_eq!(
         hello.control_ui_tabs.expect("tabs")[0]
             .order
             .expect("order")
-            .get(),
-        1.5
+            .get()
+            .to_bits(),
+        1.5_f64.to_bits()
     );
     assert_eq!(
         hello
@@ -311,7 +314,7 @@ fn rejects_overflow_negative_zero_and_nonfinite_like_numbers() {
     // Integer frame fields: `schema/frames.ts#L159-L204`.
     assert!(matches!(
         decode(r#"{"type":"event","event":"tick","seq":18446744073709551616}"#),
-        Err(CodecError::MalformedJson { .. }) | Err(CodecError::TypedDecode { .. })
+        Err(CodecError::MalformedJson { .. } | CodecError::TypedDecode { .. })
     ));
     assert!(matches!(
         decode(r#"{"type":"event","event":"tick","seq":-1}"#),
@@ -323,7 +326,7 @@ fn rejects_overflow_negative_zero_and_nonfinite_like_numbers() {
     ));
     assert!(matches!(
         decode(r#"{"type":"event","event":"tick","payload":1e400}"#),
-        Err(CodecError::MalformedJson { .. }) | Err(CodecError::NonFiniteNumber { .. })
+        Err(CodecError::MalformedJson { .. } | CodecError::NonFiniteNumber { .. })
     ));
     assert!(matches!(
         decode(r#"{"type":"event","event":"tick","payload":NaN}"#),
@@ -994,7 +997,7 @@ struct InventoryItem {
     advertised: Option<bool>,
 }
 
-fn scope_identity(scope: MethodScope) -> &'static str {
+const fn scope_identity(scope: MethodScope) -> &'static str {
     match scope {
         MethodScope::Operator(scope) => scope.as_str(),
         MethodScope::Node => "node",
@@ -1063,7 +1066,6 @@ fn generated_registry_equals_canonical_inventory_bidirectionally() {
         .collect::<BTreeSet<_>>();
     let generated_events = core_events()
         .iter()
-        .copied()
         .map(|event| event.name())
         .collect::<BTreeSet<_>>();
     assert_eq!(generated_events, inventory_events);
@@ -1125,4 +1127,32 @@ fn targeted_events_do_not_advance_sequence() {
         .expect("still expects one");
     assert_eq!(tracker.last().expect("one").get(), 1);
     assert_eq!(NonNegativeInteger::new(0).get(), 0);
+}
+
+#[test]
+fn opaque_json_constructors_agree_with_the_serialize_round_trip() {
+    // `OpaqueJson::from_serialize` exists to remove the `to_string` then
+    // `from_str` round trip from the per-event path, so it has to retain the
+    // same bytes that round trip produced, and so does a clone.
+    let value = serde_json::json!({
+        "sessionId": "ses_01",
+        "status": "running",
+        "turn": 17,
+        "tags": ["operator", "gateway"],
+    });
+    let encoded = serde_json::to_string(&value).expect("serialize");
+
+    let round_tripped: OpaqueJson = serde_json::from_str(&encoded).expect("deserialize");
+    let direct = OpaqueJson::from_serialize(&value).expect("serialize directly");
+    let adopted = OpaqueJson::from_json_string(encoded.clone()).expect("adopt text");
+
+    let cloned = direct.clone();
+    assert_eq!(direct.as_json(), round_tripped.as_json());
+    assert_eq!(adopted.as_json(), round_tripped.as_json());
+    assert_eq!(cloned.as_json(), round_tripped.as_json());
+    assert_eq!(cloned.encoded_len(), round_tripped.encoded_len());
+    assert_eq!(direct.encoded_len(), encoded.len());
+    assert_eq!(direct, round_tripped);
+
+    assert!(OpaqueJson::from_json_string("{".to_owned()).is_err());
 }

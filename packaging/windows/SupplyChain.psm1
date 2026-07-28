@@ -1,5 +1,6 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:CargoPackageCache = @{}
 
 function Get-CargoPackages {
     param(
@@ -7,6 +8,11 @@ function Get-CargoPackages {
         [Parameter(Mandatory)][ValidateSet('desktop', 'headless', 'combined')][string]$ComponentSet,
         [Parameter(Mandatory)][string[]]$RustTarget
     )
+
+    $cacheKey = "$([System.IO.Path]::GetFullPath($RepoRoot))|$ComponentSet|$(@($RustTarget | Sort-Object) -join ',')"
+    if ($script:CargoPackageCache.ContainsKey($cacheKey)) {
+        return @($script:CargoPackageCache[$cacheKey])
+    }
 
     $manifests = @()
     if ($ComponentSet -in @('headless', 'combined')) {
@@ -38,7 +44,9 @@ function Get-CargoPackages {
             }
         }
     }
-    return @($packages.Values | Sort-Object name, version)
+    $result = @($packages.Values | Sort-Object name, version)
+    $script:CargoPackageCache[$cacheKey] = $result
+    return @($result)
 }
 
 function Get-SourceRevision {
@@ -204,8 +212,13 @@ function Test-ArtifactSupplyChain {
 
     $sbom = Get-Content -LiteralPath $sbomPath -Raw | ConvertFrom-Json
     if ($sbom.spdxVersion -ne 'SPDX-2.3' -or
+        @($sbom.documentDescribes).Count -ne 1 -or
+        $sbom.documentDescribes[0] -ne 'SPDXRef-Artifact' -or
         @($sbom.files).Count -ne 1 -or
         $sbom.files[0].fileName -ne "./$artifactName" -or
+        $sbom.files[0].SPDXID -ne 'SPDXRef-Artifact' -or
+        @($sbom.files[0].checksums).Count -ne 1 -or
+        $sbom.files[0].checksums[0].algorithm -ne 'SHA256' -or
         $sbom.files[0].checksums[0].checksumValue -ne $artifactHash -or
         @($sbom.packages).Count -eq 0) {
         throw "SPDX SBOM does not attest the published artifact bytes: $artifact"
@@ -266,6 +279,9 @@ function Test-ArtifactSetChecksums {
         if ($actual -ne $Matches[1]) {
             throw "Published SHA-256 mismatch for '$name'."
         }
+    }
+    if ($seen.Count -eq 0) {
+        throw 'Published SHA256SUMS manifest contains no entries.'
     }
     $expected = @(Get-ChildItem -LiteralPath $Directory -File |
         Where-Object {

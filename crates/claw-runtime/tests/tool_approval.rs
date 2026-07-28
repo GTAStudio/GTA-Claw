@@ -187,7 +187,7 @@ async fn a_remembered_decision_answers_later_requests_without_asking() {
         Some(ApprovalDecision::approve_for_session())
     );
 
-    assert!(broker.forget(&session("approvals"), "write_file"));
+    assert_eq!(broker.forget_session(&session("approvals")), 1);
     assert_eq!(broker.remembered(&session("approvals"), "write_file"), None);
     assert!(!broker.forget(&session("approvals"), "write_file"));
 }
@@ -291,7 +291,7 @@ async fn a_hanging_tool_is_cancelled_mid_flight_and_the_adapter_is_told() {
         broker,
         Arc::clone(&clock) as Arc<_>,
         ToolExecutorConfig {
-            call_timeout: Duration::from_secs(600),
+            call_timeout: Duration::from_mins(10),
         },
     );
     let cancel = CancellationToken::new();
@@ -774,12 +774,16 @@ impl ApprovalPort for ReentrantApprovals {
     }
 
     fn abandon(&self, _approval_id: &ApprovalId) {
-        let broker = self.broker.lock().expect("the fixture mutex is healthy");
-        let outstanding = broker
-            .as_ref()
-            .expect("the broker is attached before any request")
-            .outstanding()
-            .len();
+        // The fixture's own lock is released before the observation is recorded, so the two
+        // fixture mutexes are never held at the same time.
+        let outstanding = {
+            let broker = self.broker.lock().expect("the fixture mutex is healthy");
+            broker
+                .as_ref()
+                .expect("the broker is attached before any request")
+                .outstanding()
+                .len()
+        };
         self.observed
             .lock()
             .expect("the fixture mutex is healthy")

@@ -423,6 +423,8 @@ pub enum CommandEffect {
     },
     /// Override the provider model for the session.
     SetModel(String),
+    /// Terminally destroy the in-memory conversation session.
+    DestroySession,
     /// A registry-defined command with no built-in meaning.
     Custom {
         /// The canonical command name.
@@ -590,6 +592,7 @@ impl CommandRegistry {
                 lease_id: required_argument(invocation, 0)?,
             },
             "model" => CommandEffect::SetModel(required_argument(invocation, 0)?),
+            "session-close" => CommandEffect::DestroySession,
             _ => CommandEffect::Custom {
                 name: invocation.name.clone(),
                 arguments: invocation.arguments.clone(),
@@ -642,16 +645,15 @@ fn parse_number(
     argument: Option<&String>,
     default: u32,
 ) -> Result<u32, CommandError> {
-    match argument {
-        None => Ok(default),
-        Some(value) => value
+    argument.map_or(Ok(default), |value| {
+        value
             .parse::<u32>()
             .map_err(|_| CommandError::InvalidArgument {
                 command: invocation.name.clone(),
                 argument: value.clone(),
                 reason: "expected a non-negative whole number",
-            }),
-    }
+            })
+    })
 }
 
 fn builtin_commands() -> Vec<CommandSpec> {
@@ -700,6 +702,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
         .with_arity(CommandArity::exactly(1)),
         CommandSpec::new("model", "Override the provider model", OperatorScope::Write)
             .with_arity(CommandArity::exactly(1)),
+        CommandSpec::new(
+            "session-close",
+            "Destroy the in-memory conversation session",
+            OperatorScope::Admin,
+        ),
     ]
 }
 
@@ -934,35 +941,40 @@ impl DirectiveRegistry {
     /// Splits an input body into directives and remaining text.
     ///
     /// A directive owns a whole line and starts with `!`. Lines inside fenced code blocks
-    /// (delimited by ``` or `~~~`) are never directives, and a line starting with `\!` is body
-    /// text with the escape removed. Values may be written `!name value` or `!name=value`.
+    /// (delimited by ```` ``` ```` or `~~~`) are never directives, and a line starting with
+    /// `\!` is body text with the escape removed. Values may be written `!name value` or
+    /// `!name=value`.
     ///
     /// # Errors
     ///
     /// Returns [`DirectiveError`] for unknown names, missing or unexpected values, and repeats.
     pub fn scan(&self, input: &str) -> Result<DirectiveScan, DirectiveError> {
         let mut directives: Vec<Directive> = Vec::new();
-        let mut body_lines: Vec<String> = Vec::new();
-        let mut fence: Option<String> = None;
+        // Body lines are borrowed from `input`, not owned: an operator paste is routinely
+        // hundreds of lines, and allocating a `String` per line cost one allocation per line
+        // plus a second full copy in the join. `\!` unescapes to `trimmed[1..]`, which is still
+        // a slice of the input, so no line needs an owned buffer.
+        let mut body_lines: Vec<&str> = Vec::new();
+        let mut fence: Option<&'static str> = None;
 
         for raw_line in input.split('\n') {
             let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
             let trimmed = line.trim_start();
 
-            if let Some(open) = fence.clone() {
-                if trimmed.starts_with(open.as_str()) {
+            if let Some(open) = fence {
+                if trimmed.starts_with(open) {
                     fence = None;
                 }
-                body_lines.push(line.to_owned());
+                body_lines.push(line);
                 continue;
             }
             if let Some(marker) = fence_marker(trimmed) {
                 fence = Some(marker);
-                body_lines.push(line.to_owned());
+                body_lines.push(line);
                 continue;
             }
-            if let Some(escaped) = trimmed.strip_prefix("\\!") {
-                body_lines.push(format!("!{escaped}"));
+            if trimmed.starts_with("\\!") {
+                body_lines.push(&trimmed[1..]);
                 continue;
             }
 
@@ -976,24 +988,26 @@ impl DirectiveRegistry {
                     }
                     directives.push(directive);
                 }
-                None => body_lines.push(line.to_owned()),
+                None => body_lines.push(line),
             }
         }
 
-        while body_lines
-            .first()
-            .is_some_and(|line| line.trim().is_empty())
-        {
-            body_lines.remove(0);
-        }
-        while body_lines.last().is_some_and(|line| line.trim().is_empty()) {
-            body_lines.pop();
-        }
+        // Blank lines at either end are trimmed by locating the surviving range once, rather than
+        // removing the front of the vector one line at a time, which is quadratic in the number of
+        // leading blanks. `rposition` always finds a line once `position` has, so its fallback is
+        // unreachable; a body that is entirely blank has no range at all and trims to nothing.
+        let body = body_lines
+            .iter()
+            .position(|line| !line.trim().is_empty())
+            .map_or_else(String::new, |first| {
+                let last = body_lines
+                    .iter()
+                    .rposition(|line| !line.trim().is_empty())
+                    .unwrap_or(first);
+                body_lines[first..=last].join("\n")
+            });
 
-        Ok(DirectiveScan {
-            directives,
-            body: body_lines.join("\n"),
-        })
+        Ok(DirectiveScan { directives, body })
     }
 
     /// Lowers directives into the options one turn runs with.
@@ -1010,11 +1024,11 @@ impl DirectiveRegistry {
             }
             match directive.name.as_str() {
                 "model" => {
-                    options.model = directive.value.clone();
+                    options.model.clone_from(&directive.value);
                 }
                 "no-tools" => options.tools_enabled = false,
                 "quiet" => options.quiet = true,
-                "goal" => options.goal = directive.value.clone(),
+                "goal" => options.goal.clone_from(&directive.value),
                 _ => {}
             }
         }
@@ -1072,13 +1086,10 @@ impl Default for DirectiveRegistry {
     }
 }
 
-fn fence_marker(trimmed: &str) -> Option<String> {
-    for marker in ["```", "~~~"] {
-        if trimmed.starts_with(marker) {
-            return Some(marker.to_owned());
-        }
-    }
-    None
+fn fence_marker(trimmed: &str) -> Option<&'static str> {
+    ["```", "~~~"]
+        .into_iter()
+        .find(|marker| trimmed.starts_with(marker))
 }
 
 #[cfg(test)]
@@ -1186,6 +1197,7 @@ mod tests {
                 ("suspend-status".to_owned(), Vec::new(), "operator.read"),
                 ("resume-host".to_owned(), Vec::new(), "operator.admin"),
                 ("model".to_owned(), Vec::new(), "operator.write"),
+                ("session-close".to_owned(), Vec::new(), "operator.admin"),
             ]
         );
     }
@@ -1443,6 +1455,7 @@ mod tests {
                 },
             ),
             ("/model gpt-x", CommandEffect::SetModel("gpt-x".to_owned())),
+            ("/session-close", CommandEffect::DestroySession),
         ];
 
         for (line, expected) in cases {

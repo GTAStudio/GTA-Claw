@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 
 use claw_gateway_client::GatewayCredential;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
 /// Maximum accepted credential text, in UTF-8 bytes.
 const MAX_CREDENTIAL_BYTES: usize = 4096;
@@ -117,6 +117,20 @@ impl IosCredential {
             kind,
             secret: Some(SecretString::from(trimmed.to_owned())),
         })
+    }
+
+    pub(crate) fn from_secret(
+        kind: IosCredentialKind,
+        secret: &SecretString,
+    ) -> Result<Self, CredentialError> {
+        if kind == IosCredentialKind::None {
+            return Ok(Self::none());
+        }
+        Self::secret(kind, secret.expose_secret())
+    }
+
+    pub(crate) const fn secret_value(&self) -> Option<&SecretString> {
+        self.secret.as_ref()
     }
 
     /// Returns which credential slot this fills.

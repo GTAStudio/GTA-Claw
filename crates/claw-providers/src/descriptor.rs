@@ -11,13 +11,13 @@ use claw_provider_sdk::model::{AuthMode, Capability, CapabilitySet};
 /// decides which client implementation a provider can use.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ProviderFamily {
-    /// `POST /chat/completions` in the OpenAI dialect.
+    /// `POST /chat/completions` in the `OpenAI` dialect.
     OpenAiChatCompletions,
     /// Anthropic `POST /v1/messages`.
     AnthropicMessages,
     /// GitHub Copilot's chat API, reached with an exchanged Copilot token.
     GitHubCopilot,
-    /// OpenAI's Responses/Codex protocol, which is not the chat dialect.
+    /// `OpenAI`'s Responses/Codex protocol, which is not the chat dialect.
     OpenAiResponses,
     /// Google Gemini `generateContent`.
     GoogleGemini,
@@ -99,7 +99,7 @@ impl Display for ImplementationStatus {
     }
 }
 
-/// Capabilities the OpenAI chat-completions client can drive.
+/// Capabilities the `OpenAI` chat-completions client can drive.
 pub const OPENAI_CAPABILITIES: CapabilitySet = CapabilitySet::from_slice(&[
     Capability::Completion,
     Capability::Streaming,

@@ -141,12 +141,15 @@ def main() -> None:
     if len(sys.argv) < 3:
         fail("expected json or tar command")
     command = sys.argv[1]
-    if command == "json" and len(sys.argv) == 3:
-        validate_json(sys.argv[2])
-    elif command == "tar":
-        validate_tar(sys.argv[2:])
-    else:
-        fail("invalid command or arguments")
+    try:
+        if command == "json" and len(sys.argv) == 3:
+            validate_json(sys.argv[2])
+        elif command == "tar":
+            validate_tar(sys.argv[2:])
+        else:
+            fail("invalid command or arguments")
+    except OSError as error:
+        fail(f"artifact I/O failed: {error}")
 
 
 if __name__ == "__main__":

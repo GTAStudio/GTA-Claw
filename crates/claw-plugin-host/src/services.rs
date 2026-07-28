@@ -7,8 +7,10 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
+use claw_plugin_api::cancellation::CancellationToken;
 use claw_plugin_api::capability::{EventKind, LogLevel};
 
 /// One structured log record emitted by a plugin.
@@ -54,7 +56,7 @@ pub struct ToolRegistration {
 /// addresses were resolved by the host and revalidated immediately before this
 /// value was constructed, so re-resolving [`OutboundRequest::host`] inside the
 /// transport would reopen the DNS-rebinding window the host just closed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OutboundRequest {
     /// Uppercase method, already checked against the grant's allowlist.
     pub method: String,
@@ -74,6 +76,28 @@ pub struct OutboundRequest {
     pub body: Option<Vec<u8>>,
 }
 
+impl core::fmt::Debug for OutboundRequest {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("OutboundRequest")
+            .field("method", &self.method)
+            .field("url", &redact_url_query(&self.url))
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("addresses", &self.addresses)
+            .field(
+                "header_names",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            )
+            .field("body_bytes", &self.body.as_ref().map_or(0, Vec::len))
+            .finish()
+    }
+}
+
 /// The response an [`HttpTransport`] produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboundResponse {
@@ -84,6 +108,89 @@ pub struct InboundResponse {
     /// Response body.
     pub body: Vec<u8>,
 }
+
+/// Deadline and cancellation state for one host-side operation.
+///
+/// The value is cloned out of a plugin's store before a blocking adapter runs,
+/// so the adapter can observe the same absolute deadline and cancellation flag
+/// that Wasmtime's epoch callback enforces for guest code.
+#[derive(Clone, Debug)]
+pub struct HostCallControl {
+    deadline: Instant,
+    cancellation: Option<CancellationToken>,
+}
+
+impl HostCallControl {
+    /// Creates a control with an absolute deadline and optional cancellation.
+    #[must_use]
+    pub const fn new(deadline: Instant, cancellation: Option<CancellationToken>) -> Self {
+        Self {
+            deadline,
+            cancellation,
+        }
+    }
+
+    /// Absolute deadline for the complete host call.
+    #[must_use]
+    pub const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Cancellation signal, when the caller supplied one.
+    #[must_use]
+    pub const fn cancellation(&self) -> Option<&CancellationToken> {
+        self.cancellation.as_ref()
+    }
+
+    /// Time remaining before the absolute deadline.
+    #[must_use]
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    /// Checks whether the operation must stop.
+    ///
+    /// An expired deadline wins when cancellation is also pending, matching the
+    /// store's deterministic interruption classification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostCallStop::DeadlineExceeded`] once the deadline is reached,
+    /// or [`HostCallStop::Cancelled`] when cancellation was requested first.
+    pub fn check(&self) -> Result<(), HostCallStop> {
+        if Instant::now() >= self.deadline {
+            Err(HostCallStop::DeadlineExceeded)
+        } else if self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            Err(HostCallStop::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Why a controlled host-side operation stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostCallStop {
+    /// The caller requested cancellation.
+    Cancelled,
+    /// The absolute host-call deadline was reached.
+    DeadlineExceeded,
+}
+
+impl core::fmt::Display for HostCallStop {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("operation cancelled"),
+            Self::DeadlineExceeded => formatter.write_str("operation deadline exceeded"),
+        }
+    }
+}
+
+impl core::error::Error for HostCallStop {}
 
 /// Sink for plugin log records.
 pub trait LogSink: Send + Sync {
@@ -136,6 +243,31 @@ pub trait DnsResolver: Send + Sync {
     ///
     /// Returns a human-readable message when the name cannot be resolved.
     fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String>;
+
+    /// Resolves with the guest call's absolute control.
+    ///
+    /// Existing resolvers remain source-compatible through this default. A
+    /// resolver with an interruptible backend should override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`DnsResolver::resolve`], or a stable
+    /// cancellation/deadline message when the control stops the call.
+    fn resolve_with_control(
+        &self,
+        host: &str,
+        port: u16,
+        control: &HostCallControl,
+    ) -> Result<Vec<IpAddr>, String> {
+        control
+            .check()
+            .map_err(|stop| format!("DNS resolution {stop}"))?;
+        let addresses = self.resolve(host, port);
+        control
+            .check()
+            .map_err(|stop| format!("DNS resolution {stop}"))?;
+        addresses
+    }
 }
 
 /// Outbound HTTP transport.
@@ -152,6 +284,31 @@ pub trait HttpTransport: Send + Sync {
     /// Returns a human-readable message when the transport itself failed. The
     /// message is surfaced to the guest as an `internal` error.
     fn send(&self, plugin_id: &str, request: OutboundRequest) -> Result<InboundResponse, String>;
+
+    /// Performs one request with the guest call's deadline and cancellation.
+    ///
+    /// Existing transports remain source-compatible through this default. A
+    /// transport that can interrupt blocking I/O should override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`HttpTransport::send`], or a stable
+    /// cancellation/deadline message when the control stops the call.
+    fn send_with_control(
+        &self,
+        plugin_id: &str,
+        request: OutboundRequest,
+        control: &HostCallControl,
+    ) -> Result<InboundResponse, String> {
+        control
+            .check()
+            .map_err(|stop| format!("HTTP request {stop}"))?;
+        let response = self.send(plugin_id, request);
+        control
+            .check()
+            .map_err(|stop| format!("HTTP request {stop}"))?;
+        response
+    }
 }
 
 /// Coarse wall clock.
@@ -334,28 +491,19 @@ impl InMemoryConfig {
         key: impl Into<String>,
         value: impl Into<String>,
     ) {
-        let mut guard = self
-            .values
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut guard = self.values.lock().unwrap_or_else(PoisonError::into_inner);
         guard.insert((plugin_id.into(), key.into()), value.into());
     }
 }
 
 impl ConfigProvider for InMemoryConfig {
     fn get(&self, plugin_id: &str, key: &str) -> Option<String> {
-        let guard = self
-            .values
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let guard = self.values.lock().unwrap_or_else(PoisonError::into_inner);
         guard.get(&(plugin_id.to_owned(), key.to_owned())).cloned()
     }
 
     fn keys(&self, plugin_id: &str) -> Vec<String> {
-        let guard = self
-            .values
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let guard = self.values.lock().unwrap_or_else(PoisonError::into_inner);
         guard
             .keys()
             .filter(|(owner, _)| owner == plugin_id)
@@ -381,10 +529,7 @@ impl InMemoryStore {
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut StoreMap) -> R) -> R {
-        let mut guard = self
-            .values
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut guard = self.values.lock().unwrap_or_else(PoisonError::into_inner);
         f(&mut guard)
     }
 }
@@ -471,13 +616,19 @@ impl RecordingSink {
     /// Every log record captured so far.
     #[must_use]
     pub fn logs(&self) -> Vec<LogRecord> {
-        self.logs.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.logs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Every tool registration captured so far.
     #[must_use]
     pub fn tools(&self) -> Vec<ToolRegistration> {
-        self.tools.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.tools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Every published event captured so far, with its plugin id.
@@ -485,7 +636,7 @@ impl RecordingSink {
     pub fn events(&self) -> Vec<(String, HostEvent)> {
         self.events
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 }
@@ -494,14 +645,14 @@ impl LogSink for RecordingSink {
     fn record(&self, record: LogRecord) {
         self.logs
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .push(record);
     }
 }
 
 impl ToolSink for RecordingSink {
     fn register(&self, registration: ToolRegistration) {
-        let mut guard = self.tools.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.tools.lock().unwrap_or_else(PoisonError::into_inner);
         guard.retain(|existing| {
             existing.plugin_id != registration.plugin_id || existing.name != registration.name
         });
@@ -509,7 +660,7 @@ impl ToolSink for RecordingSink {
     }
 
     fn unregister(&self, plugin_id: &str, name: &str) -> bool {
-        let mut guard = self.tools.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.tools.lock().unwrap_or_else(PoisonError::into_inner);
         let before = guard.len();
         guard.retain(|existing| existing.plugin_id != plugin_id || existing.name != name);
         guard.len() != before
@@ -520,7 +671,7 @@ impl EventSink for RecordingSink {
     fn publish(&self, plugin_id: &str, event: HostEvent) {
         self.events
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .push((plugin_id.to_owned(), event));
     }
 }
@@ -669,4 +820,9 @@ impl RandomSource for UnavailableRandom {
     fn fill(&self, _buffer: &mut [u8]) -> Result<(), String> {
         Err("no entropy source is installed".to_owned())
     }
+}
+
+fn redact_url_query(url: &str) -> String {
+    url.split_once('?')
+        .map_or_else(|| url.to_owned(), |(base, _)| format!("{base}?[REDACTED]"))
 }

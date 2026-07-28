@@ -77,7 +77,11 @@ struct Pending {
 #[derive(Default)]
 struct BrokerState {
     pending: HashMap<ApprovalId, Pending>,
-    remembered: HashMap<(String, String), ApprovalDecision>,
+    // Keyed session-first so a lookup borrows both halves instead of allocating a `(String,
+    // String)` key it throws away: `remembered` runs for every approval-gated tool call.
+    // Runtime TTL, LRU, reload, and terminal-destruction paths clear this through
+    // `forget_session`, so its ownership matches the bounded conversation registry.
+    remembered: HashMap<String, HashMap<String, ApprovalDecision>>,
     next_id: u64,
 }
 
@@ -107,7 +111,7 @@ struct PendingGuard {
 
 impl PendingGuard {
     /// Hands ownership of the pending entry back to the caller.
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -140,10 +144,13 @@ pub struct ApprovalBroker {
 
 impl fmt::Debug for ApprovalBroker {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        // Counting under the lock beats cloning every pending request just to measure it, and the
+        // lock is released before any formatting happens.
+        let outstanding = self.lock().pending.len();
         formatter
             .debug_struct("ApprovalBroker")
             .field("timeout", &self.timeout)
-            .field("outstanding", &self.outstanding().len())
+            .field("outstanding", &outstanding)
             .finish_non_exhaustive()
     }
 }
@@ -167,12 +174,15 @@ impl ApprovalBroker {
     /// Returns every outstanding request, oldest identifier first.
     #[must_use]
     pub fn outstanding(&self) -> Vec<ApprovalRequest> {
-        let state = self.lock();
-        let mut requests: Vec<ApprovalRequest> = state
-            .pending
-            .values()
-            .map(|pending| pending.request.clone())
-            .collect();
+        // The clone-out happens under the lock; the sort does not.
+        let mut requests: Vec<ApprovalRequest> = {
+            let state = self.lock();
+            state
+                .pending
+                .values()
+                .map(|pending| pending.request.clone())
+                .collect()
+        };
         requests.sort_by(|left, right| {
             left.requested_at
                 .cmp(&right.requested_at)
@@ -184,18 +194,43 @@ impl ApprovalBroker {
     /// Returns the decision remembered for a tool in a session, if any.
     #[must_use]
     pub fn remembered(&self, session_id: &SessionId, tool_name: &str) -> Option<ApprovalDecision> {
+        // Both halves of the key are borrowed: this runs for every approval-gated tool call, and
+        // the owned `(String, String)` key it used to build allocated twice per lookup only to be
+        // dropped again.
         self.lock()
             .remembered
-            .get(&(session_id.as_str().to_owned(), tool_name.to_owned()))
+            .get(session_id.as_str())?
+            .get(tool_name)
             .copied()
     }
 
     /// Forgets a remembered decision so the next call asks again.
+    ///
+    /// Returns whether a decision was actually forgotten.
+    #[must_use]
     pub fn forget(&self, session_id: &SessionId, tool_name: &str) -> bool {
+        let mut state = self.lock();
+        let Some(tools) = state.remembered.get_mut(session_id.as_str()) else {
+            return false;
+        };
+        let forgotten = tools.remove(tool_name).is_some();
+        if tools.is_empty() {
+            state.remembered.remove(session_id.as_str());
+        }
+        forgotten
+    }
+
+    /// Forgets every remembered decision owned by one conversation session.
+    ///
+    /// Returns the number of decisions removed. Runtime TTL, LRU, reload, and
+    /// terminal-destruction paths all call this, so remembered approval state is
+    /// bounded by the same ownership policy as model selection.
+    #[must_use]
+    pub fn forget_session(&self, session_id: &SessionId) -> usize {
         self.lock()
             .remembered
-            .remove(&(session_id.as_str().to_owned(), tool_name.to_owned()))
-            .is_some()
+            .remove(session_id.as_str())
+            .map_or(0, |tools| tools.len())
     }
 
     /// Answers one outstanding request.
@@ -219,13 +254,11 @@ impl ApprovalBroker {
                 .remove(approval_id)
                 .ok_or_else(|| ApprovalError::Unknown(approval_id.clone()))?;
             if decision.scope.is_remembered() {
-                state.remembered.insert(
-                    (
-                        pending.request.session_id.as_str().to_owned(),
-                        pending.request.tool_name.clone(),
-                    ),
-                    decision,
-                );
+                state
+                    .remembered
+                    .entry(pending.request.session_id.as_str().to_owned())
+                    .or_default()
+                    .insert(pending.request.tool_name.clone(), decision);
             }
             pending
         };
@@ -238,7 +271,7 @@ impl ApprovalBroker {
 
     /// Withdraws every outstanding request, waking each waiter with `reason`.
     ///
-    /// Abandoned requests are not reported here: [`PendingGuard`] retracts and dismisses them
+    /// Abandoned requests are not reported here: the private `PendingGuard` retracts and dismisses them
     /// synchronously at drop time, so by the time this runs they are already gone. Nothing is
     /// accumulated between a drop and a shutdown, which is why the broker keeps no orphan list.
     ///
@@ -278,8 +311,10 @@ impl ApprovalBroker {
     ///
     /// # Errors
     ///
-    /// Returns [`ApprovalError::Port`] when the presentation adapter fails, and
-    /// [`ApprovalError::DeadlineOverflow`] when the deadline cannot be represented.
+    /// Returns [`ApprovalError::Port`] when the presentation adapter fails,
+    /// [`ApprovalError::DeadlineOverflow`] when the deadline cannot be represented, and
+    /// [`ApprovalError::Identifier`] when the broker's identifier counter cannot advance — the
+    /// request is refused rather than issued an identifier that is already in use.
     pub async fn request(
         &self,
         ticket: ApprovalTicket,
@@ -297,31 +332,46 @@ impl ApprovalBroker {
             .checked_add(self.timeout)
             .ok_or(ApprovalError::DeadlineOverflow)?;
 
-        let (approval_id, receiver, request) = {
+        // Only the counter bump needs the lock; minting the identifier, building the request and
+        // allocating the channel all happen outside it.
+        //
+        // `checked_add`, not `saturating_add`: a saturated counter re-mints an identifier that is
+        // already in `pending`, and the insert below would then evict a live waiter. That waiter's
+        // responder would drop, so its call would report a withdrawal that no operator and no
+        // timeout ever caused, and the guard it holds would retract the *new* request instead.
+        // Exhausting a u64 is unreachable in practice, which is exactly why the failure has to be
+        // loud: an unreachable branch that silently corrupts is worse than one that refuses.
+        let ordinal = {
             let mut state = self.lock();
-            state.next_id = state.next_id.saturating_add(1);
-            let approval_id = ApprovalId::new(format!("approval-{}", state.next_id))
-                .map_err(|error| ApprovalError::Identifier(error.reason()))?;
-            let request = ApprovalRequest {
-                approval_id: approval_id.clone(),
-                session_id: ticket.session_id,
-                turn: ticket.turn,
-                call_id: ticket.call_id,
-                tool_name: ticket.tool_name,
-                arguments: ticket.arguments,
-                requested_at,
-                expires_at,
-            };
-            let (responder, receiver) = oneshot::channel();
-            state.pending.insert(
-                approval_id.clone(),
-                Pending {
-                    request: request.clone(),
-                    responder,
-                },
-            );
-            (approval_id, receiver, request)
+            let ordinal = state
+                .next_id
+                .checked_add(1)
+                .ok_or(ApprovalError::Identifier(
+                    "the broker has exhausted its identifier space",
+                ))?;
+            state.next_id = ordinal;
+            ordinal
         };
+        let approval_id = ApprovalId::new(format!("approval-{ordinal}"))
+            .map_err(|error| ApprovalError::Identifier(error.reason()))?;
+        let request = ApprovalRequest {
+            approval_id: approval_id.clone(),
+            session_id: ticket.session_id,
+            turn: ticket.turn,
+            call_id: ticket.call_id,
+            tool_name: ticket.tool_name,
+            arguments: ticket.arguments,
+            requested_at,
+            expires_at,
+        };
+        let (responder, receiver) = oneshot::channel();
+        self.lock().pending.insert(
+            approval_id.clone(),
+            Pending {
+                request: request.clone(),
+                responder,
+            },
+        );
 
         // Armed for exactly the window in which this future owns the pending entry.
         let mut guard = PendingGuard {
@@ -344,30 +394,30 @@ impl ApprovalBroker {
             () = self.clock.sleep_until(expires_at) => None,
         };
 
-        match outcome {
-            Some(decision) => {
-                // `resolve` already removed the entry when it woke this waiter.
-                guard.disarm();
-                self.approvals.settle(&approval_id).await?;
-                Ok(ApprovalOutcome::Decided {
-                    decision,
-                    remembered: false,
-                })
+        // Both outcomes below take deliberate ownership of the pending entry — one because
+        // `resolve` already removed it, the other because this path removes it itself — so the
+        // guard's unwind-time retraction is no longer wanted on either.
+        guard.disarm();
+
+        let Some(decision) = outcome else {
+            let still_pending = self.discard(&approval_id);
+            let reason = if cancel.is_cancelled() {
+                ApprovalWithdrawal::Cancelled
+            } else {
+                ApprovalWithdrawal::TimedOut
+            };
+            if still_pending {
+                self.approvals.withdraw(&approval_id, reason).await?;
             }
-            None => {
-                guard.disarm();
-                let still_pending = self.discard(&approval_id);
-                let reason = if cancel.is_cancelled() {
-                    ApprovalWithdrawal::Cancelled
-                } else {
-                    ApprovalWithdrawal::TimedOut
-                };
-                if still_pending {
-                    self.approvals.withdraw(&approval_id, reason).await?;
-                }
-                Ok(ApprovalOutcome::Withdrawn { reason })
-            }
-        }
+            return Ok(ApprovalOutcome::Withdrawn { reason });
+        };
+
+        // `resolve` already removed the entry when it woke this waiter.
+        self.approvals.settle(&approval_id).await?;
+        Ok(ApprovalOutcome::Decided {
+            decision,
+            remembered: false,
+        })
     }
 
     fn discard(&self, approval_id: &ApprovalId) -> bool {
@@ -403,4 +453,95 @@ impl ApprovalPort for SilentApprovalPort {
     }
 
     fn abandon(&self, _approval_id: &ApprovalId) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use claw_application::model::ids::{ToolCallId, TurnId};
+    use claw_application::model::time::Timestamp;
+    use claw_application::ports::PortFuture;
+    use claw_application::ports::clock::ClockPort;
+    use claw_domain::SessionId;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{ApprovalBroker, ApprovalError, ApprovalTicket, SilentApprovalPort, lock_state};
+
+    /// A clock that never moves, so a request that reaches its deadline never resolves.
+    struct FrozenClock;
+
+    impl ClockPort for FrozenClock {
+        fn now(&self) -> Timestamp {
+            Timestamp::EPOCH
+        }
+
+        fn sleep(&self, _duration: Duration) -> PortFuture<'_, ()> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn broker() -> ApprovalBroker {
+        ApprovalBroker::new(
+            Arc::new(SilentApprovalPort),
+            Arc::new(FrozenClock),
+            Duration::from_secs(30),
+        )
+    }
+
+    fn ticket() -> ApprovalTicket {
+        ApprovalTicket {
+            session_id: SessionId::new("exhaustion").expect("the test session id is valid"),
+            turn: TurnId::FIRST,
+            call_id: ToolCallId::new("call-1").expect("the test call id is valid"),
+            tool_name: "shell".to_owned(),
+            arguments: "{}".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_identifier_space_is_refused_instead_of_reusing_an_identifier() {
+        let broker = broker();
+        // Reaching this by making requests would take 2^64 of them; the counter is set directly
+        // so the branch is actually executed rather than merely reasoned about.
+        lock_state(&broker.state).next_id = u64::MAX;
+
+        let refused = broker
+            .request(ticket(), &CancellationToken::new())
+            .await
+            .expect_err("a counter that cannot advance must refuse the request");
+
+        assert!(
+            matches!(refused, ApprovalError::Identifier(_)),
+            "expected an identifier refusal, got {refused}"
+        );
+        assert!(
+            broker.outstanding().is_empty(),
+            "a refused request must not leave a waiter that a later request could evict"
+        );
+    }
+
+    #[tokio::test]
+    async fn identifiers_advance_by_one_per_request() {
+        use std::future::Future as _;
+
+        let broker = broker();
+        lock_state(&broker.state).next_id = 41;
+
+        let cancel = CancellationToken::new();
+        let mut waiting = Box::pin(broker.request(ticket(), &cancel));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            waiting.as_mut().poll(&mut context).is_pending(),
+            "a presented request waits for an answer"
+        );
+
+        assert_eq!(
+            broker.outstanding()[0].approval_id.as_str(),
+            "approval-42",
+            "the minted ordinal must be the incremented counter, not the one before it"
+        );
+        assert_eq!(lock_state(&broker.state).next_id, 42);
+    }
 }

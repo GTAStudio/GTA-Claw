@@ -35,7 +35,13 @@ const DESKTOP_DEPENDENCIES: [ExpectedDesktopDependency; 17] = [
     ExpectedDesktopDependency::registry("getrandom", "=0.4.3", None, true, &["sys_rng"]),
     ExpectedDesktopDependency::registry("httparse", "=1.10.1", Some("dev"), true, EMPTY_FEATURES),
     ExpectedDesktopDependency::registry("secrecy", "=0.10.3", None, true, EMPTY_FEATURES),
-    ExpectedDesktopDependency::registry("serde_json", "=1.0.150", None, true, &["raw_value"]),
+    ExpectedDesktopDependency::registry(
+        "serde_json",
+        "=1.0.151",
+        None,
+        true,
+        &["preserve_order", "raw_value"],
+    ),
     ExpectedDesktopDependency::registry("sha1", "=0.11.0", Some("dev"), true, EMPTY_FEATURES),
     ExpectedDesktopDependency::registry(
         "slint",
@@ -60,7 +66,7 @@ const DESKTOP_DEPENDENCIES: [ExpectedDesktopDependency; 17] = [
     ),
     ExpectedDesktopDependency::registry(
         "tokio",
-        "=1.52.3",
+        "=1.53.1",
         None,
         true,
         &[
@@ -72,7 +78,7 @@ const DESKTOP_DEPENDENCIES: [ExpectedDesktopDependency; 17] = [
             "time",
         ],
     ),
-    ExpectedDesktopDependency::registry("tokio-util", "=0.7.18", None, true, &["rt"]),
+    ExpectedDesktopDependency::registry("tokio-util", "=0.7.19", None, true, &["rt"]),
     ExpectedDesktopDependency::registry("url", "=2.5.8", None, true, EMPTY_FEATURES),
 ];
 /// Official Rust 1.94.0 Linux Cargo binary SHA-256.

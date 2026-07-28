@@ -121,6 +121,13 @@ pub trait Tool {
     ///
     /// This must be a pure function of the validated arguments so that the
     /// authorized resource and the used resource cannot diverge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Schema`] when a required argument is absent even
+    /// after validation, and [`ToolError::Sandbox`] when the argument names a
+    /// path that leaves the workspace root, escapes through a symlink, or
+    /// exceeds a path bound. A tool that cannot name its resource is never run.
     fn resource(
         &self,
         arguments: &Arguments,
@@ -128,6 +135,16 @@ pub trait Tool {
     ) -> Result<Resource, ToolError>;
 
     /// Executes the tool against already-validated, already-authorized input.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the concrete tool refuses on: [`ToolError::Sandbox`]
+    /// for a path outside the workspace root or a file past the read limit,
+    /// [`ToolError::Patch`] when patch context did not match the file,
+    /// [`ToolError::Execution`] for a command that is not on the allowlist or
+    /// that exceeded its timeout, [`ToolError::Network`] for a blocked or
+    /// oversized fetch, and [`ToolError::Permission`] when a resource reached
+    /// mid-invocation is refused by the re-authorization gate.
     fn invoke(
         &self,
         arguments: &Arguments,

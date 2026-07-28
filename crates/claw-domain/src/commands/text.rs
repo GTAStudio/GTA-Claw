@@ -8,7 +8,7 @@
 //! boundary is found, so the difference is encoded here once and reused.
 
 /// Returns whether `value` is whitespace for ECMA-262 `\s`, `trim()` and friends.
-pub(crate) fn is_js_space(value: char) -> bool {
+pub(crate) const fn is_js_space(value: char) -> bool {
     value.is_whitespace() || value == '\u{feff}'
 }
 

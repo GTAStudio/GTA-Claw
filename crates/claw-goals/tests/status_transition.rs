@@ -108,7 +108,7 @@ fn a_closed_goal_refuses_progress_and_the_refusal_names_the_status_it_holds() {
     assert_eq!(
         error,
         GoalError::AlreadyClosed {
-            goal_id: goal_id.clone(),
+            goal_id,
             status: GoalStatus::Failed,
         }
     );

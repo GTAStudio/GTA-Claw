@@ -27,6 +27,11 @@ pub enum ModelError {
     ToolParametersNotAnObject,
     /// Tool-call arguments were not a JSON object document.
     ToolArgumentsNotAnObject,
+    /// Streamed tool-call arguments exceeded the aggregate memory budget.
+    ToolArgumentsTooLarge {
+        /// The aggregate byte limit.
+        limit: usize,
+    },
     /// A request had no messages, or the message sequence is unusable.
     EmptyConversation,
     /// A numeric sampling parameter was outside its documented range.
@@ -59,6 +64,12 @@ impl Display for ModelError {
             }
             Self::ToolArgumentsNotAnObject => {
                 formatter.write_str("tool-call arguments must be a JSON object")
+            }
+            Self::ToolArgumentsTooLarge { limit } => {
+                write!(
+                    formatter,
+                    "streamed tool-call arguments exceed the {limit} byte limit"
+                )
             }
             Self::EmptyConversation => {
                 formatter.write_str("a completion needs at least one message")
@@ -524,7 +535,7 @@ pub struct CompletionRequest {
 impl CompletionRequest {
     /// Builds a minimal request for `model` with a single user turn.
     #[must_use]
-    pub fn new(model: ModelId, messages: Vec<ChatMessage>) -> Self {
+    pub const fn new(model: ModelId, messages: Vec<ChatMessage>) -> Self {
         Self {
             model,
             messages,
@@ -624,7 +635,7 @@ impl EmbeddingsRequest {
     ///
     /// Returns [`ModelError::EmptyEmbeddingInput`] when there is nothing to embed.
     pub fn validate(&self) -> Result<(), ModelError> {
-        if self.inputs.is_empty() || self.inputs.iter().all(|input| input.is_empty()) {
+        if self.inputs.is_empty() || self.inputs.iter().all(String::is_empty) {
             return Err(ModelError::EmptyEmbeddingInput);
         }
         Ok(())
@@ -796,7 +807,7 @@ pub enum AuthMode {
     OAuthDeviceCode,
     /// OAuth 2.0 authorization-code grant with PKCE.
     OAuthAuthorizationCode,
-    /// AWS SigV4 request signing.
+    /// AWS Signature Version 4 request signing.
     AwsSigV4,
     /// Google service-account or Application Default Credentials.
     GoogleServiceAccount,
@@ -926,14 +937,15 @@ mod tests {
 
     #[test]
     fn tool_arguments_validate_framing_and_normalize_empty_input() {
-        let arguments = ToolArguments::new(r#"{"path":"/tmp/x","depth":2}"#).expect("object");
-        assert_eq!(arguments.as_str(), r#"{"path":"/tmp/x","depth":2}"#);
-
         #[derive(serde::Deserialize, Debug, PartialEq)]
         struct Args {
             path: String,
             depth: u8,
         }
+
+        let arguments = ToolArguments::new(r#"{"path":"/tmp/x","depth":2}"#).expect("object");
+        assert_eq!(arguments.as_str(), r#"{"path":"/tmp/x","depth":2}"#);
+
         assert_eq!(
             arguments.deserialize::<Args>().expect("typed"),
             Args {
@@ -968,7 +980,7 @@ mod tests {
             CompletionRequest::new(model.clone(), vec![ChatMessage::user_text("hello")]);
         assert_eq!(request.validate(), Ok(()));
 
-        let empty = CompletionRequest::new(model.clone(), Vec::new());
+        let empty = CompletionRequest::new(model, Vec::new());
         assert_eq!(empty.validate(), Err(ModelError::EmptyConversation));
 
         request.temperature_milli = Some(2_001);

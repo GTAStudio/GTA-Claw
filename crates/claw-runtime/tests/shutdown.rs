@@ -335,7 +335,7 @@ async fn a_suspended_runtime_refuses_work_and_shuts_down_cleanly() {
             lease_id: lease.clone(),
             reason: "test".to_owned(),
             drain_timeout: Duration::from_secs(1),
-            lease_ttl: Duration::from_secs(600),
+            lease_ttl: Duration::from_mins(10),
         })
         .await
         .expect("an idle runtime suspends");

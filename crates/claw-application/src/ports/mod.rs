@@ -3,6 +3,11 @@
 //! Every port method returns a [`PortFuture`], a boxed `Send` future. That keeps the traits
 //! object-safe so adapters can be held as `Arc<dyn Port>` and swapped at composition time,
 //! without forcing an async runtime dependency into this crate.
+//!
+//! # Feature gate
+//!
+//! Gated behind the `runtime-ports` feature, together with
+//! [`model`](crate::model), whose types appear in these signatures.
 
 pub mod approval;
 pub mod clock;

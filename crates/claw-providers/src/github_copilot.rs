@@ -3,7 +3,7 @@
 //! Neither `github-copilot-sdk` nor the Copilot CLI appears anywhere in this
 //! crate's dependency graph. Authentication is an RFC 8628 OAuth 2.0 device
 //! authorization grant spoken directly over `hyper`/`rustls`, followed by the
-//! Copilot token exchange; the chat surface is the OpenAI dialect with the
+//! Copilot token exchange; the chat surface is the `OpenAI` dialect with the
 //! editor headers Copilot requires.
 //!
 //! The flow is:
@@ -19,7 +19,9 @@
 //! Steps 1-3 are separated from step 4 so an application can persist only the
 //! GitHub OAuth token and let this client refresh the short-lived one.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use claw_provider_sdk::cancel::CancelToken;
@@ -31,14 +33,16 @@ use claw_provider_sdk::model::{
     ModelId, ProviderId,
 };
 use claw_provider_sdk::origin::{BoundSecret, Origin, OriginApproval, TrustedOrigins};
-use claw_provider_sdk::provider::{BoxFuture, Provider, RequestContext};
+use claw_provider_sdk::provider::{
+    BoxFuture, Provider, ProviderPhase, ProviderStatus, RequestContext,
+};
 use claw_provider_sdk::secret::SecretString;
 use claw_provider_sdk::stream::CompletionStream;
 use serde::Deserialize;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
-use crate::openai_compatible::{decode_completion, events_from_chunks};
+use crate::openai_compatible::{decode_completion, event_stream};
 use crate::runtime::{ProviderRuntime, ReliabilityConfig};
 
 /// Device authorization endpoint.
@@ -83,6 +87,12 @@ pub const MIN_POLL_INTERVAL_SECONDS: u64 = 1;
 
 /// Extra seconds added to the poll interval when the server says `slow_down`.
 pub const SLOW_DOWN_INCREMENT_SECONDS: u64 = 5;
+
+/// Deadline applied to each device-code and access-token HTTP exchange.
+pub const DEFAULT_DEVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Hard ceiling for one device authorization lifecycle.
+pub const DEFAULT_DEVICE_FLOW_MAX_WAIT: Duration = Duration::from_mins(15);
 
 /// Capabilities the Copilot client can drive.
 const CAPABILITIES: CapabilitySet = crate::descriptor::COPILOT_CAPABILITIES;
@@ -219,12 +229,13 @@ pub fn oauth_error_kind(code: &str) -> ErrorKind {
     match code {
         "authorization_pending" | "slow_down" => ErrorKind::RateLimit,
         "access_denied"
-        | "unauthorized_client"
+        | "device_flow_disabled"
+        | "expired_token"
+        | "incorrect_client_credentials"
+        | "incorrect_device_code"
         | "invalid_client"
         | "invalid_grant"
-        | "incorrect_client_credentials"
-        | "incorrect_device_code" => ErrorKind::Authentication,
-        "expired_token" | "device_flow_disabled" => ErrorKind::Authentication,
+        | "unauthorized_client" => ErrorKind::Authentication,
         "unsupported_grant_type" | "invalid_request" => ErrorKind::InvalidRequest,
         _ => ErrorKind::Protocol,
     }
@@ -362,6 +373,10 @@ pub struct DeviceFlowConfig {
     pub approved_origins: Vec<OriginApproval>,
     /// Reliability policies applied to both endpoints.
     pub reliability: ReliabilityConfig,
+    /// Deadline applied to each device-code and token-poll HTTP exchange.
+    pub request_timeout: Duration,
+    /// Hard ceiling for polling even if the server advertises a longer lifetime.
+    pub max_wait: Duration,
 }
 
 impl DeviceFlowConfig {
@@ -379,6 +394,8 @@ impl DeviceFlowConfig {
             access_token_url: parse_url(ACCESS_TOKEN_URL, Operation::Authorize)?,
             approved_origins: Vec::new(),
             reliability: ReliabilityConfig::default(),
+            request_timeout: DEFAULT_DEVICE_REQUEST_TIMEOUT,
+            max_wait: DEFAULT_DEVICE_FLOW_MAX_WAIT,
         })
     }
 }
@@ -391,6 +408,8 @@ pub struct DeviceFlow {
     device_code_url: Url,
     access_token_url: Url,
     runtime: ProviderRuntime,
+    request_timeout: Duration,
+    max_wait: Duration,
 }
 
 impl DeviceFlow {
@@ -416,6 +435,8 @@ impl DeviceFlow {
             scope: config.scope,
             device_code_url: config.device_code_url,
             access_token_url: config.access_token_url,
+            request_timeout: config.request_timeout,
+            max_wait: config.max_wait,
         })
     }
 
@@ -423,7 +444,9 @@ impl DeviceFlow {
     ///
     /// # Errors
     ///
-    /// See [`DeviceFlow::new`].
+    /// Returns [`ErrorKind::InvalidRequest`] if the pinned github.com endpoint
+    /// constants ever stop parsing, and [`ErrorKind::Transport`] when the TLS
+    /// stack cannot be built.
     pub fn github() -> Result<Self, ProviderError> {
         Self::new(DeviceFlowConfig::github()?)
     }
@@ -448,43 +471,68 @@ impl DeviceFlow {
     ///
     /// # Errors
     ///
-    /// Returns the typed transport or OAuth error.
+    /// Returns [`ErrorKind::Transport`] when the device-code endpoint cannot be
+    /// reached, [`ErrorKind::Cancelled`] when `cancel` fires, the typed error
+    /// for the OAuth `error` code the server returned, and
+    /// [`ErrorKind::Protocol`] when the reply is not a device authorization.
     pub async fn start(&self, cancel: &CancelToken) -> Result<DeviceAuthorization, ProviderError> {
         let form = encode_device_code_form(&self.client_id, &self.scope);
-        let response = self
-            .runtime
-            .execute(Operation::Authorize, cancel, || {
-                Ok(HttpRequest::new(Method::Post, self.device_code_url.clone())
-                    .header("accept", "application/json")
-                    .body(Body::Form(form.clone())))
-            })
-            .await?;
-        decode_device_authorization(response.body())
+        self.runtime
+            .execute_decoded(
+                Operation::Authorize,
+                cancel,
+                || {
+                    Ok(HttpRequest::new(Method::Post, self.device_code_url.clone())
+                        .header("accept", "application/json")
+                        .body(Body::Form(form.clone()))
+                        .timeout(self.request_timeout))
+                },
+                |response| decode_device_authorization(response.body()),
+            )
+            .await
     }
 
     /// Polls the access-token endpoint exactly once.
     ///
     /// # Errors
     ///
-    /// Returns the typed transport or OAuth error. Pending and slow-down are
+    /// Returns [`ErrorKind::Transport`] when the access-token endpoint cannot
+    /// be reached, [`ErrorKind::Cancelled`] when `cancel` fires, the typed
+    /// error for a terminal OAuth `error` code such as `access_denied` or
+    /// `expired_token`, and [`ErrorKind::Protocol`] when the reply is neither
+    /// an error nor a token. `authorization_pending` and `slow_down` are
     /// reported as [`DevicePollOutcome`] values, not errors.
     pub async fn poll_once(
         &self,
         device_code: &SecretString,
         cancel: &CancelToken,
     ) -> Result<DevicePollOutcome, ProviderError> {
+        self.poll_once_with_timeout(device_code, cancel, self.request_timeout)
+            .await
+    }
+
+    async fn poll_once_with_timeout(
+        &self,
+        device_code: &SecretString,
+        cancel: &CancelToken,
+        timeout: Duration,
+    ) -> Result<DevicePollOutcome, ProviderError> {
         let form = encode_device_poll_form(&self.client_id, device_code);
-        let response = self
-            .runtime
-            .execute(Operation::Authorize, cancel, || {
-                Ok(
-                    HttpRequest::new(Method::Post, self.access_token_url.clone())
-                        .header("accept", "application/json")
-                        .body(Body::Form(form.clone())),
-                )
-            })
-            .await?;
-        decode_device_poll(response.body())
+        self.runtime
+            .execute_decoded(
+                Operation::Authorize,
+                cancel,
+                || {
+                    Ok(
+                        HttpRequest::new(Method::Post, self.access_token_url.clone())
+                            .header("accept", "application/json")
+                            .body(Body::Form(form.clone()))
+                            .timeout(timeout),
+                    )
+                },
+                |response| decode_device_poll(response.body()),
+            )
+            .await
     }
 
     /// Polls until the human approves, the grant expires, or `cancel` fires.
@@ -504,9 +552,30 @@ impl DeviceFlow {
         cancel: &CancelToken,
     ) -> Result<SecretString, ProviderError> {
         let clock = self.runtime.clock();
-        let deadline = clock
-            .now_millis()
-            .saturating_add(authorization.expires_in.saturating_mul(1_000));
+        let (deadline, server_expiry) = self.deadline(authorization, clock.now_millis());
+        self.wait_for_token_until(authorization, cancel, deadline, server_expiry)
+            .await
+    }
+
+    fn deadline(&self, authorization: &DeviceAuthorization, started_at_millis: u64) -> (u64, bool) {
+        let max_wait = u64::try_from(self.max_wait.as_millis()).unwrap_or(u64::MAX);
+        let server_wait =
+            (authorization.expires_in > 0).then(|| authorization.expires_in.saturating_mul(1_000));
+        let effective = server_wait.map_or(max_wait, |wait| wait.min(max_wait));
+        (
+            started_at_millis.saturating_add(effective),
+            server_wait.is_some_and(|wait| wait <= max_wait),
+        )
+    }
+
+    async fn wait_for_token_until(
+        &self,
+        authorization: &DeviceAuthorization,
+        cancel: &CancelToken,
+        deadline: u64,
+        server_expiry: bool,
+    ) -> Result<SecretString, ProviderError> {
+        let clock = self.runtime.clock();
         let mut interval = authorization.interval.max(MIN_POLL_INTERVAL_SECONDS);
         loop {
             if cancel.is_cancelled() {
@@ -516,22 +585,245 @@ impl DeviceFlow {
                     "the device authorization was cancelled",
                 ));
             }
-            if authorization.expires_in > 0 && clock.now_millis() >= deadline {
-                return Err(provider_error(
-                    ErrorKind::Authentication,
-                    Operation::Authorize,
-                    "the device authorization expired before it was approved",
-                )
-                .with_upstream_code("expired_token"));
+            let now = clock.now_millis();
+            if now >= deadline {
+                return Err(Self::deadline_error(server_expiry));
             }
-            clock.sleep(Duration::from_secs(interval)).await;
-            match self.poll_once(&authorization.device_code, cancel).await? {
+            let remaining = deadline.saturating_sub(now);
+            let sleep = Duration::from_secs(interval).min(Duration::from_millis(remaining));
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(provider_error(
+                        ErrorKind::Cancelled,
+                        Operation::Authorize,
+                        "the device authorization was cancelled",
+                    ));
+                }
+                () = clock.sleep(sleep) => {}
+            }
+            if clock.now_millis() >= deadline {
+                continue;
+            }
+            let remaining = Duration::from_millis(deadline.saturating_sub(clock.now_millis()));
+            let poll_cancel = CancelToken::new();
+            let polling = self.poll_once_with_timeout(
+                &authorization.device_code,
+                &poll_cancel,
+                self.request_timeout.min(remaining),
+            );
+            tokio::pin!(polling);
+            let outcome = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    poll_cancel.cancel();
+                    return Err(provider_error(
+                        ErrorKind::Cancelled,
+                        Operation::Authorize,
+                        "the device authorization was cancelled",
+                    ));
+                }
+                () = tokio::time::sleep(remaining) => {
+                    poll_cancel.cancel();
+                    return Err(Self::deadline_error(server_expiry));
+                }
+                result = &mut polling => result?,
+            };
+            if clock.now_millis() >= deadline {
+                return Err(Self::deadline_error(server_expiry));
+            }
+            match outcome {
                 DevicePollOutcome::Granted(token) => return Ok(token),
                 DevicePollOutcome::Pending => {}
                 DevicePollOutcome::SlowDown => {
                     interval = interval.saturating_add(SLOW_DOWN_INCREMENT_SECONDS);
                 }
             }
+        }
+    }
+
+    fn deadline_error(server_expiry: bool) -> ProviderError {
+        if server_expiry {
+            provider_error(
+                ErrorKind::Authentication,
+                Operation::Authorize,
+                "the device authorization expired before it was approved",
+            )
+            .with_upstream_code("expired_token")
+        } else {
+            provider_error(
+                ErrorKind::Timeout,
+                Operation::Authorize,
+                "the device authorization exceeded its maximum wait",
+            )
+            .with_upstream_code("device_flow_timeout")
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingDeviceAuthorization {
+    generation: u64,
+    authorization: DeviceAuthorization,
+    expires_at_millis: u64,
+    server_expiry: bool,
+}
+
+/// Owns one reusable device-code lifecycle and serializes engine activation.
+#[derive(Debug)]
+pub struct DeviceFlowSession {
+    flow: DeviceFlow,
+    pending: Mutex<Option<PendingDeviceAuthorization>>,
+    activation: Mutex<()>,
+    next_generation: AtomicU64,
+}
+
+impl DeviceFlowSession {
+    /// Creates an empty lifecycle around `flow`.
+    #[must_use]
+    pub const fn new(flow: DeviceFlow) -> Self {
+        Self {
+            flow,
+            pending: Mutex::const_new(None),
+            activation: Mutex::const_new(()),
+            next_generation: AtomicU64::new(1),
+        }
+    }
+
+    /// Returns the active, unexpired authorization, if one exists.
+    pub async fn pending(&self) -> Option<DeviceAuthorization> {
+        let now = self.flow.runtime.clock().now_millis();
+        let mut pending = self.pending.lock().await;
+        if pending
+            .as_ref()
+            .is_some_and(|authorization| now >= authorization.expires_at_millis)
+        {
+            *pending = None;
+        }
+        pending
+            .as_ref()
+            .map(|authorization| authorization.authorization.clone())
+    }
+
+    /// Reuses an unexpired authorization or requests a fresh user code.
+    ///
+    /// Concurrent callers serialize through the pending-state lock, so only one
+    /// device-code request is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed error from [`DeviceFlow::start`].
+    pub async fn begin(&self, cancel: &CancelToken) -> Result<DeviceAuthorization, ProviderError> {
+        Ok(self.pending_or_start(cancel).await?.authorization)
+    }
+
+    /// Clears pending device authorization state.
+    ///
+    /// Returns whether a pending authorization existed.
+    pub async fn clear(&self) -> bool {
+        self.pending.lock().await.take().is_some()
+    }
+
+    /// Completes the grant and invokes `activate` exactly once with the token.
+    ///
+    /// This is the composition seam for a host engine: `activate` should build,
+    /// start, and ping its replacement before publishing it. Concurrent calls
+    /// serialize, and pending state is cleared on every terminal outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed device-flow failure or the activation callback's
+    /// [`ProviderError`].
+    pub async fn activate_with<T, F, Fut>(
+        &self,
+        cancel: &CancelToken,
+        activate: F,
+    ) -> Result<T, ProviderError>
+    where
+        F: FnOnce(SecretString, CancelToken) -> Fut,
+        Fut: Future<Output = Result<T, ProviderError>>,
+    {
+        let activation = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Err(provider_error(
+                    ErrorKind::Cancelled,
+                    Operation::Authorize,
+                    "device-flow activation was cancelled",
+                ));
+            }
+            activation = self.activation.lock() => activation,
+        };
+        let pending = self.pending_or_start(cancel).await?;
+        let token = self
+            .flow
+            .wait_for_token_until(
+                &pending.authorization,
+                cancel,
+                pending.expires_at_millis,
+                pending.server_expiry,
+            )
+            .await;
+        self.clear_generation(pending.generation).await;
+        let result = activate(token?, cancel.clone()).await;
+        drop(activation);
+        result
+    }
+
+    /// Activates a default GitHub Copilot client and proves it ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns a device-flow, client-construction, startup, or ping failure.
+    pub async fn activate(&self, cancel: &CancelToken) -> Result<ActivatedCopilot, ProviderError> {
+        self.activate_with(cancel, |token, cancel| async move {
+            let provider = GitHubCopilot::with_github_token(token)?;
+            let context = RequestContext::with_cancel(cancel);
+            let startup_status = provider.startup(&context).await?;
+            let ping_status = provider.ping(&context).await?;
+            Ok(ActivatedCopilot {
+                provider,
+                startup_status,
+                ping_status,
+            })
+        })
+        .await
+    }
+
+    async fn pending_or_start(
+        &self,
+        cancel: &CancelToken,
+    ) -> Result<PendingDeviceAuthorization, ProviderError> {
+        let mut pending = self.pending.lock().await;
+        let now = self.flow.runtime.clock().now_millis();
+        if let Some(existing) = pending.as_ref()
+            && now < existing.expires_at_millis
+        {
+            return Ok(existing.clone());
+        }
+        *pending = None;
+
+        let authorization = self.flow.start(cancel).await?;
+        let started_at = self.flow.runtime.clock().now_millis();
+        let (expires_at_millis, server_expiry) = self.flow.deadline(&authorization, started_at);
+        let created = PendingDeviceAuthorization {
+            generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+            authorization,
+            expires_at_millis,
+            server_expiry,
+        };
+        *pending = Some(created.clone());
+        drop(pending);
+        Ok(created)
+    }
+
+    async fn clear_generation(&self, generation: u64) {
+        let mut pending = self.pending.lock().await;
+        if pending
+            .as_ref()
+            .is_some_and(|authorization| authorization.generation == generation)
+        {
+            *pending = None;
         }
     }
 }
@@ -687,6 +979,40 @@ pub struct GitHubCopilot {
     runtime: ProviderRuntime,
 }
 
+/// A device-flow result whose provider passed its startup probe.
+#[derive(Debug)]
+pub struct ActivatedCopilot {
+    provider: GitHubCopilot,
+    startup_status: ProviderStatus,
+    ping_status: ProviderStatus,
+}
+
+impl ActivatedCopilot {
+    /// Returns the successful startup status.
+    #[must_use]
+    pub const fn status(&self) -> &ProviderStatus {
+        &self.startup_status
+    }
+
+    /// Returns the successful post-start reachability probe.
+    #[must_use]
+    pub const fn ping_status(&self) -> &ProviderStatus {
+        &self.ping_status
+    }
+
+    /// Returns the activated provider.
+    #[must_use]
+    pub const fn provider(&self) -> &GitHubCopilot {
+        &self.provider
+    }
+
+    /// Consumes the activation result and returns the provider.
+    #[must_use]
+    pub fn into_provider(self) -> GitHubCopilot {
+        self.provider
+    }
+}
+
 impl GitHubCopilot {
     /// Builds a Copilot client.
     ///
@@ -744,7 +1070,9 @@ impl GitHubCopilot {
     ///
     /// # Errors
     ///
-    /// See [`GitHubCopilot::new`].
+    /// Returns [`ErrorKind::Authentication`] when `github_token` is empty once
+    /// trimmed, and [`ErrorKind::Transport`] when the TLS stack cannot be
+    /// built.
     pub fn with_github_token(github_token: SecretString) -> Result<Self, ProviderError> {
         Self::new(GitHubCopilotConfig::new(github_token)?)
     }
@@ -782,32 +1110,39 @@ impl GitHubCopilot {
     ///
     /// # Errors
     ///
-    /// Returns the typed transport or protocol error.
+    /// Returns [`ErrorKind::Authentication`] when GitHub rejects the token,
+    /// [`ErrorKind::Transport`] when the exchange endpoint cannot be reached,
+    /// [`ErrorKind::Cancelled`] when `cancel` fires, and
+    /// [`ErrorKind::Protocol`] when the reply is not a Copilot token
+    /// document.
     pub async fn exchange_token(
         &self,
         cancel: &CancelToken,
     ) -> Result<CopilotToken, ProviderError> {
-        let response = self
-            .runtime
-            .execute(Operation::Authorize, cancel, || {
-                HttpRequest::new(Method::Get, self.token_exchange_url.clone())
-                    .header("accept", "application/json")
-                    .header("editor-version", self.editor_version.clone())
-                    .header("editor-plugin-version", self.editor_plugin_version.clone())
-                    .bound_secret_header("authorization", "token ", &self.github_token)
-                    .map_err(|error| {
-                        provider_error(
-                            ErrorKind::Authentication,
-                            Operation::Authorize,
-                            format!(
-                                "the GitHub OAuth token is not authorised for this \
-                                 exchange endpoint: {error}"
-                            ),
-                        )
-                    })
-            })
-            .await?;
-        decode_copilot_token(response.body())
+        self.runtime
+            .execute_decoded(
+                Operation::Authorize,
+                cancel,
+                || {
+                    HttpRequest::new(Method::Get, self.token_exchange_url.clone())
+                        .header("accept", "application/json")
+                        .header("editor-version", self.editor_version.clone())
+                        .header("editor-plugin-version", self.editor_plugin_version.clone())
+                        .bound_secret_header("authorization", "token ", &self.github_token)
+                        .map_err(|error| {
+                            provider_error(
+                                ErrorKind::Authentication,
+                                Operation::Authorize,
+                                format!(
+                                    "the GitHub OAuth token is not authorised for this \
+                                     exchange endpoint: {error}"
+                                ),
+                            )
+                        })
+                },
+                |response| decode_copilot_token(response.body()),
+            )
+            .await
     }
 
     async fn token(&self, cancel: &CancelToken) -> Result<CopilotToken, ProviderError> {
@@ -867,6 +1202,22 @@ impl GitHubCopilot {
         }
         Ok(request)
     }
+
+    async fn probe(
+        &self,
+        operation: Operation,
+        phase: ProviderPhase,
+        context: &RequestContext,
+    ) -> Result<ProviderStatus, ProviderError> {
+        let token = self.token(context.cancel()).await?;
+        let url = self.endpoint(&token, "models")?;
+        self.runtime
+            .execute(operation, context.cancel(), || {
+                self.request(Method::Get, url.clone(), &token, false)
+            })
+            .await?;
+        Ok(ProviderStatus::new(self.id.clone(), phase))
+    }
 }
 
 /// Returns `true` when any user turn carries an image part.
@@ -896,6 +1247,20 @@ impl Provider for GitHubCopilot {
         CAPABILITIES
     }
 
+    fn startup<'a>(
+        &'a self,
+        context: &'a RequestContext,
+    ) -> BoxFuture<'a, Result<ProviderStatus, ProviderError>> {
+        Box::pin(self.probe(Operation::Startup, ProviderPhase::Started, context))
+    }
+
+    fn ping<'a>(
+        &'a self,
+        context: &'a RequestContext,
+    ) -> BoxFuture<'a, Result<ProviderStatus, ProviderError>> {
+        Box::pin(self.probe(Operation::Ping, ProviderPhase::Reachable, context))
+    }
+
     fn complete<'a>(
         &'a self,
         request: &'a CompletionRequest,
@@ -906,15 +1271,18 @@ impl Provider for GitHubCopilot {
             let url = self.endpoint(&token, "chat/completions")?;
             let body = crate::openai_compatible::encode_completion(request, false, false)?;
             let vision = requires_vision(request);
-            let response = self
-                .runtime
-                .execute(Operation::Complete, context.cancel(), || {
-                    Ok(self
-                        .request(Method::Post, url.clone(), &token, vision)?
-                        .body(Body::Json(body.clone())))
-                })
-                .await?;
-            decode_completion(PROVIDER, response.body())
+            self.runtime
+                .execute_decoded(
+                    Operation::Complete,
+                    context.cancel(),
+                    || {
+                        Ok(self
+                            .request(Method::Post, url.clone(), &token, vision)?
+                            .body(Body::Json(body.clone())))
+                    },
+                    |response| decode_completion(PROVIDER, response.body()),
+                )
+                .await
         })
     }
 
@@ -929,7 +1297,7 @@ impl Provider for GitHubCopilot {
             let body = crate::openai_compatible::encode_completion(request, true, true)?;
             let vision = requires_vision(request);
             let cancel = context.cancel().clone();
-            let stream = self
+            let events = self
                 .runtime
                 .execute_streaming(Operation::StreamCompletion, &cancel, || {
                     Ok(self
@@ -937,8 +1305,9 @@ impl Provider for GitHubCopilot {
                         .replace_header("accept", "text/event-stream")
                         .body(Body::Json(body.clone())))
                 })
-                .await?;
-            Ok(events_from_chunks(PROVIDER, cancel, stream.into_chunks()))
+                .await?
+                .decode(|chunks| event_stream(PROVIDER.to_owned(), chunks));
+            Ok(CompletionStream::new(PROVIDER, cancel, events))
         })
     }
 
@@ -949,13 +1318,14 @@ impl Provider for GitHubCopilot {
         Box::pin(async move {
             let token = self.token(context.cancel()).await?;
             let url = self.endpoint(&token, "models")?;
-            let response = self
-                .runtime
-                .execute(Operation::ListModels, context.cancel(), || {
-                    self.request(Method::Get, url.clone(), &token, false)
-                })
-                .await?;
-            decode_models(response.body())
+            self.runtime
+                .execute_decoded(
+                    Operation::ListModels,
+                    context.cancel(),
+                    || self.request(Method::Get, url.clone(), &token, false),
+                    |response| decode_models(response.body()),
+                )
+                .await
         })
     }
 }
@@ -965,6 +1335,12 @@ impl Provider for GitHubCopilot {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "this mirrors Copilot's `capabilities.supports` object one field per \
+              wire key; the flags are independent booleans upstream, so folding \
+              them into an enum would invent a state machine the API does not have"
+)]
 struct WireSupports {
     #[serde(default)]
     streaming: bool,
@@ -1009,7 +1385,7 @@ struct WireModelList {
 /// Decodes the Copilot model catalogue.
 ///
 /// Copilot publishes per-model capability and limit metadata, so unlike the
-/// plain OpenAI catalogue these descriptors carry real capability bits rather
+/// plain `OpenAI` catalogue these descriptors carry real capability bits rather
 /// than an empty set.
 ///
 /// # Errors

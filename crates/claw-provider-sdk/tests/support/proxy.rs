@@ -5,7 +5,10 @@
 //! with a scripted status, and then captures whatever the client writes into
 //! the tunnel so a test can inspect the TLS `ClientHello` directly.
 
-#![allow(dead_code, unreachable_pub)]
+#![expect(
+    unreachable_pub,
+    reason = "the crate lints `unreachable_pub` at warn, but `pub` is the right visibility here: these items are the public surface a sibling test binary consumes through `mod support`"
+)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -172,10 +175,10 @@ impl TestProxy {
     /// Returns the proxy URL, optionally carrying Basic credentials.
     #[must_use]
     pub fn url(&self, credentials: Option<&str>) -> String {
-        match credentials {
-            Some(credentials) => format!("http://{credentials}@{}", self.address),
-            None => format!("http://{}", self.address),
-        }
+        credentials.map_or_else(
+            || format!("http://{}", self.address),
+            |credentials| format!("http://{credentials}@{}", self.address),
+        )
     }
 
     /// Returns every tunnel the proxy recorded.

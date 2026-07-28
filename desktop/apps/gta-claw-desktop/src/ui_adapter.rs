@@ -43,19 +43,19 @@ impl VisualPreferencesState {
         self.density_scale
     }
 
-    pub(crate) fn set_theme(&mut self, theme: UiTheme) {
+    pub(crate) const fn set_theme(&mut self, theme: UiTheme) {
         self.theme = theme;
     }
 
-    pub(crate) fn set_high_contrast(&mut self, enabled: bool) {
+    pub(crate) const fn set_high_contrast(&mut self, enabled: bool) {
         self.high_contrast = enabled;
     }
 
-    pub(crate) fn set_reduced_motion(&mut self, enabled: bool) {
+    pub(crate) const fn set_reduced_motion(&mut self, enabled: bool) {
         self.reduced_motion = enabled;
     }
 
-    pub(crate) fn set_density_scale(&mut self, scale: f32) {
+    pub(crate) const fn set_density_scale(&mut self, scale: f32) {
         self.density_scale = scale.clamp(MINIMUM_DENSITY_SCALE, MAXIMUM_DENSITY_SCALE);
     }
 }
@@ -75,9 +75,17 @@ mod tests {
         assert_eq!(state.theme(), UiTheme::Dark);
         assert!(state.high_contrast());
         assert!(state.reduced_motion());
-        assert_eq!(state.density_scale(), MAXIMUM_DENSITY_SCALE);
+        assert_eq!(
+            state.density_scale().to_bits(),
+            MAXIMUM_DENSITY_SCALE.to_bits(),
+            "clamping must reach the upper bound exactly"
+        );
 
         state.set_density_scale(0.1);
-        assert_eq!(state.density_scale(), MINIMUM_DENSITY_SCALE);
+        assert_eq!(
+            state.density_scale().to_bits(),
+            MINIMUM_DENSITY_SCALE.to_bits(),
+            "clamping must reach the lower bound exactly"
+        );
     }
 }

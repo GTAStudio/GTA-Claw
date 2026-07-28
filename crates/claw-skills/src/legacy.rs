@@ -66,6 +66,20 @@ struct RawLegacySkill {
 /// Validates a legacy manifest and returns only manual-porting metadata.
 ///
 /// This function does not evaluate, compile, persist, or return JavaScript.
+///
+/// # Errors
+///
+/// Returns [`LegacySkillError::MalformedJson`] when the document is not JSON or
+/// a field has the wrong type, [`LegacySkillError::InvalidName`] when the name
+/// is empty or leaves the historical `[A-Za-z_][A-Za-z0-9_]*` pattern,
+/// [`LegacySkillError::EmptyDescription`] when the description is blank or only
+/// whitespace, [`LegacySkillError::InvalidParameters`] when `parameters` is
+/// neither a JSON object nor a JSON array, and
+/// [`LegacySkillError::MissingExecuteCode`] when `executeCode` is absent, null
+/// or only whitespace.
+///
+/// The inspected source never reaches the caller, so a rejection here is the
+/// end of the document: there is no partially accepted legacy skill.
 pub fn inspect_legacy_manifest(json: &str) -> Result<LegacySkillDisposition, LegacySkillError> {
     let raw: RawLegacySkill =
         serde_json::from_str(json).map_err(|_| LegacySkillError::MalformedJson)?;
@@ -246,6 +260,36 @@ struct RawRemainingJavaScript {
 }
 
 /// Structurally validates migration evidence for later cryptographic verification.
+///
+/// # Errors
+///
+/// Returns [`MigrationEvidenceError::MalformedJson`] when the report is not
+/// JSON, omits a field, or carries an unknown one, and
+/// [`MigrationEvidenceError::InvalidContract`] when it decodes but breaks the
+/// `1.0.0` contract: a different `contract_version`, an empty input source, an
+/// input digest that is not 64 hex digits, an unknown input kind, a bridge list
+/// that repeats a name or names one outside `httpGet`, `httpPost` and `log`, a
+/// diagnostic with an empty code or message or a severity outside `info`,
+/// `warning` and `error`, or a remaining-JavaScript entry with an empty
+/// location or reason.
+///
+/// Returns [`MigrationEvidenceError::RemainingJavaScript`] when the report
+/// claims `migrated` while still listing JavaScript locations, and
+/// [`MigrationEvidenceError::MigrationFailed`] when the status and exit code do
+/// not form one of the two accepted outcomes (`migrated` with exit code 0, or
+/// `manual_port_required` with exit code 2 for a legacy skill that does list
+/// remaining JavaScript).
+///
+/// Returns [`MigrationEvidenceError::MissingPortEvidence`] when a legacy skill
+/// does not carry exactly two artifacts, and
+/// [`MigrationEvidenceError::InvalidArtifact`] when the artifact set is the
+/// wrong shape for the input kind or an artifact has an absolute or traversing
+/// path, a digest that is not 64 hex digits, an algorithm other than `ed25519`,
+/// or an empty key id or signature value.
+///
+/// Every check here is structural. A successful return proves only that the
+/// signature metadata is complete enough to be verified elsewhere; it is not a
+/// signature check.
 pub fn validate_migration_evidence(
     json: &str,
 ) -> Result<ValidatedMigrationEvidence, MigrationEvidenceError> {

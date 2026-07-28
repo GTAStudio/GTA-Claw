@@ -52,7 +52,10 @@ fn frozen_inventory() -> Value {
         .join("inventories")
         .join("gateway-protocol.json");
     let bytes = std::fs::read(&path).unwrap_or_else(|error| {
-        panic!("the frozen inventory must be readable at {path:?}: {error}")
+        panic!(
+            "the frozen inventory must be readable at {}: {error}",
+            path.display()
+        )
     });
     let body = bytes
         .strip_prefix(&[0xef, 0xbb, 0xbf][..])

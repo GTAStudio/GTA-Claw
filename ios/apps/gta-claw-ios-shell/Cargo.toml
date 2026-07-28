@@ -1,0 +1,45 @@
+[package]
+name = "gta-claw-ios-shell"
+description = "Native Slint iOS shell for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+build = "build.rs"
+
+[dependencies]
+claw-gateway-client.workspace = true
+claw-platform.workspace = true
+claw-security.workspace = true
+getrandom.workspace = true
+gta-claw-ios.workspace = true
+secrecy.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[target.'cfg(target_os = "ios")'.dependencies]
+skia-safe.workspace = true
+slint = { workspace = true, features = [
+  "accessibility",
+  "backend-winit",
+  "compat-1-2",
+  "renderer-skia",
+  "std",
+] }
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+slint = { workspace = true, features = [
+  "accessibility",
+  "backend-winit",
+  "compat-1-2",
+  "renderer-software",
+  "std",
+] }
+
+[build-dependencies]
+slint-build.workspace = true
+
+[lints]
+workspace = true

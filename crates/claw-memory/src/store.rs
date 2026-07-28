@@ -8,35 +8,84 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use crate::retrieval::MemoryRecord;
+use crate::retrieval::{MemoryRecord, RecordError};
 use crate::session::{Session, SessionId};
 use crate::vector::RecordId;
 
 /// Persistence port for sessions and memory records.
 pub trait MemoryStore {
     /// Inserts or replaces one session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SessionCapacityExceeded`] when storing a session
+    /// that is not already present would take the adapter past its session
+    /// bound, or [`StoreError::Backend`] when the underlying store is
+    /// unavailable or rejects the write.
     fn put_session(&mut self, session: &Session) -> Result<(), StoreError>;
 
     /// Loads one session.
+    ///
+    /// A missing session is `Ok(None)`, never an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the underlying store is
+    /// unavailable or the stored representation cannot be decoded.
     fn get_session(&self, id: &SessionId) -> Result<Option<Session>, StoreError>;
 
     /// Lists every stored session identifier in ascending order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the underlying store is
+    /// unavailable or the listing cannot be read to completion.
     fn list_sessions(&self) -> Result<Vec<SessionId>, StoreError>;
 
     /// Deletes one session and every record that belongs to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the underlying store is
+    /// unavailable or the session and its records cannot be removed together.
     fn delete_session(&mut self, id: &SessionId) -> Result<bool, StoreError>;
 
     /// Inserts or replaces one memory record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a record-validation error for an empty or oversized body or
+    /// oversized tag set,
+    /// [`StoreError::RecordCapacityExceeded`] when storing a record that is
+    /// not already present would take the adapter past its record bound, or
+    /// [`StoreError::Backend`] when the underlying store is unavailable.
     fn put_record(&mut self, record: MemoryRecord) -> Result<(), StoreError>;
 
     /// Loads one memory record.
+    ///
+    /// A missing record is `Ok(None)`, never an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the underlying store is
+    /// unavailable or the stored representation cannot be decoded.
     fn get_record(&self, id: &RecordId) -> Result<Option<MemoryRecord>, StoreError>;
 
     /// Lists records, optionally restricted to one session, in identifier
     /// order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the underlying store is
+    /// unavailable or the listing cannot be read to completion.
     fn records(&self, session: Option<&SessionId>) -> Result<Vec<MemoryRecord>, StoreError>;
 
     /// Deletes one record, reporting whether it existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the underlying store is
+    /// unavailable or the removal cannot be applied.
     fn delete_record(&mut self, id: &RecordId) -> Result<bool, StoreError>;
 }
 
@@ -108,9 +157,7 @@ impl MemoryStore for InMemoryMemoryStore {
     }
 
     fn put_record(&mut self, record: MemoryRecord) -> Result<(), StoreError> {
-        if record.text.is_empty() {
-            return Err(StoreError::EmptyRecord);
-        }
+        record.validate().map_err(StoreError::from)?;
         if !self.records.contains_key(&record.id) && self.records.len() >= self.max_records {
             return Err(StoreError::RecordCapacityExceeded);
         }
@@ -145,6 +192,12 @@ pub enum StoreError {
     RecordCapacityExceeded,
     /// A record body was empty.
     EmptyRecord,
+    /// A record body exceeded the processing bound.
+    RecordTooLarge,
+    /// A record had too many tags.
+    TooManyTags,
+    /// One record tag exceeded its byte bound.
+    TagTooLong,
     /// The adapter failed for an implementation-specific reason.
     Backend,
 }
@@ -155,6 +208,9 @@ impl Display for StoreError {
             Self::SessionCapacityExceeded => "session capacity exceeded",
             Self::RecordCapacityExceeded => "record capacity exceeded",
             Self::EmptyRecord => "record body must not be empty",
+            Self::RecordTooLarge => "record body exceeds the maximum size",
+            Self::TooManyTags => "record has too many tags",
+            Self::TagTooLong => "record tag exceeds the maximum size",
             Self::Backend => "memory store backend failed",
         };
         formatter.write_str(message)
@@ -162,6 +218,17 @@ impl Display for StoreError {
 }
 
 impl Error for StoreError {}
+
+impl From<RecordError> for StoreError {
+    fn from(error: RecordError) -> Self {
+        match error {
+            RecordError::EmptyText => Self::EmptyRecord,
+            RecordError::TextTooLong => Self::RecordTooLarge,
+            RecordError::TooManyTags => Self::TooManyTags,
+            RecordError::TagTooLong => Self::TagTooLong,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

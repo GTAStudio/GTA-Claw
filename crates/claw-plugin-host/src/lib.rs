@@ -42,28 +42,37 @@ pub mod convert;
 pub mod engine;
 pub mod error;
 pub mod host_impl;
+pub mod http;
 pub mod inventory;
 pub mod lifecycle;
 pub mod limiter;
 pub mod services;
 pub mod state;
 
+pub use claw_plugin_api::cancellation::CancellationToken;
 pub use engine::{EPOCH_TICK, PluginEngine};
 pub use error::{GuestFailure, HostError, TerminationCause};
+pub use http::{
+    PinnedHttpError, PinnedHttpTransport, PinnedHttpTransportBuildError, PinnedHttpTransportConfig,
+};
 pub use inventory::{
     CompatibilityReport, DeliveryClassSummary, RegistryReport, describe_compatibility,
     describe_registry,
 };
 pub use lifecycle::{
-    ALLOWED_IMPORTS, Discovered, EventOutcome, LifecycleState, MANIFEST_FILE_NAME, PluginHost,
-    PluginHostBuilder, ResourceUsage,
+    ALLOWED_IMPORTS, ActivatedPlugin, ActivationControl, ActivationControlError, ActivationFailure,
+    ActivationOutcome, ActivationReport, ActivationStage, ControlledActivationOutcome,
+    ControlledActivationReport, Discovered, DiscoveryRecord, DiscoveryStage, DisposalOutcome,
+    DisposalReport, EventOutcome, LifecycleState, MANIFEST_FILE_NAME, MAX_ACTIVATION_CANDIDATES,
+    PluginHost, PluginHostBuilder, PluginToolInvocation, ResourceUsage,
 };
 pub use limiter::{HostCallGate, HostCallPermit, HostCallPermits};
 pub use services::{
     Clock, ConfigProvider, DenyAllHttp, DiscardEvents, DiscardLogs, DiscardTools, EmptyConfig,
-    EventSink, FixedClock, HostEvent, HostServices, HttpTransport, InMemoryConfig, InMemoryStore,
-    InboundResponse, LogRecord, LogSink, NullStore, OsRandom, OutboundRequest, RandomSource,
-    RecordingSink, StoreBackend, SystemClock, ToolRegistration, ToolSink, UnavailableRandom,
+    EventSink, FixedClock, HostCallControl, HostCallStop, HostEvent, HostServices, HttpTransport,
+    InMemoryConfig, InMemoryStore, InboundResponse, LogRecord, LogSink, NullStore, OsRandom,
+    OutboundRequest, RandomSource, RecordingSink, StoreBackend, SystemClock, ToolRegistration,
+    ToolSink, UnavailableRandom,
 };
 pub use state::{PluginState, ViolationPolicy};
 

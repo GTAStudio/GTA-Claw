@@ -389,8 +389,8 @@ impl GatewayClientError {
             | Self::ReconnectExhausted => FailureClass::TransientTransport,
             Self::Authentication(_) => FailureClass::Authentication,
             Self::Protocol(_) => FailureClass::Protocol,
-            Self::Configuration(_) => FailureClass::PermanentConfiguration,
-            Self::Backpressure(_)
+            Self::Configuration(_)
+            | Self::Backpressure(_)
             | Self::NotReady
             | Self::Cancelled
             | Self::RequestTimedOut(_)
@@ -534,7 +534,7 @@ pub struct IssuedDeviceToken {
 }
 
 impl IssuedDeviceToken {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         token: SecretString,
         role: String,
         scopes: Arc<[String]>,
@@ -619,6 +619,10 @@ pub enum ConnectionState {
 }
 
 /// One redaction-safe event delivered through the bounded event queue.
+///
+/// The [`Debug`] rendering is deliberately non-exhaustive: the frame payload is
+/// summarized by encoded length instead of being printed, and the queue byte
+/// permit the wrapper keeps alive is an internal accounting handle.
 pub struct GatewayEvent {
     frame: EventFrame,
     _byte_permit: OwnedSemaphorePermit,
@@ -658,6 +662,6 @@ impl Debug for GatewayEvent {
             .field("sequence", &self.frame.sequence().map(EventSequence::get))
             .field("state_version", &self.frame.state_version())
             .field("payload_bytes", &payload_bytes)
-            .finish()
+            .finish_non_exhaustive()
     }
 }

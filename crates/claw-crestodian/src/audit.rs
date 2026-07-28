@@ -35,6 +35,15 @@ impl JsonlRescueAudit {
     ///
     /// A missing trail is an empty trail; a malformed line is an error rather
     /// than a silently skipped record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrestodianError::Io`] when the trail exists but cannot be read,
+    /// and [`CrestodianError::AuditDecode`] when the bytes are not UTF-8
+    /// (reported as line `0`) or a line is not a complete `RescueAuditEvent`
+    /// object — the shape a crash during an append leaves behind. A trail whose
+    /// final record was torn is refused as a whole rather than silently reduced
+    /// to the records that happened to survive.
     pub fn read(path: &Path) -> Result<Vec<RescueAuditEvent>, CrestodianError> {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,

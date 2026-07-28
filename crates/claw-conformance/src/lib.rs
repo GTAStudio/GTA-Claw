@@ -1,4 +1,4 @@
-//! Data-driven conformance harness for the frozen OpenClaw compatibility data.
+//! Data-driven conformance harness for the frozen `OpenClaw` compatibility data.
 //!
 //! The harness never changes the authoritative `compat/upstream` artifacts. It
 //! loads and validates them, accepts evidence-backed implementation claims, and
@@ -20,6 +20,9 @@
 //! the harness rejects fabricated evidence, while reviewers judge sufficiency.
 //! The verifier recognizes literal test declarations only; macro-generated
 //! tests are conservatively rejected because their expanded items are unavailable.
+//! Reports therefore keep `measured` separate from source-`verified`: current
+//! inputs can produce verified, partial, or missing rows, but never infer runtime
+//! measurement from a cited test.
 //!
 //! # Runtime attestation follow-up
 //!
@@ -46,6 +49,6 @@ pub use error::{ConformanceError, ViolationCode};
 pub use loader::Contract;
 pub use model::{Classification, Feature, FeatureLedger, InventoryRecord};
 pub use report::{
-    FeatureReport, InventoryCoverage, LedgerReport, ParityReport, ParityStatus, ParityTotals,
-    generate_report,
+    EvidenceGap, EvidenceState, EvidenceTotals, FeatureReport, InventoryCoverage, LedgerReport,
+    ParityReport, ParityStatus, ParityTotals, generate_report,
 };

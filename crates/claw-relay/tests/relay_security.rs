@@ -73,6 +73,71 @@ fn endpoint_authenticates_exact_extension_origin_and_token() {
 }
 
 #[test]
+fn extension_replacement_closes_the_old_transport_and_duplicate_callbacks_are_idempotent() {
+    let mut endpoint = endpoint(4096);
+    let upgrade = extension_upgrade(&format!("chrome-extension://{EXTENSION_ID}"), TOKEN);
+    let first = endpoint.accept(&upgrade).expect("first extension");
+    let second = endpoint.accept(&upgrade).expect("replacement extension");
+    let mut bridge = CdpBridge::new();
+
+    assert_eq!(bridge.connect_extension(first), Vec::new());
+    bridge
+        .receive_extension(
+            first,
+            ExtensionMessage::Hello {
+                user_agent: "FixtureBrowser/1".to_owned(),
+                browser_version: "Chrome/144.0.0.0".to_owned(),
+                extension_version: "2.0.0".to_owned(),
+                tabs: vec![tab()],
+            },
+        )
+        .expect("first hello");
+    assert_eq!(
+        bridge.connect_extension(first),
+        Vec::new(),
+        "a duplicate transport callback must not reset a live lifecycle"
+    );
+    assert_eq!(
+        bridge
+            .receive_extension(first, ExtensionMessage::Pong)
+            .expect("hello state survives duplicate callback"),
+        Vec::new()
+    );
+
+    assert_eq!(
+        bridge.connect_extension(second),
+        vec![BridgeEffect::CloseExtension {
+            connection: first,
+            code: 1012,
+            reason: "Chrome extension replaced by a newer connection",
+        }]
+    );
+    assert_eq!(
+        bridge.disconnect_extension(first),
+        Vec::new(),
+        "the replaced transport's close callback must not tear down its replacement"
+    );
+    assert_eq!(
+        bridge.receive_extension(first, ExtensionMessage::Pong),
+        Err(BridgeError::UnknownExtensionConnection)
+    );
+    assert_eq!(
+        bridge
+            .receive_extension(
+                second,
+                ExtensionMessage::Hello {
+                    user_agent: "FixtureBrowser/2".to_owned(),
+                    browser_version: "Chrome/145.0.0.0".to_owned(),
+                    extension_version: "2.1.0".to_owned(),
+                    tabs: vec![tab()],
+                },
+            )
+            .expect("replacement hello"),
+        Vec::new()
+    );
+}
+
+#[test]
 fn upgrade_request_debug_redacts_credentials_at_ingress() {
     let request = UpgradeRequest {
         path: "/extension".to_owned(),
@@ -1561,7 +1626,7 @@ fn abrupt_browser_and_tab_disconnects_emit_detach_and_reap_sessions() {
             },
         )
         .expect("reattached");
-    let browser_death = bridge.disconnect_extension();
+    let browser_death = bridge.disconnect_extension(extension);
     assert_eq!(browser_death.len(), 1);
     assert!(bridge.targets().is_empty());
     let BridgeEffect::EventToCdp { connection, event } = &browser_death[0] else {
@@ -2288,7 +2353,7 @@ fn pending_work_is_bounded_expires_and_disconnect_cleanup_cannot_leak_ownership(
         )
         .expect("slot was released after timeout");
     assert_eq!(
-        bridge.disconnect_extension(),
+        bridge.disconnect_extension(extension),
         vec![BridgeEffect::ToCdp {
             connection: cdp,
             response: claw_relay::CdpResponse {
@@ -2573,7 +2638,7 @@ fn auto_attach_capacity_is_bounded_without_blocking_tab_synchronization() {
             tab_id: 41,
         })]
     );
-    assert_eq!(bridge.disconnect_extension(), Vec::new());
+    assert_eq!(bridge.disconnect_extension(extension), Vec::new());
 }
 
 #[test]
@@ -4496,4 +4561,96 @@ fn late_pending_attach_after_cdp_disconnect_is_immediately_detached() {
         Vec::new()
     );
     assert!(!bridge.targets()[0].attached);
+}
+
+#[test]
+fn browser_sessions_are_bounded_per_connection_and_released_on_detach() {
+    let mut endpoint = endpoint(4096);
+    let extension = endpoint
+        .accept(&extension_upgrade(
+            &format!("chrome-extension://{EXTENSION_ID}"),
+            TOKEN,
+        ))
+        .expect("extension");
+    let cdp = endpoint.accept(&cdp_upgrade()).expect("CDP");
+    let mut bridge = CdpBridge::with_pending_limit(3).expect("positive bound");
+    bridge.connect_extension(extension);
+    bridge.connect_cdp(cdp).expect("CDP");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Hello {
+                user_agent: "Fixture".to_owned(),
+                browser_version: "Chrome/144".to_owned(),
+                extension_version: "2.0.0".to_owned(),
+                tabs: vec![tab()],
+            },
+        )
+        .expect("hello");
+
+    let mut sessions = Vec::new();
+    for id in 1..=3 {
+        let effects = bridge
+            .receive_cdp(
+                cdp,
+                CdpRequest {
+                    id,
+                    method: "Target.attachToBrowserTarget".to_owned(),
+                    params: None,
+                    session_id: None,
+                },
+            )
+            .expect("browser session within the bound");
+        let [BridgeEffect::ToCdp { response, .. }] = effects.as_slice() else {
+            panic!("expected exactly one browser session response");
+        };
+        let session_id = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("sessionId"))
+            .and_then(serde_json::Value::as_str)
+            .expect("session id")
+            .to_owned();
+        sessions.push(session_id);
+    }
+
+    // A browser session is only released by an explicit detach or by the client
+    // going away, so the map must refuse to grow past the connection's bound
+    // instead of accumulating for the life of the connection.
+    assert_eq!(
+        bridge.receive_cdp(
+            cdp,
+            CdpRequest {
+                id: 4,
+                method: "Target.attachToBrowserTarget".to_owned(),
+                params: None,
+                session_id: None,
+            },
+        ),
+        Err(BridgeError::SessionLimit)
+    );
+
+    let released = bridge
+        .receive_cdp(
+            cdp,
+            CdpRequest {
+                id: 5,
+                method: "Target.detachFromTarget".to_owned(),
+                params: Some(json!({ "sessionId": sessions[0] })),
+                session_id: None,
+            },
+        )
+        .expect("detach releases the browser session");
+    assert_eq!(released.len(), 1);
+    bridge
+        .receive_cdp(
+            cdp,
+            CdpRequest {
+                id: 6,
+                method: "Target.attachToBrowserTarget".to_owned(),
+                params: None,
+                session_id: None,
+            },
+        )
+        .expect("released capacity is reusable");
 }

@@ -245,13 +245,12 @@ impl BoundServer {
         });
 
         let accept_permits = Arc::clone(&permits);
-        let accept_shutdown = shutdown_rx.clone();
         let acceptor = tokio::spawn(accept_loop(
             listener,
             services,
             accept_permits,
             quiesce_rx,
-            accept_shutdown,
+            shutdown_rx,
             accepting_tx,
             timeouts.close,
         ));
@@ -349,6 +348,10 @@ async fn accept_loop(
 }
 
 /// A running server with graceful shutdown.
+///
+/// Call [`Self::shutdown`] to announce and drain a normal stop. Dropping the
+/// handle is the cancellation fallback: it signals shutdown and aborts every
+/// task still owned by the handle so no listener or connection task detaches.
 #[derive(Debug)]
 pub struct ServerHandle {
     local_address: SocketAddr,
@@ -415,8 +418,10 @@ impl ServerHandle {
     ///
     /// The broadcast `shutdown` event is published *before* the cancellation
     /// signal so subscribers that are still keeping up observe it, then every
-    /// live connection closes with RFC 6455 code 1001.
-    pub async fn shutdown(self) {
+    /// live connection closes with RFC 6455 code 1001. Cancelling this future
+    /// triggers the handle's drop fallback and aborts any task that could not
+    /// finish the bounded drain.
+    pub async fn shutdown(mut self) {
         if let Ok(reason) = Name::new(SHUTDOWN_REASON, MAX_SHUTDOWN_REASON_BYTES) {
             let payload = ShutdownEvent {
                 reason,
@@ -427,16 +432,27 @@ impl ServerHandle {
             }
         }
         let _ = self.shutdown.send(true);
-        let _ = self.ticker.await;
-        let _ = self.acceptor.await;
+        let _ = (&mut self.ticker).await;
+        let _ = (&mut self.acceptor).await;
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+        self.ticker.abort();
+        self.acceptor.abort();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use claw_protocol::gateway::Role;
+    use tokio::io::AsyncReadExt as _;
+    use tokio::time::timeout;
 
     use super::*;
     use crate::auth::{CredentialPolicy, StaticAuthenticator};
@@ -593,5 +609,77 @@ mod tests {
 
         drop(first);
         handle.shutdown().await;
+    }
+
+    fn server_with_long_shutdown_window() -> GatewayServer {
+        let mut config = GatewayServerConfig::default();
+        config.timeouts.http_upgrade = Duration::from_hours(1);
+        config.timeouts.close = Duration::from_hours(1);
+        let clock = Arc::new(ManualClock::new(1_700_000_000_000));
+        let authenticator = StaticAuthenticator::new(CredentialPolicy::None, clock.clone());
+        let devices = authenticator.devices();
+        GatewayServer::new(config, Arc::new(authenticator), Arc::new(devices))
+            .expect("the long test timeouts are valid")
+            .with_clock(clock)
+    }
+
+    async fn accepted_idle_socket(handle: &ServerHandle) -> tokio::net::TcpStream {
+        let stream = tokio::net::TcpStream::connect(handle.local_address())
+            .await
+            .expect("the listener accepts the idle socket");
+        for _ in 0..200 {
+            if handle.connection_count() == 1 {
+                return stream;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the accept loop did not take ownership of the idle socket");
+    }
+
+    async fn assert_socket_released(mut stream: tokio::net::TcpStream) {
+        let mut byte = [0_u8; 1];
+        let read = timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("server task cancellation releases the socket promptly");
+        match read {
+            Ok(0) | Err(_) => {}
+            Ok(count) => panic!("a cancelled server unexpectedly wrote {count} bytes"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_handle_aborts_tasks_that_cannot_observe_shutdown() {
+        let bound = server_with_long_shutdown_window()
+            .bind("127.0.0.1:0".parse().expect("loopback address parses"))
+            .await
+            .expect("loopback bind succeeds");
+        let handle = bound.start();
+        let stream = accepted_idle_socket(&handle).await;
+
+        drop(handle);
+
+        assert_socket_released(stream).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_shutdown_aborts_every_task_the_future_still_owns() {
+        let bound = server_with_long_shutdown_window()
+            .bind("127.0.0.1:0".parse().expect("loopback address parses"))
+            .await
+            .expect("loopback bind succeeds");
+        let handle = bound.start();
+        let stream = accepted_idle_socket(&handle).await;
+        let shutdown = tokio::spawn(handle.shutdown());
+
+        tokio::task::yield_now().await;
+        shutdown.abort();
+        assert!(
+            shutdown
+                .await
+                .expect_err("the shutdown future was cancelled")
+                .is_cancelled()
+        );
+
+        assert_socket_released(stream).await;
     }
 }

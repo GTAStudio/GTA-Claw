@@ -20,7 +20,7 @@
 //! `Drop` cannot run asynchronous teardown, so instead of pretending it can,
 //! [`SubsystemHost::start`] and [`SubsystemHost::shutdown`] guarantee that a
 //! dropped future leaves the host in a state a later [`SubsystemHost::shutdown`]
-//! can finish from. See [`InterruptGuard`].
+//! can finish from. See `InterruptGuard` below.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,7 +116,7 @@ impl InterruptGuard {
     /// you. In particular `start` disarms *after* its own `abort` has finished,
     /// not before, so that a caller dropped during the rollback is still
     /// recorded as interrupted.
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -148,7 +148,13 @@ impl SubsystemHost {
     ///
     /// # Errors
     ///
-    /// Returns the [`CompositionError`] that made the composition unorderable.
+    /// Returns the [`CompositionError`] that made the composition unorderable:
+    /// a duplicate identifier, a self-dependency, an edge pointing outside the
+    /// composition, or a cycle. All four are static defects in how this binary
+    /// was wired, not runtime conditions, so they fail identically on every
+    /// machine and on every attempt. The process should report the error and
+    /// exit; restarting or retrying cannot change the answer, and no subsystem
+    /// has been touched, so there is nothing to tear down.
     pub fn new(subsystems: Vec<Arc<dyn Subsystem>>) -> Result<Self, CompositionError> {
         Self::with_lifecycle(subsystems, Lifecycle::new())
     }
@@ -163,7 +169,9 @@ impl SubsystemHost {
     ///
     /// # Errors
     ///
-    /// Returns the [`CompositionError`] that made the composition unorderable.
+    /// Returns the [`CompositionError`] that made the composition unorderable,
+    /// with the same meaning as for [`new`](Self::new): a wiring defect that
+    /// the process should report and exit on rather than retry.
     pub fn with_lifecycle(
         subsystems: Vec<Arc<dyn Subsystem>>,
         lifecycle: Lifecycle,
@@ -228,13 +236,22 @@ impl SubsystemHost {
     ///
     /// # Errors
     ///
-    /// Returns [`CompositionError::SubsystemFailed`] carrying the first failure.
-    /// Everything already brought up has been torn down by the time this
-    /// returns.
+    /// Returns [`CompositionError::SubsystemFailed`] carrying the first
+    /// failure. [`SubsystemError::subsystem`](super::error::SubsystemError::subsystem)
+    /// names the adapter that refused and
+    /// [`kind`](super::error::SubsystemError::kind) says whether waiting could
+    /// help: `Unavailable` usually means a dependency the operator can bring
+    /// back, while `Invalid`, `Conflict` and `Internal` mean this configuration
+    /// will fail the same way on the next attempt. Whichever it is, everything
+    /// already brought up has been torn down by the time this returns and the
+    /// host is in [`LifecyclePhase::Stopped`], so the caller may exit
+    /// immediately without calling [`shutdown`](Self::shutdown) and without
+    /// leaking a half-built service.
     ///
-    /// Returns [`CompositionError::PhaseTransition`] when a previous lifecycle
+    /// Returns [`CompositionError::Phase`] when a previous lifecycle
     /// future was dropped part way through and the resulting teardown has not
-    /// been finished by a call to [`shutdown`](Self::shutdown) yet.
+    /// been finished by a call to [`shutdown`](Self::shutdown) yet. Nothing has
+    /// been started; call `shutdown` to finish the abandoned teardown first.
     pub async fn start(
         &mut self,
         context: &StartContext,
@@ -386,8 +403,18 @@ impl SubsystemHost {
     ///
     /// # Errors
     ///
-    /// Returns the [`CompositionError`] produced by an illegal phase change,
-    /// which can only happen if the host was not running.
+    /// Returns [`CompositionError::Phase`] when the host was not running and
+    /// had not been interrupted either — a caller that never started it, or one
+    /// that has already stopped it. Nothing has been torn down that was not
+    /// already torn down, and the phase is left untouched, so this is a caller
+    /// sequencing mistake rather than a teardown failure and the process may
+    /// exit regardless.
+    ///
+    /// Subsystem failures are *not* reported here: they are collected into
+    /// [`ShutdownReport::errors`] so that one uncooperative adapter cannot
+    /// abort the teardown of the others. Callers should log them, treat a
+    /// non-[`clean`](ShutdownReport::is_clean) report as an unclean exit, and
+    /// still exit.
     pub async fn shutdown(&mut self) -> Result<ShutdownReport, CompositionError> {
         let mut report = ShutdownReport::default();
 
@@ -584,18 +611,18 @@ mod tests {
             })
         }
 
-        fn quiesce<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
+        fn quiesce(&self) -> BoxFuture<'_, Result<(), SubsystemError>> {
             Box::pin(async move { self.note("quiesce").await })
         }
 
-        fn drain<'a>(&'a self) -> BoxFuture<'a, Result<DrainReport, SubsystemError>> {
+        fn drain(&self) -> BoxFuture<'_, Result<DrainReport, SubsystemError>> {
             Box::pin(async move {
                 self.note("drain").await?;
                 Ok(DrainReport::clean(self.id.clone(), self.completed))
             })
         }
 
-        fn shutdown<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
+        fn shutdown(&self) -> BoxFuture<'_, Result<(), SubsystemError>> {
             Box::pin(async move { self.note("shutdown").await })
         }
     }

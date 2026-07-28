@@ -68,8 +68,7 @@ impl CompositionPlan {
             dependencies.push(edges);
         }
 
-        let order = topological_order(&dependencies).ok_or_else(|| {
-            let cycle = find_cycle(&dependencies).expect("a failed sort always contains a cycle");
+        let order = topological_order(&dependencies).map_err(|cycle| {
             CompositionError::DependencyCycle(
                 cycle
                     .into_iter()
@@ -123,20 +122,25 @@ impl CompositionPlan {
 
     /// Returns how many subsystems the plan covers.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.start_order.len()
     }
 
     /// Returns whether the composition is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.start_order.is_empty()
     }
 }
 
 /// Kahn's algorithm with the ready set held in ascending declaration order, so
 /// the result is the unique smallest topological order under that tie-break.
-fn topological_order(dependencies: &[Vec<usize>]) -> Option<Vec<usize>> {
+///
+/// A failure returns the cycle responsible rather than a bare `None`, so the
+/// order and the explanation for its absence come out of one call. A caller
+/// cannot forget to look for the cycle, and there is no second traversal that
+/// could disagree with this one about whether the graph is orderable.
+fn topological_order(dependencies: &[Vec<usize>]) -> Result<Vec<usize>, Vec<usize>> {
     let count = dependencies.len();
     let mut outstanding: Vec<usize> = dependencies.iter().map(Vec::len).collect();
     let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); count];
@@ -162,7 +166,17 @@ fn topological_order(dependencies: &[Vec<usize>]) -> Option<Vec<usize>> {
         }
     }
 
-    (order.len() == count).then_some(order)
+    if order.len() == count {
+        return Ok(order);
+    }
+
+    // Kahn's stalls only on a cycle, so the search always finds one. The
+    // fallback keeps that reasoning off a panic path: the nodes that could not
+    // be ordered are exactly the ones the cycle runs through, so an unorderable
+    // composition is still reported as unorderable and still names the
+    // subsystems at fault.
+    Err(find_cycle(dependencies)
+        .unwrap_or_else(|| (0..count).filter(|node| outstanding[*node] > 0).collect()))
 }
 
 /// Depth-first search that returns the first cycle reachable from the lowest

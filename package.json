@@ -10,29 +10,34 @@
     "dev": "node --no-node-snapshot --loader ts-node/esm src/index.ts"
   },
   "dependencies": {
-    "@github/copilot-sdk": "^0.1.30",
-    "botbuilder": "^4.23.1",
-    "pino": "^9.6.0",
+    "@github/copilot-sdk": "^1.0.8",
+    "botbuilder": "^4.23.3",
+    "pino": "^10.3.1",
     "restify": "^11.1.0",
-    "undici": "^7.22.0",
-    "ws": "^8.18.0"
+    "undici": "^8.9.0",
+    "ws": "^8.21.1"
   },
   "optionalDependencies": {
-    "isolated-vm": "^6.0.2"
+    "isolated-vm": "^7.0.0"
   },
   "devDependencies": {
     "@types/bunyan": "^1.8.11",
-    "@types/node": "^20.17.0",
+    "@types/node": "^26.1.2",
     "@types/restify": "^8.5.12",
     "ts-node": "^10.9.2",
-    "typescript": "^5.7.0"
+    "typescript": "^7.0.2"
   },
   "overrides": {
     "find-my-way": "8.2.2",
     "send": "0.19.0"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=26.0.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "allowScripts": {
+    "isolated-vm@7.0.0": true,
+    "koffi@3.1.2": true,
+    "dtrace-provider": false
+  }
 }

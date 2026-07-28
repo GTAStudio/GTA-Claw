@@ -23,10 +23,39 @@ unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 unreachable_pub = "warn"
 
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+invalid_html_tags = "warn"
+private_intra_doc_links = "warn"
+unescaped_backticks = "warn"
+
 [workspace.lints.clippy]
-all = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# `unreachable_pub` (enabled above) and `redundant_pub_crate` are mutually
+# contradictory: satisfying either one re-triggers the other.
+redundant_pub_crate = "allow"
+# UI wiring surfaces are long by construction: one screen's property fan-out is a
+# single unit of meaning and splitting it hides the binding it documents.
+too_many_lines = "allow"
 
 [profile.release]
 codegen-units = 1
 lto = "thin"
 strip = "symbols"
+panic = "unwind"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+opt-level = 2
+debug = false

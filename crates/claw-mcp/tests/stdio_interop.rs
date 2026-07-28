@@ -1,5 +1,8 @@
 //! MCP process transport interoperability tests.
-#![allow(deprecated)]
+#![expect(
+    deprecated,
+    reason = "these tests cover the sampling and logging surfaces that SEP-2577 deprecates, which is exactly why they must keep running"
+)]
 
 use std::{
     ffi::OsString,
@@ -34,7 +37,7 @@ impl SamplingPort for RecordingSampling {
         true
     }
 
-    fn create_message<'a>(&'a self, request: CreateMessageRequestParams) -> SamplingFuture<'a> {
+    fn create_message(&self, request: CreateMessageRequestParams) -> SamplingFuture<'_> {
         let request = serde_json::to_value(request).expect("sampling request must serialize");
         self.requests
             .lock()

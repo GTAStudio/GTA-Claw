@@ -10,14 +10,15 @@ mod openai_support;
 
 use claw_http_api::ToolChoice;
 use openai_support::{
-    RequestSpec, assert_error_contracts_are_distinct, observe, run_fixture, script, spawn,
+    FLOOD_CHUNK_BYTES, RequestSpec, STREAM_OUTPUT_FLOOR_BYTES, assert_error_contracts_are_distinct,
+    observe, parse_sse, run_fixture, script, spawn, text_flood,
 };
 use serde_json::{Value, json};
 
 /// Ledger row this file is evidence for.
 const FEATURE: &str = "interop.openai.chat-completions";
 
-/// A buffered completion matches the pinned OpenAI envelope and usage block.
+/// A buffered completion matches the pinned `OpenAI` envelope and usage block.
 #[tokio::test]
 async fn chat_completion_json_matches_the_pinned_contract() {
     let run = run_fixture(FEATURE, "chat/json_completion.json").await;
@@ -336,7 +337,7 @@ async fn chat_errors_stay_classified_per_failure_class() {
 ///
 /// This one is deliberately outside the classified-error table above: the
 /// router answers with an empty body and an `Allow` header rather than with an
-/// OpenAI error envelope, and pinning that difference is the point.
+/// `OpenAI` error envelope, and pinning that difference is the point.
 #[tokio::test]
 async fn chat_rejects_the_wrong_method_at_the_router() {
     let run = run_fixture(FEATURE, "chat/error_wrong_method.json").await;
@@ -381,6 +382,119 @@ async fn chat_rejects_unauthenticated_callers_without_reaching_the_provider() {
         server.runtime.generation_requests().is_empty(),
         "an unauthenticated request reached the provider"
     );
+}
+
+/// A constrained stream that fits the buffer ceiling is delivered unchanged.
+///
+/// This is the important half of the ceiling: a response that stays under it
+/// must be byte-for-byte what it was before the bound existed. 63 KiB of text
+/// under a 64 KiB ceiling is one byte-count away from the refusal below, so
+/// nothing is being tested by a wide margin here.
+#[tokio::test]
+async fn chat_stream_delivers_a_constrained_response_that_fits_the_ceiling() {
+    let chunks = STREAM_OUTPUT_FLOOR_BYTES / FLOOD_CHUNK_BYTES - 1;
+    let server = spawn(text_flood(chunks)).await;
+
+    let response = server.send(&constrained_stream_request()).await;
+
+    assert_eq!(response.status, 200);
+    let events = parse_sse(response.text());
+    let content = events
+        .iter()
+        .filter_map(|event| event.data["choices"][0]["delta"]["content"].as_str())
+        .collect::<String>();
+    assert_eq!(
+        content,
+        "a".repeat(chunks * FLOOD_CHUNK_BYTES),
+        "text under the ceiling must reach the client whole"
+    );
+    assert!(
+        events.iter().all(|event| event.data.get("error").is_none()),
+        "a response inside the ceiling must not be refused"
+    );
+    assert_eq!(
+        events.last().and_then(|event| event.data.as_str()),
+        Some("[DONE]")
+    );
+    assert_eq!(
+        server.runtime.stream_events_delivered(),
+        chunks,
+        "the adapter must consume the whole provider stream"
+    );
+}
+
+/// A provider that overruns the buffer ceiling is refused, mid-stream.
+///
+/// The delivered-event count is the actual assertion: an adapter that buffered
+/// the whole megabyte and complained afterwards would still produce the error
+/// frame below, so the test pins that the coordinator stopped consuming within
+/// one channel's worth of events of the ceiling.
+#[tokio::test]
+async fn chat_stream_refuses_a_response_that_overruns_the_buffer_ceiling() {
+    let ceiling_chunks = STREAM_OUTPUT_FLOOR_BYTES / FLOOD_CHUNK_BYTES;
+    let offered = ceiling_chunks * 16;
+    let server = spawn(text_flood(offered)).await;
+
+    let response = server.send(&constrained_stream_request()).await;
+
+    assert_eq!(
+        response.status, 200,
+        "the status is already committed when the overrun is detected"
+    );
+    let events = parse_sse(response.text());
+    let error = events
+        .iter()
+        .rev()
+        .find(|event| event.data.get("error").is_some())
+        .map(|event| event.data.clone())
+        .expect("the overrun must be delivered as a classified error frame");
+    assert_eq!(
+        error["error"]["type"], "api_error",
+        "an upstream that will not stop talking is an upstream fault, not a client fault"
+    );
+    assert_eq!(
+        error["error"]["message"],
+        "The provider exceeded the maximum buffered response size."
+    );
+    assert_eq!(
+        events.last().and_then(|event| event.data.as_str()),
+        Some("[DONE]"),
+        "a refused stream must still terminate with the sentinel"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.data["choices"][0]["delta"]["content"].is_null()),
+        "withheld text must not be emitted once the response is refused"
+    );
+
+    let delivered = server.runtime.stream_events_delivered();
+    assert!(
+        delivered >= ceiling_chunks,
+        "the ceiling clipped a response that still fitted: {delivered} of {offered} chunks"
+    );
+    assert!(
+        delivered <= ceiling_chunks + 32,
+        "the coordinator kept accumulating past the ceiling: {delivered} of {offered} chunks"
+    );
+}
+
+/// A streamed chat request whose `max_tokens` puts it on the buffered path.
+///
+/// `max_tokens` does two things at once here: it is one of the four triggers
+/// that make the coordinator withhold deltas, and it is the bound the buffer
+/// ceiling is derived from.
+fn constrained_stream_request() -> RequestSpec {
+    RequestSpec::post(
+        "/v1/chat/completions",
+        "operator-token",
+        json!({
+            "model": "openclaw",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true,
+            "max_tokens": 8
+        }),
+    )
 }
 
 /// Decodes the pinned SSE payloads of a golden run into JSON chunks.

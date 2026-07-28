@@ -8,12 +8,14 @@ fn main() -> ExitCode {
     let options = match Options::parse(std::env::args_os()) {
         Ok(options) => options,
         Err(message) => {
+            // Requested help is not an error: it belongs on stdout so it can be
+            // piped into a pager or grep like every other tool's help.
+            if message.starts_with("Usage:") {
+                println!("{message}");
+                return ExitCode::SUCCESS;
+            }
             eprintln!("{message}");
-            return if message.starts_with("Usage:") {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(2)
-            };
+            return ExitCode::from(2);
         }
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()

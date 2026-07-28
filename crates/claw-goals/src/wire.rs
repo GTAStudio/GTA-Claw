@@ -31,6 +31,18 @@ struct ProgressEnvelope {
     compacted: bool,
 }
 
+/// The write-side mirror of [`ProgressEnvelope`], borrowing the note.
+///
+/// The field set, the names and the declaration order are the same, so the
+/// bytes are the same.
+#[derive(Serialize)]
+struct ProgressEnvelopeRef<'a> {
+    index: u64,
+    note: &'a str,
+    recorded_at_millis: i64,
+    compacted: bool,
+}
+
 /// The persisted form of one goal.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct GoalEnvelope {
@@ -45,6 +57,47 @@ struct GoalEnvelope {
     compacted_entries: u64,
     revision: u64,
     progress: Vec<ProgressEnvelope>,
+}
+
+/// The write-side mirror of [`GoalEnvelope`], borrowing every string.
+///
+/// [`encode`] used to build an owned [`GoalEnvelope`] purely to hand it to
+/// `serde_json`, which copied the objective, both identifiers, the status label
+/// and every progress note — up to a quarter of a megabyte of copying whose
+/// only consumer was the serializer that immediately copied it again into the
+/// output buffer. The field set, the names and the declaration order are
+/// identical, and the workspace builds `serde_json` with `preserve_order`, so
+/// the bytes this produces are the bytes the owned envelope produced.
+#[derive(Serialize)]
+struct GoalEnvelopeRef<'a> {
+    schema: u32,
+    goal_id: &'a str,
+    session_id: &'a str,
+    objective: &'a str,
+    status: &'a str,
+    created_at_millis: i64,
+    updated_at_millis: i64,
+    closed_at_millis: Option<i64>,
+    compacted_entries: u64,
+    revision: u64,
+    progress: ProgressSeq<'a>,
+}
+
+/// Serializes a record's progress history straight out of the record.
+///
+/// A `Vec` of borrowing envelopes would still allocate one vector per encode;
+/// this streams the same JSON array from the slice the record already holds.
+struct ProgressSeq<'a>(&'a [GoalProgress]);
+
+impl Serialize for ProgressSeq<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|entry| ProgressEnvelopeRef {
+            index: entry.index,
+            note: &entry.note,
+            recorded_at_millis: entry.recorded_at.as_millis(),
+            compacted: entry.compacted,
+        }))
+    }
 }
 
 /// A goal file that could not be turned back into a [`GoalRecord`].
@@ -109,27 +162,18 @@ fn status_from_label(label: &str) -> Option<GoalStatus> {
 /// Returns [`WireError::Malformed`] only if `serde_json` cannot serialise the envelope, which
 /// requires a serializer failure rather than any property of the record.
 pub fn encode(record: &GoalRecord) -> Result<String, WireError> {
-    let envelope = GoalEnvelope {
+    let envelope = GoalEnvelopeRef {
         schema: SCHEMA_VERSION,
-        goal_id: record.goal_id.as_str().to_owned(),
-        session_id: record.session_id.as_str().to_owned(),
-        objective: record.objective.clone(),
-        status: record.status.label().to_owned(),
+        goal_id: record.goal_id.as_str(),
+        session_id: record.session_id.as_str(),
+        objective: &record.objective,
+        status: record.status.label(),
         created_at_millis: record.created_at.as_millis(),
         updated_at_millis: record.updated_at.as_millis(),
         closed_at_millis: record.closed_at.map(Timestamp::as_millis),
         compacted_entries: record.compacted_entries,
         revision: record.revision,
-        progress: record
-            .progress
-            .iter()
-            .map(|entry| ProgressEnvelope {
-                index: entry.index,
-                note: entry.note.clone(),
-                recorded_at_millis: entry.recorded_at.as_millis(),
-                compacted: entry.compacted,
-            })
-            .collect(),
+        progress: ProgressSeq(&record.progress),
     };
 
     let mut text = serde_json::to_string_pretty(&envelope)

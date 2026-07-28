@@ -51,6 +51,20 @@
 //! [`BoxFuture`], and everything a runtime would supply — spawning, cancellation
 //! and time — is itself a port ([`TaskSpawner`], [`ShutdownSignal`], [`Clock`]).
 //! `apps/gta-claw-daemon` supplies the tokio implementations.
+//!
+//! # Feature gate
+//!
+//! This module is process-wiring machinery for binaries that compose
+//! subsystems, and is gated behind the `composition` feature. Front-ends that
+//! link this crate only for [`Application`](crate::Application) and
+//! [`SystemProbe`](crate::SystemProbe) therefore do not inherit `claw-domain`,
+//! `secrecy` or `url`.
+//!
+//! `test` is in the gate as well as the feature so that `cargo test -p
+//! claw-application` compiles and runs the composition suite instead of
+//! silently reporting success over 123 skipped tests. Under `cfg(test)` the
+//! three crates are supplied by dev-dependencies, which are not resolved into
+//! dependent lockfiles, so the gate costs consumers nothing.
 
 use std::future::Future;
 use std::pin::Pin;

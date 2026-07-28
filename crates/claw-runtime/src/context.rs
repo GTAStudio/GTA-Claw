@@ -122,7 +122,7 @@ pub struct ConformanceReport {
 impl ConformanceReport {
     /// Returns whether every check passed.
     #[must_use]
-    pub fn is_conformant(&self) -> bool {
+    pub const fn is_conformant(&self) -> bool {
         self.failures.is_empty()
     }
 }

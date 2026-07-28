@@ -23,8 +23,8 @@ mod policy;
 mod service;
 
 pub use caller::{
-    AdminRpcAuthRejection, AdminRpcAuthenticator, AdminRpcCaller, DenyAllAuthenticator,
-    FnAuthenticator,
+    AdminRpcAuthRejection, AdminRpcAuthenticator, AdminRpcCaller, BearerAdminRpcAuthenticator,
+    DenyAllAuthenticator, FnAuthenticator,
 };
 pub use error::{AdminRpcEnvelope, AdminRpcError, dispatch_status};
 pub use policy::{AdminMethodPolicy, operator_scope_to_security};

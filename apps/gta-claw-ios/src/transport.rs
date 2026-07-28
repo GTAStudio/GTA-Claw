@@ -15,10 +15,10 @@
 //! # Nothing here has been confirmed on an Apple device
 //!
 //! Every record reports [`IosTransportRecord::confirmed_on_ios`] as `false`,
-//! and a test in this module asserts that. This workspace has only ever been
-//! built and run on Windows x86_64; `aarch64-apple-ios` cannot be type-checked
-//! from that host because `ring` requires `xcrun` and the iOS SDK. A status
-//! below is a reasoned position, not a measurement.
+//! and a test in this module asserts that. The core has run as a macOS arm64 host
+//! binary, but iOS device and simulator checks stop in `ring` because the
+//! installed Command Line Tools have no target SDK. A status below is a reasoned
+//! position, not a device measurement.
 
 use std::fmt::{self, Display, Formatter};
 
@@ -73,11 +73,11 @@ impl ClientTransport {
                  requires the com.apple.developer.networking.multicast entitlement that Apple \
                  grants case by case on request, so no build made from source has it. The system \
                  DNS-SD path avoids that entitlement for declared service types but needs C \
-                 interop this workspace's unsafe_code setting forbids. Separately, claw-nodes \
-                 compiles mdns-sd, the Hickory resolver and MdnsBrowser only for Windows, macOS \
-                 and Linux, so on iOS the raw-multicast browser does not exist at all rather \
-                 than merely lacking permission. See the host_app module, which turns each \
-                 missing facility into a reported condition.",
+                 interop this workspace's unsafe_code setting forbids. claw-discovery deliberately \
+                 supplies only pure DNS-SD codec and resolution policy, not a network runtime, so \
+                 a host provider is required on every platform. See the host_app and \
+                 host_facilities modules, which turn each missing facility into a reported \
+                 condition and define the bounded provider port.",
             ),
             Self::TailscaleLocalApi => (
                 IosTransportStatus::BelievedUnavailable,
@@ -89,9 +89,9 @@ impl ClientTransport {
             Self::SshTunnel => (
                 IosTransportStatus::NeedsHostAppFacilities,
                 "Requires caller-provisioned sandbox paths for the private key and known_hosts. \
-                 This crate has no Keychain or Secure Enclave integration, so key material would \
-                 sit in ordinary application-container files, which is a regression against the \
-                 platform's own norm rather than a neutral omission.",
+                 This crate exposes a host credential-store port but no Keychain or Secure Enclave \
+                 implementation, and it refuses to substitute ordinary application-container \
+                 files for protected storage.",
             ),
         };
         IosTransportRecord {

@@ -52,6 +52,11 @@ fn a_first_start_publishes_defaults_and_a_restart_reloads_them_unchanged() {
     assert_eq!(runtime.settings(), &CrestodianSettings::default());
     assert_eq!(runtime.settings().gateway_port, DEFAULT_GATEWAY_PORT);
     assert!(settings_path.is_file(), "defaults must be published");
+    assert_eq!(
+        runtime.last_write_warnings(),
+        &[],
+        "publishing defaults reported success, so it must also report full durability"
+    );
     let published = std::fs::read(&settings_path).expect("read settings");
     let digest = runtime.digest().expect("digest");
     drop(runtime);
@@ -59,6 +64,11 @@ fn a_first_start_publishes_defaults_and_a_restart_reloads_them_unchanged() {
     let restarted = CrestodianRuntime::start(&settings_path).expect("restart");
     assert_eq!(restarted.settings(), &CrestodianSettings::default());
     assert_eq!(restarted.digest().expect("digest"), digest);
+    assert_eq!(
+        restarted.last_write_warnings(),
+        &[],
+        "a restart that wrote nothing has no write warnings to report"
+    );
     assert_eq!(
         std::fs::read(&settings_path).expect("read settings"),
         published,
@@ -289,6 +299,100 @@ fn the_rescue_policy_in_force_after_a_restart_is_the_durable_one() {
     let session = restarted.open_rescue_session();
     assert_eq!(session.policy().enabled, RescueEnabled::Explicit(false));
     assert_eq!(session.policy().pending_ttl_minutes, 45);
+}
+
+#[test]
+fn a_torn_settings_file_is_refused_rather_than_accepted_as_state() {
+    let directory = TestDirectory::create();
+    let complete = r#"{"schemaVersion":1,"gatewayPort":19001,"gatewayAuthToken":null,"rescue":{"enabled":"auto","ownerDmOnly":true,"pendingTtlMinutes":15},"workspace":null}"#;
+
+    for (name, contents) in [
+        ("empty.json", String::new()),
+        ("whitespace.json", "\n".to_owned()),
+        ("head.json", complete[..complete.len() / 2].to_owned()),
+        (
+            "unterminated.json",
+            complete.trim_end_matches('}').to_owned(),
+        ),
+        ("tail.json", format!("{complete}{}", &complete[..24])),
+    ] {
+        let path = directory.path().join(name);
+        std::fs::write(&path, &contents).expect("write torn settings");
+
+        let error = CrestodianRuntime::start(&path).expect_err("a torn file must never load");
+        match error {
+            CrestodianError::SettingsDecode {
+                path: reported,
+                message,
+                ..
+            } => {
+                assert_eq!(reported, path);
+                assert!(!message.is_empty(), "drift for {name}");
+            }
+            other => panic!("expected a decode refusal for {name}, got {other}"),
+        }
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            contents.as_bytes(),
+            "a torn settings file must never be repaired into defaults"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn settings_are_published_by_rename_so_earlier_bytes_are_never_edited_in_place() {
+    use std::os::unix::fs::MetadataExt;
+
+    let directory = TestDirectory::create();
+    let settings_path = directory.path().join("settings.json");
+    let mut runtime = CrestodianRuntime::start(&settings_path).expect("first start");
+    let published = std::fs::read(&settings_path).expect("read settings");
+    let published_inode = std::fs::metadata(&settings_path).expect("metadata").ino();
+
+    // A second name for the same inode. An in-place rewrite would change what
+    // this link sees; an atomic temp-file-then-rename can only ever leave it
+    // holding the exact previous bytes.
+    let witness = directory.path().join("witness.json");
+    std::fs::hard_link(&settings_path, &witness).expect("hard link the published settings");
+
+    runtime
+        .apply(&TypedMutation::GatewayPort(19_001))
+        .expect("apply a durable mutation");
+
+    assert_eq!(
+        std::fs::read(&witness).expect("read witness"),
+        published,
+        "the previous settings bytes must survive intact, so the write was never in place"
+    );
+    assert_ne!(
+        std::fs::metadata(&settings_path).expect("metadata").ino(),
+        published_inode,
+        "a published settings file must be a renamed replacement, not a rewritten original"
+    );
+    assert_eq!(runtime.settings().gateway_port, 19_001);
+    assert_eq!(
+        runtime.last_write_warnings(),
+        &[],
+        "a durable mutation must report no unresolved durability caveat"
+    );
+    assert_eq!(
+        CrestodianRuntime::start(&settings_path)
+            .expect("restart")
+            .settings()
+            .gateway_port,
+        19_001
+    );
+
+    let leftovers: Vec<_> = std::fs::read_dir(directory.path())
+        .expect("read directory")
+        .map(|entry| entry.expect("directory entry").file_name())
+        .filter(|name| name.to_string_lossy().contains(".gta-claw.tmp."))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a completed write must leave no atomic-write artifact behind, found {leftovers:?}"
+    );
 }
 
 #[test]

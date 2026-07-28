@@ -1,6 +1,6 @@
 //! Anthropic `POST /v1/messages`.
 //!
-//! Anthropic's dialect differs from OpenAI's in four ways this module handles
+//! Anthropic's dialect differs from `OpenAI`'s in four ways this module handles
 //! explicitly: the system prompt is a top-level field rather than a message,
 //! `max_tokens` is mandatory, tool results are carried as blocks inside a user
 //! turn, and streaming is a typed event protocol rather than a single chunk
@@ -17,7 +17,9 @@ use claw_provider_sdk::model::{
     ToolArguments, ToolCall, ToolChoice, Usage,
 };
 use claw_provider_sdk::origin::{BoundApiKey, Origin, OriginApproval};
-use claw_provider_sdk::provider::{BoxFuture, Provider, RequestContext};
+use claw_provider_sdk::provider::{
+    BoxFuture, Provider, ProviderPhase, ProviderStatus, RequestContext,
+};
 use claw_provider_sdk::secret::ApiKey;
 use claw_provider_sdk::sse::{SseDecoder, SseEvent};
 use claw_provider_sdk::stream::{CompletionStream, StreamEvent, ToolCallAssembler};
@@ -216,7 +218,9 @@ impl Anthropic {
     ///
     /// # Errors
     ///
-    /// See [`Anthropic::new`].
+    /// Returns [`ErrorKind::Authentication`] when `api_key` is empty or is
+    /// bound to an origin other than [`DEFAULT_BASE_URL`]'s, and
+    /// [`ErrorKind::Transport`] when the TLS stack cannot be built.
     pub fn with_api_key(api_key: ApiKey) -> Result<Self, ProviderError> {
         Self::new(AnthropicConfig::new(api_key)?)
     }
@@ -273,6 +277,21 @@ impl Anthropic {
         }
         Ok(request)
     }
+
+    async fn probe(
+        &self,
+        operation: Operation,
+        phase: ProviderPhase,
+        context: &RequestContext,
+    ) -> Result<ProviderStatus, ProviderError> {
+        let url = self.endpoint("v1/models")?;
+        self.runtime
+            .execute(operation, context.cancel(), || {
+                self.request(Method::Get, url.clone())
+            })
+            .await?;
+        Ok(ProviderStatus::new(self.id.clone(), phase))
+    }
 }
 
 impl Provider for Anthropic {
@@ -284,6 +303,20 @@ impl Provider for Anthropic {
         CAPABILITIES
     }
 
+    fn startup<'a>(
+        &'a self,
+        context: &'a RequestContext,
+    ) -> BoxFuture<'a, Result<ProviderStatus, ProviderError>> {
+        Box::pin(self.probe(Operation::Startup, ProviderPhase::Started, context))
+    }
+
+    fn ping<'a>(
+        &'a self,
+        context: &'a RequestContext,
+    ) -> BoxFuture<'a, Result<ProviderStatus, ProviderError>> {
+        Box::pin(self.probe(Operation::Ping, ProviderPhase::Reachable, context))
+    }
+
     fn complete<'a>(
         &'a self,
         request: &'a CompletionRequest,
@@ -292,15 +325,18 @@ impl Provider for Anthropic {
         Box::pin(async move {
             let url = self.endpoint("v1/messages")?;
             let body = encode_messages(request, self.default_max_tokens, false)?;
-            let response = self
-                .runtime
-                .execute(Operation::Complete, context.cancel(), || {
-                    Ok(self
-                        .request(Method::Post, url.clone())?
-                        .body(Body::Json(body.clone())))
-                })
-                .await?;
-            decode_message(self.id.as_str(), response.body())
+            self.runtime
+                .execute_decoded(
+                    Operation::Complete,
+                    context.cancel(),
+                    || {
+                        Ok(self
+                            .request(Method::Post, url.clone())?
+                            .body(Body::Json(body.clone())))
+                    },
+                    |response| decode_message(self.id.as_str(), response.body()),
+                )
+                .await
         })
     }
 
@@ -313,7 +349,8 @@ impl Provider for Anthropic {
             let url = self.endpoint("v1/messages")?;
             let body = encode_messages(request, self.default_max_tokens, true)?;
             let cancel = context.cancel().clone();
-            let stream = self
+            let provider = self.id.as_str().to_owned();
+            let events = self
                 .runtime
                 .execute_streaming(Operation::StreamCompletion, &cancel, || {
                     Ok(self
@@ -321,12 +358,9 @@ impl Provider for Anthropic {
                         .replace_header("accept", "text/event-stream")
                         .body(Body::Json(body.clone())))
                 })
-                .await?;
-            Ok(CompletionStream::new(
-                self.id.as_str(),
-                cancel,
-                event_stream(self.id.as_str().to_owned(), stream.into_chunks()),
-            ))
+                .await?
+                .decode(move |chunks| event_stream(provider, chunks));
+            Ok(CompletionStream::new(self.id.as_str(), cancel, events))
         })
     }
 
@@ -336,13 +370,14 @@ impl Provider for Anthropic {
     ) -> BoxFuture<'a, Result<Vec<ModelDescriptor>, ProviderError>> {
         Box::pin(async move {
             let url = self.endpoint("v1/models")?;
-            let response = self
-                .runtime
-                .execute(Operation::ListModels, context.cancel(), || {
-                    self.request(Method::Get, url.clone())
-                })
-                .await?;
-            decode_models(self.id.as_str(), response.body())
+            self.runtime
+                .execute_decoded(
+                    Operation::ListModels,
+                    context.cancel(),
+                    || self.request(Method::Get, url.clone()),
+                    |response| decode_models(self.id.as_str(), response.body()),
+                )
+                .await
         })
     }
 }
@@ -634,6 +669,12 @@ pub fn encode_messages(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Deserialize)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "these are Anthropic's wire field names; renaming them to drop the \
+              shared `_tokens` suffix would need `#[serde(rename)]` on every \
+              field and put the real name one indirection away from the type"
+)]
 struct WireUsage {
     #[serde(default)]
     input_tokens: u64,
@@ -1759,7 +1800,10 @@ mod tests {
                 "anthropic capability {capability:?}"
             );
         }
-        assert_eq!(client.capabilities().len(), supported.len() as u32);
+        assert_eq!(
+            client.capabilities().len(),
+            u32::try_from(supported.len()).expect("capability count fits in u32")
+        );
         assert!(!client.capabilities().contains(Capability::Embeddings));
 
         let request = client

@@ -13,7 +13,7 @@ use claw_domain::commands::authorization::{
     authorize_command,
 };
 use claw_domain::commands::directives::{
-    Directive, extract_directive_for_sender, extract_exec_directive,
+    Directive, DirectiveLevel, extract_directive_for_sender, extract_exec_directive,
 };
 use claw_domain::commands::golden::{GoldenRecord, parse_golden};
 use claw_domain::commands::registry::{
@@ -251,7 +251,7 @@ fn inline_directive_parsing_matches_the_golden_table() {
             "{case}: raw level"
         );
         assert_eq!(
-            parsed.level().map(|level| level.as_str()),
+            parsed.level().map(DirectiveLevel::as_str),
             record.get("level"),
             "{case}: normalized level"
         );

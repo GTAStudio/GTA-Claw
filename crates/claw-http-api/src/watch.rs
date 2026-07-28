@@ -1,6 +1,7 @@
 //! Bounded watchOS direct-node HTTP transport.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,7 +30,7 @@ use crate::state::ApiState;
 
 const MAX_PENDING_CHALLENGES: usize = 4_096;
 const MAX_PENDING_CHALLENGES_PER_CLIENT: usize = 8;
-const CHALLENGE_TTL: Duration = Duration::from_secs(60);
+const CHALLENGE_TTL: Duration = Duration::from_mins(1);
 const WATCH_COMMANDS: [&str; 3] = ["device.info", "device.status", "system.notify"];
 
 #[derive(Clone)]
@@ -121,6 +122,7 @@ impl WatchRuntime {
                 client_ip,
             },
         );
+        drop(challenges);
         let expires_at_ms = unix_millis().saturating_add(60_000);
         Ok((nonce, expires_at_ms))
     }
@@ -132,6 +134,7 @@ impl WatchRuntime {
             .remove(nonce)
             .is_some_and(|challenge| challenge.expires > now && challenge.client_ip == client_ip);
         challenges.retain(|_, challenge| challenge.expires > now);
+        drop(challenges);
         Ok(valid)
     }
 
@@ -152,13 +155,46 @@ impl WatchRuntime {
             .node_tokens
             .lock()
             .map_err(|_| internal_error())?;
-        if let Some(previous_token) = node_tokens.insert(node_id, token.clone())
+        if let Some(previous_token) = node_tokens.remove(&node_id)
             && let Some(previous) = sessions.remove(&previous_token)
         {
             previous.close();
         }
+        self.prune_sessions(&mut sessions, &mut node_tokens);
+        node_tokens.insert(node_id, token.clone());
         sessions.insert(token, session.clone());
+        drop(node_tokens);
+        drop(sessions);
         Ok(session)
+    }
+
+    fn prune_sessions(
+        &self,
+        sessions: &mut HashMap<String, Arc<WatchSession>>,
+        node_tokens: &mut HashMap<String, String>,
+    ) {
+        let stale = sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.closed.load(Ordering::Acquire)
+                    || session.expired(self.inner.limits.watch_idle_timeout)
+            })
+            .map(|(token, _)| token.clone())
+            .collect::<Vec<_>>();
+        for token in stale {
+            remove_session(sessions, node_tokens, &token);
+        }
+        let capacity = self.inner.limits.watch_sessions.max(1);
+        while sessions.len() >= capacity {
+            let Some(oldest) = sessions
+                .iter()
+                .max_by_key(|(_, session)| session.idle_elapsed())
+                .map(|(token, _)| token.clone())
+            else {
+                break;
+            };
+            remove_session(sessions, node_tokens, &oldest);
+        }
     }
 
     fn session(&self, token: &str) -> Result<Option<Arc<WatchSession>>, ApiError> {
@@ -200,6 +236,7 @@ impl WatchRuntime {
         {
             nodes.remove(&session.node_id);
         }
+        drop(nodes);
         Ok(())
     }
 
@@ -221,6 +258,7 @@ impl WatchRuntime {
         {
             nodes.remove(&session.node_id);
         }
+        drop(nodes);
         Ok(())
     }
 
@@ -254,18 +292,17 @@ impl WatchRuntime {
         let Some(session) = session else {
             return Ok(false);
         };
-        let value = match payload {
-            Some(payload) => json!({"event":event,"payload":payload}),
-            None => json!({"event":event}),
-        };
-        let bytes = serde_json::to_vec(&value)
-            .map_err(|_| {
-                PortError::new(
-                    crate::ports::PortErrorKind::InvalidRequest,
-                    "event is not serializable",
-                )
-            })?
-            .len();
+        if session.closed.load(Ordering::Acquire)
+            || session.expired(self.inner.limits.watch_idle_timeout)
+        {
+            self.close_session_port(&session)?;
+            return Ok(false);
+        }
+        let value = payload.map_or_else(
+            || json!({"event": event}),
+            |payload| json!({"event": event, "payload": payload}),
+        );
+        let bytes = serialized_len(&value)?;
         if bytes > self.inner.limits.watch_event_bytes {
             self.close_session_port(&session)?;
             return Ok(false);
@@ -295,9 +332,13 @@ impl WatchSession {
     }
 
     fn expired(&self, idle: Duration) -> bool {
+        self.idle_elapsed() >= idle
+    }
+
+    fn idle_elapsed(&self) -> Duration {
         self.last_seen
             .lock()
-            .map_or(true, |last_seen| last_seen.elapsed() >= idle)
+            .map_or(Duration::MAX, |last_seen| last_seen.elapsed())
     }
 
     fn close(&self) {
@@ -312,12 +353,55 @@ impl WatchSession {
     fn pop(&self) -> Result<Option<Value>, ApiError> {
         let mut queue = self.queue.lock().map_err(|_| internal_error())?;
         let event = queue.events.pop_front();
-        if let Some(event) = event {
+        if let Some(event) = &event {
             queue.bytes = queue.bytes.saturating_sub(event.bytes);
-            Ok(Some(event.value))
-        } else {
-            Ok(None)
         }
+        drop(queue);
+        Ok(event.map(|event| event.value))
+    }
+}
+
+fn remove_session(
+    sessions: &mut HashMap<String, Arc<WatchSession>>,
+    node_tokens: &mut HashMap<String, String>,
+    token: &str,
+) {
+    let Some(session) = sessions.remove(token) else {
+        return;
+    };
+    session.close();
+    if node_tokens
+        .get(&session.node_id)
+        .is_some_and(|active| active == token)
+    {
+        node_tokens.remove(&session.node_id);
+    }
+}
+
+fn serialized_len(value: &Value) -> Result<usize, PortError> {
+    let mut writer = ByteCounter::default();
+    serde_json::to_writer(&mut writer, value).map_err(|_| {
+        PortError::new(
+            crate::ports::PortErrorKind::InvalidRequest,
+            "event is not serializable",
+        )
+    })?;
+    Ok(writer.bytes)
+}
+
+#[derive(Default)]
+struct ByteCounter {
+    bytes: usize,
+}
+
+impl Write for ByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -328,11 +412,25 @@ pub struct WatchNodeHandle {
 }
 
 impl WatchNodeHandle {
-    pub(crate) fn new(runtime: WatchRuntime) -> Self {
+    pub(crate) const fn new(runtime: WatchRuntime) -> Self {
         Self { runtime }
     }
 
     /// Enqueues one bounded event for a connected node.
+    ///
+    /// Returns `false` — not an error — when `node_id` has no live session, so
+    /// a node that disconnected is not an error condition for the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PortErrorKind::InvalidRequest`] error when `payload` cannot
+    /// be serialized to JSON, and a [`PortErrorKind::Internal`] error when the
+    /// transport's internal state is poisoned. Neither is rendered to an HTTP
+    /// client directly: this is the Gateway-side ingress, and the connected
+    /// node observes a dropped event or a closed session instead.
+    ///
+    /// [`PortErrorKind::InvalidRequest`]: crate::PortErrorKind::InvalidRequest
+    /// [`PortErrorKind::Internal`]: crate::PortErrorKind::Internal
     pub fn send(
         &self,
         node_id: &str,
@@ -350,7 +448,7 @@ pub(crate) async fn challenge(
     let (nonce, expires_at_ms) = state.inner.watch.issue_challenge(peer.ip())?;
     let mut response = json_response(
         StatusCode::OK,
-        json!({"ok":true,"nonce":nonce,"expiresAtMs":expires_at_ms}),
+        &json!({"ok":true,"nonce":nonce,"expiresAtMs":expires_at_ms}),
     );
     response
         .headers_mut()
@@ -399,7 +497,7 @@ pub(crate) async fn connect(
     if let Some(device_token) = identity.device_token {
         body["deviceToken"] = json!(device_token);
     }
-    Ok(json_response(StatusCode::OK, body))
+    Ok(json_response(StatusCode::OK, &body))
 }
 
 pub(crate) async fn poll(
@@ -431,7 +529,7 @@ pub(crate) async fn poll(
     if let Some(event) = session.pop()? {
         return Ok(json_response(
             StatusCode::OK,
-            json!({"ok":true,"event":event}),
+            &json!({"ok":true,"event":event}),
         ));
     }
     let generation = session.poll_generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -446,28 +544,36 @@ pub(crate) async fn poll(
     loop {
         let notified = session.notify.notified();
         tokio::pin!(notified);
+        // Register as a waiter *before* re-reading the session state. `Notify`
+        // only delivers `notify_waiters` to waiters that are already
+        // registered, so an event enqueued between the queue read and the
+        // `select!` below would wake nobody and the node would sit out the
+        // whole long poll with work already queued.
+        notified.as_mut().enable();
+        if session.closed.load(Ordering::Acquire) {
+            guard.armed = false;
+            return Err(unauthorized());
+        }
+        if session.poll_generation.load(Ordering::Acquire) != generation {
+            guard.armed = false;
+            return Ok(json_response(
+                StatusCode::CONFLICT,
+                &json!({"ok":false,"reason":"superseded poll"}),
+            ));
+        }
+        if let Some(event) = session.pop()? {
+            guard.armed = false;
+            return Ok(json_response(
+                StatusCode::OK,
+                &json!({"ok":true,"event":event}),
+            ));
+        }
         tokio::select! {
             () = &mut deadline => {
                 guard.armed = false;
-                return Ok(json_response(StatusCode::OK, json!({"ok":true,"event":null})));
+                return Ok(json_response(StatusCode::OK, &json!({"ok":true,"event":null})));
             }
-            () = &mut notified => {
-                if session.closed.load(Ordering::Acquire) {
-                    guard.armed = false;
-                    return Err(unauthorized());
-                }
-                if session.poll_generation.load(Ordering::Acquire) != generation {
-                    guard.armed = false;
-                    return Ok(json_response(
-                        StatusCode::CONFLICT,
-                        json!({"ok":false,"reason":"superseded poll"}),
-                    ));
-                }
-                if let Some(event) = session.pop()? {
-                    guard.armed = false;
-                    return Ok(json_response(StatusCode::OK, json!({"ok":true,"event":event})));
-                }
-            }
+            () = &mut notified => {}
         }
     }
 }
@@ -513,7 +619,7 @@ pub(crate) async fn disconnect(
         return Ok(close_connection_response(error));
     }
     state.inner.watch.close_session(&session)?;
-    Ok(json_response(StatusCode::OK, json!({"ok":true})))
+    Ok(json_response(StatusCode::OK, &json!({"ok":true})))
 }
 
 pub(crate) async fn result(
@@ -562,14 +668,12 @@ pub(crate) async fn result(
     .await
     .map_err(|_| internal_error())?
     .map_err(|_| internal_error())?;
-    Ok(json_response(
-        StatusCode::OK,
-        if accepted {
-            json!({"ok":true})
-        } else {
-            json!({"ok":true,"ignored":true})
-        },
-    ))
+    let body = if accepted {
+        json!({"ok":true})
+    } else {
+        json!({"ok":true,"ignored":true})
+    };
+    Ok(json_response(StatusCode::OK, &body))
 }
 
 fn authenticated_session(
@@ -584,7 +688,10 @@ fn authenticated_session(
 }
 
 fn validate_watch_connect(connect: &ConnectParams) -> Result<(), ApiError> {
-    let role = connect.role.as_ref().map(|role| role.as_str());
+    let role = connect
+        .role
+        .as_ref()
+        .map(claw_protocol::gateway::Name::as_str);
     let scopes_empty = connect.scopes.as_ref().is_none_or(Vec::is_empty);
     let platform = connect.client.platform.as_str().to_ascii_lowercase();
     let family = connect

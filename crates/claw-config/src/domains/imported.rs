@@ -1,4 +1,10 @@
-#![allow(missing_docs)]
+#![expect(
+    missing_docs,
+    reason = "this module is a mechanical transcription of the frozen upstream 47-domain source \
+              shape; its item and field names are the JSON keys themselves, and the authoritative \
+              description of each one lives in compat/upstream, so per-item prose here would be \
+              duplicated text that can silently drift from the sealed contract"
+)]
 
 use std::fmt::{self, Debug, Formatter};
 use std::{borrow::Cow, collections::BTreeMap};
@@ -8,8 +14,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 macro_rules! optional_config {
-    ($name:ident { $($field:ident: $type:ty),* $(,)? }) => {
-        #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Serialize)]
+    (@define [$($equality:ident),*] $name:ident { $($field:ident: $type:ty),* $(,)? }) => {
+        #[derive(Clone, Debug, Default, PartialEq, $($equality,)* Deserialize, JsonSchema, Serialize)]
         #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
         pub struct $name {
             $(
@@ -17,6 +23,14 @@ macro_rules! optional_config {
                 pub $field: Option<$type>,
             )*
         }
+    };
+    // Upstream models these values as JSON numbers that are not integers, so the
+    // domain carries IEEE-754 fields and total equality does not hold.
+    (partial_eq_only $name:ident { $($field:ident: $type:ty),* $(,)? }) => {
+        optional_config!(@define [] $name { $($field: $type),* });
+    };
+    ($name:ident { $($field:ident: $type:ty),* $(,)? }) => {
+        optional_config!(@define [Eq] $name { $($field: $type),* });
     };
 }
 
@@ -30,21 +44,21 @@ macro_rules! string_enum {
     };
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum StringOrNumber {
     String(String),
     Number(i64),
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum StringOrFalse {
     String(String),
     False(LiteralFalse),
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum StringNumberOrFalse {
     String(String),
@@ -91,7 +105,7 @@ impl Serialize for LiteralFalse {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum BoolOrAuto {
     Bool(bool),
@@ -100,7 +114,7 @@ pub enum BoolOrAuto {
 
 string_enum!(AutoValue, "lowercase", Auto);
 
-#[derive(Clone, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DomainSecretRef {
     source: SecretSource,
@@ -109,6 +123,20 @@ pub struct DomainSecretRef {
 }
 
 impl DomainSecretRef {
+    /// Builds a validated reference to secret material held outside the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `"secret provider must match [a-z][a-z0-9_-]{0,63}"` when
+    /// `provider` is not a lowercase alias of at most 64 characters, and
+    /// `"secret reference id is invalid for its source"` when `id` does not
+    /// satisfy the rule for `source`: 1..=128 characters of `A-Z`, `0-9`, and
+    /// `_` starting with an uppercase letter for [`SecretSource::Env`]; either
+    /// the literal `value` or a leading-slash JSON Pointer whose only `~`
+    /// escapes are `~0` and `~1` for [`SecretSource::File`]; and 1..=256
+    /// characters of `A-Za-z0-9._:/#-` starting alphanumerically and containing
+    /// no `.` or `..` path segment for [`SecretSource::Exec`]. Neither message
+    /// repeats the rejected value, because it can be the secret itself.
     pub fn new(
         source: SecretSource,
         provider: impl Into<String>,
@@ -258,7 +286,7 @@ impl fmt::Display for DomainSecretRef {
 
 string_enum!(SecretSource, "lowercase", Env, File, Exec);
 
-#[derive(Clone, PartialEq, Deserialize, JsonSchema)]
+#[derive(Clone, Eq, PartialEq, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum SecretInput {
     Literal(String),
@@ -285,7 +313,7 @@ impl Serialize for SecretInput {
 
 string_enum!(AuthMode, "kebab-case", ApiKey, AwsSdk, Oauth, Token);
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AuthProfileConfig {
     pub provider: String,
@@ -296,7 +324,7 @@ pub struct AuthProfileConfig {
     pub display_name: Option<String>,
 }
 
-optional_config!(AuthCooldownConfig {
+optional_config!(partial_eq_only AuthCooldownConfig {
     billing_backoff_hours: f64,
     billing_backoff_hours_by_provider: BTreeMap<String, f64>,
     billing_max_hours: f64,
@@ -310,7 +338,7 @@ optional_config!(AuthCooldownConfig {
 
 string_enum!(DiscordMembershipType, "camelCase", CanViewChannel);
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum AccessGroupConfig {
     #[serde(rename = "discord.channelAudience")]
@@ -353,7 +381,7 @@ string_enum!(
     Paragraph
 );
 
-optional_config!(DiagnosticsOtelConfig {
+optional_config!(partial_eq_only DiagnosticsOtelConfig {
     enabled: bool,
     endpoint: String,
     traces_endpoint: String,
@@ -380,7 +408,7 @@ pub enum OtelProtocol {
     Grpc,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum OtelCaptureContent {
     Enabled(bool),
@@ -435,7 +463,7 @@ string_enum!(
 );
 string_enum!(BrowserSnapshotMode, "lowercase", Efficient);
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct BrowserProfileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -462,7 +490,7 @@ pub struct BrowserProfileConfig {
 optional_config!(BrowserSnapshotDefaults {
     mode: BrowserSnapshotMode,
 });
-optional_config!(BrowserTabCleanupConfig {
+optional_config!(partial_eq_only BrowserTabCleanupConfig {
     enabled: bool,
     idle_minutes: f64,
     max_tabs_per_session: u32,
@@ -489,12 +517,12 @@ string_enum!(SessionSendPolicyAction, "lowercase", Allow, Deny);
 string_enum!(SpawnContextMode, "lowercase", Isolated, Fork);
 string_enum!(SessionMaintenanceMode, "lowercase", Enforce, Warn);
 
-optional_config!(SessionResetConfig {
+optional_config!(partial_eq_only SessionResetConfig {
     mode: SessionResetMode,
     at_hour: u8,
     idle_minutes: f64,
 });
-optional_config!(SessionResetByTypeConfig {
+optional_config!(partial_eq_only SessionResetByTypeConfig {
     direct: SessionResetConfig,
     dm: SessionResetConfig,
     group: SessionResetConfig,
@@ -507,7 +535,7 @@ optional_config!(SessionSendPolicyMatch {
     raw_key_prefix: String,
 });
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SessionSendPolicyRule {
     pub action: SessionSendPolicyAction,
@@ -527,7 +555,7 @@ optional_config!(SessionWriteLockConfig {
 optional_config!(SessionAgentToAgentConfig {
     max_ping_pong_turns: u8,
 });
-optional_config!(SessionThreadBindingsConfig {
+optional_config!(partial_eq_only SessionThreadBindingsConfig {
     enabled: bool,
     idle_hours: f64,
     max_age_hours: f64,
@@ -545,7 +573,7 @@ optional_config!(SessionMaintenanceConfig {
     high_water_bytes: StringOrNumber,
 });
 
-optional_config!(WebReconnectConfig {
+optional_config!(partial_eq_only WebReconnectConfig {
     initial_ms: u64,
     max_ms: u64,
     factor: f64,
@@ -560,7 +588,7 @@ optional_config!(WebWhatsAppConfig {
 
 pub type ExtensionObject = BTreeMap<String, Value>;
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(tag = "source", rename_all = "lowercase", deny_unknown_fields)]
 pub enum SecretProviderConfig {
     Env {
@@ -581,7 +609,7 @@ pub enum SecretProviderConfig {
     Exec(ExecSecretProviderConfig),
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum ExecSecretProviderConfig {
     Manual {
@@ -832,7 +860,7 @@ optional_config!(McpServerToolFilterConfig {
     include: Vec<String>,
     exclude: Vec<String>,
 });
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpServerCodexConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -848,13 +876,13 @@ pub struct McpServerCodexConfig {
     )]
     pub default_tools_approval_mode_legacy: Option<McpCodexToolApprovalMode>,
 }
-optional_config!(NodeHostMcpConfig {
+optional_config!(partial_eq_only NodeHostMcpConfig {
     servers: BTreeMap<String, McpServerConfig>,
 });
 
 string_enum!(BroadcastStrategy, "lowercase", Parallel, Sequential);
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct BroadcastConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -863,7 +891,7 @@ pub struct BroadcastConfig {
     pub peers: BTreeMap<String, Vec<String>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AudioTranscriptionConfig {
     pub command: Vec<String>,
@@ -874,14 +902,14 @@ pub struct AudioTranscriptionConfig {
 string_enum!(VisibleRepliesMode, "snake_case", Automatic, MessageTool);
 string_enum!(ResponseUsageMode, "lowercase", On, Off, Tokens, Full);
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum ResponseUsageConfig {
     Mode(ResponseUsageMode),
     PerChannel(BTreeMap<String, ResponseUsageMode>),
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum UsageTemplateConfig {
     Text(String),
@@ -1000,7 +1028,7 @@ string_enum!(
     None
 );
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum NativeCommandMode {
     Enabled(bool),
@@ -1160,7 +1188,7 @@ pub struct ChannelsDomain {
     pub plugin_channels: BTreeMap<String, BuiltinChannelConfig>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum AgentModelConfig {
     Model(String),
@@ -1172,7 +1200,7 @@ optional_config!(AgentModelSelectionConfig {
     fallbacks: Vec<String>,
 });
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum AgentToolModelConfig {
     Model(String),
@@ -1272,12 +1300,12 @@ optional_config!(AgentContextLimitsConfig {
     tool_result_max_chars: u32,
     post_compaction_max_chars: u32,
 });
-optional_config!(AgentContextPruningConfig {
+optional_config!(partial_eq_only AgentContextPruningConfig {
     soft_trim_ratio: f64,
     hard_clear_ratio: f64,
     keep_last_assistants: u32,
 });
-optional_config!(AgentCompactionConfig {
+optional_config!(partial_eq_only AgentCompactionConfig {
     mode: CompactionMode,
     max_history_share: f64,
     recent_turns_preserve: u32,
@@ -1326,14 +1354,14 @@ optional_config!(SubagentsDefaultsConfig {
     archive_after_minutes: u32,
 });
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct CliBackendConfig {
     #[serde(flatten)]
     pub fields: ExtensionObject,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct MemorySearchConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1348,7 +1376,7 @@ pub struct MemorySearchConfig {
     pub provider_options: ExtensionObject,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AgentSandboxConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1393,7 +1421,7 @@ optional_config!(AgentToolsConfig {
     deny: Vec<String>,
 });
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum AgentRuntimeConfig {
     Embedded,
@@ -1533,7 +1561,7 @@ pub struct AgentDefaultsConfig {
     pub sandbox: Option<AgentSandboxConfig>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentConfig {
     pub id: String,
@@ -1653,13 +1681,13 @@ pub struct ToolsWebSearchConfig {
     pub provider_options: ExtensionObject,
 }
 
-optional_config!(ToolsWebFetchConfig {
+optional_config!(partial_eq_only ToolsWebFetchConfig {
     enabled: bool,
     max_chars: u32,
     timeout_seconds: u32,
     cache_ttl_minutes: f64,
 });
-optional_config!(ToolsWebConfig {
+optional_config!(partial_eq_only ToolsWebConfig {
     search: ToolsWebSearchConfig,
     fetch: ToolsWebFetchConfig,
 });
@@ -1681,7 +1709,7 @@ optional_config!(ToolLoopDetectionConfig {
     critical_threshold: u32,
 });
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum ToolSearchConfig {
     Enabled(bool),
@@ -1695,7 +1723,7 @@ optional_config!(ToolSearchOptions {
     max_search_limit: u32,
 });
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum CodeModeConfig {
     Enabled(bool),
@@ -1781,14 +1809,14 @@ string_enum!(RouteBindingType, "lowercase", Route);
 string_enum!(AcpBindingType, "lowercase", Acp);
 string_enum!(ChatTypeKind, "lowercase", Direct, Group, Channel, Dm);
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentBindingPeerMatch {
     pub kind: ChatTypeKind,
     pub id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentBindingMatch {
     pub channel: String,
@@ -1811,7 +1839,7 @@ optional_config!(AgentBindingAcpOptions {
     backend: String,
 });
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentRouteBinding {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
@@ -1825,7 +1853,7 @@ pub struct AgentRouteBinding {
     pub session: Option<AgentBindingSessionConfig>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentAcpBinding {
     #[serde(rename = "type")]
@@ -1839,7 +1867,7 @@ pub struct AgentAcpBinding {
     pub acp: Option<AgentBindingAcpOptions>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum AgentBinding {
     Route(AgentRouteBinding),
@@ -1861,7 +1889,7 @@ optional_config!(ExecApprovalForwardingConfig {
     targets: Vec<ExecApprovalForwardTarget>,
 });
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ExecApprovalForwardTarget {
     pub channel: String,
@@ -1931,7 +1959,7 @@ pub struct ModelTieredPriceConfig {
     pub range: ModelTierRange,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum ModelTierRange {
     Bounded([u64; 2]),
@@ -1947,7 +1975,7 @@ optional_config!(ThinkingLevelMapConfig {
     xhigh: NullableString,
     max: NullableString,
 });
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum NullableString {
     String(String),
@@ -1966,7 +1994,7 @@ optional_config!(ModelMediaInputConfig {
     image: ModelImageInputConfig,
 });
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ModelProviderLocalServiceConfig {
     pub command: String,
@@ -1984,7 +2012,7 @@ pub struct ModelProviderLocalServiceConfig {
     pub idle_stop_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ConfiguredProviderRequestAuth {
     ProviderDefault,
@@ -2009,7 +2037,7 @@ optional_config!(ConfiguredProviderRequestTls {
     insecure_skip_verify: bool,
 });
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ConfiguredProviderRequestProxy {
     EnvProxy {
@@ -2186,14 +2214,14 @@ optional_config!(CronFailureDestinationConfig {
     mode: CronAlertMode,
 });
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum SessionRetention {
     Duration(String),
     Disabled(LiteralFalse),
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TranscriptsAutoStartConfig {
     pub provider_id: String,
@@ -2232,7 +2260,7 @@ optional_config!(HookMappingTransform {
     export: String,
 });
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct HookMappingConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2297,7 +2325,7 @@ optional_config!(HooksGmailConfig {
     thinking: HooksGmailThinking,
 });
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct InternalHookHandler {
     pub event: String,
@@ -2306,7 +2334,7 @@ pub struct InternalHookHandler {
     pub export: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct HookConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2366,7 +2394,7 @@ string_enum!(
     ForceAgentConsult
 );
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct TalkProviderEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2375,7 +2403,7 @@ pub struct TalkProviderEntry {
     pub options: ExtensionObject,
 }
 
-optional_config!(TalkRealtimeConfig {
+optional_config!(partial_eq_only TalkRealtimeConfig {
     provider: String,
     providers: BTreeMap<String, TalkProviderEntry>,
     model: String,
@@ -2443,7 +2471,7 @@ optional_config!(GatewayRateLimitConfig {
     exempt_loopback: bool,
 });
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct GatewayTrustedProxyConfig {
     pub user_header: String,
@@ -2511,7 +2539,7 @@ optional_config!(PdfConfig {
     min_text_chars: u32,
 });
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct GatewayHttpResponsesFilesConfig {
     #[serde(flatten)]
@@ -2558,7 +2586,7 @@ optional_config!(SshVerifyObject {
     cidrs: Vec<String>,
 });
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(untagged)]
 pub enum SshVerifyConfig {
     Enabled(bool),
@@ -2594,7 +2622,7 @@ optional_config!(CloudWorkerLifetimePolicyConfig {
     max_lifetime_minutes: u32,
 });
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CloudWorkerProfileConfig {
     pub provider: String,
@@ -2616,7 +2644,7 @@ optional_config!(MemoryQmdMcporterConfig {
     start_daemon: bool,
 });
 
-#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct MemoryQmdIndexPath {
     pub path: String,

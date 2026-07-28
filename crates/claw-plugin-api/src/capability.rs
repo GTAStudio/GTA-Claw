@@ -899,7 +899,7 @@ pub fn validate_relative_path(path: &str) -> Result<PathBuf, String> {
     if path.contains('\0') {
         return Err("path must not contain NUL".to_owned());
     }
-    if path.chars().any(|c| c.is_control()) {
+    if path.chars().any(char::is_control) {
         return Err("path must not contain control characters".to_owned());
     }
     if path.contains('\\') {

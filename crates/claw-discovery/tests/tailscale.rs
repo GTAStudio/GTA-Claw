@@ -1,6 +1,6 @@
 //! Tailscale Serve and Funnel authorisation oracles.
 //!
-//! Each denial below is a condition that a faithful LocalAPI client will happily
+//! Each denial below is a condition that a faithful `LocalAPI` client will happily
 //! publish through if nothing checks it first, and each one has a distinct
 //! failure mode in production: a Funnel on a port Tailscale does not terminate
 //! looks published and silently never receives traffic; a Funnel without the
@@ -19,7 +19,7 @@ use claw_discovery::tailscale_policy::{
 const NODE: &str = "studio.tail.example";
 const PLAIN_NODE: &str = "plain.tail.example";
 
-fn loopback(port: u16) -> SocketAddr {
+const fn loopback(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
 
@@ -327,4 +327,26 @@ fn every_denial_names_its_cause_in_the_operator_message() {
     assert_eq!(DenialCause::HttpsDisabled.to_string(), "https-disabled");
     assert_eq!(ExposureMode::Funnel.to_string(), "funnel");
     assert_eq!(ExposureMode::Serve.to_string(), "serve");
+}
+
+#[test]
+fn every_denial_cause_has_static_non_secret_remediation() {
+    for cause in [
+        DenialCause::UnknownNode,
+        DenialCause::NodeKeyExpired,
+        DenialCause::MachineAuthPending,
+        DenialCause::HttpsDisabled,
+        DenialCause::MissingFunnelAttribute,
+        DenialCause::PublicPortNotAllowed,
+        DenialCause::BackendNotLoopback,
+        DenialCause::InvalidPath,
+    ] {
+        let guidance = cause.remediation();
+        assert!(!guidance.is_empty());
+        assert!(!guidance.contains(NODE));
+    }
+
+    let denial = policy().evaluate(&funnel(9443)).expect_err("bad port");
+    assert_eq!(denial.remediation(), denial.cause.remediation());
+    assert!(denial.remediation().contains("Funnel"));
 }

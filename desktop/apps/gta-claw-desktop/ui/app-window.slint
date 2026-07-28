@@ -2,6 +2,7 @@ import { FirstRunSurface } from "@gta-ui/first-run.slint";
 import { GatewayOnboardingSurface } from "@gta-ui/gateway-onboarding.slint";
 import {
     ActivityItem,
+    CommandItem,
     DeliverableItem,
     DiffItem,
     ExtensionItem,
@@ -16,6 +17,7 @@ import { DesignTokens, StatusKind, ThemeMode, VisualPreferences } from "@gta-ui/
 export { DesignTokens, VisualPreferences }
 export {
     ActivityItem,
+    CommandItem,
     DeliverableItem,
     DiffItem,
     ExtensionItem,
@@ -62,11 +64,91 @@ export component AppWindow inherits Window {
     in-out property <bool> consent-checked: false;
     in property <length> layout-width: root.width;
     out property <bool> narrow-layout: root.layout-width < 900px;
+    out property <string> connection-focused-action: "";
     in property <bool> workspace-ready: false;
     in property <int> onboarding-stage: 0;
     in property <int> selected-screen: 0;
     in property <int> selected-settings-section: 0;
     in property <bool> palette-open: false;
+    in-out property <string> palette-query: "";
+    in property <[CommandItem]> palette-commands;
+    in property <int> palette-selected-index: 0;
+    in property <int> palette-command-count: 0;
+    in property <int> palette-selected-action-id: -1;
+    in property <string> palette-selected-label: "";
+    in-out property <int> palette-focused-command-index: -1;
+    out property <[CommandItem]> command-catalog: [
+        {
+            action-id: 0,
+            glyph: "F",
+            title: @tr("Go to Focus"),
+            detail: @tr("Ctrl/Cmd+1"),
+            keywords: @tr("focus home attention overview"),
+        },
+        {
+            action-id: 1,
+            glyph: "W",
+            title: @tr("Go to Workspaces"),
+            detail: @tr("Ctrl/Cmd+2"),
+            keywords: @tr("workspace repository local remote git"),
+        },
+        {
+            action-id: 2,
+            glyph: "R",
+            title: @tr("Open Run Monitor"),
+            detail: @tr("Ctrl/Cmd+3"),
+            keywords: @tr("runs sessions tasks monitor"),
+        },
+        {
+            action-id: 3,
+            glyph: "S",
+            title: @tr("Open Schedule Manager"),
+            detail: @tr("Ctrl/Cmd+4"),
+            keywords: @tr("schedules recurring cadence automation"),
+        },
+        {
+            action-id: 4,
+            glyph: "D",
+            title: @tr("Open Deliverables"),
+            detail: @tr("Ctrl/Cmd+5"),
+            keywords: @tr("deliverables files artifacts output"),
+        },
+        {
+            action-id: 5,
+            glyph: "E",
+            title: @tr("Open Extension Manager"),
+            detail: @tr("Ctrl/Cmd+6"),
+            keywords: @tr("extensions roles tools permissions"),
+        },
+        {
+            action-id: 6,
+            glyph: "G",
+            title: @tr("Open Settings"),
+            detail: @tr("Ctrl/Cmd+7"),
+            keywords: @tr("settings preferences appearance connection"),
+        },
+        {
+            action-id: 7,
+            glyph: "?",
+            title: @tr("Show keyboard shortcuts"),
+            detail: @tr("Settings"),
+            keywords: @tr("help keyboard shortcuts keys"),
+        },
+        {
+            action-id: 8,
+            glyph: "U",
+            title: @tr("View update availability"),
+            detail: @tr("Settings"),
+            keywords: @tr("update upgrade release version unavailable guidance"),
+        },
+        {
+            action-id: 9,
+            glyph: "H",
+            title: @tr("View diagnostic availability"),
+            detail: @tr("Settings"),
+            keywords: @tr("diagnostics health renderer gateway accessibility availability"),
+        },
+    ];
     in property <int> diff-mode: 0;
     in property <[RunItem]> runs;
     in property <[WorkspaceItem]> workspaces;
@@ -98,6 +180,7 @@ export component AppWindow inherits Window {
     in property <string> run-page-label: "Page 1 of 1";
     in property <bool> can-previous-run-page: false;
     in property <bool> can-next-run-page: false;
+    in-out property <int> focused-run-index: -1;
     in-out property <ThemeMode> theme-mode <=> VisualPreferences.theme-mode;
     in-out property <bool> high-contrast <=> VisualPreferences.high-contrast;
     in-out property <bool> reduced-motion <=> VisualPreferences.reduced-motion;
@@ -112,6 +195,9 @@ export component AppWindow inherits Window {
     callback navigate-requested(int);
     callback palette-toggle-requested();
     callback palette-dismiss-requested();
+    callback palette-query-changed(string);
+    callback palette-selection-step-requested(int);
+    callback palette-command-requested(int);
     callback open-session-requested(int);
     callback open-workspace-requested(int);
     callback settings-section-requested(int);
@@ -135,33 +221,133 @@ export component AppWindow inherits Window {
         return root.close();
     }
 
+    // Mirrored from the onboarding surface because it is conditional: an element
+    // inside an `if` cannot be reached by id from here.
+    private property <bool> onboarding-endpoint-has-focus: false;
+    private property <bool> onboarding-token-has-focus: false;
+
     public function purge-token-input() {
-        root.token-preserve-focus = onboarding.token-has-focus;
+        root.token-preserve-focus = root.onboarding-token-has-focus;
         root.token-input = "";
         root.token-reset-selector = !root.token-reset-selector;
     }
 
     public function replace-endpoint-input(value: string) {
-        root.endpoint-preserve-focus = onboarding.endpoint-has-focus;
+        root.endpoint-preserve-focus = root.onboarding-endpoint-has-focus;
         root.endpoint-input = value;
         root.endpoint-reset-selector = !root.endpoint-reset-selector;
     }
 
-    first-run := FirstRunSurface {
+    application-focus := FocusScope {
         width: 100%;
         height: 100%;
-        visible: !root.workspace-ready && root.onboarding-stage < 3;
-        enabled: self.visible;
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        private property <bool> observed-workspace-ready: root.workspace-ready;
+        private property <int> observed-onboarding-stage: root.onboarding-stage;
+        private property <bool> observed-palette-open: root.palette-open;
+
+        init => { self.focus(); }
+        changed observed-workspace-ready => {
+            root.connection-focused-action = "";
+            self.focus();
+        }
+        changed observed-onboarding-stage => {
+            root.connection-focused-action = "";
+            self.focus();
+        }
+        changed observed-palette-open => {
+            if (!self.observed-palette-open) {
+                self.focus();
+            }
+        }
+
+        key-pressed(event) => {
+            if (root.workspace-ready
+                && (event.text == Key.F1
+                    || ((event.modifiers.control || event.modifiers.meta)
+                        && (event.text == "k" || event.text == "K")))) {
+                root.palette-toggle-requested();
+                return accept;
+            }
+            if (root.workspace-ready
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "1") {
+                root.navigate-requested(0);
+                return accept;
+            }
+            if (root.workspace-ready
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "2") {
+                root.navigate-requested(1);
+                return accept;
+            }
+            if (root.workspace-ready
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "3") {
+                root.navigate-requested(2);
+                return accept;
+            }
+            if (root.workspace-ready
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "4") {
+                root.navigate-requested(3);
+                return accept;
+            }
+            if (root.workspace-ready
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "5") {
+                root.navigate-requested(4);
+                return accept;
+            }
+            if (root.workspace-ready
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "6") {
+                root.navigate-requested(5);
+                return accept;
+            }
+            if (root.workspace-ready
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "7") {
+                root.navigate-requested(6);
+                return accept;
+            }
+            if (event.text == Key.Escape) {
+                if (root.palette-open) {
+                    root.palette-dismiss-requested();
+                    return accept;
+                }
+                if (!root.workspace-ready && root.onboarding-stage > 0
+                    && root.onboarding-stage < 3) {
+                    root.onboarding-stage-requested(root.onboarding-stage - 1);
+                    return accept;
+                }
+                if (!root.workspace-ready && root.onboarding-stage == 3 && root.can-cancel) {
+                    root.cancel-requested();
+                    return accept;
+                }
+                if (!root.workspace-ready && root.onboarding-stage == 3 && root.can-disconnect) {
+                    root.disconnect-requested();
+                    return accept;
+                }
+            }
+            return reject;
+        }
+
+    // `if` instead of `visible`: a hidden element still exists, is laid out and
+    // keeps its whole subtree alive, so all three surfaces used to be built at
+    // startup. `if` builds exactly the surface that is on screen.
+    if (!root.workspace-ready && root.onboarding-stage < 3) : FirstRunSurface {
+        width: 100%;
+        height: 100%;
         stage: root.onboarding-stage;
         available-width: root.layout-width;
         stage-requested(stage) => { root.onboarding-stage-requested(stage); }
     }
 
-    onboarding := GatewayOnboardingSurface {
+    if (!root.workspace-ready && root.onboarding-stage == 3) : GatewayOnboardingSurface {
         width: 100%;
         height: 100%;
-        visible: !root.workspace-ready && root.onboarding-stage == 3;
-        enabled: self.visible;
         available-width: root.layout-width;
         state-title: root.state-title;
         state-detail: root.state-detail;
@@ -199,17 +385,27 @@ export component AppWindow inherits Window {
         cancel-requested => { root.cancel-requested(); }
         disconnect-requested => { root.disconnect-requested(); }
         error-dismiss-requested => { root.error-dismiss-requested(); }
+        focus-changed(endpoint-focused, token-focused, focused-action) => {
+            root.onboarding-endpoint-has-focus = endpoint-focused;
+            root.onboarding-token-has-focus = token-focused;
+            root.connection-focused-action = focused-action;
+        }
     }
 
-    product := ProductShell {
+    if (root.workspace-ready) : ProductShell {
         width: 100%;
         height: 100%;
-        visible: root.workspace-ready;
-        enabled: self.visible;
         available-width: root.layout-width;
         selected-screen: root.selected-screen;
         selected-settings-section: root.selected-settings-section;
         palette-open: root.palette-open;
+        palette-query <=> root.palette-query;
+        palette-commands: root.palette-commands;
+        palette-selected-index: root.palette-selected-index;
+        palette-command-count: root.palette-command-count;
+        palette-selected-action-id: root.palette-selected-action-id;
+        palette-selected-label: root.palette-selected-label;
+        palette-focused-command-index <=> root.palette-focused-command-index;
         diff-mode: root.diff-mode;
         runs: root.runs;
         workspaces: root.workspaces;
@@ -241,9 +437,21 @@ export component AppWindow inherits Window {
         run-page-label: root.run-page-label;
         can-previous-run-page: root.can-previous-run-page;
         can-next-run-page: root.can-next-run-page;
+        focused-run-index <=> root.focused-run-index;
+        gateway-status-text: root.status-text;
+        gateway-status-label: root.status-label;
+        gateway-status-icon: root.status-icon;
+        gateway-status-kind: root.status-kind;
+        gateway-server: root.server-summary;
+        gateway-role: root.role-summary;
+        gateway-scopes: root.scopes-summary;
+        gateway-health: root.health-summary;
         navigate-requested(index) => { root.navigate-requested(index); }
         palette-toggle-requested => { root.palette-toggle-requested(); }
         palette-dismiss-requested => { root.palette-dismiss-requested(); }
+        palette-query-changed(query) => { root.palette-query-changed(query); }
+        palette-selection-step-requested(step) => { root.palette-selection-step-requested(step); }
+        palette-command-requested(action-id) => { root.palette-command-requested(action-id); }
         open-session-requested(index) => { root.open-session-requested(index); }
         open-workspace-requested(index) => { root.open-workspace-requested(index); }
         settings-section-requested(index) => { root.settings-section-requested(index); }
@@ -263,5 +471,6 @@ export component AppWindow inherits Window {
         extension-toggled(index) => { root.extension-toggled(index); }
         deliverable-selected(index) => { root.deliverable-selected(index); }
         deliverable-pin-toggle-requested => { root.deliverable-pin-toggle-requested(); }
+    }
     }
 }

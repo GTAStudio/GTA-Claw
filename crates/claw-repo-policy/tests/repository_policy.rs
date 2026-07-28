@@ -101,7 +101,7 @@ fn repository_legacy_javascript_surface_does_not_grow() {
     assert!(
         LEGACY_RUNTIME_INVENTORY
             .iter()
-            .filter(|path| path.ends_with(".ts") || path.ends_with(".tsx"))
+            .filter(|path| has_legacy_typescript_extension(path))
             .count()
             <= LEGACY_TYPESCRIPT_CEILING,
         "the binding legacy TypeScript ceiling was raised instead of lowered"
@@ -143,7 +143,8 @@ fn repository_legacy_javascript_surface_does_not_grow() {
     }
     for allowed in ALLOWED_ADVERSARIAL_SHELL_FIXTURES {
         assert!(
-            allowed.starts_with(".github/fixtures/security-tools/") && allowed.ends_with(".sh"),
+            allowed.starts_with(".github/fixtures/security-tools/")
+                && Path::new(allowed).extension() == Some(OsStr::new("sh")),
             "adversarial shell fixture allowlist entry escapes its frozen tree: {allowed}"
         );
         assert!(
@@ -614,7 +615,8 @@ fn collect_action_files(directory: &Path, action_files: &mut Vec<PathBuf>) -> io
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
             continue;
-        } else if file_type.is_dir() {
+        }
+        if file_type.is_dir() {
             if entry.file_name() == OsStr::new(".git") {
                 continue;
             }
@@ -666,7 +668,8 @@ fn collect_container_files(directory: &Path, container_files: &mut Vec<PathBuf>)
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
             continue;
-        } else if file_type.is_dir() {
+        }
+        if file_type.is_dir() {
             if matches!(entry.file_name().to_str(), Some(".git" | "target")) {
                 continue;
             }
@@ -867,6 +870,21 @@ fn normalized_relative(root: &Path, path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+// A `.TS` entry must count against the ceiling exactly like a `.ts` one, so the
+// match ignores ASCII case. `Path::extension` is deliberately not used: a file
+// named exactly `.ts` has no extension by that definition and would slip past
+// the count that this ratchet bounds.
+fn has_legacy_typescript_extension(path: &str) -> bool {
+    ["ts", "tsx"].into_iter().any(|extension| {
+        path.len()
+            .checked_sub(extension.len() + 1)
+            .and_then(|dot| path.get(dot..))
+            .is_some_and(|suffix| {
+                suffix.starts_with('.') && suffix[1..].eq_ignore_ascii_case(extension)
+            })
+    })
 }
 
 fn is_forbidden_directory(path: &Path) -> bool {

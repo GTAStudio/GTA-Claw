@@ -28,6 +28,7 @@
 //! string below and the compiled ABI cannot drift apart.
 
 pub mod abi;
+pub mod cancellation;
 pub mod capability;
 pub mod compat;
 pub mod limits;

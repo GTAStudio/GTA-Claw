@@ -71,6 +71,12 @@ pub fn normalize_any_channel_id(raw: &str) -> Option<&'static str> {
 ///
 /// `Default` reproduces the documented defaults: `text` and `restart` are on,
 /// `useAccessGroups` is on, and every other feature flag is off.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one field per boolean key of the upstream `commands` config block; a bitset would \
+              still need a per-key match to name the bit and would hide which config key each \
+              default belongs to"
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandsConfig {
     text: bool,
@@ -305,14 +311,14 @@ impl MessageContext {
     /// Sets `ctx.From`.
     #[must_use]
     pub fn with_from(mut self, from: &str) -> Self {
-        self.from = js_trim(from).to_owned();
+        js_trim(from).clone_into(&mut self.from);
         self
     }
 
     /// Sets `ctx.To`.
     #[must_use]
     pub fn with_to(mut self, to: &str) -> Self {
-        self.to = js_trim(to).to_owned();
+        js_trim(to).clone_into(&mut self.to);
         self
     }
 
@@ -433,6 +439,19 @@ impl MessageContext {
 
 /// Ports `isConversationLikeIdentity`.
 fn is_conversation_like_identity(value: &str) -> bool {
+    // `/(^|:)(channel|group|thread|topic|room|space|spaces):/`, expanded into
+    // the two literal forms each alternative can take so the check needs no
+    // formatting at all.
+    const KINDS: [(&str, &str); 7] = [
+        ("channel:", ":channel:"),
+        ("group:", ":group:"),
+        ("thread:", ":thread:"),
+        ("topic:", ":topic:"),
+        ("room:", ":room:"),
+        ("space:", ":space:"),
+        ("spaces:", ":spaces:"),
+    ];
+
     let normalized = normalize_lowercase_or_empty(value);
     if normalized.is_empty() {
         return false;
@@ -440,17 +459,9 @@ fn is_conversation_like_identity(value: &str) -> bool {
     if normalized.starts_with("chat_id:") {
         return true;
     }
-    // `/(^|:)(channel|group|thread|topic|room|space|spaces):/`
-    const KINDS: [&str; 7] = [
-        "channel", "group", "thread", "topic", "room", "space", "spaces",
-    ];
-    KINDS.into_iter().any(|kind| {
-        let needle = format!("{kind}:");
-        if normalized.starts_with(&needle) {
-            return true;
-        }
-        normalized.contains(&format!(":{needle}"))
-    })
+    KINDS
+        .into_iter()
+        .any(|(head, embedded)| normalized.starts_with(head) || normalized.contains(embedded))
 }
 
 fn format_allow_from_list(list: &[String]) -> Vec<String> {

@@ -11,7 +11,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::schema::{
+use crate::schema_v1::{
     ContentBlock, McpServer, McpServerHttp, McpServerSse, McpServerStdio, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
     SessionModeId,
@@ -43,7 +43,7 @@ pub enum HarnessPermissionMode {
 }
 
 impl PermissionPolicy for HarnessPermissionMode {
-    fn decide<'a>(&'a self, request: RequestPermissionRequest) -> PermissionFuture<'a> {
+    fn decide(&self, request: RequestPermissionRequest) -> PermissionFuture<'_> {
         Box::pin(async move {
             let selected = match self {
                 Self::Deny => None,
@@ -53,12 +53,12 @@ impl PermissionPolicy for HarnessPermissionMode {
                     .iter()
                     .find(|option| allowed.contains(option.option_id.0.as_ref())),
             };
-            Ok(RequestPermissionResponse::new(match selected {
-                Some(option) => RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+            let outcome = selected.map_or(RequestPermissionOutcome::Cancelled, |option| {
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                     option.option_id.clone(),
-                )),
-                None => RequestPermissionOutcome::Cancelled,
-            }))
+                ))
+            });
+            Ok(RequestPermissionResponse::new(outcome))
         })
     }
 }
@@ -168,10 +168,26 @@ pub struct ProcessLease {
 /// Persistence and exclusivity port for ACPX process leases.
 pub trait ProcessLeaseStore: Send + Sync + 'static {
     /// Acquires a lease, rejecting another open lease for the same session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpInteropError::Lifecycle`] when the session already holds
+    /// an open lease, or when the backing store cannot be reached.
     fn acquire(&self, lease: ProcessLease) -> Result<()>;
     /// Marks an open lease complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpInteropError::Lifecycle`] when `state` is
+    /// [`LeaseState::Open`], when `lease_id` is unknown, when that lease was
+    /// already completed, or when the backing store cannot be reached.
     fn finish(&self, lease_id: &str, state: LeaseState) -> Result<ProcessLease>;
     /// Lists all lease records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpInteropError::Lifecycle`] when the backing store cannot be
+    /// reached.
     fn list(&self) -> Result<Vec<ProcessLease>>;
 }
 
@@ -190,12 +206,14 @@ impl ProcessLeaseStore for MemoryProcessLeaseStore {
         if leases.values().any(|candidate| {
             candidate.session_key == lease.session_key && candidate.state == LeaseState::Open
         }) {
+            let session_key = lease.session_key;
+            drop(leases);
             return Err(AcpInteropError::Lifecycle(format!(
-                "ACP session already has an open process lease: {}",
-                lease.session_key
+                "ACP session already has an open process lease: {session_key}"
             )));
         }
         leases.insert(lease.lease_id.clone(), lease);
+        drop(leases);
         Ok(())
     }
 
@@ -209,17 +227,23 @@ impl ProcessLeaseStore for MemoryProcessLeaseStore {
             .leases
             .lock()
             .map_err(|_| AcpInteropError::Lifecycle("process lease lock poisoned".into()))?;
-        let lease = leases.get_mut(lease_id).ok_or_else(|| {
-            AcpInteropError::Lifecycle(format!("process lease does not exist: {lease_id}"))
-        })?;
+        let Some(lease) = leases.get_mut(lease_id) else {
+            drop(leases);
+            return Err(AcpInteropError::Lifecycle(format!(
+                "process lease does not exist: {lease_id}"
+            )));
+        };
         if lease.state != LeaseState::Open {
+            drop(leases);
             return Err(AcpInteropError::Lifecycle(format!(
                 "process lease is already complete: {lease_id}"
             )));
         }
         lease.state = state;
         lease.ended_at = Some(SystemTime::now());
-        Ok(lease.clone())
+        let finished = lease.clone();
+        drop(leases);
+        Ok(finished)
     }
 
     fn list(&self) -> Result<Vec<ProcessLease>> {
@@ -233,10 +257,26 @@ impl ProcessLeaseStore for MemoryProcessLeaseStore {
 /// Persistence port for ACP session identifiers.
 pub trait AcpxSessionStore: Send + Sync + 'static {
     /// Loads the ACP session for a GTA-Claw session key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpInteropError::Lifecycle`] when the backing store cannot be
+    /// reached. An absent session is `Ok(None)`, not an error.
     fn load(&self, session_key: &str) -> Result<Option<StoredSession>>;
     /// Saves the ACP session for later turns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpInteropError::Lifecycle`] when the backing store cannot be
+    /// reached, in which case the session identifier is not persisted and the
+    /// turn's lease is reconciled as failed.
     fn save(&self, session_key: &str, session: StoredSession) -> Result<()>;
     /// Removes a persisted session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpInteropError::Lifecycle`] when the backing store cannot be
+    /// reached. Removing an absent session is not an error.
     fn delete(&self, session_key: &str) -> Result<()>;
 }
 
@@ -380,6 +420,12 @@ impl fmt::Debug for AcpxRuntime {
 
 impl AcpxRuntime {
     /// Creates a runtime and rejects duplicate normalized aliases.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpInteropError::Configuration`] when a harness has an empty
+    /// command, a zero timeout, a name or alias that is blank after trimming,
+    /// or when two harnesses normalize to the same alias.
     pub fn new(
         configs: Vec<HarnessConfig>,
         leases: Arc<dyn ProcessLeaseStore>,
@@ -411,6 +457,12 @@ impl AcpxRuntime {
     }
 
     /// Resolves an alias to its canonical harness configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpInteropError::Configuration`] when `alias` is blank after
+    /// trimming, and [`AcpInteropError::UnknownHarness`] when no configured
+    /// harness claims it.
     pub fn resolve(&self, alias: &str) -> Result<Arc<HarnessConfig>> {
         let normalized = normalize_name(alias)?;
         self.harnesses
@@ -420,6 +472,21 @@ impl AcpxRuntime {
     }
 
     /// Runs one turn with lease acquisition and guaranteed lease completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpInteropError::Configuration`] when the session key is
+    /// blank, and [`AcpInteropError::UnknownHarness`] when the turn names a
+    /// harness this runtime does not serve; neither takes a lease.
+    ///
+    /// Once a lease is held, returns [`AcpInteropError::Lifecycle`] when the
+    /// session already has an open lease, when the persisted session belongs
+    /// to a different harness, when the session store refuses to load or save,
+    /// and when the lease itself cannot be closed. Returns
+    /// [`AcpInteropError::Protocol`] or [`AcpInteropError::Timeout`] when the
+    /// agent process fails or outlives the harness timeout. Every one of those
+    /// paths marks the lease failed before returning, so a failed turn never
+    /// leaves the session locked.
     pub async fn run_turn(&self, turn: AcpxTurn) -> Result<AcpxTurnResult> {
         if turn.session_key.trim().is_empty() {
             return Err(AcpInteropError::Configuration(
@@ -516,6 +583,12 @@ impl AcpxRuntime {
     }
 
     /// Clears persistent session state after ensuring no lease is open.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpInteropError::Lifecycle`] when the session still has an
+    /// open process lease, or when the lease or session store cannot be
+    /// reached. The persisted session is left intact in both cases.
     pub fn reset_session(&self, session_key: &str) -> Result<()> {
         if self
             .leases
@@ -565,6 +638,12 @@ impl AcpxRuntime {
 }
 
 /// Converts a configured `claw-mcp` server into the ACP session bridge shape.
+///
+/// # Errors
+///
+/// Returns [`AcpInteropError::Configuration`] when the server uses a transport
+/// the ACP session bridge cannot express, which is every transport other than
+/// stdio, HTTP and SSE.
 pub fn mcp_bridge_from_registry(config: &McpServerConfig) -> Result<McpServer> {
     let server = match &config.transport {
         ServerTransportConfig::Stdio {
@@ -577,7 +656,7 @@ pub fn mcp_bridge_from_registry(config: &McpServerConfig) -> Result<McpServer> {
                 .env(
                     environment
                         .iter()
-                        .map(|(name, value)| crate::schema::EnvVariable::new(name, value))
+                        .map(|(name, value)| crate::schema_v1::EnvVariable::new(name, value))
                         .collect(),
                 ),
         ),
@@ -607,7 +686,7 @@ fn normalize_name(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{
+    use crate::schema_v1::{
         PermissionOption, PermissionOptionId, PermissionOptionKind, ToolCall, ToolCallId,
     };
 

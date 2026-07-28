@@ -1,6 +1,6 @@
 //! Slash command registry, authorization and inline directive parsing.
 //!
-//! This module is a faithful port of the OpenClaw command surface, pinned to
+//! This module is a faithful port of the `OpenClaw` command surface, pinned to
 //! `openclaw/openclaw@b43e832fcc8000ed7287c7accc54e381db607f85`:
 //!
 //! | area | upstream source |

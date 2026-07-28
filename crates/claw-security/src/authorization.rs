@@ -33,6 +33,13 @@ impl Role {
     pub const ALL: [Self; 3] = [Self::Operator, Self::Node, Self::Worker];
 
     /// Parses an exact, case-sensitive role identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::UnknownRole`] for anything other than the exact
+    /// byte strings `operator`, `node`, or `worker`. Case variants, surrounding
+    /// whitespace, and Unicode look-alikes are rejected rather than normalized,
+    /// so an unknown role can never be folded onto a known one.
     pub fn parse(value: &str) -> Result<Self, RegistryError> {
         match value {
             "operator" => Ok(Self::Operator),
@@ -95,6 +102,13 @@ impl Scope {
     ];
 
     /// Parses an exact, case-sensitive scope identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::UnknownScope`] for anything other than the six
+    /// frozen identities listed in [`Scope::ALL`]. Case variants, surrounding
+    /// whitespace, and Unicode look-alikes are rejected rather than normalized,
+    /// so a scope outside the closed set can never be granted.
     pub fn parse(value: &str) -> Result<Self, RegistryError> {
         match value {
             "operator.admin" => Ok(Self::OperatorAdmin),
@@ -177,6 +191,12 @@ impl ScopeSet {
     }
 }
 
+impl FromIterator<Scope> for ScopeSet {
+    fn from_iter<I: IntoIterator<Item = Scope>>(iter: I) -> Self {
+        Self::from_scopes(iter)
+    }
+}
+
 /// Unknown identities are rejected rather than normalized.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegistryError {
@@ -220,6 +240,22 @@ impl ClientClass {
 }
 
 /// Validates only the compatibility behavior proven by the pinned baseline.
+///
+/// # Errors
+///
+/// - [`ProtocolPolicyError::IndependentWorkerProtocol`] when `role` is
+///   [`Role::Worker`] or `class` is [`ClientClass::Worker`]; workers never
+///   negotiate the general gateway protocol.
+/// - [`ProtocolPolicyError::NodeClassRequiresNodeRole`] when `class` is
+///   [`ClientClass::AuthenticatedNode`] but `role` is not [`Role::Node`], so
+///   the v3 node compatibility window cannot be borrowed by an operator.
+/// - [`ProtocolPolicyError::UnsupportedVersion`] when `version` falls outside
+///   the window for `class`: general clients accept only
+///   [`CURRENT_PROTOCOL_VERSION`], authenticated nodes accept
+///   [`MIN_AUTHENTICATED_NODE_PROTOCOL_VERSION`] through
+///   [`CURRENT_PROTOCOL_VERSION`], and probes accept
+///   [`MIN_PROBE_PROTOCOL_VERSION`] through [`CURRENT_PROTOCOL_VERSION`].
+#[must_use = "an ignored protocol decision silently admits a downgraded client"]
 pub fn validate_protocol(
     role: Role,
     class: ClientClass,
@@ -282,6 +318,13 @@ impl Error for ProtocolPolicyError {}
 /// Operator roles may carry members of the closed operator scope set. Node and
 /// worker roles carry no operator scopes. This function does not claim any
 /// gateway methods are implemented.
+///
+/// # Errors
+///
+/// Returns [`RoleScopeError::OperatorScopesRequireOperatorRole`] when `role` is
+/// [`Role::Node`] or [`Role::Worker`] and `scopes` is not empty, so a
+/// non-operator handshake can never carry an operator scope.
+#[must_use = "an ignored role/scope decision silently admits an over-scoped handshake"]
 pub fn validate_role_scopes(role: Role, scopes: ScopeSet) -> Result<(), RoleScopeError> {
     if role == Role::Operator || scopes.is_empty() {
         Ok(())
@@ -395,6 +438,7 @@ fn authorize(request: AuthorizationRequest) -> AuthorizationDecision {
 
 // Pinned `operator-scope-compat.ts` proves admin satisfies every operator scope
 // and write satisfies read. No other implications are assumed.
+#[must_use = "an ignored scope decision silently grants the required scope"]
 fn scope_satisfied(granted: ScopeSet, required: Scope) -> bool {
     granted.contains(Scope::OperatorAdmin)
         || granted.contains(required)
@@ -402,6 +446,13 @@ fn scope_satisfied(granted: ScopeSet, required: Scope) -> bool {
 }
 
 /// Authorizes only after the structured decision is durably audited.
+///
+/// # Errors
+///
+/// Returns [`AuditFailure::Sink`] when `sink` could not durably persist the
+/// decision record. The [`AuthorizationDecision`] is then withheld rather than
+/// returned, so an unauditable request is denied by construction; a caller
+/// cannot proceed on a grant that was never written down.
 pub fn authorize_audited<S: AuditSink>(
     request: AuthorizationRequest,
     unix_millis: u64,

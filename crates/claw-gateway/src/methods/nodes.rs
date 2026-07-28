@@ -83,13 +83,12 @@ impl MethodHandler for NodeDescribe {
         Box::pin(async move {
             let request: NodeIdParams = params_of(context.method, params)?;
             identity(context.method, "nodeId", &request.node_id)?;
-            let info = context
-                .directory
-                .node(&request.node_id)
-                .ok_or(DispatchError::NotFound {
+            let info = context.directory.node(&request.node_id).ok_or_else(|| {
+                DispatchError::NotFound {
                     kind: "node",
                     id: request.node_id.clone(),
-                })?;
+                }
+            })?;
             Ok(json!({ "node": render_node(&info) }))
         })
     }
@@ -125,14 +124,12 @@ impl MethodHandler for PendingEnqueue {
                 &request.payload,
                 MAX_INVOCATION_PAYLOAD_BYTES,
             )?;
-            let target =
-                context
-                    .directory
-                    .node(&request.node_id)
-                    .ok_or(DispatchError::NotFound {
-                        kind: "node",
-                        id: request.node_id.clone(),
-                    })?;
+            let target = context.directory.node(&request.node_id).ok_or_else(|| {
+                DispatchError::NotFound {
+                    kind: "node",
+                    id: request.node_id.clone(),
+                }
+            })?;
             let invocation = PendingInvocation {
                 id: request.id.clone(),
                 command: request.command.clone(),

@@ -132,16 +132,44 @@ fn reports_non_runtime_and_cli_mappings_as_manual() {
 
     let result = migrate_legacy_environment(environment).expect("migration");
 
-    assert_eq!(result.diagnostics.len(), 4);
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .all(|diagnostic| matches!(diagnostic, MigrationDiagnostic::ManualRequired(_)))
-    );
+    let manual = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| matches!(diagnostic, MigrationDiagnostic::ManualRequired(_)))
+        .count();
+    assert_eq!(manual, 4);
     let output = to_json5(&result.config).expect("serialize");
     assert!(!output.contains("publish-secret"));
     assert!(!output.contains("cli_path"));
+}
+
+#[test]
+fn reports_applied_and_unknown_inputs_in_deterministic_order() {
+    let mut environment = minimum_environment();
+    environment.extend([("PORT", "8080"), ("TYPO_PORT", "8081")]);
+
+    let result = migrate_legacy_environment(environment).expect("migration report");
+    let applied = result
+        .diagnostics
+        .iter()
+        .filter_map(|diagnostic| match diagnostic {
+            MigrationDiagnostic::Applied { legacy_env, target } => Some((*legacy_env, *target)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        applied,
+        vec![
+            ("GITHUB_TOKEN", "auth.github.pat"),
+            ("AGENT_ROLE_URL", "role.source_url"),
+            ("ENABLE_TEAMS", "channels.teams.enabled"),
+            ("PORT", "server.port"),
+        ]
+    );
+    assert!(matches!(
+        result.diagnostics.last(),
+        Some(MigrationDiagnostic::IgnoredUnknown { name }) if name == "TYPO_PORT"
+    ));
 }
 
 #[test]

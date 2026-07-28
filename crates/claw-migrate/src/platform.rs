@@ -51,11 +51,9 @@ impl SystemPlatformPaths {
             env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)?;
         if cfg!(windows) {
             let config = env::var_os("APPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join("AppData").join("Roaming"));
+                .map_or_else(|| home.join("AppData").join("Roaming"), PathBuf::from);
             let data = env::var_os("LOCALAPPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join("AppData").join("Local"));
+                .map_or_else(|| home.join("AppData").join("Local"), PathBuf::from);
             Some(Self {
                 platform: HostPlatform::Windows,
                 home,
@@ -73,12 +71,10 @@ impl SystemPlatformPaths {
                 codex_home: env::var_os("CODEX_HOME").map(PathBuf::from),
             })
         } else {
-            let config = env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".config"));
+            let config =
+                env::var_os("XDG_CONFIG_HOME").map_or_else(|| home.join(".config"), PathBuf::from);
             let data = env::var_os("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".local").join("share"));
+                .map_or_else(|| home.join(".local").join("share"), PathBuf::from);
             Some(Self {
                 platform: HostPlatform::Linux,
                 home,
@@ -91,7 +87,7 @@ impl SystemPlatformPaths {
 
     /// Constructs explicit paths, primarily for adapters and cross-platform tests.
     #[must_use]
-    pub fn from_parts(
+    pub const fn from_parts(
         platform: HostPlatform,
         home: PathBuf,
         config: PathBuf,

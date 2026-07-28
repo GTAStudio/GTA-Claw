@@ -77,7 +77,7 @@ pub trait ObservabilityPort: Send + Sync + 'static {
 
 /// Durable storage for sessions and turns.
 ///
-/// Implemented by `claw-state`, which owns the schema and the SQLite file
+/// Implemented by `claw-state`, which owns the schema and the `SQLite` file
 /// control. The composition treats persistence strictly as a port and never
 /// reaches for a file path.
 pub trait PersistencePort: Send + Sync + 'static {
@@ -568,10 +568,8 @@ mod tests {
     #[tokio::test]
     async fn a_credential_request_keeps_the_origin_it_was_checked_against() {
         let origin = endpoint().await;
-        let request = CredentialRequest::new(
-            CredentialName::new("openai-key").expect("valid"),
-            origin.clone(),
-        );
+        let request =
+            CredentialRequest::new(CredentialName::new("openai-key").expect("valid"), origin);
 
         assert_eq!(request.name().as_str(), "openai-key");
         assert_eq!(request.origin().host(), "api.example.com");

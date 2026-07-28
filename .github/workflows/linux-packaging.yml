@@ -217,7 +217,7 @@ jobs:
           relative_root="${build_root#"$GITHUB_WORKSPACE/target/"}"
           cli="$(jq -er '.binaries[] | select(.name == "gta-claw-cli") | .path' "$BUILD_MANIFEST")"
           daemon="$(jq -er '.binaries[] | select(.name == "gta-claw-daemon") | .path' "$BUILD_MANIFEST")"
-          image='gta-claw-linux-build:rust-1.97.0-bookworm'
+          image='gta-claw-linux-build:rust-1.97.1-bookworm'
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             --cap-drop ALL \

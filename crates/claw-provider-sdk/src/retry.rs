@@ -46,7 +46,7 @@ impl Default for RetryPolicy {
             multiplier_centi: 200,
             jitter: JitterMode::Full,
             respect_retry_after: true,
-            max_retry_after: Duration::from_secs(120),
+            max_retry_after: Duration::from_mins(2),
         }
     }
 }
@@ -84,6 +84,13 @@ impl RetryPolicy {
             if scaled >= self.max_backoff.as_nanos() {
                 return self.max_backoff;
             }
+            // A multiplier of 100 or less never reaches the ceiling, so without
+            // this the loop would spin up to `u32::MAX` times computing the same
+            // delay. Once a step stops making progress, every later step repeats
+            // it, and the answer is already known.
+            if scaled == delay.as_nanos() {
+                break;
+            }
             delay = Duration::from_nanos(u64::try_from(scaled).unwrap_or(u64::MAX));
         }
         delay.min(self.max_backoff)
@@ -93,7 +100,9 @@ impl RetryPolicy {
     ///
     /// A `retry_after` hint wins over the computed exponential delay when
     /// [`RetryPolicy::respect_retry_after`] is set, and is never jittered:
-    /// the server named an exact time.
+    /// the server named an exact time. The hint is always clamped to
+    /// [`RetryPolicy::max_retry_after`], so an upstream that answers
+    /// `Retry-After: 86400` cannot park the caller for a day.
     #[must_use]
     pub fn delay_for(
         &self,
@@ -118,12 +127,24 @@ impl RetryPolicy {
     }
 }
 
+/// Multiplies `duration` by `fraction`, treating `fraction` as clamped to
+/// `[0, 1]`.
+///
+/// A [`JitterSource`] is a trait a caller implements, so `fraction` is
+/// untrusted: a negative, out-of-range or `NaN` sample is folded to the low end
+/// of the window rather than producing a nonsensical or panicking delay. The
+/// result is never longer than `duration`, so a jittered delay can never exceed
+/// the exponential delay it randomizes.
 fn scale(duration: Duration, fraction: f64) -> Duration {
-    let fraction = fraction.clamp(0.0, 1.0);
-    let nanos = duration.as_nanos();
-    // `fraction` is in [0, 1], so the product never exceeds `nanos`.
-    let scaled = (nanos as f64 * fraction) as u128;
-    Duration::from_nanos(u64::try_from(scaled.min(u128::from(u64::MAX))).unwrap_or(u64::MAX))
+    if !fraction.is_finite() || fraction <= 0.0 {
+        return Duration::ZERO;
+    }
+    if fraction >= 1.0 {
+        return duration;
+    }
+    Duration::try_from_secs_f64(duration.as_secs_f64() * fraction)
+        .unwrap_or(duration)
+        .min(duration)
 }
 
 /// Outcome of one attempt, as seen by [`RetryExecutor::run`].
@@ -239,7 +260,7 @@ mod tests {
         let policy = RetryPolicy {
             max_attempts: 8,
             initial_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_millis(1_000),
+            max_backoff: Duration::from_secs(1),
             multiplier_centi: 300,
             jitter: JitterMode::None,
             respect_retry_after: false,
@@ -249,8 +270,39 @@ mod tests {
         assert_eq!(policy.base_backoff(1), Duration::from_millis(100));
         assert_eq!(policy.base_backoff(2), Duration::from_millis(300));
         assert_eq!(policy.base_backoff(3), Duration::from_millis(900));
-        assert_eq!(policy.base_backoff(4), Duration::from_millis(1_000));
-        assert_eq!(policy.base_backoff(40), Duration::from_millis(1_000));
+        assert_eq!(policy.base_backoff(4), Duration::from_secs(1));
+        assert_eq!(policy.base_backoff(40), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_backoff_that_stops_growing_terminates_instead_of_iterating_per_attempt() {
+        // A multiplier of 100 or less never reaches `max_backoff`, so the loop
+        // has no ceiling to return from and runs once per attempt. `attempt`
+        // is a caller-supplied `u32`, so a policy like this would otherwise
+        // burn billions of iterations recomputing the same delay.
+        let flat = RetryPolicy {
+            max_attempts: 5,
+            initial_backoff: Duration::from_millis(250),
+            max_backoff: Duration::from_mins(1),
+            multiplier_centi: 100,
+            jitter: JitterMode::None,
+            respect_retry_after: false,
+            max_retry_after: Duration::ZERO,
+        };
+        assert_eq!(flat.base_backoff(u32::MAX), Duration::from_millis(250));
+
+        let shrinking = RetryPolicy {
+            multiplier_centi: 0,
+            ..flat
+        };
+        assert_eq!(shrinking.base_backoff(u32::MAX), Duration::ZERO);
+
+        let zeroed = RetryPolicy {
+            initial_backoff: Duration::ZERO,
+            multiplier_centi: 200,
+            ..flat
+        };
+        assert_eq!(zeroed.base_backoff(u32::MAX), Duration::ZERO);
     }
 
     #[test]
@@ -258,7 +310,7 @@ mod tests {
         let policy = RetryPolicy {
             max_attempts: 5,
             initial_backoff: Duration::from_millis(400),
-            max_backoff: Duration::from_secs(60),
+            max_backoff: Duration::from_mins(1),
             multiplier_centi: 200,
             jitter: JitterMode::None,
             respect_retry_after: false,
@@ -296,7 +348,7 @@ mod tests {
         let policy = RetryPolicy {
             max_attempts: 5,
             initial_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_secs(60),
+            max_backoff: Duration::from_mins(1),
             multiplier_centi: 200,
             jitter: JitterMode::Full,
             respect_retry_after: true,
@@ -308,7 +360,7 @@ mod tests {
             Duration::from_secs(3)
         );
         assert_eq!(
-            policy.delay_for(1, Some(Duration::from_secs(600)), &jitter),
+            policy.delay_for(1, Some(Duration::from_mins(10)), &jitter),
             Duration::from_secs(10)
         );
 
@@ -334,7 +386,7 @@ mod tests {
             multiplier_centi: 200,
             jitter: JitterMode::None,
             respect_retry_after: true,
-            max_retry_after: Duration::from_secs(60),
+            max_retry_after: Duration::from_mins(1),
         };
         let executor = RetryExecutor::new(policy, &clock, &jitter);
         let attempts = RefCell::new(Vec::new());

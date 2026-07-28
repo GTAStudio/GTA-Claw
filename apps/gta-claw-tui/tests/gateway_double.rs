@@ -1,6 +1,10 @@
 //! End-to-end TUI worker coverage over a real local WebSocket double.
 
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "the Gateway test double is shared with claw-gateway-client, which owns the file; \
+              this binary exercises only the subset the TUI worker needs"
+)]
 #[path = "../../../crates/claw-gateway-client/tests/support/mod.rs"]
 mod support;
 
@@ -11,7 +15,8 @@ use gta_claw_tui::gateway::{GatewayOptions, UiCommand, WorkerEvent, spawn_gatewa
 use gta_claw_tui::model::{RunState, SessionSummary, TranscriptEntry};
 use serde_json::json;
 use support::{
-    TestGateway, complete_handshake, handler, receive_request, send_json, wait_for_close,
+    TestGateway, complete_handshake, handler, raw_stalled_server, receive_request, send_json,
+    wait_for_close,
 };
 
 #[tokio::test]
@@ -23,7 +28,7 @@ async fn gateway_worker_loads_sessions_and_streams_transcript() {
                 .scopes
                 .expect("TUI requests scopes")
                 .iter()
-                .map(|scope| scope.as_str())
+                .map(claw_protocol::gateway::Name::as_str)
                 .collect::<Vec<_>>(),
             vec!["operator.read", "operator.write", "operator.approvals"]
         );
@@ -116,11 +121,19 @@ async fn gateway_worker_loads_sessions_and_streams_transcript() {
     }))
     .await;
 
-    let (commands, mut events) = spawn_gateway_worker(GatewayOptions {
+    let mut worker = spawn_gateway_worker(GatewayOptions {
         url: gateway.url.clone(),
         token: None,
     });
-    let connection = tokio::time::timeout(Duration::from_secs(3), events.recv())
+    let connecting = tokio::time::timeout(Duration::from_secs(3), worker.events.recv())
+        .await
+        .expect("connecting event timeout")
+        .expect("connecting event");
+    assert_eq!(
+        connecting,
+        WorkerEvent::Connection("Gateway: connecting (bounded retries)".to_owned())
+    );
+    let connection = tokio::time::timeout(Duration::from_secs(3), worker.events.recv())
         .await
         .expect("connection event timeout")
         .expect("connection event");
@@ -128,7 +141,7 @@ async fn gateway_worker_loads_sessions_and_streams_transcript() {
         connection,
         WorkerEvent::Connection("Gateway: ready (protocol 4, epoch 1)".to_owned())
     );
-    let sessions = tokio::time::timeout(Duration::from_secs(3), events.recv())
+    let sessions = tokio::time::timeout(Duration::from_secs(3), worker.events.recv())
         .await
         .expect("sessions event timeout")
         .expect("sessions event");
@@ -142,7 +155,7 @@ async fn gateway_worker_loads_sessions_and_streams_transcript() {
             progress: Some(37),
         }])
     );
-    let message = tokio::time::timeout(Duration::from_secs(3), events.recv())
+    let message = tokio::time::timeout(Duration::from_secs(3), worker.events.recv())
         .await
         .expect("message event timeout")
         .expect("message event");
@@ -153,7 +166,7 @@ async fn gateway_worker_loads_sessions_and_streams_transcript() {
             text: "Downloaded manifest".to_owned(),
         })
     );
-    let changed = tokio::time::timeout(Duration::from_secs(3), events.recv())
+    let changed = tokio::time::timeout(Duration::from_secs(3), worker.events.recv())
         .await
         .expect("changed event timeout")
         .expect("changed event");
@@ -161,11 +174,12 @@ async fn gateway_worker_loads_sessions_and_streams_transcript() {
         changed,
         WorkerEvent::Notice("Sessions changed; press r to refresh".to_owned())
     );
-    commands
+    worker
+        .commands
         .send(UiCommand::LoadArtifacts("session-42".to_owned()))
         .await
         .expect("request artifacts");
-    let artifacts = tokio::time::timeout(Duration::from_secs(3), events.recv())
+    let artifacts = tokio::time::timeout(Duration::from_secs(3), worker.events.recv())
         .await
         .expect("artifacts event timeout")
         .expect("artifacts event");
@@ -173,7 +187,7 @@ async fn gateway_worker_loads_sessions_and_streams_transcript() {
         artifacts,
         WorkerEvent::Artifacts(vec!["report.json".to_owned()])
     );
-    let preview = tokio::time::timeout(Duration::from_secs(3), events.recv())
+    let preview = tokio::time::timeout(Duration::from_secs(3), worker.events.recv())
         .await
         .expect("artifact preview timeout")
         .expect("artifact preview");
@@ -186,9 +200,92 @@ async fn gateway_worker_loads_sessions_and_streams_transcript() {
         ])
     );
 
-    commands
-        .send(UiCommand::Shutdown)
-        .await
-        .expect("send worker shutdown");
+    worker.shutdown().await;
     gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_connections_can_be_retried_without_restarting_the_tui() {
+    let gateway = TestGateway::spawn(handler(|mut socket, index| async move {
+        if index < 3 {
+            return;
+        }
+        complete_handshake(&mut socket, AUTHENTICATED_MAX_FRAME_BYTES).await;
+        let request = receive_request(&mut socket).await;
+        assert_eq!(request.method().as_str(), "sessions.list");
+        send_json(
+            &mut socket,
+            json!({
+                "type": "res",
+                "id": request.id().as_str(),
+                "ok": true,
+                "payload": {"sessions": []}
+            }),
+        )
+        .await;
+        wait_for_close(&mut socket).await;
+    }))
+    .await;
+    let mut worker = spawn_gateway_worker(GatewayOptions {
+        url: gateway.url.clone(),
+        token: None,
+    });
+
+    assert_eq!(
+        worker.events.recv().await,
+        Some(WorkerEvent::Connection(
+            "Gateway: connecting (bounded retries)".to_owned()
+        ))
+    );
+    let unavailable = tokio::time::timeout(Duration::from_secs(5), worker.events.recv())
+        .await
+        .expect("bounded connection attempts")
+        .expect("unavailable event");
+    assert_eq!(
+        unavailable,
+        WorkerEvent::Connection("Gateway: unavailable (press r to retry)".to_owned())
+    );
+    let _notice = worker.events.recv().await.expect("actionable error notice");
+    worker
+        .commands
+        .send(UiCommand::Refresh)
+        .await
+        .expect("retry command");
+    assert_eq!(
+        worker.events.recv().await,
+        Some(WorkerEvent::Connection(
+            "Gateway: connecting (bounded retries)".to_owned()
+        ))
+    );
+    assert!(matches!(
+        worker.events.recv().await,
+        Some(WorkerEvent::Connection(connection)) if connection.starts_with("Gateway: ready")
+    ));
+    assert_eq!(
+        worker.events.recv().await,
+        Some(WorkerEvent::Sessions(Vec::new()))
+    );
+
+    worker.shutdown().await;
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_cancels_a_stalled_connection_attempt() {
+    let (url, cancellation, tasks) = raw_stalled_server().await;
+    let mut worker = spawn_gateway_worker(GatewayOptions { url, token: None });
+    assert!(matches!(
+        worker.events.recv().await,
+        Some(WorkerEvent::Connection(_))
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(Duration::from_secs(2), worker.shutdown())
+        .await
+        .expect("worker shutdown is bounded");
+
+    cancellation.cancel();
+    tasks.close();
+    tokio::time::timeout(Duration::from_secs(2), tasks.wait())
+        .await
+        .expect("stalled test server shuts down");
 }

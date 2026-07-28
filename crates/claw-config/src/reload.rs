@@ -43,6 +43,15 @@ impl ReloadManager {
     /// Parses and validates a complete candidate before publishing it.
     ///
     /// Any error leaves the previous snapshot unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`crate::parse_json5`] rejects: [`ConfigError::Syntax`]
+    /// for malformed JSON5, [`ConfigError::Decode`] naming the offending field
+    /// path, [`ConfigError::UnsupportedVersion`] for a `schema_version` this
+    /// build does not implement, and [`ConfigError::Validation`] for a violated
+    /// domain invariant. Nothing is published and [`Self::snapshot`] keeps
+    /// returning the last-known-good value.
     pub fn reload_json5(
         &mut self,
         source: &str,
@@ -131,11 +140,23 @@ pub struct ConfigSubscription {
 
 impl ConfigSubscription {
     /// Blocks until the next change or all publisher handles are dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`mpsc::RecvError`] once every [`ConfigHub`] handle has been
+    /// dropped and no buffered change remains, which is the normal shutdown
+    /// signal for a subscriber loop.
     pub fn recv(&self) -> Result<ConfigChange, mpsc::RecvError> {
         self.receiver.recv()
     }
 
     /// Receives a pending change without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`mpsc::TryRecvError::Empty`] when no change has been published
+    /// since the last receive, and [`mpsc::TryRecvError::Disconnected`] once
+    /// every [`ConfigHub`] handle has been dropped.
     pub fn try_recv(&self) -> Result<ConfigChange, mpsc::TryRecvError> {
         self.receiver.try_recv()
     }
@@ -196,6 +217,13 @@ impl ConfigHub {
     }
 
     /// Returns one complete immutable snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigHubError::LockPoisoned`] when a previous publisher
+    /// panicked while holding the snapshot cell. The stored snapshot is still a
+    /// fully validated value, but the hub refuses to hand it out rather than
+    /// hide the panic.
     pub fn snapshot(&self) -> Result<Arc<ConfigSnapshot>, ConfigHubError> {
         self.current
             .read()
@@ -204,6 +232,12 @@ impl ConfigHub {
     }
 
     /// Adds an independent typed subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigHubError::LockPoisoned`] when a previous publisher
+    /// panicked while holding the subscriber list, in which case no subscription
+    /// is registered.
     pub fn subscribe(&self) -> Result<ConfigSubscription, ConfigHubError> {
         let (sender, receiver) = mpsc::channel();
         self.subscribers
@@ -214,12 +248,23 @@ impl ConfigHub {
     }
 
     /// Validates then atomically publishes a complete candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigHubError::Config`] when `source` is not JSON5, decodes to
+    /// the wrong shape, declares an unsupported `schema_version`, or violates a
+    /// domain invariant; the published snapshot is then left untouched. Returns
+    /// [`ConfigHubError::LockPoisoned`] when a previous publisher panicked while
+    /// holding the subscriber list or the snapshot cell.
     pub fn reload_json5(
         &self,
         source: &str,
         source_name: &str,
     ) -> Result<ConfigChange, ConfigHubError> {
         let candidate = Arc::new(parse_json5(source, source_name)?);
+        // The subscriber lock spans the whole transaction on purpose: it is what
+        // serializes concurrent publishers so notifications are delivered in the
+        // same order the snapshots were committed.
         let mut subscribers = self
             .subscribers
             .lock()
@@ -229,14 +274,16 @@ impl ConfigHub {
                 .current
                 .write()
                 .map_err(|_| ConfigHubError::LockPoisoned("snapshot"))?;
-            let previous = Arc::clone(&current);
+            let previous = std::mem::replace(&mut *current, Arc::clone(&candidate));
+            // Readers only need the pointer swap; classifying the change walks
+            // every domain, so it happens after the write lock is released.
+            drop(current);
             let changed_domains = changed_domains(&previous, &candidate);
             let restart_required_domains = changed_domains
                 .iter()
                 .copied()
                 .filter(|domain| restart_required(*domain))
                 .collect();
-            *current = Arc::clone(&candidate);
             ConfigChange {
                 previous,
                 current: candidate,
@@ -245,6 +292,7 @@ impl ConfigHub {
             }
         };
         subscribers.retain(|subscriber| subscriber.send(change.clone()).is_ok());
+        drop(subscribers);
         Ok(change)
     }
 }
@@ -259,6 +307,15 @@ pub struct ConfigFileWatcher {
 
 impl ConfigFileWatcher {
     /// Loads a file, publishes it as the initial snapshot, and records its bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigHubError::Config`] wrapping [`ConfigError::Io`] when
+    /// `path` cannot be read, [`ConfigError::Syntax`] when its bytes are not
+    /// UTF-8 or not well-formed JSON5, and the usual [`ConfigError::Decode`],
+    /// [`ConfigError::UnsupportedVersion`], or [`ConfigError::Validation`] when
+    /// the document is structurally or semantically invalid. No watcher is
+    /// created unless the initial file is fully valid.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigHubError> {
         let path = path.as_ref().to_owned();
         let bytes = fs::read(&path).map_err(|source| ConfigError::io(&path, source))?;
@@ -284,6 +341,18 @@ impl ConfigFileWatcher {
     ///
     /// A rejected candidate leaves both the last-known-good snapshot and the
     /// successful fingerprint unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigHubError::Config`] wrapping [`ConfigError::Io`] when the
+    /// watched file cannot be read this cycle, and [`ConfigError::Syntax`],
+    /// [`ConfigError::Decode`], [`ConfigError::UnsupportedVersion`], or
+    /// [`ConfigError::Validation`] when the new bytes are invalid, which is the
+    /// expected result of catching a half-written editor save. Returns
+    /// [`ConfigHubError::LockPoisoned`] when a previous publisher panicked while
+    /// holding an internal lock. Because the fingerprint is only advanced after a
+    /// successful publication, the same bad bytes are retried on the next poll
+    /// and a later repair is still detected.
     pub fn poll(&mut self) -> Result<Option<ConfigChange>, ConfigHubError> {
         let bytes = fs::read(&self.path).map_err(|source| ConfigError::io(&self.path, source))?;
         let next_fingerprint = fingerprint(&bytes);

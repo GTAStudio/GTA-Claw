@@ -2,7 +2,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A boxed future returned by [`Clock::sleep`].
@@ -63,7 +63,7 @@ pub struct ManualClock {
 impl ManualClock {
     /// Creates a clock positioned at `now_millis` since the Unix epoch.
     #[must_use]
-    pub fn new(now_millis: u64) -> Self {
+    pub const fn new(now_millis: u64) -> Self {
         Self {
             state: Mutex::new(ManualState {
                 now_millis,
@@ -74,26 +74,28 @@ impl ManualClock {
 
     /// Advances virtual time without recording a sleep.
     pub fn advance(&self, duration: Duration) {
-        let mut state = self.state.lock().expect("manual clock mutex");
-        state.now_millis = state
-            .now_millis
-            .saturating_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+        let mut state = self.lock();
+        state.now_millis = state.now_millis.saturating_add(millis_of(duration));
     }
 
     /// Returns every duration passed to [`Clock::sleep`], in call order.
     #[must_use]
     pub fn recorded_sleeps(&self) -> Vec<Duration> {
-        self.state
-            .lock()
-            .expect("manual clock mutex")
-            .sleeps
-            .clone()
+        self.lock().sleeps.clone()
+    }
+
+    /// Locks the state, recovering from a poisoned mutex.
+    ///
+    /// A test that panics while another thread holds this lock would otherwise
+    /// turn one failing assertion into a cascade of unrelated panics.
+    fn lock(&self) -> MutexGuard<'_, ManualState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl Clock for ManualClock {
     fn now_millis(&self) -> u64 {
-        self.state.lock().expect("manual clock mutex").now_millis
+        self.lock().now_millis
     }
 
     fn now(&self) -> SystemTime {
@@ -102,14 +104,17 @@ impl Clock for ManualClock {
 
     fn sleep(&self, duration: Duration) -> SleepFuture {
         {
-            let mut state = self.state.lock().expect("manual clock mutex");
+            let mut state = self.lock();
             state.sleeps.push(duration);
-            state.now_millis = state
-                .now_millis
-                .saturating_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+            state.now_millis = state.now_millis.saturating_add(millis_of(duration));
         }
         Box::pin(std::future::ready(()))
     }
+}
+
+/// Returns `duration` in whole milliseconds, saturating instead of wrapping.
+fn millis_of(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Source of the randomized component of exponential backoff.
@@ -127,12 +132,15 @@ pub struct PseudoRandomJitter {
     state: Mutex<u64>,
 }
 
+/// `2^53`, the largest integer an `f64` represents exactly.
+const F64_EXACT_INTEGER_SCALE: f64 = 9_007_199_254_740_992.0;
+
 impl PseudoRandomJitter {
     /// Creates a generator from an explicit seed.
     ///
     /// A zero seed is replaced, because `xorshift64*` has a fixed point at zero.
     #[must_use]
-    pub fn new(seed: u64) -> Self {
+    pub const fn new(seed: u64) -> Self {
         Self {
             state: Mutex::new(if seed == 0 {
                 0x9E37_79B9_7F4A_7C15
@@ -160,16 +168,23 @@ impl PseudoRandomJitter {
 
 impl JitterSource for PseudoRandomJitter {
     fn next_unit_interval(&self) -> f64 {
-        let mut state = self.state.lock().expect("jitter mutex");
-        let mut value = *state;
-        value ^= value >> 12;
-        value ^= value << 25;
-        value ^= value >> 27;
-        *state = value;
-        let scrambled = value.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        let scrambled = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut value = *state;
+            value ^= value >> 12;
+            value ^= value << 25;
+            value ^= value >> 27;
+            *state = value;
+            value
+        };
         // 53 bits is the exact mantissa width of f64, so the quotient is exact.
-        let mantissa = scrambled >> 11;
-        mantissa as f64 / ((1_u64 << 53) as f64)
+        let mantissa = scrambled.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "`mantissa` is shifted down to 53 bits, which is exactly the range `f64` represents without rounding, so the conversion is lossless"
+        )]
+        let numerator = mantissa as f64;
+        numerator / F64_EXACT_INTEGER_SCALE
     }
 }
 
@@ -179,9 +194,16 @@ pub struct FixedJitter(f64);
 
 impl FixedJitter {
     /// Creates a fixed source, clamping `fraction` into `[0.0, 1.0]`.
+    ///
+    /// A `NaN` input becomes `0.0`, so a broken caller cannot poison a backoff
+    /// computation with a non-finite delay.
     #[must_use]
-    pub fn new(fraction: f64) -> Self {
-        Self(fraction.clamp(0.0, 1.0))
+    pub const fn new(fraction: f64) -> Self {
+        Self(if fraction.is_nan() {
+            0.0
+        } else {
+            fraction.clamp(0.0, 1.0)
+        })
     }
 }
 
@@ -199,7 +221,7 @@ mod tests {
     async fn manual_clock_advances_virtual_time_and_records_every_sleep() {
         let clock = ManualClock::new(1_000);
         assert_eq!(clock.now_millis(), 1_000);
-        assert_eq!(clock.now(), UNIX_EPOCH + Duration::from_millis(1_000));
+        assert_eq!(clock.now(), UNIX_EPOCH + Duration::from_secs(1));
 
         clock.sleep(Duration::from_millis(250)).await;
         clock.sleep(Duration::from_secs(2)).await;
@@ -227,10 +249,12 @@ mod tests {
 
     #[test]
     fn pseudo_random_jitter_stays_in_range_and_is_seed_reproducible() {
+        const SAMPLE_COUNT: u32 = 1_000;
+
         let first = PseudoRandomJitter::new(0xDEAD_BEEF);
         let second = PseudoRandomJitter::new(0xDEAD_BEEF);
         let mut samples = Vec::new();
-        for _ in 0..1_000 {
+        for _ in 0..SAMPLE_COUNT {
             let value = first.next_unit_interval();
             assert!((0.0..=1.0).contains(&value), "{value}");
             assert!((value - second.next_unit_interval()).abs() < f64::EPSILON);
@@ -238,15 +262,27 @@ mod tests {
         }
         let distinct = samples
             .iter()
-            .map(|value| (value * 1_000.0) as u64)
+            .map(|value| format!("{value:.3}"))
             .collect::<std::collections::BTreeSet<_>>();
         assert!(
             distinct.len() > 500,
             "generator collapsed: {}",
             distinct.len()
         );
-        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        let mean = samples.iter().sum::<f64>() / f64::from(SAMPLE_COUNT);
         assert!((0.4..0.6).contains(&mean), "biased generator: {mean}");
+    }
+
+    #[test]
+    fn fixed_jitter_folds_a_non_finite_fraction_to_zero() {
+        assert!(FixedJitter::new(f64::NAN).next_unit_interval().abs() < f64::EPSILON);
+        assert!(
+            FixedJitter::new(f64::NEG_INFINITY)
+                .next_unit_interval()
+                .abs()
+                < f64::EPSILON
+        );
+        assert!((FixedJitter::new(f64::INFINITY).next_unit_interval() - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

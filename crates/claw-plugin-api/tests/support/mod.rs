@@ -1,6 +1,10 @@
 //! Shared helpers for the `claw-plugin-api` integration tests.
 
-#![allow(dead_code, unreachable_pub)]
+#![expect(
+    unreachable_pub,
+    reason = "a test binary's helper module is private to that binary, so `pub` here documents \
+              the intended surface for the test files that include it and can never leak"
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

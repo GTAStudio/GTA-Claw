@@ -6,7 +6,7 @@
 //! to carry a service instance name — which is UTF-8 and may legitimately
 //! contain a dot — inside a single DNS label.
 
-use core::fmt;
+use core::fmt::{self, Write as _};
 
 use super::DnsSdError;
 
@@ -96,13 +96,13 @@ impl Name {
 
     /// Returns the number of labels, root exclusive.
     #[must_use]
-    pub fn label_count(&self) -> usize {
+    pub const fn label_count(&self) -> usize {
         self.labels.len()
     }
 
     /// Returns `true` when this is the root name.
     #[must_use]
-    pub fn is_root(&self) -> bool {
+    pub const fn is_root(&self) -> bool {
         self.labels.is_empty()
     }
 
@@ -222,7 +222,11 @@ pub fn escape_label(label: &[u8]) -> String {
             b'.' => text.push_str("\\."),
             b'\\' => text.push_str("\\\\"),
             0x20..=0x7e => text.push(char::from(byte)),
-            other => text.push_str(&format!("\\{other:03}")),
+            // Writing into a `String` is infallible, so there is no error to
+            // propagate out of an escape.
+            other => {
+                let _ = write!(text, "\\{other:03}");
+            }
         }
     }
     text

@@ -40,7 +40,7 @@ pub enum MemberRole {
 impl MemberRole {
     /// Returns the label value for this role.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Leader => "leader",
             Self::Follower => "follower",
@@ -84,7 +84,7 @@ impl ImageRef {
         if reference.starts_with('-') {
             return Err(invalid("image reference would be parsed as a flag"));
         }
-        if let Some((repository, digest)) = reference.split_once("@") {
+        if let Some((repository, digest)) = reference.split_once('@') {
             validate_repository(repository).map_err(|detail| invalid(&detail))?;
             let hex = digest
                 .strip_prefix("sha256:")
@@ -126,7 +126,7 @@ impl ImageRef {
 
     /// Returns `true` when the reference is pinned to a digest.
     #[must_use]
-    pub fn is_digest_pinned(&self) -> bool {
+    pub const fn is_digest_pinned(&self) -> bool {
         self.digest_pinned
     }
 }
@@ -295,7 +295,7 @@ pub enum CellOperation {
 pub struct CommandPlan {
     /// Executable to run.
     pub program: PathBuf,
-    /// Arguments, excluding argv[0].
+    /// Arguments, excluding `argv[0]`.
     pub argv: Vec<String>,
 }
 
@@ -750,8 +750,8 @@ impl fmt::Display for FleetPlanError {
                 field,
                 value,
                 detail,
-            } => write!(formatter, "{field} {value:?} rejected: {detail}"),
-            Self::InvalidValue {
+            }
+            | Self::InvalidValue {
                 field,
                 value,
                 detail,

@@ -9,8 +9,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use claw_discovery::dnssd::message::{
-    CLASS_IN, FLAG_AUTHORITATIVE, FLAG_RESPONSE, Message, RecordData, TYPE_A, TYPE_AAAA, TYPE_PTR,
-    TYPE_SRV, TYPE_TXT,
+    CLASS_IN, FLAG_AUTHORITATIVE, FLAG_RESPONSE, MAX_MESSAGE_BYTES, Message, RecordData, TYPE_A,
+    TYPE_AAAA, TYPE_PTR, TYPE_SRV, TYPE_TXT,
 };
 use claw_discovery::dnssd::name::Name;
 use claw_discovery::dnssd::service::{
@@ -279,6 +279,7 @@ fn wide_area_answer_resolves_the_pinned_srv_txt_and_address_chain() {
     assert_eq!(resolved.len(), 1);
     let service = &resolved[0];
     assert_eq!(service.instance_label, "edge");
+    assert!(!service.instance_label_is_lossy);
     assert_eq!(
         service.instance.to_string(),
         "edge._openclaw-gw._tcp.claw.example."
@@ -554,11 +555,21 @@ fn compression_pointer_that_does_not_point_backwards_is_refused() {
 #[test]
 fn truncated_and_overlong_wire_forms_are_refused() {
     let wire = pinned_announcement();
-    for cut in [0usize, 4, 11, 20, 60, 120] {
+    for cut in [0usize, 4, 11, 120] {
         assert_eq!(
             Message::decode(&wire[..cut]),
             Err(DnsSdError::Truncated),
             "a {cut}-byte prefix must not decode"
+        );
+    }
+    for cut in [20usize, 60] {
+        assert_eq!(
+            Message::decode(&wire[..cut]),
+            Err(DnsSdError::ImpossibleSectionCounts {
+                questions: 0,
+                records: 5,
+                available: cut - 12,
+            })
         );
     }
 
@@ -568,10 +579,128 @@ fn truncated_and_overlong_wire_forms_are_refused() {
 
     // A record that claims more rdata than the buffer holds must not be read
     // past the end.
-    let mut overlong = wire.clone();
+    let mut overlong = wire;
     let rdlen = overlong.len() - 18;
     overlong[rdlen] = 0xff;
     assert_eq!(Message::decode(&overlong), Err(DnsSdError::Truncated));
+}
+
+#[test]
+fn wire_size_and_declared_section_counts_are_rejected_before_decode_work() {
+    let oversized = vec![0_u8; MAX_MESSAGE_BYTES + 1];
+    assert_eq!(
+        Message::decode(&oversized),
+        Err(DnsSdError::MessageTooLarge {
+            actual: MAX_MESSAGE_BYTES + 1,
+            limit: MAX_MESSAGE_BYTES,
+        })
+    );
+
+    let impossible = [
+        0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+    ];
+    assert_eq!(
+        Message::decode(&impossible),
+        Err(DnsSdError::ImpossibleSectionCounts {
+            questions: 0,
+            records: usize::from(u16::MAX),
+            available: 0,
+        })
+    );
+
+    let huge_rdata = Message {
+        id: 0,
+        flags: FLAG_RESPONSE,
+        questions: Vec::new(),
+        answers: vec![claw_discovery::dnssd::ResourceRecord {
+            name: Name::parse("large.local.").expect("owner"),
+            class: CLASS_IN,
+            cache_flush: false,
+            ttl: 60,
+            data: RecordData::Other {
+                record_type: 65_000,
+                rdata: vec![0_u8; usize::from(u16::MAX)],
+            },
+        }],
+        authorities: Vec::new(),
+        additionals: Vec::new(),
+    };
+    assert!(matches!(
+        huge_rdata.encode(),
+        Err(DnsSdError::MessageTooLarge {
+            limit: MAX_MESSAGE_BYTES,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn resolution_flags_lossy_instance_labels_and_deduplicates_addresses() {
+    let service_type = Name::parse("_openclaw-gw._tcp.local.").expect("service type");
+    let zone = Name::parse("local.").expect("zone");
+    let instance = service_type
+        .prepend(vec![b'e', b'd', b'g', b'e', 0xff])
+        .expect("binary instance");
+    let host = Name::parse("edge.local.").expect("host");
+    let address = Ipv4Addr::new(192, 0, 2, 44);
+    let message = Message {
+        id: 0,
+        flags: FLAG_RESPONSE,
+        questions: Vec::new(),
+        answers: vec![
+            claw_discovery::dnssd::ResourceRecord {
+                name: service_type.clone(),
+                class: CLASS_IN,
+                cache_flush: false,
+                ttl: 60,
+                data: RecordData::Ptr(instance.clone()),
+            },
+            claw_discovery::dnssd::ResourceRecord {
+                name: instance.clone(),
+                class: CLASS_IN,
+                cache_flush: false,
+                ttl: 60,
+                data: RecordData::Srv {
+                    priority: 0,
+                    weight: 0,
+                    port: 4711,
+                    target: host.clone(),
+                },
+            },
+            claw_discovery::dnssd::ResourceRecord {
+                name: instance,
+                class: CLASS_IN,
+                cache_flush: false,
+                ttl: 60,
+                data: RecordData::Txt(gateway_txt()),
+            },
+            claw_discovery::dnssd::ResourceRecord {
+                name: host.clone(),
+                class: CLASS_IN,
+                cache_flush: false,
+                ttl: 60,
+                data: RecordData::A(address),
+            },
+            claw_discovery::dnssd::ResourceRecord {
+                name: host,
+                class: CLASS_IN,
+                cache_flush: false,
+                ttl: 60,
+                data: RecordData::A(address),
+            },
+        ],
+        authorities: Vec::new(),
+        additionals: Vec::new(),
+    };
+
+    let resolved = resolve_services(&message, &service_type, &zone).expect("resolve");
+    assert_eq!(resolved.len(), 1);
+    assert!(resolved[0].instance_label_is_lossy);
+    assert!(resolved[0].instance_label.contains('\u{fffd}'));
+    assert_eq!(
+        resolved[0].addresses,
+        vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 44))]
+    );
 }
 
 #[test]
@@ -733,5 +862,22 @@ fn instance_conflict_suffixes_are_deterministic_and_bounded() {
     assert_eq!(
         resolve_instance_conflict(&long, &taken, 5),
         Err(DnsSdError::NoFreeInstanceName(long))
+    );
+}
+
+#[test]
+fn non_printable_label_bytes_round_trip_through_the_decimal_escape() {
+    // RFC 1035 section 5.1 renders a byte outside printable US-ASCII as an
+    // exact three-digit decimal escape. An operator copying the presentation
+    // form out of a log must get the identical labels back.
+    let name = Name::from_labels([vec![b'a', 0x00, 0x1f, 0x7f, 0xff, b'z'], b"local".to_vec()])
+        .expect("labels");
+    assert_eq!(name.to_string(), "a\\000\\031\\127\\255z.local.");
+    assert_eq!(Name::parse(&name.to_string()).expect("reparse"), name);
+    assert_eq!(
+        Name::parse("a\\000\\031\\127\\255z.local.")
+            .expect("parse")
+            .labels()[0],
+        vec![b'a', 0x00, 0x1f, 0x7f, 0xff, b'z']
     );
 }

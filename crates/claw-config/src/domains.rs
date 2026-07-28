@@ -1,13 +1,12 @@
 use std::collections::BTreeMap;
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-
 use crate::ConfigError;
 use crate::layer::{merge_layer, merge_value};
 use crate::migration::parse_legacy_integer;
 use crate::{ConfigLayerKind, LayeredConfigError};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 mod imported;
 mod reload;
@@ -68,17 +67,22 @@ pub const CONFIG_DOMAIN_NAMES: [&str; 47] = [
 macro_rules! object_domain {
     ($(#[$meta:meta])* $name:ident, $value:ty) => {
         $(#[$meta])*
-        #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Serialize)]
+        #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
         #[serde(transparent)]
         pub struct $name(pub BTreeMap<String, $value>);
     };
 }
 
 macro_rules! typed_domain {
-    ($(#[$meta:meta])* $name:ident { $($field:ident: $type:ty => $wire:literal),* $(,)? }) => {
+    (@define [$($equality:ident),*] $(#[$meta:meta])* $name:ident { $($field:ident: $type:ty => $wire:literal),* $(,)? }) => {
         $(#[$meta])*
-        #[allow(missing_docs)]
-        #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Serialize)]
+        #[expect(
+            missing_docs,
+            reason = "these fields are the frozen upstream JSON keys; the authoritative \
+                      description of each one lives in compat/upstream, not in a per-field \
+                      comment that could silently drift from it"
+        )]
+        #[derive(Clone, Debug, Default, PartialEq, $($equality,)* Deserialize, JsonSchema, Serialize)]
         #[serde(default, deny_unknown_fields)]
         pub struct $name {
             $(
@@ -87,11 +91,20 @@ macro_rules! typed_domain {
             )*
         }
     };
+    // Domains that carry an IEEE-754 value, directly or through a nested type.
+    // `Eq` promises reflexivity, which floating point does not provide, so these
+    // deliberately stop at `PartialEq`.
+    ($(#[$meta:meta])* partial_eq_only $name:ident { $($field:ident: $type:ty => $wire:literal),* $(,)? }) => {
+        typed_domain!(@define [] $(#[$meta])* $name { $($field: $type => $wire),* });
+    };
+    ($(#[$meta:meta])* $name:ident { $($field:ident: $type:ty => $wire:literal),* $(,)? }) => {
+        typed_domain!(@define [Eq] $(#[$meta])* $name { $($field: $type => $wire),* });
+    };
 }
 
 typed_domain!(
     /// Authentication provider and profile configuration.
-    AuthDomain {
+    partial_eq_only AuthDomain {
         profiles: BTreeMap<String, AuthProfileConfig> => "profiles",
         order: BTreeMap<String, Vec<String>> => "order",
         cooldowns: AuthCooldownConfig => "cooldowns",
@@ -118,7 +131,7 @@ typed_domain!(
 );
 typed_domain!(
     /// Diagnostics and tracing configuration.
-    DiagnosticsDomain {
+    partial_eq_only DiagnosticsDomain {
         enabled: bool => "enabled",
         flags: Vec<String> => "flags",
         stuck_session_warn_ms: u64 => "stuckSessionWarnMs",
@@ -155,7 +168,7 @@ typed_domain!(
 );
 typed_domain!(
     /// Browser automation configuration.
-    BrowserDomain {
+    partial_eq_only BrowserDomain {
         enabled: bool => "enabled",
         allow_system_profile_import: bool => "allowSystemProfileImport",
         evaluate_enabled: bool => "evaluateEnabled",
@@ -220,7 +233,7 @@ typed_domain!(
 );
 typed_domain!(
     /// Model provider and catalog configuration.
-    ModelsDomain {
+    partial_eq_only ModelsDomain {
         mode: ModelsMode => "mode",
         providers: BTreeMap<String, ModelProviderConfig> => "providers",
         pricing: ModelPricingConfig => "pricing",
@@ -228,7 +241,7 @@ typed_domain!(
 );
 typed_domain!(
     /// Node-host pairing and remote command configuration.
-    NodeHostDomain {
+    partial_eq_only NodeHostDomain {
         browser_proxy: NodeHostBrowserProxyConfig => "browserProxy",
         mcp: NodeHostMcpConfig => "mcp",
         skills: NodeHostSkillsConfig => "skills",
@@ -236,14 +249,14 @@ typed_domain!(
 );
 typed_domain!(
     /// Agent defaults, entries, and runtime policy.
-    AgentsDomain {
+    partial_eq_only AgentsDomain {
         defaults: AgentDefaultsConfig => "defaults",
         list: Vec<AgentConfig> => "list",
     }
 );
 typed_domain!(
     /// Tool exposure and execution policy.
-    ToolsDomain {
+    partial_eq_only ToolsDomain {
         profile: ToolProfileId => "profile",
         allow: Vec<String> => "allow",
         also_allow: Vec<String> => "alsoAllow",
@@ -324,7 +337,7 @@ typed_domain!(
 );
 typed_domain!(
     /// Session keying, reset, and maintenance configuration.
-    SessionDomain {
+    partial_eq_only SessionDomain {
         scope: SessionScope => "scope",
         dm_scope: DmScope => "dmScope",
         identity_links: BTreeMap<String, Vec<String>> => "identityLinks",
@@ -346,7 +359,7 @@ typed_domain!(
 );
 typed_domain!(
     /// Web runtime configuration.
-    WebDomain {
+    partial_eq_only WebDomain {
         enabled: bool => "enabled",
         heartbeat_seconds: f64 => "heartbeatSeconds",
         reconnect: WebReconnectConfig => "reconnect",
@@ -411,7 +424,7 @@ typed_domain!(
 );
 typed_domain!(
     /// Voice and talk-mode configuration.
-    TalkDomain {
+    partial_eq_only TalkDomain {
         provider: String => "provider",
         providers: BTreeMap<String, TalkProviderEntry> => "providers",
         realtime: TalkRealtimeConfig => "realtime",
@@ -464,18 +477,18 @@ typed_domain!(
 );
 typed_domain!(
     /// Model Context Protocol client and server configuration.
-    McpDomain {
+    partial_eq_only McpDomain {
         servers: BTreeMap<String, McpServerConfig> => "servers",
         apps: McpAppsConfig => "apps",
         session_idle_ttl_ms: f64 => "sessionIdleTtlMs",
     }
 );
 
-/// Metadata written with an authored OpenClaw configuration.
+/// Metadata written with an authored `OpenClaw` configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct MetaConfig {
-    /// Last OpenClaw version that wrote the file.
+    /// Last `OpenClaw` version that wrote the file.
     pub last_touched_version: Option<String>,
     /// ISO timestamp at which the file was last written.
     pub last_touched_at: Option<String>,
@@ -492,7 +505,7 @@ pub struct ShellEnvironmentConfig {
 }
 
 /// Environment variables applied when the process environment does not define them.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct EnvironmentConfig {
     /// Optional login-shell import.
@@ -520,7 +533,7 @@ pub enum WizardMode {
 pub struct WizardConfig {
     /// Last completion timestamp.
     pub last_run_at: Option<String>,
-    /// OpenClaw version used for the run.
+    /// `OpenClaw` version used for the run.
     pub last_run_version: Option<String>,
     /// Source commit used for the run.
     pub last_run_commit: Option<String>,
@@ -760,7 +773,7 @@ pub struct TuiConfig {
 }
 
 /// Per-surface behavior.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct SurfaceConfigEntry {
     /// Surface-specific silent reply policy.
@@ -777,7 +790,7 @@ pub struct MediaConfig {
     pub ttl_hours: Option<u64>,
 }
 
-/// Complete pinned OpenClaw source configuration.
+/// Complete pinned `OpenClaw` source configuration.
 ///
 /// Every inventory domain has a distinct Rust type. Plugin-extensible upstream
 /// domains retain their nested object entries while fixed core domains reject
@@ -970,6 +983,26 @@ impl OpenClawConfigLayers {
     }
 
     /// Resolves defaults, system, user, workspace, environment, then CLI.
+    ///
+    /// Layers are merged in place: `merge_layer` moves each parsed overlay
+    /// into the accumulator instead of cloning it, so resolution is one
+    /// allocation pass over the layers rather than one per layer per domain.
+    ///
+    /// Caching the built-in tree in a `OnceLock` was measured and rejected:
+    /// `serde_json::to_value(OpenClawConfig::default())` costs 1.43-1.58us and
+    /// cloning a cached `Value` of the same shape costs 0.76us, so the whole
+    /// saving is under 1% of a three-layer resolution that measured 97us.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayeredConfigError::Layer`] tagged with the offending
+    /// [`ConfigLayerKind`] when one of the partial layers is not JSON5 or does
+    /// not parse to an object, and [`LayeredConfigError::Result`] when the merged
+    /// document cannot be re-encoded or fails whole-document validation. The
+    /// second case is the common one in practice: each layer is only checked for
+    /// shape on its own, so an override that pushes a value out of range, for
+    /// example `gateway.port` to `0`, is only reported once every layer has been
+    /// merged.
     pub fn resolve(&self) -> Result<ResolvedOpenClawConfig, LayeredConfigError> {
         let mut merged = serde_json::to_value(OpenClawConfig::default())
             .map_err(ConfigError::from_serialize)
@@ -993,10 +1026,13 @@ impl OpenClawConfigLayers {
             merge_layer(&mut merged, source, ConfigLayerKind::CommandLine)?;
             applied_layers.push(ConfigLayerKind::CommandLine);
         }
-        let source = serde_json::to_string(&merged)
-            .map_err(ConfigError::from_serialize)
+        validate_source_shape(&merged, "<layered-openclaw-config>")
             .map_err(LayeredConfigError::Result)?;
-        let config = parse_openclaw_json5(&source, "<layered-openclaw-config>")
+        let config = decode_openclaw_value(&merged, "<layered-openclaw-config>")
+            .and_then(|config| {
+                config.validate()?;
+                Ok(config)
+            })
             .map_err(LayeredConfigError::Result)?;
         Ok(ResolvedOpenClawConfig {
             config,
@@ -1214,6 +1250,20 @@ fn set_source_path(root: &mut Value, path: &[&str], value: Value) {
 
 impl OpenClawConfig {
     /// Validates invariants not expressible through Serde's shape checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] carrying the exact dotted path of the
+    /// first violated invariant. The checked rules are: `env.shellEnv.timeoutMs`
+    /// and every other timeout or TTL must be greater than zero;
+    /// `env.<NAME>` keys must match `[A-Za-z_][A-Za-z0-9_]*`;
+    /// `security.audit.suppressions[_].checkId` and
+    /// `security.installPolicy.exec.command` must not be blank;
+    /// `crestodian.rescue.pendingTtlMinutes` must be from 1 through 1440;
+    /// the `update.auto` hour values must be finite and non-negative;
+    /// `ui.seamColor` must be a six-digit hexadecimal color;
+    /// `gateway.port` must be from 1 through 65535; and every
+    /// `bindings[_]` ACP entry must carry a non-empty `match.peer.id`.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if let Some(env) = &self.env {
             if let Some(shell) = &env.shell_env
@@ -1333,25 +1383,92 @@ impl OpenClawConfig {
 }
 
 /// Parses and validates the pinned 47-domain source configuration.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Syntax`] when `source` is not well-formed JSON5 and
+/// [`ConfigError::Decode`] naming the exact dotted path when a value has the
+/// wrong JSON type, when a fixed core domain carries an unknown key, when a
+/// top-level key is outside the frozen 47-domain set, when a direct `env` entry
+/// is not a string, or when `bindings[_].agentId` is not a string. Returns
+/// [`ConfigError::Validation`] for every cross-field invariant listed on
+/// [`OpenClawConfig::validate`]. `source_name` is echoed in each diagnostic so
+/// the caller can name the rejected file.
 pub fn parse_openclaw_json5(
     source: &str,
     source_name: &str,
 ) -> Result<OpenClawConfig, ConfigError> {
-    let raw = json5::from_str::<Value>(source).map_err(|error| ConfigError::Syntax {
-        source_name: source_name.to_owned(),
-        message: error.to_string(),
-    })?;
-    validate_source_shape(&raw, source_name)?;
+    // One JSON5 scan on the success path. The `serde_json::Value` tree and the
+    // `serde_path_to_error` wrapper both exist only to describe a rejection, so
+    // a document that decodes cleanly no longer pays for either; a document that
+    // does not is re-read by `openclaw_rejection`, which reproduces the original
+    // diagnostic exactly. Measured over the 47-domain fixture corpus
+    // (9.8 KiB, best-of-7 x 2000, interleaved release binaries): building the
+    // `Value` cost 72-79us and tracking paths cost a further 14-16us on top of
+    // the 59-61us decode, so startup fell 155.8us -> 59.1us.
+    let config = json5::from_str::<OpenClawConfig>(source)
+        .map_err(|_| openclaw_rejection(source, source_name))?;
+    config.validate()?;
+    Ok(config)
+}
+
+/// Re-reads a document that already failed, in the original diagnostic order:
+/// JSON5 syntax, then the `env`/`bindings` shape pre-check, then the exact
+/// dotted field path.
+#[cold]
+fn openclaw_rejection(source: &str, source_name: &str) -> ConfigError {
+    let raw = match json5::from_str::<Value>(source) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return ConfigError::Syntax {
+                source_name: source_name.to_owned(),
+                message: error.to_string(),
+            };
+        }
+    };
+    if let Err(error) = validate_source_shape(&raw, source_name) {
+        return error;
+    }
     let mut deserializer = json5::Deserializer::from_str(source);
-    let config = serde_path_to_error::deserialize::<_, OpenClawConfig>(&mut deserializer).map_err(
-        |error| ConfigError::Decode {
+    match serde_path_to_error::deserialize::<_, OpenClawConfig>(&mut deserializer) {
+        Err(error) => ConfigError::Decode {
             source_name: source_name.to_owned(),
             path: nonempty_path(error.path().to_string()),
             message: error.inner().to_string(),
         },
-    )?;
-    config.validate()?;
-    Ok(config)
+        // Unreachable: the only failure `json5::from_str` reports that a bare
+        // `Deserializer` does not is trailing content, and that already returned
+        // above as a syntax error. Classified as syntax rather than panicking so
+        // a future json5 divergence degrades into a diagnostic, not a crash.
+        Ok(_) => ConfigError::Syntax {
+            source_name: source_name.to_owned(),
+            message: "document is not well-formed JSON5".to_owned(),
+        },
+    }
+}
+
+fn decode_openclaw_value(raw: &Value, source_name: &str) -> Result<OpenClawConfig, ConfigError> {
+    // Decoding straight from the merged tree skips a whole
+    // `Value -> UTF-8 -> Value` round trip. The round trip is only worth its
+    // cost when it has a diagnostic to produce, because `serde_json::Error`
+    // carries a line and column that a borrowed `Value` cannot, so it is kept
+    // for the rejection path. Measured on the layered resolver: 122.6-142.2us
+    // for the round trip against 22.7us borrowed.
+    OpenClawConfig::deserialize(raw).or_else(|_| decode_openclaw_value_located(raw, source_name))
+}
+
+#[cold]
+fn decode_openclaw_value_located(
+    raw: &Value,
+    source_name: &str,
+) -> Result<OpenClawConfig, ConfigError> {
+    let bytes = serde_json::to_vec(raw).map_err(ConfigError::from_serialize)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    serde_path_to_error::deserialize(&mut deserializer).map_err(|error| ConfigError::Decode {
+        source_name: source_name.to_owned(),
+        path: nonempty_path(error.path().to_string()),
+        message: error.inner().to_string(),
+    })
 }
 
 fn validate_source_shape(raw: &Value, source_name: &str) -> Result<(), ConfigError> {
@@ -1391,6 +1508,20 @@ fn decode_shape<T>(source_name: &str, path: &str, message: &str) -> Result<T, Co
 }
 
 /// Serializes the pinned 47-domain source configuration to deterministic JSON5.
+///
+/// Encoding through a pre-reserved buffer was measured and rejected:
+/// `json5::to_writer` into a `Vec::with_capacity(16_384)` plus
+/// `String::from_utf8` ran 41.6-41.8us against 41.1-43.7us for
+/// `json5::to_string` followed by `String::push`, which is inside the noise of
+/// a loaded machine and costs a magic constant plus a second UTF-8 validation.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Validation`] when `config` was assembled in memory and
+/// violates one of the invariants listed on [`OpenClawConfig::validate`]; the
+/// value is re-checked here so an invalid document can never be written out.
+/// Returns [`ConfigError::Serialize`] when the JSON5 encoder rejects the
+/// validated value.
 pub fn openclaw_to_json5(config: &OpenClawConfig) -> Result<String, ConfigError> {
     config.validate()?;
     let mut output =
@@ -1400,6 +1531,18 @@ pub fn openclaw_to_json5(config: &OpenClawConfig) -> Result<String, ConfigError>
 }
 
 /// Returns JSON Schema for the complete pinned 47-domain source configuration.
+///
+/// This is not startup work: `schemars` builds the whole 47-domain schema on
+/// every call, which measured 1.79-1.85ms, but no binary in the workspace calls
+/// it while starting. It is a tool entry point, so the cost is left where it is
+/// visible rather than moved into a build script that would have to be kept in
+/// step with the model.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Serialize`] when the generated schema cannot be
+/// rendered as pretty JSON. The schema itself is derived at compile time, so
+/// this only fires if the JSON writer fails.
 pub fn openclaw_schema_json() -> Result<String, ConfigError> {
     let schema = schemars::schema_for!(OpenClawConfig);
     serde_json::to_string_pretty(&schema).map_err(|error| ConfigError::Serialize(error.to_string()))

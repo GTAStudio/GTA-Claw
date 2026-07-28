@@ -241,7 +241,7 @@ impl DrainGuard {
     ///
     /// Must be called before the controller mutex is taken, because [`Drop`] locks the same
     /// non-reentrant mutex.
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -278,7 +278,7 @@ impl Shared {
     fn lock(mutex: &Mutex<ControllerState>) -> MutexGuard<'_, ControllerState> {
         mutex
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -291,11 +291,15 @@ pub struct SuspensionController {
 
 impl fmt::Debug for SuspensionController {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        let state = Shared::lock(&self.shared.state);
+        // Read out first so the controller lock is not held across the formatting itself.
+        let (phase, in_flight) = {
+            let state = Shared::lock(&self.shared.state);
+            (state.phase, state.in_flight)
+        };
         formatter
             .debug_struct("SuspensionController")
-            .field("phase", &state.phase)
-            .field("in_flight", &state.in_flight)
+            .field("phase", &phase)
+            .field("in_flight", &in_flight)
             .finish_non_exhaustive()
     }
 }
@@ -367,36 +371,32 @@ impl SuspensionController {
             .checked_add(request.lease_ttl)
             .ok_or(SuspendError::DeadlineOverflow)?;
 
+        // Built before the lock is taken so the critical section is the phase check plus the
+        // transition, with no allocation inside it.
+        let lease = SuspendLease {
+            lease_id: request.lease_id.clone(),
+            reason: request.reason.clone(),
+            granted_at,
+            expires_at,
+        };
+
         let mut guard = {
             let mut state = Shared::lock(&self.shared.state);
             self.expire_locked(&mut state);
-            match state.phase {
-                SuspensionPhase::Draining => {
-                    let lease_id = state
-                        .lease
-                        .as_ref()
-                        .map_or_else(|| request.lease_id.clone(), |lease| lease.lease_id.clone());
-                    return Err(SuspendError::AlreadyDraining { lease_id });
-                }
-                SuspensionPhase::Suspended => {
-                    let lease_id = state
-                        .lease
-                        .as_ref()
-                        .map_or_else(|| request.lease_id.clone(), |lease| lease.lease_id.clone());
-                    return Err(SuspendError::AlreadySuspended { lease_id });
-                }
-                SuspensionPhase::Active => {}
+            let refusal = match state.phase {
+                SuspensionPhase::Draining => Some(SuspendError::AlreadyDraining {
+                    lease_id: Self::owning_lease_id(&state, &request.lease_id),
+                }),
+                SuspensionPhase::Suspended => Some(SuspendError::AlreadySuspended {
+                    lease_id: Self::owning_lease_id(&state, &request.lease_id),
+                }),
+                SuspensionPhase::Active => None,
+            };
+            if let Some(error) = refusal {
+                drop(state);
+                return Err(error);
             }
-            DrainGuard::arm(
-                &self.shared,
-                &mut state,
-                SuspendLease {
-                    lease_id: request.lease_id.clone(),
-                    reason: request.reason.clone(),
-                    granted_at,
-                    expires_at,
-                },
-            )
+            DrainGuard::arm(&self.shared, &mut state, lease)
         };
 
         let drained = self.wait_for_drain(drain_deadline).await;
@@ -489,6 +489,14 @@ impl SuspensionController {
         }
     }
 
+    /// Returns the lease that currently owns the handshake, falling back to `requested`.
+    fn owning_lease_id(state: &ControllerState, requested: &LeaseId) -> LeaseId {
+        state
+            .lease
+            .as_ref()
+            .map_or_else(|| requested.clone(), |held| held.lease_id.clone())
+    }
+
     /// Drops an expired lease so a crashed host cannot wedge the runtime forever.
     fn expire_locked(&self, state: &mut ControllerState) {
         if state.phase != SuspensionPhase::Suspended {
@@ -539,16 +547,21 @@ mod tests {
         DrainGuard::arm(shared, &mut state, held)
     }
 
+    /// Copies the controller state out from under the mutex so assertions never run holding it.
+    fn snapshot(shared: &Arc<Shared>) -> (SuspensionPhase, Option<SuspendLease>, usize) {
+        let state = Shared::lock(&shared.state);
+        (state.phase, state.lease.clone(), state.in_flight)
+    }
+
     #[test]
     fn arming_the_guard_commits_the_draining_transition() {
         let shared = active_shared();
         let mut guard = arm(&shared, lease("lease-a"));
 
-        let state = Shared::lock(&shared.state);
-        assert_eq!(state.phase, SuspensionPhase::Draining);
-        assert_eq!(state.lease, Some(lease("lease-a")));
-        assert_eq!(state.in_flight, 1);
-        drop(state);
+        let (phase, held, in_flight) = snapshot(&shared);
+        assert_eq!(phase, SuspensionPhase::Draining);
+        assert_eq!(held, Some(lease("lease-a")));
+        assert_eq!(in_flight, 1);
 
         guard.disarm();
     }
@@ -559,11 +572,11 @@ mod tests {
         let guard = arm(&shared, lease("lease-b"));
         drop(guard);
 
-        let state = Shared::lock(&shared.state);
-        assert_eq!(state.phase, SuspensionPhase::Active);
-        assert_eq!(state.lease, None);
+        let (phase, held, in_flight) = snapshot(&shared);
+        assert_eq!(phase, SuspensionPhase::Active);
+        assert_eq!(held, None);
         // The rollback releases the phase, never the work that is still running.
-        assert_eq!(state.in_flight, 1);
+        assert_eq!(in_flight, 1);
     }
 
     #[test]
@@ -573,9 +586,9 @@ mod tests {
         guard.disarm();
         drop(guard);
 
-        let state = Shared::lock(&shared.state);
-        assert_eq!(state.phase, SuspensionPhase::Draining);
-        assert_eq!(state.lease, Some(lease("lease-c")));
+        let (phase, held, _) = snapshot(&shared);
+        assert_eq!(phase, SuspensionPhase::Draining);
+        assert_eq!(held, Some(lease("lease-c")));
     }
 
     #[test]
@@ -588,9 +601,9 @@ mod tests {
         Shared::lock(&shared.state).lease = Some(lease("lease-e"));
         drop(guard);
 
-        let state = Shared::lock(&shared.state);
-        assert_eq!(state.phase, SuspensionPhase::Draining);
-        assert_eq!(state.lease, Some(lease("lease-e")));
+        let (phase, held, _) = snapshot(&shared);
+        assert_eq!(phase, SuspensionPhase::Draining);
+        assert_eq!(held, Some(lease("lease-e")));
     }
 
     #[test]
@@ -601,8 +614,8 @@ mod tests {
         Shared::lock(&shared.state).phase = SuspensionPhase::Suspended;
         drop(guard);
 
-        let state = Shared::lock(&shared.state);
-        assert_eq!(state.phase, SuspensionPhase::Suspended);
-        assert_eq!(state.lease, Some(lease("lease-f")));
+        let (phase, held, _) = snapshot(&shared);
+        assert_eq!(phase, SuspensionPhase::Suspended);
+        assert_eq!(held, Some(lease("lease-f")));
     }
 }

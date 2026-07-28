@@ -107,6 +107,27 @@ impl fmt::Display for RejectionCause {
     }
 }
 
+impl RejectionCause {
+    /// Returns non-secret operator guidance for resolving this refusal safely.
+    #[must_use]
+    pub const fn remediation(self) -> &'static str {
+        match self {
+            Self::Revoked => {
+                "do not connect; remove the revocation only after re-establishing host trust"
+            }
+            Self::Mismatch => {
+                "verify the host out of band before replacing the recorded known_hosts key"
+            }
+            Self::Unknown => {
+                "pair and record the host key through a trusted channel before connecting"
+            }
+            Self::CertificateAuthorityOnly => {
+                "use a host certificate signed by the recorded authority or add an explicit host key"
+            }
+        }
+    }
+}
+
 /// A refusal, carrying both its machine-readable cause and an operator message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostKeyRejection {
@@ -131,13 +152,13 @@ pub enum HostKeyVerdict {
 impl HostKeyVerdict {
     /// Returns `true` only for [`HostKeyVerdict::Accepted`].
     #[must_use]
-    pub fn is_accepted(&self) -> bool {
+    pub const fn is_accepted(&self) -> bool {
         matches!(self, Self::Accepted { .. })
     }
 
     /// Returns the rejection cause, or `None` when the key was accepted.
     #[must_use]
-    pub fn cause(&self) -> Option<RejectionCause> {
+    pub const fn cause(&self) -> Option<RejectionCause> {
         match self {
             Self::Accepted { .. } => None,
             Self::Rejected(rejection) => Some(rejection.cause),
@@ -150,6 +171,15 @@ impl HostKeyVerdict {
         match self {
             Self::Accepted { .. } => None,
             Self::Rejected(rejection) => Some(&rejection.detail),
+        }
+    }
+
+    /// Returns safe operator guidance for a rejection.
+    #[must_use]
+    pub const fn remediation(&self) -> Option<&'static str> {
+        match self {
+            Self::Accepted { .. } => None,
+            Self::Rejected(rejection) => Some(rejection.cause.remediation()),
         }
     }
 }
@@ -178,19 +208,19 @@ pub struct KnownHostEntry {
 impl KnownHostEntry {
     /// Returns the one-based line number this entry came from.
     #[must_use]
-    pub fn line(&self) -> usize {
+    pub const fn line(&self) -> usize {
         self.line
     }
 
     /// Returns the marker on this line, if any.
     #[must_use]
-    pub fn marker(&self) -> Option<Marker> {
+    pub const fn marker(&self) -> Option<Marker> {
         self.marker
     }
 
     /// Returns the recorded key.
     #[must_use]
-    pub fn key(&self) -> &HostKey {
+    pub const fn key(&self) -> &HostKey {
         &self.key
     }
 
@@ -289,13 +319,10 @@ impl KnownHosts {
     #[must_use]
     pub fn verify(&self, host: &str, port: u16, key: &HostKey) -> HostKeyVerdict {
         let subject = Self::match_key(host, port);
-        let matching: Vec<&KnownHostEntry> = self
-            .entries
-            .iter()
-            .filter(|entry| entry.matches(&subject))
-            .collect();
-
-        for entry in &matching {
+        let mut accepted = None;
+        let mut recorded = Vec::new();
+        let mut saw_authority = None;
+        for entry in self.entries.iter().filter(|entry| entry.matches(&subject)) {
             if entry.marker == Some(Marker::Revoked) && entry.key == *key {
                 return HostKeyVerdict::Rejected(HostKeyRejection {
                     cause: RejectionCause::Revoked,
@@ -306,23 +333,22 @@ impl KnownHosts {
                     ),
                 });
             }
-        }
-
-        let mut recorded = Vec::new();
-        let mut saw_authority = None;
-        for entry in &matching {
             match entry.marker {
                 Some(Marker::Revoked) => {}
                 Some(Marker::CertAuthority) => saw_authority = Some(entry.line),
                 None => {
                     if entry.key == *key {
-                        return HostKeyVerdict::Accepted { line: entry.line };
+                        accepted.get_or_insert(entry.line);
+                    } else {
+                        recorded.push(entry.key.fingerprint());
                     }
-                    recorded.push(entry.key.fingerprint());
                 }
             }
         }
 
+        if let Some(line) = accepted {
+            return HostKeyVerdict::Accepted { line };
+        }
         if !recorded.is_empty() {
             return HostKeyVerdict::Rejected(HostKeyRejection {
                 cause: RejectionCause::Mismatch,
@@ -400,10 +426,9 @@ fn parse_entry(number: usize, line: &str) -> Result<KnownHostEntry, KnownHostsEr
     } else {
         let mut patterns = Vec::new();
         for element in hosts.split(',') {
-            let (negated, pattern) = match element.strip_prefix('!') {
-                Some(rest) => (true, rest),
-                None => (false, element),
-            };
+            let (negated, pattern) = element
+                .strip_prefix('!')
+                .map_or((false, element), |rest| (true, rest));
             if pattern.is_empty() {
                 return Err(KnownHostsError::Malformed(
                     number,

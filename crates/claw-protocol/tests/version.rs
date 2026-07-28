@@ -16,7 +16,7 @@ use claw_protocol::gateway::{
     NegotiationState, RequestId, Role,
 };
 
-fn preauth() -> Codec {
+const fn preauth() -> Codec {
     Codec::preauthentication()
 }
 

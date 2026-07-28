@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use claw_http_api::{
     ApiConfig, BearerAuthenticator, BearerCredential, DeterministicRuntime, GenerationOutput,
-    HTTP_ENDPOINTS, HttpApi, InputMedia, InputMediaKind, InputMediaSource, ToolCall,
-    ToolInvocation, ToolInvocationContext, Usage, WebhookRoute,
+    HTTP_ENDPOINTS, HttpApi, InputMedia, InputMediaKind, InputMediaSource, ServingStateHandle,
+    ToolCall, ToolInvocation, ToolInvocationContext, Usage, WebhookRoute,
 };
 use claw_security::authorization::{Role, Scope, ScopeSet};
 use http::HeaderValue;
@@ -168,12 +168,20 @@ fn config() -> ApiConfig {
         "zapier".to_owned(),
         WebhookRoute::new("zapier", "webhook-secret"),
     );
-    config.limits.heartbeat_interval = Duration::from_secs(60);
+    config.limits.heartbeat_interval = Duration::from_mins(1);
     config
 }
 
 async fn spawn_with(config: ApiConfig, runtime: Arc<DeterministicRuntime>) -> Server {
-    let api = HttpApi::new(config, runtime.services());
+    spawn_with_serving(config, runtime, ServingStateHandle::serving()).await
+}
+
+async fn spawn_with_serving(
+    config: ApiConfig,
+    runtime: Arc<DeterministicRuntime>,
+    serving: ServingStateHandle,
+) -> Server {
+    let api = HttpApi::with_serving_state(config, runtime.services(), Arc::new(serving));
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test listener");
@@ -248,10 +256,15 @@ async fn request_at(
         body.len()
     );
     if let Some(token) = token {
-        head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        head.push_str("Authorization: Bearer ");
+        head.push_str(token);
+        head.push_str("\r\n");
     }
     for (name, value) in extra_headers {
-        head.push_str(&format!("{name}: {value}\r\n"));
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
     }
     head.push_str("\r\n");
     stream
@@ -436,12 +449,12 @@ fn decode_chunked(mut bytes: &[u8]) -> Vec<u8> {
     decoded
 }
 
-fn json_body(value: Value) -> Vec<u8> {
-    serde_json::to_vec(&value).expect("test JSON serializes")
+fn json_body(value: &Value) -> Vec<u8> {
+    serde_json::to_vec(value).expect("test JSON serializes")
 }
 
 fn watch_connect_body(nonce: &str, device_id: &str) -> Vec<u8> {
-    json_body(json!({
+    json_body(&json!({
         "minProtocol":4,
         "maxProtocol":4,
         "client":{
@@ -661,7 +674,7 @@ async fn auth_models_embeddings_and_json_generation_match_contracts() {
         "/v1/embeddings",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({"model":"openclaw","input":"hi","dimensions":2})),
+        &json_body(&json!({"model":"openclaw","input":"hi","dimensions":2})),
     )
     .await;
     assert_eq!(embeddings.status, 200);
@@ -681,7 +694,7 @@ async fn auth_models_embeddings_and_json_generation_match_contracts() {
         "/v1/chat/completions",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "messages":[{"role":"user","content":"hello"}]
         })),
@@ -716,7 +729,7 @@ async fn auth_models_embeddings_and_json_generation_match_contracts() {
         "/v1/responses",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({"model":"openclaw","input":"hello"})),
+        &json_body(&json!({"model":"openclaw","input":"hello"})),
     )
     .await;
     assert_eq!(responses.status, 200);
@@ -750,7 +763,7 @@ async fn chat_and_responses_sse_have_exact_framing_and_terminal_events() {
         "/v1/chat/completions",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "stream":true,
             "stream_options":{"include_usage":true},
@@ -802,7 +815,7 @@ async fn chat_and_responses_sse_have_exact_framing_and_terminal_events() {
         "/v1/responses",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({"model":"openclaw","input":"hello","stream":true})),
+        &json_body(&json!({"model":"openclaw","input":"hello","stream":true})),
     )
     .await;
     assert_eq!(responses.status, 200);
@@ -861,7 +874,7 @@ async fn tools_admin_mcp_and_webhooks_enforce_and_map_contracts() {
             ("x-openclaw-message-to", "room-7"),
             ("x-openclaw-thread-id", "thread-2"),
         ],
-        &json_body(json!({
+        &json_body(&json!({
             "name":"echo",
             "args":{"value":7},
             "action":"send",
@@ -903,7 +916,7 @@ async fn tools_admin_mcp_and_webhooks_enforce_and_map_contracts() {
         "/api/v1/admin/rpc",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({"id":"rpc-1","method":"status","params":{"verbose":true}})),
+        &json_body(&json!({"id":"rpc-1","method":"status","params":{"verbose":true}})),
     )
     .await;
     assert_eq!(admin.status, 200);
@@ -927,7 +940,7 @@ async fn tools_admin_mcp_and_webhooks_enforce_and_map_contracts() {
         "/api/v1/admin/rpc",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({"id":"rpc-2","method":"chat.send"})),
+        &json_body(&json!({"id":"rpc-2","method":"chat.send"})),
     )
     .await;
     assert_eq!(denied_admin.status, 400);
@@ -944,13 +957,13 @@ async fn tools_admin_mcp_and_webhooks_enforce_and_map_contracts() {
         "/api/v1/admin/rpc",
         Some("read-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({"id":"rpc-3","method":"config.set","params":{}})),
+        &json_body(&json!({"id":"rpc-3","method":"config.set","params":{}})),
     )
     .await;
     assert_eq!(scope_denied.status, 403);
     assert_eq!(
         scope_denied.json(),
-        json!({"ok":false,"error":{"type":"forbidden","message":"Forbidden"}})
+        json!({"ok":false,"error":{"type":"forbidden","message":"missing scope: operator.admin"}})
     );
     assert_eq!(
         runtime.audit_events().expect("scope audit events").len(),
@@ -987,7 +1000,7 @@ async fn tools_admin_mcp_and_webhooks_enforce_and_map_contracts() {
         "POST",
         Some("mcp-owner"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "jsonrpc":"2.0","id":1,"method":"initialize",
             "params":{"protocolVersion":"2024-11-05"}
         })),
@@ -1010,7 +1023,7 @@ async fn tools_admin_mcp_and_webhooks_enforce_and_map_contracts() {
         "POST",
         Some("mcp-client"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "jsonrpc":"2.0","id":"call-1","method":"tools/call",
             "params":{"name":"echo","arguments":{"hello":"world"}}
         })),
@@ -1031,7 +1044,7 @@ async fn tools_admin_mcp_and_webhooks_enforce_and_map_contracts() {
         "/plugins/webhooks/zapier",
         None,
         &[("Content-Type", "application/json")],
-        &json_body(json!({"action":"list_flows"})),
+        &json_body(&json!({"action":"list_flows"})),
     )
     .await;
     assert_eq!(webhook_denied.status, 401);
@@ -1045,7 +1058,7 @@ async fn tools_admin_mcp_and_webhooks_enforce_and_map_contracts() {
             ("Content-Type", "application/json"),
             ("x-openclaw-webhook-secret", "webhook-secret"),
         ],
-        &json_body(json!({"action":"list_flows"})),
+        &json_body(&json!({"action":"list_flows"})),
     )
     .await;
     assert_eq!(webhook.status, 200);
@@ -1073,7 +1086,7 @@ async fn tools_admin_mcp_and_webhooks_enforce_and_map_contracts() {
                 ("Content-Type", "application/json"),
                 ("x-openclaw-webhook-secret", "webhook-secret"),
             ],
-            &json_body(invalid_body),
+            &json_body(&invalid_body),
         )
         .await;
         assert_eq!(invalid_webhook.status, 400);
@@ -1094,7 +1107,7 @@ async fn tools_invoke_rejects_auth_schema_scope_and_maps_tool_errors() {
         "/tools/invoke",
         None,
         &[("Content-Type", "application/json")],
-        &json_body(json!({"name":"echo","args":{}})),
+        &json_body(&json!({"name":"echo","args":{}})),
     )
     .await;
     assert_eq!(unauthenticated.status, 401);
@@ -1109,7 +1122,7 @@ async fn tools_invoke_rejects_auth_schema_scope_and_maps_tool_errors() {
         "/tools/invoke",
         Some("read-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({"name":"echo","args":{}})),
+        &json_body(&json!({"name":"echo","args":{}})),
     )
     .await;
     assert_eq!(scope_denied.status, 403);
@@ -1127,7 +1140,7 @@ async fn tools_invoke_rejects_auth_schema_scope_and_maps_tool_errors() {
         "/tools/invoke",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({"args":{}})),
+        &json_body(&json!({"args":{}})),
     )
     .await;
     assert_eq!(invalid.status, 400);
@@ -1145,7 +1158,7 @@ async fn tools_invoke_rejects_auth_schema_scope_and_maps_tool_errors() {
         "/tools/invoke",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({"name":"missing","args":{"value":7}})),
+        &json_body(&json!({"name":"missing","args":{"value":7}})),
     )
     .await;
     assert_eq!(missing_tool.status, 404);
@@ -1198,7 +1211,7 @@ async fn malformed_oversized_timeout_and_disconnect_fail_safely() {
         "/v1/embeddings",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({"model":"openclaw","input":["valid",7]})),
+        &json_body(&json!({"model":"openclaw","input":["valid",7]})),
     )
     .await;
     assert_eq!(invalid_embedding.status, 400);
@@ -1217,7 +1230,7 @@ async fn malformed_oversized_timeout_and_disconnect_fail_safely() {
         "/v1/chat/completions",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "messages":[{"role":"user","content":"hello"}]
         })),
@@ -1234,7 +1247,7 @@ async fn malformed_oversized_timeout_and_disconnect_fail_safely() {
         "/v1/embeddings",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({"model":"openclaw","input":"hello"})),
+        &json_body(&json!({"model":"openclaw","input":"hello"})),
     )
     .await;
     assert_eq!(embedding_timeout.status, 504);
@@ -1251,7 +1264,7 @@ async fn malformed_oversized_timeout_and_disconnect_fail_safely() {
     let mut stream = TcpStream::connect(disconnect_server.address)
         .await
         .expect("connect stream client");
-    let body = json_body(json!({
+    let body = json_body(&json!({
         "model":"openclaw","stream":true,
         "messages":[{"role":"user","content":"hello"}]
     }));
@@ -1355,7 +1368,7 @@ async fn watch_transport_covers_challenge_connect_queue_poll_result_and_disconne
         "/api/nodes/watch/result",
         Some(&session_token),
         &[("Content-Type", "application/json")],
-        &json_body(json!({"id":"invoke-1","ok":true,"payload":{"done":true}})),
+        &json_body(&json!({"id":"invoke-1","ok":true,"payload":{"done":true}})),
     )
     .await;
     assert_eq!(result.status, 200);
@@ -1541,7 +1554,7 @@ async fn required_tool_choice_returns_structured_calls_on_both_openai_surfaces()
         "/v1/chat/completions",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "messages":[{"role":"user","content":"find rust"}],
             "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
@@ -1565,7 +1578,7 @@ async fn required_tool_choice_returns_structured_calls_on_both_openai_surfaces()
         "/v1/responses",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "input":"find rust",
             "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
@@ -1598,7 +1611,7 @@ async fn constrained_streams_fail_without_leaking_text_and_response_timeouts_fai
         "/v1/chat/completions",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "messages":[{"role":"user","content":"find rust"}],
             "tools":[required_tool],
@@ -1642,7 +1655,7 @@ async fn constrained_streams_fail_without_leaking_text_and_response_timeouts_fai
         "/v1/responses",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "input":"find rust",
             "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
@@ -1697,7 +1710,7 @@ async fn constrained_streams_fail_without_leaking_text_and_response_timeouts_fai
         "/v1/responses",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({"model":"openclaw","input":"hello","stream":true})),
+        &json_body(&json!({"model":"openclaw","input":"hello","stream":true})),
     )
     .await;
     assert_eq!(timed_out.status, 200);
@@ -1730,7 +1743,7 @@ async fn constrained_streams_fail_without_leaking_text_and_response_timeouts_fai
         "/v1/responses",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({"model":"openclaw","input":"hello"})),
+        &json_body(&json!({"model":"openclaw","input":"hello"})),
     )
     .await;
     assert_eq!(non_stream_timeout.status, 504);
@@ -1767,7 +1780,7 @@ async fn restrictive_generation_parameters_are_enforced_or_rejected() {
         "/v1/chat/completions",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "messages":[{"role":"user","content":"return JSON"}],
             "response_format":{"type":"json_object"}
@@ -1789,7 +1802,7 @@ async fn restrictive_generation_parameters_are_enforced_or_rejected() {
         "/v1/chat/completions",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "messages":[{"role":"user","content":"return JSON"}],
             "response_format":{"type":"json_object"},
@@ -1841,7 +1854,7 @@ async fn restrictive_generation_parameters_are_enforced_or_rejected() {
         "/v1/chat/completions",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "messages":[{"role":"user","content":"return JSON"}],
             "stop":"STOP",
@@ -1861,7 +1874,7 @@ async fn restrictive_generation_parameters_are_enforced_or_rejected() {
         "/v1/chat/completions",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "messages":[{"role":"user","content":"short"}],
             "max_completion_tokens":1
@@ -1898,7 +1911,7 @@ async fn restrictive_generation_parameters_are_enforced_or_rejected() {
         "/v1/chat/completions",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "messages":[{"role":"user","content":"do not call tools"}],
             "tools":[{"type":"function","function":{
@@ -1939,7 +1952,7 @@ async fn restrictive_generation_parameters_are_enforced_or_rejected() {
             "/v1/chat/completions",
             Some("operator-token"),
             &[("Content-Type", "application/json")],
-            &json_body(json!({
+            &json_body(&json!({
                 "model":"openclaw",
                 "messages":[{"role":"user","content":"use only allowed"}],
                 "tools":[{"type":"function","function":{
@@ -2013,7 +2026,7 @@ async fn restrictive_generation_parameters_are_enforced_or_rejected() {
         "/v1/responses",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "input":"one call only",
             "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
@@ -2058,7 +2071,7 @@ async fn restrictive_generation_parameters_are_enforced_or_rejected() {
             "/v1/responses",
             Some("operator-token"),
             &[("Content-Type", "application/json")],
-            &json_body(unsupported),
+            &json_body(&unsupported),
         )
         .await;
         assert_eq!(response.status, 400);
@@ -2074,7 +2087,7 @@ async fn restrictive_generation_parameters_are_enforced_or_rejected() {
         "/v1/chat/completions",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "messages":[{"role":"user","content":"strict"}],
             "tools":[{"type":"function","function":{
@@ -2098,7 +2111,7 @@ async fn restrictive_generation_parameters_are_enforced_or_rejected() {
         "/v1/chat/completions",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "messages":[{"role":"user","content":"schema"}],
             "response_format":{"type":"json_schema","json_schema":{"name":"answer"}}
@@ -2120,7 +2133,7 @@ async fn restrictive_generation_parameters_are_enforced_or_rejected() {
         "/v1/chat/completions",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "messages":[{"role":"user","content":"one tool at a time"}],
             "parallel_tool_calls":false
@@ -2147,7 +2160,7 @@ async fn responses_continuity_is_scoped_to_authenticated_subject_and_model() {
         "/v1/responses",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({"model":"openclaw","input":"first"})),
+        &json_body(&json!({"model":"openclaw","input":"first"})),
     )
     .await;
     assert_eq!(first.status, 200);
@@ -2167,7 +2180,7 @@ async fn responses_continuity_is_scoped_to_authenticated_subject_and_model() {
         "/v1/responses",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "input":"continued",
             "previous_response_id":first_id
@@ -2188,7 +2201,7 @@ async fn responses_continuity_is_scoped_to_authenticated_subject_and_model() {
         "/v1/responses",
         Some("operator-two"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "input":"isolated",
             "previous_response_id":first_id
@@ -2209,7 +2222,7 @@ async fn responses_continuity_is_scoped_to_authenticated_subject_and_model() {
         "/v1/responses",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw/main",
             "input":"model isolated",
             "previous_response_id":first_id
@@ -2264,7 +2277,7 @@ async fn generation_ports_receive_validated_parameters_media_and_strict_response
         "/v1/chat/completions",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "messages":[
                 {"role":"system","content":"Be exact."},
@@ -2321,7 +2334,7 @@ async fn generation_ports_receive_validated_parameters_media_and_strict_response
         "/v1/responses",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "instructions":"Top-level.",
             "input":[
@@ -2380,7 +2393,7 @@ async fn generation_ports_receive_validated_parameters_media_and_strict_response
         "/v1/responses",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "input":[{
                 "type":"message","role":"user",
@@ -2401,7 +2414,7 @@ async fn generation_ports_receive_validated_parameters_media_and_strict_response
         "/v1/chat/completions",
         Some("operator-token"),
         &[("Content-Type", "application/json")],
-        &json_body(json!({
+        &json_body(&json!({
             "model":"openclaw",
             "messages":[{"role":"user","content":"hello"}],
             "stop":["1","2","3","4","5"]
@@ -2416,4 +2429,194 @@ async fn generation_ports_receive_validated_parameters_media_and_strict_response
             "type":"invalid_request_error"
         }})
     );
+}
+
+#[tokio::test]
+async fn draining_rejects_new_main_api_work_before_dispatch() {
+    let runtime = DeterministicRuntime::new();
+    let serving = ServingStateHandle::serving();
+    let server = spawn_with_serving(config(), runtime.clone(), serving.clone()).await;
+
+    serving.begin_draining();
+
+    let chat = request(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(&json!({
+            "model":"openclaw",
+            "messages":[{"role":"user","content":"must not dispatch"}]
+        })),
+    )
+    .await;
+    assert_eq!(chat.status, 503);
+    assert_eq!(
+        chat.json(),
+        json!({"error":{"message":"Service draining","type":"api_error"}})
+    );
+    assert_eq!(
+        chat.headers.get("retry-after").map(String::as_str),
+        Some("1")
+    );
+    assert!(
+        runtime
+            .last_generation_request()
+            .expect("provider request lock")
+            .is_none(),
+        "draining traffic reached the provider"
+    );
+
+    let admin = request(
+        &server,
+        "POST",
+        "/api/v1/admin/rpc",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(&json!({"id":"drain","method":"status"})),
+    )
+    .await;
+    assert_eq!(admin.status, 503);
+    assert_eq!(
+        admin.json(),
+        json!({"ok":false,"error":{"type":"unavailable","message":"service is draining"}})
+    );
+
+    let webhook = request(
+        &server,
+        "POST",
+        "/plugins/webhooks/zapier",
+        None,
+        &[("Content-Type", "application/json")],
+        &json_body(&json!({"action":"list_flows"})),
+    )
+    .await;
+    assert_eq!(webhook.status, 503);
+    assert_eq!(
+        webhook.json(),
+        json!({"ok":false,"code":"unavailable","error":"service is draining"})
+    );
+
+    let liveness = request(&server, "GET", "/health", None, &[], b"").await;
+    assert_eq!(liveness.status, 200);
+    assert_eq!(liveness.json()["phase"], "draining");
+}
+
+#[tokio::test]
+async fn watch_session_capacity_evicts_the_oldest_live_node() {
+    let runtime = DeterministicRuntime::new();
+    let mut watch_config = config();
+    watch_config.limits.watch_sessions = 1;
+    watch_config.limits.watch_poll_timeout = Duration::from_millis(25);
+    let server = spawn_with(watch_config, runtime).await;
+
+    let first = connect_watch(&server, "bounded-watch-1").await;
+    let second = connect_watch(&server, "bounded-watch-2").await;
+
+    let evicted = request(
+        &server,
+        "POST",
+        "/api/nodes/watch/poll",
+        Some(&first),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(evicted.status, 401);
+    assert!(
+        !server
+            .api
+            .watch_handle()
+            .send("bounded-watch-1", "node.invoke.request", None)
+            .expect("old-node enqueue")
+    );
+    assert!(
+        server
+            .api
+            .watch_handle()
+            .send(
+                "bounded-watch-2",
+                "node.invoke.request",
+                Some(json!({"id":"bounded"}))
+            )
+            .expect("new-node enqueue")
+    );
+    let current = request(
+        &server,
+        "POST",
+        "/api/nodes/watch/poll",
+        Some(&second),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(current.status, 200);
+    assert_eq!(
+        current.json()["event"],
+        json!({"event":"node.invoke.request","payload":{"id":"bounded"}})
+    );
+
+    let runtime = DeterministicRuntime::new();
+    let mut reconnect_config = config();
+    reconnect_config.limits.watch_sessions = 2;
+    let reconnect_server = spawn_with(reconnect_config, runtime).await;
+    let first_node = connect_watch(&reconnect_server, "reconnect-watch-1").await;
+    let old_second = connect_watch(&reconnect_server, "reconnect-watch-2").await;
+    let _new_second = connect_watch(&reconnect_server, "reconnect-watch-2").await;
+    assert!(
+        reconnect_server
+            .api
+            .watch_handle()
+            .send(
+                "reconnect-watch-1",
+                "node.invoke.request",
+                Some(json!({"id":"still-live"}))
+            )
+            .expect("unrelated node enqueue"),
+        "reconnecting one node must not evict an unrelated session"
+    );
+    let unrelated = request(
+        &reconnect_server,
+        "POST",
+        "/api/nodes/watch/poll",
+        Some(&first_node),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(unrelated.status, 200);
+    assert_eq!(unrelated.json()["event"]["payload"]["id"], "still-live");
+    let replaced = request(
+        &reconnect_server,
+        "POST",
+        "/api/nodes/watch/poll",
+        Some(&old_second),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(replaced.status, 401);
+}
+
+async fn connect_watch(server: &Server, device_id: &str) -> String {
+    let challenge = request(server, "GET", "/api/nodes/watch/challenge", None, &[], b"").await;
+    let nonce = challenge.json()["nonce"]
+        .as_str()
+        .expect("watch challenge nonce")
+        .to_owned();
+    let connect = request(
+        server,
+        "POST",
+        "/api/nodes/watch/connect",
+        None,
+        &[("Content-Type", "application/json")],
+        &watch_connect_body(&nonce, device_id),
+    )
+    .await;
+    assert_eq!(connect.status, 200, "{}", connect.text());
+    connect.json()["sessionToken"]
+        .as_str()
+        .expect("watch session token")
+        .to_owned()
 }

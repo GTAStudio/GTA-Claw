@@ -34,21 +34,31 @@ impl Default for CrestodianState {
     }
 }
 
-pub(crate) fn read_state(path: &Path) -> Result<CrestodianState, CrestodianError> {
-    let bytes = fs::read(path).map_err(|source| CrestodianError::io(path, source))?;
-    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
-    serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
+pub(crate) fn decode_state(path: &Path, bytes: &[u8]) -> Result<CrestodianState, CrestodianError> {
+    let refuse = |json_path: String, message: String| CrestodianError::StateDecode {
+        path: path.to_owned(),
+        json_path,
+        message,
+    };
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let state = serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
         let json_path = error.path().to_string();
-        CrestodianError::StateDecode {
-            path: path.to_owned(),
-            json_path: if json_path.is_empty() {
+        refuse(
+            if json_path.is_empty() {
                 "<root>".to_owned()
             } else {
                 json_path
             },
-            message: error.inner().to_string(),
-        }
-    })
+            error.inner().to_string(),
+        )
+    })?;
+    // Bytes trailing a complete state object mean the file is not one this
+    // build wrote; reporting it corrupt keeps a torn tail from passing as
+    // healthy state just because its first object happened to parse.
+    deserializer
+        .end()
+        .map_err(|error| refuse("<root>".to_owned(), error.to_string()))?;
+    Ok(state)
 }
 
 pub(crate) fn write_state(

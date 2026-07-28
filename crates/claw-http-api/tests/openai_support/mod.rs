@@ -3,14 +3,17 @@
 //! Five test binaries (`openai_chat`, `openai_responses`, `openai_models`,
 //! `openai_embeddings`, `openai_tools_invoke`) include this module, so any single
 //! binary uses only a subset of it.
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "shared fixture harness compiled into five test binaries; each one exercises only the subset of the helpers its own feature needs"
+)]
 
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -198,7 +201,7 @@ pub(crate) enum EmbedScript {
 }
 
 /// Dimensions the scripted embedding provider uses when the request omits them.
-fn default_dimensions() -> usize {
+const fn default_dimensions() -> usize {
     3
 }
 
@@ -306,6 +309,10 @@ impl ToolCallSpec {
 /// Usage accounting a scripted provider reports.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the field names are the fixture JSON keys, and `deny_unknown_fields` makes renaming them a breaking change to every golden fixture"
+)]
 pub(crate) struct UsageSpec {
     /// Input token count.
     input_tokens: u64,
@@ -412,6 +419,7 @@ pub(crate) struct ScriptedRuntime {
     tool_invocations: Mutex<Vec<ToolInvocation>>,
     audits: Mutex<Vec<AuditEvent>>,
     stream_cancelled: AtomicBool,
+    stream_events_delivered: AtomicUsize,
 }
 
 impl ScriptedRuntime {
@@ -424,6 +432,7 @@ impl ScriptedRuntime {
             tool_invocations: Mutex::new(Vec::new()),
             audits: Mutex::new(Vec::new()),
             stream_cancelled: AtomicBool::new(false),
+            stream_events_delivered: AtomicUsize::new(0),
         })
     }
 
@@ -509,6 +518,16 @@ impl ScriptedRuntime {
     /// Reports whether a streaming generation observed cancellation.
     pub(crate) fn stream_was_cancelled(&self) -> bool {
         self.stream_cancelled.load(Ordering::Acquire)
+    }
+
+    /// Returns how many scripted stream events the adapter actually accepted.
+    ///
+    /// A coordinator that stops consuming — because it refused the response or
+    /// because the client went away — leaves this well below the scripted event
+    /// count, which is how a test proves the adapter stopped accumulating
+    /// rather than merely reported a failure once the provider finished.
+    pub(crate) fn stream_events_delivered(&self) -> usize {
+        self.stream_events_delivered.load(Ordering::Acquire)
     }
 }
 
@@ -605,6 +624,7 @@ impl ProviderPort for ScriptedRuntime {
                         "stream receiver disconnected",
                     ));
                 }
+                self.stream_events_delivered.fetch_add(1, Ordering::AcqRel);
             }
             outcome
         })
@@ -644,7 +664,11 @@ fn dimensioned_vectors(request: &EmbeddingRequest, fallback: usize) -> Vec<Vec<f
         .enumerate()
         .map(|(index, _)| {
             (0..width)
-                .map(|dimension| (index * 8 + dimension) as f32 / 4.0)
+                .map(|dimension| {
+                    let component = u16::try_from(index * 8 + dimension)
+                        .expect("fixture embedding widths stay inside `u16`");
+                    f32::from(component) / 4.0
+                })
                 .collect()
         })
         .collect()
@@ -817,7 +841,7 @@ fn config(agents: Vec<String>) -> ApiConfig {
     ]));
     config.agents = agents;
     // Long enough that no keep-alive comment can land inside a pinned stream.
-    config.limits.heartbeat_interval = Duration::from_secs(600);
+    config.limits.heartbeat_interval = Duration::from_mins(10);
     config
 }
 
@@ -846,6 +870,35 @@ pub(crate) async fn spawn(script: RuntimeScript) -> TestServer {
 /// Parses a runtime script from an inline JSON literal.
 pub(crate) fn script(value: Value) -> RuntimeScript {
     serde_json::from_value(value).expect("inline runtime script parses")
+}
+
+/// Bytes of assistant text one [`text_flood`] chunk carries.
+pub(crate) const FLOOD_CHUNK_BYTES: usize = 1024;
+
+/// The smallest provider-output buffer the streaming coordinators ever grant.
+///
+/// This mirrors `MIN_STREAM_OUTPUT_BYTES` in `src/openai.rs`: a request that
+/// states a small `max_tokens`/`max_output_tokens` gets exactly this floor
+/// rather than a bound derived from the token count, which is how a test can
+/// reach the ceiling without moving the eight megabytes an unbounded request
+/// would need.
+pub(crate) const STREAM_OUTPUT_FLOOR_BYTES: usize = 64 * 1024;
+
+/// Builds a script whose provider offers `chunks` text deltas of [`FLOOD_CHUNK_BYTES`].
+///
+/// The provider is *willing* to send every chunk; how many it gets to send is
+/// decided by the adapter, and [`ScriptedRuntime::stream_events_delivered`]
+/// reports the difference.
+pub(crate) fn text_flood(chunks: usize) -> RuntimeScript {
+    let chunk = "a".repeat(FLOOD_CHUNK_BYTES);
+    script(json!({
+        "stream": {
+            "kind": "events",
+            "events": (0..chunks)
+                .map(|_| json!({ "text": chunk }))
+                .collect::<Vec<_>>()
+        }
+    }))
 }
 
 /// One complete HTTP response read off the socket.
@@ -887,7 +940,9 @@ impl TestServer {
             body.len()
         );
         if let Some(token) = &request.token {
-            head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+            head.push_str("Authorization: Bearer ");
+            head.push_str(token);
+            head.push_str("\r\n");
         }
         let declares_content_type = request
             .headers
@@ -897,7 +952,10 @@ impl TestServer {
             head.push_str("Content-Type: application/json\r\n");
         }
         for (name, value) in &request.headers {
-            head.push_str(&format!("{name}: {value}\r\n"));
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(value);
+            head.push_str("\r\n");
         }
         head.push_str("\r\n");
 

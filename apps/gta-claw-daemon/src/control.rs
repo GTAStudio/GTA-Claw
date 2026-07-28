@@ -17,9 +17,13 @@ use std::io::{self, Write};
 
 use claw_application::Application;
 use claw_platform::NativeSystemProbe;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
+use tokio_util::sync::CancellationToken;
 
-use crate::compose::{Daemon, StopSummary};
+use crate::compose::{Daemon, STOP_DEADLINE, StopSummary};
+use crate::production::{
+    LoadedConfig, ProductionOptions, ProductionService, ProductionStopSummary,
+};
 
 /// The control word that ends a run.
 pub const SHUTDOWN_COMMAND: &str = "shutdown";
@@ -64,12 +68,26 @@ impl StopTrigger {
 ///
 /// Installed *before* the daemon starts serving, so a supervisor that stops the
 /// process during startup is still observed rather than being left to the
-/// default disposition. Dropping this value uninstalls the handlers.
+/// default disposition.
+///
+/// # A second signal during the drain
+///
+/// The handlers stay installed for the rest of the process: tokio registers a
+/// process-wide handler the first time a signal kind is asked for and never
+/// removes it, so dropping this value only stops *this* code from being told.
+/// A supervisor that loses patience and sends a second `SIGTERM` while the
+/// drain is in progress therefore cannot kill the process — the signal is
+/// delivered to a stream nobody is reading, the drain finishes, and the stop
+/// summary is still printed. The bound on how long that can take is
+/// [`STOP_DEADLINE`], not the operator's
+/// patience.
 pub struct StopSignals {
     #[cfg(unix)]
     terminate: tokio::signal::unix::Signal,
     #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    reload: tokio::signal::unix::Signal,
     #[cfg(windows)]
     ctrl_c: tokio::signal::windows::CtrlC,
     #[cfg(windows)]
@@ -85,9 +103,13 @@ impl StopSignals {
     ///
     /// # Errors
     ///
-    /// Returns an [`io::Error`] when a handler cannot be installed. Reporting
-    /// that here rather than at stop time means the failure is visible before
-    /// the daemon claims to be ready.
+    /// Returns an [`io::Error`] when a handler cannot be installed — no signal
+    /// driver on this runtime, or the process is out of the resources tokio
+    /// needs to register one. Reporting it here rather than at stop time means
+    /// the failure is visible before the daemon claims to be ready, so a
+    /// supervisor sees a start-up failure instead of a process that looks
+    /// healthy and then ignores `SIGTERM`. It is an environment fault, not a
+    /// configuration one: a restart will reproduce it.
     #[cfg(unix)]
     pub fn install() -> io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
@@ -95,6 +117,7 @@ impl StopSignals {
         Ok(Self {
             terminate: signal(SignalKind::terminate())?,
             interrupt: signal(SignalKind::interrupt())?,
+            reload: signal(SignalKind::hangup())?,
         })
     }
 
@@ -102,7 +125,8 @@ impl StopSignals {
     ///
     /// # Errors
     ///
-    /// Returns an [`io::Error`] when a handler cannot be installed.
+    /// Returns an [`io::Error`] when a handler cannot be installed; see the
+    /// unix documentation of this method for what an operator should conclude.
     #[cfg(windows)]
     pub fn install() -> io::Result<Self> {
         use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
@@ -121,10 +145,10 @@ impl StopSignals {
     /// rather than as a stop, so a closed stream cannot shut the daemon down.
     #[cfg(unix)]
     pub async fn recv(&mut self) -> StopTrigger {
-        tokio::select! {
-            Some(()) = self.terminate.recv() => StopTrigger::Terminate,
-            Some(()) = self.interrupt.recv() => StopTrigger::Interrupt,
-            else => std::future::pending().await,
+        loop {
+            if let SignalEvent::Stop(trigger) = self.recv_event().await {
+                return trigger;
+            }
         }
     }
 
@@ -142,6 +166,75 @@ impl StopSignals {
             else => std::future::pending().await,
         }
     }
+
+    /// Waits for a stop or reload signal.
+    #[cfg(unix)]
+    pub async fn recv_event(&mut self) -> SignalEvent {
+        tokio::select! {
+            Some(()) = self.terminate.recv() => SignalEvent::Stop(StopTrigger::Terminate),
+            Some(()) = self.interrupt.recv() => SignalEvent::Stop(StopTrigger::Interrupt),
+            Some(()) = self.reload.recv() => SignalEvent::Reload,
+            else => std::future::pending().await,
+        }
+    }
+
+    /// Waits for a stop signal on platforms without `SIGHUP`.
+    #[cfg(windows)]
+    pub async fn recv_event(&mut self) -> SignalEvent {
+        SignalEvent::Stop(self.recv().await)
+    }
+}
+
+/// One operating-system lifecycle event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalEvent {
+    /// Stop for the enclosed reason.
+    Stop(StopTrigger),
+    /// Reload the configured file.
+    Reload,
+}
+
+#[derive(Debug)]
+enum ControlEvent {
+    Stop,
+    Reload,
+    Status,
+    Ignored,
+}
+
+struct ControlChannel<R> {
+    lines: Lines<BufReader<R>>,
+    open: bool,
+}
+
+impl<R> ControlChannel<R>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    fn new(reader: R) -> Self {
+        Self {
+            lines: BufReader::new(reader).lines(),
+            open: true,
+        }
+    }
+
+    async fn recv(&mut self) -> ControlEvent {
+        if !self.open {
+            return std::future::pending().await;
+        }
+        match self.lines.next_line().await {
+            Ok(Some(line)) if line.trim().eq_ignore_ascii_case(SHUTDOWN_COMMAND) => {
+                ControlEvent::Stop
+            }
+            Ok(Some(line)) if line.trim().eq_ignore_ascii_case("reload") => ControlEvent::Reload,
+            Ok(Some(line)) if line.trim().eq_ignore_ascii_case("status") => ControlEvent::Status,
+            Ok(Some(_)) => ControlEvent::Ignored,
+            Ok(None) | Err(_) => {
+                self.open = false;
+                std::future::pending().await
+            }
+        }
+    }
 }
 
 /// Parses the command line.
@@ -149,7 +242,9 @@ impl StopSignals {
 /// # Errors
 ///
 /// Returns an [`io::Error`] with kind [`io::ErrorKind::InvalidInput`] when the
-/// arguments are not a supported combination.
+/// arguments are not a supported combination — anything other than no arguments
+/// at all or exactly `--probe`. The message is the usage line, and an operator
+/// must fix the invocation: a restart will fail identically.
 pub fn parse_mode<I, S>(arguments: I) -> io::Result<DaemonMode>
 where
     I: IntoIterator<Item = S>,
@@ -171,9 +266,15 @@ where
 
 /// Writes the one-shot health line.
 ///
+/// This is what `ExecStartPre` runs, so its exit status gates the service: a
+/// failure here stops the unit before the real daemon is started.
+///
 /// # Errors
 ///
-/// Returns an [`io::Error`] when the output cannot be written.
+/// Returns an [`io::Error`] when the health line cannot be written or flushed,
+/// which means the pipe the supervisor was reading has already been closed. The
+/// probe itself cannot fail; nothing about the host is inspected that could be
+/// unavailable.
 pub fn probe(mut output: impl Write) -> io::Result<()> {
     let application = Application::new(NativeSystemProbe);
 
@@ -225,11 +326,30 @@ pub async fn await_stop(
 /// summary, so a caller can tell a clean shutdown from an abandoned one without
 /// parsing anything ambiguous.
 ///
+/// The stop itself is bounded by [`STOP_DEADLINE`], so this returns even when a
+/// subsystem refuses to: an expired deadline comes back as a summary that is
+/// not [`clean`](StopSummary::is_clean) rather than as a process that never
+/// exits.
+///
 /// # Errors
 ///
-/// Returns an error when a stop-signal handler cannot be installed, when the
-/// composition cannot be built or started, or when the output cannot be
-/// written.
+/// Returns an error before the ready line when the run cannot start, which an
+/// operator should read as "this will happen again on restart, fix it":
+///
+/// * a stop-signal handler that cannot be installed — an environment fault;
+/// * a composition that cannot be built — a subsystem graph with a cycle or a
+///   missing port, which is a defect in this binary rather than in the
+///   deployment;
+/// * a subsystem that refuses to start. Everything already brought up has been
+///   torn down and every task it spawned has been joined before this returns.
+///
+/// Returns an error after the ready line only when the ready, health or summary
+/// line cannot be written — a closed or full standard output, meaning the
+/// supervisor that was reading it has gone away.
+///
+/// A shutdown that left work behind is *not* an error here: it is reported in
+/// the returned summary, because the caller has to print that summary before
+/// deciding what the exit status should be.
 pub async fn serve(
     mut output: impl Write,
     control: impl tokio::io::AsyncRead + Unpin,
@@ -241,7 +361,15 @@ pub async fn serve(
     let application = Application::new(NativeSystemProbe);
     let mut daemon = Daemon::builder().build()?;
 
-    daemon.start().await?;
+    if let Err(error) = daemon.start().await {
+        // The subsystems that came up have been torn down by `start` itself,
+        // but the tasks they spawned are this side's to account for: without
+        // this they would be dropped by the runtime at process exit, which is
+        // exactly the detached teardown the task ledger exists to rule out.
+        daemon.runtime().shutdown_within(STOP_DEADLINE).await;
+
+        return Err(Box::new(error));
+    }
 
     writeln!(output, "{}", application.ready())?;
     writeln!(output, "{}", application.health())?;
@@ -264,6 +392,213 @@ pub async fn serve(
     output.flush()?;
 
     Ok(summary)
+}
+
+/// Runs the bound production service until a stop request or supervised fault.
+///
+/// Unlike [`serve`], this path owns real HTTP, MCP, and Gateway listeners. End
+/// of file on the control channel still does not stop it, but it is not parked:
+/// the ingress tasks remain supervised and an unexpected exit becomes a
+/// non-clean process result.
+///
+/// # Errors
+///
+/// Returns a startup error before readiness when signal installation or service
+/// composition fails. After readiness, returns an output error only after the
+/// service has been drained.
+pub async fn serve_production(
+    mut output: impl Write,
+    control: impl tokio::io::AsyncRead + Unpin,
+    options: &ProductionOptions,
+    loaded: LoadedConfig,
+) -> Result<ProductionStopSummary, Box<dyn std::error::Error>> {
+    let mut signals = StopSignals::install()?;
+    let application = Application::new(NativeSystemProbe);
+    let mut control = ControlChannel::new(control);
+    let startup_cancellation = CancellationToken::new();
+    let startup = ProductionService::start(options, loaded, startup_cancellation.clone());
+    tokio::pin!(startup);
+    let mut reload_deferred = false;
+    let mut service = loop {
+        enum StartupEvent<T> {
+            Started(T),
+            Signal(SignalEvent),
+            Control(ControlEvent),
+        }
+        let event = tokio::select! {
+            result = &mut startup => StartupEvent::Started(result),
+            signal = signals.recv_event() => StartupEvent::Signal(signal),
+            control = control.recv() => StartupEvent::Control(control),
+        };
+        match event {
+            StartupEvent::Started(result) => break result?,
+            StartupEvent::Signal(SignalEvent::Stop(trigger)) => {
+                startup_cancellation.cancel();
+                let summary = match startup.as_mut().await {
+                    Ok(service) => service.stop(None).await,
+                    Err(error) if error.stage() == "startup" => {
+                        ProductionStopSummary::before_start()
+                    }
+                    Err(error) => return Err(Box::new(error)),
+                };
+                write_production_stop(&mut output, trigger.label(), &summary)?;
+                return Ok(summary);
+            }
+            StartupEvent::Control(ControlEvent::Stop) => {
+                startup_cancellation.cancel();
+                let summary = match startup.as_mut().await {
+                    Ok(service) => service.stop(None).await,
+                    Err(error) if error.stage() == "startup" => {
+                        ProductionStopSummary::before_start()
+                    }
+                    Err(error) => return Err(Box::new(error)),
+                };
+                write_production_stop(&mut output, StopTrigger::Control.label(), &summary)?;
+                return Ok(summary);
+            }
+            StartupEvent::Signal(SignalEvent::Reload)
+            | StartupEvent::Control(ControlEvent::Reload) => {
+                reload_deferred = true;
+                writeln!(output, "reload deferred phase=starting")?;
+                output.flush()?;
+            }
+            StartupEvent::Control(ControlEvent::Status) => {
+                writeln!(output, "status ready=false phase=starting")?;
+                output.flush()?;
+            }
+            StartupEvent::Control(ControlEvent::Ignored) => {
+                writeln!(output, "control ignored")?;
+                output.flush()?;
+            }
+        }
+    };
+    if reload_deferred {
+        let reload_write =
+            writeln!(output, "{}", reload_line(&service).await).and_then(|()| output.flush());
+        if let Err(error) = reload_write {
+            let _ = service
+                .stop(Some(format!("supervisor output failed: {error}")))
+                .await;
+            return Err(Box::new(error));
+        }
+    }
+    let addresses = service.addresses();
+
+    let startup_write = (|| -> io::Result<()> {
+        writeln!(output, "{}", application.ready())?;
+        writeln!(output, "{}", application.health())?;
+        writeln!(
+            output,
+            "service http={} legacy={} gateway={} mcp={} provider={} config_generation={}",
+            addresses.http,
+            addresses.legacy,
+            addresses.gateway,
+            addresses.mcp,
+            service.provider_name(),
+            service.config_generation(),
+        )?;
+        output.flush()
+    })();
+    if let Err(error) = startup_write {
+        let _ = service
+            .stop(Some(format!("supervisor output failed: {error}")))
+            .await;
+        return Err(Box::new(error));
+    }
+
+    let (reason, fault) = loop {
+        enum Event {
+            Signal(SignalEvent),
+            Control(ControlEvent),
+            Fault(crate::production::ProductionError),
+        }
+        let event = tokio::select! {
+            signal = signals.recv_event() => Event::Signal(signal),
+            control = control.recv() => Event::Control(control),
+            fault = service.wait_for_failure() => Event::Fault(fault),
+        };
+        match event {
+            Event::Signal(SignalEvent::Stop(trigger)) => {
+                break (trigger.label(), None);
+            }
+            Event::Control(ControlEvent::Stop) => {
+                break (StopTrigger::Control.label(), None);
+            }
+            Event::Fault(error) => {
+                break ("runtime", Some(error.to_string()));
+            }
+            Event::Signal(SignalEvent::Reload) | Event::Control(ControlEvent::Reload) => {
+                let line = reload_line(&service).await;
+                if let Err(error) = writeln!(output, "{line}").and_then(|()| output.flush()) {
+                    break (
+                        "runtime",
+                        Some(format!("supervisor output failed: {error}")),
+                    );
+                }
+            }
+            Event::Control(ControlEvent::Status) => {
+                if let Err(error) =
+                    writeln!(output, "{}", service.status_line()).and_then(|()| output.flush())
+                {
+                    break (
+                        "runtime",
+                        Some(format!("supervisor output failed: {error}")),
+                    );
+                }
+            }
+            Event::Control(ControlEvent::Ignored) => {
+                if let Err(error) =
+                    writeln!(output, "control ignored").and_then(|()| output.flush())
+                {
+                    break (
+                        "runtime",
+                        Some(format!("supervisor output failed: {error}")),
+                    );
+                }
+            }
+        }
+    };
+
+    let summary = service.stop(fault).await;
+    write_production_stop(&mut output, reason, &summary)?;
+    Ok(summary)
+}
+
+async fn reload_line(service: &ProductionService) -> String {
+    match service.reload().await {
+        Ok(applied) => format!(
+            "reloaded generation={} changed={}",
+            applied.generation,
+            if applied.changed.is_empty() {
+                "none".to_owned()
+            } else {
+                applied.changed.join(",")
+            }
+        ),
+        Err(error) => format!(
+            "reload rejected generation={} reason={error}",
+            service.config_generation()
+        ),
+    }
+}
+
+fn write_production_stop(
+    output: &mut impl Write,
+    reason: &str,
+    summary: &ProductionStopSummary,
+) -> io::Result<()> {
+    writeln!(
+        output,
+        "stopped reason={} clean={} drained={} completed={} abandoned={} tasks={}/{}",
+        reason,
+        summary.is_clean(),
+        summary.drained(),
+        summary.completed(),
+        summary.abandoned(),
+        summary.terminated(),
+        summary.spawned(),
+    )?;
+    output.flush()
 }
 
 #[cfg(test)]
@@ -318,17 +653,16 @@ mod tests {
 
     #[tokio::test]
     async fn the_shutdown_word_is_matched_without_regard_to_case_or_padding() {
-        let trigger = await_control("  ShUtDoWn  \n".as_bytes()).await;
+        let trigger = await_control(&b"  ShUtDoWn  \n"[..]).await;
 
         assert_eq!(trigger, Some(StopTrigger::Control));
     }
 
     #[tokio::test]
     async fn a_control_channel_that_ends_is_not_a_stop() {
-        let trigger =
-            tokio::time::timeout(Duration::from_secs(1), await_control("status\n".as_bytes()))
-                .await
-                .expect("reading a finite channel terminates");
+        let trigger = tokio::time::timeout(Duration::from_secs(1), await_control(&b"status\n"[..]))
+            .await
+            .expect("reading a finite channel terminates");
 
         assert_eq!(trigger, None);
     }
@@ -392,7 +726,7 @@ mod tests {
 
         let trigger = tokio::time::timeout(
             Duration::from_secs(5),
-            await_stop(&mut signals, "shutdown\n".as_bytes()),
+            await_stop(&mut signals, &b"shutdown\n"[..]),
         )
         .await
         .expect("the control channel resolves the stop");
@@ -410,7 +744,7 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             Duration::from_millis(250),
-            await_stop(&mut signals, "status\n".as_bytes()),
+            await_stop(&mut signals, &b"status\n"[..]),
         )
         .await;
 

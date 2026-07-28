@@ -14,7 +14,7 @@ use crate::events::ConnectionId;
 
 /// Wire identity of a negotiated compatibility path.
 #[must_use]
-pub fn compatibility_identity(mode: CompatibilityMode) -> &'static str {
+pub const fn compatibility_identity(mode: CompatibilityMode) -> &'static str {
     match mode {
         CompatibilityMode::Current => "current",
         CompatibilityMode::LegacyProbe => "legacy-probe",
@@ -111,17 +111,22 @@ impl ConnectionDirectory {
     /// Removes an entry only while `serial` still owns it.
     fn remove_registered(&self, id: ConnectionId, serial: u64) -> bool {
         let mut entries = self.lock();
-        if entries
+        let owned = entries
             .get(&id.get())
-            .is_some_and(|held| held.serial == serial)
-        {
+            .is_some_and(|held| held.serial == serial);
+        if owned {
             entries.remove(&id.get());
-            return true;
         }
-        false
+        drop(entries);
+        owned
     }
 
     /// Removes one connection, returning the entry when it was present.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "removing the connection is the point of the call and the returned entry is \
+                  only for callers that want to report what went away, as for `BTreeMap::remove`"
+    )]
     pub fn remove(&self, id: ConnectionId) -> Option<ConnectionInfo> {
         self.lock().remove(&id.get()).map(|held| held.info)
     }

@@ -1,10 +1,22 @@
 //! Provider, tool and context stand-ins.
 //!
-//! The registry is the piece that matters most for correctness. It resolves a
-//! provider name to a [`ProviderBinding`] by passing the configured URL through
-//! the [`EgressGuard`], so the binding carries the addresses that were actually
-//! checked. Everything downstream connects to those addresses and never sees a
-//! hostname it could look up again.
+//! Nothing here talks to a provider. The transport answers from a script, the
+//! tools return fixed strings, and the context is a list of notes; they stand in
+//! for `claw-providers`, `claw-tools` and `claw-memory` until those land.
+//!
+//! The registry is the piece that matters most for correctness, and it is real.
+//! It resolves a provider name to a [`ProviderBinding`] by passing the
+//! configured URL through the [`EgressGuard`], so the binding carries the
+//! addresses that were actually checked. Everything downstream connects to those
+//! addresses and never sees a hostname it could look up again.
+//!
+//! # Lock poisoning
+//!
+//! The accessors below unwrap their lock guards, so each panics if a previous
+//! holder panicked while holding it. An operator should restart the daemon and
+//! investigate the *first* panic in the log; the state behind the lock is
+//! process-lifetime memory, so there is nothing to repair and nothing to
+//! configure differently.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -88,7 +100,7 @@ impl GuardedProviderRegistry {
     /// Creates a registry over `configured`, checking every destination with
     /// `guard`.
     #[must_use]
-    pub fn new(configured: Vec<ProviderConfig>, guard: Arc<EgressGuard>) -> Self {
+    pub const fn new(configured: Vec<ProviderConfig>, guard: Arc<EgressGuard>) -> Self {
         Self {
             configured,
             guard,
@@ -249,11 +261,21 @@ impl ScriptedTransport {
     }
 
     /// Queues a reply, used before the echo fallback and in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the reply queue's lock is poisoned; see the module note on
+    /// lock poisoning.
     pub fn push_reply(&self, reply: ProviderReply) {
         self.replies.lock().expect("uncontended").push(reply);
     }
 
     /// Returns everything the transport was asked to send.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the call log's lock is poisoned; see the module note on lock
+    /// poisoning.
     #[must_use]
     pub fn calls(&self) -> Vec<RecordedCall> {
         self.calls.lock().expect("uncontended").clone()
@@ -350,6 +372,11 @@ impl MemoryToolSurface {
     }
 
     /// Removes a tool, so the next turn's catalogue differs from this one's.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the catalogue's lock is poisoned; see the module note on lock
+    /// poisoning.
     pub fn withdraw(&self, name: &ToolName) {
         self.tools
             .write()
@@ -358,6 +385,11 @@ impl MemoryToolSurface {
     }
 
     /// Returns every invocation as a name and argument pair.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the invocation log's lock is poisoned; see the module note on
+    /// lock poisoning.
     #[must_use]
     pub fn invocations(&self) -> Vec<(String, String)> {
         self.invocations.lock().expect("uncontended").clone()
@@ -430,6 +462,11 @@ impl NoteContext {
     }
 
     /// Adds a note that later turns will see.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the note list's lock is poisoned; see the module note on lock
+    /// poisoning.
     pub fn remember(&self, note: impl Into<String>) {
         self.notes.write().expect("uncontended").push(note.into());
     }

@@ -1,4 +1,9 @@
 //! Signed, resumable, and rollback-safe GTA Claw updater.
+//!
+//! A verified artifact remains bound to its signed release until installation
+//! succeeds, so a restart-required retry reuses local bytes instead of fetching
+//! them again. Successful installs remove staging artifacts and obsolete
+//! anti-rollback floor files.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -54,6 +59,7 @@ const MAX_BUNDLE_ENTRY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_BUNDLE_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_BUNDLE_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const BUNDLE_MAGIC: &str = "gta-claw-bundle-v1";
+const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const STAGED_PART: &str = "artifact.part";
 const STAGED_VERIFIED: &str = "artifact.verified";
 const RESUME_BINDING: &str = "artifact.resume.json";
@@ -63,6 +69,15 @@ const ROLLBACK_LOCK: &str = "release-floor.lock";
 trait UpdateIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> UpdateIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+/// Streaming scratch space kept on the heap.
+///
+/// `update_object_digest` recurses once per bundle directory level and
+/// `hash_handle` is held across an `await`, so a stack array of this size would
+/// both multiply the recursion frame and inflate every download future.
+fn stream_buffer() -> Vec<u8> {
+    vec![0_u8; STREAM_BUFFER_BYTES]
+}
 
 /// Compiled maintainer-controlled Ed25519 release key.
 pub const PRODUCTION_PUBLIC_KEY: [u8; 32] = [
@@ -207,7 +222,7 @@ pub struct AvailableUpdate {
 impl AvailableUpdate {
     /// Returns the signed artifact metadata.
     #[must_use]
-    pub fn artifact(&self) -> &ReleaseArtifact {
+    pub const fn artifact(&self) -> &ReleaseArtifact {
         &self.artifact
     }
 }
@@ -242,6 +257,13 @@ pub struct InstallTarget {
 
 impl InstallTarget {
     /// Validates a caller-selected local destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UpdateError::InvalidInstallTarget`] when `path` has no file
+    /// name or no parent directory, or when `mode` is
+    /// [`InstallMode::MacOsBundle`] and `path` does not end in `.app`. Nothing
+    /// is read from or written to disk, so this cannot fail for I/O reasons.
     pub fn new(path: PathBuf, mode: InstallMode) -> Result<Self, UpdateError> {
         if path.file_name().is_none() || path.parent().is_none() {
             return Err(UpdateError::InvalidInstallTarget);
@@ -320,6 +342,18 @@ pub struct Updater {
 
 impl Updater {
     /// Creates the production updater with a compiled trust root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UpdateError::InvalidPublicKey`] if [`PRODUCTION_PUBLIC_KEY`]
+    /// is not a canonical Ed25519 point,
+    /// [`UpdateError::StateDirectoryUnavailable`] if the per-user state
+    /// directory cannot be derived from the environment,
+    /// [`UpdateError::NativeRootsUnavailable`] or
+    /// [`UpdateError::TlsConfiguration`] if no usable platform root
+    /// certificates exist, and [`UpdateError::Http`] if the HTTP client itself
+    /// cannot be constructed. All of these are configuration faults: retrying
+    /// without changing the environment will fail the same way.
     pub fn production(target_triple: impl Into<String>) -> Result<Self, UpdateError> {
         Self::build(
             PRODUCTION_PUBLIC_KEY,
@@ -330,6 +364,12 @@ impl Updater {
     }
 
     /// Creates an updater with an explicit trust root, primarily for isolated tests.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Updater::production`], except that
+    /// [`UpdateError::InvalidPublicKey`] now reports a caller-supplied
+    /// `public_key` that is not a canonical Ed25519 point.
     pub fn with_public_key(
         public_key: [u8; 32],
         target_triple: impl Into<String>,
@@ -338,6 +378,12 @@ impl Updater {
     }
 
     /// Creates an isolated updater with an explicit trust root and protected state directory.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Updater::with_public_key`], except that the
+    /// caller-supplied `state_dir` replaces the derived one, so
+    /// [`UpdateError::StateDirectoryUnavailable`] cannot occur here.
     pub fn with_public_key_and_state(
         public_key: [u8; 32],
         target_triple: impl Into<String>,
@@ -357,7 +403,7 @@ impl Updater {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(300))
+            .timeout(Duration::from_mins(5))
             .user_agent(concat!("gta-claw-updater/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(redact_http_error)?;
@@ -373,6 +419,43 @@ impl Updater {
     }
 
     /// Fetches, bounds, and verifies a release manifest before comparing versions.
+    ///
+    /// An up-to-date installation is **not** an error: it is reported as an
+    /// `Ok` value holding [`UpdateDecision::Current`].
+    ///
+    /// # Errors
+    ///
+    /// Transient, safe to retry later: [`UpdateError::Http`],
+    /// [`UpdateError::HttpsIo`], [`UpdateError::HttpsProtocol`],
+    /// [`UpdateError::HttpTask`], [`UpdateError::HttpTimeout`],
+    /// [`UpdateError::HttpStatus`], [`UpdateError::InvalidProxyResponse`] and
+    /// [`UpdateError::UnsupportedProxy`] all mean the release server, proxy or
+    /// network could not be reached within the fixed 5 minute transfer budget.
+    /// [`UpdateError::NativeRootsUnavailable`] and
+    /// [`UpdateError::TlsConfiguration`] mean the platform trust store is
+    /// unusable.
+    ///
+    /// Do not retry, and do not install anything: [`UpdateError::ForgedManifest`]
+    /// means the served bytes are not signed by the trusted release key,
+    /// [`UpdateError::InvalidSignatureEncoding`] that the signature field is not
+    /// decodable Ed25519 data, and [`UpdateError::RollbackManifest`],
+    /// [`UpdateError::RollbackVersion`] or
+    /// [`UpdateError::ReleaseSequenceConflict`] that a validly signed but
+    /// *older or conflicting* release was replayed at this client. Treat these
+    /// as an attack on the update channel.
+    ///
+    /// Also possible: [`UpdateError::InsecureUrl`] or
+    /// [`UpdateError::CredentialBearingUrl`] for a rejected `manifest_url`,
+    /// [`UpdateError::ManifestTooLarge`] above the 1 MiB cap,
+    /// [`UpdateError::ManifestJson`], [`UpdateError::InvalidVersion`],
+    /// [`UpdateError::InvalidReleaseMetadata`], [`UpdateError::ExpiredManifest`],
+    /// the artifact validation errors listed on
+    /// [`Updater::verify_manifest`], [`UpdateError::CurrentReleaseRevoked`] or
+    /// [`UpdateError::RevokedRelease`] for a withdrawn release,
+    /// [`UpdateError::ArtifactUnavailable`] when no artifact matches this target
+    /// triple, and [`UpdateError::CorruptState`],
+    /// [`UpdateError::UnsafeFilesystemObject`] or [`UpdateError::Io`] while
+    /// persisting the anti-rollback floor.
     pub async fn check(
         &self,
         manifest_url: &Url,
@@ -382,7 +465,7 @@ impl Updater {
         let response = self.get(manifest_url, None).await?;
         ensure_success(response.status())?;
         let bytes = tokio::time::timeout(
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             read_response_limited(response, MAX_MANIFEST_BYTES),
         )
         .await
@@ -391,13 +474,23 @@ impl Updater {
     }
 
     /// Verifies and accepts already-fetched manifest bytes before comparing versions.
+    ///
+    /// An up-to-date installation is **not** an error: it is reported as an
+    /// `Ok` value holding [`UpdateDecision::Current`].
+    ///
+    /// # Errors
+    ///
+    /// Every non-transport error listed on [`Updater::check`] applies here,
+    /// because this is the half of `check` that runs once the bytes are in
+    /// hand. In particular [`UpdateError::ForgedManifest`] means the bytes are
+    /// not signed by the trusted release key and must never be installed.
     pub fn check_manifest_bytes(
         &self,
         bytes: &[u8],
         current: &Version,
     ) -> Result<UpdateDecision, UpdateError> {
-        let manifest = self.verify_manifest(bytes)?;
-        let rollback_state = self.accept_manifest(&manifest)?;
+        let (manifest, manifest_sha256) = self.verify_manifest_with_digest(bytes)?;
+        let rollback_state = self.accept_manifest_with_digest(&manifest, &manifest_sha256)?;
         let available =
             Version::parse(&manifest.version).map_err(|_| UpdateError::InvalidVersion)?;
         let current_revoked = rollback_state
@@ -428,7 +521,8 @@ impl Updater {
             None => return Err(UpdateError::ArtifactUnavailable),
         };
         validate_artifact(&artifact, self.allow_loopback_http)?;
-        let authorization = release_authorization(&manifest, &artifact)?;
+        let authorization =
+            release_authorization_with_digest(&manifest, &artifact, &manifest_sha256)?;
         Ok(UpdateDecision::Available {
             version: available,
             update: AvailableUpdate {
@@ -439,8 +533,41 @@ impl Updater {
     }
 
     /// Strictly verifies signed manifest bytes.
+    ///
+    /// # Errors
+    ///
+    /// Do not retry and do not install anything:
+    /// [`UpdateError::ForgedManifest`] means `bytes` are not signed by this
+    /// updater's trusted release key, and [`UpdateError::InvalidSignatureEncoding`]
+    /// means the `signature` field is not standard-base64 Ed25519 data. Either
+    /// one is a tampered or substituted manifest.
+    ///
+    /// Malformed but unsigned-tampering-free input reports
+    /// [`UpdateError::ManifestTooLarge`] above the 1 MiB cap,
+    /// [`UpdateError::ManifestJson`] for JSON that does not match the exact
+    /// envelope shape, [`UpdateError::InvalidVersion`] for a non-`SemVer`
+    /// version, [`UpdateError::InvalidReleaseMetadata`] for a zero sequence, a
+    /// publication time beyond the 5 minute skew allowance, an artifact whose
+    /// `release_sequence` disagrees with the manifest, or duplicate revocation
+    /// entries, and [`UpdateError::ExpiredManifest`] once `expires_at_unix` has
+    /// passed. Per-artifact validation adds
+    /// [`UpdateError::InvalidArtifactSize`] for a zero length,
+    /// [`UpdateError::InvalidArtifactHash`] for a digest that is not 64
+    /// lowercase hex characters, [`UpdateError::InvalidArtifactUrl`] for an
+    /// unparseable URL, and [`UpdateError::InsecureUrl`] or
+    /// [`UpdateError::CredentialBearingUrl`] for a non-HTTPS or
+    /// credential-bearing one.
     pub fn verify_manifest(&self, bytes: &[u8]) -> Result<ReleaseManifest, UpdateError> {
-        if bytes.len() > usize::try_from(MAX_MANIFEST_BYTES).expect("manifest cap fits usize") {
+        self.verify_manifest_with_digest(bytes)
+            .map(|(manifest, _)| manifest)
+    }
+
+    fn verify_manifest_with_digest(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(ReleaseManifest, String), UpdateError> {
+        let length = u64::try_from(bytes.len()).map_err(|_| UpdateError::ManifestTooLarge)?;
+        if length > MAX_MANIFEST_BYTES {
             return Err(UpdateError::ManifestTooLarge);
         }
         let envelope: SignedManifest =
@@ -455,6 +582,7 @@ impl Updater {
         self.verifying_key
             .verify_strict(&canonical, &signature)
             .map_err(|_| UpdateError::ForgedManifest)?;
+        let manifest_sha256 = encode_hex(&Sha256::digest(&canonical));
         validate_manifest_metadata(&envelope.manifest, unix_time_now()?)?;
         for artifact in &envelope.manifest.artifacts {
             if artifact.release_sequence != envelope.manifest.sequence {
@@ -462,63 +590,22 @@ impl Updater {
             }
             validate_artifact(artifact, self.allow_loopback_http)?;
         }
-        Ok(envelope.manifest)
+        Ok((envelope.manifest, manifest_sha256))
     }
 
+    #[cfg(test)]
     fn accept_manifest(&self, manifest: &ReleaseManifest) -> Result<RollbackState, UpdateError> {
-        let guard = self.lock_rollback_state()?;
-        self.accept_manifest_locked(manifest, &guard)
+        let manifest_sha256 = manifest_digest(manifest)?;
+        self.accept_manifest_with_digest(manifest, &manifest_sha256)
     }
 
-    fn accept_manifest_locked(
+    fn accept_manifest_with_digest(
         &self,
         manifest: &ReleaseManifest,
-        guard: &RollbackGuard,
+        manifest_sha256: &str,
     ) -> Result<RollbackState, UpdateError> {
-        let state_directory = &guard.directory;
-        let mut state = load_rollback_state(state_directory)?;
-        let available =
-            Version::parse(&manifest.version).map_err(|_| UpdateError::InvalidVersion)?;
-        let manifest_sha256 = manifest_digest(manifest)?;
-
-        if manifest.sequence < state.highest_sequence {
-            return Err(UpdateError::RollbackManifest {
-                observed: state.highest_sequence,
-                received: manifest.sequence,
-            });
-        }
-        if manifest.sequence == state.highest_sequence
-            && state.highest_sequence != 0
-            && (state.highest_version != manifest.version
-                || state.manifest_sha256 != manifest_sha256)
-        {
-            return Err(UpdateError::ReleaseSequenceConflict);
-        }
-        if !state.highest_version.is_empty() {
-            let highest =
-                Version::parse(&state.highest_version).map_err(|_| UpdateError::CorruptState)?;
-            if available < highest {
-                return Err(UpdateError::RollbackVersion {
-                    observed: state.highest_version,
-                    received: manifest.version.clone(),
-                });
-            }
-        }
-
-        let previous = state.clone();
-        if manifest.sequence > state.highest_sequence {
-            state.highest_sequence = manifest.sequence;
-            state.highest_version.clone_from(&manifest.version);
-            state.manifest_sha256 = manifest_sha256;
-        }
-        state
-            .revoked_versions
-            .extend(manifest.revoked_versions.iter().cloned());
-        if state != previous {
-            let state_name = rollback_state_name(state.highest_sequence);
-            state_directory.write_json_atomic(&state_name, &state)?;
-        }
-        Ok(state)
+        let guard = self.lock_rollback_state()?;
+        accept_manifest_locked_with_digest(manifest, manifest_sha256, &guard)
     }
 
     fn lock_rollback_state(&self) -> Result<RollbackGuard, UpdateError> {
@@ -532,63 +619,52 @@ impl Updater {
         })
     }
 
-    fn authorize_install(
-        &self,
-        authorization: &ReleaseAuthorization,
-        guard: &RollbackGuard,
-    ) -> Result<(), UpdateError> {
-        validate_authorization_time(authorization, unix_time_now()?)?;
-        let state = load_rollback_state(&guard.directory)?;
-        if state.highest_sequence > authorization.sequence {
-            return Err(UpdateError::RollbackManifest {
-                observed: state.highest_sequence,
-                received: authorization.sequence,
-            });
-        }
-        if state.highest_sequence < authorization.sequence {
-            return Err(UpdateError::CorruptState);
-        }
-        if state.highest_version != authorization.version
-            || state.manifest_sha256 != authorization.manifest_sha256
-        {
-            return Err(UpdateError::ReleaseSequenceConflict);
-        }
-        if state.revoked_versions.contains(&authorization.version) {
-            return Err(UpdateError::RevokedRelease);
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn accept_manifest_while_locked(
-        &self,
-        manifest: &ReleaseManifest,
-        guard: &RollbackGuard,
-    ) -> Result<RollbackState, UpdateError> {
-        self.accept_manifest_locked(manifest, guard)
-    }
-
     #[cfg(test)]
     fn rollback_lock_for_test(&self) -> Result<RollbackGuard, UpdateError> {
         self.lock_rollback_state()
     }
 
-    fn validate_update_binding(&self, update: &AvailableUpdate) -> Result<(), UpdateError> {
-        if artifact_digest(&update.artifact)? != update.authorization.artifact_sha256
-            || update.artifact.release_sequence != update.authorization.sequence
-        {
-            return Err(UpdateError::InvalidReleaseMetadata);
-        }
-        Ok(())
-    }
-
     /// Downloads one signed artifact with safe resume and verifies exact size and SHA-256.
+    ///
+    /// The bytes are streamed into a private staging directory next to the
+    /// install target and are only renamed to the verified name once both the
+    /// exact signed length and the exact signed SHA-256 match. The live
+    /// installation is never touched by this call.
+    ///
+    /// # Errors
+    ///
+    /// Transient, safe to retry later: [`UpdateError::Http`],
+    /// [`UpdateError::HttpsIo`], [`UpdateError::HttpsProtocol`],
+    /// [`UpdateError::HttpTask`], [`UpdateError::HttpStatus`],
+    /// [`UpdateError::UnsupportedProxy`], [`UpdateError::InvalidProxyResponse`],
+    /// [`UpdateError::HttpTimeout`] when the transfer exceeds its fixed 5 minute
+    /// budget, and [`UpdateError::InterruptedDownload`] when the connection ends
+    /// early. A retry resumes from the persisted offset instead of restarting.
+    ///
+    /// Do not retry, and do not install anything: [`UpdateError::HashMismatch`]
+    /// means the fully received bytes do not hash to the signed digest, so the
+    /// mirror served something other than the signed release. The partial
+    /// artifact and its resume binding are deleted before this is returned.
+    /// [`UpdateError::ArtifactTooLarge`] (more bytes than the manifest signed
+    /// for) and [`UpdateError::InvalidContentRange`] (a resume response that
+    /// does not match the requested range) are the same class of finding.
+    ///
+    /// Also possible: [`UpdateError::InvalidReleaseMetadata`] when `update` was
+    /// not produced by this updater's own [`Updater::check`],
+    /// [`UpdateError::InstallModeMismatch`] when the signed artifact kind does
+    /// not match `target`, the artifact and URL validation errors listed on
+    /// [`Updater::verify_manifest`], [`UpdateError::SwapRecoveryConflict`] when
+    /// an earlier interrupted swap cannot be resolved without overwriting an
+    /// unknown object, and [`UpdateError::UnsafeFilesystemObject`],
+    /// [`UpdateError::CorruptState`] or [`UpdateError::Io`] for staging
+    /// failures. No elevation is attempted, so a read-only or foreign-owned
+    /// install directory surfaces as [`UpdateError::Io`].
     pub async fn download(
         &self,
         update: &AvailableUpdate,
         target: &InstallTarget,
     ) -> Result<VerifiedArtifact, UpdateError> {
-        self.validate_update_binding(update)?;
+        validate_update_binding(update)?;
         let artifact = &update.artifact;
         validate_artifact(artifact, self.allow_loopback_http)?;
         ensure_kind_matches(artifact.kind, target.mode)?;
@@ -596,7 +672,7 @@ impl Updater {
         validate_network_url(&url, self.allow_loopback_http)?;
         let stage = Arc::new(SecureStaging::open(target)?);
         recover_interrupted_swap(&stage)?;
-        let expected_binding = stage.resume_binding(artifact, target);
+        let expected_binding = resume_binding(artifact, target);
         let binding_matches = match stage
             .directory
             .read_json::<ResumeBinding>(OsStr::new(RESUME_BINDING))
@@ -618,6 +694,42 @@ impl Updater {
             stage
                 .directory
                 .write_json_atomic(OsStr::new(RESUME_BINDING), &expected_binding)?;
+        }
+        let expected_digest = decode_sha256(&artifact.sha256)?;
+        if binding_matches {
+            match stage
+                .directory
+                .open_regular(OsStr::new(STAGED_VERIFIED), false)
+            {
+                Ok(verified) => {
+                    let metadata = verified.metadata().map_err(UpdateError::Io)?;
+                    let digest = hash_handle(&verified).await?;
+                    if metadata.len() == artifact.size && digest == expected_digest {
+                        #[cfg(unix)]
+                        ensure_entry_identity(
+                            &stage.directory,
+                            OsStr::new(STAGED_VERIFIED),
+                            &verified,
+                        )?;
+                        let staged_path = stage.directory.path.join(STAGED_VERIFIED);
+                        return Ok(VerifiedArtifact {
+                            path: staged_path,
+                            file: verified,
+                            stage,
+                            digest,
+                            size: artifact.size,
+                            kind: artifact.kind,
+                            authorization: update.authorization.clone(),
+                        });
+                    }
+                    drop(verified);
+                    stage
+                        .directory
+                        .remove_file_if_exists(OsStr::new(STAGED_VERIFIED))?;
+                }
+                Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
 
         let retained = match stage.directory.open_regular(OsStr::new(STAGED_PART), false) {
@@ -654,7 +766,7 @@ impl Updater {
             file.seek(std::io::SeekFrom::Start(offset))
                 .await
                 .map_err(UpdateError::Io)?;
-            downloaded = tokio::time::timeout(Duration::from_secs(300), async {
+            downloaded = tokio::time::timeout(Duration::from_mins(5), async {
                 while let Some(chunk) = response.next_chunk().await? {
                     downloaded = downloaded
                         .checked_add(
@@ -682,8 +794,7 @@ impl Updater {
             });
         }
         let digest = hash_handle(&retained).await?;
-        let expected = decode_sha256(&artifact.sha256)?;
-        if digest != expected {
+        if digest != expected_digest {
             drop(retained);
             let _ = stage.directory.remove_file(OsStr::new(STAGED_PART));
             let _ = stage.directory.remove_file(OsStr::new(RESUME_BINDING));
@@ -700,9 +811,6 @@ impl Updater {
                 OsStr::new(STAGED_VERIFIED),
             )
             .map_err(UpdateError::Io)?;
-        stage
-            .directory
-            .remove_file_if_exists(OsStr::new(RESUME_BINDING))?;
         #[cfg(unix)]
         ensure_entry_identity(&stage.directory, OsStr::new(STAGED_VERIFIED), &retained)?;
         let staged_path = stage.directory.path.join(STAGED_VERIFIED);
@@ -718,6 +826,41 @@ impl Updater {
     }
 
     /// Re-verifies and atomically installs a previously downloaded artifact.
+    ///
+    /// The staged bytes are re-hashed and, on Unix, re-checked for object
+    /// identity immediately before the swap, so a racing writer cannot
+    /// substitute the artifact between [`Updater::download`] and this call.
+    /// The previous installation is moved aside, not deleted, until the new one
+    /// is in place.
+    ///
+    /// # Errors
+    ///
+    /// Do not retry, and treat as an attack on the update channel:
+    /// [`UpdateError::StagedArtifactChanged`] means the verified staging file
+    /// changed size, digest, or filesystem identity after it was verified.
+    /// [`UpdateError::RollbackManifest`], [`UpdateError::ReleaseSequenceConflict`]
+    /// or [`UpdateError::RevokedRelease`] mean the persisted anti-rollback floor
+    /// moved past this artifact — most benignly because another updater run
+    /// installed something newer — and this artifact must be discarded.
+    /// [`UpdateError::ExpiredManifest`] or
+    /// [`UpdateError::InvalidReleaseMetadata`] mean the signed authorization is
+    /// no longer valid at the current clock.
+    ///
+    /// The installation itself is fail-safe:
+    /// [`UpdateError::InstallRolledBack`] means the replacement failed and the
+    /// previous version was fully restored, so the install is still usable.
+    /// [`UpdateError::RollbackFailed`] is the one serious case — replacement
+    /// *and* restore both failed, so the target may be missing and the previous
+    /// version is in the sibling `.gta-claw.rollback` object; it carries both
+    /// underlying [`io::Error`] values.
+    ///
+    /// Also possible: [`UpdateError::InstallModeMismatch`],
+    /// [`UpdateError::InvalidBundle`] for a malformed or path-traversing macOS
+    /// bundle archive, [`UpdateError::SwapRecoveryConflict`],
+    /// [`UpdateError::CorruptState`], [`UpdateError::UnsafeFilesystemObject`]
+    /// and [`UpdateError::Io`]. A Windows sharing lock is not an error: it is
+    /// reported as an `Ok` value holding [`InstallOutcome::RestartRequired`],
+    /// with the verified bytes left staged.
     pub async fn install(
         &self,
         verified: VerifiedArtifact,
@@ -748,12 +891,35 @@ impl Updater {
             },
             ArtifactKind::MacOsBundle => prepare_bundle(&verified).await?,
         };
-        let guard = self.lock_rollback_state()?;
-        self.authorize_install(&verified.authorization, &guard)?;
-        atomic_swap_verified(&prepared, cfg!(windows))
+        let outcome = (|| {
+            let guard = self.lock_rollback_state()?;
+            authorize_install(&verified.authorization, &guard)?;
+            atomic_swap_verified(&prepared, cfg!(windows))
+        })();
+        if outcome.is_err() && verified.kind == ArtifactKind::MacOsBundle {
+            let _ = verified
+                .stage
+                .directory
+                .remove_entry_recursive(&prepared.source_name);
+        }
+        outcome
     }
 
     /// Runs the full signed update flow.
+    ///
+    /// An up-to-date installation is **not** an error: it is reported as an
+    /// `Ok` value holding [`UpdateOutcome::Current`]. On Linux, where
+    /// distribution packages own updates, no network or filesystem work happens
+    /// at all and the result is an `Ok` value holding
+    /// [`UpdateOutcome::SystemManaged`].
+    ///
+    /// # Errors
+    ///
+    /// Returns any error documented on [`Updater::check`],
+    /// [`Updater::download`] and [`Updater::install`], in that order; the flow
+    /// stops at the first failure. Until [`Updater::install`] reaches its final
+    /// rename the existing installation is untouched, so every error before
+    /// that point leaves a working install behind.
     pub async fn execute(
         &self,
         manifest_url: &Url,
@@ -838,7 +1004,7 @@ impl Updater {
             .map_err(UpdateError::HttpsProtocol)?;
         let connection = tokio::spawn(connection);
         let response = match tokio::time::timeout(
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             sender.send_request(request),
         )
         .await
@@ -919,6 +1085,118 @@ impl Updater {
     }
 }
 
+#[cfg(test)]
+fn accept_manifest_locked(
+    manifest: &ReleaseManifest,
+    guard: &RollbackGuard,
+) -> Result<RollbackState, UpdateError> {
+    let manifest_sha256 = manifest_digest(manifest)?;
+    accept_manifest_locked_with_digest(manifest, &manifest_sha256, guard)
+}
+
+fn accept_manifest_locked_with_digest(
+    manifest: &ReleaseManifest,
+    manifest_sha256: &str,
+    guard: &RollbackGuard,
+) -> Result<RollbackState, UpdateError> {
+    let state_directory = &guard.directory;
+    let mut state = load_rollback_state(state_directory)?;
+    let available = Version::parse(&manifest.version).map_err(|_| UpdateError::InvalidVersion)?;
+
+    if manifest.sequence < state.highest_sequence {
+        return Err(UpdateError::RollbackManifest {
+            observed: state.highest_sequence,
+            received: manifest.sequence,
+        });
+    }
+    if manifest.sequence == state.highest_sequence
+        && state.highest_sequence != 0
+        && (state.highest_version != manifest.version || state.manifest_sha256 != manifest_sha256)
+    {
+        return Err(UpdateError::ReleaseSequenceConflict);
+    }
+    if !state.highest_version.is_empty() {
+        let highest =
+            Version::parse(&state.highest_version).map_err(|_| UpdateError::CorruptState)?;
+        if available < highest {
+            return Err(UpdateError::RollbackVersion {
+                observed: state.highest_version,
+                received: manifest.version.clone(),
+            });
+        }
+    }
+
+    let previous = state.clone();
+    if manifest.sequence > state.highest_sequence {
+        state.highest_sequence = manifest.sequence;
+        state.highest_version.clone_from(&manifest.version);
+        manifest_sha256.clone_into(&mut state.manifest_sha256);
+    }
+    state
+        .revoked_versions
+        .extend(manifest.revoked_versions.iter().cloned());
+    let state_name = rollback_state_name(state.highest_sequence);
+    if state != previous {
+        state_directory.write_json_atomic(&state_name, &state)?;
+    }
+    prune_rollback_states(state_directory, &state_name)?;
+    Ok(state)
+}
+
+fn prune_rollback_states(
+    state_directory: &SecureDirectory,
+    retained: &OsStr,
+) -> Result<(), UpdateError> {
+    for name in state_directory.list_names()? {
+        if name != retained && rollback_sequence_from_name(&name).is_some() {
+            state_directory.remove_file_if_exists(&name)?;
+        }
+    }
+    state_directory.sync().map_err(UpdateError::Io)
+}
+
+fn authorize_install(
+    authorization: &ReleaseAuthorization,
+    guard: &RollbackGuard,
+) -> Result<(), UpdateError> {
+    validate_authorization_time(authorization, unix_time_now()?)?;
+    let state = load_rollback_state(&guard.directory)?;
+    if state.highest_sequence > authorization.sequence {
+        return Err(UpdateError::RollbackManifest {
+            observed: state.highest_sequence,
+            received: authorization.sequence,
+        });
+    }
+    if state.highest_sequence < authorization.sequence {
+        return Err(UpdateError::CorruptState);
+    }
+    #[expect(
+        clippy::suspicious_operation_groupings,
+        reason = "the persisted floor and the signed authorization name the same two values \
+                  with different field names: RollbackState::highest_version is deliberately \
+                  compared against ReleaseAuthorization::version, and the type has no \
+                  `highest_version` field for clippy's suggested symmetry to refer to"
+    )]
+    if state.highest_version != authorization.version
+        || state.manifest_sha256 != authorization.manifest_sha256
+    {
+        return Err(UpdateError::ReleaseSequenceConflict);
+    }
+    if state.revoked_versions.contains(&authorization.version) {
+        return Err(UpdateError::RevokedRelease);
+    }
+    Ok(())
+}
+
+fn validate_update_binding(update: &AvailableUpdate) -> Result<(), UpdateError> {
+    if artifact_digest(&update.artifact)? != update.authorization.artifact_sha256
+        || update.artifact.release_sequence != update.authorization.sequence
+    {
+        return Err(UpdateError::InvalidReleaseMetadata);
+    }
+    Ok(())
+}
+
 /// Opaque proof that one staged artifact passed signature, size, and hash checks.
 #[derive(Debug)]
 pub struct VerifiedArtifact {
@@ -980,7 +1258,7 @@ pub enum UpdateError {
     InvalidSignatureEncoding,
     /// Signature did not match the exact manifest.
     ForgedManifest,
-    /// Release version was not valid SemVer.
+    /// Release version was not valid `SemVer`.
     InvalidVersion,
     /// Signed publication, expiration, sequence, or revocation metadata was invalid.
     InvalidReleaseMetadata,
@@ -1174,11 +1452,12 @@ impl Error for UpdateError {
         match self {
             Self::ManifestJson(error) => Some(error),
             Self::Http(error) => Some(error),
-            Self::HttpsIo(error) => Some(error),
             Self::HttpsProtocol(error) => Some(error),
             Self::HttpTask(error) => Some(error),
-            Self::Io(error) | Self::InstallRolledBack(error) => Some(error),
-            Self::RollbackFailed { install, .. } => Some(install),
+            Self::HttpsIo(error)
+            | Self::Io(error)
+            | Self::InstallRolledBack(error)
+            | Self::RollbackFailed { install: error, .. } => Some(error),
             _ => None,
         }
     }
@@ -1444,7 +1723,7 @@ impl SecureDirectory {
                     }
                     Err(error)
                         if is_windows_sharing_violation(&error)
-                            && started.elapsed() < Duration::from_secs(300) =>
+                            && started.elapsed() < Duration::from_mins(5) =>
                     {
                         std::thread::sleep(Duration::from_millis(10));
                     }
@@ -1730,16 +2009,16 @@ impl SecureStaging {
             backup_name: OsString::from(format!(".{target_name}.gta-claw.rollback")),
         })
     }
+}
 
-    fn resume_binding(&self, artifact: &ReleaseArtifact, target: &InstallTarget) -> ResumeBinding {
-        ResumeBinding {
-            target: target.path.to_string_lossy().into_owned(),
-            url: artifact.url.clone(),
-            size: artifact.size,
-            sha256: artifact.sha256.clone(),
-            kind: artifact.kind,
-            release_sequence: artifact.release_sequence,
-        }
+fn resume_binding(artifact: &ReleaseArtifact, target: &InstallTarget) -> ResumeBinding {
+    ResumeBinding {
+        target: target.path.to_string_lossy().into_owned(),
+        url: artifact.url.clone(),
+        size: artifact.size,
+        sha256: artifact.sha256.clone(),
+        kind: artifact.kind,
+        release_sequence: artifact.release_sequence,
     }
 }
 
@@ -1792,7 +2071,7 @@ fn update_object_digest(
         digest.update(metadata.len().to_be_bytes());
         let mut file = object;
         file.seek(SeekFrom::Start(0)).map_err(UpdateError::Io)?;
-        let mut buffer = [0_u8; 64 * 1024];
+        let mut buffer = stream_buffer();
         loop {
             let count = file.read(&mut buffer).map_err(UpdateError::Io)?;
             if count == 0 {
@@ -1843,7 +2122,6 @@ fn recover_interrupted_swap(stage: &SecureStaging) -> Result<(), UpdateError> {
                 .map_err(UpdateError::Io)?;
             stage.parent.sync().map_err(UpdateError::Io)
         }
-        (None, true, true) => Err(UpdateError::SwapRecoveryConflict),
         (Some(_), false, true) => {
             stage
                 .parent
@@ -1883,7 +2161,7 @@ fn recover_interrupted_swap(stage: &SecureStaging) -> Result<(), UpdateError> {
                 .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
             stage.parent.sync().map_err(UpdateError::Io)
         }
-        (Some(_), false, false) => Err(UpdateError::SwapRecoveryConflict),
+        (None, true, true) | (Some(_), false, false) => Err(UpdateError::SwapRecoveryConflict),
     }
 }
 
@@ -1955,6 +2233,7 @@ fn load_rollback_state(state_directory: &SecureDirectory) -> Result<RollbackStat
     Ok(state)
 }
 
+#[cfg(test)]
 fn manifest_digest(manifest: &ReleaseManifest) -> Result<String, UpdateError> {
     let bytes = serde_json::to_vec(manifest).map_err(UpdateError::ManifestJson)?;
     Ok(encode_hex(&Sha256::digest(bytes)))
@@ -1965,21 +2244,31 @@ fn artifact_digest(artifact: &ReleaseArtifact) -> Result<String, UpdateError> {
     Ok(encode_hex(&Sha256::digest(bytes)))
 }
 
+#[cfg(test)]
 fn release_authorization(
     manifest: &ReleaseManifest,
     artifact: &ReleaseArtifact,
+) -> Result<ReleaseAuthorization, UpdateError> {
+    let manifest_sha256 = manifest_digest(manifest)?;
+    release_authorization_with_digest(manifest, artifact, &manifest_sha256)
+}
+
+fn release_authorization_with_digest(
+    manifest: &ReleaseManifest,
+    artifact: &ReleaseArtifact,
+    manifest_sha256: &str,
 ) -> Result<ReleaseAuthorization, UpdateError> {
     Ok(ReleaseAuthorization {
         sequence: manifest.sequence,
         version: manifest.version.clone(),
         published_at_unix: manifest.published_at_unix,
         expires_at_unix: manifest.expires_at_unix,
-        manifest_sha256: manifest_digest(manifest)?,
+        manifest_sha256: manifest_sha256.to_owned(),
         artifact_sha256: artifact_digest(artifact)?,
     })
 }
 
-fn validate_authorization_time(
+const fn validate_authorization_time(
     authorization: &ReleaseAuthorization,
     now: u64,
 ) -> Result<(), UpdateError> {
@@ -2217,7 +2506,7 @@ impl UpdateResponse {
         self.status
     }
 
-    fn headers(&self) -> &HeaderMap {
+    const fn headers(&self) -> &HeaderMap {
         &self.headers
     }
 
@@ -2463,18 +2752,17 @@ fn validate_network_url(url: &Url, allow_loopback_http: bool) -> Result<(), Upda
     if url.scheme() == "https" {
         return Ok(());
     }
-    if allow_loopback_http && url.scheme() == "http" && is_literal_loopback(url.host()) {
+    if allow_loopback_http && url.scheme() == "http" && is_literal_loopback(url.host().as_ref()) {
         return Ok(());
     }
     Err(UpdateError::InsecureUrl)
 }
 
-fn is_literal_loopback(host: Option<Host<&str>>) -> bool {
+const fn is_literal_loopback(host: Option<&Host<&str>>) -> bool {
     match host {
         Some(Host::Ipv4(address)) => address.is_loopback(),
         Some(Host::Ipv6(address)) => address.is_loopback(),
-        Some(Host::Domain(_)) => false,
-        None => false,
+        Some(Host::Domain(_)) | None => false,
     }
 }
 
@@ -2527,7 +2815,7 @@ fn decode_sha256(value: &str) -> Result<[u8; 32], UpdateError> {
     Ok(digest)
 }
 
-fn hex_nibble(value: u8) -> Option<u8> {
+const fn hex_nibble(value: u8) -> Option<u8> {
     match value {
         b'0'..=b'9' => Some(value - b'0'),
         b'a'..=b'f' => Some(value - b'a' + 10),
@@ -2541,7 +2829,7 @@ async fn hash_handle(file: &File) -> Result<[u8; 32], UpdateError> {
         .await
         .map_err(UpdateError::Io)?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = stream_buffer();
     loop {
         let count = file.read(&mut buffer).await.map_err(UpdateError::Io)?;
         if count == 0 {
@@ -2592,7 +2880,7 @@ fn sibling_path(target: &Path, suffix: &str) -> Result<PathBuf, UpdateError> {
     Ok(parent.join(format!(".{name}.gta-claw.{suffix}")))
 }
 
-fn ensure_kind_matches(kind: ArtifactKind, mode: InstallMode) -> Result<(), UpdateError> {
+const fn ensure_kind_matches(kind: ArtifactKind, mode: InstallMode) -> Result<(), UpdateError> {
     if matches!(
         (kind, mode),
         (ArtifactKind::Executable, InstallMode::Executable)
@@ -2793,6 +3081,15 @@ fn atomic_swap_verified(
         .remove_file_if_exists(&prepared.source_name)?;
     stage
         .directory
+        .remove_file_if_exists(OsStr::new(STAGED_VERIFIED))?;
+    stage
+        .directory
+        .remove_file_if_exists(OsStr::new(STAGED_PART))?;
+    stage
+        .directory
+        .remove_file_if_exists(OsStr::new(RESUME_BINDING))?;
+    stage
+        .directory
         .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
     stage.parent.sync().map_err(UpdateError::Io)?;
     stage.directory.sync().map_err(UpdateError::Io)?;
@@ -2856,6 +3153,15 @@ fn atomic_swap_verified(
         .remove_file_if_exists(&prepared.source_name)?;
     stage
         .directory
+        .remove_file_if_exists(OsStr::new(STAGED_VERIFIED))?;
+    stage
+        .directory
+        .remove_file_if_exists(OsStr::new(STAGED_PART))?;
+    stage
+        .directory
+        .remove_file_if_exists(OsStr::new(RESUME_BINDING))?;
+    stage
+        .directory
         .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
     stage.parent.sync().map_err(UpdateError::Io)?;
     stage.directory.sync().map_err(UpdateError::Io)?;
@@ -2877,7 +3183,7 @@ fn copy_verified_handle(
         .map_err(UpdateError::Io)?;
     let mut digest = Sha256::new();
     let mut written = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = stream_buffer();
     loop {
         let count = source.read(&mut buffer).map_err(UpdateError::Io)?;
         if count == 0 {
@@ -2912,7 +3218,7 @@ fn file_object_digest(file: &File) -> Result<String, UpdateError> {
     digest.update(b"file");
     digest.update(metadata.len().to_be_bytes());
     file.seek(SeekFrom::Start(0)).map_err(UpdateError::Io)?;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = stream_buffer();
     loop {
         let count = file.read(&mut buffer).map_err(UpdateError::Io)?;
         if count == 0 {
@@ -3083,6 +3389,7 @@ mod unit_tests {
             let mut existing = self.existing.lock().expect("existing lock");
             existing.remove(from);
             existing.insert(to.to_owned());
+            drop(existing);
             Ok(())
         }
 
@@ -3592,9 +3899,7 @@ mod unit_tests {
                 let guard = high_updater
                     .rollback_lock_for_test()
                     .expect("higher floor lock");
-                high_updater
-                    .accept_manifest_while_locked(&high_manifest, &guard)
-                    .expect("persist higher floor");
+                accept_manifest_locked(&high_manifest, &guard).expect("persist higher floor");
                 high_ready_thread.wait();
                 release_high_thread.wait();
             });

@@ -98,6 +98,7 @@ async fn help_lists_only_the_commands_the_caller_may_run() {
             "suspend-status",
             "resume-host",
             "model",
+            "session-close",
         ]
     );
 
@@ -619,6 +620,7 @@ fn every_builtin_command_lowers_to_a_distinct_effect() {
         "/suspend-status",
         "/resume-host lease-9",
         "/model fast",
+        "/session-close",
     ]
     .into_iter()
     .map(|line| {
@@ -655,6 +657,7 @@ fn every_builtin_command_lowers_to_a_distinct_effect() {
                 lease_id: "lease-9".to_owned(),
             },
             CommandEffect::SetModel("fast".to_owned()),
+            CommandEffect::DestroySession,
         ]
     );
 }
@@ -670,6 +673,7 @@ async fn a_read_only_operator_cannot_reach_write_or_admin_commands() {
         ("/goal x", "goal", OperatorScope::Write),
         ("/compact", "compact", OperatorScope::Admin),
         ("/suspend", "suspend", OperatorScope::Admin),
+        ("/session-close", "session-close", OperatorScope::Admin),
         ("/deny approval-1", "deny", OperatorScope::Approvals),
     ] {
         assert_eq!(
@@ -925,6 +929,38 @@ async fn model_default_clears_the_pin_case_insensitively() {
         .await
         .expect("the turn finishes");
     assert_eq!(fixture.provider.requests()[0].model, None);
+
+    fixture.runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn session_close_terminally_destroys_in_memory_scope() {
+    let fixture = fixture(Vec::new());
+    let session_id = session("cmd-close");
+    fixture
+        .runtime
+        .dispatch_command(&session_id, "/model pinned", ScopeSet::all())
+        .await
+        .expect("model");
+
+    assert_eq!(
+        fixture
+            .runtime
+            .dispatch_command(&session_id, "/session-close", ScopeSet::all())
+            .await
+            .expect("close"),
+        CommandOutcome::SessionDestroyed { existed: true }
+    );
+    assert_eq!(fixture.runtime.selected_model(&session_id), None);
+    assert_eq!(fixture.runtime.managed_session_ids(), Vec::new());
+    assert_eq!(
+        fixture
+            .runtime
+            .dispatch_command(&session_id, "/session-close", ScopeSet::all())
+            .await
+            .expect("idempotent close"),
+        CommandOutcome::SessionDestroyed { existed: false }
+    );
 
     fixture.runtime.shutdown().await.expect("shutdown is clean");
 }

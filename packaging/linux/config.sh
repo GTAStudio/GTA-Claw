@@ -9,15 +9,28 @@ LINUX_CLI_NAME="gta-claw-cli"
 # shellcheck disable=SC2034
 LINUX_PACKAGE_RELEASE="${PACKAGE_RELEASE:-1}"
 # shellcheck disable=SC2034
-LINUX_RUST_TOOLCHAIN="1.97.0"
+LINUX_RUST_TOOLCHAIN="1.97.1"
 # shellcheck disable=SC2034
 LINUX_GLIBC_CEILING="2.36"
 # shellcheck disable=SC2034
-LINUX_BUILD_IMAGE="rust:1.97.0-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a"
+LINUX_BUILD_IMAGE="rust:1.97.1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa"
 # shellcheck disable=SC2034
 LINUX_DEBIAN_SNAPSHOT="20260701T000000Z"
 # shellcheck disable=SC2034
 LINUX_MINIMAL_IMAGE="debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df"
+
+workspace_rust_toolchain="$(
+  awk -F'"' '$1 ~ /^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' \
+    "$REPO_ROOT/rust-toolchain.toml"
+)"
+dockerfile_rust_toolchain="$(
+  awk -F= '$1 == "ENV RUSTUP_TOOLCHAIN" { print $2; exit }' \
+    "$LINUX_DIR/Dockerfile.build"
+)"
+[[ "$workspace_rust_toolchain" == "$LINUX_RUST_TOOLCHAIN" ]] ||
+  die "Linux toolchain $LINUX_RUST_TOOLCHAIN differs from rust-toolchain.toml ($workspace_rust_toolchain)"
+[[ "$dockerfile_rust_toolchain" == "$LINUX_RUST_TOOLCHAIN" ]] ||
+  die "Dockerfile RUSTUP_TOOLCHAIN differs from pinned Linux toolchain $LINUX_RUST_TOOLCHAIN"
 
 workspace_version="$(
   awk '

@@ -43,6 +43,16 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use axum::extract::{Request, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use serde_json::json;
+
+use crate::config::HttpLimits;
+use crate::error::ApiError;
+use crate::http_support::{json_response, rejected_response};
+
 /// The stable phase label reported while the host is serving normally.
 pub const PHASE_RUNNING: &str = "running";
 /// The stable phase label reported while the host has not begun serving.
@@ -107,6 +117,55 @@ impl Default for ServingState {
 pub trait ServingStatePort: Send + Sync {
     /// Returns the serving state at this instant.
     fn serving_state(&self) -> ServingState;
+}
+
+#[derive(Clone)]
+pub(crate) struct ServingMiddlewareState {
+    pub(crate) serving: Arc<dyn ServingStatePort>,
+    pub(crate) limits: HttpLimits,
+}
+
+pub(crate) async fn require_serving(
+    State(state): State<ServingMiddlewareState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if matches!(
+        request.uri().path(),
+        "/health" | "/healthz" | "/ready" | "/readyz"
+    ) || state.serving.serving_state().accepts_work()
+    {
+        return next.run(request).await;
+    }
+    let path = request.uri().path().to_owned();
+    let body_limit = state.limits.body_limit_for_path(&path);
+    let mut response = if path == "/api/v1/admin/rpc" {
+        json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"ok":false,"error":{"type":"unavailable","message":"service is draining"}}),
+        )
+    } else if path == "/mcp" {
+        json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error":"service_draining"}),
+        )
+    } else if path.starts_with("/plugins/webhooks/") {
+        json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"ok":false,"code":"unavailable","error":"service is draining"}),
+        )
+    } else {
+        ApiError::openai(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service draining",
+            "api_error",
+        )
+        .into_response()
+    };
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    rejected_response(request, body_limit, state.limits.body_timeout, response).await
 }
 
 /// A cloneable, externally driven serving state for hosts without a full lifecycle.

@@ -9,10 +9,10 @@ use std::thread;
 use std::time::Duration;
 
 use claw_channel_sdk::{
-    BackoffSleeper, Channel, ChannelCredential, ChannelError, CredentialBinding,
-    CredentialBindingError, CredentialKind, CredentialRequest, DeliveryAcknowledgement,
-    DeliveryState, InboundMessage, OutboundMessage, OutboundRetrySafety, RetryPolicy,
-    TransportErrorKind, UnsupportedOperation, send_with_retry,
+    BackoffSleeper, Channel, ChannelCredential, ChannelError, ConfigurationError,
+    CredentialBinding, CredentialBindingError, CredentialKind, CredentialRequest,
+    DeliveryAcknowledgement, DeliveryState, InboundMessage, OutboundMessage, OutboundRetrySafety,
+    RetryPolicy, TransportErrorKind, UnsupportedOperation, send_with_retry,
 };
 use claw_channels::{
     AuthMode, ChannelCapability, ImplementationStatus, LoopbackHttpTransport, QaChannel,
@@ -246,7 +246,9 @@ fn webhook_authentication_failure_is_typed_and_body_free() {
 fn every_partial_webhook_adapter_completes_against_a_local_server() {
     let registered = registry()
         .iter()
-        .filter(|entry| entry.implementation == ImplementationStatus::OutboundWebhook)
+        .filter(|entry| {
+            entry.implementation == ImplementationStatus::OutboundWebhook || entry.id == "discord"
+        })
         .map(|entry| entry.id)
         .collect::<std::collections::BTreeSet<_>>();
     let exercised = FIXTURE_WEBHOOK_CASES
@@ -292,11 +294,10 @@ fn assert_retry_capability_matches_runtime(
 #[test]
 fn executable_channel_advertisements_match_runtime_controls() {
     let rendered = Rc::new(RefCell::new(Vec::new()));
-    for entry in registry()
-        .iter()
-        .filter(|entry| entry.implementation == ImplementationStatus::OutboundWebhook)
-    {
-        assert_eq!(entry.auth_modes, &[AuthMode::WebhookUrl]);
+    for entry in registry().iter().filter(|entry| {
+        entry.implementation == ImplementationStatus::OutboundWebhook || entry.id == "discord"
+    }) {
+        assert!(entry.auth_modes.contains(&AuthMode::WebhookUrl));
         let transport = InspectingTransport {
             rendered: Rc::clone(&rendered),
         };
@@ -355,10 +356,9 @@ fn executable_channel_advertisements_match_runtime_controls() {
 #[test]
 fn outbound_webhook_rejects_a_conversation_mismatch_before_transport() {
     let rendered = Rc::new(RefCell::new(Vec::new()));
-    for entry in registry()
-        .iter()
-        .filter(|entry| entry.implementation == ImplementationStatus::OutboundWebhook)
-    {
+    for entry in registry().iter().filter(|entry| {
+        entry.implementation == ImplementationStatus::OutboundWebhook || entry.id == "discord"
+    }) {
         let transport = InspectingTransport {
             rendered: Rc::clone(&rendered),
         };
@@ -398,10 +398,9 @@ fn outbound_webhooks_do_not_retry_ambiguous_failures() {
         NonZeroU32::new(2).expect("non-zero"),
     )
     .expect("valid retry policy");
-    for entry in registry()
-        .iter()
-        .filter(|entry| entry.implementation == ImplementationStatus::OutboundWebhook)
-    {
+    for entry in registry().iter().filter(|entry| {
+        entry.implementation == ImplementationStatus::OutboundWebhook || entry.id == "discord"
+    }) {
         let calls = Rc::new(Cell::new(0));
         let transport = FailingTransport {
             calls: Rc::clone(&calls),
@@ -480,4 +479,33 @@ fn redirect_response_is_not_treated_as_delivery() {
         server.join().expect("fixture server").body,
         br#"{"content":"hello fixture"}"#
     );
+}
+
+#[test]
+fn a_webhook_endpoint_carrying_crlf_cannot_smuggle_a_second_request() {
+    // The endpoint is a secret supplied by configuration, and the loopback
+    // transport writes it straight into the request line. Anything that could
+    // terminate that line early must be refused before a socket is opened.
+    for endpoint in [
+        "http://127.0.0.1:9/hook\r\nX-Injected: 1",
+        "http://127.0.0.1:9/hook HTTP/1.1\r\nHost: evil.example",
+        "http://127.0.0.1:9/hook\nGET /admin HTTP/1.1",
+    ] {
+        let credential = webhook_credential("slack", endpoint.to_owned());
+        let mut channel = WebhookChannel::new(
+            "slack",
+            "primary",
+            "room-1",
+            LoopbackHttpTransport,
+            FixedClock(7),
+        )
+        .expect("valid adapter");
+        assert_eq!(
+            channel.send_outbound(&outbound(), Some(&credential)),
+            Err(ChannelError::Configuration(
+                ConfigurationError::InvalidAdapterConfiguration
+            )),
+            "{endpoint:?}"
+        );
+    }
 }

@@ -2,8 +2,12 @@
 
 mod support;
 
-use claw_plugin_host::{LifecycleState, PluginHost};
-use support::{PROBE_ID, PROBE_VERSION, install_probe, probe_component, unsigned_core_policy};
+use claw_plugin_host::{LifecycleState, PluginHost, PluginToolInvocation};
+use serde_json::json;
+use support::{
+    PROBE_ID, PROBE_VERSION, install_probe, install_variant, probe_component,
+    probe_component_returning_json, unsigned_core_policy,
+};
 
 #[test]
 fn the_probe_fixture_assembles_into_a_component() {
@@ -41,4 +45,29 @@ fn the_probe_fixture_loads_activates_and_answers() {
 
     host.unload(&id).expect("unload");
     assert_eq!(host.state(&id), None);
+}
+
+#[test]
+fn typed_json_dispatch_bridges_parameters_and_guest_output() {
+    let root = support::tempdir();
+    let component = probe_component_returning_json();
+    let dir = install_variant(root.path(), "probe", &component, Vec::new());
+    let mut host = PluginHost::builder()
+        .trust_policy(unsigned_core_policy(root.path()))
+        .build()
+        .expect("host");
+    let id = host.load(&dir).expect("load");
+    host.activate(&id).expect("activate");
+
+    let parameters = json!({"message":"hello"});
+    assert_eq!(
+        host.invoke_json_tool(PluginToolInvocation {
+            plugin_id: &id,
+            tool: "x",
+            parameters: &parameters,
+            cancellation: None,
+        })
+        .expect("typed dispatch"),
+        json!({})
+    );
 }

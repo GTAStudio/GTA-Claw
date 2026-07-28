@@ -2,14 +2,38 @@
 
 set -e
 
-if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] ||
-  [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ]; then
-  if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
-    systemctl --system daemon-reload >/dev/null
-    if [ -n "${2:-}" ]; then
-      deb-systemd-invoke try-restart gta-claw-daemon.service >/dev/null
-    fi
-  fi
+if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+  case "$1" in
+    configure)
+      systemctl --system daemon-reload >/dev/null
+      if [ -n "${2:-}" ]; then
+        deb-systemd-invoke try-restart gta-claw-daemon.service >/dev/null
+      else
+        systemctl --system preset gta-claw-daemon.service >/dev/null
+      fi
+      rm -f /run/gta-claw-daemon.deb-was-active
+      rm -f /run/gta-claw-daemon.deb-was-enabled
+      ;;
+    abort-remove)
+      systemctl --system daemon-reload >/dev/null
+      if [ -e /run/gta-claw-daemon.deb-was-enabled ] &&
+        ! systemctl --system is-enabled --quiet gta-claw-daemon.service; then
+        systemctl --system enable gta-claw-daemon.service >/dev/null
+      fi
+      if [ -e /run/gta-claw-daemon.deb-was-active ] &&
+        ! systemctl --system is-active --quiet gta-claw-daemon.service; then
+        systemctl --system start gta-claw-daemon.service >/dev/null
+      fi
+      rm -f /run/gta-claw-daemon.deb-was-active
+      rm -f /run/gta-claw-daemon.deb-was-enabled
+      ;;
+    abort-upgrade | abort-deconfigure)
+      systemctl --system daemon-reload >/dev/null
+      if [ -n "${2:-}" ]; then
+        deb-systemd-invoke try-restart gta-claw-daemon.service >/dev/null
+      fi
+      ;;
+  esac
 fi
 
 exit 0

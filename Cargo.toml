@@ -71,8 +71,14 @@ claw-runtime = { path = "crates/claw-runtime", version = "0.1.0" }
 claw-security = { path = "crates/claw-security", version = "0.1.0" }
 claw-skills = { path = "crates/claw-skills", version = "0.1.0" }
 claw-tools = { path = "crates/claw-tools", version = "0.1.0" }
-serde = { version = "=1.0.228", features = ["derive"] }
-serde_json = { version = "=1.0.150", features = ["raw_value"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+# `preserve_order` is not optional: `agent-client-protocol-schema` requires it,
+# and Cargo unifies features across the workspace. Declaring it here makes the
+# resulting `serde_json::Map` ordering (insertion order, not sorted) identical
+# whether a crate is built alone with `-p` or as part of the whole workspace.
+# Leaving it implicit meant `cargo test -p claw-mcp` and `cargo test --workspace`
+# disagreed about serialized key order.
+serde_json = { version = "=1.0.151", features = ["preserve_order", "raw_value"] }
 serde_path_to_error = "=0.1.20"
 sha2 = "=0.11.0"
 
@@ -89,10 +95,52 @@ unsafe_code = "forbid"
 unsafe_op_in_unsafe_fn = "deny"
 unreachable_pub = "warn"
 
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+invalid_html_tags = "warn"
+private_intra_doc_links = "warn"
+unescaped_backticks = "warn"
+
 [workspace.lints.clippy]
-all = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# `unreachable_pub` (enabled above) and `redundant_pub_crate` are mutually
+# contradictory: satisfying either one re-triggers the other. The rustc lint is
+# the one that describes the intended visibility discipline, so it wins.
+redundant_pub_crate = "allow"
+# The frozen contract tables, wire inventories and golden fixtures are long by
+# construction. Splitting them to satisfy a line count would scatter one
+# contract across several functions and make the evidence harder to audit.
+too_many_lines = "allow"
 
 [profile.release]
 codegen-units = 1
 lto = "thin"
 strip = "symbols"
+# A panic in a supervised daemon must unwind so the surrounding task boundary can
+# report it; `panic = "abort"` would turn one poisoned request into a lost node.
+panic = "unwind"
+
+[profile.dev]
+# Backtraces and debugger line numbers without the multi-gigabyte DWARF blobs a
+# 37-crate workspace otherwise produces.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Third-party code is not being debugged, so optimise it once and keep the fast
+# edit-compile-test loop for first-party crates.
+opt-level = 2
+debug = false
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+opt-level = 2
+debug = false
+
+[profile.bench]
+codegen-units = 1
+lto = "thin"
+debug = "line-tables-only"

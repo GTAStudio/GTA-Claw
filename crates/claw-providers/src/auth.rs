@@ -104,7 +104,7 @@ pub enum AuthConfig {
         /// The access token.
         access_token: SecretField,
     },
-    /// AWS SigV4 signing material.
+    /// AWS `SigV4` signing material.
     AwsSigv4 {
         /// Access key identifier. Not secret, but required.
         access_key_id: String,
