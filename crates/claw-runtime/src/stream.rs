@@ -126,6 +126,15 @@ pub struct StreamAssembler {
     reasoning: String,
     tool_calls: Vec<ToolCall>,
     open: Vec<OpenToolCall>,
+    /// Running sum of every assembled byte: the text, the reasoning, and the name and arguments
+    /// of every completed and still-open tool call.
+    ///
+    /// The size guard runs on *every* chunk, and a provider sends one chunk per token. Deriving
+    /// this by walking `tool_calls` and `open` per chunk made a stream quadratic in the number of
+    /// tool calls it had already completed: 256 calls of 16 fragments each cost 295 µs against
+    /// 59 µs for 64 calls. Every mutation below charges this counter for exactly the bytes it
+    /// added, so the guard reads one field.
+    assembled: usize,
     next_sequence: u64,
     limit: usize,
     ended: bool,
@@ -146,6 +155,7 @@ impl StreamAssembler {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             open: Vec::new(),
+            assembled: 0,
             next_sequence: 0,
             limit,
             ended: false,
@@ -158,19 +168,32 @@ impl StreamAssembler {
     /// append to the arguments already received.
     #[must_use]
     pub fn resume(partial: PartialAssistantMessage, limit: usize) -> Self {
+        let open: Vec<OpenToolCall> = partial
+            .pending_tool_calls
+            .into_iter()
+            .map(|pending| OpenToolCall {
+                call_id: pending.call_id,
+                name: pending.name,
+                arguments: pending.partial_arguments,
+            })
+            .collect();
+        let assembled = partial.text.len()
+            + partial.reasoning.len()
+            + partial
+                .tool_calls
+                .iter()
+                .map(|call| call.name.len() + call.arguments.len())
+                .sum::<usize>()
+            + open
+                .iter()
+                .map(|open| open.name.len() + open.arguments.len())
+                .sum::<usize>();
         Self {
             text: partial.text,
             reasoning: partial.reasoning,
             tool_calls: partial.tool_calls,
-            open: partial
-                .pending_tool_calls
-                .into_iter()
-                .map(|pending| OpenToolCall {
-                    call_id: pending.call_id,
-                    name: pending.name,
-                    arguments: pending.partial_arguments,
-                })
-                .collect(),
+            open,
+            assembled,
             next_sequence: partial.next_sequence,
             limit,
             ended: false,
@@ -197,6 +220,11 @@ impl StreamAssembler {
 
     /// Feeds one chunk and returns the events it produced.
     ///
+    /// Every branch yields either no event or exactly one, so the returned `Vec` is a heap
+    /// allocation per chunk that can never hold more than one element — roughly 25 ns of the
+    /// ~35 ns this costs per chunk. Collapsing it to `Option<StreamEvent>` would remove that, but
+    /// the return type is public API and callers live outside this crate, so it stands.
+    ///
     /// # Errors
     ///
     /// Returns a [`StreamError`] when the provider violates the stream contract.
@@ -212,6 +240,7 @@ impl StreamAssembler {
                 }
                 self.reserve(text.len())?;
                 self.text.push_str(&text);
+                self.assembled = self.assembled.saturating_add(text.len());
                 Ok(vec![self.emit(StreamPayload::TextDelta { delta: text })])
             }
             ProviderChunk::ReasoningDelta { text } => {
@@ -220,6 +249,7 @@ impl StreamAssembler {
                 }
                 self.reserve(text.len())?;
                 self.reasoning.push_str(&text);
+                self.assembled = self.assembled.saturating_add(text.len());
                 Ok(vec![
                     self.emit(StreamPayload::ReasoningDelta { delta: text }),
                 ])
@@ -232,6 +262,7 @@ impl StreamAssembler {
                     return Err(StreamError::DuplicateToolCall(call_id));
                 }
                 self.reserve(name.len())?;
+                self.assembled = self.assembled.saturating_add(name.len());
                 self.open.push(OpenToolCall {
                     call_id: call_id.clone(),
                     name: name.clone(),
@@ -249,9 +280,12 @@ impl StreamAssembler {
                     .find(|open| open.call_id == call_id)
                     .ok_or_else(|| StreamError::UnknownToolCall(call_id.clone()))?;
                 open.arguments.push_str(&fragment);
+                self.assembled = self.assembled.saturating_add(fragment.len());
                 Ok(Vec::new())
             }
             ProviderChunk::ToolCallEnd { call_id } => {
+                // Moving an open call into `tool_calls` keeps the same name and arguments, so the
+                // assembled byte total does not change here.
                 let index = self
                     .open
                     .iter()
@@ -311,28 +345,20 @@ impl StreamAssembler {
         }
     }
 
+    /// Rejected: indexing the completed calls in a `HashSet<ToolCallId>` to make this O(1).
+    ///
+    /// The scan is quadratic in the number of tool calls one message contains, which looks
+    /// alarming until it is measured. Deleting the check outright — the upper bound on any index —
+    /// is worth 2% at 8 calls per message, 11% at 64 and 21% at 256. Real assistant messages carry
+    /// single-digit tool calls, so a set would pay a hash on every `ToolCallBegin` to recover at
+    /// most 2% of a shape that is already 4.5 µs.
     fn is_known(&self, call_id: &ToolCallId) -> bool {
         self.open.iter().any(|open| &open.call_id == call_id)
             || self.tool_calls.iter().any(|call| &call.call_id == call_id)
     }
 
-    fn assembled_len(&self) -> usize {
-        self.text.len()
-            + self.reasoning.len()
-            + self
-                .tool_calls
-                .iter()
-                .map(|call| call.name.len() + call.arguments.len())
-                .sum::<usize>()
-            + self
-                .open
-                .iter()
-                .map(|open| open.name.len() + open.arguments.len())
-                .sum::<usize>()
-    }
-
-    fn reserve(&self, additional: usize) -> Result<(), StreamError> {
-        let actual = self.assembled_len().saturating_add(additional);
+    const fn reserve(&self, additional: usize) -> Result<(), StreamError> {
+        let actual = self.assembled.saturating_add(additional);
         if actual > self.limit {
             return Err(StreamError::MessageTooLarge {
                 limit: self.limit,

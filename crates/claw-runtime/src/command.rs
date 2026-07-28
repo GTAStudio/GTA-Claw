@@ -950,27 +950,31 @@ impl DirectiveRegistry {
     /// Returns [`DirectiveError`] for unknown names, missing or unexpected values, and repeats.
     pub fn scan(&self, input: &str) -> Result<DirectiveScan, DirectiveError> {
         let mut directives: Vec<Directive> = Vec::new();
-        let mut body_lines: Vec<String> = Vec::new();
-        let mut fence: Option<String> = None;
+        // Body lines are borrowed from `input`, not owned: an operator paste is routinely
+        // hundreds of lines, and allocating a `String` per line cost one allocation per line
+        // plus a second full copy in the join. `\!` unescapes to `trimmed[1..]`, which is still
+        // a slice of the input, so no line needs an owned buffer.
+        let mut body_lines: Vec<&str> = Vec::new();
+        let mut fence: Option<&'static str> = None;
 
         for raw_line in input.split('\n') {
             let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
             let trimmed = line.trim_start();
 
-            if let Some(open) = fence.clone() {
-                if trimmed.starts_with(open.as_str()) {
+            if let Some(open) = fence {
+                if trimmed.starts_with(open) {
                     fence = None;
                 }
-                body_lines.push(line.to_owned());
+                body_lines.push(line);
                 continue;
             }
             if let Some(marker) = fence_marker(trimmed) {
                 fence = Some(marker);
-                body_lines.push(line.to_owned());
+                body_lines.push(line);
                 continue;
             }
-            if let Some(escaped) = trimmed.strip_prefix("\\!") {
-                body_lines.push(format!("!{escaped}"));
+            if trimmed.starts_with("\\!") {
+                body_lines.push(&trimmed[1..]);
                 continue;
             }
 
@@ -984,7 +988,7 @@ impl DirectiveRegistry {
                     }
                     directives.push(directive);
                 }
-                None => body_lines.push(line.to_owned()),
+                None => body_lines.push(line),
             }
         }
 
@@ -1082,13 +1086,10 @@ impl Default for DirectiveRegistry {
     }
 }
 
-fn fence_marker(trimmed: &str) -> Option<String> {
-    for marker in ["```", "~~~"] {
-        if trimmed.starts_with(marker) {
-            return Some(marker.to_owned());
-        }
-    }
-    None
+fn fence_marker(trimmed: &str) -> Option<&'static str> {
+    ["```", "~~~"]
+        .into_iter()
+        .find(|marker| trimmed.starts_with(marker))
 }
 
 #[cfg(test)]

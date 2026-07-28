@@ -1733,20 +1733,26 @@ impl TurnExecution {
             .await?;
         }
 
-        self.ingest(ContextItem::UserInput {
-            text: self.input.clone(),
-        })
-        .await?;
+        // The turn owns its input and ingests it exactly once, so it is moved rather than copied:
+        // an operator paste can be tens of kilobytes and the field is dead afterwards.
+        let input = std::mem::take(&mut self.input);
+        self.ingest(ContextItem::UserInput { text: input }).await?;
 
-        let tool_names: Vec<String> = if self.options.tools_enabled {
-            self.inner
-                .tool_catalogue()
-                .into_iter()
-                .map(|descriptor| descriptor.name)
-                .collect()
+        // The catalogue is resolved once per turn and kept, rather than rebuilt per tool call.
+        // `ToolPort::describe` hands back an owned `Vec<ToolDescriptor>`, so the old
+        // `executor.describe(name)` lookup below materialised — and immediately dropped — the
+        // whole catalogue on every call the model made. The executor still resolves it once more
+        // inside `execute`, which is where the gate that matters lives; this removes the second,
+        // purely advisory copy.
+        let catalogue: Vec<ToolDescriptor> = if self.options.tools_enabled {
+            self.inner.tool_catalogue()
         } else {
             Vec::new()
         };
+        let tool_names: Vec<String> = catalogue
+            .iter()
+            .map(|descriptor| descriptor.name.clone())
+            .collect();
 
         // A `!model` directive wins for this turn only; otherwise the session's `/model` selection
         // applies. Resolved once so every round of the turn runs against the same model even if an
@@ -1899,10 +1905,13 @@ impl TurnExecution {
                     continue;
                 }
 
-                let requires_approval = self
-                    .inner
-                    .executor
-                    .describe(&call.name)
+                // Rejected: keying the catalogue by name in a `HashMap` for this lookup. Deleting
+                // the scan outright — the upper bound on any index — is worth 3% of a turn at 8
+                // tool calls and 4% at 32, against a catalogue of 24 tools. Building the map would
+                // cost 24 hashes per turn to recover that.
+                let requires_approval = catalogue
+                    .iter()
+                    .find(|descriptor| descriptor.name == call.name)
                     .is_some_and(|descriptor| descriptor.requires_approval)
                     && self
                         .inner
@@ -1910,6 +1919,11 @@ impl TurnExecution {
                         .remembered(&self.session_id, &call.name)
                         .is_none();
 
+                // `call` is owned by this loop and its last borrow is the descriptor lookup above,
+                // so the invocation takes it by move. Only the name is copied out beforehand for
+                // the context item recorded after the call returns; cloning the whole `ToolCall`
+                // here would have duplicated the (frequently large) JSON argument payload.
+                let tool_name = call.name.clone();
                 if requires_approval {
                     self.advance(machine, SessionEvent::RequestApproval).await?;
                     self.emit(RuntimeEventKind::AwaitingApproval { call: call.clone() })
@@ -1926,7 +1940,7 @@ impl TurnExecution {
                         ToolInvocation {
                             session_id: self.session_id.clone(),
                             turn: self.turn,
-                            call: call.clone(),
+                            call,
                         },
                         &self.cancel,
                     )
@@ -1938,7 +1952,7 @@ impl TurnExecution {
 
                 changed_workspace |= outcome.changed_workspace;
                 self.ingest(ContextItem::ToolResult {
-                    tool_name: call.name.clone(),
+                    tool_name,
                     output: outcome.output.clone(),
                     failed: outcome.status.is_failure(),
                 })
@@ -2144,10 +2158,23 @@ impl TurnExecution {
     }
 
     async fn emit(&self, kind: RuntimeEventKind) {
+        // `RuntimeEvent::session_id` is an owned `SessionId`, so every event a turn emits copies
+        // the identifier — one allocation per streamed token. Holding it as an `Arc` would remove
+        // that, but the field is public API and the type belongs to `claw-domain`.
         let event = RuntimeEvent {
             session_id: self.session_id.clone(),
             turn: self.turn,
             kind,
+        };
+
+        // A subscriber that keeps up leaves the channel with capacity, which is the case for
+        // essentially every event a turn emits — a provider sends one chunk per token. `try_send`
+        // takes that path without constructing the select's two cancellation futures; it succeeds
+        // exactly when the `send` below would have completed on its first poll, and a closed
+        // channel drops its error just as the `drop(result)` arm does.
+        let event = match self.events.try_send(event) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
+            Err(mpsc::error::TrySendError::Full(event)) => event,
         };
 
         // A subscriber that stops reading must not be able to wedge shutdown, so the send races

@@ -77,9 +77,11 @@ struct Pending {
 #[derive(Default)]
 struct BrokerState {
     pending: HashMap<ApprovalId, Pending>,
+    // Keyed session-first so a lookup borrows both halves instead of allocating a `(String,
+    // String)` key it throws away: `remembered` runs for every approval-gated tool call.
     // Runtime TTL, LRU, reload, and terminal-destruction paths clear this through
     // `forget_session`, so its ownership matches the bounded conversation registry.
-    remembered: HashMap<(String, String), ApprovalDecision>,
+    remembered: HashMap<String, HashMap<String, ApprovalDecision>>,
     next_id: u64,
 }
 
@@ -192,9 +194,14 @@ impl ApprovalBroker {
     /// Returns the decision remembered for a tool in a session, if any.
     #[must_use]
     pub fn remembered(&self, session_id: &SessionId, tool_name: &str) -> Option<ApprovalDecision> {
-        // The key is built before the lock is taken: this runs for every approval-gated tool call.
-        let key = (session_id.as_str().to_owned(), tool_name.to_owned());
-        self.lock().remembered.get(&key).copied()
+        // Both halves of the key are borrowed: this runs for every approval-gated tool call, and
+        // the owned `(String, String)` key it used to build allocated twice per lookup only to be
+        // dropped again.
+        self.lock()
+            .remembered
+            .get(session_id.as_str())?
+            .get(tool_name)
+            .copied()
     }
 
     /// Forgets a remembered decision so the next call asks again.
@@ -202,8 +209,15 @@ impl ApprovalBroker {
     /// Returns whether a decision was actually forgotten.
     #[must_use]
     pub fn forget(&self, session_id: &SessionId, tool_name: &str) -> bool {
-        let key = (session_id.as_str().to_owned(), tool_name.to_owned());
-        self.lock().remembered.remove(&key).is_some()
+        let mut state = self.lock();
+        let Some(tools) = state.remembered.get_mut(session_id.as_str()) else {
+            return false;
+        };
+        let forgotten = tools.remove(tool_name).is_some();
+        if tools.is_empty() {
+            state.remembered.remove(session_id.as_str());
+        }
+        forgotten
     }
 
     /// Forgets every remembered decision owned by one conversation session.
@@ -213,17 +227,10 @@ impl ApprovalBroker {
     /// bounded by the same ownership policy as model selection.
     #[must_use]
     pub fn forget_session(&self, session_id: &SessionId) -> usize {
-        let before;
-        let after;
-        {
-            let mut state = self.lock();
-            before = state.remembered.len();
-            state
-                .remembered
-                .retain(|(owned_session, _), _| owned_session != session_id.as_str());
-            after = state.remembered.len();
-        }
-        before.saturating_sub(after)
+        self.lock()
+            .remembered
+            .remove(session_id.as_str())
+            .map_or(0, |tools| tools.len())
     }
 
     /// Answers one outstanding request.
@@ -247,13 +254,11 @@ impl ApprovalBroker {
                 .remove(approval_id)
                 .ok_or_else(|| ApprovalError::Unknown(approval_id.clone()))?;
             if decision.scope.is_remembered() {
-                state.remembered.insert(
-                    (
-                        pending.request.session_id.as_str().to_owned(),
-                        pending.request.tool_name.clone(),
-                    ),
-                    decision,
-                );
+                state
+                    .remembered
+                    .entry(pending.request.session_id.as_str().to_owned())
+                    .or_default()
+                    .insert(pending.request.tool_name.clone(), decision);
             }
             pending
         };
