@@ -116,6 +116,13 @@ impl BoundedIoDiagnostics {
 /// back to this working size whenever it drains completely.
 const IDLE_BUFFER_CAPACITY: usize = 64 * 1024;
 
+fn reclaim_idle_frame(frame: &mut Vec<u8>) {
+    frame.clear();
+    if frame.capacity() > IDLE_BUFFER_CAPACITY {
+        frame.shrink_to(IDLE_BUFFER_CAPACITY);
+    }
+}
+
 /// Incremental decoder for newline-delimited JSON-RPC messages.
 ///
 /// A decoder accepts arbitrarily split or coalesced byte reads. Empty lines are
@@ -434,9 +441,7 @@ where
                         // A single oversized frame must not pin its peak size
                         // for the transport's lifetime, the same policy the
                         // decoder applies to its carry-over buffer.
-                        if frame.capacity() > IDLE_BUFFER_CAPACITY {
-                            frame.shrink_to(IDLE_BUFFER_CAPACITY);
-                        }
+                        reclaim_idle_frame(&mut frame);
                         output.flush().await
                     } => result,
                 };
@@ -598,7 +603,7 @@ mod tests {
 
     use super::{
         BoundedIoTransport, DEFAULT_MAX_FRAME_BYTES, IDLE_BUFFER_CAPACITY, JsonLineDecoder,
-        McpError, encode,
+        McpError, encode, reclaim_idle_frame,
     };
 
     #[test]
@@ -756,6 +761,7 @@ mod tests {
                     .expect("a split frame must keep buffering"),
             );
         }
+
         assert!(values.is_empty(), "no terminator has arrived yet");
         values.extend(
             decoder
@@ -768,6 +774,20 @@ mod tests {
         assert!(
             decoder.buffered.capacity() < frame.len(),
             "a fully drained buffer must not pin the peak frame size"
+        );
+    }
+
+    #[test]
+    fn writer_releases_an_oversized_frame_after_the_write() {
+        let mut frame = vec![0; 4 * IDLE_BUFFER_CAPACITY];
+        let peak_capacity = frame.capacity();
+
+        reclaim_idle_frame(&mut frame);
+
+        assert!(frame.is_empty());
+        assert!(
+            frame.capacity() < peak_capacity,
+            "a written frame must not pin the peak allocation"
         );
     }
 
