@@ -1471,7 +1471,7 @@ impl ProductionService {
         let mut plugins_joined = false;
         let mut plugin_invocations_spawned = 0;
         let mut plugin_invocations_terminated = 0;
-        if let Some(plugins) = self.plugins.take() {
+        if let Some(mut plugins) = self.plugins.take() {
             let report = plugins.drain_invocations(remaining(started)).await;
             plugin_invocations_spawned = report.spawned;
             plugin_invocations_terminated = report.terminated;
@@ -1492,35 +1492,37 @@ impl ProductionService {
                     terminated = report.terminated,
                     "plugin invocation drain deadline expired"
                 );
-            }
-            let mut task = tokio::task::spawn_blocking(move || plugins.shutdown_host());
-            match tokio::time::timeout(remaining(started), &mut task).await {
-                Ok(Ok(report)) => {
-                    plugins_joined = true;
-                    if report.failed > 0 {
-                        abandoned = abandoned
-                            .saturating_add(u32::try_from(report.failed).unwrap_or(u32::MAX));
+                plugins.abandon_host();
+            } else {
+                let mut task = tokio::task::spawn_blocking(move || plugins.shutdown_host());
+                match tokio::time::timeout(remaining(started), &mut task).await {
+                    Ok(Ok(report)) => {
+                        plugins_joined = true;
+                        if report.failed > 0 {
+                            abandoned = abandoned
+                                .saturating_add(u32::try_from(report.failed).unwrap_or(u32::MAX));
+                        }
+                        info!(
+                            stage = "shutdown",
+                            subsystem = "plugins",
+                            attempted = report.attempted,
+                            failed = report.failed,
+                            "plugin shutdown complete"
+                        );
                     }
-                    info!(
-                        stage = "shutdown",
-                        subsystem = "plugins",
-                        attempted = report.attempted,
-                        failed = report.failed,
-                        "plugin shutdown complete"
-                    );
-                }
-                Ok(Err(error)) => {
-                    abandoned = abandoned.saturating_add(1);
-                    warn!(stage = "shutdown", subsystem = "plugins", error = %error);
-                }
-                Err(_) => {
-                    task.abort();
-                    abandoned = abandoned.saturating_add(1);
-                    warn!(
-                        stage = "shutdown",
-                        subsystem = "plugins",
-                        "plugin shutdown deadline expired"
-                    );
+                    Ok(Err(error)) => {
+                        abandoned = abandoned.saturating_add(1);
+                        warn!(stage = "shutdown", subsystem = "plugins", error = %error);
+                    }
+                    Err(_) => {
+                        task.abort();
+                        abandoned = abandoned.saturating_add(1);
+                        warn!(
+                            stage = "shutdown",
+                            subsystem = "plugins",
+                            "plugin shutdown deadline expired"
+                        );
+                    }
                 }
             }
         }
