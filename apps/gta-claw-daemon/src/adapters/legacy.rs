@@ -334,6 +334,7 @@ pub struct LegacyTeamsAdapter {
     app_password: SecretString,
     token: AsyncMutex<Option<CachedTeamsToken>>,
     jwt_keys: AsyncMutex<Option<CachedTeamsJwtKeys>>,
+    jwt_last_refresh: AsyncMutex<Option<Instant>>,
     replies: Mutex<VecDeque<String>>,
 }
 
@@ -424,6 +425,7 @@ impl LegacyTeamsAdapter {
             app_password,
             token: AsyncMutex::new(None),
             jwt_keys: AsyncMutex::new(None),
+            jwt_last_refresh: AsyncMutex::new(None),
             replies: Mutex::new(VecDeque::with_capacity(16)),
         }))
     }
@@ -629,19 +631,18 @@ impl LegacyTeamsAdapter {
         {
             return Ok((keys.issuer.clone(), key.clone()));
         }
-        if cached.is_some() {
+        let had_cache = cached.is_some();
+        let mut last_refresh = self.jwt_last_refresh.lock().await;
+        if had_cache
+            && last_refresh.is_some_and(|refresh| refresh.elapsed() < Duration::from_mins(1))
+        {
             return Err(invalid("Teams bearer token key id is unknown"));
         }
         let loaded = self.load_teams_jwt_keys(cancellation).await?;
-        let key = loaded
-            .keys
-            .get(key_id)
-            .cloned()
-            .ok_or_else(|| invalid("Teams bearer token key id is unknown"))?;
-        let issuer = loaded.issuer.clone();
-        *cached = Some(loaded);
+        let result = cache_refreshed_teams_keys(&mut cached, &mut last_refresh, loaded, key_id);
+        drop(last_refresh);
         drop(cached);
-        Ok((issuer, key))
+        result
     }
 
     async fn load_teams_jwt_keys(
@@ -725,6 +726,7 @@ impl LegacyTeamsAdapter {
                 return Err(PortError::new(PortErrorKind::Unavailable, "request cancelled"));
             }
         };
+
         if !response.is_success() {
             return Err(PortError::new(
                 PortErrorKind::Unavailable,
@@ -1292,6 +1294,20 @@ fn admin_argv(
     }
 }
 
+fn cache_refreshed_teams_keys(
+    cached: &mut Option<CachedTeamsJwtKeys>,
+    last_refresh: &mut Option<Instant>,
+    loaded: CachedTeamsJwtKeys,
+    key_id: &str,
+) -> Result<(String, TeamsRsaKey), PortError> {
+    let issuer = loaded.issuer.clone();
+    let key = loaded.keys.get(key_id).cloned();
+    *cached = Some(loaded);
+    *last_refresh = Some(Instant::now());
+    key.map(|key| (issuer, key))
+        .ok_or_else(|| invalid("Teams bearer token key id is unknown"))
+}
+
 fn valid_command_target(target: &str) -> bool {
     !target.is_empty()
         && target.len() <= 128
@@ -1505,14 +1521,16 @@ fn invalid(message: impl Into<String>) -> PortError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use claw_provider_sdk::{CancelToken, SecretString};
     use claw_providers::github_copilot::DeviceAuthorization;
 
     use super::{
-        LegacyDeviceFlowAdapter, WhatsAppRequestGuard, official_origin, three_floats,
-        valid_command_target,
+        CachedTeamsJwtKeys, LegacyDeviceFlowAdapter, TeamsRsaKey, WhatsAppRequestGuard,
+        cache_refreshed_teams_keys, official_origin, three_floats, valid_command_target,
     };
 
     #[test]
@@ -1559,5 +1577,36 @@ mod tests {
         });
         assert!(cancel.is_cancelled());
         assert!(slot.lock().expect("request slot").is_none());
+    }
+
+    #[test]
+    fn an_unknown_rotated_key_still_publishes_the_refreshed_key_set() {
+        let mut cached = None;
+        let mut refreshed = None;
+        let known = TeamsRsaKey {
+            modulus: "modulus".to_owned(),
+            exponent: "AQAB".to_owned(),
+            endorsements: vec!["msteams".to_owned()],
+        };
+        let loaded = CachedTeamsJwtKeys {
+            issuer: "https://api.botframework.com".to_owned(),
+            keys: BTreeMap::from([("rotated".to_owned(), known.clone())]),
+            expires_at: Instant::now() + Duration::from_mins(5),
+        };
+
+        let result =
+            cache_refreshed_teams_keys(&mut cached, &mut refreshed, loaded, "still-unknown");
+        let Err(error) = result else {
+            panic!("the requested key remains unknown");
+        };
+
+        assert_eq!(error.to_string(), "Teams bearer token key id is unknown");
+        assert!(refreshed.is_some());
+        let published = cached.expect("the successful refresh is retained");
+        assert_eq!(published.issuer, "https://api.botframework.com");
+        assert_eq!(
+            published.keys.get("rotated").map(|key| &key.modulus),
+            Some(&known.modulus)
+        );
     }
 }
