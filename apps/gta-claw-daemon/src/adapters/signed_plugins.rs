@@ -406,7 +406,7 @@ impl LogSink for PluginLogs {
 
 /// Signed plugin runtime owned by one daemon run.
 pub struct SignedPluginRuntime {
-    host: Arc<Mutex<PluginHost>>,
+    host: Option<Arc<Mutex<PluginHost>>>,
     tools: Arc<PluginToolSurface>,
     summary: PluginActivationSummary,
     shutdown: AtomicBool,
@@ -472,7 +472,7 @@ impl SignedPluginRuntime {
             ));
         }
         Ok(Self {
-            host,
+            host: Some(host),
             tools,
             summary,
             shutdown: AtomicBool::new(false),
@@ -492,9 +492,13 @@ impl SignedPluginRuntime {
     }
 
     /// Creates a `claw-skills` Wasm adapter.
+    ///
+    /// Returns [`None`] after the host was abandoned during a bounded shutdown.
     #[must_use]
-    pub fn wasm_skills(&self) -> PluginWasmSkillHost {
-        PluginWasmSkillHost::new(Arc::clone(&self.host))
+    pub fn wasm_skills(&self) -> Option<PluginWasmSkillHost> {
+        self.host
+            .as_ref()
+            .map(|host| PluginWasmSkillHost::new(Arc::clone(host)))
     }
 
     /// Refuses new tool calls and waits for every tracked invocation.
@@ -511,8 +515,13 @@ impl SignedPluginRuntime {
                 failed: 0,
             };
         }
-        let report = self
-            .host
+        let Some(host) = self.host.as_ref() else {
+            return PluginShutdownSummary {
+                attempted: 0,
+                failed: 0,
+            };
+        };
+        let report = host
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .shutdown();
@@ -524,6 +533,25 @@ impl SignedPluginRuntime {
                 .filter(|outcome| outcome.result.is_err())
                 .count(),
         }
+    }
+
+    /// Drops the host without running deactivation hooks.
+    ///
+    /// Used only after invocation drain has already exceeded its deadline, when
+    /// synchronously waiting for the host mutex would violate process shutdown.
+    pub fn abandon_host(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.tools
+            .registrations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        *self
+            .tools
+            .host
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        self.host.take();
     }
 }
 
