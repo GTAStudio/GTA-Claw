@@ -47,7 +47,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::fmt::{self, Display, Formatter, Write as _};
+use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
@@ -282,11 +282,19 @@ impl Drop for HeldStoreLock<'_> {
 }
 
 /// Returns the lowercase hex SHA-256 of an identifier, used as its filename stem.
+///
+/// The hex is written from a table rather than through `write!`: the formatting
+/// machinery cost more than seven times the digest it was encoding (233 ns
+/// against 20 ns for the SHA-256 itself, on 32 bytes), and every path this
+/// store builds goes through here — including one per goal on the per-save
+/// usage walk.
 fn digest_of(value: &str) -> String {
+    const DIGITS: [u8; 16] = *b"0123456789abcdef";
     let digest = Sha256::digest(value.as_bytes());
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        let _ = write!(hex, "{byte:02x}");
+        hex.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        hex.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     hex
 }
@@ -466,6 +474,15 @@ impl FileGoalStore {
 
     fn usage_unlocked(&self, session_id: &SessionId) -> Result<BudgetUsage, StoreError> {
         let index = self.read_index(session_id)?;
+        self.usage_of_index(&index)
+    }
+
+    /// Measures a session from an index that has already been read.
+    ///
+    /// Saving reads the index to decide whether the goal is new, and then had
+    /// to measure the session too; going back through [`Self::usage_unlocked`]
+    /// re-read and re-parsed the same file inside the same held lock.
+    fn usage_of_index(&self, index: &SessionIndex) -> Result<BudgetUsage, StoreError> {
         let mut usage = BudgetUsage {
             goals: index.goal_ids.len(),
             bytes: 0,
@@ -577,6 +594,17 @@ impl FileGoalStore {
     /// The temporary sibling is flushed before the rename and the directory holding it is flushed
     /// after, because a rename whose directory entry is still only in the page cache can be lost
     /// even though every byte of the file it names was already on the platter.
+    //
+    // Measured, with numbers: a publication costs 7.97-8.16 ms whatever it
+    // writes — 1 goal, 16, 64, or a 32-note record — because both `sync_all`
+    // calls become `F_FULLFSYNC` on macOS and the device round trip swamps
+    // everything else. For scale, encoding a fat record is 23.5 us (0.3%) and
+    // computing every digest in a 64-goal index is 75 us (0.9%). Rejected, with
+    // numbers: shaving syscalls off this path. Removing a whole fsync is the
+    // only change large enough to register, and that is the durability the
+    // hard-link/inode witness test exists to prove. CPU-side work here was
+    // therefore optimised only where it is also on a read path (see
+    // `digest_of` and `usage_of_index`), never for the sake of a save.
     fn write_atomically(&self, path: &Path, contents: &str) -> Result<(), StoreError> {
         let directory = path.parent().unwrap_or(&self.root);
         let ordinal = self.sequence.fetch_add(1, Ordering::SeqCst);
@@ -613,13 +641,24 @@ impl FileGoalStore {
     }
 
     fn read_record_at(path: &Path) -> Result<Option<GoalRecord>, StoreError> {
+        Ok(Self::read_record_sized(path)?.map(|(record, _)| record))
+    }
+
+    /// Reads a record and reports the byte length the file had when it was read.
+    ///
+    /// The length is exactly what `fs::metadata` would report for the same
+    /// file, and the read already has it, so a caller that needs both — saving,
+    /// which charges a replacement only its new size — does not follow the read
+    /// with a `stat` of the path it just finished reading.
+    fn read_record_sized(path: &Path) -> Result<Option<(GoalRecord, u64)>, StoreError> {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(io_error(path, error)),
         };
+        let bytes = text.len() as u64;
         wire::decode(&text)
-            .map(Some)
+            .map(|record| Some((record, bytes)))
             .map_err(|source| StoreError::Corrupt {
                 path: path.to_path_buf(),
                 source,
@@ -828,10 +867,10 @@ impl FileGoalStore {
         let path = self.record_path_for(record.goal_id.as_str());
 
         self.with_store_lock(|| {
-            let existing = Self::read_record_at(&path)?;
+            let existing = Self::read_record_sized(&path)?;
             let expected = existing
                 .as_ref()
-                .map_or(1, |stored| stored.revision.saturating_add(1));
+                .map_or(1, |(stored, _)| stored.revision.saturating_add(1));
             if record.revision != expected {
                 return Err(StoreError::Conflict {
                     expected,
@@ -845,10 +884,10 @@ impl FileGoalStore {
                 .iter()
                 .any(|goal_id| goal_id == record.goal_id.as_str());
 
-            let mut held = self.usage_unlocked(&record.session_id)?;
+            let mut held = self.usage_of_index(&index)?;
             if !is_new {
                 // A replacement is charged its new size, not its old size as well.
-                let existing_bytes = fs::metadata(&path).map_or(0, |metadata| metadata.len());
+                let existing_bytes = existing.map_or(0, |(_, bytes)| bytes);
                 held.bytes = held.bytes.saturating_sub(existing_bytes);
             }
             self.budget
@@ -912,7 +951,7 @@ impl GoalStorePort for FileGoalStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileGoalStore, StoreError, digest_of};
+    use super::{FileGoalStore, StoreError, WRITE_LOCK_ATTEMPTS, digest_of};
     use crate::budget::{BudgetError, GoalBudget};
     use crate::testing::{TempRoot, block_on, goal_id, record, session_id};
     use claw_application::ports::PortError;
@@ -989,7 +1028,26 @@ mod tests {
             thread::spawn(move || {
                 let candidate = record("s", "s:goal-1", "objective", 1);
                 barrier.wait();
-                store.save_blocking(&candidate)
+                // The loser is entitled to report `Busy` rather than
+                // `Conflict`: the winner publishes two records under the store
+                // lock and each publication is two `F_FULLFSYNC`s, measured at
+                // ~8 ms apiece, against a wait budget of
+                // `WRITE_LOCK_ATTEMPTS * WRITE_LOCK_RETRY_DELAY` = 64 ms. On a
+                // loaded machine the winner overruns that and the loser gives
+                // up before it ever reaches the revision check, which made this
+                // test fail roughly one run in four. Retrying through `Busy`
+                // keeps the claim exactly as strong — one commit, one refusal
+                // on revision — while making the answer a fact about
+                // serialization instead of a fact about the disk.
+                let mut outcome = store.save_blocking(&candidate);
+                for _ in 0..WRITE_LOCK_ATTEMPTS {
+                    if matches!(outcome, Err(StoreError::Busy { .. })) {
+                        outcome = store.save_blocking(&candidate);
+                    } else {
+                        break;
+                    }
+                }
+                outcome
             })
         });
         barrier.wait();

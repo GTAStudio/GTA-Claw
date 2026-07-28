@@ -438,7 +438,12 @@ impl KeywordRetriever {
         if terms.is_empty() {
             return Err(RetrievalError::EmptyQuery);
         }
-        let mut scored: Vec<RetrievedItem> = Vec::new();
+        // Scoring borrows: a record body is up to `MAX_RECORD_BYTES`, and every
+        // record that matches a single term used to be cloned in full even
+        // though at most `limit` of them survive the ranking. Candidates carry a
+        // reference until the ranking is settled, so a query over a large corpus
+        // copies `limit` records rather than every match.
+        let mut scored: Vec<Candidate<'_>> = Vec::new();
         let mut examined_records = 0_usize;
         let mut matched_records = 0_usize;
         for indexed in self.records.values() {
@@ -461,16 +466,16 @@ impl KeywordRetriever {
                           exactly inside f32's 2^24 integer range"
             )]
             let score = hits as f32 / terms.len() as f32;
-            scored.push(RetrievedItem {
-                record: indexed.record.clone(),
+            scored.push(Candidate {
+                record: &indexed.record,
                 score,
             });
             if scored.len() >= query.limit().saturating_mul(2) {
-                sort_results(&mut scored);
+                sort_candidates(&mut scored);
                 scored.truncate(query.limit());
             }
         }
-        sort_results(&mut scored);
+        sort_candidates(&mut scored);
         scored.truncate(query.limit());
         let coverage = if matched_records > scored.len() {
             RetrievalCoverage::Partial
@@ -478,7 +483,7 @@ impl KeywordRetriever {
             RetrievalCoverage::Complete
         };
         Ok(RetrievalReport {
-            items: scored,
+            items: scored.into_iter().map(Candidate::into_item).collect(),
             examined_records,
             matched_records,
             coverage,
@@ -591,20 +596,20 @@ impl<M: EmbeddingModel, I: VectorIndex> VectorRetriever<M, I> {
             .map_err(RetrievalError::Vector)?;
         let examined_records = hits.len();
         let backend_exhausted = examined_records < candidates || candidates >= self.records.len();
-        let mut scored: Vec<RetrievedItem> = Vec::new();
-        for hit in hits {
+        let mut scored: Vec<Candidate<'_>> = Vec::new();
+        for hit in &hits {
             let Some(record) = self.records.get(&hit.id) else {
                 continue;
             };
             if !query.accepts(record) {
                 continue;
             }
-            scored.push(RetrievedItem {
-                record: record.clone(),
+            scored.push(Candidate {
+                record,
                 score: hit.score,
             });
         }
-        sort_results(&mut scored);
+        sort_candidates(&mut scored);
         let matched_records = scored.len();
         scored.truncate(query.limit());
         let coverage = if backend_exhausted && matched_records <= scored.len() {
@@ -613,7 +618,7 @@ impl<M: EmbeddingModel, I: VectorIndex> VectorRetriever<M, I> {
             RetrievalCoverage::Partial
         };
         Ok(RetrievalReport {
-            items: scored,
+            items: scored.into_iter().map(Candidate::into_item).collect(),
             examined_records,
             matched_records,
             coverage,
@@ -635,7 +640,7 @@ impl<M: EmbeddingModel, I: VectorIndex> Retriever for VectorRetriever<M, I> {
 }
 
 /// Applies the crate-wide result ordering.
-fn sort_results(items: &mut [RetrievedItem]) {
+fn sort_candidates(items: &mut [Candidate<'_>]) {
     items.sort_by(|left, right| {
         right
             .score
@@ -643,6 +648,26 @@ fn sort_results(items: &mut [RetrievedItem]) {
             .then(right.record.unix_millis.cmp(&left.record.unix_millis))
             .then(left.record.id.cmp(&right.record.id))
     });
+}
+
+/// A borrowed retrieval result, ranked before anything is copied.
+///
+/// Ranking moves candidates around — the keyword retriever re-sorts its buffer
+/// every time it fills, and both retrievers truncate to the query limit — so
+/// carrying the record itself would copy bodies that are then discarded.
+struct Candidate<'a> {
+    record: &'a MemoryRecord,
+    score: f32,
+}
+
+impl Candidate<'_> {
+    /// Copies the record out, which happens once the ranking has settled.
+    fn into_item(self) -> RetrievedItem {
+        RetrievedItem {
+            record: self.record.clone(),
+            score: self.score,
+        }
+    }
 }
 
 /// A rejected retrieval request.

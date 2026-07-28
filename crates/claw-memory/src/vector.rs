@@ -27,6 +27,21 @@ pub(crate) const DEFAULT_INDEX_CAPACITY: usize = 100_000;
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Embedding {
     values: Vec<f32>,
+    /// The magnitude, computed once by the constructor that already had to
+    /// compute it to reject the zero vector.
+    ///
+    /// Cosine similarity is the inner loop of every exact search, and it needs
+    /// both magnitudes. Recomputing them there made a search over `n` records
+    /// walk the query vector `n` times and each stored vector twice, so a
+    /// scoring pass touched three times the floats it had to. The value stored
+    /// here is the one [`Embedding::new`] computed, from the same components in
+    /// the same order, so scores are bit-for-bit what they were.
+    ///
+    /// It is not part of the wire shape: it is derived from `values`, and
+    /// [`Deserialize`] reconstructs it by running the same validation the
+    /// constructor does.
+    #[serde(skip)]
+    norm: f32,
 }
 
 /// The wire shape of an [`Embedding`], before it is validated.
@@ -74,7 +89,7 @@ impl Embedding {
         if norm == 0.0 || !norm.is_finite() {
             return Err(VectorError::ZeroEmbedding);
         }
-        Ok(Self { values })
+        Ok(Self { values, norm })
     }
 
     /// Returns the components.
@@ -105,7 +120,7 @@ impl Embedding {
             .zip(other.values.iter())
             .map(|(left, right)| left * right)
             .sum();
-        Ok(dot / (norm(&self.values) * norm(&other.values)))
+        Ok(dot / (self.norm * other.norm))
     }
 }
 
@@ -407,24 +422,30 @@ impl VectorIndex for ExactVectorIndex {
         }
         // Only the running best `limit` matches are retained, so the working
         // set is bounded by the caller's limit rather than by the index size.
+        // A candidate's identifier is cloned only once it has displaced
+        // something, so a scan over a large index does not allocate a string
+        // per record it looks at and then throws away.
         let mut best: Vec<ScoredMatch> = Vec::with_capacity(limit.min(self.entries.len()));
         for (id, embedding) in &self.entries {
-            let candidate = ScoredMatch {
-                id: id.clone(),
-                score: query.cosine_similarity(embedding)?,
-            };
+            let score = query.cosine_similarity(embedding)?;
             if best.len() == limit {
                 let worst = best.last().expect("a full buffer has a last element");
-                if !ranks_before(&candidate, worst) {
+                if !ranks_before(score, id, worst) {
                     continue;
                 }
                 best.pop();
             }
             let position = best
                 .iter()
-                .position(|existing| ranks_before(&candidate, existing))
+                .position(|existing| ranks_before(score, id, existing))
                 .unwrap_or(best.len());
-            best.insert(position, candidate);
+            best.insert(
+                position,
+                ScoredMatch {
+                    id: id.clone(),
+                    score,
+                },
+            );
         }
         Ok(best)
     }
@@ -435,9 +456,9 @@ impl VectorIndex for ExactVectorIndex {
 }
 
 /// Orders two matches by descending score, then by ascending identifier.
-fn ranks_before(candidate: &ScoredMatch, existing: &ScoredMatch) -> bool {
-    match existing.score.total_cmp(&candidate.score) {
-        Ordering::Equal => candidate.id < existing.id,
+fn ranks_before(score: f32, id: &RecordId, existing: &ScoredMatch) -> bool {
+    match existing.score.total_cmp(&score) {
+        Ordering::Equal => *id < existing.id,
         Ordering::Less => true,
         Ordering::Greater => false,
     }

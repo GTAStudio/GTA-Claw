@@ -120,6 +120,15 @@ pub struct SummarizationPlan {
 ///
 /// Anchors are never part of a plan: system and pinned messages survive
 /// compaction verbatim.
+///
+/// # Cost
+///
+/// The trigger is "does the history already cost more than `trigger_percent`
+/// of the budget", and the running total only grows, so counting stops at the
+/// message that crosses the threshold. Past that point the walk is a predicate
+/// per message, which makes the token work proportional to the *budget* rather
+/// than to the conversation — the difference between a session that is a little
+/// over the trigger and one that has been running all day.
 #[must_use]
 pub fn plan_summarization<C: TokenCounter + ?Sized>(
     session: &Session,
@@ -127,34 +136,47 @@ pub fn plan_summarization<C: TokenCounter + ?Sized>(
     counter: &C,
     policy: SummarizationPolicy,
 ) -> Option<SummarizationPlan> {
-    let used: usize = session
-        .messages()
-        .iter()
-        .map(|message| counter.count_message(message))
-        .sum();
     let threshold = budget
         .available()
         .saturating_mul(policy.trigger_percent() as usize)
         / 100;
-    if used <= threshold {
+    let mut used = 0_usize;
+    let mut over_threshold = false;
+    let mut compactable = 0_usize;
+    for message in session.messages() {
+        if !message.is_anchor() {
+            compactable += 1;
+        }
+        if !over_threshold {
+            used = used.saturating_add(counter.count_message(message));
+            over_threshold = used > threshold;
+        }
+    }
+    if !over_threshold {
         return None;
     }
-    let compactable: Vec<&Message> = session
+    if compactable <= policy.keep_recent() {
+        return None;
+    }
+    let cut = compactable - policy.keep_recent();
+
+    // The run is the oldest `cut` non-anchor messages, so its bounds are the
+    // first and the `cut`-th of them. Naming them directly avoids gathering a
+    // reference to every compactable message in the session just to index twice.
+    let mut ordinary = session
         .messages()
         .iter()
-        .filter(|message| !message.is_anchor())
-        .collect();
-    if compactable.len() <= policy.keep_recent() {
-        return None;
-    }
-    let cut = compactable.len() - policy.keep_recent();
-    let run = &compactable[..cut];
-    let first = run.first()?.id;
-    let last = run.last()?.id;
+        .filter(|message| !message.is_anchor());
+    let first = ordinary.next()?.id;
+    let last = if cut == 1 {
+        first
+    } else {
+        ordinary.nth(cut - 2)?.id
+    };
     Some(SummarizationPlan {
         first,
         last,
-        message_count: run.len(),
+        message_count: cut,
         max_tokens: policy.summary_tokens(budget).max(1),
     })
 }
