@@ -21,6 +21,7 @@
 pub mod agent_runtime;
 pub mod channels;
 pub mod engine;
+pub mod gateway_pairing;
 pub mod http_api;
 pub mod ingress;
 pub mod legacy;

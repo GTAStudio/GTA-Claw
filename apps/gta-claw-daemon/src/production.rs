@@ -52,9 +52,10 @@ use url::Url;
 
 use crate::adapters::agent_runtime::{AgentRuntime, RuntimeModelTools};
 use crate::adapters::channels::{ChannelSupervisor, DiscordSettings, TelegramSettings};
+use crate::adapters::gateway_pairing::GatewayPairingStore;
 use crate::adapters::http_api::{
     AppliedReload, ConfigController, DependencyReadiness, Diagnostics, DisabledExternalPorts,
-    DurableSecurityAudit, ModelToolCatalog, OperatorAdmin, OperatorInventory,
+    DurableSecurityAudit, GatewayPairingAdmin, ModelToolCatalog, OperatorAdmin, OperatorInventory,
     OperatorRuntimeStatus, ProviderHistoryConfig, SmokeProvider, SwappableProvider,
     copilot_request_timeout_ms, updates_enabled,
 };
@@ -720,6 +721,12 @@ impl ProductionService {
         let state_dir = options.state_dir()?;
         std::fs::create_dir_all(&state_dir)
             .map_err(|error| ProductionError::new("state", error))?;
+        let gateway_pairing = GatewayPairingStore::open(state_dir.join("gateway-pairings.json"))
+            .map_err(|error| ProductionError::message("gateway-pairing", error))?;
+        diagnostics.record(format!(
+            "gateway pairing store opened with {} grants",
+            gateway_pairing.len()
+        ));
         let audit = Arc::new(
             DurableSecurityAudit::open(
                 &state_dir.join("security-audit.jsonl"),
@@ -975,12 +982,13 @@ impl ProductionService {
                 || legacy_settings.discord.is_some())
             && !provider.is_active()
         {
-            let instructions = claw_http_api::LegacyDeviceFlowPort::instructions(
-                flow.as_ref(),
-                startup_cancellation.child_token(),
-            )
-            .await
-            .map_err(|error| ProductionError::new("device-flow", error))?;
+            let instructions = tokio::select! {
+                result = claw_http_api::LegacyDeviceFlowPort::instructions(
+                    flow.as_ref(),
+                    startup_cancellation.child_token(),
+                ) => result.map_err(|error| ProductionError::new("device-flow", error))?,
+                () = startup_cancellation.cancelled() => return Err(startup_cancelled()),
+            };
             diagnostics.record(format!(
                 "channel authentication instructions prepared ({} bytes)",
                 instructions.len()
@@ -995,17 +1003,18 @@ impl ProductionService {
         .into_iter()
         .filter(|enabled| *enabled)
         .count();
-        let channel_supervisor = ChannelSupervisor::start(
-            legacy_settings.telegram.take(),
-            legacy_settings.discord.take(),
-            Arc::clone(&agent_runtime),
-            Arc::clone(&channel_authentication),
-            proxy.clone(),
-            Arc::clone(&diagnostics),
-            startup_cancellation.clone(),
-        )
-        .await
-        .map_err(|error| ProductionError::message("channels", error))?;
+        let channel_supervisor = tokio::select! {
+            result = ChannelSupervisor::start(
+                legacy_settings.telegram.take(),
+                legacy_settings.discord.take(),
+                Arc::clone(&agent_runtime),
+                Arc::clone(&channel_authentication),
+                proxy.clone(),
+                Arc::clone(&diagnostics),
+                startup_cancellation.clone(),
+            ) => result.map_err(|error| ProductionError::message("channels", error))?,
+            () = startup_cancellation.cancelled() => return Err(startup_cancelled()),
+        };
         readiness.set("channels", true);
         info!(
             stage = "channels",
@@ -1041,6 +1050,7 @@ impl ProductionService {
                 Arc::clone(&agent_runtime) as Arc<dyn OperatorRuntimeStatus>,
             ),
             Arc::clone(&reload_lock),
+            Arc::clone(&gateway_pairing) as Arc<dyn GatewayPairingAdmin>,
         ));
         let admin_token = admin_token(&loaded.snapshot)?;
         let external = Arc::new(DisabledExternalPorts);
@@ -1139,11 +1149,13 @@ impl ProductionService {
             .map_or(CredentialPolicy::None, |token| {
                 CredentialPolicy::Token(GatewaySecret::from(token))
             });
-        let gateway_authenticator = StaticAuthenticator::new(gateway_credential, gateway_clock);
-        let devices = gateway_authenticator.devices();
-        diagnostics.record(
-            "gateway is bound with no paired devices; pairing persistence has no public composition adapter",
-        );
+        let devices = gateway_pairing.devices();
+        let gateway_authenticator =
+            StaticAuthenticator::with_devices(gateway_credential, gateway_clock, devices.clone());
+        diagnostics.record(format!(
+            "gateway authorization loaded {} paired devices",
+            gateway_pairing.len()
+        ));
         let gateway = GatewayServer::new(
             gateway_config,
             Arc::new(gateway_authenticator),

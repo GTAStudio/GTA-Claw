@@ -160,6 +160,16 @@ pub trait OperatorRuntimeStatus: Send + Sync {
     ) -> PortFuture<'a, Result<Option<Value>, PortError>>;
 }
 
+/// Durable Gateway device-pairing administration.
+pub trait GatewayPairingAdmin: std::fmt::Debug + Send + Sync {
+    /// Dispatches one device/node pairing method when owned by this adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid, persistence, or internal-state failure.
+    fn dispatch(&self, method: &str, params: Option<&Value>) -> Result<Option<Value>, PortError>;
+}
+
 /// HTTP/provider-SDK bridge with a startup-populated model cache.
 #[derive(Clone, Copy, Debug)]
 pub struct ProviderHistoryConfig {
@@ -557,9 +567,20 @@ impl ProviderPort for ProviderAdapter {
             if self.ready_gate.load(Ordering::Acquire) {
                 self.readiness.set("provider", true);
             }
-            if accumulator.finish_reason().is_some() {
-                self.remember(&prepared.session_id, prepared.user, accumulator.message());
+            if accumulator.finish_reason().is_none() {
+                let error = ProviderError::new(
+                    ErrorKind::Protocol,
+                    &self.provider_name,
+                    claw_provider_sdk::Operation::StreamCompletion,
+                    "provider stream ended before its completion event",
+                );
+                self.observe_error(&error);
+                return Err(PortError::new(
+                    PortErrorKind::Unavailable,
+                    "provider stream ended before completion",
+                ));
             }
+            self.remember(&prepared.session_id, prepared.user, accumulator.message());
             Ok(http_usage(accumulator.usage()))
         })
     }
@@ -1507,6 +1528,7 @@ pub struct OperatorAdmin {
     diagnostics: Arc<Diagnostics>,
     inventory: OperatorInventory,
     reload_lock: Arc<tokio::sync::Mutex<()>>,
+    gateway_pairing: Arc<dyn GatewayPairingAdmin>,
 }
 
 impl OperatorAdmin {
@@ -1519,6 +1541,7 @@ impl OperatorAdmin {
         diagnostics: Arc<Diagnostics>,
         inventory: OperatorInventory,
         reload_lock: Arc<tokio::sync::Mutex<()>>,
+        gateway_pairing: Arc<dyn GatewayPairingAdmin>,
     ) -> Self {
         Self {
             config,
@@ -1527,6 +1550,7 @@ impl OperatorAdmin {
             diagnostics,
             inventory,
             reload_lock,
+            gateway_pairing,
         }
     }
 
@@ -1615,6 +1639,16 @@ impl AdminPort for OperatorAdmin {
                     json!({"generation": applied.generation, "changed": applied.changed})
                 }
                 _ => {
+                    if let Some(payload) = self
+                        .gateway_pairing
+                        .dispatch(&method, params.as_ref())
+                        .map_err(admin_port_failure)?
+                    {
+                        return Ok(AdminSuccess {
+                            payload,
+                            meta: None,
+                        });
+                    }
                     if let Some(payload) = self
                         .inventory
                         .runtime

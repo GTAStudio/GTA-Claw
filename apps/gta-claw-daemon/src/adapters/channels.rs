@@ -96,12 +96,14 @@ impl Drop for ChildTaskGuard {
     }
 }
 
+type RequestCancellations = Arc<Mutex<Vec<Arc<Mutex<Option<CancelToken>>>>>>;
+
 /// Owns every polling/socket task started for configured channels.
 pub struct ChannelSupervisor {
     cancellation: CancellationToken,
     tracker: TaskTracker,
     aborts: Mutex<Vec<AbortHandle>>,
-    request_cancellations: Vec<Arc<Mutex<Option<CancelToken>>>>,
+    request_cancellations: RequestCancellations,
     spawned: u64,
     terminated: Arc<AtomicU64>,
 }
@@ -109,6 +111,7 @@ pub struct ChannelSupervisor {
 struct ChannelStartGuard<'a> {
     cancellation: &'a CancellationToken,
     aborts: &'a Mutex<Vec<AbortHandle>>,
+    request_cancellations: RequestCancellations,
     armed: bool,
 }
 
@@ -124,6 +127,7 @@ impl Drop for ChannelStartGuard<'_> {
             return;
         }
         self.cancellation.cancel();
+        cancel_requests(&self.request_cancellations);
         for abort in self
             .aborts
             .lock()
@@ -138,11 +142,7 @@ impl Drop for ChannelStartGuard<'_> {
 impl Drop for ChannelSupervisor {
     fn drop(&mut self) {
         self.cancellation.cancel();
-        for slot in &self.request_cancellations {
-            if let Some(cancel) = slot.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
-                cancel.cancel();
-            }
-        }
+        cancel_requests(&self.request_cancellations);
         for abort in self
             .aborts
             .lock()
@@ -150,6 +150,18 @@ impl Drop for ChannelSupervisor {
             .iter()
         {
             abort.abort();
+        }
+    }
+}
+
+fn cancel_requests(requests: &RequestCancellations) {
+    for slot in requests
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+    {
+        if let Some(cancel) = slot.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            cancel.cancel();
         }
     }
 }
@@ -175,12 +187,13 @@ impl ChannelSupervisor {
         let tracker = TaskTracker::new();
         let terminated = Arc::new(AtomicU64::new(0));
         let aborts = Mutex::new(Vec::new());
+        let request_cancellations = Arc::new(Mutex::new(Vec::new()));
         let mut start_guard = ChannelStartGuard {
             cancellation: &cancellation,
             aborts: &aborts,
+            request_cancellations: Arc::clone(&request_cancellations),
             armed: true,
         };
-        let mut request_cancellations = Vec::new();
         let mut spawned = 0_u64;
 
         if let Some(settings) = telegram {
@@ -231,7 +244,10 @@ impl ChannelSupervisor {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(handle.abort_handle());
             drop(handle);
-            request_cancellations.push(request_cancel);
+            request_cancellations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request_cancel);
             spawned = spawned.saturating_add(1);
         }
 
@@ -337,7 +353,10 @@ impl ChannelSupervisor {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(channel_task.abort_handle());
             drop(channel_task);
-            request_cancellations.push(request_cancel);
+            request_cancellations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request_cancel);
             spawned = spawned.saturating_add(1);
             match tokio::time::timeout(CHANNEL_START_TIMEOUT, ready_rx).await {
                 Ok(Ok(Ok(()))) => {}
@@ -372,11 +391,7 @@ impl ChannelSupervisor {
     pub async fn shutdown(&self, budget: Duration) -> ChannelTaskReport {
         let started = Instant::now();
         self.cancellation.cancel();
-        for slot in &self.request_cancellations {
-            if let Some(cancel) = slot.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
-                cancel.cancel();
-            }
-        }
+        cancel_requests(&self.request_cancellations);
         self.tracker.close();
         let grace = std::cmp::min(CHANNEL_STOP_GRACE, budget / 2);
         let graceful = tokio::time::timeout(grace, self.tracker.wait())
@@ -1162,9 +1177,10 @@ fn provider_channel_error(error: &claw_provider_sdk::ProviderError) -> ChannelEr
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
+    use claw_provider_sdk::CancelToken;
     use tokio_util::sync::CancellationToken;
     use tokio_util::task::TaskTracker;
 
@@ -1177,11 +1193,16 @@ mod tests {
         let task = tracker.spawn(std::future::pending::<()>());
         let abort = task.abort_handle();
         let aborts = Mutex::new(vec![abort.clone()]);
+        let request_cancel = CancelToken::new();
+        let request_cancellations = Arc::new(Mutex::new(vec![Arc::new(Mutex::new(Some(
+            request_cancel.clone(),
+        )))]));
         drop(task);
         {
             let _guard = ChannelStartGuard {
                 cancellation: &cancellation,
                 aborts: &aborts,
+                request_cancellations,
                 armed: true,
             };
         }
@@ -1193,6 +1214,7 @@ mod tests {
         .await
         .expect("worker abort finishes");
         assert!(cancellation.is_cancelled());
+        assert!(request_cancel.is_cancelled());
         assert_eq!(
             aborts.lock().unwrap_or_else(PoisonError::into_inner).len(),
             1

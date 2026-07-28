@@ -436,7 +436,10 @@ pub async fn serve_production(
                 startup_cancellation.cancel();
                 let summary = match startup.as_mut().await {
                     Ok(service) => service.stop(None).await,
-                    Err(_) => ProductionStopSummary::before_start(),
+                    Err(error) if error.stage() == "startup" => {
+                        ProductionStopSummary::before_start()
+                    }
+                    Err(error) => return Err(Box::new(error)),
                 };
                 write_production_stop(&mut output, trigger.label(), &summary)?;
                 return Ok(summary);
@@ -445,7 +448,10 @@ pub async fn serve_production(
                 startup_cancellation.cancel();
                 let summary = match startup.as_mut().await {
                     Ok(service) => service.stop(None).await,
-                    Err(_) => ProductionStopSummary::before_start(),
+                    Err(error) if error.stage() == "startup" => {
+                        ProductionStopSummary::before_start()
+                    }
+                    Err(error) => return Err(Box::new(error)),
                 };
                 write_production_stop(&mut output, StopTrigger::Control.label(), &summary)?;
                 return Ok(summary);
