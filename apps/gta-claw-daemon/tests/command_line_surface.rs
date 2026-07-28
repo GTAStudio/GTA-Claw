@@ -1,12 +1,20 @@
 //! What an operator sees when they invoke the binary directly.
 //!
 //! The parser tests next to `CommandLine::parse` cover the mapping from
-//! arguments to a mode. They cannot observe the two things an operator
-//! actually experiences: the exit status, and which stream carries the text.
-//! `--help` exiting 1 with `Error: Custom { .. }` on standard error passed
-//! every parser test in this workspace, because no test ran the process.
+//! arguments to a mode. They cannot observe the three things an operator
+//! actually experiences: the exit status, which stream carries the text, and
+//! the exact bytes on it. `--help` exiting 1 with `Error: Custom { .. }` on
+//! standard error passed every parser test in this workspace, because no test
+//! ran the process.
+//!
+//! Assertions here compare whole streams rather than prefixes. A prefix check
+//! would still pass if the usage text were truncated, duplicated, or followed
+//! by stray output, and truncated usage is exactly the kind of regression a
+//! reader of these tests would expect them to catch.
 
 use std::process::{Command, Output};
+
+use gta_claw_daemon::production::USAGE;
 
 fn run(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
@@ -23,92 +31,93 @@ fn stderr_of(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("UTF-8 stderr")
 }
 
-#[test]
-fn help_succeeds_and_writes_only_to_stdout() {
-    for flag in ["--help", "-h"] {
-        let output = run(&[flag]);
+/// The complete successful answer: usage on stdout, nothing on stderr.
+fn assert_is_the_help_answer(output: &Output, invocation: &[&str]) {
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{invocation:?} must succeed, stderr was {:?}",
+        stderr_of(output)
+    );
+    assert_eq!(
+        stdout_of(output),
+        format!("{USAGE}\n"),
+        "{invocation:?} must print exactly the usage text"
+    );
+    assert_eq!(
+        stderr_of(output),
+        "",
+        "{invocation:?} must leave stderr untouched"
+    );
+}
 
-        assert_eq!(output.status.code(), Some(0), "{flag} must succeed");
-        assert!(
-            stdout_of(&output).starts_with("usage: gta-claw-daemon"),
-            "{flag} must print the invocation on stdout, got {:?}",
-            stdout_of(&output)
-        );
-        assert!(
-            stderr_of(&output).is_empty(),
-            "{flag} must leave stderr empty, got {:?}",
-            stderr_of(&output)
-        );
+#[test]
+fn both_help_aliases_print_exactly_the_usage_text() {
+    for alias in ["--help", "-h"] {
+        let invocation = [alias];
+        assert_is_the_help_answer(&run(&invocation), &invocation);
     }
 }
 
 #[test]
 fn help_is_answered_wherever_it_appears() {
     // `--config --help` is the case that matters most: before the scan was
-    // hoisted, the value-taking flag consumed `--help` and the daemon reported
-    // that a file named `--help` could not be read.
-    let orderings: [&[&str]; 5] = [
+    // hoisted out of the argument loop, the value-taking flag consumed
+    // `--help` and the daemon reported that a file named `--help` could not be
+    // read. The request was not refused, it was silently reinterpreted.
+    let orderings: [&[&str]; 8] = [
         &["--help", "--nonsense"],
         &["--nonsense", "--help"],
+        &["--nonsense", "-h"],
         &["--config", "--help"],
         &["--listen", "-h"],
+        &["--state-dir", "--help"],
+        &["--log-file", "-h"],
         &["--probe", "--smoke", "--help"],
     ];
 
     for ordering in orderings {
-        let output = run(ordering);
-
-        assert_eq!(
-            output.status.code(),
-            Some(0),
-            "{ordering:?} must succeed, stderr was {:?}",
-            stderr_of(&output)
-        );
-        assert!(
-            stdout_of(&output).starts_with("usage: gta-claw-daemon"),
-            "{ordering:?} must print the invocation"
-        );
+        assert_is_the_help_answer(&run(ordering), ordering);
     }
 }
 
 #[test]
-fn an_unsupported_flag_fails_on_stderr_without_a_debug_wrapper() {
+fn an_unsupported_flag_fails_with_the_usage_text_on_stderr() {
     let output = run(&["--nonsense-flag"]);
-    let stderr = stderr_of(&output);
 
+    assert_eq!(output.status.code(), Some(1));
     assert_eq!(
-        output.status.code(),
-        Some(1),
-        "a rejected command line fails"
+        stdout_of(&output),
+        "",
+        "a rejection must not write to stdout"
     );
-    assert!(
-        stdout_of(&output).is_empty(),
-        "a rejection must not write to stdout, got {:?}",
-        stdout_of(&output)
-    );
-    assert!(
-        stderr.starts_with("gta-claw-daemon: usage:"),
-        "the message must name the program and the invocation, got {stderr:?}"
-    );
-    // The original defect: `main` returned `Result`, so the message arrived
-    // wrapped in the `Debug` rendering of the error type.
-    assert!(
-        !stderr.contains("Error:") && !stderr.contains("Custom {"),
-        "the message must not be a Debug-formatted wrapper, got {stderr:?}"
-    );
+    // The original defect rendered this as
+    // `Error: Custom { kind: InvalidInput, error: "usage: ..." }`, so the
+    // whole stream is compared rather than searched for a substring.
+    assert_eq!(stderr_of(&output), format!("gta-claw-daemon: {USAGE}\n"));
 }
 
 #[test]
-fn a_flag_missing_its_value_is_still_rejected() {
+fn a_flag_missing_its_value_names_what_it_needed() {
     // The whole-command-line help scan must not turn an incomplete invocation
-    // into a help request.
-    for flag in ["--config", "--listen", "--state-dir"] {
+    // into a help request, and the diagnostic has to say which flag and what
+    // kind of value, not merely restate the usage line.
+    let expectations = [
+        ("--config", "--config requires a path"),
+        ("--listen", "--listen requires an address"),
+        ("--state-dir", "--state-dir requires a path"),
+        ("--log-file", "--log-file requires a path"),
+    ];
+
+    for (flag, reason) in expectations {
         let output = run(&[flag]);
 
         assert_eq!(output.status.code(), Some(1), "{flag} alone must fail");
-        assert!(
-            stderr_of(&output).starts_with("gta-claw-daemon: "),
-            "{flag} must explain itself on stderr"
+        assert_eq!(stdout_of(&output), "", "{flag} must not write to stdout");
+        assert_eq!(
+            stderr_of(&output),
+            format!("gta-claw-daemon: {reason}\n{USAGE}\n"),
+            "{flag} must name the flag and the value it needed"
         );
     }
 }
