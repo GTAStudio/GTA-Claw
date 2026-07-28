@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use gta_claw_daemon::production::USAGE;
+
 static NEXT_STATE: AtomicU64 = AtomicU64::new(0);
 
 struct ChildGuard {
@@ -101,9 +103,45 @@ fn one_shot_probe_exits_successfully() {
 }
 
 #[test]
+fn help_aliases_print_exact_usage_and_exit_successfully() {
+    let expected_stdout = format!("{USAGE}\n");
+
+    for flag in ["--help", "-h"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
+            .arg(flag)
+            .output()
+            .expect("daemon help starts");
+
+        assert!(output.status.success(), "{flag}");
+        assert_eq!(output.stdout, expected_stdout.as_bytes(), "{flag}");
+        assert!(output.stderr.is_empty(), "{flag}");
+    }
+}
+
+#[test]
+fn help_wins_after_unsupported_and_value_taking_flags() {
+    let expected_stdout = format!("{USAGE}\n");
+
+    for arguments in [
+        ["--nonsense", "--help"],
+        ["--config", "--help"],
+        ["--listen", "--help"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
+            .args(arguments)
+            .output()
+            .expect("daemon help starts");
+
+        assert!(output.status.success(), "{arguments:?}");
+        assert_eq!(output.stdout, expected_stdout.as_bytes(), "{arguments:?}");
+        assert!(output.stderr.is_empty(), "{arguments:?}");
+    }
+}
+
+#[test]
 fn an_unsupported_argument_is_refused_with_the_usage_line() {
     let output = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
-        .arg("--reload")
+        .arg("--nonsense")
         .output()
         .expect("daemon starts");
 
@@ -112,11 +150,20 @@ fn an_unsupported_argument_is_refused_with_the_usage_line() {
         Some(1),
         "an unsupported argument must be a plain start-up failure"
     );
+    assert!(output.stdout.is_empty());
 
     let message = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert!(
-        message.contains("usage: gta-claw-daemon"),
-        "an operator was not told how to invoke the daemon: {message:?}"
+        message.starts_with("gta-claw-daemon: usage:"),
+        "unexpected diagnostic prefix: {message:?}"
+    );
+    assert!(
+        !message.contains("Error:"),
+        "the diagnostic leaked the main Result wrapper: {message:?}"
+    );
+    assert!(
+        !message.contains("Custom {"),
+        "the diagnostic leaked the io::Error debug form: {message:?}"
     );
 }
 

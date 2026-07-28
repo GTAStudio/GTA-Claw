@@ -104,6 +104,17 @@ impl CommandLine {
     /// Returns [`io::ErrorKind::InvalidInput`] for unknown, incomplete,
     /// non-Unicode, or mutually incompatible arguments.
     pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Self> {
+        let arguments = arguments.into_iter().collect::<Vec<_>>();
+        if arguments
+            .iter()
+            .any(|argument| matches!(argument.to_str(), Some("--help" | "-h")))
+        {
+            return Ok(Self {
+                mode: CommandMode::Help,
+                options: ProductionOptions::default(),
+            });
+        }
+
         let mut mode = CommandMode::Serve;
         let mut options = ProductionOptions::default();
         let mut arguments = arguments.into_iter();
@@ -112,14 +123,6 @@ impl CommandLine {
                 return Err(usage_error());
             };
             match flag {
-                // Asking how to run the process is not a usage error, so this
-                // wins over every other flag and reports success.
-                "--help" | "-h" => {
-                    return Ok(Self {
-                        mode: CommandMode::Help,
-                        options,
-                    });
-                }
                 "--probe" if mode == CommandMode::Serve => mode = CommandMode::Probe,
                 "--check-config" if mode == CommandMode::Serve => mode = CommandMode::CheckConfig,
                 "--config" => options.config_path = Some(required_path(&mut arguments, flag)?),
@@ -2438,14 +2441,16 @@ mod tests {
     }
 
     #[test]
-    fn help_wins_over_a_later_unsupported_flag() {
+    fn help_wins_over_an_unsupported_flag_in_both_orders() {
         // A caller who cannot remember the flags is the caller most likely to
         // pair `--help` with something invalid, so the request must still be
         // answered rather than rejected.
-        let parsed = CommandLine::parse(["--help", "--nonsense"].into_iter().map(OsString::from))
-            .expect("help must not be rejected");
+        for arguments in [["--help", "--nonsense"], ["--nonsense", "--help"]] {
+            let parsed = CommandLine::parse(arguments.into_iter().map(OsString::from))
+                .expect("help must not be rejected");
 
-        assert_eq!(parsed.mode, CommandMode::Help);
+            assert_eq!(parsed.mode, CommandMode::Help, "{arguments:?}");
+        }
     }
 
     #[test]

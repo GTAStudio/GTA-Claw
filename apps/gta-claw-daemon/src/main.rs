@@ -42,6 +42,18 @@ use gta_claw_daemon::production::{
 const BLOCKING_TEARDOWN_GRACE: Duration = Duration::from_millis(250);
 
 fn main() -> std::process::ExitCode {
+    let command = match CommandLine::parse(std::env::args_os().skip(1)) {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("gta-claw-daemon: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    if command.mode == CommandMode::Help {
+        println!("{USAGE}");
+        return std::process::ExitCode::SUCCESS;
+    }
+
     // Built by hand rather than with `#[tokio::main]` so that the runtime is
     // still owned here after `run` returns, which is what makes the bounded
     // teardown below possible.
@@ -56,7 +68,7 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    let outcome = runtime.block_on(run());
+    let outcome = runtime.block_on(run(command));
 
     runtime.shutdown_timeout(BLOCKING_TEARDOWN_GRACE);
 
@@ -72,13 +84,9 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let command = CommandLine::parse(std::env::args_os().skip(1))?;
-
+async fn run(command: CommandLine) -> Result<(), Box<dyn std::error::Error>> {
     match command.mode {
-        CommandMode::Help => {
-            println!("{USAGE}");
-        }
+        CommandMode::Help => unreachable!("help exits before runtime construction"),
         CommandMode::Probe => {
             probe(io::stdout().lock())?;
         }
