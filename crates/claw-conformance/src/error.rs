@@ -7,6 +7,10 @@ use std::fmt;
 pub enum ViolationCode {
     /// An artifact could not be read.
     Io,
+    /// Claim discovery encountered a link, reparse point, or out-of-root path.
+    UnsafeTraversal,
+    /// Claim discovery exceeded one of its declared traversal bounds.
+    TraversalLimit,
     /// JSON did not satisfy its strongly typed schema.
     JsonSchema,
     /// The manifest or fixed topology drifted.
@@ -31,6 +35,8 @@ impl ViolationCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Io => "io",
+            Self::UnsafeTraversal => "unsafe_traversal",
+            Self::TraversalLimit => "traversal_limit",
             Self::JsonSchema => "json_schema",
             Self::ManifestDrift => "manifest_drift",
             Self::InventoryDrift => "inventory_drift",

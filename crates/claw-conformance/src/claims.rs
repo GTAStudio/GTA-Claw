@@ -18,6 +18,9 @@ const MAX_CARGO_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_RUST_SOURCE_BYTES: u64 = 1024 * 1024;
 const MAX_CACHED_EVIDENCE_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOTAL_REACHABLE_RUST_BYTES: usize = 128 * 1024 * 1024;
+const MAX_CLAIM_DISCOVERY_DEPTH: usize = 32;
+const MAX_CLAIM_DISCOVERY_DIRECTORIES: usize = 65_536;
+const MAX_CLAIM_DISCOVERY_FILES: usize = 20_000;
 const MAX_DISCOVERED_DIRECTORIES: usize = 65_536;
 const MAX_DISCOVERED_MANIFESTS: usize = 4096;
 const MAX_REACHABLE_RUST_SOURCES: usize = 20_000;
@@ -1203,50 +1206,236 @@ impl Registry {
 ///
 /// # Errors
 ///
-/// Returns a [`ViolationCode::Io`] error when `apps/` or `crates/` exists but a
-/// directory beneath it cannot be listed. Discovery is silent about missing
-/// top-level directories, but never about an unreadable one: skipping it would
-/// quietly drop every claim a whole subtree publishes.
+/// Returns a [`ViolationCode::Io`] error when the repository or a directory
+/// beneath it cannot be inspected, [`ViolationCode::UnsafeTraversal`] when the
+/// repository root or an entry is a symlink/reparse point or resolves outside
+/// the root, and [`ViolationCode::TraversalLimit`] when a declared bound is
+/// exceeded. Missing `apps/` and `crates/` directories are ignored.
 pub fn discover_claim_files(
     repository_root: impl AsRef<Path>,
 ) -> Result<Vec<PathBuf>, ConformanceError> {
-    let repository_root = repository_root.as_ref();
-    let mut found = Vec::new();
-    for directory in ["apps", "crates"] {
-        let start = repository_root.join(directory);
-        if start.is_dir() {
-            discover_in(&start, &mut found)?;
+    discover_claim_files_with_limits(repository_root.as_ref(), ClaimDiscoveryLimits::default())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClaimDiscoveryLimits {
+    depth: usize,
+    directories: usize,
+    files: usize,
+}
+
+impl Default for ClaimDiscoveryLimits {
+    fn default() -> Self {
+        Self {
+            depth: MAX_CLAIM_DISCOVERY_DEPTH,
+            directories: MAX_CLAIM_DISCOVERY_DIRECTORIES,
+            files: MAX_CLAIM_DISCOVERY_FILES,
         }
     }
+}
+
+#[derive(Debug)]
+struct PendingDirectory {
+    path: PathBuf,
+    depth: usize,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DirectoryIdentity {
+    #[cfg(unix)]
+    Unix { device: u64, inode: u64 },
+    #[cfg(not(unix))]
+    Canonical(PathBuf),
+}
+
+fn discover_claim_files_with_limits(
+    repository_root: &Path,
+    limits: ClaimDiscoveryLimits,
+) -> Result<Vec<PathBuf>, ConformanceError> {
+    let root_metadata = claim_discovery_metadata(repository_root)?;
+    if is_symlink_or_reparse(&root_metadata) {
+        return Err(unsafe_traversal_error(
+            repository_root,
+            "repository root must not be a symlink or reparse point",
+        ));
+    }
+    if !root_metadata.is_dir() {
+        return Err(unsafe_traversal_error(
+            repository_root,
+            "repository root must be a directory",
+        ));
+    }
+    let canonical_root = claim_discovery_canonicalize(repository_root)?;
+    let mut found = Vec::new();
+    let mut pending = Vec::new();
+    for directory in ["apps", "crates"] {
+        let start = repository_root.join(directory);
+        let metadata = match fs::symlink_metadata(&start) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(claim_discovery_io_error(&start, &error)),
+        };
+        if is_symlink_or_reparse(&metadata) {
+            return Err(unsafe_traversal_error(
+                &start,
+                "claim discovery root must not be a symlink or reparse point",
+            ));
+        }
+        if metadata.is_dir() {
+            pending.push(PendingDirectory {
+                path: start,
+                depth: 1,
+            });
+        }
+    }
+    pending.sort_by(|left, right| right.path.cmp(&left.path));
+    let mut directories_discovered = pending.len();
+    if directories_discovered > limits.directories {
+        return Err(traversal_limit_error(
+            repository_root,
+            format!(
+                "claim discovery exceeded {} directories",
+                limits.directories
+            ),
+        ));
+    }
+
+    let mut visited_identities = BTreeSet::new();
+    let mut visited_canonical_paths = BTreeSet::new();
+    let mut files_examined = 0_usize;
+    while let Some(directory) = pending.pop() {
+        if directory.depth > limits.depth {
+            return Err(traversal_limit_error(
+                &directory.path,
+                format!("claim discovery exceeded maximum depth {}", limits.depth),
+            ));
+        }
+
+        let metadata = claim_discovery_metadata(&directory.path)?;
+        if is_symlink_or_reparse(&metadata) {
+            return Err(unsafe_traversal_error(
+                &directory.path,
+                "directory entry must not be a symlink or reparse point",
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(unsafe_traversal_error(
+                &directory.path,
+                "queued claim discovery entry is no longer a directory",
+            ));
+        }
+
+        let canonical_directory = claim_discovery_canonicalize(&directory.path)?;
+        if !canonical_directory.starts_with(&canonical_root) {
+            return Err(unsafe_traversal_error(
+                &directory.path,
+                "directory resolves outside the repository root",
+            ));
+        }
+        let new_identity =
+            visited_identities.insert(directory_identity(&metadata, &canonical_directory));
+        let new_canonical_path = visited_canonical_paths.insert(canonical_directory);
+        if !new_identity || !new_canonical_path {
+            continue;
+        }
+
+        let entries = fs::read_dir(&directory.path)
+            .map_err(|error| claim_discovery_io_error(&directory.path, &error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| claim_discovery_io_error(&directory.path, &error))?;
+            let path = entry.path();
+            let metadata = claim_discovery_metadata(&path)?;
+            if is_symlink_or_reparse(&metadata) {
+                return Err(unsafe_traversal_error(
+                    &path,
+                    "claim discovery entry must not be a symlink or reparse point",
+                ));
+            }
+            if metadata.is_dir() {
+                let depth = directory.depth + 1;
+                if depth > limits.depth {
+                    return Err(traversal_limit_error(
+                        &path,
+                        format!("claim discovery exceeded maximum depth {}", limits.depth),
+                    ));
+                }
+                directories_discovered += 1;
+                if directories_discovered > limits.directories {
+                    return Err(traversal_limit_error(
+                        &path,
+                        format!(
+                            "claim discovery exceeded {} directories",
+                            limits.directories
+                        ),
+                    ));
+                }
+                pending.push(PendingDirectory { path, depth });
+                continue;
+            }
+
+            files_examined += 1;
+            if files_examined > limits.files {
+                return Err(traversal_limit_error(
+                    &path,
+                    format!("claim discovery exceeded {} files", limits.files),
+                ));
+            }
+            if metadata.is_file() && entry.file_name().to_str() == Some("conformance-claims.json") {
+                found.push(path);
+            }
+        }
+    }
+
     found.sort();
     Ok(found)
 }
 
-fn discover_in(directory: &Path, found: &mut Vec<PathBuf>) -> Result<(), ConformanceError> {
-    let entries = fs::read_dir(directory).map_err(|error| {
-        ConformanceError::new(
-            ViolationCode::Io,
-            Some(directory.display().to_string()),
-            error.to_string(),
-        )
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            ConformanceError::new(
-                ViolationCode::Io,
-                Some(directory.display().to_string()),
-                error.to_string(),
-            )
-        })?;
-        let path = entry.path();
-        if path.is_dir() {
-            discover_in(&path, found)?;
-        } else if path.file_name().and_then(|name| name.to_str()) == Some("conformance-claims.json")
-        {
-            found.push(path);
-        }
+fn claim_discovery_metadata(path: &Path) -> Result<fs::Metadata, ConformanceError> {
+    fs::symlink_metadata(path).map_err(|error| claim_discovery_io_error(path, &error))
+}
+
+fn claim_discovery_canonicalize(path: &Path) -> Result<PathBuf, ConformanceError> {
+    path.canonicalize()
+        .map_err(|error| claim_discovery_io_error(path, &error))
+}
+
+fn claim_discovery_io_error(path: &Path, error: &io::Error) -> ConformanceError {
+    ConformanceError::new(
+        ViolationCode::Io,
+        Some(path.display().to_string()),
+        error.to_string(),
+    )
+}
+
+fn unsafe_traversal_error(path: &Path, message: impl Into<String>) -> ConformanceError {
+    ConformanceError::new(
+        ViolationCode::UnsafeTraversal,
+        Some(path.display().to_string()),
+        message,
+    )
+}
+
+fn traversal_limit_error(path: &Path, message: impl Into<String>) -> ConformanceError {
+    ConformanceError::new(
+        ViolationCode::TraversalLimit,
+        Some(path.display().to_string()),
+        message,
+    )
+}
+
+#[cfg(unix)]
+fn directory_identity(metadata: &fs::Metadata, _canonical: &Path) -> DirectoryIdentity {
+    use std::os::unix::fs::MetadataExt as _;
+
+    DirectoryIdentity::Unix {
+        device: metadata.dev(),
+        inode: metadata.ino(),
     }
-    Ok(())
+}
+
+#[cfg(not(unix))]
+fn directory_identity(_metadata: &fs::Metadata, canonical: &Path) -> DirectoryIdentity {
+    DirectoryIdentity::Canonical(canonical.to_path_buf())
 }
 
 pub(crate) fn validate_evidence(
@@ -2269,6 +2458,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::env;
     use std::fs;
+    #[cfg(windows)]
+    use std::io;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
     use std::sync::Arc;
@@ -2277,9 +2468,10 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        CargoTestTargets, OrdinalPathResolver, cargo_executable, cargo_pattern_matches,
-        declares_enabled_test, load_manifest_scope, normalized_api_path, read_file_bounded,
-        resolve_cargo_executable, resolve_external_executable,
+        CargoTestTargets, ClaimDiscoveryLimits, OrdinalPathResolver, cargo_executable,
+        cargo_pattern_matches, declares_enabled_test, discover_claim_files,
+        discover_claim_files_with_limits, load_manifest_scope, normalized_api_path,
+        read_file_bounded, resolve_cargo_executable, resolve_external_executable,
     };
     use crate::ViolationCode;
 
@@ -2319,6 +2511,42 @@ mod tests {
 
     struct CompilerOracleFixture {
         root: PathBuf,
+    }
+
+    struct ClaimDiscoveryFixture {
+        root: PathBuf,
+    }
+
+    impl ClaimDiscoveryFixture {
+        fn new(name: &str) -> Self {
+            let root = env::temp_dir().join(format!(
+                "claw-conformance-claim-discovery-{name}-{}-{}",
+                std::process::id(),
+                NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).expect("create claim discovery fixture");
+            Self { root }
+        }
+
+        fn limits(
+            max_depth: usize,
+            max_directories: usize,
+            max_files: usize,
+        ) -> ClaimDiscoveryLimits {
+            ClaimDiscoveryLimits {
+                depth: max_depth,
+                directories: max_directories,
+                files: max_files,
+            }
+        }
+    }
+
+    impl Drop for ClaimDiscoveryFixture {
+        fn drop(&mut self) {
+            if self.root.exists() {
+                fs::remove_dir_all(&self.root).expect("remove claim discovery fixture");
+            }
+        }
     }
 
     fn compiler_oracle_command(cargo: &Path, root: &Path) -> Command {
@@ -2416,6 +2644,199 @@ mod tests {
                 "{variable} must be absent from compiler oracle subprocesses"
             );
         }
+    }
+
+    #[test]
+    fn claim_discovery_is_iterative_reachable_and_deterministic() {
+        let fixture = ClaimDiscoveryFixture::new("ordinary");
+        let apps_claim = fixture
+            .root
+            .join("apps")
+            .join("zeta")
+            .join("conformance-claims.json");
+        let crates_claim = fixture
+            .root
+            .join("crates")
+            .join("alpha")
+            .join("nested")
+            .join("conformance-claims.json");
+        fs::create_dir_all(apps_claim.parent().expect("apps claim parent"))
+            .expect("create apps tree");
+        fs::create_dir_all(crates_claim.parent().expect("crates claim parent"))
+            .expect("create crates tree");
+        fs::write(&apps_claim, "{}").expect("write apps claim");
+        fs::write(&crates_claim, "{}").expect("write crates claim");
+        fs::write(
+            fixture.root.join("apps").join("zeta").join("unrelated.txt"),
+            "",
+        )
+        .expect("write unrelated file");
+
+        let discovered = discover_claim_files(&fixture.root).expect("discover ordinary claims");
+
+        assert_eq!(discovered, vec![apps_claim, crates_claim]);
+    }
+
+    #[test]
+    fn claim_discovery_depth_bound_is_typed() {
+        let fixture = ClaimDiscoveryFixture::new("depth-limit");
+        fs::create_dir_all(fixture.root.join("apps").join("one").join("two"))
+            .expect("create deep claim tree");
+
+        let error = discover_claim_files_with_limits(
+            &fixture.root,
+            ClaimDiscoveryFixture::limits(2, 10, 10),
+        )
+        .expect_err("depth limit must reject deep trees");
+
+        assert_eq!(error.code(), ViolationCode::TraversalLimit);
+        assert!(error.message().contains("maximum depth 2"));
+    }
+
+    #[test]
+    fn claim_discovery_directory_bound_is_typed() {
+        let fixture = ClaimDiscoveryFixture::new("directory-limit");
+        fs::create_dir_all(fixture.root.join("apps").join("alpha"))
+            .expect("create first directory");
+        fs::create_dir_all(fixture.root.join("apps").join("beta"))
+            .expect("create second directory");
+
+        let error = discover_claim_files_with_limits(
+            &fixture.root,
+            ClaimDiscoveryFixture::limits(10, 2, 10),
+        )
+        .expect_err("directory limit must reject broad trees");
+
+        assert_eq!(error.code(), ViolationCode::TraversalLimit);
+        assert!(error.message().contains("exceeded 2 directories"));
+    }
+
+    #[test]
+    fn claim_discovery_file_bound_is_typed() {
+        let fixture = ClaimDiscoveryFixture::new("file-limit");
+        let apps = fixture.root.join("apps");
+        fs::create_dir(&apps).expect("create apps directory");
+        fs::write(apps.join("alpha.txt"), "").expect("write first file");
+        fs::write(apps.join("beta.txt"), "").expect("write second file");
+
+        let error = discover_claim_files_with_limits(
+            &fixture.root,
+            ClaimDiscoveryFixture::limits(10, 10, 1),
+        )
+        .expect_err("file limit must reject large trees");
+
+        assert_eq!(error.code(), ViolationCode::TraversalLimit);
+        assert!(error.message().contains("exceeded 1 files"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_discovery_rejects_self_symlink_cycle() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ClaimDiscoveryFixture::new("self-cycle");
+        let package = fixture.root.join("apps").join("package");
+        fs::create_dir_all(&package).expect("create package directory");
+        let cycle = package.join("self");
+        symlink(".", &cycle).expect("create self symlink");
+
+        let error = discover_claim_files(&fixture.root).expect_err("self cycle must be rejected");
+
+        assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
+        assert_eq!(error.subject(), Some(cycle.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_discovery_rejects_ancestor_symlink_cycle() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ClaimDiscoveryFixture::new("ancestor-cycle");
+        let package = fixture.root.join("apps").join("package");
+        fs::create_dir_all(&package).expect("create package directory");
+        let cycle = package.join("ancestor");
+        symlink("..", &cycle).expect("create ancestor symlink");
+
+        let error =
+            discover_claim_files(&fixture.root).expect_err("ancestor cycle must be rejected");
+
+        assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
+        assert_eq!(error.subject(), Some(cycle.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_discovery_never_traverses_outside_root_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ClaimDiscoveryFixture::new("outside-link");
+        let outside = ClaimDiscoveryFixture::new("outside-target");
+        let package = fixture.root.join("apps").join("package");
+        fs::create_dir_all(&package).expect("create package directory");
+        fs::write(outside.root.join("conformance-claims.json"), "{}").expect("write outside claim");
+        let link = package.join("outside");
+        symlink(&outside.root, &link).expect("create outside symlink");
+
+        let error =
+            discover_claim_files(&fixture.root).expect_err("outside symlink must be rejected");
+
+        assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
+        assert_eq!(error.subject(), Some(link.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_discovery_rejects_symlinked_top_level_root() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ClaimDiscoveryFixture::new("top-level-link");
+        let outside = ClaimDiscoveryFixture::new("top-level-target");
+        let apps = fixture.root.join("apps");
+        symlink(&outside.root, &apps).expect("create top-level apps symlink");
+
+        let error =
+            discover_claim_files(&fixture.root).expect_err("top-level symlink must be rejected");
+
+        assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
+        assert_eq!(error.subject(), Some(apps.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_discovery_rejects_symlink_repository_root() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ClaimDiscoveryFixture::new("root-link-parent");
+        let target = fixture.root.join("target");
+        let link = fixture.root.join("repository-link");
+        fs::create_dir(&target).expect("create repository root target");
+        symlink(&target, &link).expect("create repository root symlink");
+
+        let error = discover_claim_files(&link).expect_err("root symlink must be rejected");
+
+        assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn claim_discovery_rejects_directory_reparse_points() {
+        use std::os::windows::fs::symlink_dir;
+
+        let fixture = ClaimDiscoveryFixture::new("windows-reparse");
+        let outside = ClaimDiscoveryFixture::new("windows-reparse-target");
+        let apps = fixture.root.join("apps");
+        fs::create_dir(&apps).expect("create apps directory");
+        let link = apps.join("outside");
+        match symlink_dir(&outside.root, &link) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("create directory reparse point: {error}"),
+        }
+
+        let error =
+            discover_claim_files(&fixture.root).expect_err("reparse point must be rejected");
+
+        assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
     }
 
     #[test]
