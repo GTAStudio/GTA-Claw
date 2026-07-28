@@ -229,7 +229,7 @@ async fn read_client_messages(
                 break;
             }
             let wire_bytes = frame.len();
-            let message = match incoming {
+            let mut message = match incoming {
                 Ok(Some(message)) => message,
                 Ok(None) => break,
                 Err(error) => {
@@ -241,7 +241,7 @@ async fn read_client_messages(
             };
             if message.get("method").is_none() {
                 if is_response_message(&message) {
-                    let _ = peer.resolve_response(&message);
+                    let _ = peer.resolve_response(&mut message);
                 } else {
                     peer.respond::<serde_json::Value>(
                         response_id(&message),
@@ -251,7 +251,7 @@ async fn read_client_messages(
                 }
                 continue;
             }
-            let (method, params, id) = match message_parts(&message) {
+            let (method, params, id) = match message_parts(&mut message) {
                 Ok(parts) => parts,
                 Err(error) => {
                     peer.respond::<serde_json::Value>(response_id(&message), Err(error))
@@ -259,7 +259,7 @@ async fn read_client_messages(
                     continue;
                 }
             };
-            match (method, id) {
+            match (method.as_str(), id) {
                 ("session/update", None) => {
                     buffered_notification_bytes =
                         buffered_notification_bytes.saturating_add(wire_bytes);

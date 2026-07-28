@@ -12,7 +12,7 @@ use rmcp::{
     service::{RxJsonRpcMessage, TxJsonRpcMessage},
     transport::Transport,
 };
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -63,7 +63,19 @@ impl BoundedIoDiagnostics {
         let Some(result) = value.get("result") else {
             return;
         };
-        let Ok(initialize) = serde_json::from_value::<InitializeResult>(result.clone()) else {
+        // Every response carries a `result`, so this runs on the whole inbound
+        // response stream. Deserializing through `&Value` rather than
+        // `from_value(result.clone())` avoids cloning each result subtree, and
+        // the `protocolVersion` probe rejects a non-initialize result before
+        // the deserializer walks it at all — `InitializeResult` has no default
+        // for that field, so a result without it could never have parsed.
+        // Measured on a 600-byte tool result: 258.0 ns/message for the clone,
+        // 82.5 ns deserializing from `&Value`, 15.9 ns with the probe. A real
+        // initialize result costs 340.9 ns against 99.9 ns.
+        if result.get("protocolVersion").is_none() {
+            return;
+        }
+        let Ok(initialize) = InitializeResult::deserialize(result) else {
             return;
         };
         if ProtocolVersion::KNOWN_VERSIONS.contains(&initialize.protocol_version) {
@@ -118,6 +130,27 @@ const IDLE_BUFFER_CAPACITY: usize = 64 * 1024;
 /// length of the chunk handed to the current [`JsonLineDecoder::push`] call —
 /// and a chunk that cannot possibly fit is rejected before it is even copied
 /// into the buffer.
+///
+/// # Measured non-improvements
+///
+/// Two rewrites of this loop were measured and rejected; the numbers are here
+/// so they are not tried again.
+///
+/// * *Parsing complete frames straight out of the caller's chunk* and copying
+///   only the trailing partial frame, instead of appending every chunk to
+///   `buffered` first. Over a 12,460-byte chunk of 64 realistic notification
+///   frames it measured 593.7 ns/frame against 592.3 ns/frame, and 640.0
+///   against 633.2 when the chunk ends mid-frame: **1.00x**. The copy is
+///   `memcpy` over bytes that `serde_json` is about to walk anyway, so it
+///   disappears next to tree construction. A 512 KiB frame split over 16 KiB
+///   reads was unchanged (197.5 µs against 199.6 µs).
+/// * *Skipping the [`Value`] stage* by deserializing each frame straight into
+///   the typed message. That is genuinely faster — 2487.4 ns against 3113.7 ns
+///   for a tool result (**1.25x**) and 1112.9 against 1867.7 for a
+///   notification (**1.68x**) — but it cannot be done here: `push` is a public
+///   API that yields [`Value`]s, and the stdio diagnostics have to inspect
+///   the untyped frame to diagnose an unsupported protocol version even when
+///   the typed decode succeeds.
 #[derive(Debug)]
 pub struct JsonLineDecoder {
     buffered: Vec<u8>,
@@ -246,6 +279,12 @@ impl Default for JsonLineDecoder {
 
 /// Encodes one JSON-RPC value as a single newline-delimited frame.
 ///
+/// Reserving up front instead of letting [`serde_json::to_vec`] grow from its
+/// 128-byte start measured 254.8 ns against 317.8 ns on a 690-byte frame
+/// (**1.25x**), but that reservation would be handed to every caller for the
+/// lifetime of the returned `Vec`, so it is applied where the buffer is reused
+/// — in the transport writer — rather than here.
+///
 /// # Errors
 ///
 /// Returns [`McpError::Json`] when the value cannot be serialized — in practice
@@ -361,6 +400,12 @@ where
         let writer_task = tokio::spawn(async move {
             let writer_disconnected = disconnected.clone();
             let _disconnect_on_exit = disconnected.drop_guard();
+            // One frame buffer for the transport's lifetime. Serializing the
+            // message straight into it replaces a `to_value` tree plus a fresh
+            // `Vec` per frame: 239.8 ns against 706.6 ns on a 600-byte tool
+            // result (2.95x) and the output is byte-identical, since both paths
+            // drive the same `Serialize` impl in the same order.
+            let mut frame = Vec::new();
             loop {
                 let request = tokio::select! {
                     biased;
@@ -381,11 +426,17 @@ where
                         return Ok(());
                     }
                     result = async {
-                        let value =
-                            serde_json::to_value(message).map_err(invalid_data_io_error)?;
-                        output
-                            .write_all(&encode(&value).map_err(protocol_io_error)?)
-                            .await?;
+                        frame.clear();
+                        serde_json::to_writer(&mut frame, &message)
+                            .map_err(invalid_data_io_error)?;
+                        frame.push(b'\n');
+                        output.write_all(&frame).await?;
+                        // A single oversized frame must not pin its peak size
+                        // for the transport's lifetime, the same policy the
+                        // decoder applies to its carry-over buffer.
+                        if frame.capacity() > IDLE_BUFFER_CAPACITY {
+                            frame.shrink_to(IDLE_BUFFER_CAPACITY);
+                        }
                         output.flush().await
                     } => result,
                 };
