@@ -104,6 +104,23 @@ impl CommandLine {
     /// Returns [`io::ErrorKind::InvalidInput`] for unknown, incomplete,
     /// non-Unicode, or mutually incompatible arguments.
     pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Self> {
+        let arguments: Vec<OsString> = arguments.into_iter().collect();
+
+        // Scanned across the whole command line before anything is validated or
+        // consumed, because position must not decide whether the question is
+        // answered. Detecting it inside the loop below made `--nonsense --help`
+        // a usage error, and made `--config --help` silently treat `--help` as
+        // a file path — the flag was swallowed as the previous flag's value.
+        if arguments
+            .iter()
+            .any(|argument| matches!(argument.to_str(), Some("--help" | "-h")))
+        {
+            return Ok(Self {
+                mode: CommandMode::Help,
+                options: ProductionOptions::default(),
+            });
+        }
+
         let mut mode = CommandMode::Serve;
         let mut options = ProductionOptions::default();
         let mut arguments = arguments.into_iter();
@@ -112,14 +129,6 @@ impl CommandLine {
                 return Err(usage_error());
             };
             match flag {
-                // Asking how to run the process is not a usage error, so this
-                // wins over every other flag and reports success.
-                "--help" | "-h" => {
-                    return Ok(Self {
-                        mode: CommandMode::Help,
-                        options,
-                    });
-                }
                 "--probe" if mode == CommandMode::Serve => mode = CommandMode::Probe,
                 "--check-config" if mode == CommandMode::Serve => mode = CommandMode::CheckConfig,
                 "--config" => options.config_path = Some(required_path(&mut arguments, flag)?),
@@ -2438,14 +2447,39 @@ mod tests {
     }
 
     #[test]
-    fn help_wins_over_a_later_unsupported_flag() {
-        // A caller who cannot remember the flags is the caller most likely to
-        // pair `--help` with something invalid, so the request must still be
-        // answered rather than rejected.
-        let parsed = CommandLine::parse(["--help", "--nonsense"].into_iter().map(OsString::from))
-            .expect("help must not be rejected");
+    fn help_is_answered_regardless_of_position() {
+        // Every one of these reached a different failure before the scan was
+        // hoisted out of the loop: the unsupported flag hit the catch-all, and
+        // the value-taking flags swallowed `--help` as their own argument, so
+        // `--config --help` treated the request as a file path.
+        let orderings: [&[&str]; 7] = [
+            &["--help", "--nonsense"],
+            &["--nonsense", "--help"],
+            &["--nonsense", "-h"],
+            &["--config", "--help"],
+            &["--listen", "--help"],
+            &["--state-dir", "-h"],
+            &["--probe", "--smoke", "--help"],
+        ];
 
-        assert_eq!(parsed.mode, CommandMode::Help);
+        for ordering in orderings {
+            let parsed = CommandLine::parse(ordering.iter().copied().map(OsString::from))
+                .unwrap_or_else(|error| panic!("{ordering:?} must parse, got {error}"));
+
+            assert_eq!(parsed.mode, CommandMode::Help, "{ordering:?}");
+        }
+    }
+
+    #[test]
+    fn a_value_taking_flag_without_its_value_still_fails_without_help() {
+        // The guard above must not turn every incomplete command line into a
+        // help request; only an explicit `--help` does that.
+        for flag in ["--config", "--listen", "--state-dir", "--log-file"] {
+            let error = CommandLine::parse(std::iter::once(OsString::from(flag)))
+                .expect_err("a flag missing its value must fail");
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{flag}");
+        }
     }
 
     #[test]
