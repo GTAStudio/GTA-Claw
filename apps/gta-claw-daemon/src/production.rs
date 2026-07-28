@@ -68,7 +68,8 @@ pub const PRODUCTION_STOP_DEADLINE: Duration = Duration::from_secs(10);
 const PLUGIN_ACTIVATION_CANCEL_GRACE: Duration = Duration::from_secs(2);
 const DEFAULT_GATEWAY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const DEFAULT_MCP: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-const USAGE: &str = "usage: gta-claw-daemon [--probe | --check-config] [--config PATH] \
+/// Supported invocation, printed for `--help` and for a rejected command line.
+pub const USAGE: &str = "usage: gta-claw-daemon [--probe | --check-config] [--config PATH] \
                      [--listen ADDRESS] [--legacy-listen ADDRESS] \
                      [--gateway-listen ADDRESS] [--mcp-listen ADDRESS] [--state-dir PATH] \
                      [--log-file PATH] [--tls-terminated-by-frontend] [--smoke]";
@@ -82,6 +83,8 @@ pub enum CommandMode {
     Probe,
     /// Load and composition-check configuration without opening listeners.
     CheckConfig,
+    /// Print the supported invocation and exit successfully.
+    Help,
 }
 
 /// Parsed process command line.
@@ -109,6 +112,14 @@ impl CommandLine {
                 return Err(usage_error());
             };
             match flag {
+                // Asking how to run the process is not a usage error, so this
+                // wins over every other flag and reports success.
+                "--help" | "-h" => {
+                    return Ok(Self {
+                        mode: CommandMode::Help,
+                        options,
+                    });
+                }
                 "--probe" if mode == CommandMode::Serve => mode = CommandMode::Probe,
                 "--check-config" if mode == CommandMode::Serve => mode = CommandMode::CheckConfig,
                 "--config" => options.config_path = Some(required_path(&mut arguments, flag)?),
@@ -2414,6 +2425,27 @@ mod tests {
             .expect_err("mixed mode must fail");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn asking_for_help_is_not_a_usage_error() {
+        for flag in ["--help", "-h"] {
+            let parsed = CommandLine::parse(std::iter::once(OsString::from(flag)))
+                .unwrap_or_else(|error| panic!("{flag} must parse, got {error}"));
+
+            assert_eq!(parsed.mode, CommandMode::Help, "{flag}");
+        }
+    }
+
+    #[test]
+    fn help_wins_over_a_later_unsupported_flag() {
+        // A caller who cannot remember the flags is the caller most likely to
+        // pair `--help` with something invalid, so the request must still be
+        // answered rather than rejected.
+        let parsed = CommandLine::parse(["--help", "--nonsense"].into_iter().map(OsString::from))
+            .expect("help must not be rejected");
+
+        assert_eq!(parsed.mode, CommandMode::Help);
     }
 
     #[test]

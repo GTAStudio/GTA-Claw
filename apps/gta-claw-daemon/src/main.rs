@@ -26,7 +26,9 @@ use std::io;
 use std::time::Duration;
 
 use gta_claw_daemon::control::{probe, serve_production};
-use gta_claw_daemon::production::{CommandLine, CommandMode, check_configuration, init_telemetry};
+use gta_claw_daemon::production::{
+    CommandLine, CommandMode, USAGE, check_configuration, init_telemetry,
+};
 
 /// How long the process waits at exit for blocking work that cannot be
 /// cancelled.
@@ -39,25 +41,44 @@ use gta_claw_daemon::production::{CommandLine, CommandMode, check_configuration,
 /// avoid. This bounds that wait instead.
 const BLOCKING_TEARDOWN_GRACE: Duration = Duration::from_millis(250);
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
     // Built by hand rather than with `#[tokio::main]` so that the runtime is
     // still owned here after `run` returns, which is what makes the bounded
     // teardown below possible.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?;
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("gta-claw-daemon: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
 
     let outcome = runtime.block_on(run());
 
     runtime.shutdown_timeout(BLOCKING_TEARDOWN_GRACE);
 
-    outcome
+    // Returning `Result` from `main` would report the error with `Debug`, which
+    // prints the wrapper struct around the message instead of the message the
+    // module contract promises on standard error.
+    match outcome {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("gta-claw-daemon: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let command = CommandLine::parse(std::env::args_os().skip(1))?;
 
     match command.mode {
+        CommandMode::Help => {
+            println!("{USAGE}");
+        }
         CommandMode::Probe => {
             probe(io::stdout().lock())?;
         }
