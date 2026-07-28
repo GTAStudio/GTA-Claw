@@ -22,7 +22,7 @@
   },
   "devDependencies": {
     "@types/bunyan": "^1.8.11",
-    "@types/node": "^26.1.1",
+    "@types/node": "^26.1.2",
     "@types/restify": "^8.5.12",
     "ts-node": "^10.9.2",
     "typescript": "^7.0.2"
