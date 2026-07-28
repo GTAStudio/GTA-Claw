@@ -504,3 +504,90 @@ fn claude_discovery_reads_only_the_injected_home() {
         )
     );
 }
+
+#[test]
+fn explicit_claude_source_file_is_authoritative_and_migrates_in_isolation() {
+    let root = TestDir::new("claude-explicit-file");
+    let target = root.join("target");
+    let explicit = root.join("isolated-claude.json");
+    write(
+        &explicit,
+        r#"{
+  "mcpServers": {
+    "docs": {
+      "command": "docs-server",
+      "env": { "MCP_TOKEN": "explicit-plaintext" }
+    }
+  }
+}"#,
+    );
+    // Populate default roots with unrelated state to prove explicit source wins.
+    write(
+        &root.join("home").join(".claude").join("settings.json"),
+        r#"{"env":{"CLAUDE_ENV_SECRET":"ignored-default"}}"#,
+    );
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+
+    let plan = ClaudeMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&explicit),
+            target_root: &target,
+            overwrite: false,
+            signer: &signer,
+        })
+        .expect("plan explicit Claude source file");
+    assert_eq!(plan.result.status, MigrationStatus::Migrated);
+
+    let mut secrets = MemorySecretStore::default();
+    let mut apply = ApplyContext {
+        target_root: &target,
+        backup_root: &root.join("backup"),
+        overwrite: false,
+        secret_store: &mut secrets,
+    };
+    ClaudeMigrationProvider
+        .apply(&mut apply, &plan)
+        .expect("apply explicit file migration");
+    let migrated = read(
+        &target
+            .join("config")
+            .join("migrations")
+            .join("claude")
+            .join("claude-desktop.json"),
+    );
+    assert!(migrated.contains("\"docs-server\""));
+    assert!(migrated.contains("keyring://gta-claw/"));
+    assert!(!migrated.contains("explicit-plaintext"));
+    assert_eq!(secrets.values.len(), 1);
+    assert!(!secrets.holds("ignored-default"));
+}
+
+#[test]
+fn missing_explicit_claude_source_fails_without_default_fallback() {
+    let root = TestDir::new("claude-missing-explicit");
+    let missing = root.join("does-not-exist");
+    let target = root.join("target");
+    write(
+        &root.join("home").join(".claude").join("settings.json"),
+        r#"{"env":{"CLAUDE_ENV_SECRET":"must-not-be-imported"}}"#,
+    );
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+
+    let error = ClaudeMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&missing),
+            target_root: &target,
+            overwrite: false,
+            signer: &signer,
+        })
+        .expect_err("missing explicit source must fail");
+    assert_eq!(
+        error.to_string(),
+        format!("claude state was not found at {}", missing.display())
+    );
+    assert!(!target.exists());
+}

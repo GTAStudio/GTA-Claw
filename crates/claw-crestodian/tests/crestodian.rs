@@ -299,6 +299,34 @@ fn incompatible_config_and_state_are_detected_without_mutation() {
         std::fs::read(&state_path).expect("state preserved"),
         future_state
     );
+
+    let error = Crestodian::new(&config_path, &state_path)
+        .recover(&baseline(), 777)
+        .expect_err("recovery must refuse newer schemas");
+    match error {
+        CrestodianError::IncompatibleRecoverySchema {
+            path,
+            found,
+            supported,
+        } => {
+            assert!(
+                path == config_path || path == state_path,
+                "unexpected refusal path: {}",
+                path.display()
+            );
+            assert_eq!(found, 99);
+            assert_eq!(supported, 1);
+        }
+        other => panic!("expected incompatible-schema refusal, got {other}"),
+    }
+    assert_eq!(
+        std::fs::read(&config_path).expect("config unchanged"),
+        future_config.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(&state_path).expect("state unchanged"),
+        future_state
+    );
 }
 
 #[test]

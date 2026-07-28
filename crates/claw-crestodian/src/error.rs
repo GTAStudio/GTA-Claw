@@ -83,6 +83,15 @@ pub enum CrestodianError {
         /// Actionable validation diagnostic.
         message: String,
     },
+    /// Recovery refused to overwrite a newer or unsupported schema.
+    IncompatibleRecoverySchema {
+        /// Path whose schema is newer or unsupported.
+        path: PathBuf,
+        /// Version found in the file.
+        found: u32,
+        /// Version this build supports.
+        supported: u32,
+    },
 }
 
 impl CrestodianError {
@@ -148,6 +157,15 @@ impl Display for CrestodianError {
             Self::InvalidAnswer { field, message } => {
                 write!(formatter, "setup answer {field}: {message}")
             }
+            Self::IncompatibleRecoverySchema {
+                path,
+                found,
+                supported,
+            } => write!(
+                formatter,
+                "{}: recovery refused unsupported schema version {found} (supported {supported})",
+                path.display()
+            ),
         }
     }
 }
@@ -164,7 +182,8 @@ impl Error for CrestodianError {
             | Self::AuditDecode { .. }
             | Self::AlreadyConfigured(_)
             | Self::UnsafePath { .. }
-            | Self::InvalidAnswer { .. } => None,
+            | Self::InvalidAnswer { .. }
+            | Self::IncompatibleRecoverySchema { .. } => None,
         }
     }
 }

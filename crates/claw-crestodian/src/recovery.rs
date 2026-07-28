@@ -194,6 +194,20 @@ impl Crestodian {
             config: inspect_config_bytes(&self.config_path, original_config.as_deref()),
             state: inspect_state_bytes(&self.state_path, original_state.as_deref()),
         };
+        if let ConfigCondition::Incompatible { found, supported } = before.config {
+            return Err(CrestodianError::IncompatibleRecoverySchema {
+                path: self.config_path.clone(),
+                found,
+                supported,
+            });
+        }
+        if let StateCondition::Incompatible { found, supported } = before.state {
+            return Err(CrestodianError::IncompatibleRecoverySchema {
+                path: self.state_path.clone(),
+                found,
+                supported,
+            });
+        }
         let repair_config = !matches!(before.config, ConfigCondition::Healthy);
         let repair_state = !matches!(before.state, StateCondition::Healthy);
         if !repair_config && !repair_state {

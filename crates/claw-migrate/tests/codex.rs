@@ -490,3 +490,81 @@ fn codex_refuses_to_overwrite_an_existing_target() {
     assert_eq!(read(&occupied), "model = \"already-migrated\"\n");
     assert!(secrets.values.is_empty());
 }
+
+#[test]
+fn codex_inline_env_and_header_tables_preserve_table_shape_while_redacting_values() {
+    let root = TestDir::new("codex-inline-table");
+    let target = root.join("target");
+    let source = root.join("codex-home");
+    write(
+        &source.join("config.toml"),
+        r#"model = "gpt-5-codex"
+[mcp_servers.docs]
+command = "docs-server"
+env = { DOCS_TOKEN = "token-plaintext", REGION = "us-east-1" }
+headers = { Authorization = "Bearer abc", X_TRACE = "trace-id" }
+"#,
+    );
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+    let plan = CodexMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&source),
+            target_root: &target,
+            overwrite: false,
+            signer: &signer,
+        })
+        .expect("plan Codex inline table migration");
+    let mut secrets = MemorySecretStore::default();
+    let mut apply = ApplyContext {
+        target_root: &target,
+        backup_root: &root.join("backup"),
+        overwrite: false,
+        secret_store: &mut secrets,
+    };
+    CodexMigrationProvider
+        .apply(&mut apply, &plan)
+        .expect("apply Codex inline table migration");
+
+    let migrated = read(
+        &target
+            .join("config")
+            .join("migrations")
+            .join("codex")
+            .join("config.toml"),
+    );
+    assert!(migrated.contains("env = { DOCS_TOKEN = \"keyring://gta-claw/"));
+    assert!(migrated.contains(", REGION = \"keyring://gta-claw/"));
+    assert!(migrated.contains("headers = { Authorization = \"keyring://gta-claw/"));
+    assert!(migrated.contains(", X_TRACE = \"keyring://gta-claw/"));
+    assert!(!migrated.contains("token-plaintext"));
+    assert!(!migrated.contains("Bearer abc"));
+    assert_eq!(secrets.values.len(), 4);
+}
+
+#[test]
+fn missing_explicit_codex_source_fails_without_default_fallback() {
+    let root = TestDir::new("codex-missing-explicit");
+    let missing = root.join("does-not-exist");
+    let target = root.join("target");
+    write(
+        &root.join("home").join(".codex").join("config.toml"),
+        "model = \"default-source\"\n",
+    );
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+    let error = CodexMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&missing),
+            target_root: &target,
+            overwrite: false,
+            signer: &signer,
+        })
+        .expect_err("missing explicit source must fail");
+    assert_eq!(
+        error.to_string(),
+        format!("codex state was not found at {}", missing.display())
+    );
+}

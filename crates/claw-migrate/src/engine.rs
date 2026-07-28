@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1380,13 +1380,24 @@ fn transform_text(
                 || toml_secret_section
                 || yaml_secret_indent.is_some()
             {
-                let value = unquote(raw);
-                if value.is_empty() {
-                    line.to_owned()
+                if separator == '='
+                    && secret_container_key(normalized_key)
+                    && raw.starts_with('{')
+                    && raw.ends_with('}')
+                    && let Some(inline) =
+                        redact_inline_secret_table(raw, namespace, index, store, undo)?
+                {
+                    format!("{key}{separator} {inline}")
                 } else {
-                    let id = secret_identifier(namespace, &format!("/{index}/{normalized_key}"));
-                    let reference = route_secret(store, undo, &id, value.as_bytes())?;
-                    format!("{key}{separator} \"{reference}\"")
+                    let value = unquote(raw);
+                    if value.is_empty() {
+                        line.to_owned()
+                    } else {
+                        let id =
+                            secret_identifier(namespace, &format!("/{index}/{normalized_key}"));
+                        let reference = route_secret(store, undo, &id, value.as_bytes())?;
+                        format!("{key}{separator} \"{reference}\"")
+                    }
                 }
             } else {
                 line.to_owned()
@@ -1397,7 +1408,95 @@ fn transform_text(
         output.push_str(&transformed);
         output.push('\n');
     }
+
     write_bytes(target, output.as_bytes())
+}
+
+fn redact_inline_secret_table(
+    raw: &str,
+    namespace: &str,
+    index: usize,
+    store: &mut dyn SecretStore,
+    undo: &mut Vec<SecretUndo>,
+) -> Result<Option<String>, MigrationError> {
+    let body = raw
+        .trim()
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'));
+    let Some(body) = body else {
+        return Ok(None);
+    };
+    let entries = split_inline_table_entries(body);
+    if entries.is_empty() {
+        return Ok(Some("{ }".to_owned()));
+    }
+    let mut rewritten = Vec::with_capacity(entries.len());
+    for (position, entry) in entries.iter().enumerate() {
+        let Some((key, value)) = entry.split_once('=') else {
+            return Ok(None);
+        };
+        let key = key.trim();
+        let value = unquote(value.trim());
+        if value.is_empty() {
+            rewritten.push(format!("{key} = \"\""));
+            continue;
+        }
+        let id = secret_identifier(namespace, &format!("/{index}/inline/{position}/{key}"));
+        let reference = route_secret(store, undo, &id, value.as_bytes())?;
+        rewritten.push(format!("{key} = \"{reference}\""));
+    }
+    Ok(Some(format!("{{ {} }}", rewritten.join(", "))))
+}
+
+fn split_inline_table_entries(body: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut current = String::new();
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut escaped = false;
+    let mut depth = 0_u32;
+    for character in body.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if single_quote || double_quote => {
+                current.push(character);
+                escaped = true;
+            }
+            '\'' if !double_quote => {
+                single_quote = !single_quote;
+                current.push(character);
+            }
+            '"' if !single_quote => {
+                double_quote = !double_quote;
+                current.push(character);
+            }
+            '{' | '[' if !single_quote && !double_quote => {
+                depth += 1;
+                current.push(character);
+            }
+            '}' | ']' if !single_quote && !double_quote && depth > 0 => {
+                depth -= 1;
+                current.push(character);
+            }
+            ',' if !single_quote && !double_quote && depth == 0 => {
+                let entry = current.trim();
+                if !entry.is_empty() {
+                    entries.push(entry.to_owned());
+                }
+                current.clear();
+            }
+            _ => current.push(character),
+        }
+    }
+    let tail = current.trim();
+    if !tail.is_empty() {
+        entries.push(tail.to_owned());
+    }
+    entries
 }
 
 fn import_environment(
@@ -1578,7 +1677,9 @@ fn reject_executable_file(path: &Path) -> Result<(), MigrationError> {
 pub(crate) fn digest_path(path: &Path) -> Result<String, MigrationError> {
     reject_symlink(path)?;
     if path.is_file() {
-        return Ok(digest_bytes(&read_bytes(path)?));
+        let mut hasher = Sha256::new();
+        hash_file(path, &mut hasher)?;
+        return Ok(encode_hex(&hasher.finalize()));
     }
     if !path.is_dir() {
         return Err(MigrationError::SourceNotFound {
@@ -1614,9 +1715,32 @@ fn digest_directory(
         if file_type.is_dir() {
             digest_directory(root, &path, hasher)?;
         } else if file_type.is_file() {
-            hasher.update(read_bytes(&path)?);
+            hash_file(&path, hasher)?;
         }
         hasher.update([0xff]);
+    }
+    Ok(())
+}
+
+fn hash_file(path: &Path, hasher: &mut Sha256) -> Result<(), MigrationError> {
+    let mut file = fs::File::open(path).map_err(|source| MigrationError::Io {
+        action: "read",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|source| MigrationError::Io {
+                action: "read",
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
     }
     Ok(())
 }

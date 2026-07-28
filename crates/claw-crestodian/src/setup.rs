@@ -329,11 +329,9 @@ pub(crate) fn restore_paths<const N: usize>(
 
 /// Puts one path back exactly as it was, byte for byte or absent.
 ///
-/// The rollback deliberately drops the [`claw_config::WriteWarning`] values the
-/// republication may raise: this runs while an operation is already failing, its
-/// result is folded into a [`RestoreFailure`] list that carries only a path and
-/// a message, and there is no caller here to hand a durability caveat to. Losing
-/// them is the price of not losing the original bytes.
+/// Any non-fatal write warnings during republication are promoted into the
+/// rollback failure message so callers can see durability caveats alongside
+/// hard rollback failures.
 fn restore_path(path: &Path, original: Option<&[u8]>) -> Result<(), String> {
     let Some(bytes) = original else {
         return match fs::remove_file(path) {
@@ -351,6 +349,21 @@ fn restore_path(path: &Path, original: Option<&[u8]>) -> Result<(), String> {
     };
     ensure_parent_directory(path).map_err(|error| error.to_string())?;
     let restored = write_bytes_atomically(path, bytes).map_err(|error| error.to_string())?;
-    drop(restored.warnings);
+    if !restored.warnings.is_empty() {
+        let warning = restored
+            .warnings
+            .into_iter()
+            .map(|warning| match warning {
+                WriteWarning::BackupCleanupFailed { path, message } => {
+                    format!("backup cleanup failed at {}: {message}", path.display())
+                }
+                WriteWarning::DirectorySyncFailed { path, message } => {
+                    format!("directory sync failed at {}: {message}", path.display())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("restore durability warning: {warning}"));
+    }
     Ok(())
 }

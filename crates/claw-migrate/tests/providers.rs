@@ -1134,3 +1134,53 @@ fn apply_refuses_a_dangling_symlink_planted_at_a_target() {
     assert!(!root.join("backup").exists());
     assert_eq!(secrets.values, BTreeMap::new());
 }
+
+#[test]
+fn missing_explicit_source_is_authoritative_for_every_provider() {
+    let root = TestDir::new("explicit-authority");
+    let missing = root.join("missing-source");
+    let target = root.join("target");
+    write(
+        &root.join("home").join(".claude").join("settings.json"),
+        r#"{"env":{"CLAUDE_ENV_SECRET":"fallback-must-not-load"}}"#,
+    );
+    write(
+        &root.join("home").join(".codex").join("config.toml"),
+        "model = \"fallback\"\n",
+    );
+    write(
+        &root.join("home").join(".hermes").join("config.yaml"),
+        "default_model: fallback\n",
+    );
+    let paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+
+    for (provider, label) in [
+        (
+            Box::new(ClaudeMigrationProvider) as Box<dyn MigrationProvider>,
+            "claude",
+        ),
+        (
+            Box::new(CodexMigrationProvider) as Box<dyn MigrationProvider>,
+            "codex",
+        ),
+        (
+            Box::new(HermesMigrationProvider) as Box<dyn MigrationProvider>,
+            "hermes",
+        ),
+    ] {
+        let error = provider
+            .plan(&PlanContext {
+                paths: &paths,
+                source: Some(&missing),
+                target_root: &target,
+                overwrite: false,
+                signer: &signer,
+            })
+            .expect_err("missing explicit source must fail without fallback");
+        assert_eq!(
+            error.to_string(),
+            format!("{label} state was not found at {}", missing.display())
+        );
+    }
+}

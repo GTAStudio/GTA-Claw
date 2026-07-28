@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::io::atomic_write_bytes;
-use crate::{CONFIG_SCHEMA_VERSION, ConfigError, parse_json5, write_file};
+use crate::{CONFIG_SCHEMA_VERSION, ConfigError, parse_json5, to_json5};
 
 static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -48,6 +49,20 @@ pub enum ConfigMigrationError {
         /// Current implementation version.
         current: u32,
     },
+    /// A migration lock could not be acquired.
+    Lock {
+        /// Lock file path.
+        path: PathBuf,
+        /// Operating-system failure.
+        source: io::Error,
+    },
+    /// The source changed after review and before publication.
+    ConcurrentEdit {
+        /// Migrated configuration path.
+        config_path: PathBuf,
+        /// Durable backup containing the concurrent bytes.
+        backup_path: PathBuf,
+    },
     /// Backup creation failed before any destructive operation.
     Backup {
         /// Intended backup path.
@@ -82,6 +97,23 @@ impl Display for ConfigMigrationError {
                     path.display()
                 )
             }
+            Self::Lock { path, source } => {
+                write!(
+                    formatter,
+                    "{}: could not acquire migration lock: {source}",
+                    path.display()
+                )
+            }
+            Self::ConcurrentEdit {
+                config_path,
+                backup_path,
+            } => write!(
+                formatter,
+                "{}: concurrent edit detected; migration refused to overwrite newer bytes and \
+                 backed them up at {}",
+                config_path.display(),
+                backup_path.display()
+            ),
             Self::Restore {
                 migration,
                 restore,
@@ -100,9 +132,11 @@ impl Error for ConfigMigrationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Config(error) => Some(error),
-            Self::Backup { source, .. } => Some(source),
+            Self::Backup { source, .. } | Self::Lock { source, .. } => Some(source),
             Self::Restore { migration, .. } => Some(migration),
-            Self::MissingVersion | Self::UnsupportedPath { .. } => None,
+            Self::MissingVersion | Self::UnsupportedPath { .. } | Self::ConcurrentEdit { .. } => {
+                None
+            }
         }
     }
 }
@@ -153,7 +187,15 @@ impl From<ConfigError> for ConfigMigrationError {
 pub fn migrate_config_file(
     path: impl AsRef<Path>,
 ) -> Result<ConfigMigrationOutcome, ConfigMigrationError> {
+    migrate_config_file_with_precommit(path, |_| {})
+}
+
+fn migrate_config_file_with_precommit(
+    path: impl AsRef<Path>,
+    mut precommit: impl FnMut(&Path),
+) -> Result<ConfigMigrationOutcome, ConfigMigrationError> {
     let path = path.as_ref();
+    let _lock = MigrationLock::acquire(path)?;
     let source = fs::read(path).map_err(|source| ConfigError::io(path, source))?;
     let text = std::str::from_utf8(&source).map_err(|error| ConfigError::Syntax {
         source_name: path.display().to_string(),
@@ -189,17 +231,33 @@ pub fn migrate_config_file(
     let candidate_source =
         json5::to_string(&document).map_err(|error| ConfigError::Serialize(error.to_string()))?;
     let candidate = parse_json5(&candidate_source, &path.display().to_string())?;
+    let destination_bytes = to_json5(&candidate)
+        .map_err(ConfigMigrationError::Config)?
+        .into_bytes();
+    let source_digest = digest_hex(&source);
 
     let backup_path = create_backup(path, &source)?;
-    if let Err(migration) = write_file(path, &candidate) {
-        if let Err(restore) = atomic_write_bytes(path, &source, || Ok(())) {
-            return Err(ConfigMigrationError::Restore {
-                migration,
-                restore,
-                backup_path,
+    let mut conflict_backup = None;
+    if let Err(source) = atomic_write_bytes(path, &destination_bytes, || {
+        precommit(path);
+        let current = fs::read(path)?;
+        if digest_hex(&current) != source_digest {
+            let backup = create_backup_io(path, &current)?;
+            conflict_backup = Some(backup);
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "concurrent edit detected",
+            ));
+        }
+        Ok(())
+    }) {
+        if let Some(concurrent_backup) = conflict_backup {
+            return Err(ConfigMigrationError::ConcurrentEdit {
+                config_path: path.to_owned(),
+                backup_path: concurrent_backup,
             });
         }
-        return Err(ConfigMigrationError::Config(migration));
+        return Err(ConfigMigrationError::Config(ConfigError::io(path, source)));
     }
     Ok(ConfigMigrationOutcome::Migrated(ConfigMigrationRecord {
         config_path: path.to_owned(),
@@ -229,6 +287,13 @@ pub fn rollback_config_migration(
 }
 
 fn create_backup(path: &Path, bytes: &[u8]) -> Result<PathBuf, ConfigMigrationError> {
+    create_backup_io(path, bytes).map_err(|source| ConfigMigrationError::Backup {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+fn create_backup_io(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     for _ in 0..128 {
         let sequence = BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let backup_path = path.with_file_name(format!(
@@ -248,32 +313,77 @@ fn create_backup(path: &Path, bytes: &[u8]) -> Result<PathBuf, ConfigMigrationEr
                 file.write_all(bytes)
                     .and_then(|()| file.flush())
                     .and_then(|()| file.sync_all())
-                    .map_err(|source| ConfigMigrationError::Backup {
-                        path: backup_path.clone(),
-                        source,
-                    })?;
-                sync_parent(&backup_path).map_err(|source| ConfigMigrationError::Backup {
-                    path: backup_path.clone(),
-                    source,
-                })?;
+                    .map_err(|source| io::Error::new(source.kind(), source.to_string()))?;
+                sync_parent(&backup_path)?;
                 return Ok(backup_path);
             }
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(source) => {
-                return Err(ConfigMigrationError::Backup {
-                    path: backup_path,
-                    source,
-                });
-            }
+            Err(source) => return Err(source),
         }
     }
-    Err(ConfigMigrationError::Backup {
-        path: path.to_owned(),
-        source: io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not allocate a unique migration backup",
-        ),
-    })
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique migration backup",
+    ))
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    encode_hex(&hasher.finalize())
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
+}
+
+struct MigrationLock {
+    path: PathBuf,
+}
+
+impl MigrationLock {
+    fn acquire(config_path: &Path) -> Result<Self, ConfigMigrationError> {
+        let lock_path = config_path.with_file_name(format!(
+            ".{}.schema-migrate.lock",
+            config_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("config")
+        ));
+        let mut lock_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .map_err(|source| ConfigMigrationError::Lock {
+                path: lock_path.clone(),
+                source,
+            })?;
+        lock_file
+            .write_all(std::process::id().to_string().as_bytes())
+            .and_then(|()| lock_file.flush())
+            .and_then(|()| lock_file.sync_all())
+            .map_err(|source| ConfigMigrationError::Lock {
+                path: lock_path.clone(),
+                source,
+            })?;
+        sync_parent(&lock_path).map_err(|source| ConfigMigrationError::Lock {
+            path: lock_path.clone(),
+            source,
+        })?;
+        Ok(Self { path: lock_path })
+    }
+}
+
+impl Drop for MigrationLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 #[cfg(unix)]
@@ -288,4 +398,74 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 fn sync_parent(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigMigrationError, ConfigMigrationOutcome, migrate_config_file_with_precommit};
+
+    const VERSION_ZERO: &str = r#"
+{
+  schema_version: 0,
+  core: {
+    auth: { github: { pat: "env:GITHUB_TOKEN", device: { enabled: false } } },
+    role: { source_url: "https://roles.example.test/default.json" },
+    channels: { teams: { enabled: false } },
+    server: {},
+    logging: {},
+    sessions: {},
+    copilot: {},
+    legacy: {},
+    updates: {},
+    admin: {},
+    network: {},
+  },
+}
+"#;
+
+    #[test]
+    fn concurrent_edit_is_detected_and_backed_up_before_publication() {
+        let directory = std::env::temp_dir().join(format!(
+            "claw-config-versioning-test-{}-{}",
+            std::process::id(),
+            1
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create directory");
+        let path = directory.join("config.json5");
+        let concurrent = VERSION_ZERO.replace("schema_version: 0", "schema_version: 99");
+        std::fs::write(&path, VERSION_ZERO.as_bytes()).expect("write source");
+
+        let error = migrate_config_file_with_precommit(&path, |path| {
+            std::fs::write(path, concurrent.as_bytes()).expect("write concurrent bytes");
+        })
+        .expect_err("concurrent edit must fail");
+
+        match error {
+            ConfigMigrationError::ConcurrentEdit {
+                config_path,
+                backup_path,
+            } => {
+                assert_eq!(config_path, path);
+                assert_eq!(
+                    std::fs::read(&backup_path).expect("read conflict backup"),
+                    concurrent.as_bytes()
+                );
+            }
+            other => panic!("expected concurrent edit error, got {other}"),
+        }
+        assert_eq!(
+            std::fs::read(&path).expect("source preserved"),
+            concurrent.as_bytes()
+        );
+        assert!(
+            matches!(
+                migrate_config_file_with_precommit(&path, |_| {}),
+                Err(ConfigMigrationError::UnsupportedPath { .. })
+                    | Ok(ConfigMigrationOutcome::Current)
+            ),
+            "post-conflict source remains untouched by failed migration"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 }

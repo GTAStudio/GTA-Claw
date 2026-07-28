@@ -31,6 +31,47 @@ impl MigrationProvider for ClaudeMigrationProvider {
         paths: &dyn PlatformPaths,
         source: Option<&Path>,
     ) -> Result<Detection, MigrationError> {
+        if let Some(explicit) = source {
+            let root = explicit.to_path_buf();
+            let found = if root.is_file() {
+                true
+            } else {
+                let primary = [
+                    root.join("settings.json"),
+                    root.join("CLAUDE.md"),
+                    root.join(".mcp.json"),
+                    root.join(".credentials.json"),
+                    root.join(".claude").join("settings.json"),
+                    root.join(".claude").join("CLAUDE.md"),
+                ];
+                let desktop = root.join("claude_desktop_config.json");
+                let user_json = root.join(".claude.json");
+                primary.iter().any(|path| path.is_file())
+                    || desktop.is_file()
+                    || user_json.is_file()
+                    || root.join("skills").is_dir()
+                    || root.join("commands").is_dir()
+                    || root.join("projects").is_dir()
+                    || root.join(".claude").join("skills").is_dir()
+                    || root.join(".claude").join("commands").is_dir()
+                    || root.join(".claude").join("rules").is_dir()
+                    || root.join(".claude").join("agents").is_dir()
+            };
+            return Ok(Detection {
+                found,
+                source: root,
+                confidence: if found {
+                    DetectionConfidence::High
+                } else {
+                    DetectionConfidence::Low
+                },
+                message: if found {
+                    "Claude state found.".to_owned()
+                } else {
+                    "Claude state not found.".to_owned()
+                },
+            });
+        }
         let root = source.map_or_else(|| paths.home_dir().join(".claude"), Path::to_path_buf);
         let primary = [
             root.join("settings.json"),
@@ -117,6 +158,30 @@ impl MigrationProvider for CodexMigrationProvider {
         paths: &dyn PlatformPaths,
         source: Option<&Path>,
     ) -> Result<Detection, MigrationError> {
+        if let Some(explicit) = source {
+            let root = explicit.to_path_buf();
+            let found = root.join("config.toml").is_file()
+                || root.join("auth.json").is_file()
+                || root.join("config.json").is_file()
+                || root.join("sessions").is_dir()
+                || root.join("skills").is_dir()
+                || root.join("prompts").is_dir()
+                || root.join("history.jsonl").is_file();
+            return Ok(Detection {
+                found,
+                source: root,
+                confidence: if found {
+                    DetectionConfidence::High
+                } else {
+                    DetectionConfidence::Low
+                },
+                message: if found {
+                    "Codex state found.".to_owned()
+                } else {
+                    "Codex state not found.".to_owned()
+                },
+            });
+        }
         let root = source
             .map(Path::to_path_buf)
             .or_else(|| paths.codex_home().map(Path::to_path_buf))
@@ -197,6 +262,36 @@ impl MigrationProvider for HermesMigrationProvider {
         paths: &dyn PlatformPaths,
         source: Option<&Path>,
     ) -> Result<Detection, MigrationError> {
+        if let Some(explicit) = source {
+            let root = explicit.to_path_buf();
+            let found = root.join("config.yaml").is_file()
+                || root.join(".env").is_file()
+                || root.join("auth.json").is_file()
+                || root.join("SOUL.md").is_file()
+                || root.join("AGENTS.md").is_file()
+                || root.join("memories").is_dir()
+                || root.join("skills").is_dir()
+                || root.join("sessions").is_dir()
+                || root.join("plugins").is_dir()
+                || root.join("logs").is_dir()
+                || root.join("cron").is_dir()
+                || root.join("mcp-tokens").is_dir()
+                || root.join("state.db").is_file();
+            return Ok(Detection {
+                found,
+                source: root,
+                confidence: if found {
+                    DetectionConfidence::High
+                } else {
+                    DetectionConfidence::Low
+                },
+                message: if found {
+                    "Hermes state found.".to_owned()
+                } else {
+                    "Hermes state not found.".to_owned()
+                },
+            });
+        }
         let root = source.map_or_else(|| paths.home_dir().join(".hermes"), Path::to_path_buf);
         let high = root.join("config.yaml").is_file()
             || root.join(".env").is_file()
