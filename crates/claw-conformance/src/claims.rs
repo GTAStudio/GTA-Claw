@@ -2638,10 +2638,12 @@ mod tests {
             rejected,
             BTreeSet::from([
                 ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs".to_owned(),
+                "android/apps/gta-claw-android-shell/build.rs".to_owned(),
                 "crates/claw-config/build.rs".to_owned(),
                 "crates/claw-protocol/build.rs".to_owned(),
                 "desktop/apps/gta-claw-desktop/build.rs".to_owned(),
                 "desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs".to_owned(),
+                "ios/apps/gta-claw-ios-shell/build.rs".to_owned(),
             ])
         );
     }
