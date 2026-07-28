@@ -1639,15 +1639,22 @@ impl AdminPort for OperatorAdmin {
                     json!({"generation": applied.generation, "changed": applied.changed})
                 }
                 _ => {
-                    if let Some(payload) = self
-                        .gateway_pairing
-                        .dispatch(&method, params.as_ref())
-                        .map_err(admin_port_failure)?
-                    {
-                        return Ok(AdminSuccess {
-                            payload,
-                            meta: None,
-                        });
+                    if is_pairing_method(&method) {
+                        let gateway_pairing = Arc::clone(&self.gateway_pairing);
+                        let pairing_method = method.clone();
+                        let pairing_params = params.clone();
+                        let dispatched = tokio::task::spawn_blocking(move || {
+                            gateway_pairing.dispatch(&pairing_method, pairing_params.as_ref())
+                        })
+                        .await
+                        .map_err(|_| admin_internal("gateway pairing task failed"))?
+                        .map_err(admin_port_failure)?;
+                        if let Some(payload) = dispatched {
+                            return Ok(AdminSuccess {
+                                payload,
+                                meta: None,
+                            });
+                        }
                     }
                     if let Some(payload) = self
                         .inventory
@@ -1698,8 +1705,56 @@ fn admin_unavailable(message: impl Into<String>) -> AdminFailure {
     }
 }
 
+fn admin_internal(message: impl Into<String>) -> AdminFailure {
+    AdminFailure {
+        code: "INTERNAL".to_owned(),
+        message: message.into(),
+        details: None,
+        retryable: Some(false),
+        retry_after_ms: None,
+    }
+}
+
+fn is_pairing_method(method: &str) -> bool {
+    matches!(
+        method,
+        "device.pair.list"
+            | "device.pair.approve"
+            | "device.pair.reject"
+            | "device.pair.remove"
+            | "node.pair.list"
+            | "node.pair.approve"
+            | "node.pair.reject"
+            | "node.pair.remove"
+    )
+}
+
 fn admin_port_failure(error: PortError) -> AdminFailure {
-    admin_unavailable(error.message)
+    match error.kind {
+        PortErrorKind::InvalidRequest => admin_invalid(error.message),
+        PortErrorKind::NotFound => AdminFailure {
+            code: "NOT_FOUND".to_owned(),
+            message: error.message,
+            details: None,
+            retryable: Some(false),
+            retry_after_ms: None,
+        },
+        PortErrorKind::Unavailable => admin_unavailable(error.message),
+        PortErrorKind::Timeout => AdminFailure {
+            code: "AGENT_TIMEOUT".to_owned(),
+            message: error.message,
+            details: None,
+            retryable: Some(true),
+            retry_after_ms: None,
+        },
+        PortErrorKind::Internal => AdminFailure {
+            code: "INTERNAL".to_owned(),
+            message: error.message,
+            details: None,
+            retryable: Some(false),
+            retry_after_ms: None,
+        },
+    }
 }
 
 /// Deterministic local provider used only by the explicit `--smoke` mode.
@@ -1888,11 +1943,12 @@ impl Provider for SmokeProvider {
 mod tests {
     use super::{
         ConfigController, DependencyReadiness, Diagnostics, EmptyModelTools, ProviderHistoryConfig,
-        SmokeProvider, SwappableProvider, copilot_request_timeout_ms,
+        SmokeProvider, SwappableProvider, admin_port_failure, copilot_request_timeout_ms,
     };
     use std::sync::Arc;
 
     use claw_config::{migrate_legacy_environment, to_json5};
+    use claw_http_api::{PortError, PortErrorKind};
 
     fn snapshot(model: &str) -> claw_config::ConfigSnapshot {
         snapshot_with_timeout(model, "120000")
@@ -1908,6 +1964,27 @@ mod tests {
         ])
         .expect("fixture config")
         .config
+    }
+
+    #[test]
+    fn admin_port_errors_retain_their_http_classification() {
+        let cases = [
+            (
+                PortErrorKind::InvalidRequest,
+                "INVALID_REQUEST",
+                Some(false),
+            ),
+            (PortErrorKind::NotFound, "NOT_FOUND", Some(false)),
+            (PortErrorKind::Unavailable, "UNAVAILABLE", Some(false)),
+            (PortErrorKind::Timeout, "AGENT_TIMEOUT", Some(true)),
+            (PortErrorKind::Internal, "INTERNAL", Some(false)),
+        ];
+        for (kind, code, retryable) in cases {
+            let failure = admin_port_failure(PortError::new(kind, "safe message"));
+            assert_eq!(failure.code, code);
+            assert_eq!(failure.message, "safe message");
+            assert_eq!(failure.retryable, retryable);
+        }
     }
 
     #[tokio::test]

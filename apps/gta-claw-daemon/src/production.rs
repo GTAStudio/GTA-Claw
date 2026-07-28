@@ -19,10 +19,7 @@ use claw_config::{
     SecretRef, load_role as load_role_document, migrate_legacy_environment, to_json5,
 };
 use claw_crestodian::{Crestodian, RecoveryGuidance};
-use claw_gateway::{
-    CredentialPolicy, Exposure, GatewayServer, GatewayServerConfig, ServerHandle,
-    StaticAuthenticator,
-};
+use claw_gateway::{CredentialPolicy, Exposure, GatewayServer, GatewayServerConfig, ServerHandle};
 use claw_http_api::{
     ApiConfig, ApiServices, BearerAuthenticator, BearerCredential, HttpApi, LegacyAdminCredential,
     LegacyApiConfig, LegacyApiServices, LegacyChannelStatus, LegacyHttpApi, LegacyReloadError,
@@ -52,7 +49,7 @@ use url::Url;
 
 use crate::adapters::agent_runtime::{AgentRuntime, RuntimeModelTools};
 use crate::adapters::channels::{ChannelSupervisor, DiscordSettings, TelegramSettings};
-use crate::adapters::gateway_pairing::GatewayPairingStore;
+use crate::adapters::gateway_pairing::{GatewayPairingAuthenticator, GatewayPairingStore};
 use crate::adapters::http_api::{
     AppliedReload, ConfigController, DependencyReadiness, Diagnostics, DisabledExternalPorts,
     DurableSecurityAudit, GatewayPairingAdmin, ModelToolCatalog, OperatorAdmin, OperatorInventory,
@@ -1150,8 +1147,11 @@ impl ProductionService {
                 CredentialPolicy::Token(GatewaySecret::from(token))
             });
         let devices = gateway_pairing.devices();
-        let gateway_authenticator =
-            StaticAuthenticator::with_devices(gateway_credential, gateway_clock, devices.clone());
+        let gateway_authenticator = GatewayPairingAuthenticator::new(
+            gateway_credential,
+            gateway_clock,
+            Arc::clone(&gateway_pairing),
+        );
         diagnostics.record(format!(
             "gateway authorization loaded {} paired devices",
             gateway_pairing.len()

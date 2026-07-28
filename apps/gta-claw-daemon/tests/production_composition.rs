@@ -289,20 +289,17 @@ fn bound_http_is_ready_and_dispatches_to_the_composed_provider() {
         status_body["payload"]["runtime"]["goals"]["unlockFailures"],
         0
     );
-    let device_id = "a".repeat(64);
-    let pairing_body = format!(
-        r#"{{"method":"device.pair.approve","params":{{"deviceId":"{device_id}","role":"operator","scopes":["operator.read"]}}}}"#
-    );
+    let pairing_body = r#"{"method":"device.pair.list","params":{}}"#;
     let pairing = request(
         daemon.http,
         "POST",
         "/api/v1/admin/rpc",
         Some("operator-token"),
-        Some(&pairing_body),
+        Some(pairing_body),
     );
     assert!(pairing.starts_with("HTTP/1.1 200"), "{pairing}");
-    assert!(pairing.contains(r#""approved":true"#), "{pairing}");
-    assert!(pairing.contains(&device_id), "{pairing}");
+    assert!(pairing.contains(r#""pending":[]"#), "{pairing}");
+    assert!(pairing.contains(r#""paired":[]"#), "{pairing}");
     let goal = request(
         daemon.http,
         "POST",
