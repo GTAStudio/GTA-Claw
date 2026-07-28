@@ -1,5 +1,5 @@
 import { logger } from "../utils/logger.js";
-import { fetch } from "../utils/proxy.js";
+import { fetch as defaultFetch } from "../utils/proxy.js";
 import { splitMessage } from "../utils/splitMessage.js";
 
 interface TelegramUser {
@@ -38,55 +38,73 @@ export interface TelegramPollingOptions {
     userName: string;
     text: string;
   }) => Promise<string>;
+  fetchFn?: typeof defaultFetch;
 }
 
 export class TelegramPollingClient {
   private readonly baseUrl: string;
   private readonly pollIntervalMs: number;
   private readonly onMessage: TelegramPollingOptions["onMessage"];
+  private readonly fetchFn: typeof defaultFetch;
   private running = false;
   private loopPromise: Promise<void> | null = null;
+  private lifecycleController: AbortController | null = null;
   private offset = 0;
 
   constructor(options: TelegramPollingOptions) {
     this.baseUrl = `https://api.telegram.org/bot${options.botToken}`;
     this.pollIntervalMs = options.pollIntervalMs;
     this.onMessage = options.onMessage;
+    this.fetchFn = options.fetchFn ?? defaultFetch;
   }
 
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
-    this.loopPromise = this.loop();
+    this.lifecycleController = new AbortController();
+    this.loopPromise = this.loop(this.lifecycleController.signal);
     logger.info("Telegram polling client started");
   }
 
   async stop(): Promise<void> {
     this.running = false;
-    if (this.loopPromise) {
-      await this.loopPromise;
-      this.loopPromise = null;
+    this.lifecycleController?.abort();
+    this.lifecycleController = null;
+
+    const loopPromise = this.loopPromise;
+    if (loopPromise) {
+      await loopPromise;
+      if (this.loopPromise === loopPromise) {
+        this.loopPromise = null;
+      }
     }
     logger.info("Telegram polling client stopped");
   }
 
-  private async loop(): Promise<void> {
-    while (this.running) {
+  private async loop(signal: AbortSignal): Promise<void> {
+    while (this.running && !signal.aborted) {
       try {
-        const updates = await this.getUpdates();
-        for (const update of updates) {
-          this.offset = Math.max(this.offset, update.update_id + 1);
-          await this.handleUpdate(update);
-        }
+        const updates = await this.getUpdates(signal);
+        await this.processUpdates(updates);
       } catch (err) {
+        if (!this.running || signal.aborted) {
+          break;
+        }
         logger.error({ err }, "Telegram polling loop error");
       }
 
-      await new Promise((resolve) => setTimeout(resolve, this.pollIntervalMs));
+      await this.waitForNextPoll(signal);
     }
   }
 
-  private async getUpdates(): Promise<TelegramUpdate[]> {
+  private async processUpdates(updates: TelegramUpdate[]): Promise<void> {
+    for (const update of updates) {
+      await this.handleUpdate(update);
+      this.offset = Math.max(this.offset, update.update_id + 1);
+    }
+  }
+
+  private async getUpdates(signal: AbortSignal): Promise<TelegramUpdate[]> {
     const url = new URL(`${this.baseUrl}/getUpdates`);
     url.searchParams.set("timeout", "25");
     url.searchParams.set("allowed_updates", '["message"]');
@@ -94,8 +112,8 @@ export class TelegramPollingClient {
       url.searchParams.set("offset", String(this.offset));
     }
 
-    const resp = await fetch(url, {
-      signal: AbortSignal.timeout(35_000),
+    const resp = await this.fetchFn(url, {
+      signal: AbortSignal.any([signal, AbortSignal.timeout(35_000)]),
     });
 
     if (!resp.ok) {
@@ -108,6 +126,22 @@ export class TelegramPollingClient {
     }
 
     return data.result ?? [];
+  }
+
+  private waitForNextPoll(signal: AbortSignal): Promise<void> {
+    if (!this.running || signal.aborted) {
+      return Promise.resolve();
+    }
+
+    return new Promise((resolve) => {
+      const finish = (): void => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, this.pollIntervalMs);
+      signal.addEventListener("abort", finish, { once: true });
+    });
   }
 
   private async handleUpdate(update: TelegramUpdate): Promise<void> {
@@ -136,7 +170,7 @@ export class TelegramPollingClient {
   private async sendMessage(chatId: number, text: string): Promise<void> {
     const chunks = splitMessage(text, 4000);
     for (const chunk of chunks) {
-      const resp = await fetch(`${this.baseUrl}/sendMessage`, {
+      const resp = await this.fetchFn(`${this.baseUrl}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
