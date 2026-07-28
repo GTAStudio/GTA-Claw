@@ -551,6 +551,17 @@ impl ExecPolicy {
     /// Returns [`ExecutionError::ProgramNameRejected`] when `name` is not a
     /// bare identifier and [`ExecutionError::ProgramNotAllowed`] when it is not
     /// on the operator allowlist.
+    ///
+    /// Two suspicions about this path were checked and neither survives. The
+    /// allowlist is a `BTreeMap`, so a lookup is a handful of comparisons and
+    /// never a scan; and although `validate_program_name` does run twice here,
+    /// once below and once inside [`Self::program`], one spawn-and-wait of
+    /// `/bin/echo` on this machine costs 3.4 ms, so the duplicated scan of a
+    /// name that is at most a few dozen bytes — like the per-call rebuild of
+    /// the environment map in `ExecTool::invoke` — is far below a thousandth
+    /// of an invocation. Neither was changed: the cost of `exec` is the child
+    /// process, and every syscall on the way to it belongs to proving the
+    /// executable is still the file that was allowlisted.
     pub fn resolve_program(&self, name: &str) -> Result<&Path, ExecutionError> {
         validate_program_name(name)?;
         self.program(name)

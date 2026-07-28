@@ -1,5 +1,7 @@
 //! Bounded literal content search across the workspace sandbox.
 
+use std::fmt::Write as _;
+
 use serde_json::{Value, json};
 
 use crate::error::ToolError;
@@ -105,9 +107,11 @@ impl Tool for FsSearchTool {
         let limit = usize::try_from(requested.min(MAX_SEARCH_RESULTS)).unwrap_or(0);
 
         let mut matches: Vec<Value> = Vec::new();
-        let mut rendered = Vec::new();
+        let mut rendered = String::new();
         let mut total = 0_usize;
         let mut skipped_files = 0_usize;
+        let needle_is_ascii = needle.is_ascii();
+        let mut folded = String::new();
         for file in context.sandbox.walk_files(&root)? {
             let Ok(bytes) = context.sandbox.read_file(&file) else {
                 skipped_files += 1;
@@ -119,9 +123,22 @@ impl Tool for FsSearchTool {
             };
             for (index, line) in text.lines().enumerate() {
                 // The case-sensitive path is the common one and must not copy
-                // every line of every file just to look for a substring.
+                // every line of every file just to look for a substring. The
+                // case-insensitive path folds into one reused buffer while the
+                // line is plain ASCII, which is the overwhelming majority of
+                // source text, and only falls back to a full Unicode lowering
+                // (which allocates) otherwise. Folding into a buffer rather
+                // than comparing windows in place keeps `str::contains`, whose
+                // substring search is far faster than a byte-window scan.
                 let found = if case_sensitive {
                     line.contains(needle.as_str())
+                } else if line.is_ascii() {
+                    needle_is_ascii && {
+                        folded.clear();
+                        folded.push_str(line);
+                        folded.make_ascii_lowercase();
+                        folded.contains(needle.as_str())
+                    }
                 } else {
                     line.to_lowercase().contains(needle.as_str())
                 };
@@ -133,7 +150,12 @@ impl Tool for FsSearchTool {
                     continue;
                 }
                 let excerpt: String = line.chars().take(MAX_LINE_CHARS).collect();
-                rendered.push(format!("{}:{}: {excerpt}", file.as_str(), index + 1));
+                if !rendered.is_empty() {
+                    rendered.push('\n');
+                }
+                // Appended in place: the rendered block was a `Vec<String>`
+                // joined at the end, which allocated once per reported match.
+                let _ = write!(rendered, "{}:{}: {excerpt}", file.as_str(), index + 1);
                 matches.push(json!({
                     "path": file.as_str(),
                     "line": index + 1,
@@ -143,7 +165,7 @@ impl Tool for FsSearchTool {
         }
         let truncated = total > matches.len();
         Ok(ToolOutput::new(
-            rendered.join("\n"),
+            rendered,
             json!({
                 "root": root.as_str(),
                 "matches": matches,
