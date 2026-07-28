@@ -12,7 +12,7 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use claw_config::write_bytes_atomically;
@@ -39,12 +39,13 @@ const MAX_REQUEST_ID_BYTES: usize = 128;
 const PENDING_PAIRING_TTL: Duration = Duration::from_mins(10);
 
 static PENDING_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static PAIRING_RUNTIMES: OnceLock<Mutex<BTreeMap<PathBuf, Weak<PairingRuntime>>>> = OnceLock::new();
 
 const fn pairing_schema_version() -> u32 {
     PAIRING_SCHEMA_VERSION
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct StoredPairing {
     device_id: String,
@@ -68,6 +69,13 @@ struct PendingPairingState {
     approving: BTreeMap<String, StoredPendingPairing>,
 }
 
+#[derive(Debug, Default)]
+struct PairingRuntime {
+    mutation_gate: Mutex<()>,
+    pairings: Mutex<BTreeMap<String, StoredPairing>>,
+    devices: DeviceDirectory,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PairingDocument {
@@ -82,14 +90,63 @@ enum PendingRegistration {
     Pending(String),
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct PairingTestPause {
+    reached: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl PairingTestPause {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            reached: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        })
+    }
+
+    fn pause(&self) {
+        self.reached.wait();
+        self.release.wait();
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct PairingTestHooks {
+    approval_before_mutation: Mutex<Option<Arc<PairingTestPause>>>,
+    approval_reserved: Mutex<Option<Arc<PairingTestPause>>>,
+    remove_before_mutation: Mutex<Option<Arc<std::sync::Barrier>>>,
+}
+
+#[cfg(test)]
+impl PairingTestHooks {
+    fn pause_once(slot: &Mutex<Option<Arc<PairingTestPause>>>) {
+        let pause = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(pause) = pause {
+            pause.pause();
+        }
+    }
+
+    fn wait_once(slot: &Mutex<Option<Arc<std::sync::Barrier>>>) {
+        let barrier = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(barrier) = barrier {
+            barrier.wait();
+        }
+    }
+}
+
 /// One durable pairing file and the live Gateway grant directory it feeds.
 #[derive(Debug)]
 pub struct GatewayPairingStore {
     path: PathBuf,
-    pairings: Mutex<BTreeMap<String, StoredPairing>>,
+    mutation_lock_path: PathBuf,
+    runtime: Arc<PairingRuntime>,
     pending: Mutex<PendingPairingState>,
-    devices: DeviceDirectory,
     durability_warnings: AtomicU64,
+    #[cfg(test)]
+    test_hooks: PairingTestHooks,
 }
 
 impl GatewayPairingStore {
@@ -101,63 +158,45 @@ impl GatewayPairingStore {
     /// duplicate grants, or cannot be initialized durably.
     pub fn open(path: impl AsRef<Path>) -> Result<Arc<Self>, String> {
         let path = prepare_pairing_path(path.as_ref())?;
-        let (pairings, initial_warnings) = match fs::symlink_metadata(&path) {
-            Ok(_) => {
-                let bytes = read_pairing_file(&path)?;
-                let document: PairingDocument = serde_json::from_slice(&bytes)
-                    .map_err(|_| "gateway pairing file is invalid".to_owned())?;
-                if document.schema_version != PAIRING_SCHEMA_VERSION {
-                    return Err("gateway pairing file schema is unsupported".to_owned());
-                }
-                if document.pairings.len() > MAX_PAIRINGS {
-                    return Err("gateway pairing file contains too many grants".to_owned());
-                }
-                let mut pairings = BTreeMap::new();
-                for mut pairing in document.pairings {
-                    validate_pairing(&pairing)?;
-                    pairing.scopes.sort_unstable();
-                    if pairings
-                        .insert(pairing.device_id.clone(), pairing)
-                        .is_some()
-                    {
-                        return Err("gateway pairing file contains a duplicate device".to_owned());
-                    }
-                }
-                (pairings, 0)
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let pairings = BTreeMap::new();
-                let warnings = persist_pairings(&path, &pairings)?;
-                (pairings, warnings)
-            }
-            Err(error) => return Err(safe_io("inspect", &error)),
+        let mutation_lock_path = pairing_lock_path(&path)?;
+        let runtime = pairing_runtime(&mutation_lock_path);
+        let initial_warnings = {
+            let _process_lock = runtime
+                .mutation_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let _file_lock = acquire_pairing_lock(&mutation_lock_path)?;
+            let (pairings, warnings) = load_or_initialize_pairings(&path)?;
+            let mut held = runtime
+                .pairings
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            reconcile_pairing_directory(&runtime.devices, &held, &pairings, None);
+            *held = pairings;
+            warnings
         };
-        let devices = DeviceDirectory::new();
-        for pairing in pairings.values() {
-            devices.pair(
-                pairing.device_id.clone(),
-                Grant::new(pairing.role, pairing.scopes.iter().copied()),
-            );
-        }
         Ok(Arc::new(Self {
             path,
-            pairings: Mutex::new(pairings),
+            mutation_lock_path,
+            runtime,
             pending: Mutex::new(PendingPairingState::default()),
-            devices,
             durability_warnings: AtomicU64::new(initial_warnings as u64),
+            #[cfg(test)]
+            test_hooks: PairingTestHooks::default(),
         }))
     }
 
     /// Returns the live directory shared by handshake and connection policy.
     #[must_use]
     pub fn devices(&self) -> DeviceDirectory {
-        self.devices.clone()
+        self.runtime.devices.clone()
     }
 
     /// Returns the number of durable grants.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.pairings
+        self.runtime
+            .pairings
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len()
@@ -179,7 +218,11 @@ impl GatewayPairingStore {
             .map(|pending| render_pending(pending, node))
             .collect::<Vec<_>>();
         drop(pending_state);
-        let pairings = self.pairings.lock().unwrap_or_else(PoisonError::into_inner);
+        let pairings = self
+            .runtime
+            .pairings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let paired = pairings
             .values()
             .filter(|pairing| !node || pairing.role == Role::Node)
@@ -202,48 +245,58 @@ impl GatewayPairingStore {
                 )
             })?;
         let node = method.starts_with("node.");
-        let pending = {
-            let mut pending_state = self.pending.lock().map_err(|_| {
-                PortError::new(PortErrorKind::Internal, "gateway pairing state unavailable")
-            })?;
-            prune_pending(&mut pending_state.queued, unix_millis());
-            let pending = pending_state
-                .queued
-                .get(request_id)
-                .cloned()
-                .ok_or_else(|| {
-                    PortError::new(PortErrorKind::InvalidRequest, "unknown requestId")
+        #[cfg(test)]
+        PairingTestHooks::pause_once(&self.test_hooks.approval_before_mutation);
+        self.with_durable_mutation(|| {
+            let pending = {
+                let mut pending_state = self.pending.lock().map_err(|_| {
+                    PortError::new(PortErrorKind::Internal, "gateway pairing state unavailable")
                 })?;
-            if node && pending.role != Role::Node {
-                return Err(PortError::new(
-                    PortErrorKind::InvalidRequest,
-                    "pair approval request belongs to a different pairing surface",
-                ));
+                prune_pending(&mut pending_state.queued, unix_millis());
+                let pending = pending_state
+                    .queued
+                    .get(request_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        PortError::new(PortErrorKind::InvalidRequest, "unknown requestId")
+                    })?;
+                if node && pending.role != Role::Node {
+                    return Err(PortError::new(
+                        PortErrorKind::InvalidRequest,
+                        "pair approval request belongs to a different pairing surface",
+                    ));
+                }
+                pending_state.queued.remove(request_id);
+                pending_state
+                    .approving
+                    .insert(request_id.to_owned(), pending.clone());
+                pending
+            };
+            #[cfg(test)]
+            PairingTestHooks::pause_once(&self.test_hooks.approval_reserved);
+            let result = self.commit_approval(request_id, node, &pending);
+            if result.is_err() {
+                self.restore_pending(pending);
             }
-            pending_state.queued.remove(request_id);
-            pending_state
-                .approving
-                .insert(request_id.to_owned(), pending.clone());
-            pending
-        };
-        let Ok(mut held) = self.pairings.lock() else {
-            self.restore_pending(pending);
-            return Err(PortError::new(
-                PortErrorKind::Internal,
-                "gateway pairing state unavailable",
-            ));
-        };
-        let mut candidate = held.clone();
+            result
+        })
+    }
+
+    fn commit_approval(
+        &self,
+        request_id: &str,
+        node: bool,
+        pending: &StoredPendingPairing,
+    ) -> Result<Value, PortError> {
+        let mut candidate = load_pairings(&self.path)
+            .map_err(|error| PortError::new(PortErrorKind::Unavailable, error))?;
         if !candidate.contains_key(&pending.device_id) && candidate.len() >= MAX_PAIRINGS {
-            drop(held);
-            self.restore_pending(pending);
             return Err(PortError::new(
                 PortErrorKind::InvalidRequest,
                 "gateway pairing capacity is exhausted",
             ));
         }
-        let pending_for_restore = pending.clone();
-        let mut approved_scopes = pending.scopes;
+        let mut approved_scopes = pending.scopes.clone();
         if let Some(existing) = candidate.get(&pending.device_id)
             && existing.role == pending.role
         {
@@ -252,24 +305,27 @@ impl GatewayPairingStore {
             approved_scopes.dedup();
         }
         let pairing = StoredPairing {
-            device_id: pending.device_id,
+            device_id: pending.device_id.clone(),
             role: pending.role,
             scopes: approved_scopes,
         };
         candidate.insert(pairing.device_id.clone(), pairing.clone());
-        let warnings = match persist_pairings(&self.path, &candidate) {
-            Ok(warnings) => warnings,
-            Err(error) => {
-                drop(held);
-                self.restore_pending(pending_for_restore);
-                return Err(PortError::new(PortErrorKind::Unavailable, error));
-            }
-        };
-        *held = candidate;
-        let generation = self.devices.pair(
+        let mut held = self.runtime.pairings.lock().map_err(|_| {
+            PortError::new(PortErrorKind::Internal, "gateway pairing state unavailable")
+        })?;
+        let warnings = persist_pairings(&self.path, &candidate)
+            .map_err(|error| PortError::new(PortErrorKind::Unavailable, error))?;
+        reconcile_pairing_directory(
+            &self.runtime.devices,
+            &held,
+            &candidate,
+            Some(&pairing.device_id),
+        );
+        let generation = self.runtime.devices.pair(
             pairing.device_id.clone(),
             Grant::new(pairing.role, pairing.scopes.iter().copied()),
         );
+        *held = candidate;
         drop(held);
         self.complete_approval(request_id, &pairing);
         self.record_durability_warnings(warnings);
@@ -325,37 +381,45 @@ impl GatewayPairingStore {
                 format!("pair removal requires a canonical {key}"),
             )
         })?;
-        let mut held = self.pairings.lock().map_err(|_| {
-            PortError::new(PortErrorKind::Internal, "gateway pairing state unavailable")
-        })?;
-        let mut candidate = held.clone();
-        let pairing = candidate.get(device_id).ok_or_else(|| {
-            PortError::new(PortErrorKind::InvalidRequest, format!("unknown {key}"))
-        })?;
-        if node && pairing.role != Role::Node {
-            return Err(PortError::new(
-                PortErrorKind::InvalidRequest,
-                "pair removal target belongs to a different pairing surface",
-            ));
-        }
-        candidate.remove(device_id);
-        let warnings = persist_pairings(&self.path, &candidate)
-            .map_err(|error| PortError::new(PortErrorKind::Unavailable, error))?;
-        *held = candidate;
-        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-        pending
-            .queued
-            .retain(|_, request| request.device_id != device_id);
-        let removed = self.devices.revoke(device_id);
-        drop(pending);
-        drop(held);
-        self.record_durability_warnings(warnings);
-        let mut payload = json!({
-            "removed": removed,
-            "durable": warnings == 0,
-        });
-        payload[key] = json!(device_id);
-        Ok(payload)
+        #[cfg(test)]
+        PairingTestHooks::wait_once(&self.test_hooks.remove_before_mutation);
+        self.with_durable_mutation(|| {
+            let mut candidate = load_pairings(&self.path)
+                .map_err(|error| PortError::new(PortErrorKind::Unavailable, error))?;
+            let pairing = candidate.get(device_id).ok_or_else(|| {
+                PortError::new(PortErrorKind::InvalidRequest, format!("unknown {key}"))
+            })?;
+            if node && pairing.role != Role::Node {
+                return Err(PortError::new(
+                    PortErrorKind::InvalidRequest,
+                    "pair removal target belongs to a different pairing surface",
+                ));
+            }
+            let removed = candidate.remove(device_id).is_some();
+            let mut held = self.runtime.pairings.lock().map_err(|_| {
+                PortError::new(PortErrorKind::Internal, "gateway pairing state unavailable")
+            })?;
+            let warnings = persist_pairings(&self.path, &candidate)
+                .map_err(|error| PortError::new(PortErrorKind::Unavailable, error))?;
+            reconcile_pairing_directory(&self.runtime.devices, &held, &candidate, None);
+            *held = candidate;
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            pending
+                .queued
+                .retain(|_, request| request.device_id != device_id);
+            pending
+                .approving
+                .retain(|_, request| request.device_id != device_id);
+            drop(pending);
+            drop(held);
+            self.record_durability_warnings(warnings);
+            let mut payload = json!({
+                "removed": removed,
+                "durable": warnings == 0,
+            });
+            payload[key] = json!(device_id);
+            Ok(payload)
+        })
     }
 
     fn record_pending(
@@ -379,7 +443,9 @@ impl GatewayPairingStore {
         if self.grant_satisfies(device_id, role, &scopes) {
             return Ok(PendingRegistration::Granted);
         }
-        if self.devices.current_grant(device_id).is_none() && self.devices.len() >= MAX_PAIRINGS {
+        if self.runtime.devices.current_grant(device_id).is_none()
+            && self.runtime.devices.len() >= MAX_PAIRINGS
+        {
             return Err("gateway pairing capacity is exhausted".to_owned());
         }
         if let Some(existing) = held.queued.values_mut().find(|existing| {
@@ -413,9 +479,12 @@ impl GatewayPairingStore {
     }
 
     fn grant_satisfies(&self, device_id: &str, role: Role, scopes: &[OperatorScope]) -> bool {
-        self.devices.current_grant(device_id).is_some_and(|grant| {
-            grant.role == role && scopes.iter().all(|scope| grant.scopes.contains(scope))
-        })
+        self.runtime
+            .devices
+            .current_grant(device_id)
+            .is_some_and(|grant| {
+                grant.role == role && scopes.iter().all(|scope| grant.scopes.contains(scope))
+            })
     }
 
     fn complete_approval(&self, request_id: &str, pairing: &StoredPairing) {
@@ -444,6 +513,20 @@ impl GatewayPairingStore {
             held.queued.len().saturating_add(held.approving.len()) < MAX_PENDING_PAIRINGS
         );
         held.queued.insert(pending.request_id.clone(), pending);
+    }
+
+    fn with_durable_mutation<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, PortError>,
+    ) -> Result<T, PortError> {
+        let _process_lock = self
+            .runtime
+            .mutation_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let _file_lock = acquire_pairing_lock(&self.mutation_lock_path)
+            .map_err(|error| PortError::new(PortErrorKind::Unavailable, error))?;
+        operation()
     }
 
     fn record_durability_warnings(&self, warnings: usize) {
@@ -519,7 +602,8 @@ impl AuthenticationPort for GatewayPairingAuthenticator {
                     details
                 }
                 ConnectErrorDetailCode::AuthScopeMismatch => {
-                    let Some(details) = scope_upgrade_details(request, &self.pairings.devices)
+                    let Some(details) =
+                        scope_upgrade_details(request, &self.pairings.runtime.devices)
                     else {
                         return AuthenticationDecision::Rejected(rejection);
                     };
@@ -706,6 +790,30 @@ fn validate_pairing(pairing: &StoredPairing) -> Result<(), String> {
     Ok(())
 }
 
+fn reconcile_pairing_directory(
+    devices: &DeviceDirectory,
+    previous: &BTreeMap<String, StoredPairing>,
+    current: &BTreeMap<String, StoredPairing>,
+    preferred_device: Option<&str>,
+) {
+    for device_id in previous.keys() {
+        if !current.contains_key(device_id) {
+            devices.revoke(device_id);
+        }
+    }
+    for (device_id, pairing) in current {
+        if preferred_device == Some(device_id.as_str()) {
+            continue;
+        }
+        if previous.get(device_id) != Some(pairing) {
+            devices.pair(
+                device_id.clone(),
+                Grant::new(pairing.role, pairing.scopes.iter().copied()),
+            );
+        }
+    }
+}
+
 fn validate_pending_fields(
     device_id: &str,
     role: Role,
@@ -727,6 +835,65 @@ fn validate_pending_fields(
         return Err("gateway pending node pairing carries operator scopes".to_owned());
     }
     Ok(())
+}
+
+fn pairing_runtime(path: &Path) -> Arc<PairingRuntime> {
+    let runtimes = PAIRING_RUNTIMES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut runtimes = runtimes.lock().unwrap_or_else(PoisonError::into_inner);
+    runtimes.retain(|_, runtime| runtime.strong_count() > 0);
+    if let Some(runtime) = runtimes.get(path).and_then(Weak::upgrade) {
+        return runtime;
+    }
+    let runtime = Arc::new(PairingRuntime::default());
+    runtimes.insert(path.to_owned(), Arc::downgrade(&runtime));
+    runtime
+}
+
+fn pairing_lock_path(path: &Path) -> Result<PathBuf, String> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "gateway pairing path has no file name".to_owned())?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    Ok(path.with_file_name(lock_name))
+}
+
+fn load_or_initialize_pairings(
+    path: &Path,
+) -> Result<(BTreeMap<String, StoredPairing>, usize), String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => load_pairings(path).map(|pairings| (pairings, 0)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let pairings = BTreeMap::new();
+            let warnings = persist_pairings(path, &pairings)?;
+            Ok((pairings, warnings))
+        }
+        Err(error) => Err(safe_io("inspect", &error)),
+    }
+}
+
+fn load_pairings(path: &Path) -> Result<BTreeMap<String, StoredPairing>, String> {
+    let bytes = read_pairing_file(path)?;
+    let document: PairingDocument =
+        serde_json::from_slice(&bytes).map_err(|_| "gateway pairing file is invalid".to_owned())?;
+    if document.schema_version != PAIRING_SCHEMA_VERSION {
+        return Err("gateway pairing file schema is unsupported".to_owned());
+    }
+    if document.pairings.len() > MAX_PAIRINGS {
+        return Err("gateway pairing file contains too many grants".to_owned());
+    }
+    let mut pairings = BTreeMap::new();
+    for mut pairing in document.pairings {
+        validate_pairing(&pairing)?;
+        pairing.scopes.sort_unstable();
+        if pairings
+            .insert(pairing.device_id.clone(), pairing)
+            .is_some()
+        {
+            return Err("gateway pairing file contains a duplicate device".to_owned());
+        }
+    }
+    Ok(pairings)
 }
 
 fn prepare_pairing_path(path: &Path) -> Result<PathBuf, String> {
@@ -790,6 +957,62 @@ fn persist_pairings(
     write_bytes_atomically(path, &bytes)
         .map(|outcome| outcome.warnings.len())
         .map_err(|_| "gateway pairing publication failed".to_owned())
+}
+
+fn acquire_pairing_lock(path: &Path) -> Result<File, String> {
+    let file = open_pairing_lock(path).map_err(|error| safe_io("open mutation lock", &error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| safe_io("inspect mutation lock", &error))?;
+    if is_link_or_reparse(&metadata) {
+        return Err(
+            "gateway pairing mutation lock must not be a symlink or reparse point".to_owned(),
+        );
+    }
+    if !metadata.is_file() {
+        return Err("gateway pairing mutation lock must be a regular file".to_owned());
+    }
+    File::lock(&file).map_err(|error| safe_io("lock mutations", &error))?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_pairing_lock(path: &Path) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+
+    rustix::fs::open(
+        path,
+        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    )
+    .map(File::from)
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+#[cfg(windows)]
+fn open_pairing_lock(path: &Path) -> io::Result<File> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_pairing_lock(path: &Path) -> io::Result<File> {
+    use std::fs::OpenOptions;
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
 }
 
 fn read_pairing_file(path: &Path) -> Result<Vec<u8>, String> {
@@ -886,6 +1109,8 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     use claw_gateway::AuthorizationSource;
     use claw_protocol::gateway::{OperatorScope, Role};
@@ -894,8 +1119,8 @@ mod tests {
     use super::{
         GatewayPairingAdmin, GatewayPairingStore, MAX_PAIRING_FILE_BYTES, MAX_PAIRINGS,
         MAX_PENDING_PAIRINGS, MAX_SCOPES_PER_PAIRING, PAIRING_SCHEMA_VERSION, PENDING_PAIRING_TTL,
-        PairingDocument, PendingRegistration, PortErrorKind, StoredPairing, StoredPendingPairing,
-        parse_scope_names, unix_millis,
+        PairingDocument, PairingTestPause, PendingRegistration, PortErrorKind, StoredPairing,
+        StoredPendingPairing, parse_scope_names, unix_millis,
     };
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -992,6 +1217,162 @@ mod tests {
         assert_eq!(removed["removed"], true);
         assert_eq!(reopened.len(), 0);
         assert_eq!(reopened.devices().current_grant(&device_id), None);
+    }
+
+    #[test]
+    fn two_stores_revoke_then_approve_without_resurrecting_a_stale_grant() {
+        let root = TestRoot::new("two-store-linearization");
+        let path = root.join("pairings.json");
+        let revoked_device = "a".repeat(64);
+        let approved_device = "b".repeat(64);
+        let revoker = GatewayPairingStore::open(path.clone()).expect("revoking store opens");
+        let revoked_request = pending_id(
+            revoker
+                .record_pending(&revoked_device, Role::Operator, vec![OperatorScope::Read])
+                .expect("initial request accepted"),
+        );
+        revoker
+            .dispatch(
+                "device.pair.approve",
+                Some(&json!({"requestId":revoked_request})),
+            )
+            .expect("initial grant commits");
+        let approver = GatewayPairingStore::open(path.clone()).expect("approving store opens");
+        let approved_request = pending_id(
+            approver
+                .record_pending(&approved_device, Role::Operator, vec![OperatorScope::Write])
+                .expect("second request accepted"),
+        );
+        let approval_pause = PairingTestPause::new();
+        *approver
+            .test_hooks
+            .approval_before_mutation
+            .lock()
+            .expect("approval hook") = Some(Arc::clone(&approval_pause));
+        let approving_store = Arc::clone(&approver);
+        let approving = thread::spawn(move || {
+            approving_store.dispatch(
+                "device.pair.approve",
+                Some(&json!({"requestId":approved_request})),
+            )
+        });
+
+        approval_pause.reached.wait();
+        let removed = revoker.dispatch(
+            "device.pair.remove",
+            Some(&json!({"deviceId":revoked_device})),
+        );
+        approval_pause.release.wait();
+        let removed = removed
+            .expect("revocation succeeds")
+            .expect("removal method handled");
+        let response = approving
+            .join()
+            .expect("approval thread joins")
+            .expect("approval succeeds")
+            .expect("approval method handled");
+
+        assert_eq!(removed["removed"], true);
+        assert_eq!(response["device"]["deviceId"], approved_device);
+        assert_eq!(
+            approver.devices().current_grant(&revoked_device),
+            None,
+            "the approving store reconciles the externally revoked grant"
+        );
+        assert!(approver.devices().current_grant(&approved_device).is_some());
+        assert_eq!(revoker.devices().current_grant(&revoked_device), None);
+        assert!(revoker.devices().current_grant(&approved_device).is_some());
+        assert_eq!(revoker.len(), 1);
+        let reopened = GatewayPairingStore::open(path).expect("store reopens");
+        assert_eq!(reopened.devices().current_grant(&revoked_device), None);
+        assert!(reopened.devices().current_grant(&approved_device).is_some());
+        assert_eq!(reopened.len(), 1);
+    }
+
+    #[test]
+    fn remove_waiting_on_scope_approval_cannot_be_resurrected() {
+        let root = TestRoot::new("approval-remove-linearization");
+        let path = root.join("pairings.json");
+        let device_id = "d".repeat(64);
+        let store = GatewayPairingStore::open(path.clone()).expect("store opens");
+        let initial_request = pending_id(
+            store
+                .record_pending(&device_id, Role::Operator, vec![OperatorScope::Read])
+                .expect("initial request accepted"),
+        );
+        store
+            .dispatch(
+                "device.pair.approve",
+                Some(&json!({"requestId":initial_request})),
+            )
+            .expect("initial grant commits");
+        let upgrade_request = pending_id(
+            store
+                .record_pending(&device_id, Role::Operator, vec![OperatorScope::Write])
+                .expect("scope upgrade accepted"),
+        );
+        let approval_pause = PairingTestPause::new();
+        *store
+            .test_hooks
+            .approval_reserved
+            .lock()
+            .expect("approval hook") = Some(Arc::clone(&approval_pause));
+        let remove_started = Arc::new(Barrier::new(2));
+        *store
+            .test_hooks
+            .remove_before_mutation
+            .lock()
+            .expect("remove hook") = Some(Arc::clone(&remove_started));
+
+        let approving_store = Arc::clone(&store);
+        let approving = thread::spawn(move || {
+            approving_store.dispatch(
+                "device.pair.approve",
+                Some(&json!({"requestId":upgrade_request})),
+            )
+        });
+        approval_pause.reached.wait();
+        let removing_store = Arc::clone(&store);
+        let removing_device = device_id.clone();
+        let removing = thread::spawn(move || {
+            removing_store.dispatch(
+                "device.pair.remove",
+                Some(&json!({"deviceId":removing_device})),
+            )
+        });
+        remove_started.wait();
+        approval_pause.release.wait();
+
+        approving
+            .join()
+            .expect("approval thread joins")
+            .expect("scope approval succeeds")
+            .expect("approval method handled");
+        let removed = removing
+            .join()
+            .expect("removal thread joins")
+            .expect("removal succeeds")
+            .expect("removal method handled");
+        assert_eq!(removed["removed"], true);
+        assert_eq!(store.devices().current_grant(&device_id), None);
+        assert!(store.is_empty());
+        let pending = store.pending.lock().expect("pending state");
+        assert!(
+            pending
+                .queued
+                .values()
+                .all(|request| request.device_id != device_id)
+        );
+        assert!(
+            pending
+                .approving
+                .values()
+                .all(|request| request.device_id != device_id)
+        );
+        drop(pending);
+        let reopened = GatewayPairingStore::open(path).expect("store reopens");
+        assert_eq!(reopened.devices().current_grant(&device_id), None);
+        assert!(reopened.is_empty());
     }
 
     #[test]
