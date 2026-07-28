@@ -20,6 +20,8 @@ const MAX_CACHED_EVIDENCE_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOTAL_REACHABLE_RUST_BYTES: usize = 128 * 1024 * 1024;
 const MAX_DISCOVERED_DIRECTORIES: usize = 65_536;
 const MAX_DISCOVERED_MANIFESTS: usize = 4096;
+const MAX_CLAIM_DISCOVERY_DEPTH: usize = 128;
+const MAX_CLAIM_FILES_EXAMINED: usize = 1_000_000;
 const MAX_REACHABLE_RUST_SOURCES: usize = 20_000;
 const MAX_EVIDENCE_ITEMS_PER_CLAIM: usize = 1024;
 
@@ -1203,50 +1205,327 @@ impl Registry {
 ///
 /// # Errors
 ///
-/// Returns a [`ViolationCode::Io`] error when `apps/` or `crates/` exists but a
-/// directory beneath it cannot be listed. Discovery is silent about missing
-/// top-level directories, but never about an unreadable one: skipping it would
-/// quietly drop every claim a whole subtree publishes.
+/// Returns a [`ViolationCode::Io`] error when the root or a directory beneath
+/// `apps/` or `crates/` cannot be inspected. [`ViolationCode::UnsafeTraversal`]
+/// rejects a link-like or non-directory root and any directory that resolves
+/// outside or changes identity during discovery. Symlink and reparse-point
+/// entries beneath a valid root are skipped without being followed.
+/// [`ViolationCode::TraversalLimit`] reports explicit depth, directory, and file
+/// bounds. Missing top-level directories remain valid.
 pub fn discover_claim_files(
     repository_root: impl AsRef<Path>,
 ) -> Result<Vec<PathBuf>, ConformanceError> {
-    let repository_root = repository_root.as_ref();
-    let mut found = Vec::new();
-    for directory in ["apps", "crates"] {
-        let start = repository_root.join(directory);
-        if start.is_dir() {
-            discover_in(&start, &mut found)?;
-        }
-    }
-    found.sort();
-    Ok(found)
+    discover_claim_files_with_limits(repository_root.as_ref(), ClaimDiscoveryLimits::DEFAULT)
 }
 
-fn discover_in(directory: &Path, found: &mut Vec<PathBuf>) -> Result<(), ConformanceError> {
-    let entries = fs::read_dir(directory).map_err(|error| {
-        ConformanceError::new(
-            ViolationCode::Io,
-            Some(directory.display().to_string()),
-            error.to_string(),
-        )
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            ConformanceError::new(
-                ViolationCode::Io,
-                Some(directory.display().to_string()),
-                error.to_string(),
-            )
-        })?;
-        let path = entry.path();
-        if path.is_dir() {
-            discover_in(&path, found)?;
-        } else if path.file_name().and_then(|name| name.to_str()) == Some("conformance-claims.json")
-        {
-            found.push(path);
-        }
+#[derive(Clone, Copy, Debug)]
+struct ClaimDiscoveryLimits {
+    depth: usize,
+    directories: usize,
+    files: usize,
+}
+
+impl ClaimDiscoveryLimits {
+    const DEFAULT: Self = Self {
+        depth: MAX_CLAIM_DISCOVERY_DEPTH,
+        directories: MAX_DISCOVERED_DIRECTORIES,
+        files: MAX_CLAIM_FILES_EXAMINED,
+    };
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn directory_identity(metadata: &fs::Metadata) -> DirectoryIdentity {
+    use std::os::unix::fs::MetadataExt as _;
+
+    DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
     }
-    Ok(())
+}
+
+#[derive(Debug)]
+struct PendingClaimDirectory {
+    path: PathBuf,
+    canonical_path: PathBuf,
+    depth: usize,
+    #[cfg(unix)]
+    identity: DirectoryIdentity,
+}
+
+#[derive(Debug)]
+struct ClaimDiscoveryWalker {
+    canonical_root: PathBuf,
+    limits: ClaimDiscoveryLimits,
+    directories_seen: usize,
+    files_examined: usize,
+    visited_paths: BTreeSet<PathBuf>,
+    #[cfg(unix)]
+    visited_identities: BTreeSet<DirectoryIdentity>,
+}
+
+impl ClaimDiscoveryWalker {
+    fn new(repository_root: &Path, limits: ClaimDiscoveryLimits) -> Result<Self, ConformanceError> {
+        let metadata = discovery_metadata(repository_root)?;
+        if is_symlink_or_reparse(&metadata) {
+            return Err(discovery_unsafe(
+                repository_root,
+                "claim discovery root must not be a symlink or reparse point",
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(discovery_unsafe(
+                repository_root,
+                "claim discovery root must be a directory",
+            ));
+        }
+        let canonical_root = discovery_canonicalize(repository_root)?;
+        let mut walker = Self {
+            canonical_root,
+            limits,
+            directories_seen: 0,
+            files_examined: 0,
+            visited_paths: BTreeSet::new(),
+            #[cfg(unix)]
+            visited_identities: BTreeSet::new(),
+        };
+        let root = walker
+            .prepare_directory(repository_root.to_path_buf(), 0, &metadata)?
+            .expect("a new claim discovery root cannot already be visited");
+        walker.verify_directory(&root)?;
+        Ok(walker)
+    }
+
+    fn walk(mut self, repository_root: &Path) -> Result<Vec<PathBuf>, ConformanceError> {
+        let mut directories = VecDeque::new();
+        for name in ["apps", "crates"] {
+            let path = repository_root.join(name);
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(discovery_io(&path, &error)),
+            };
+            if is_symlink_or_reparse(&metadata) || !metadata.is_dir() {
+                continue;
+            }
+            if let Some(directory) = self.prepare_directory(path, 1, &metadata)? {
+                directories.push_back(directory);
+            }
+        }
+
+        let mut found = Vec::new();
+        while let Some(directory) = directories.pop_front() {
+            self.verify_directory(&directory)?;
+            let entries = fs::read_dir(&directory.path)
+                .map_err(|error| discovery_io(&directory.path, &error))?;
+            let mut child_directories = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|error| discovery_io(&directory.path, &error))?;
+                let path = entry.path();
+                let metadata = discovery_metadata(&path)?;
+                if is_symlink_or_reparse(&metadata) {
+                    self.examine_file_like(repository_root)?;
+                    continue;
+                }
+                if metadata.is_dir() {
+                    if let Some(child) =
+                        self.prepare_directory(path, directory.depth + 1, &metadata)?
+                    {
+                        child_directories.push(child);
+                    }
+                    continue;
+                }
+                self.examine_file_like(repository_root)?;
+                if metadata.is_file() && entry.file_name() == OsStr::new("conformance-claims.json")
+                {
+                    self.verify_claim_file(&path)?;
+                    found.push(path);
+                }
+            }
+            child_directories.sort_by(|left, right| left.path.cmp(&right.path));
+            directories.extend(child_directories);
+        }
+        found.sort();
+        Ok(found)
+    }
+
+    fn prepare_directory(
+        &mut self,
+        path: PathBuf,
+        depth: usize,
+        metadata: &fs::Metadata,
+    ) -> Result<Option<PendingClaimDirectory>, ConformanceError> {
+        if depth > self.limits.depth {
+            return Err(discovery_limit(
+                &self.canonical_root,
+                format!(
+                    "claim discovery exceeded maximum depth {}",
+                    self.limits.depth
+                ),
+            ));
+        }
+        if is_symlink_or_reparse(metadata) || !metadata.is_dir() {
+            return Err(discovery_unsafe(
+                &path,
+                "claim discovery directory became link-like or stopped being a directory",
+            ));
+        }
+        let canonical_path = discovery_canonicalize(&path)?;
+        if !canonical_path.starts_with(&self.canonical_root) {
+            return Err(discovery_unsafe(
+                &path,
+                "claim discovery directory resolves outside the requested root",
+            ));
+        }
+        let verified_metadata = discovery_metadata(&path)?;
+        if is_symlink_or_reparse(&verified_metadata) || !verified_metadata.is_dir() {
+            return Err(discovery_unsafe(
+                &path,
+                "claim discovery directory became link-like or stopped being a directory",
+            ));
+        }
+        #[cfg(unix)]
+        let identity = directory_identity(&verified_metadata);
+        #[cfg(unix)]
+        if directory_identity(metadata) != identity {
+            return Err(discovery_unsafe(
+                &path,
+                "claim discovery directory changed identity while it was inspected",
+            ));
+        }
+        if self.visited_paths.contains(&canonical_path) {
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        if self.visited_identities.contains(&identity) {
+            return Ok(None);
+        }
+        if self.directories_seen >= self.limits.directories {
+            return Err(discovery_limit(
+                &self.canonical_root,
+                format!(
+                    "claim discovery exceeded {} directories visited",
+                    self.limits.directories
+                ),
+            ));
+        }
+        self.directories_seen += 1;
+        self.visited_paths.insert(canonical_path.clone());
+        #[cfg(unix)]
+        self.visited_identities.insert(identity);
+        Ok(Some(PendingClaimDirectory {
+            path,
+            canonical_path,
+            depth,
+            #[cfg(unix)]
+            identity,
+        }))
+    }
+
+    fn examine_file_like(&mut self, repository_root: &Path) -> Result<(), ConformanceError> {
+        self.files_examined += 1;
+        if self.files_examined > self.limits.files {
+            return Err(discovery_limit(
+                repository_root,
+                format!(
+                    "claim discovery exceeded {} files examined",
+                    self.limits.files
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_directory(&self, directory: &PendingClaimDirectory) -> Result<(), ConformanceError> {
+        let metadata = discovery_metadata(&directory.path)?;
+        if is_symlink_or_reparse(&metadata) || !metadata.is_dir() {
+            return Err(discovery_unsafe(
+                &directory.path,
+                "claim discovery directory became link-like or stopped being a directory",
+            ));
+        }
+        #[cfg(unix)]
+        if directory_identity(&metadata) != directory.identity {
+            return Err(discovery_unsafe(
+                &directory.path,
+                "claim discovery directory changed identity before enumeration",
+            ));
+        }
+        let canonical_path = discovery_canonicalize(&directory.path)?;
+        if canonical_path != directory.canonical_path
+            || !canonical_path.starts_with(&self.canonical_root)
+        {
+            return Err(discovery_unsafe(
+                &directory.path,
+                "claim discovery directory changed location before enumeration",
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_claim_file(&self, path: &Path) -> Result<(), ConformanceError> {
+        let canonical_path = discovery_canonicalize(path)?;
+        if !canonical_path.starts_with(&self.canonical_root) {
+            return Err(discovery_unsafe(
+                path,
+                "claim manifest resolves outside the requested root",
+            ));
+        }
+        let metadata = discovery_metadata(path)?;
+        if is_symlink_or_reparse(&metadata) || !metadata.is_file() {
+            return Err(discovery_unsafe(
+                path,
+                "claim manifest became link-like or stopped being a regular file",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn discover_claim_files_with_limits(
+    repository_root: &Path,
+    limits: ClaimDiscoveryLimits,
+) -> Result<Vec<PathBuf>, ConformanceError> {
+    ClaimDiscoveryWalker::new(repository_root, limits)?.walk(repository_root)
+}
+
+fn discovery_metadata(path: &Path) -> Result<fs::Metadata, ConformanceError> {
+    fs::symlink_metadata(path).map_err(|error| discovery_io(path, &error))
+}
+
+fn discovery_canonicalize(path: &Path) -> Result<PathBuf, ConformanceError> {
+    path.canonicalize()
+        .map_err(|error| discovery_io(path, &error))
+}
+
+fn discovery_io(path: &Path, error: &io::Error) -> ConformanceError {
+    ConformanceError::new(
+        ViolationCode::Io,
+        Some(path.display().to_string()),
+        error.to_string(),
+    )
+}
+
+fn discovery_unsafe(path: &Path, message: impl Into<String>) -> ConformanceError {
+    ConformanceError::new(
+        ViolationCode::UnsafeTraversal,
+        Some(path.display().to_string()),
+        message,
+    )
+}
+
+fn discovery_limit(path: &Path, message: impl Into<String>) -> ConformanceError {
+    ConformanceError::new(
+        ViolationCode::TraversalLimit,
+        Some(path.display().to_string()),
+        message,
+    )
 }
 
 pub(crate) fn validate_evidence(
@@ -2277,9 +2556,10 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        CargoTestTargets, OrdinalPathResolver, cargo_executable, cargo_pattern_matches,
-        declares_enabled_test, load_manifest_scope, normalized_api_path, read_file_bounded,
-        resolve_cargo_executable, resolve_external_executable,
+        CargoTestTargets, ClaimDiscoveryLimits, OrdinalPathResolver, cargo_executable,
+        cargo_pattern_matches, declares_enabled_test, discover_claim_files,
+        discover_claim_files_with_limits, load_manifest_scope, normalized_api_path,
+        read_file_bounded, resolve_cargo_executable, resolve_external_executable,
     };
     use crate::ViolationCode;
 
@@ -2319,6 +2599,46 @@ mod tests {
 
     struct CompilerOracleFixture {
         root: PathBuf,
+    }
+
+    struct ClaimDiscoveryFixture {
+        base: PathBuf,
+        root: PathBuf,
+        outside: PathBuf,
+    }
+
+    impl ClaimDiscoveryFixture {
+        fn new(name: &str) -> Self {
+            let base = env::temp_dir().join(format!(
+                "claw-conformance-discovery-{name}-{}-{}",
+                std::process::id(),
+                NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let root = base.join("repository");
+            let outside = base.join("outside");
+            fs::create_dir_all(&root).expect("create claim discovery root");
+            fs::create_dir_all(&outside).expect("create outside directory");
+            Self {
+                base,
+                root,
+                outside,
+            }
+        }
+
+        fn write_claim(&self, relative: &str) -> PathBuf {
+            let path = self.root.join(relative).join("conformance-claims.json");
+            fs::create_dir_all(path.parent().expect("claim parent")).expect("create claim parent");
+            fs::write(&path, "{}").expect("write claim fixture");
+            path
+        }
+    }
+
+    impl Drop for ClaimDiscoveryFixture {
+        fn drop(&mut self) {
+            if self.base.exists() {
+                fs::remove_dir_all(&self.base).expect("remove claim discovery fixture");
+            }
+        }
     }
 
     fn compiler_oracle_command(cargo: &Path, root: &Path) -> Command {
@@ -2400,6 +2720,172 @@ mod tests {
             "compiler oracle failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn claim_discovery_preserves_reachability_and_sorted_order() {
+        let fixture = ClaimDiscoveryFixture::new("ordering");
+        let mut expected = vec![
+            fixture.write_claim("crates/zeta"),
+            fixture.write_claim("apps/nested/alpha"),
+            fixture.write_claim("crates/middle/deeper"),
+        ];
+        fs::write(
+            fixture.root.join("crates").join("ordinary.txt"),
+            "not a claim",
+        )
+        .expect("write ordinary file");
+
+        expected.sort();
+        assert_eq!(
+            discover_claim_files(&fixture.root).expect("discover ordinary tree"),
+            expected
+        );
+    }
+
+    #[test]
+    fn claim_discovery_reports_typed_depth_limit() {
+        let fixture = ClaimDiscoveryFixture::new("depth-limit");
+        fixture.write_claim("crates/package");
+        let limits = ClaimDiscoveryLimits {
+            depth: 1,
+            ..ClaimDiscoveryLimits::DEFAULT
+        };
+
+        let error = discover_claim_files_with_limits(&fixture.root, limits)
+            .expect_err("nested package must exceed the depth limit");
+        assert_eq!(error.code(), ViolationCode::TraversalLimit);
+        assert_eq!(error.message(), "claim discovery exceeded maximum depth 1");
+    }
+
+    #[test]
+    fn claim_discovery_reports_typed_directory_limit() {
+        let fixture = ClaimDiscoveryFixture::new("directory-limit");
+        fixture.write_claim("crates/package");
+        let limits = ClaimDiscoveryLimits {
+            directories: 2,
+            ..ClaimDiscoveryLimits::DEFAULT
+        };
+
+        let error = discover_claim_files_with_limits(&fixture.root, limits)
+            .expect_err("root, crates, and package must exceed the directory limit");
+        assert_eq!(error.code(), ViolationCode::TraversalLimit);
+        assert_eq!(
+            error.message(),
+            "claim discovery exceeded 2 directories visited"
+        );
+    }
+
+    #[test]
+    fn claim_discovery_reports_typed_file_limit() {
+        let fixture = ClaimDiscoveryFixture::new("file-limit");
+        let crates = fixture.root.join("crates");
+        fs::create_dir_all(&crates).expect("create crates directory");
+        for name in ["one.txt", "two.txt", "three.txt"] {
+            fs::write(crates.join(name), "").expect("write examined file");
+        }
+        let limits = ClaimDiscoveryLimits {
+            files: 2,
+            ..ClaimDiscoveryLimits::DEFAULT
+        };
+
+        let error = discover_claim_files_with_limits(&fixture.root, limits)
+            .expect_err("three files must exceed the file limit");
+        assert_eq!(error.code(), ViolationCode::TraversalLimit);
+        assert_eq!(error.message(), "claim discovery exceeded 2 files examined");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_discovery_rejects_a_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ClaimDiscoveryFixture::new("root-symlink");
+        let alias = fixture.base.join("repository-link");
+        symlink(&fixture.root, &alias).expect("create repository root symlink");
+
+        let error = discover_claim_files(&alias).expect_err("root symlink must be rejected");
+        assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
+        assert_eq!(
+            error.message(),
+            "claim discovery root must not be a symlink or reparse point"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_discovery_skips_a_cyclic_self_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ClaimDiscoveryFixture::new("self-cycle");
+        let claim = fixture.write_claim("crates/package");
+        symlink(".", fixture.root.join("crates/package/self"))
+            .expect("create self-referential directory symlink");
+
+        assert_eq!(
+            discover_claim_files(&fixture.root).expect("cycle must terminate"),
+            vec![claim]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_discovery_skips_a_cyclic_ancestor_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ClaimDiscoveryFixture::new("ancestor-cycle");
+        let claim = fixture.write_claim("crates/package");
+        symlink("../..", fixture.root.join("crates/package/ancestor"))
+            .expect("create ancestor directory symlink");
+
+        assert_eq!(
+            discover_claim_files(&fixture.root).expect("ancestor cycle must terminate"),
+            vec![claim]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_discovery_does_not_follow_an_outside_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ClaimDiscoveryFixture::new("outside-link");
+        let claim = fixture.write_claim("crates/package");
+        let outside_claim = fixture.outside.join("conformance-claims.json");
+        fs::write(&outside_claim, "{}").expect("write outside claim");
+        symlink(
+            &fixture.outside,
+            fixture.root.join("crates/package/outside"),
+        )
+        .expect("create outside-pointing directory symlink");
+
+        let found = discover_claim_files(&fixture.root).expect("outside link must be skipped");
+        assert_eq!(found, vec![claim]);
+        assert!(!found.contains(&outside_claim));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn claim_discovery_skips_a_directory_reparse_point_when_supported() {
+        use std::os::windows::fs::symlink_dir;
+
+        let fixture = ClaimDiscoveryFixture::new("windows-reparse");
+        let claim = fixture.write_claim("crates/package");
+        fs::write(fixture.outside.join("conformance-claims.json"), "{}")
+            .expect("write outside claim");
+        if symlink_dir(
+            &fixture.outside,
+            fixture.root.join("crates/package/reparse"),
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        assert_eq!(
+            discover_claim_files(&fixture.root).expect("reparse point must be skipped"),
+            vec![claim]
         );
     }
 
