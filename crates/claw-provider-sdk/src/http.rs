@@ -27,6 +27,7 @@ use http_body_util::{BodyExt as _, Full};
 use hyper::body::{Body as _, Incoming};
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
+use tokio::time::Instant;
 use url::Url;
 
 pub use self::proxy::{
@@ -712,7 +713,7 @@ impl HttpTransport {
         request: HttpRequest,
         cancel: &CancelToken,
     ) -> Result<HttpResponse, ProviderError> {
-        let deadline = request.timeout.unwrap_or(self.request_timeout);
+        let deadline = deadline_after(request.timeout.unwrap_or(self.request_timeout));
         let response = self
             .dispatch(provider, operation, &request, deadline, cancel)
             .await?;
@@ -747,7 +748,7 @@ impl HttpTransport {
         // A streamed response has no total deadline, but both its handshake and
         // every silent interval are bounded so a dead upstream cannot retain a
         // connection forever.
-        let deadline = request.timeout.unwrap_or(self.request_timeout);
+        let deadline = deadline_after(request.timeout.unwrap_or(self.request_timeout));
         let idle_timeout = request
             .stream_idle_timeout
             .unwrap_or(self.stream_idle_timeout);
@@ -776,7 +777,7 @@ impl HttpTransport {
         provider: &str,
         operation: Operation,
         request: &HttpRequest,
-        deadline: Duration,
+        deadline: Instant,
         cancel: &CancelToken,
     ) -> Result<http::Response<Incoming>, ProviderError> {
         let wire = self.build(provider, operation, request)?;
@@ -894,7 +895,36 @@ async fn collect_bounded(
     Ok(buffer)
 }
 
+/// Converts a relative timeout to a representable absolute deadline.
+///
+/// Tokio's own [`tokio::time::sleep`] handles an overflowing duration by using
+/// a deadline roughly 30 years in the future. Preserve that non-panicking
+/// behavior for absolute request deadlines and rolling stream-idle resets. The
+/// fallback is shortened only when a platform's [`Instant`] range requires it.
+fn deadline_after(timeout: Duration) -> Instant {
+    const FAR_FUTURE: Duration = Duration::from_hours(24 * 365 * 30);
+
+    let now = Instant::now();
+    if let Some(deadline) = now.checked_add(timeout) {
+        return deadline;
+    }
+
+    let mut horizon = FAR_FUTURE;
+    loop {
+        if let Some(deadline) = now.checked_add(horizon) {
+            return deadline;
+        }
+        if horizon.is_zero() {
+            return now;
+        }
+        horizon /= 2;
+    }
+}
+
 /// Races a future against the cancel token and a deadline.
+///
+/// The deadline is absolute so callers can reuse it across successive phases
+/// without restoring time already spent in an earlier phase.
 ///
 /// Cancellation wins over the deadline, and both win over the future, so a
 /// cancelled request never reports a timeout it did not have. Dropping the
@@ -902,7 +932,7 @@ async fn collect_bounded(
 async fn with_deadline<F>(
     provider: &str,
     operation: Operation,
-    deadline: Duration,
+    deadline: Instant,
     cancel: &CancelToken,
     cancelled_detail: &str,
     future: F,
@@ -910,6 +940,22 @@ async fn with_deadline<F>(
 where
     F: Future,
 {
+    if cancel.is_cancelled() {
+        return Err(ProviderError::new(
+            ErrorKind::Cancelled,
+            provider,
+            operation,
+            cancelled_detail,
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(ProviderError::new(
+            ErrorKind::Timeout,
+            provider,
+            operation,
+            "the request exceeded its deadline",
+        ));
+    }
     tokio::select! {
         biased;
         () = cancel.cancelled() => Err(ProviderError::new(
@@ -918,7 +964,7 @@ where
             operation,
             cancelled_detail,
         )),
-        () = tokio::time::sleep(deadline) => Err(ProviderError::new(
+        () = tokio::time::sleep_until(deadline) => Err(ProviderError::new(
             ErrorKind::Timeout,
             provider,
             operation,
@@ -1016,9 +1062,7 @@ impl Stream for CancellableChunks {
                 }
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                     Ok(chunk) => {
-                        this.idle
-                            .as_mut()
-                            .reset(tokio::time::Instant::now() + this.idle_timeout);
+                        this.idle.as_mut().reset(deadline_after(this.idle_timeout));
                         Poll::Ready(Some(Ok(chunk)))
                     }
                     // Trailers carry no body bytes, so keep polling rather than
@@ -1359,7 +1403,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cancelled_token_short_circuits_before_any_socket_is_opened() {
+    async fn a_cancelled_buffered_request_with_an_extreme_timeout_never_opens_a_socket() {
         let transport = HttpTransport::with_config(&TransportConfig {
             tls_policy: TlsPolicy::AllowLoopbackPlaintext,
             ..TransportConfig::default()
@@ -1373,7 +1417,8 @@ mod tests {
             .send(
                 "ollama",
                 Operation::Complete,
-                HttpRequest::new(Method::Get, url("http://127.0.0.1:1/api/tags")),
+                HttpRequest::new(Method::Get, url("http://127.0.0.1:1/api/tags"))
+                    .timeout(Duration::MAX),
                 &cancel,
             )
             .await
@@ -1383,6 +1428,90 @@ mod tests {
             error.detail(),
             "the request was cancelled before a response arrived"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_streaming_request_with_an_extreme_timeout_never_opens_a_socket() {
+        let transport = HttpTransport::with_config(&TransportConfig {
+            tls_policy: TlsPolicy::AllowLoopbackPlaintext,
+            ..TransportConfig::default()
+        })
+        .expect("transport builds");
+        let cancel = CancelToken::cancelled_token();
+        let error = transport
+            .send_streaming(
+                "ollama",
+                Operation::StreamCompletion,
+                HttpRequest::new(Method::Get, url("http://127.0.0.1:1/api/chat"))
+                    .timeout(Duration::MAX),
+                &cancel,
+            )
+            .await
+            .expect_err("cancelled");
+        assert_eq!(error.kind(), ErrorKind::Cancelled);
+        assert_eq!(error.operation(), Operation::StreamCompletion);
+        assert_eq!(
+            error.detail(),
+            "the request was cancelled before a response arrived"
+        );
+    }
+
+    #[test]
+    fn an_extreme_timeout_saturates_to_a_far_future_deadline() {
+        let now = Instant::now();
+        let deadline = deadline_after(Duration::MAX);
+
+        assert!(deadline > now);
+    }
+
+    #[tokio::test]
+    async fn work_that_finishes_before_the_deadline_returns_its_output() {
+        let output = with_deadline(
+            "test",
+            Operation::Complete,
+            deadline_after(Duration::from_secs(1)),
+            &CancelToken::new(),
+            "cancelled",
+            async { 42_u8 },
+        )
+        .await
+        .expect("the future completes before the deadline");
+
+        assert_eq!(output, 42);
+    }
+
+    #[tokio::test]
+    async fn the_deadline_wins_at_the_exact_boundary() {
+        let error = with_deadline(
+            "test",
+            Operation::Complete,
+            Instant::now(),
+            &CancelToken::new(),
+            "cancelled",
+            async { 42_u8 },
+        )
+        .await
+        .expect_err("an already-expired deadline wins over ready work");
+
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+        assert_eq!(error.detail(), "the request exceeded its deadline");
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_when_the_deadline_is_also_ready() {
+        let error = with_deadline(
+            "test",
+            Operation::Complete,
+            Instant::now(),
+            &CancelToken::cancelled_token(),
+            "cancelled at the boundary",
+            async { 42_u8 },
+        )
+        .await
+        .expect_err("cancellation has priority over an expired deadline");
+
+        assert_eq!(error.kind(), ErrorKind::Cancelled);
+        assert_eq!(error.detail(), "cancelled at the boundary");
     }
 
     #[test]
