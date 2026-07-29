@@ -1166,7 +1166,7 @@ impl ProductionService {
             .map_or(CredentialPolicy::None, |token| {
                 CredentialPolicy::Token(GatewaySecret::from(token))
             });
-        let devices = gateway_pairing.devices();
+        let gateway_authorization = gateway_pairing.devices();
         let gateway_authenticator = GatewayPairingAuthenticator::new(
             gateway_credential,
             gateway_clock,
@@ -1179,7 +1179,7 @@ impl ProductionService {
         let gateway = GatewayServer::new(
             gateway_config,
             Arc::new(gateway_authenticator),
-            Arc::new(devices),
+            Arc::new(gateway_authorization),
         )
         .map_err(|error| ProductionError::new("gateway-build", error))?
         .bind(gateway_requested)

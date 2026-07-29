@@ -170,10 +170,12 @@ impl GatewayPairingStore {
         }))
     }
 
-    /// Returns the live directory shared by handshake and connection policy.
+    /// Returns a live authorization handle that retains this store's ownership.
     #[must_use]
-    pub fn devices(&self) -> DeviceDirectory {
-        self.runtime.devices.clone()
+    pub fn devices(&self) -> GatewayPairingAuthorization {
+        GatewayPairingAuthorization {
+            runtime: Arc::clone(&self.runtime),
+        }
     }
 
     /// Returns the number of durable grants.
@@ -556,10 +558,58 @@ impl GatewayPairingAdmin for GatewayPairingStore {
     }
 }
 
+/// Read-only live authorization handle for one durable pairing runtime.
+///
+/// Every clone retains the runtime's lifetime-exclusive process ownership, so
+/// the directory cannot outlive its protection and become stale while another
+/// process opens and mutates the same pairing file.
+#[derive(Clone)]
+pub struct GatewayPairingAuthorization {
+    runtime: Arc<PairingRuntime>,
+}
+
+impl GatewayPairingAuthorization {
+    /// Returns the number of paired devices currently authorized.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.runtime.devices.len()
+    }
+
+    /// Reports whether no device is currently authorized.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.runtime.devices.is_empty()
+    }
+
+    fn directory(&self) -> DeviceDirectory {
+        self.runtime.devices.clone()
+    }
+}
+
+impl Debug for GatewayPairingAuthorization {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayPairingAuthorization")
+            .field("paired_devices", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthorizationSource for GatewayPairingAuthorization {
+    fn generation(&self) -> u64 {
+        self.runtime.devices.generation()
+    }
+
+    fn current_grant(&self, device_wire_id: &str) -> Option<Grant> {
+        self.runtime.devices.current_grant(device_wire_id)
+    }
+}
+
 /// Authentication adapter that turns verified unpaired devices into durable
 /// pending requests while delegating proof and grant validation.
 pub struct GatewayPairingAuthenticator {
     inner: StaticAuthenticator,
+    authorization: GatewayPairingAuthorization,
     pairings: Arc<GatewayPairingStore>,
 }
 
@@ -571,8 +621,13 @@ impl GatewayPairingAuthenticator {
         clock: Arc<dyn Clock>,
         pairings: Arc<GatewayPairingStore>,
     ) -> Self {
-        let inner = StaticAuthenticator::with_devices(credential, clock, pairings.devices());
-        Self { inner, pairings }
+        let authorization = pairings.devices();
+        let inner = StaticAuthenticator::with_devices(credential, clock, authorization.directory());
+        Self {
+            inner,
+            authorization,
+            pairings,
+        }
     }
 }
 
@@ -581,6 +636,7 @@ impl Debug for GatewayPairingAuthenticator {
         formatter
             .debug_struct("GatewayPairingAuthenticator")
             .field("inner", &self.inner)
+            .field("authorization", &self.authorization)
             .field("pairings", &self.pairings.len())
             .finish()
     }
@@ -601,9 +657,7 @@ impl AuthenticationPort for GatewayPairingAuthenticator {
                     details
                 }
                 ConnectErrorDetailCode::AuthScopeMismatch => {
-                    let Some(details) =
-                        scope_upgrade_details(request, &self.pairings.runtime.devices)
-                    else {
+                    let Some(details) = scope_upgrade_details(request, &self.authorization) else {
                         return AuthenticationDecision::Rejected(rejection);
                     };
                     details
@@ -640,10 +694,10 @@ impl AuthenticationPort for GatewayPairingAuthenticator {
 
 fn scope_upgrade_details(
     request: AuthenticationRequest<'_>,
-    devices: &DeviceDirectory,
+    authorization: &impl AuthorizationSource,
 ) -> Option<PairingRequiredDetails> {
     let device_id = request.params().device.as_ref()?.id.as_str();
-    let grant = devices.current_grant(device_id)?;
+    let grant = authorization.current_grant(device_id)?;
     let requested_scopes = request
         .params()
         .scopes
@@ -1513,6 +1567,36 @@ mod tests {
             .expect("list method handled");
 
         assert_eq!(list["durabilityWarnings"], 2);
+    }
+
+    #[test]
+    fn authorization_handle_retains_process_ownership_after_store_drop() {
+        let root = TestRoot::new("authorization-ownership");
+        let path = root.join("pairings.json");
+        let device_id = "a".repeat(64);
+        let store = GatewayPairingStore::open(path.clone()).expect("owning store opens");
+        let request_id = pending_id(
+            store
+                .record_pending(&device_id, Role::Operator, vec![OperatorScope::Read])
+                .expect("pending request accepted"),
+        );
+        store
+            .dispatch(
+                "device.pair.approve",
+                Some(&json!({"requestId":request_id})),
+            )
+            .expect("grant commits");
+        let authorization = store.devices();
+        drop(store);
+
+        run_ownership_helper(&path, "blocked");
+        assert!(authorization.current_grant(&device_id).is_some());
+        drop(authorization);
+
+        run_ownership_helper(&path, "revoke");
+        let reopened = GatewayPairingStore::open(path).expect("store reopens after handle drops");
+        assert_eq!(reopened.devices().current_grant(&device_id), None);
+        assert!(reopened.is_empty());
     }
 
     #[test]
