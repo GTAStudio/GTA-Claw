@@ -6,6 +6,7 @@ import test from "node:test";
 import { gzipSync } from "node:zlib";
 import {
   captureWhatsAppRawBody,
+  MAX_WHATSAPP_WEBHOOK_BODY_BYTES,
   WhatsAppWebhookHandler,
 } from "../dist/channels/whatsappWebhook.js";
 
@@ -67,7 +68,7 @@ test("raw-body capture is scoped to the WhatsApp POST route", async () => {
 
 test("captured gzip body is authenticated and parsed without req.body", async () => {
   const json = Buffer.from(
-    `{\n  "entry": [{"changes":[{"value":{"messages":[{"from":"15551234567","id":"wamid.raw","timestamp":"1","type":"text","text":{"body":"hello"}}]}}]}]\n}`,
+    `{\n  "entry": [{"changes":[{"value":{"metadata":{"phone_number_id":"phone"},"messages":[{"from":"15551234567","id":"wamid.raw","timestamp":"1","type":"text","text":{"body":"hello"}}]}}]}]\n}`,
   );
   const compressed = gzipSync(json);
   const capture = captureWhatsAppRawBody(WEBHOOK_PATH);
@@ -124,6 +125,30 @@ test("captured gzip body is authenticated and parsed without req.body", async ()
   );
   assert.equal(rejected.calls[0].status, 401);
   assert.equal(handled, 1);
+});
+
+test("chunked raw-body capture rejects payloads over the byte cap", async () => {
+  const capture = captureWhatsAppRawBody(WEBHOOK_PATH);
+  const request = requestStream("POST", WEBHOOK_PATH);
+  const response = responseRecorder();
+  const nextArgs = [];
+  capture(request, response, (arg) => {
+    nextArgs.push(arg);
+  });
+
+  const ended = once(request, "end");
+  request.write(Buffer.alloc(MAX_WHATSAPP_WEBHOOK_BODY_BYTES, 0x61));
+  request.write(Buffer.from("b"));
+  assert.deepEqual(response.calls, []);
+  assert.deepEqual(nextArgs, []);
+  request.end();
+  await ended;
+
+  assert.deepEqual(response.calls, [
+    { status: 413, body: { error: "WhatsApp webhook body too large" } },
+  ]);
+  assert.deepEqual(nextArgs, [false]);
+  assert.equal(request.whatsappRawBody, undefined);
 });
 
 test("authenticated malformed or unsupported bodies return client errors", async () => {

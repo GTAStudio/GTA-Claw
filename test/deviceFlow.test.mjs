@@ -124,6 +124,71 @@ test("Device Flow coalesces startup and retains an acquired token for activation
   client.stop();
 });
 
+test("Device Flow retains a token while metadata lookup crosses code expiry", async () => {
+  const scheduledPolls = [];
+  const userLookupStarted = [];
+  let resolveUser;
+  const userResponse = new Promise((resolve) => {
+    resolveUser = resolve;
+  });
+  let deviceCodeRequests = 0;
+  const activations = [];
+  const client = new GitHubDeviceFlow({
+    clientId: "client-id",
+    scheduleFn: (callback, delayMs) => {
+      const timer = { callback, delayMs, cancelled: false };
+      scheduledPolls.push(timer);
+      return timer;
+    },
+    clearScheduleFn: (timer) => {
+      timer.cancelled = true;
+    },
+    fetchFn: async (url) => {
+      if (String(url).endsWith("/login/device/code")) {
+        deviceCodeRequests += 1;
+        return jsonResponse({
+          device_code: "device",
+          user_code: "CODE",
+          verification_uri: "https://github.com/login/device",
+          expires_in: 1,
+          interval: 0,
+        });
+      }
+      if (String(url).endsWith("/login/oauth/access_token")) {
+        return jsonResponse({ access_token: "retained-token" });
+      }
+      if (String(url).endsWith("/user")) {
+        userLookupStarted.push(true);
+        return userResponse;
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    },
+    onTokenAcquired: async (token, login) => {
+      activations.push({ token, login });
+    },
+  });
+
+  await client.getAuthMessage();
+  const poll = scheduledPolls[0].callback();
+  await new Promise(setImmediate);
+  assert.equal(userLookupStarted.length, 1);
+  assert.equal(client.acquiredToken?.token, "retained-token");
+
+  client.flowExpiresAt = 0;
+  const concurrentMessage = client.getAuthMessage();
+  await new Promise(setImmediate);
+  assert.equal(deviceCodeRequests, 1);
+
+  resolveUser(jsonResponse({ login: "octocat" }));
+  await poll;
+  assert.equal(await concurrentMessage, "GitHub authorization completed.");
+  assert.deepEqual(activations, [
+    { token: "retained-token", login: "octocat" },
+  ]);
+  assert.equal(deviceCodeRequests, 1);
+  client.stop();
+});
+
 test("Device Flow ignores stale polling work after flow rollover", async () => {
   const scheduledPolls = [];
   const activations = [];

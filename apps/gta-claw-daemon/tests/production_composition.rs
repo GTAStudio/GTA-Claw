@@ -81,7 +81,6 @@ impl Running {
             .env("WHATSAPP_VERIFY_TOKEN", "verify-token")
             .env("WHATSAPP_ACCESS_TOKEN", "access-token")
             .env("WHATSAPP_PHONE_NUMBER_ID", "phone-id")
-            .env("WHATSAPP_APP_SECRET", "app-secret")
             .env("GTA_CLAW_LOG", "off")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -723,7 +722,6 @@ fn write_config_fixture(path: &Path, model: &str, role_url: &str, teams: bool, w
         ("WHATSAPP_VERIFY_TOKEN", "verify-token"),
         ("WHATSAPP_ACCESS_TOKEN", "access-token"),
         ("WHATSAPP_PHONE_NUMBER_ID", "phone-id"),
-        ("WHATSAPP_APP_SECRET", "app-secret"),
         ("COPILOT_MODEL", model),
         ("AGENT_ROLE_URL", role_url),
     ])

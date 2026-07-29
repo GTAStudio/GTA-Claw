@@ -12,6 +12,7 @@ import {
 const MAX_COMPLETED_MESSAGE_IDS = 10_000;
 const MAX_DEAD_LETTERED_MESSAGE_IDS = 10_000;
 const MAX_PENDING_REPLIES = 10_000;
+export const MAX_WHATSAPP_WEBHOOK_BODY_BYTES = 1024 * 1024;
 const gunzipAsync = promisify(gunzip);
 
 class WhatsAppWebhookBodyError extends Error {
@@ -68,13 +69,15 @@ export function isWhatsAppWebhookPost(
 }
 
 export function captureWhatsAppRawBody(whatsappPath: string) {
-  return (req: Request, _res: Response, next: Next): void => {
+  return (req: Request, res: Response, next: Next): void => {
     if (!isWhatsAppWebhookPost(req, whatsappPath)) {
       next();
       return;
     }
 
     const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    let oversized = false;
     let settled = false;
     const finish = (err?: Error): void => {
       if (settled) return;
@@ -83,14 +86,28 @@ export function captureWhatsAppRawBody(whatsappPath: string) {
         next(err);
         return;
       }
-      (req as WhatsAppRawRequest).whatsappRawBody = Buffer.concat(chunks);
+      if (oversized) {
+        res.send(413, { error: "WhatsApp webhook body too large" });
+        next(false);
+        return;
+      }
+      (req as WhatsAppRawRequest).whatsappRawBody = Buffer.concat(
+        chunks,
+        totalBytes,
+      );
       next();
     };
 
     req.on("data", (chunk: Buffer | string) => {
-      chunks.push(
-        Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(chunk),
-      );
+      if (oversized) return;
+      const buffer = Buffer.from(chunk);
+      totalBytes += buffer.length;
+      if (totalBytes > MAX_WHATSAPP_WEBHOOK_BODY_BYTES) {
+        oversized = true;
+        chunks.length = 0;
+        return;
+      }
+      chunks.push(buffer);
     });
     req.once("end", () => finish());
     req.once("error", (err) =>
@@ -180,7 +197,11 @@ export class WhatsAppWebhookHandler {
 
       for (const entry of entries) {
         for (const change of entry.changes ?? []) {
-          for (const msg of change.value?.messages ?? []) {
+          const value = change.value;
+          if (value?.metadata?.phone_number_id !== this.phoneNumberId) {
+            continue;
+          }
+          for (const msg of value.messages ?? []) {
             if (msg.type !== "text") continue;
             const text = msg.text?.body?.trim();
             if (!text) continue;

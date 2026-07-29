@@ -14,6 +14,27 @@ class TelegramTerminalDeliveryError extends Error {
   }
 }
 
+class TelegramRetryableDeliveryError extends Error {
+  constructor(
+    readonly status: number,
+    readonly retryAfterMs: number | null,
+  ) {
+    super(`Telegram sendMessage failed with retryable status ${status}`);
+    this.name = "TelegramRetryableDeliveryError";
+  }
+}
+
+interface TelegramResponseParameters {
+  retry_after?: number;
+  migrate_to_chat_id?: number;
+}
+
+interface TelegramErrorResponse {
+  parameters?: TelegramResponseParameters;
+}
+
+type TelegramFetchResponse = Awaited<ReturnType<typeof defaultFetch>>;
+
 interface TelegramUser {
   id: number;
   username?: string;
@@ -58,6 +79,7 @@ export interface TelegramPollingOptions {
     text: string;
   }) => Promise<string>;
   fetchFn?: typeof defaultFetch;
+  waitFn?: (delayMs: number, signal: AbortSignal) => Promise<void>;
 }
 
 export class TelegramPollingClient {
@@ -65,6 +87,7 @@ export class TelegramPollingClient {
   private readonly pollIntervalMs: number;
   private readonly onMessage: TelegramPollingOptions["onMessage"];
   private readonly fetchFn: typeof defaultFetch;
+  private readonly waitFn: NonNullable<TelegramPollingOptions["waitFn"]>;
   private running = false;
   private loopPromise: Promise<void> | null = null;
   private lifecyclePromise: Promise<void> = Promise.resolve();
@@ -82,6 +105,7 @@ export class TelegramPollingClient {
     this.pollIntervalMs = options.pollIntervalMs;
     this.onMessage = options.onMessage;
     this.fetchFn = options.fetchFn ?? defaultFetch;
+    this.waitFn = options.waitFn ?? waitForDelay;
   }
 
   start(): Promise<void> {
@@ -118,6 +142,7 @@ export class TelegramPollingClient {
 
   private async loop(signal: AbortSignal): Promise<void> {
     while (this.running && !signal.aborted) {
+      let nextPollDelayMs = this.pollIntervalMs;
       try {
         const updates = await this.getUpdates(signal);
         await this.processUpdates(updates);
@@ -126,9 +151,17 @@ export class TelegramPollingClient {
           break;
         }
         logger.error({ err }, "Telegram polling loop error");
+        if (
+          err instanceof TelegramRetryableDeliveryError &&
+          err.retryAfterMs !== null
+        ) {
+          nextPollDelayMs = Math.max(nextPollDelayMs, err.retryAfterMs);
+        }
       }
 
-      await this.waitForNextPoll(signal);
+      if (this.running && !signal.aborted) {
+        await this.waitFn(nextPollDelayMs, signal);
+      }
     }
   }
 
@@ -172,22 +205,6 @@ export class TelegramPollingClient {
     }
 
     return data.result ?? [];
-  }
-
-  private waitForNextPoll(signal: AbortSignal): Promise<void> {
-    if (!this.running || signal.aborted) {
-      return Promise.resolve();
-    }
-
-    return new Promise((resolve) => {
-      const finish = (): void => {
-        clearTimeout(timer);
-        signal.removeEventListener("abort", finish);
-        resolve();
-      };
-      const timer = setTimeout(finish, this.pollIntervalMs);
-      signal.addEventListener("abort", finish, { once: true });
-    });
   }
 
   private async handleUpdate(update: TelegramUpdate): Promise<void> {
@@ -246,13 +263,64 @@ export class TelegramPollingClient {
       });
 
       if (!resp.ok) {
+        const parameters = await this.readResponseParameters(resp);
+        const retryAfterMs =
+          parameters?.retry_after !== undefined
+            ? parameters.retry_after * 1000
+            : null;
+        if (parameters?.migrate_to_chat_id !== undefined) {
+          checkpoint.chatId = parameters.migrate_to_chat_id;
+          throw new TelegramRetryableDeliveryError(resp.status, retryAfterMs);
+        }
+        if (retryAfterMs !== null) {
+          throw new TelegramRetryableDeliveryError(resp.status, retryAfterMs);
+        }
         if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
           throw new TelegramTerminalDeliveryError(resp.status);
         }
-        throw new Error(`Telegram sendMessage failed: ${resp.status}`);
+        throw new TelegramRetryableDeliveryError(resp.status, null);
       }
       checkpoint.nextChunk += 1;
     }
+  }
+
+  private async readResponseParameters(
+    resp: TelegramFetchResponse,
+  ): Promise<TelegramResponseParameters | null> {
+    let data: unknown;
+    try {
+      data = (await resp.json()) as TelegramErrorResponse;
+    } catch (err) {
+      logger.warn(
+        { err, status: resp.status },
+        "Telegram error response was not valid JSON",
+      );
+      return null;
+    }
+
+    if (typeof data !== "object" || data === null) {
+      return null;
+    }
+    const parameters = (data as TelegramErrorResponse).parameters;
+    if (typeof parameters !== "object" || parameters === null) {
+      return null;
+    }
+
+    const parsed: TelegramResponseParameters = {};
+    if (
+      typeof parameters.retry_after === "number" &&
+      Number.isSafeInteger(parameters.retry_after) &&
+      parameters.retry_after >= 0
+    ) {
+      parsed.retry_after = parameters.retry_after;
+    }
+    if (
+      typeof parameters.migrate_to_chat_id === "number" &&
+      Number.isSafeInteger(parameters.migrate_to_chat_id)
+    ) {
+      parsed.migrate_to_chat_id = parameters.migrate_to_chat_id;
+    }
+    return parsed;
   }
 
   private terminalFailureReason(err: unknown): string | null {
@@ -283,4 +351,20 @@ export class TelegramPollingClient {
       }
     }
   }
+}
+
+function waitForDelay(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, delayMs);
+    signal.addEventListener("abort", finish, { once: true });
+  });
 }

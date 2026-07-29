@@ -21,7 +21,7 @@ interface DiscordMessageCreate {
   };
 }
 
-const NON_RESUMABLE_CLOSE_CODES = new Set([4007, 4009]);
+const NON_RESUMABLE_CLOSE_CODES = new Set([1000, 1001, 4007, 4009]);
 const FATAL_CLOSE_CODES = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 
 export interface DiscordGatewayOptions {
@@ -84,6 +84,7 @@ export class DiscordGatewayClient {
     }
 
     this.clearHeartbeat();
+    this.clearSession();
 
     if (this.ws) {
       const ws = this.ws;
@@ -93,7 +94,7 @@ export class DiscordGatewayClient {
         logger.debug({ err }, "Discord gateway error during shutdown");
       });
       try {
-        ws.close();
+        ws.close(1000);
       } catch (err) {
         logger.error({ err }, "Failed to close Discord gateway");
       }

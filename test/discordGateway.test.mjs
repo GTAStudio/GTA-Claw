@@ -7,6 +7,7 @@ class FakeWebSocket extends EventEmitter {
   readyState = 1;
   sent = [];
   closeCalls = 0;
+  closeCodes = [];
   terminateCalls = 0;
   sendError = null;
   closeError = null;
@@ -16,13 +17,19 @@ class FakeWebSocket extends EventEmitter {
     callback?.(this.sendError);
   }
 
-  close(code = 1000) {
+  close(code) {
     this.closeCalls += 1;
+    this.closeCodes.push(code);
     this.readyState = 3;
-    this.emit("close", code);
+    this.emit("close", code ?? 1005);
     if (this.closeError) {
       setImmediate(() => this.emit("error", this.closeError));
     }
+  }
+
+  remoteClose(code) {
+    this.readyState = 3;
+    this.emit("close", code);
   }
 
   terminate() {
@@ -127,7 +134,7 @@ test("Discord retains sequence when Hello and ACK omit s", async () => {
   packet(first, { op: 1, t: null, d: null });
   assert.deepEqual(first.sent.at(-1), { op: 1, d: 42 });
 
-  first.close();
+  first.remoteClose(1006);
   clearTimeout(client.reconnectTimer);
   client.reconnectTimer = null;
   client.connect();
@@ -165,7 +172,7 @@ test("Discord resumes with the saved session, sequence, and resume gateway URL",
     },
   });
 
-  first.close();
+  first.remoteClose(1006);
   clearTimeout(client.reconnectTimer);
   client.reconnectTimer = null;
   client.connect();
@@ -218,7 +225,7 @@ test("Discord identifies after a non-resumable session close", async () => {
     },
   });
 
-  first.close(4009);
+  first.remoteClose(4009);
   clearTimeout(client.reconnectTimer);
   client.reconnectTimer = null;
   client.connect();
@@ -245,7 +252,7 @@ test("Discord stops reconnecting after an unrecoverable gateway close", async ()
     d: { heartbeat_interval: 60_000 },
   });
 
-  socket.close(4004);
+  socket.remoteClose(4004);
   assert.equal(client.running, false);
   assert.equal(client.heartbeatTimer, null);
   assert.equal(client.reconnectTimer, null);
@@ -267,6 +274,106 @@ test("Discord contains close-time errors when stopped while connecting", async (
   assert.equal(sockets.length, 1);
   assert.equal(client.reconnectTimer, null);
   assert.equal(socket.listenerCount("error"), 1);
+  assert.deepEqual(socket.closeCodes, [1000]);
+});
+
+test("Discord final stop sends 1000 and clears resumable state", async () => {
+  const { client, sockets } = createClient();
+  client.start();
+  const socket = sockets[0];
+  packet(socket, {
+    op: 10,
+    t: null,
+    d: { heartbeat_interval: 60_000 },
+  });
+  packet(socket, {
+    op: 0,
+    t: "READY",
+    s: 42,
+    d: {
+      session_id: "session-1",
+      resume_gateway_url: "wss://resume.example",
+    },
+  });
+
+  await client.stop();
+
+  assert.deepEqual(socket.closeCodes, [1000]);
+  assert.equal(client.sessionId, null);
+  assert.equal(client.seq, null);
+  assert.equal(client.resumeGatewayUrl, null);
+  assert.equal(client.reconnectTimer, null);
+});
+
+test("Discord clean remote closes discard the resumable session", async () => {
+  for (const closeCode of [1000, 1001]) {
+    const { client, sockets } = createClient();
+    client.start();
+    const first = sockets[0];
+    packet(first, {
+      op: 10,
+      t: null,
+      d: { heartbeat_interval: 60_000 },
+    });
+    packet(first, {
+      op: 0,
+      t: "READY",
+      s: 42,
+      d: {
+        session_id: "session-1",
+        resume_gateway_url: "wss://resume.example",
+      },
+    });
+
+    first.remoteClose(closeCode);
+    clearTimeout(client.reconnectTimer);
+    client.reconnectTimer = null;
+    client.connect();
+    const next = sockets[1];
+    packet(next, {
+      op: 10,
+      t: null,
+      d: { heartbeat_interval: 60_000 },
+    });
+
+    assert.equal(next.sent[0].op, 2, String(closeCode));
+    await client.stop();
+  }
+});
+
+test("Discord gateway-requested no-code close remains resumable", async () => {
+  const { client, sockets } = createClient();
+  client.start();
+  const first = sockets[0];
+  packet(first, {
+    op: 10,
+    t: null,
+    d: { heartbeat_interval: 60_000 },
+  });
+  packet(first, {
+    op: 0,
+    t: "READY",
+    s: 42,
+    d: {
+      session_id: "session-1",
+      resume_gateway_url: "wss://resume.example",
+    },
+  });
+
+  packet(first, { op: 7, t: null, d: null });
+  assert.deepEqual(first.closeCodes, [undefined]);
+  clearTimeout(client.reconnectTimer);
+  client.reconnectTimer = null;
+  client.connect();
+  const resumed = sockets[1];
+  packet(resumed, {
+    op: 10,
+    t: null,
+    d: { heartbeat_interval: 60_000 },
+  });
+  assert.equal(resumed.sent[0].op, 6);
+
+  await client.stop();
 });
 
 test("Discord falls back after the resume gateway factory fails", async () => {
@@ -303,7 +410,7 @@ test("Discord falls back after the resume gateway factory fails", async () => {
     },
   });
 
-  sockets[0].close();
+  sockets[0].remoteClose(1006);
   clearTimeout(client.reconnectTimer);
   client.reconnectTimer = null;
   client.connect();
@@ -347,11 +454,11 @@ test("Discord falls back after a pre-Hello resume gateway close", async () => {
     },
   });
 
-  sockets[0].close();
+  sockets[0].remoteClose(1006);
   clearTimeout(client.reconnectTimer);
   client.reconnectTimer = null;
   client.connect();
-  sockets[1].close();
+  sockets[1].remoteClose(1006);
   clearTimeout(client.reconnectTimer);
   client.reconnectTimer = null;
   client.connect();

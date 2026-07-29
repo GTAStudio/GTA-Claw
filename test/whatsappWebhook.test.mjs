@@ -5,13 +5,14 @@ import { WhatsAppWebhookHandler } from "../dist/channels/whatsappWebhook.js";
 
 const APP_SECRET = "test-app-secret";
 
-function webhookBody(messageId = "wamid.1") {
+function webhookBody(messageId = "wamid.1", phoneNumberId = "phone") {
   return {
     entry: [
       {
         changes: [
           {
             value: {
+              metadata: { phone_number_id: phoneNumberId },
               messages: [
                 {
                   from: "15551234567",
@@ -96,6 +97,29 @@ test("WhatsApp authenticates the exact raw body and rejects unsafe signatures", 
     assert.equal(rejected.calls[0].status, 401);
   }
   assert.equal(handled, 1);
+});
+
+test("WhatsApp ignores messages scoped to another phone number", async () => {
+  let handled = 0;
+  const handler = createHandler({
+    onMessage: async () => {
+      handled += 1;
+      return "must not send";
+    },
+    fetchFn: async () => {
+      throw new Error("outbound send must not run for another phone number");
+    },
+  });
+  const response = responseRecorder();
+
+  await handler.incoming(
+    signedRequest(webhookBody("wamid.wrong-phone", "different-phone")),
+    response,
+    () => undefined,
+  );
+
+  assert.equal(response.calls[0].status, 200);
+  assert.equal(handled, 0);
 });
 
 test("WhatsApp retries only outbound delivery after a send failure", async () => {

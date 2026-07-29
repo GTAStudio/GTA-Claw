@@ -60,6 +60,7 @@ export class GitHubDeviceFlow {
   private flowGeneration = 0;
   private flowController: AbortController | null = null;
   private acquiredToken: { token: string; login: string } | null = null;
+  private tokenMetadataPromise: Promise<void> | null = null;
   private activationPromise: Promise<void> | null = null;
 
   constructor(options: DeviceFlowOptions) {
@@ -73,6 +74,12 @@ export class GitHubDeviceFlow {
   /** Returns a user-facing message with authorization instructions. Starts a new flow if none is pending. */
   async getAuthMessage(): Promise<string> {
     if (this.acquiredToken) {
+      if (this.tokenMetadataPromise) {
+        await this.tokenMetadataPromise;
+      }
+      if (!this.acquiredToken) {
+        return "GitHub authorization was cancelled.";
+      }
       try {
         await this.activateAcquiredToken();
         return "GitHub authorization completed.";
@@ -203,18 +210,43 @@ export class GitHubDeviceFlow {
         }
 
         if (data.access_token) {
-          const login = await this.fetchUserLogin(data.access_token, signal);
-          if (!this.isCurrentFlow(generation)) {
+          const acquiredToken = {
+            token: data.access_token,
+            login: "unknown",
+          };
+          this.acquiredToken = acquiredToken;
+          const metadataPromise = this.fetchUserLogin(
+            acquiredToken.token,
+            signal,
+          ).then((login) => {
+            if (this.acquiredToken === acquiredToken) {
+              acquiredToken.login = login;
+            }
+          });
+          this.tokenMetadataPromise = metadataPromise;
+          try {
+            await metadataPromise;
+          } finally {
+            if (this.tokenMetadataPromise === metadataPromise) {
+              this.tokenMetadataPromise = null;
+            }
+          }
+          if (
+            !this.isCurrentFlow(generation) ||
+            this.acquiredToken !== acquiredToken
+          ) {
             return;
           }
           this.clearPendingFlow(generation);
-          this.acquiredToken = { token: data.access_token, login };
-          logger.info({ login }, "Device Flow authorization completed");
+          logger.info(
+            { login: acquiredToken.login },
+            "Device Flow authorization completed",
+          );
           try {
             await this.activateAcquiredToken();
           } catch (err) {
             logger.error(
-              { err, login },
+              { err, login: acquiredToken.login },
               "GitHub token acquired but GTA-Claw activation failed",
             );
           }
@@ -393,5 +425,6 @@ export class GitHubDeviceFlow {
   stop(): void {
     this.invalidatePendingFlow();
     this.acquiredToken = null;
+    this.tokenMetadataPromise = null;
   }
 }

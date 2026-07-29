@@ -393,3 +393,108 @@ test("Telegram retains checkpoints for 429, 5xx, and network failures", async ()
   assert.equal(sends, 4);
   assert.equal(client.deadLetteredUpdates.size, 0);
 });
+
+test("Telegram honors retry_after before polling again", async () => {
+  const waitStarted = deferred();
+  const waits = [];
+  let handled = 0;
+  const client = new TelegramPollingClient({
+    botToken: "token",
+    pollIntervalMs: 100,
+    onMessage: async () => {
+      handled += 1;
+      return "reply";
+    },
+    fetchFn: async (url) => {
+      if (String(url).includes("/getUpdates")) {
+        return new Response(
+          JSON.stringify({ ok: true, result: [update(60)] }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error_code: 429,
+          parameters: { retry_after: 7 },
+        }),
+        {
+          status: 429,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    },
+    waitFn: async (delayMs) => {
+      waits.push(delayMs);
+      client.running = false;
+      waitStarted.resolve();
+    },
+  });
+
+  await client.start();
+  await waitStarted.promise;
+  await client.stop();
+
+  assert.deepEqual(waits, [7_000]);
+  assert.equal(handled, 1);
+  assert.equal(client.offset, 0);
+  assert.equal(client.deliveryCheckpoints.has(60), true);
+});
+
+test("Telegram migrates a checkpoint destination without duplicate side effects", async () => {
+  const sent = [];
+  let handled = 0;
+  let sendAttempt = 0;
+  const client = new TelegramPollingClient({
+    botToken: "token",
+    pollIntervalMs: 60_000,
+    onMessage: async () => {
+      handled += 1;
+      return "x".repeat(5_000);
+    },
+    fetchFn: async (_url, init) => {
+      sendAttempt += 1;
+      sent.push(JSON.parse(init.body));
+      if (sendAttempt === 2) {
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            error_code: 400,
+            parameters: { migrate_to_chat_id: -1009876543210 },
+          }),
+          {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
+      return new Response(null, { status: 200 });
+    },
+  });
+
+  await assert.rejects(
+    client.processUpdates([update(70)]),
+    /retryable status 400/,
+  );
+  assert.equal(client.offset, 0);
+  assert.equal(client.deliveryCheckpoints.get(70).nextChunk, 1);
+  assert.equal(
+    client.deliveryCheckpoints.get(70).chatId,
+    -1009876543210,
+  );
+
+  await client.processUpdates([update(70)]);
+  assert.equal(client.offset, 71);
+  assert.equal(handled, 1);
+  assert.deepEqual(
+    sent.map(({ chat_id, text }) => [chat_id, text.length]),
+    [
+      [123, 4_000],
+      [123, 1_000],
+      [-1009876543210, 1_000],
+    ],
+  );
+});
