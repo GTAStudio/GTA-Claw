@@ -571,7 +571,7 @@ fn workspace_claim_manifests_pass_conformance() {
     let claim_files = discover_claim_files(&repository).expect("discover workspace claims");
     for claim_file in claim_files {
         registry
-            .load_claims_file(claim_file)
+            .load_discovered_claim_file(claim_file)
             .expect("load workspace claims");
     }
 

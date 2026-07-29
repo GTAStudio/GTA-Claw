@@ -1,13 +1,13 @@
 //! CI command-line entry point for the conformance harness.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use claw_conformance::{
-    ConformanceError, Contract, Registry, discover_claim_files, generate_report,
+    ClaimFileKey, ConformanceError, Contract, DiscoveredClaimFile, Registry, discover_claim_files,
+    generate_report, open_claim_file,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,21 +47,24 @@ fn run() -> Result<(), String> {
     let contract = Contract::load(&arguments.contract_root)
         .map_err(|error| conformance_error("contract load", &error))?;
     let repository_root = repository_root(&arguments.contract_root)?;
-    let mut claim_files = discover_claim_files(&repository_root)
+    let discovered_claims = discover_claim_files(&repository_root)
         .map_err(|error| conformance_error("claim discovery", &error))?;
-    claim_files.extend(arguments.claim_files);
-    let claim_files = claim_files
-        .into_iter()
-        .map(|path| {
-            fs::canonicalize(&path)
-                .map_err(|error| format!("cannot resolve claim file '{}': {error}", path.display()))
-        })
-        .collect::<Result<BTreeSet<_>, _>>()?;
+    let mut claim_files: BTreeMap<ClaimFileKey, DiscoveredClaimFile> = BTreeMap::new();
+    for claim in discovered_claims {
+        claim_files.insert(claim.key().clone(), claim);
+    }
+    for path in arguments.claim_files {
+        let claim = open_claim_file(&path)
+            .map_err(|error| conformance_error("explicit claim opening", &error))?;
+        claim_files.entry(claim.key().clone()).or_insert(claim);
+    }
 
+    let mut claim_files = claim_files.into_values().collect::<Vec<_>>();
+    claim_files.sort_by(|left, right| left.path().cmp(right.path()));
     let mut registry = Registry::new();
-    for path in claim_files {
+    for claim in claim_files {
         registry
-            .load_claims_file(path)
+            .load_discovered_claim_file(claim)
             .map_err(|error| conformance_error("claim loading", &error))?;
     }
     let report = generate_report(&contract, &registry, &repository_root)

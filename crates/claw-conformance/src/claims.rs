@@ -15,12 +15,11 @@ use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 #[cfg(unix)]
 use cap_fs_ext::{MetadataExt as _, OpenOptionsSyncExt as _};
 use cap_std::ambient_authority;
-#[cfg(not(unix))]
-use cap_std::fs::File as CapabilityFile;
 #[cfg(windows)]
 use cap_std::fs::OpenOptionsExt as _;
 use cap_std::fs::{
-    Dir as CapabilityDir, Metadata as CapabilityMetadata, OpenOptions as CapabilityOpenOptions,
+    Dir as CapabilityDir, File as CapabilityFile, Metadata as CapabilityMetadata,
+    OpenOptions as CapabilityOpenOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +44,12 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 #[cfg(windows)]
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+#[cfg(windows)]
+const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
 /// Claimed implementation level.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -243,6 +248,56 @@ pub struct ClaimsFile {
     /// Inventory-record claims.
     #[serde(default)]
     pub inventories: Vec<InventoryClaim>,
+}
+
+/// Stable identity used to deduplicate equivalent claim-file path spellings.
+///
+/// Keys use handle-backed filesystem identity on Unix and Windows. Platforms
+/// without stable identity fall back to a normalized canonical path.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ClaimFileKey(ClaimFileKeyKind);
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ClaimFileKeyKind {
+    #[cfg(any(unix, windows))]
+    Identity(FilesystemIdentity),
+    #[cfg(not(any(unix, windows)))]
+    CanonicalPath(PathBuf),
+}
+
+/// A claim manifest held open through the discovery-to-load handoff.
+///
+/// The path is diagnostic only. Loading consumes the already-verified,
+/// no-follow file handle, so replacing the pathname cannot redirect claim
+/// contents after discovery or explicit opening returns.
+#[must_use = "load claim artifacts through Registry::load_discovered_claim_file"]
+pub struct DiscoveredClaimFile {
+    path: PathBuf,
+    key: ClaimFileKey,
+    handle: CapabilityFile,
+}
+
+impl std::fmt::Debug for DiscoveredClaimFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DiscoveredClaimFile")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DiscoveredClaimFile {
+    /// Returns the original diagnostic path for this manifest.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the stable key used to deduplicate equivalent path spellings.
+    #[must_use]
+    pub const fn key(&self) -> &ClaimFileKey {
+        &self.key
+    }
 }
 
 /// Aggregated claims from Rust callers or claim manifests.
@@ -836,6 +891,24 @@ fn trusted_executable(repository_root: &Path, candidate: &Path) -> Result<PathBu
 fn read_file_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     let file = File::open(path)?;
     let reported_size = file.metadata()?.len();
+    read_open_file_bounded(file, reported_size, path, max_bytes)
+}
+
+fn read_capability_file_bounded(
+    file: CapabilityFile,
+    path: &Path,
+    max_bytes: u64,
+) -> io::Result<Vec<u8>> {
+    let reported_size = file.metadata()?.len();
+    read_open_file_bounded(file, reported_size, path, max_bytes)
+}
+
+fn read_open_file_bounded(
+    file: impl Read,
+    reported_size: u64,
+    path: &Path,
+    max_bytes: u64,
+) -> io::Result<Vec<u8>> {
     if reported_size > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -850,7 +923,8 @@ fn read_file_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
             .unwrap_or(usize::MAX)
             .min(usize::try_from(max_bytes).unwrap_or(usize::MAX)),
     );
-    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1188,7 +1262,38 @@ impl Registry {
                 error.to_string(),
             )
         })?;
-        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+        self.load_claims_bytes(path, &bytes)
+    }
+
+    /// Loads and registers a pinned claim manifest artifact.
+    ///
+    /// The artifact's verified file handle is consumed directly. Its diagnostic
+    /// path is never reopened, so a replacement after discovery cannot redirect
+    /// the bytes being parsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed I/O, JSON-schema, and duplicate-claim errors as
+    /// [`Self::load_claims_file`].
+    pub fn load_discovered_claim_file(
+        &mut self,
+        claim: DiscoveredClaimFile,
+    ) -> Result<(), ConformanceError> {
+        let DiscoveredClaimFile { path, handle, .. } = claim;
+        let bytes = read_capability_file_bounded(handle, &path, MAX_CLAIMS_FILE_BYTES).map_err(
+            |error| {
+                ConformanceError::new(
+                    ViolationCode::Io,
+                    Some(path.display().to_string()),
+                    error.to_string(),
+                )
+            },
+        )?;
+        self.load_claims_bytes(&path, &bytes)
+    }
+
+    fn load_claims_bytes(&mut self, path: &Path, bytes: &[u8]) -> Result<(), ConformanceError> {
+        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
         let claims: ClaimsFile =
             serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
                 ConformanceError::at_json_path(
@@ -1221,8 +1326,8 @@ impl Registry {
     }
 }
 
-/// Finds conventional `conformance-claims.json` manifests under `apps/` and
-/// `crates/`, returning a deterministic sorted list.
+/// Opens conventional `conformance-claims.json` manifests under `apps/` and
+/// `crates/`, returning a deterministic sorted list of verified artifacts.
 ///
 /// # Errors
 ///
@@ -1236,8 +1341,84 @@ impl Registry {
 /// and claim-manifest bounds. Missing top-level directories remain valid.
 pub fn discover_claim_files(
     repository_root: impl AsRef<Path>,
-) -> Result<Vec<PathBuf>, ConformanceError> {
+) -> Result<Vec<DiscoveredClaimFile>, ConformanceError> {
     discover_claim_files_with_limits(repository_root.as_ref(), ClaimDiscoveryLimits::DEFAULT)
+}
+
+/// Opens one explicit claim manifest as a verified, deduplicable artifact.
+///
+/// The input spelling remains available through [`DiscoveredClaimFile::path`],
+/// while its key uses handle-backed filesystem identity where available and a
+/// normalized canonical path only as fallback. Loading consumes the returned
+/// no-follow handle rather than reopening the input path.
+///
+/// # Errors
+///
+/// Returns [`ViolationCode::Io`] when the path cannot be resolved or opened,
+/// and [`ViolationCode::UnsafeTraversal`] when the final target is link-like,
+/// not a regular file, or changes identity during opening.
+pub fn open_claim_file(path: impl AsRef<Path>) -> Result<DiscoveredClaimFile, ConformanceError> {
+    open_claim_file_before_open(path.as_ref(), |_| {})
+}
+
+#[cfg(test)]
+fn open_claim_file_with_hook(
+    path: &Path,
+    hook: ClaimDiscoveryHook,
+) -> Result<DiscoveredClaimFile, ConformanceError> {
+    open_claim_file_before_open(path, move |path| {
+        hook(ClaimDiscoveryEvent::BeforeClaimFileOpen(path.to_path_buf()));
+    })
+}
+
+fn open_claim_file_before_open(
+    path: &Path,
+    before_open: impl FnOnce(&Path),
+) -> Result<DiscoveredClaimFile, ConformanceError> {
+    let absolute_path = absolute_claim_path(path)?;
+    #[cfg(windows)]
+    reject_windows_claim_stream(path, &absolute_path)?;
+    let (anchor_path, relative_path) = split_claim_path_anchor(&absolute_path, path)?;
+    let anchor = CapabilityDir::open_ambient_dir(&anchor_path, ambient_authority())
+        .map_err(|error| discovery_io(path, &error))?;
+    let observed = observe_entry(&anchor, &relative_path, path)?;
+    validate_claim_metadata(path, &observed.metadata, "explicit claim manifest")?;
+    before_open(path);
+    let handle = anchor
+        .open_with(&relative_path, &claim_file_open_options())
+        .map_err(|error| {
+            discovery_claim_open_error(&anchor, relative_path.as_os_str(), path, &error)
+        })?;
+    let metadata = handle
+        .metadata()
+        .map_err(|error| discovery_io(path, &error))?;
+    validate_claim_metadata(path, &metadata, "explicit claim manifest")?;
+    let opened_identity =
+        file_handle_identity(&handle, &metadata).map_err(|error| discovery_io(path, &error))?;
+    verify_opened_identity(
+        observed.identity,
+        opened_identity,
+        path,
+        "explicit claim manifest changed identity while it was opened",
+    )?;
+    #[cfg(any(unix, windows))]
+    let key = claim_file_key(require_identity(
+        opened_identity,
+        path,
+        "filesystem identity was unavailable for an explicit claim manifest",
+    )?);
+    #[cfg(not(any(unix, windows)))]
+    let key = {
+        let canonical_relative = anchor
+            .canonicalize(&relative_path)
+            .map_err(|error| discovery_io(path, &error))?;
+        claim_file_key(anchor_path.join(canonical_relative))
+    };
+    Ok(DiscoveredClaimFile {
+        path: path.to_path_buf(),
+        key,
+        handle,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1255,21 +1436,212 @@ impl ClaimDiscoveryLimits {
         files: MAX_CLAIM_FILES_EXAMINED,
         claim_files: MAX_DISCOVERED_CLAIM_FILES,
     };
+
+    const fn entry_budget(self) -> usize {
+        self.directories.saturating_add(self.files)
+    }
 }
 
-#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct FilesystemIdentity {
-    device: u64,
-    inode: u64,
+enum FilesystemIdentity {
+    #[cfg(unix)]
+    Unix { device: u64, inode: u64 },
+    #[cfg(windows)]
+    Windows {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    },
 }
 
 #[cfg(unix)]
 fn filesystem_identity(metadata: &CapabilityMetadata) -> FilesystemIdentity {
-    FilesystemIdentity {
+    FilesystemIdentity::Unix {
         device: metadata.dev(),
         inode: metadata.ino(),
     }
+}
+
+#[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "Windows exposes full 128-bit file identity only through FILE_ID_INFO; this is the \
+              crate's single audited FFI boundary and accepts only already-open handles"
+)]
+mod windows_file_id {
+    use std::io;
+    use std::mem::{self, MaybeUninit};
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    use super::FilesystemIdentity;
+
+    pub(super) fn from_handle(
+        handle: &(impl AsRawHandle + ?Sized),
+    ) -> io::Result<FilesystemIdentity> {
+        let mut info = MaybeUninit::<FILE_ID_INFO>::uninit();
+        let buffer_size =
+            u32::try_from(mem::size_of::<FILE_ID_INFO>()).expect("FILE_ID_INFO size fits in u32");
+        let raw_handle: HANDLE = handle.as_raw_handle();
+        // SAFETY: `handle` remains borrowed for the call, `info` points to
+        // writable storage of exactly FILE_ID_INFO size, and the initialized
+        // value is read only after the API reports success.
+        let succeeded = unsafe {
+            GetFileInformationByHandleEx(
+                raw_handle,
+                FileIdInfo,
+                info.as_mut_ptr().cast(),
+                buffer_size,
+            )
+        };
+        if succeeded == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: A successful GetFileInformationByHandleEx call initialized
+        // the complete FILE_ID_INFO buffer.
+        let info = unsafe { info.assume_init() };
+        Ok(FilesystemIdentity::Windows {
+            volume_serial_number: info.VolumeSerialNumber,
+            file_id: info.FileId.Identifier,
+        })
+    }
+}
+
+fn verify_opened_identity(
+    observed: Option<FilesystemIdentity>,
+    opened: Option<FilesystemIdentity>,
+    path: &Path,
+    message: &str,
+) -> Result<(), ConformanceError> {
+    #[cfg(any(unix, windows))]
+    if observed.is_none() || opened.is_none() || observed != opened {
+        return Err(discovery_unsafe(path, message));
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (observed, opened);
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn require_identity(
+    identity: Option<FilesystemIdentity>,
+    path: &Path,
+    message: &str,
+) -> Result<FilesystemIdentity, ConformanceError> {
+    identity.ok_or_else(|| discovery_unsafe(path, message))
+}
+
+#[cfg_attr(
+    unix,
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Windows FILE_ID_INFO lookup shares this signature and can fail"
+    )
+)]
+fn directory_handle_identity(
+    directory: &CapabilityDir,
+    metadata: &CapabilityMetadata,
+) -> Result<Option<FilesystemIdentity>, io::Error> {
+    #[cfg(unix)]
+    {
+        let _ = directory;
+        Ok(Some(filesystem_identity(metadata)))
+    }
+    #[cfg(windows)]
+    {
+        let _ = metadata;
+        windows_file_id::from_handle(directory).map(Some)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = directory;
+        Ok(None)
+    }
+}
+
+#[cfg_attr(
+    unix,
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Windows FILE_ID_INFO lookup shares this signature and can fail"
+    )
+)]
+fn file_handle_identity(
+    file: &CapabilityFile,
+    metadata: &CapabilityMetadata,
+) -> Result<Option<FilesystemIdentity>, io::Error> {
+    #[cfg(unix)]
+    {
+        let _ = file;
+        Ok(Some(filesystem_identity(metadata)))
+    }
+    #[cfg(windows)]
+    {
+        let _ = metadata;
+        windows_file_id::from_handle(file).map(Some)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Ok(None)
+    }
+}
+
+struct ObservedEntry {
+    metadata: CapabilityMetadata,
+    identity: Option<FilesystemIdentity>,
+}
+
+#[cfg(windows)]
+fn observe_entry(
+    parent: &CapabilityDir,
+    relative_path: &Path,
+    diagnostic_path: &Path,
+) -> Result<ObservedEntry, ConformanceError> {
+    let handle = parent
+        .open_with(relative_path, &windows_observation_options())
+        .map_err(|error| discovery_io(diagnostic_path, &error))?;
+    let metadata = handle
+        .metadata()
+        .map_err(|error| discovery_io(diagnostic_path, &error))?;
+    let identity = file_handle_identity(&handle, &metadata)
+        .map_err(|error| discovery_io(diagnostic_path, &error))?;
+    if identity.is_none() {
+        return Err(discovery_unsafe(
+            diagnostic_path,
+            "Windows FILE_ID_INFO was unavailable for an observed filesystem entry",
+        ));
+    }
+    Ok(ObservedEntry { metadata, identity })
+}
+
+#[cfg(not(windows))]
+fn observe_entry(
+    parent: &CapabilityDir,
+    relative_path: &Path,
+    diagnostic_path: &Path,
+) -> Result<ObservedEntry, ConformanceError> {
+    let metadata = parent
+        .symlink_metadata(relative_path)
+        .map_err(|error| discovery_io(diagnostic_path, &error))?;
+    #[cfg(unix)]
+    let identity = Some(filesystem_identity(&metadata));
+    #[cfg(not(any(unix, windows)))]
+    let identity = None;
+    Ok(ObservedEntry { metadata, identity })
+}
+
+#[cfg(any(unix, windows))]
+const fn claim_file_key(identity: FilesystemIdentity) -> ClaimFileKey {
+    ClaimFileKey(ClaimFileKeyKind::Identity(identity))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn claim_file_key(canonical_path: PathBuf) -> ClaimFileKey {
+    ClaimFileKey(ClaimFileKeyKind::CanonicalPath(canonical_path))
 }
 
 struct PinnedClaimDirectory {
@@ -1279,7 +1651,7 @@ struct PinnedClaimDirectory {
     relative_path: PathBuf,
     path: PathBuf,
     depth: usize,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     identity: FilesystemIdentity,
 }
 
@@ -1290,10 +1662,10 @@ struct ClaimDirectorySnapshot {
     identity: FilesystemIdentity,
 }
 
-// Windows retains no-share-delete handles through final verification. Unix can
-// drop them after traversal and revalidate lightweight device/inode snapshots.
+// The handle crosses the discovery-to-load boundary. Windows additionally
+// retains the ancestor chain through final verification; Unix revalidates
+// lightweight device/inode snapshots before returning the still-open file.
 struct PinnedClaimFile {
-    #[cfg(not(unix))]
     handle: CapabilityFile,
     #[cfg(not(unix))]
     parent: Arc<PinnedClaimDirectory>,
@@ -1301,39 +1673,58 @@ struct PinnedClaimFile {
     directories: Vec<ClaimDirectorySnapshot>,
     name: OsString,
     path: PathBuf,
-    #[cfg(unix)]
+    key: ClaimFileKey,
+    #[cfg(any(unix, windows))]
     identity: FilesystemIdentity,
 }
 
-#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ClaimDiscoveryEvent {
+    BeforeRootOpen(PathBuf),
+    BeforeDirectoryOpen(PathBuf),
     BeforeDirectoryRead(PathBuf),
+    DirectoryEntryRetained,
+    BeforeClaimFileOpen(PathBuf),
     ClaimFileOpened(PathBuf),
 }
 
-#[cfg(test)]
 type ClaimDiscoveryHook = Arc<dyn Fn(ClaimDiscoveryEvent) + Send + Sync>;
 
 struct ClaimDiscoveryWalker {
     repository_root: PathBuf,
+    #[cfg(not(any(unix, windows)))]
+    canonical_root: PathBuf,
     root: Arc<PinnedClaimDirectory>,
-    // Keeps the root's containing directory stable while its final component
-    // is opened and revalidated without following links.
+    // Retains the capability from which the root's final component was opened.
+    // Windows also uses the live handle as a namespace replacement barrier.
     _root_parent: Option<CapabilityDir>,
     limits: ClaimDiscoveryLimits,
     directories_seen: usize,
     files_examined: usize,
+    entries_seen: usize,
     #[cfg(unix)]
     visited_identities: BTreeSet<FilesystemIdentity>,
-    #[cfg(test)]
     hook: Option<ClaimDiscoveryHook>,
 }
 
 impl ClaimDiscoveryWalker {
     fn new(repository_root: &Path, limits: ClaimDiscoveryLimits) -> Result<Self, ConformanceError> {
+        Self::new_with_optional_hook(repository_root, limits, None)
+    }
+
+    fn new_with_optional_hook(
+        repository_root: &Path,
+        limits: ClaimDiscoveryLimits,
+        hook: Option<ClaimDiscoveryHook>,
+    ) -> Result<Self, ConformanceError> {
         let repository_root = normalize_repository_root(repository_root);
-        let (root_handle, root_parent) = open_repository_root(&repository_root)?;
+        let root_hook = hook.clone();
+        let (root_handle, root_parent) =
+            open_repository_root_before_open(&repository_root, move |path| {
+                if let Some(hook) = &root_hook {
+                    hook(ClaimDiscoveryEvent::BeforeRootOpen(path.to_path_buf()));
+                }
+            })?;
         let metadata = root_handle
             .dir_metadata()
             .map_err(|error| discovery_io(&repository_root, &error))?;
@@ -1349,8 +1740,22 @@ impl ClaimDiscoveryWalker {
                 "claim discovery exceeded 0 directories visited",
             ));
         }
+        #[cfg(any(unix, windows))]
+        let root_identity = require_identity(
+            directory_handle_identity(&root_handle, &metadata)
+                .map_err(|error| discovery_io(&repository_root, &error))?,
+            &repository_root,
+            "filesystem identity was unavailable for the claim discovery root",
+        )?;
+        #[cfg(not(windows))]
+        let canonical_root = canonical_claim_path(&repository_root)?;
         #[cfg(unix)]
-        let root_identity = filesystem_identity(&metadata);
+        verify_canonical_file_identity(
+            &canonical_root,
+            root_identity,
+            &repository_root,
+            "claim discovery root canonical path changed identity",
+        )?;
         let root = Arc::new(PinnedClaimDirectory {
             handle: root_handle,
             parent: None,
@@ -1358,20 +1763,22 @@ impl ClaimDiscoveryWalker {
             relative_path: PathBuf::new(),
             path: repository_root.clone(),
             depth: 0,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             identity: root_identity,
         });
         let walker = Self {
             repository_root,
+            #[cfg(not(any(unix, windows)))]
+            canonical_root,
             root,
             _root_parent: root_parent,
             limits,
             directories_seen: 1,
             files_examined: 0,
+            entries_seen: 0,
             #[cfg(unix)]
             visited_identities: BTreeSet::from([root_identity]),
-            #[cfg(test)]
-            hook: None,
+            hook,
         };
         Ok(walker)
     }
@@ -1382,12 +1789,10 @@ impl ClaimDiscoveryWalker {
         limits: ClaimDiscoveryLimits,
         hook: ClaimDiscoveryHook,
     ) -> Result<Self, ConformanceError> {
-        let mut walker = Self::new(repository_root, limits)?;
-        walker.hook = Some(hook);
-        Ok(walker)
+        Self::new_with_optional_hook(repository_root, limits, Some(hook))
     }
 
-    fn walk(mut self) -> Result<Vec<PathBuf>, ConformanceError> {
+    fn walk(mut self) -> Result<Vec<DiscoveredClaimFile>, ConformanceError> {
         let mut found = Vec::new();
         let root = Arc::clone(&self.root);
         for name in ["apps", "crates"] {
@@ -1412,20 +1817,10 @@ impl ClaimDiscoveryWalker {
         directory: &Arc<PinnedClaimDirectory>,
         found: &mut Vec<PinnedClaimFile>,
     ) -> Result<(), ConformanceError> {
-        #[cfg(test)]
         self.notify(ClaimDiscoveryEvent::BeforeDirectoryRead(
             directory.path.clone(),
         ));
-        let entries = directory
-            .handle
-            .entries()
-            .map_err(|error| discovery_io(&directory.path, &error))?;
-        let mut names = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|error| discovery_io(&directory.path, &error))?;
-            names.push(entry.file_name());
-        }
-        names.sort();
+        let names = self.read_directory_names(directory)?;
 
         for name in names {
             let path = directory.path.join(&name);
@@ -1448,10 +1843,38 @@ impl ClaimDiscoveryWalker {
 
             self.examine_file_like()?;
             if metadata.is_file() && name == OsStr::new("conformance-claims.json") {
-                self.pin_claim_file(directory, name, &metadata, found)?;
+                self.pin_claim_file(directory, name, found)?;
             }
         }
         Ok(())
+    }
+
+    fn read_directory_names(
+        &mut self,
+        directory: &PinnedClaimDirectory,
+    ) -> Result<Vec<OsString>, ConformanceError> {
+        let entries = directory
+            .handle
+            .entries()
+            .map_err(|error| discovery_io(&directory.path, &error))?;
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| discovery_io(&directory.path, &error))?;
+            if self.entries_seen >= self.limits.entry_budget() {
+                return Err(discovery_limit(
+                    &directory.path,
+                    format!(
+                        "claim discovery exceeded the combined bounds of {} directories and {} files",
+                        self.limits.directories, self.limits.files
+                    ),
+                ));
+            }
+            self.entries_seen += 1;
+            names.push(entry.file_name());
+            self.notify(ClaimDiscoveryEvent::DirectoryEntryRetained);
+        }
+        names.sort();
+        Ok(names)
     }
 
     fn pin_directory(
@@ -1478,6 +1901,14 @@ impl ClaimDiscoveryWalker {
                 "claim discovery directory became link-like or stopped being a directory",
             ));
         }
+        let observed = observe_entry(&parent.handle, Path::new(name), &path)?;
+        if capability_metadata_is_link_like(&observed.metadata) || !observed.metadata.is_dir() {
+            return Err(discovery_unsafe(
+                &path,
+                "claim discovery directory changed before it could be observed",
+            ));
+        }
+        self.notify(ClaimDiscoveryEvent::BeforeDirectoryOpen(path.clone()));
         let handle = parent
             .handle
             .open_dir_nofollow(name)
@@ -1491,15 +1922,20 @@ impl ClaimDiscoveryWalker {
                 "claim discovery directory became link-like or stopped being a directory",
             ));
         }
-        #[cfg(unix)]
-        let identity = filesystem_identity(&metadata);
-        #[cfg(unix)]
-        if filesystem_identity(observed_metadata) != identity {
-            return Err(discovery_unsafe(
-                &path,
-                "claim discovery directory changed identity while it was inspected",
-            ));
-        }
+        let opened_identity = directory_handle_identity(&handle, &metadata)
+            .map_err(|error| discovery_io(&path, &error))?;
+        verify_opened_identity(
+            observed.identity,
+            opened_identity,
+            &path,
+            "claim discovery directory changed identity while it was inspected",
+        )?;
+        #[cfg(any(unix, windows))]
+        let identity = require_identity(
+            opened_identity,
+            &path,
+            "filesystem identity was unavailable for a claim discovery directory",
+        )?;
         #[cfg(unix)]
         if !self.visited_identities.insert(identity) {
             return Ok(None);
@@ -1521,7 +1957,7 @@ impl ClaimDiscoveryWalker {
             relative_path,
             path,
             depth,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             identity,
         })))
     }
@@ -1544,13 +1980,13 @@ impl ClaimDiscoveryWalker {
         &self,
         parent: &Arc<PinnedClaimDirectory>,
         name: OsString,
-        observed_metadata: &CapabilityMetadata,
         found: &mut Vec<PinnedClaimFile>,
     ) -> Result<(), ConformanceError> {
-        #[cfg(not(unix))]
-        let _ = observed_metadata;
         let path = parent.path.join(&name);
         let options = claim_file_open_options();
+        let observed = observe_entry(&parent.handle, Path::new(&name), &path)?;
+        validate_claim_metadata(&path, &observed.metadata, "claim manifest")?;
+        self.notify(ClaimDiscoveryEvent::BeforeClaimFileOpen(path.clone()));
         let handle = parent
             .handle
             .open_with(&name, &options)
@@ -1564,15 +2000,24 @@ impl ClaimDiscoveryWalker {
                 "claim manifest became link-like or stopped being a regular file",
             ));
         }
-        #[cfg(unix)]
-        let identity = filesystem_identity(&metadata);
-        #[cfg(unix)]
-        if filesystem_identity(observed_metadata) != identity {
-            return Err(discovery_unsafe(
-                &path,
-                "claim manifest changed identity while it was opened",
-            ));
-        }
+        let opened_identity = file_handle_identity(&handle, &metadata)
+            .map_err(|error| discovery_io(&path, &error))?;
+        verify_opened_identity(
+            observed.identity,
+            opened_identity,
+            &path,
+            "claim manifest changed identity while it was opened",
+        )?;
+        #[cfg(any(unix, windows))]
+        let identity = require_identity(
+            opened_identity,
+            &path,
+            "filesystem identity was unavailable for a claim manifest",
+        )?;
+        #[cfg(any(unix, windows))]
+        let key = claim_file_key(identity);
+        #[cfg(not(any(unix, windows)))]
+        let key = claim_file_key(self.canonical_root.join(&parent.relative_path).join(&name));
         if found.len() >= self.limits.claim_files {
             return Err(discovery_limit(
                 &self.repository_root,
@@ -1582,12 +2027,10 @@ impl ClaimDiscoveryWalker {
                 ),
             ));
         }
-        #[cfg(test)]
         self.notify(ClaimDiscoveryEvent::ClaimFileOpened(path.clone()));
         #[cfg(unix)]
         let directories = Self::snapshot_directory_chain(parent);
         found.push(PinnedClaimFile {
-            #[cfg(not(unix))]
             handle,
             #[cfg(not(unix))]
             parent: Arc::clone(parent),
@@ -1595,7 +2038,8 @@ impl ClaimDiscoveryWalker {
             directories,
             name,
             path,
-            #[cfg(unix)]
+            key,
+            #[cfg(any(unix, windows))]
             identity,
         });
         Ok(())
@@ -1623,7 +2067,10 @@ impl ClaimDiscoveryWalker {
         chain
     }
 
-    fn finish(self, mut found: Vec<PinnedClaimFile>) -> Result<Vec<PathBuf>, ConformanceError> {
+    fn finish(
+        self,
+        mut found: Vec<PinnedClaimFile>,
+    ) -> Result<Vec<DiscoveredClaimFile>, ConformanceError> {
         found.sort_by(|left, right| left.path.cmp(&right.path));
         let (reopened_root, _reopened_parent) = open_repository_root(&self.repository_root)?;
         let root_metadata = reopened_root
@@ -1635,18 +2082,26 @@ impl ClaimDiscoveryWalker {
                 "claim discovery root became link-like or stopped being a directory",
             ));
         }
-        #[cfg(unix)]
-        if filesystem_identity(&root_metadata) != self.root.identity {
-            return Err(discovery_unsafe(
-                &self.repository_root,
-                "claim discovery root changed identity during traversal",
-            ));
-        }
+        #[cfg(any(unix, windows))]
+        verify_opened_identity(
+            Some(self.root.identity),
+            directory_handle_identity(&reopened_root, &root_metadata)
+                .map_err(|error| discovery_io(&self.repository_root, &error))?,
+            &self.repository_root,
+            "claim discovery root changed identity during traversal",
+        )?;
 
         for claim in &found {
             Self::verify_claim_path(&reopened_root, claim)?;
         }
-        Ok(found.into_iter().map(|claim| claim.path).collect())
+        Ok(found
+            .into_iter()
+            .map(|claim| DiscoveredClaimFile {
+                path: claim.path,
+                key: claim.key,
+                handle: claim.handle,
+            })
+            .collect())
     }
 
     #[cfg(unix)]
@@ -1669,12 +2124,13 @@ impl ClaimDiscoveryWalker {
                     "claim discovery directory changed before final verification",
                 ));
             }
-            if filesystem_identity(&metadata) != directory.identity {
-                return Err(discovery_unsafe(
-                    &directory.path,
-                    "claim discovery directory changed identity before final verification",
-                ));
-            }
+            verify_opened_identity(
+                Some(directory.identity),
+                directory_handle_identity(&handle, &metadata)
+                    .map_err(|error| discovery_io(&directory.path, &error))?,
+                &directory.path,
+                "claim discovery directory changed identity before final verification",
+            )?;
             reopened.push(handle);
         }
 
@@ -1693,12 +2149,13 @@ impl ClaimDiscoveryWalker {
                 "claim manifest changed before final verification",
             ));
         }
-        if filesystem_identity(&metadata) != claim.identity {
-            return Err(discovery_unsafe(
-                &claim.path,
-                "claim manifest changed identity before final verification",
-            ));
-        }
+        verify_opened_identity(
+            Some(claim.identity),
+            file_handle_identity(&reopened_file, &metadata)
+                .map_err(|error| discovery_io(&claim.path, &error))?,
+            &claim.path,
+            "claim manifest changed identity before final verification",
+        )?;
         Ok(())
     }
 
@@ -1748,6 +2205,14 @@ impl ClaimDiscoveryWalker {
                     "claim discovery directory changed before final verification",
                 ));
             }
+            #[cfg(windows)]
+            verify_opened_identity(
+                Some(directory.identity),
+                directory_handle_identity(&handle, &metadata)
+                    .map_err(|error| discovery_io(&directory.path, &error))?,
+                &directory.path,
+                "claim discovery directory changed identity before final verification",
+            )?;
             reopened.push(handle);
         }
 
@@ -1766,10 +2231,17 @@ impl ClaimDiscoveryWalker {
                 "claim manifest changed before final verification",
             ));
         }
+        #[cfg(windows)]
+        verify_opened_identity(
+            Some(claim.identity),
+            file_handle_identity(&reopened_file, &metadata)
+                .map_err(|error| discovery_io(&claim.path, &error))?,
+            &claim.path,
+            "claim manifest changed identity before final verification",
+        )?;
         Ok(())
     }
 
-    #[cfg(test)]
     fn notify(&self, event: ClaimDiscoveryEvent) {
         if let Some(hook) = &self.hook {
             hook(event);
@@ -1780,7 +2252,7 @@ impl ClaimDiscoveryWalker {
 fn discover_claim_files_with_limits(
     repository_root: &Path,
     limits: ClaimDiscoveryLimits,
-) -> Result<Vec<PathBuf>, ConformanceError> {
+) -> Result<Vec<DiscoveredClaimFile>, ConformanceError> {
     ClaimDiscoveryWalker::new(repository_root, limits)?.walk()
 }
 
@@ -1788,9 +2260,17 @@ fn discover_claim_files_with_limits(
 fn discover_claim_files_with_hook(
     repository_root: &Path,
     hook: ClaimDiscoveryHook,
-) -> Result<Vec<PathBuf>, ConformanceError> {
-    ClaimDiscoveryWalker::new_with_hook(repository_root, ClaimDiscoveryLimits::DEFAULT, hook)?
-        .walk()
+) -> Result<Vec<DiscoveredClaimFile>, ConformanceError> {
+    discover_claim_files_with_limits_and_hook(repository_root, ClaimDiscoveryLimits::DEFAULT, hook)
+}
+
+#[cfg(test)]
+fn discover_claim_files_with_limits_and_hook(
+    repository_root: &Path,
+    limits: ClaimDiscoveryLimits,
+    hook: ClaimDiscoveryHook,
+) -> Result<Vec<DiscoveredClaimFile>, ConformanceError> {
+    ClaimDiscoveryWalker::new_with_hook(repository_root, limits, hook)?.walk()
 }
 
 fn normalize_repository_root(repository_root: &Path) -> PathBuf {
@@ -1799,11 +2279,165 @@ fn normalize_repository_root(repository_root: &Path) -> PathBuf {
     repository_root.components().collect()
 }
 
+fn absolute_claim_path(path: &Path) -> Result<PathBuf, ConformanceError> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        env::current_dir()
+            .map(|directory| directory.join(path))
+            .map_err(|error| discovery_io(path, &error))
+    }
+}
+
+#[cfg(windows)]
+fn reject_windows_claim_stream(
+    diagnostic_path: &Path,
+    absolute_path: &Path,
+) -> Result<(), ConformanceError> {
+    if absolute_path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value),
+            _ => None,
+        })
+        .any(|component| component.to_string_lossy().contains(':'))
+    {
+        return Err(discovery_unsafe(
+            diagnostic_path,
+            "claim manifests must not use NTFS alternate data streams",
+        ));
+    }
+    Ok(())
+}
+
+fn split_claim_path_anchor(
+    absolute_path: &Path,
+    diagnostic_path: &Path,
+) -> Result<(PathBuf, PathBuf), ConformanceError> {
+    let mut anchor = PathBuf::new();
+    let mut relative = PathBuf::new();
+    let mut saw_relative = false;
+    for component in absolute_path.components() {
+        if !saw_relative && matches!(component, Component::Prefix(_) | Component::RootDir) {
+            anchor.push(component.as_os_str());
+        } else {
+            saw_relative = true;
+            relative.push(component.as_os_str());
+        }
+    }
+    if !anchor.is_absolute() || relative.as_os_str().is_empty() {
+        return Err(discovery_unsafe(
+            diagnostic_path,
+            "explicit claim manifest must name a file beneath an absolute filesystem root",
+        ));
+    }
+    Ok((anchor, relative))
+}
+
+#[cfg(not(windows))]
+fn canonical_claim_path(path: &Path) -> Result<PathBuf, ConformanceError> {
+    fs::canonicalize(path).map_err(|error| discovery_io(path, &error))
+}
+
+fn validate_claim_metadata(
+    path: &Path,
+    metadata: &CapabilityMetadata,
+    role: &str,
+) -> Result<(), ConformanceError> {
+    if capability_metadata_is_link_like(metadata) || !metadata.is_file() {
+        return Err(discovery_unsafe(
+            path,
+            format!("{role} must be a regular non-link file"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_canonical_file_identity(
+    canonical_path: &Path,
+    expected: FilesystemIdentity,
+    diagnostic_path: &Path,
+    message: &str,
+) -> Result<(), ConformanceError> {
+    let metadata =
+        fs::metadata(canonical_path).map_err(|error| discovery_io(diagnostic_path, &error))?;
+    let actual = FilesystemIdentity::Unix {
+        device: std::os::unix::fs::MetadataExt::dev(&metadata),
+        inode: std::os::unix::fs::MetadataExt::ino(&metadata),
+    };
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(discovery_unsafe(diagnostic_path, message))
+    }
+}
+
 fn open_repository_root(
     repository_root: &Path,
 ) -> Result<(CapabilityDir, Option<CapabilityDir>), ConformanceError> {
-    let metadata = discovery_metadata(repository_root)?;
-    if is_symlink_or_reparse(&metadata) {
+    open_repository_root_before_open(repository_root, |_| {})
+}
+
+fn open_repository_root_before_open(
+    repository_root: &Path,
+    before_open: impl FnOnce(&Path),
+) -> Result<(CapabilityDir, Option<CapabilityDir>), ConformanceError> {
+    let (root, parent, observed) = if let Some(name) = repository_root.file_name() {
+        let parent_path = repository_root
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = CapabilityDir::open_ambient_dir(parent_path, ambient_authority())
+            .map_err(|error| discovery_io(parent_path, &error))?;
+        let observed = observe_entry(&parent, Path::new(name), repository_root)?;
+        validate_root_metadata(repository_root, &observed.metadata)?;
+        before_open(repository_root);
+        let root = parent
+            .open_dir_nofollow(name)
+            .map_err(|error| discovery_root_open_error(repository_root, &error))?;
+        (root, Some(parent), observed)
+    } else {
+        let observed_root = CapabilityDir::open_ambient_dir(repository_root, ambient_authority())
+            .map_err(|error| discovery_root_open_error(repository_root, &error))?;
+        let observed = observed_root
+            .dir_metadata()
+            .map_err(|error| discovery_io(repository_root, &error))?;
+        validate_root_metadata(repository_root, &observed)?;
+        let observed_identity = directory_handle_identity(&observed_root, &observed)
+            .map_err(|error| discovery_io(repository_root, &error))?;
+        before_open(repository_root);
+        let root = CapabilityDir::open_ambient_dir(repository_root, ambient_authority())
+            .map_err(|error| discovery_root_open_error(repository_root, &error))?;
+        (
+            root,
+            None,
+            ObservedEntry {
+                metadata: observed,
+                identity: observed_identity,
+            },
+        )
+    };
+    let opened_metadata = root
+        .dir_metadata()
+        .map_err(|error| discovery_io(repository_root, &error))?;
+    validate_root_metadata(repository_root, &opened_metadata)?;
+    let opened_identity = directory_handle_identity(&root, &opened_metadata)
+        .map_err(|error| discovery_io(repository_root, &error))?;
+    verify_opened_identity(
+        observed.identity,
+        opened_identity,
+        repository_root,
+        "claim discovery root changed identity while it was opened",
+    )?;
+    Ok((root, parent))
+}
+
+fn validate_root_metadata(
+    repository_root: &Path,
+    metadata: &CapabilityMetadata,
+) -> Result<(), ConformanceError> {
+    if capability_metadata_is_link_like(metadata) {
         return Err(discovery_unsafe(
             repository_root,
             "claim discovery root must not be a symlink or reparse point",
@@ -1815,33 +2449,7 @@ fn open_repository_root(
             "claim discovery root must be a directory",
         ));
     }
-
-    let (root, parent) = if let Some(name) = repository_root.file_name() {
-        let parent_path = repository_root
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let parent = CapabilityDir::open_ambient_dir(parent_path, ambient_authority())
-            .map_err(|error| discovery_io(parent_path, &error))?;
-        let root = parent
-            .open_dir_nofollow(name)
-            .map_err(|error| discovery_root_open_error(repository_root, &error))?;
-        (root, Some(parent))
-    } else {
-        let root = CapabilityDir::open_ambient_dir(repository_root, ambient_authority())
-            .map_err(|error| discovery_root_open_error(repository_root, &error))?;
-        (root, None)
-    };
-    let opened_metadata = root
-        .dir_metadata()
-        .map_err(|error| discovery_io(repository_root, &error))?;
-    if capability_metadata_is_link_like(&opened_metadata) || !opened_metadata.is_dir() {
-        return Err(discovery_unsafe(
-            repository_root,
-            "claim discovery root became link-like or stopped being a directory",
-        ));
-    }
-    Ok((root, parent))
+    Ok(())
 }
 
 fn claim_file_open_options() -> CapabilityOpenOptions {
@@ -1851,12 +2459,18 @@ fn claim_file_open_options() -> CapabilityOpenOptions {
     #[cfg(unix)]
     options.nonblock(true);
     #[cfg(windows)]
-    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    options.share_mode(FILE_SHARE_READ);
     options
 }
 
-fn discovery_metadata(path: &Path) -> Result<fs::Metadata, ConformanceError> {
-    fs::symlink_metadata(path).map_err(|error| discovery_io(path, &error))
+#[cfg(windows)]
+fn windows_observation_options() -> CapabilityOpenOptions {
+    let mut options = CapabilityOpenOptions::new();
+    options.access_mode(0);
+    options.follow(FollowSymlinks::No);
+    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+    options
 }
 
 fn discovery_root_open_error(path: &Path, error: &io::Error) -> ConformanceError {
@@ -2976,17 +3590,19 @@ mod tests {
     use std::sync::Arc;
     #[cfg(windows)]
     use std::sync::Mutex;
-    #[cfg(unix)]
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use serde::Deserialize;
 
+    #[cfg(windows)]
+    use super::FilesystemIdentity;
     use super::{
-        CargoTestTargets, ClaimDiscoveryEvent, ClaimDiscoveryLimits, OrdinalPathResolver,
-        cargo_executable, cargo_pattern_matches, declares_enabled_test, discover_claim_files,
-        discover_claim_files_with_hook, discover_claim_files_with_limits, load_manifest_scope,
-        normalized_api_path, read_file_bounded, resolve_cargo_executable,
+        CargoTestTargets, ClaimDiscoveryEvent, ClaimDiscoveryLimits, ClaimsFile,
+        DiscoveredClaimFile, FeatureClaim, OrdinalPathResolver, Registry, cargo_executable,
+        cargo_pattern_matches, declares_enabled_test, discover_claim_files,
+        discover_claim_files_with_hook, discover_claim_files_with_limits,
+        discover_claim_files_with_limits_and_hook, load_manifest_scope, normalized_api_path,
+        open_claim_file, open_claim_file_with_hook, read_file_bounded, resolve_cargo_executable,
         resolve_external_executable,
     };
     use crate::ViolationCode;
@@ -3059,6 +3675,14 @@ mod tests {
             fs::write(&path, "{}").expect("write claim fixture");
             path
         }
+
+        fn write_registered_claim(&self, relative: &str, feature_id: &str) -> PathBuf {
+            let path = self.root.join(relative).join("conformance-claims.json");
+            fs::create_dir_all(path.parent().expect("claim parent")).expect("create claim parent");
+            fs::write(&path, registered_claim_manifest(feature_id))
+                .expect("write registered claim fixture");
+            path
+        }
     }
 
     impl Drop for ClaimDiscoveryFixture {
@@ -3077,6 +3701,33 @@ mod tests {
             PathBuf::from(trailing_separator),
             path.join("."),
         ]
+    }
+
+    fn discovered_paths(claims: Vec<DiscoveredClaimFile>) -> Vec<PathBuf> {
+        claims
+            .into_iter()
+            .map(|claim| claim.path().to_path_buf())
+            .collect()
+    }
+
+    fn deduplicate_claims(
+        claims: impl IntoIterator<Item = DiscoveredClaimFile>,
+    ) -> BTreeMap<super::ClaimFileKey, DiscoveredClaimFile> {
+        let mut deduplicated = BTreeMap::new();
+        for claim in claims {
+            deduplicated.entry(claim.key().clone()).or_insert(claim);
+        }
+        deduplicated
+    }
+
+    fn registered_claim_manifest(feature_id: &str) -> Vec<u8> {
+        serde_json::to_vec(&ClaimsFile {
+            schema_version: 1,
+            crate_name: feature_id.to_owned(),
+            features: vec![FeatureClaim::registered(feature_id)],
+            inventories: Vec::new(),
+        })
+        .expect("serialize registered claim fixture")
     }
 
     #[cfg(windows)]
@@ -3231,7 +3882,7 @@ mod tests {
 
         expected.sort();
         assert_eq!(
-            discover_claim_files(&fixture.root).expect("discover ordinary tree"),
+            discovered_paths(discover_claim_files(&fixture.root).expect("discover ordinary tree")),
             expected
         );
     }
@@ -3243,12 +3894,102 @@ mod tests {
 
         for spelling in repository_root_spellings(&fixture.root) {
             assert_eq!(
-                discover_claim_files(&spelling).expect("ordinary root spelling must be accepted"),
+                discovered_paths(
+                    discover_claim_files(&spelling)
+                        .expect("ordinary root spelling must be accepted"),
+                ),
                 vec![claim.clone()],
                 "root spelling {}",
                 spelling.display()
             );
         }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn hard_link_claim_sources_share_one_identity_key() {
+        let fixture = ClaimDiscoveryFixture::new("hard-link-dedupe");
+        let claim = fixture.write_registered_claim("crates/package", "inside.feature");
+        let hard_link = fixture.base.join("hard-linked-claims.json");
+        fs::hard_link(&claim, &hard_link).expect("create equivalent hard-linked claim");
+
+        let direct = open_claim_file(&claim).expect("open direct hard-link spelling");
+        let alias = open_claim_file(&hard_link).expect("open equivalent hard-link spelling");
+        assert_eq!(direct.key(), alias.key());
+        assert_ne!(direct.path(), alias.path());
+
+        let deduplicated = deduplicate_claims([direct, alias]);
+        assert_eq!(deduplicated.len(), 1);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn explicit_claim_open_rejects_preopen_regular_file_replacement() {
+        let fixture = ClaimDiscoveryFixture::new("explicit-preopen-replacement");
+        let claim = fixture.write_registered_claim("crates/package", "inside.feature");
+        let moved = claim.with_file_name("conformance-claims-original.json");
+        let replacement = fixture.base.join("replacement-claims.json");
+        fs::write(&replacement, registered_claim_manifest("outside.feature"))
+            .expect("write explicit replacement claim");
+        let hook_claim = claim.clone();
+        let hook_moved = moved.clone();
+        let hook_replacement = replacement;
+        let replaced = Arc::new(AtomicBool::new(false));
+        let hook_replaced = Arc::clone(&replaced);
+        let hook = Arc::new(move |event| {
+            if let ClaimDiscoveryEvent::BeforeClaimFileOpen(path) = event
+                && path == hook_claim
+                && !hook_replaced.swap(true, Ordering::SeqCst)
+            {
+                fs::rename(&hook_claim, &hook_moved)
+                    .expect("move explicit claim after pre-open observation");
+                fs::rename(&hook_replacement, &hook_claim)
+                    .expect("replace explicit claim with a regular file");
+            }
+        });
+
+        let error = open_claim_file_with_hook(&claim, hook)
+            .expect_err("explicit open must reject a pre-open identity change");
+        assert!(replaced.load(Ordering::SeqCst), "replacement hook must run");
+        assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
+
+        fs::remove_file(&claim).expect("remove explicit replacement");
+        fs::rename(moved, claim).expect("restore explicit claim for fixture cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_alias_and_dotdot_sources_share_one_claim_key() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ClaimDiscoveryFixture::new("unix-dedupe-alias");
+        let claim = fixture.write_registered_claim("crates/package", "inside.feature");
+        fs::create_dir_all(fixture.base.join("step")).expect("create dot-dot anchor");
+        let alias = fixture.base.join("base-alias");
+        symlink(&fixture.base, &alias).expect("create repository ancestor alias");
+        let equivalent_root = alias.join("step").join("..").join("repository");
+
+        let mut discovered =
+            discover_claim_files(&equivalent_root).expect("discover through equivalent root");
+        assert_eq!(discovered.len(), 1);
+        let discovered = discovered.remove(0);
+        let explicit = open_claim_file(&claim).expect("open explicit direct spelling");
+        assert_eq!(discovered.key(), explicit.key());
+        assert_ne!(
+            discovered.path(),
+            explicit.path(),
+            "diagnostic spellings remain distinct"
+        );
+
+        let mut deduplicated = deduplicate_claims([discovered, explicit]);
+        assert_eq!(deduplicated.len(), 1);
+        let mut registry = Registry::new();
+        registry
+            .load_discovered_claim_file(deduplicated.pop_first().expect("one deduplicated claim").1)
+            .expect("load the equivalent claim only once");
+        assert!(registry.features.contains_key("inside.feature"));
+
+        fs::remove_file(alias).expect("remove repository ancestor alias");
     }
 
     #[test]
@@ -3304,6 +4045,42 @@ mod tests {
     }
 
     #[test]
+    fn claim_discovery_bounds_directory_entries_before_sorting() {
+        let fixture = ClaimDiscoveryFixture::new("entry-limit");
+        let crates = fixture.root.join("crates");
+        fs::create_dir_all(&crates).expect("create crates directory");
+        for index in 0..10 {
+            fs::write(crates.join(format!("{index:02}.txt")), "")
+                .expect("write bounded directory entry");
+        }
+        let limits = ClaimDiscoveryLimits {
+            directories: 2,
+            files: 2,
+            ..ClaimDiscoveryLimits::DEFAULT
+        };
+        let retained = Arc::new(AtomicU64::new(0));
+        let hook_retained = Arc::clone(&retained);
+        let hook = Arc::new(move |event| {
+            if event == ClaimDiscoveryEvent::DirectoryEntryRetained {
+                hook_retained.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let error = discover_claim_files_with_limits_and_hook(&fixture.root, limits, hook)
+            .expect_err("the fifth entry must exceed the combined pre-allocation bound");
+        assert_eq!(error.code(), ViolationCode::TraversalLimit);
+        assert_eq!(
+            error.message(),
+            "claim discovery exceeded the combined bounds of 2 directories and 2 files"
+        );
+        assert_eq!(
+            retained.load(Ordering::SeqCst),
+            4,
+            "the entry beyond the combined bound must not be retained"
+        );
+    }
+
+    #[test]
     fn claim_discovery_reports_typed_claim_manifest_limit() {
         let fixture = ClaimDiscoveryFixture::new("claim-limit");
         fixture.write_claim("crates/one");
@@ -3354,7 +4131,7 @@ mod tests {
             .expect("create self-referential directory symlink");
 
         assert_eq!(
-            discover_claim_files(&fixture.root).expect("cycle must terminate"),
+            discovered_paths(discover_claim_files(&fixture.root).expect("cycle must terminate")),
             vec![claim]
         );
     }
@@ -3370,7 +4147,9 @@ mod tests {
             .expect("create ancestor directory symlink");
 
         assert_eq!(
-            discover_claim_files(&fixture.root).expect("ancestor cycle must terminate"),
+            discovered_paths(
+                discover_claim_files(&fixture.root).expect("ancestor cycle must terminate"),
+            ),
             vec![claim]
         );
     }
@@ -3390,7 +4169,9 @@ mod tests {
         )
         .expect("create outside-pointing directory symlink");
 
-        let found = discover_claim_files(&fixture.root).expect("outside link must be skipped");
+        let found = discovered_paths(
+            discover_claim_files(&fixture.root).expect("outside link must be skipped"),
+        );
         assert_eq!(found, vec![claim]);
         assert!(!found.contains(&outside_claim));
     }
@@ -3468,6 +4249,35 @@ mod tests {
         fs::rename(moved, claim).expect("restore pinned claim for fixture cleanup");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn discovered_claim_loads_from_pinned_handle_after_unix_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ClaimDiscoveryFixture::new("unix-post-discovery-replacement");
+        let claim = fixture.write_registered_claim("crates/package", "inside.feature");
+        let outside_claim = fixture.outside.join("conformance-claims.json");
+        fs::write(&outside_claim, registered_claim_manifest("outside.feature"))
+            .expect("write outside replacement claim");
+        let mut discovered =
+            discover_claim_files(&fixture.root).expect("discover pinned claim artifact");
+        assert_eq!(discovered.len(), 1);
+        let artifact = discovered.remove(0);
+        let moved = claim.with_file_name("conformance-claims-original.json");
+        fs::rename(&claim, &moved).expect("move discovered claim after discovery");
+        symlink(&outside_claim, &claim).expect("replace discovered path with outside symlink");
+
+        let mut registry = Registry::new();
+        registry
+            .load_discovered_claim_file(artifact)
+            .expect("load bytes through the pinned discovery handle");
+        assert!(registry.features.contains_key("inside.feature"));
+        assert!(!registry.features.contains_key("outside.feature"));
+
+        fs::remove_file(&claim).expect("remove replacement symlink");
+        fs::rename(moved, claim).expect("restore discovered claim for fixture cleanup");
+    }
+
     #[cfg(windows)]
     #[test]
     fn claim_discovery_rejects_all_ntfs_junction_root_spellings() {
@@ -3501,10 +4311,210 @@ mod tests {
         );
 
         assert_eq!(
-            discover_claim_files(&fixture.root).expect("NTFS junction must be skipped"),
+            discovered_paths(
+                discover_claim_files(&fixture.root).expect("NTFS junction must be skipped"),
+            ),
             vec![claim]
         );
         drop(junction);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_and_junction_alias_sources_share_one_claim_key() {
+        let fixture = ClaimDiscoveryFixture::new("windows-dedupe-alias");
+        let claim = fixture.write_registered_claim("crates/package", "inside.feature");
+        let alias = fixture.base.with_extension("junction-alias");
+        let junction = WindowsJunction::create(&fixture.base, &alias);
+        let equivalent_root = junction.path().join("repository");
+
+        let mut discovered =
+            discover_claim_files(&equivalent_root).expect("discover through junction ancestor");
+        assert_eq!(discovered.len(), 1);
+        let discovered = discovered.remove(0);
+        let verbatim_claim = fs::canonicalize(&claim).expect("resolve Windows verbatim claim path");
+        assert!(
+            verbatim_claim
+                .as_os_str()
+                .to_string_lossy()
+                .starts_with(r"\\?\"),
+            "Windows canonical paths must exercise the verbatim prefix"
+        );
+        let explicit =
+            open_claim_file(&verbatim_claim).expect("open explicit Windows verbatim spelling");
+        assert_eq!(discovered.key(), explicit.key());
+        assert_ne!(
+            discovered.path(),
+            explicit.path(),
+            "diagnostic spellings remain distinct"
+        );
+        let case_alias = PathBuf::from(verbatim_claim.to_string_lossy().to_uppercase());
+        let explicit_case_alias =
+            open_claim_file(&case_alias).expect("open explicit Windows case alias");
+        assert_eq!(discovered.key(), explicit_case_alias.key());
+        assert_ne!(explicit.path(), explicit_case_alias.path());
+
+        let mut deduplicated = deduplicate_claims([discovered, explicit, explicit_case_alias]);
+        assert_eq!(deduplicated.len(), 1);
+        let mut registry = Registry::new();
+        registry
+            .load_discovered_claim_file(deduplicated.pop_first().expect("one deduplicated claim").1)
+            .expect("load the equivalent claim only once");
+        assert!(registry.features.contains_key("inside.feature"));
+        drop(junction);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_alternate_stream_claim_is_rejected_before_dedupe_or_load() {
+        let fixture = ClaimDiscoveryFixture::new("windows-claim-ads");
+        let claim = fixture.write_registered_claim("crates/package", "inside.feature");
+        let stream = PathBuf::from(format!("{}:outside", claim.display()));
+        fs::write(&stream, registered_claim_manifest("outside.feature"))
+            .expect("create NTFS alternate data stream claim");
+
+        let base = open_claim_file(&claim).expect("open the base claim");
+        let error = open_claim_file(&stream).expect_err("claim ADS must be rejected");
+        assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
+        assert_eq!(
+            error.message(),
+            "claim manifests must not use NTFS alternate data streams"
+        );
+
+        let mut registry = Registry::new();
+        registry
+            .load_discovered_claim_file(base)
+            .expect("load only the base claim");
+        assert!(registry.features.contains_key("inside.feature"));
+        assert!(!registry.features.contains_key("outside.feature"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_identity_compares_all_128_file_id_bits() {
+        let low_bits = 0x0123_4567_89ab_cdef_u64.to_le_bytes();
+        let mut first_file_id = [0_u8; 16];
+        first_file_id[..8].copy_from_slice(&low_bits);
+        let mut second_file_id = first_file_id;
+        second_file_id[15] = 1;
+        assert_eq!(&first_file_id[..8], &second_file_id[..8]);
+
+        let first = FilesystemIdentity::Windows {
+            volume_serial_number: 7,
+            file_id: first_file_id,
+        };
+        let second = FilesystemIdentity::Windows {
+            volume_serial_number: 7,
+            file_id: second_file_id,
+        };
+        assert_ne!(first, second);
+        assert_ne!(
+            super::ClaimFileKey(super::ClaimFileKeyKind::Identity(first)),
+            super::ClaimFileKey(super::ClaimFileKeyKind::Identity(second))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_root_identity_rejects_preopen_regular_directory_replacement() {
+        let fixture = ClaimDiscoveryFixture::new("windows-root-preopen-replacement");
+        fixture.write_claim("crates/package");
+        let moved = fixture.base.join("repository-original");
+        let replacement = fixture.base.join("replacement-root");
+        fs::create_dir_all(&replacement).expect("create replacement repository root");
+        let hook_root = fixture.root.clone();
+        let hook_moved = moved.clone();
+        let hook_replacement = replacement;
+        let replaced = Arc::new(AtomicBool::new(false));
+        let hook_replaced = Arc::clone(&replaced);
+        let hook = Arc::new(move |event| {
+            if let ClaimDiscoveryEvent::BeforeRootOpen(path) = event
+                && path == hook_root
+                && !hook_replaced.swap(true, Ordering::SeqCst)
+            {
+                fs::rename(&hook_root, &hook_moved)
+                    .expect("move observed repository root before open");
+                fs::rename(&hook_replacement, &hook_root)
+                    .expect("replace repository root with a regular directory");
+            }
+        });
+
+        let error = discover_claim_files_with_hook(&fixture.root, hook)
+            .expect_err("root identity change must be rejected");
+        assert!(replaced.load(Ordering::SeqCst), "replacement hook must run");
+        assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
+
+        fs::remove_dir_all(&fixture.root).expect("remove replacement repository root");
+        fs::rename(moved, &fixture.root).expect("restore repository root for fixture cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_identity_rejects_preopen_regular_replacement() {
+        let fixture = ClaimDiscoveryFixture::new("windows-directory-preopen-replacement");
+        fixture.write_claim("crates/package");
+        let package = fixture.root.join("crates/package");
+        let moved = fixture.root.join("crates/package-original");
+        let replacement = fixture.base.join("replacement-package");
+        fs::create_dir_all(&replacement).expect("create replacement package directory");
+        let hook_package = package.clone();
+        let hook_moved = moved.clone();
+        let hook_replacement = replacement;
+        let replaced = Arc::new(AtomicBool::new(false));
+        let hook_replaced = Arc::clone(&replaced);
+        let hook = Arc::new(move |event| {
+            if let ClaimDiscoveryEvent::BeforeDirectoryOpen(path) = event
+                && path == hook_package
+                && !hook_replaced.swap(true, Ordering::SeqCst)
+            {
+                fs::rename(&hook_package, &hook_moved)
+                    .expect("move observed package directory before open");
+                fs::rename(&hook_replacement, &hook_package)
+                    .expect("replace package with a regular directory");
+            }
+        });
+
+        let error = discover_claim_files_with_hook(&fixture.root, hook)
+            .expect_err("directory identity change must be rejected");
+        assert!(replaced.load(Ordering::SeqCst), "replacement hook must run");
+        assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
+
+        fs::remove_dir_all(&package).expect("remove replacement package directory");
+        fs::rename(moved, package).expect("restore package for fixture cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_claim_identity_rejects_preopen_regular_file_replacement() {
+        let fixture = ClaimDiscoveryFixture::new("windows-claim-preopen-replacement");
+        let claim = fixture.write_registered_claim("crates/package", "inside.feature");
+        let moved = claim.with_file_name("conformance-claims-original.json");
+        let replacement = fixture.base.join("replacement-claims.json");
+        fs::write(&replacement, registered_claim_manifest("outside.feature"))
+            .expect("write replacement claim");
+        let hook_claim = claim.clone();
+        let hook_moved = moved.clone();
+        let hook_replacement = replacement;
+        let replaced = Arc::new(AtomicBool::new(false));
+        let hook_replaced = Arc::clone(&replaced);
+        let hook = Arc::new(move |event| {
+            if let ClaimDiscoveryEvent::BeforeClaimFileOpen(path) = event
+                && path == hook_claim
+                && !hook_replaced.swap(true, Ordering::SeqCst)
+            {
+                fs::rename(&hook_claim, &hook_moved).expect("move observed claim before open");
+                fs::rename(&hook_replacement, &hook_claim)
+                    .expect("replace claim with a regular file");
+            }
+        });
+
+        let error = discover_claim_files_with_hook(&fixture.root, hook)
+            .expect_err("claim identity change must be rejected");
+        assert!(replaced.load(Ordering::SeqCst), "replacement hook must run");
+        assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
+
+        fs::remove_file(&claim).expect("remove replacement claim");
+        fs::rename(moved, claim).expect("restore claim for fixture cleanup");
     }
 
     #[cfg(windows)]
@@ -3528,8 +4538,10 @@ mod tests {
         });
 
         assert_eq!(
-            discover_claim_files_with_hook(&fixture.root, hook)
-                .expect("Windows directory pin must prevent replacement"),
+            discovered_paths(
+                discover_claim_files_with_hook(&fixture.root, hook)
+                    .expect("Windows directory pin must prevent replacement"),
+            ),
             vec![claim]
         );
         let error = attempt
@@ -3565,8 +4577,10 @@ mod tests {
         });
 
         assert_eq!(
-            discover_claim_files_with_hook(&fixture.root, hook)
-                .expect("Windows claim pin must prevent replacement"),
+            discovered_paths(
+                discover_claim_files_with_hook(&fixture.root, hook)
+                    .expect("Windows claim pin must prevent replacement"),
+            ),
             vec![claim]
         );
         let error = attempt
@@ -3579,6 +4593,43 @@ mod tests {
             matches!(error.raw_os_error(), Some(5 | 32)),
             "expected access denied or sharing violation, got {error}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn discovered_claim_handle_blocks_windows_replacement_until_load() {
+        let fixture = ClaimDiscoveryFixture::new("windows-post-discovery-replacement");
+        let claim = fixture.write_registered_claim("crates/package", "inside.feature");
+        fs::write(
+            fixture.outside.join("conformance-claims.json"),
+            registered_claim_manifest("outside.feature"),
+        )
+        .expect("write outside replacement claim");
+        let mut discovered =
+            discover_claim_files(&fixture.root).expect("discover pinned claim artifact");
+        assert_eq!(discovered.len(), 1);
+        let artifact = discovered.remove(0);
+        let moved = claim.with_file_name("conformance-claims-moved.json");
+
+        let error =
+            fs::rename(&claim, &moved).expect_err("the returned claim handle must block rename");
+        assert!(
+            matches!(error.raw_os_error(), Some(5 | 32)),
+            "expected access denied or sharing violation, got {error}"
+        );
+        let error = fs::write(&claim, registered_claim_manifest("outside.feature"))
+            .expect_err("the returned claim handle must block replacement writes");
+        assert!(
+            matches!(error.raw_os_error(), Some(5 | 32)),
+            "expected access denied or sharing violation, got {error}"
+        );
+
+        let mut registry = Registry::new();
+        registry
+            .load_discovered_claim_file(artifact)
+            .expect("load bytes through the returned pinned handle");
+        assert!(registry.features.contains_key("inside.feature"));
+        assert!(!registry.features.contains_key("outside.feature"));
     }
 
     #[test]

@@ -42,8 +42,8 @@ mod model;
 mod report;
 
 pub use claims::{
-    ClaimLevel, ClaimsFile, Evidence, FeatureClaim, ImplementationPointer, InventoryClaim,
-    Registry, discover_claim_files,
+    ClaimFileKey, ClaimLevel, ClaimsFile, DiscoveredClaimFile, Evidence, FeatureClaim,
+    ImplementationPointer, InventoryClaim, Registry, discover_claim_files, open_claim_file,
 };
 pub use error::{ConformanceError, ViolationCode};
 pub use loader::Contract;
