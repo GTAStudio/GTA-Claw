@@ -351,10 +351,13 @@ usage: gta-claw-daemon [--probe | --check-config] [--config PATH] [--listen ADDR
 ```
 
 另外也接受 `--help` 和 `-h`。帮助参数是全局的：只要任一写法出现在任何位置，守护进程就会在创建 Tokio
-运行时之前打印用法并成功退出，即使同时存在未知参数或缺少参数值。没有帮助参数时，选项名必须是 Unicode
-且与支持的参数完全匹配；地址值必须是 Unicode `SocketAddr` 字符串；模式冲突或缺少值会被拒绝。路径值是
-原始 OS 字符串，因此接受非 Unicode 路径。解析器不识别 `--`，也不会阻止路径选项把后续形似参数的文本吞作
-路径；例如 `--config --smoke` 会选择一个字面名称为 `--smoke` 的文件，而不会启用 smoke 模式。
+运行时之前打印用法并成功退出，即使同时存在未知参数或缺少参数值。没有帮助参数时，每个顶层选项记号都必须
+是 Unicode，并与受支持的参数完全匹配。地址参数会取下一个实参，并要求它是可解析为 `SocketAddr` 的 Unicode
+字符串。路径参数 `--config`、`--state-dir` 和 `--log-file` 则把下一个原始 `OsString` 直接作为路径，因此
+解析器会接受非 Unicode 路径和形似参数的值。取值参数只有在后面完全没有实参时才会因缺值被拒绝。只有进入
+顶层选项匹配的记号才会因不受支持而被拒绝，被禁止的模式/服务参数组合也会被拒绝；已经作为路径被吞入的
+记号不会再进入该匹配步骤。解析器不识别 `--`。例如 `--config --smoke` 会选择一个字面名称为 `--smoke`
+的文件，而不会启用 smoke 模式。
 
 ### 5.1 健康探针
 
@@ -373,9 +376,10 @@ gta-claw-daemon --probe
 gta-claw-daemon --check-config --config /etc/gta-claw/config.json5
 ```
 
-加载分层配置，并检查一部分非网络组装策略：监听暴露、状态目录解析、代理策略、管理令牌解析、更新设置、
-遗留/通道设置、通道覆盖和提供方认证配置。它不会打开监听器，也不会证明状态目录可写，不会打开配对/审计/
-目标存储或遥测输出，不会获取角色、激活插件或初始化提供方。
+加载分层配置，并执行当前的非网络检查子集：针对检查模式所允许选项的暴露策略、状态目录路径解析、代理策略
+构造、管理令牌解析、更新及遗留/通道设置、通道覆盖，以及提供方认证配置和密钥解析。它不会打开监听器。
+它只计算状态目录路径，不会创建该目录、测试其可用性或权限，也不会打开配对、审计或目标存储；同样不会
+初始化遥测或测试其输出、获取角色、发现或激活插件，也不会初始化提供方。
 `--check-config` 可与 `--config`、`--state-dir` 一起使用；不能与 `--probe` 或任何监听、日志、TLS 断言及
 smoke 选项组合。因此，尽管检查过程会调用暴露策略，它无法预检拟议的监听覆盖值或可路由部署。
 
@@ -412,14 +416,17 @@ gta-claw-daemon
 | `--smoke` | 使用确定性的本地安装诊断提供方。所有显式指定的监听地址都必须保持为回环地址。 |
 
 不要仅添加 `--tls-terminated-by-frontend` 就暴露遗留监听器。遗留 `/chat` 没有应用层调用方认证。设置
-`GTA_CLAW_ADMIN_TOKEN` 也不会改变这一点：该令牌为主 API 中受保护的模型/工具路由、Admin RPC 和 MCP
-提供 Bearer 认证，并启用遗留 `/admin/reload`、`/admin/system` 和 `/admin/exec`。reload 路由要求令牌
-完全匹配，但 system 和 exec 路由接受令牌或回环对端；因此同主机反向代理在这两个处理器看来就是回环来源。
-可路由的遗留监听器必须由前端自行认证调用方，并只转发明确允许的路由；除非代理实施等价授权，否则应阻断
+`GTA_CLAW_ADMIN_TOKEN` 也不会改变这一点。它会配置一个操作员身份且授予全部 scope 的令牌，用于认证以下
+六条受保护的主 API 路由：`GET /v1/models`、`GET /v1/models/{id}`、`POST /v1/embeddings`、
+`POST /v1/chat/completions`、`POST /v1/responses` 和 `POST /tools/invoke`；同一凭据也认证
+`POST /api/v1/admin/rpc`。该令牌存在时还会注册遗留 `/admin/reload`、`/admin/system` 和
+`/admin/exec`。reload 路由要求令牌完全匹配，但 system 和 exec 路由接受令牌或回环对端。该令牌不会写入
+MCP 专用认证器，因此不能认证 `/mcp`。同主机反向代理在 system 和 exec 处理器看来就是回环来源。可路由的
+遗留监听器必须由前端自行认证调用方，并只转发明确允许的路由；除非代理实施等价授权，否则应阻断
 `/admin/*`，也不要在没有单独调用方认证策略时转发 `/chat`。
 
 启动时，它会先安装停止信号处理器，再进行组装——这样即使监管进程在启动过程中要求停止，也能被观察到。
-监听器和启动组装完成后，会打印以下进程及监听公告：
+组装完成监听器的绑定和启动后，会打印：
 
 ```text
 ready protocol=1
@@ -427,8 +434,10 @@ healthy runtime=<os>-<arch>
 service http=<address> legacy=<address> gateway=<address> mcp=<address> provider=<name> config_generation=<n>
 ```
 
-这些文本行不是依赖就绪契约。就绪状态由 `/ready`、`/readyz` 和 `status` 控制响应报告。监听公告中的提供方
-可能是 `device-flow-pending`；在 Device Flow 激活提供方之前，提供方依赖仍处于未就绪状态。
+`ready protocol=1` 和 `healthy runtime=...` 是进程协议/健康公告，`service ...` 行是监听器/启动公告；
+它们都不表示依赖已经就绪。`/ready`、`/readyz` 和 `status` 控制响应报告依赖及服务状态的就绪性。监听公告
+中的提供方可能是 `device-flow-pending`；在 Device Flow 激活提供方之前，提供方依赖为 false，整体就绪
+状态也为 false。
 
 之后持续提供服务，直到出现下列情况之一：
 
@@ -436,7 +445,7 @@ service http=<address> legacy=<address> gateway=<address> mcp=<address> provider
   它），或 Windows 上的控制台关闭 / 系统关机；
 - 中断信号——Unix 上的 `SIGINT`，Windows 上的 Ctrl-C 或 Ctrl-Break；
 - 控制通道（标准输入）上收到 `shutdown` 一行文本；
-- 受监管的 HTTP/MCP/遗留入口任务意外退出，并被报告为运行时故障。
+- 发生受监管的运行时/入口故障：主 HTTP、MCP 或遗留 HTTP 任务意外失败、返回或消失。
 
 标准输入到达末尾**不是**停止条件：以关闭的 stdin 启动的守护进程会继续提供服务。
 同一控制通道还接受 `status` 和 `reload`；重载会报告已应用的代次及变化域，或报告拒绝原因并让上一代配置
@@ -448,9 +457,10 @@ service http=<address> legacy=<address> gateway=<address> mcp=<address> provider
 stopped reason=<terminate|interrupt|control|runtime> clean=<bool> drained=<n> completed=<n> abandoned=<n> tasks=<terminated>/<spawned>
 ```
 
-`reason=runtime` 表示受监管入口失败或消失；完成排空后仍会打印停止汇总。如果仍有未完成的工作，或记录了
-运行时故障，进程会以错误退出。任务计数是真实的：终止计数由守卫对象的
-`Drop` 累加，因此中途被取消的任务同样计入，这让 `tasks=t/s` 成为一次真正的泄漏检查，而不是"关停函数返回了"。
+`reason=runtime` 表示启动后发生了受监管故障，通常是入口任务失败、返回或消失；向监管方写入控制响应失败
+时也使用这一原因。入口故障发生后，守护进程会排空、输出停止汇总，并因该故障使汇总不再 clean 而以错误
+退出；仍有工作遗留时也会以错误退出。任务计数是真实的：终止计数由守卫对象的 `Drop` 累加，因此中途被取消
+的任务同样计入，这让 `tasks=t/s` 成为一次真正的泄漏检查，而不是"关停函数返回了"。
 
 手动停止：
 
@@ -578,7 +588,7 @@ gta-claw-updater \
 | `GTA_CLAW_GATEWAY_TOKEN` | `gta-claw-tui`、`gta-claw-daemon` | 共享的 Gateway 令牌；设置后守护进程把它作为 Gateway 凭据。 |
 | `GTA_CLAW_CONFIG` | `gta-claw-daemon` | 未指定 `--config` 时的配置文件回退值。 |
 | `GTA_CLAW_STATE_DIR` | `gta-claw-daemon` | 未指定 `--state-dir` 时的状态根目录回退值。 |
-| `GTA_CLAW_ADMIN_TOKEN` | `gta-claw-daemon` | 为主 API 中受保护的模型/工具路由、Admin RPC 和 MCP 提供 Bearer 认证，并注册遗留 `/admin/*`。它不保护遗留 `/chat`；遗留 system/exec 还会信任回环对端。 |
+| `GTA_CLAW_ADMIN_TOKEN` | `gta-claw-daemon` | 覆盖配置中的管理令牌；认证主 API 的六条受保护模型/工具路由和 `POST /api/v1/admin/rpc`，并注册遗留 `/admin/*`。它不认证 `/mcp` 或遗留 `/chat`；遗留 system/exec 还会信任回环对端。 |
 | `NO_COLOR` | `gta-claw-tui` | 单色输出。 |
 | `TERM` | `gta-claw-tui` | 取值为 `dumb` 时视为非交互。 |
 | `GTA_CLAW_CREDENTIALS_DIR` | `claw-provider-sdk` 文件密钥存储 | 覆盖凭据根目录。否则依次为 `$XDG_DATA_HOME/gta-claw/credentials`，再否则 `$HOME`（或 `%USERPROFILE%`）`/.local/share/gta-claw/credentials`。 |
