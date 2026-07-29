@@ -11,6 +11,12 @@ use claw_application::model::goal::GoalStatus;
 use claw_goals::invoke_goal_tool;
 use claw_goals::testing::{TempRoot, block_on, open_durable, session_id};
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize)]
+struct LegacyReader {
+    goal_ids: Vec<String>,
+}
+
 /// Runs the goal writer in a separate OS process and returns what it printed.
 fn write_in_another_process(root: &TempRoot, session: &str, clock: u64, action: &str, value: &str) {
     let output = Command::new(env!("CARGO_BIN_EXE_claw-goal-writer"))
@@ -281,16 +287,17 @@ fn a_legacy_index_migrates_its_high_water_before_record_loss_and_restart() {
                 .is_some_and(|extension| extension == "json")
         })
         .expect("session index");
-    let mut index: serde_json::Value =
+    let index: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&index_path).expect("index reads"))
             .expect("index JSON");
-    index
-        .as_object_mut()
-        .expect("index object")
-        .remove("goal_id_high_water");
+    let legacy = serde_json::json!({
+        "schema": 1,
+        "session_id": "migrate",
+        "goal_ids": index["goal_ids"]["entries"].clone(),
+    });
     std::fs::write(
         &index_path,
-        serde_json::to_string_pretty(&index).expect("index encodes"),
+        serde_json::to_string_pretty(&legacy).expect("index encodes"),
     )
     .expect("legacy fixture writes");
 
@@ -298,6 +305,15 @@ fn a_legacy_index_migrates_its_high_water_before_record_loss_and_restart() {
         let migrated = open_durable(root.path(), 50_000);
         assert!(migrated.store.recovery().is_clean());
     }
+    let migrated_text = std::fs::read_to_string(&index_path).expect("migrated index reads");
+    let migrated: serde_json::Value =
+        serde_json::from_str(&migrated_text).expect("migrated index JSON");
+    assert_eq!(migrated["schema"], 2);
+    assert_eq!(migrated["goal_ids"]["high_water"], 2);
+    assert!(
+        serde_json::from_str::<LegacyReader>(&migrated_text).is_err(),
+        "the durable index shape fences readers that would ignore the high-water mark"
+    );
 
     let second_record = std::fs::read_dir(root.path().join("goals"))
         .expect("goals directory")

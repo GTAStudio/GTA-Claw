@@ -10,7 +10,7 @@ use std::fmt::{self, Display, Formatter};
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
-use crate::bounded::{BoundedString, BoundedVec};
+use crate::bounded::{BoundedString, BoundedVec, reject_unbounded_json_reader};
 
 /// Inclusive maximum byte length of a session identifier.
 pub const MAX_SESSION_ID_BYTES: usize = 128;
@@ -82,6 +82,7 @@ impl<'de> Deserialize<'de> for SessionId {
     where
         D: Deserializer<'de>,
     {
+        reject_unbounded_json_reader::<D>()?;
         let value = BoundedString::<MAX_SESSION_ID_BYTES>::deserialize(deserializer)?.into_inner();
         Self::new(&value).map_err(de::Error::custom)
     }
@@ -174,6 +175,7 @@ impl<'de> Deserialize<'de> for Message {
     where
         D: Deserializer<'de>,
     {
+        reject_unbounded_json_reader::<D>()?;
         let raw = RawMessage::deserialize(deserializer)?;
         let content = raw.content.into_inner();
         check_body(&content).map_err(de::Error::custom)?;
@@ -226,6 +228,7 @@ impl<'de> Deserialize<'de> for Summary {
     where
         D: Deserializer<'de>,
     {
+        reject_unbounded_json_reader::<D>()?;
         let raw = RawSummary::deserialize(deserializer)?;
         let summary = Self {
             first: raw.first,
@@ -366,6 +369,17 @@ impl Session {
         Some(self.messages.remove(index))
     }
 
+    /// Returns the identifier the next successful append will assign.
+    ///
+    /// Removed messages do not rewind this value.
+    #[must_use]
+    pub const fn next_message_id(&self) -> Option<MessageId> {
+        match self.next_ordinal.checked_add(1) {
+            Some(_) => Some(MessageId(self.next_ordinal)),
+            None => None,
+        }
+    }
+
     /// Returns every message in ascending identifier order.
     #[must_use]
     pub fn messages(&self) -> &[Message] {
@@ -491,10 +505,10 @@ impl Session {
     /// bound the type advertises — and a store that can be loaded into an
     /// invalid state has no bounds at all.
     ///
-    /// The bounded visitors reject a message or summary at `MAX + 1` before
-    /// materializing it, and this step validates semantic invariants that do
-    /// not affect allocation: identifier order, body validity, summary ranges,
-    /// and the next ordinal.
+    /// The bounded visitors cap raw string input and reject a message or
+    /// summary sequence at `MAX + 1`; this step validates semantic invariants
+    /// that do not affect allocation: identifier order, body validity, summary
+    /// ranges, and the next ordinal.
     ///
     /// On any session the write path could have produced this is the identity
     /// function.
@@ -540,6 +554,7 @@ impl<'de> Deserialize<'de> for Session {
     where
         D: Deserializer<'de>,
     {
+        reject_unbounded_json_reader::<D>()?;
         Self::restore(RawSession::deserialize(deserializer)?).map_err(de::Error::custom)
     }
 }
@@ -694,6 +709,29 @@ mod tests {
     }
 
     #[test]
+    fn removal_and_a_refused_append_never_rewind_or_retain_a_message() {
+        let mut session = session();
+        let removed = session
+            .append(Role::System, "goal", 1)
+            .expect("goal appended");
+        assert!(session.remove(removed).is_some());
+        assert_eq!(session.next_message_id(), Some(MessageId::new(1)));
+
+        assert_eq!(
+            session.append(Role::User, "", 2),
+            Err(SessionError::EmptyMessage)
+        );
+        assert!(session.messages().is_empty());
+        assert_eq!(session.next_message_id(), Some(MessageId::new(1)));
+        assert_eq!(
+            session
+                .append(Role::User, "after clear", 3)
+                .expect("append succeeds"),
+            MessageId::new(1)
+        );
+    }
+
+    #[test]
     fn max_plus_one_messages_are_rejected_by_the_bounded_sequence_visitor() {
         let mut messages = vec![
             message_json(0, Role::System, "rules", false),
@@ -773,7 +811,7 @@ mod tests {
         let error =
             restore(&document(&oversized, &[], 1)).expect_err("an oversized body is refused");
         assert!(
-            error.to_string().contains("no longer than 1048576 bytes"),
+            error.to_string().contains("maximum is 1048576"),
             "unexpected error: {error}"
         );
 

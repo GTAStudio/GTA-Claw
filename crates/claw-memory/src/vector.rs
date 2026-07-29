@@ -13,7 +13,7 @@ use std::fmt::{self, Display, Formatter};
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
-use crate::bounded::{BoundedString, BoundedVec};
+use crate::bounded::{BoundedString, BoundedVec, reject_unbounded_json_reader};
 
 /// Inclusive maximum embedding dimensionality accepted by this crate.
 const MAX_DIMENSIONS: usize = 8192;
@@ -60,6 +60,7 @@ impl<'de> Deserialize<'de> for Embedding {
     where
         D: Deserializer<'de>,
     {
+        reject_unbounded_json_reader::<D>()?;
         let raw = RawEmbedding::deserialize(deserializer)?;
         Self::new(raw.values.into_inner()).map_err(de::Error::custom)
     }
@@ -275,6 +276,7 @@ impl<'de> Deserialize<'de> for RecordId {
     where
         D: Deserializer<'de>,
     {
+        reject_unbounded_json_reader::<D>()?;
         let value = BoundedString::<MAX_RECORD_ID_BYTES>::deserialize(deserializer)?.into_inner();
         Self::new(&value).map_err(de::Error::custom)
     }

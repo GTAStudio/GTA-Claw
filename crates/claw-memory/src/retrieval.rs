@@ -7,7 +7,7 @@ use std::fmt::{self, Display, Formatter};
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
-use crate::bounded::{BoundedString, BoundedVec};
+use crate::bounded::{BoundedString, BoundedVec, reject_unbounded_json_reader};
 use crate::session::SessionId;
 use crate::vector::{
     DEFAULT_INDEX_CAPACITY, Embedding, EmbeddingModel, RecordId, VectorError, VectorIndex,
@@ -99,6 +99,7 @@ impl<'de> Deserialize<'de> for MemoryRecord {
     where
         D: Deserializer<'de>,
     {
+        reject_unbounded_json_reader::<D>()?;
         let raw = RawMemoryRecord::deserialize(deserializer)?;
         let record = Self {
             id: raw.id,

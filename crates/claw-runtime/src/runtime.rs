@@ -1997,9 +1997,10 @@ impl TurnExecution {
 
     /// Applies one model-authored goal-tool call.
     ///
-    /// Argument and goal-service failures become a failed [`ToolOutcome`] rather than a turn
-    /// failure, so a model that sends bad arguments is told about it and can retry within the same
-    /// turn. Only an event-channel failure can abort the turn, and that is not reachable here.
+    /// Argument and ordinary goal-service failures become a failed [`ToolOutcome`] rather than a
+    /// turn failure, so a model that sends bad arguments is told about it and can retry within the
+    /// same turn. A committed-but-not-durable store outcome aborts the turn because presenting it
+    /// as a failed tool call would invite an unsafe model retry.
     async fn run_goal_tool(&self, call: &ToolCall) -> Result<ToolOutcome, RuntimeError> {
         let action = match parse_goal_action(&call.arguments) {
             Ok(action) => action,
@@ -2008,6 +2009,9 @@ impl TurnExecution {
 
         let record = match self.inner.goals.apply(&self.session_id, &action).await {
             Ok(record) => record,
+            Err(error @ GoalError::Port(PortError::CommittedButNotDurable(_))) => {
+                return Err(RuntimeError::Goal(error));
+            }
             Err(error) => return Ok(Self::failed_goal_call(call, &error)),
         };
 

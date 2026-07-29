@@ -165,6 +165,29 @@ fn max_plus_one_persisted_items_are_rejected_by_bounded_visitors() {
 
 #[test]
 fn max_plus_one_nested_strings_and_vectors_are_rejected_on_deserialization() {
+    let mut valid_session = session("owned");
+    valid_session
+        .append(Role::User, "valid", 1)
+        .expect("valid message");
+    let owned_session = serde_json::to_value(&valid_session).expect("session serializes");
+    assert!(
+        serde_json::from_value::<Session>(owned_session).is_ok(),
+        "owned sessions and identifiers remain compatible"
+    );
+
+    let valid_record = serde_json::json!({
+        "id": "record",
+        "session": "bounds",
+        "kind": "note",
+        "text": "kept",
+        "unix_millis": 1,
+        "tags": ["valid"],
+    });
+    assert!(
+        serde_json::from_value::<MemoryRecord>(valid_record).is_ok(),
+        "owned serde values remain compatible"
+    );
+
     let oversized_record = serde_json::json!({
         "id": "record",
         "session": "bounds",

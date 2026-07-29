@@ -112,8 +112,7 @@ impl AnchoredContext {
     /// Offers one item to the context.
     ///
     /// A [`ContextItem::GoalStatement`] updates the anchor's objective rather than joining the
-    /// droppable items, so restating the goal can never turn it into something compaction is free
-    /// to discard.
+    /// droppable items, while [`ContextItem::GoalCleared`] removes the anchor.
     pub fn ingest(&mut self, item: ContextItem) {
         match item {
             ContextItem::GoalStatement { objective } => {
@@ -121,6 +120,7 @@ impl AnchoredContext {
                     anchor.objective = objective;
                 }
             }
+            ContextItem::GoalCleared => self.anchor = None,
             other => self.items.push(other),
         }
     }
@@ -247,6 +247,17 @@ mod tests {
                 objective: "ship the adapter, with tests".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn clearing_the_goal_removes_the_anchor_without_adding_a_droppable_item() {
+        let mut context = AnchoredContext::new(Some(anchor()));
+        context.ingest(note("chatter"));
+        context.ingest(ContextItem::GoalCleared);
+
+        assert!(context.anchor().is_none());
+        assert_eq!(context.item_count(), 1);
+        assert_eq!(context.assemble(), vec![note("chatter")]);
     }
 
     #[test]

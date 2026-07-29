@@ -72,6 +72,8 @@ const SESSIONS_DIR: &str = "sessions";
 const RECORD_EXTENSION: &str = "json";
 const TEMP_PREFIX: &str = "pending-";
 const WRITE_LOCK_FILE: &str = ".goal-store.lock";
+const SESSION_INDEX_SCHEMA_VERSION: u32 = 2;
+const LEGACY_SESSION_INDEX_SCHEMA_VERSION: u32 = 1;
 
 /// Maximum attempts made to acquire the cross-process store lock.
 pub const WRITE_LOCK_ATTEMPTS: usize = 64;
@@ -80,13 +82,44 @@ pub const WRITE_LOCK_ATTEMPTS: usize = 64;
 pub const WRITE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 /// The persisted order of one session's goals.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SessionIndex {
     schema: u32,
     session_id: String,
     goal_ids: Vec<String>,
+    goal_id_high_water: u64,
+}
+
+#[derive(Deserialize)]
+struct SessionIndexEnvelope {
+    schema: u32,
+    session_id: String,
+    goal_ids: SessionGoalIds,
     #[serde(default)]
     goal_id_high_water: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SessionGoalIds {
+    Legacy(Vec<String>),
+    Durable {
+        entries: Vec<String>,
+        high_water: u64,
+    },
+}
+
+#[derive(Serialize)]
+struct DurableSessionIndex<'a> {
+    schema: u32,
+    session_id: &'a str,
+    goal_ids: DurableGoalIds<'a>,
+}
+
+#[derive(Serialize)]
+struct DurableGoalIds<'a> {
+    entries: &'a [String],
+    high_water: u64,
 }
 
 /// What [`FileGoalStore::open`] had to repair before the store was usable.
@@ -704,12 +737,9 @@ impl FileGoalStore {
     fn read_index(&self, session_id: &SessionId) -> Result<SessionIndex, StoreError> {
         let path = self.index_path_for(session_id.as_str());
         match fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).map_err(|error| StoreError::Corrupt {
-                path,
-                source: WireError::Malformed(error.to_string()),
-            }),
+            Ok(text) => Self::decode_index(&path, &text),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(SessionIndex {
-                schema: wire::SCHEMA_VERSION,
+                schema: SESSION_INDEX_SCHEMA_VERSION,
                 session_id: session_id.as_str().to_owned(),
                 goal_ids: Vec::new(),
                 goal_id_high_water: 0,
@@ -718,9 +748,60 @@ impl FileGoalStore {
         }
     }
 
+    fn decode_index(path: &Path, text: &str) -> Result<SessionIndex, StoreError> {
+        let envelope: SessionIndexEnvelope =
+            serde_json::from_str(text).map_err(|error| StoreError::Corrupt {
+                path: path.to_path_buf(),
+                source: WireError::Malformed(error.to_string()),
+            })?;
+        let (goal_ids, goal_id_high_water) = match (envelope.schema, envelope.goal_ids) {
+            (LEGACY_SESSION_INDEX_SCHEMA_VERSION, SessionGoalIds::Legacy(goal_ids)) => {
+                (goal_ids, envelope.goal_id_high_water)
+            }
+            (
+                SESSION_INDEX_SCHEMA_VERSION,
+                SessionGoalIds::Durable {
+                    entries,
+                    high_water,
+                },
+            ) => (entries, high_water),
+            (found, _) if found != SESSION_INDEX_SCHEMA_VERSION => {
+                return Err(StoreError::Corrupt {
+                    path: path.to_path_buf(),
+                    source: WireError::UnsupportedSchema {
+                        expected: SESSION_INDEX_SCHEMA_VERSION,
+                        found,
+                    },
+                });
+            }
+            (_, _) => {
+                return Err(StoreError::Corrupt {
+                    path: path.to_path_buf(),
+                    source: WireError::Malformed(
+                        "session index payload does not match its schema".to_owned(),
+                    ),
+                });
+            }
+        };
+        Ok(SessionIndex {
+            schema: envelope.schema,
+            session_id: envelope.session_id,
+            goal_ids,
+            goal_id_high_water,
+        })
+    }
+
     fn write_index(&self, index: &SessionIndex) -> Result<(), StoreError> {
         let path = self.index_path_for(&index.session_id);
-        let mut text = serde_json::to_string_pretty(index)
+        let durable = DurableSessionIndex {
+            schema: SESSION_INDEX_SCHEMA_VERSION,
+            session_id: &index.session_id,
+            goal_ids: DurableGoalIds {
+                entries: &index.goal_ids,
+                high_water: index.goal_id_high_water,
+            },
+        };
+        let mut text = serde_json::to_string_pretty(&durable)
             .map_err(|error| StoreError::Encoding(WireError::Malformed(error.to_string())))?;
         text.push('\n');
         self.write_atomically(&path, &text)
@@ -837,11 +918,7 @@ impl FileGoalStore {
                 continue;
             }
             let text = fs::read_to_string(&path).map_err(|error| io_error(&path, error))?;
-            let index: SessionIndex =
-                serde_json::from_str(&text).map_err(|error| StoreError::Corrupt {
-                    path: path.clone(),
-                    source: WireError::Malformed(error.to_string()),
-                })?;
+            let index = Self::decode_index(&path, &text)?;
             sessions.insert(index.session_id);
         }
 
@@ -856,6 +933,7 @@ impl FileGoalStore {
                 })?;
             let mut index = self.read_index(&session_id)?;
             let indexed = index.goal_ids.len();
+            let legacy_schema = index.schema != SESSION_INDEX_SCHEMA_VERSION;
             let previous_high_water = index.goal_id_high_water;
             index.goal_id_high_water = index
                 .goal_ids
@@ -902,7 +980,11 @@ impl FileGoalStore {
 
             report.pruned_dangling += pruned;
             report.adopted_orphans += adopted;
-            if pruned > 0 || adopted > 0 || index.goal_id_high_water != previous_high_water {
+            if legacy_schema
+                || pruned > 0
+                || adopted > 0
+                || index.goal_id_high_water != previous_high_water
+            {
                 self.write_index(&index)?;
             }
         }
@@ -1033,9 +1115,10 @@ impl GoalStorePort for FileGoalStore {
 mod tests {
     use super::{FileGoalStore, StoreError, WRITE_LOCK_ATTEMPTS, digest_of};
     use crate::budget::{BudgetError, GoalBudget};
-    use crate::testing::{TempRoot, block_on, goal_id, record, session_id};
+    use crate::testing::{SteppingClock, TempRoot, block_on, goal_id, record, session_id};
     use claw_application::ports::PortError;
     use claw_application::ports::goal::GoalStorePort;
+    use claw_runtime::{GoalConfig, GoalService};
     use std::fs::OpenOptions;
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -1329,6 +1412,35 @@ mod tests {
             .list_blocking(&session_id("s"))
             .expect("completed index reads");
         assert_eq!(listed, vec![record]);
+        assert_eq!(store.accepted_writes(), 1);
+    }
+
+    #[test]
+    fn a_service_retry_adopts_the_original_orphan_when_the_clock_has_advanced() {
+        let root = TempRoot::new("live-service-orphan-retry");
+        let store = Arc::new(FileGoalStore::open(root.path()).expect("store opens"));
+        let orphan = record("s", "s:goal-1", "objective", 1);
+        let encoded = crate::wire::encode(&orphan).expect("record encodes");
+        store
+            .write_atomically(&store.record_path_for(orphan.goal_id.as_str()), &encoded)
+            .expect("record publication succeeds before the index split");
+        let service = GoalService::new(
+            Arc::clone(&store) as Arc<_>,
+            Arc::new(SteppingClock::new(99_000, 1_000)),
+            GoalConfig::default(),
+        );
+
+        let adopted = block_on(service.start(&session_id("s"), " objective "))
+            .expect("retry adopts and indexes the original record");
+
+        assert_eq!(
+            adopted, orphan,
+            "the retry retains the committed timestamps"
+        );
+        assert_eq!(
+            block_on(service.history(&session_id("s"))).expect("history"),
+            vec![orphan]
+        );
         assert_eq!(store.accepted_writes(), 1);
     }
 }

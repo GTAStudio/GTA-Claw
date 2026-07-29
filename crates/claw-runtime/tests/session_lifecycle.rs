@@ -34,9 +34,16 @@ struct Harness {
 }
 
 fn harness(rounds: Vec<Round>, config: RuntimeConfig) -> Harness {
+    harness_with_goals(rounds, config, &MemoryGoals::new())
+}
+
+fn harness_with_goals(
+    rounds: Vec<Round>,
+    config: RuntimeConfig,
+    goals: &Arc<MemoryGoals>,
+) -> Harness {
     let clock = FakeClock::new(1_000);
     let state = MemoryState::new();
-    let goals = MemoryGoals::new();
     let approvals = RecordingApprovals::new();
     let context = SimpleContext::new();
     let provider = ScriptedProvider::new(rounds);
@@ -67,7 +74,7 @@ fn harness(rounds: Vec<Round>, config: RuntimeConfig) -> Harness {
             state: Arc::clone(&state) as Arc<_>,
             tools: Arc::clone(&tools) as Arc<_>,
             approvals: Arc::clone(&approvals) as Arc<_>,
-            goals: Arc::clone(&goals) as Arc<_>,
+            goals: Arc::clone(goals) as Arc<_>,
             context: Arc::clone(&context) as Arc<_>,
         },
         config,
@@ -82,6 +89,55 @@ fn harness(rounds: Vec<Round>, config: RuntimeConfig) -> Harness {
         context,
         provider,
     }
+}
+
+#[tokio::test]
+async fn committed_but_not_durable_goal_tool_failure_aborts_without_model_retry() {
+    let goals = MemoryGoals::new();
+    goals.refuse_saves_with(PortError::CommittedButNotDurable(
+        "record committed; do not retry blindly".to_owned(),
+    ));
+    let harness = harness_with_goals(
+        vec![
+            tool_round(
+                "goal-1",
+                "update_goal",
+                r#"{"action":"set","objective":"ship safely"}"#,
+            ),
+            text_round("would be an unsafe retry"),
+        ],
+        RuntimeConfig::default(),
+        &goals,
+    );
+    let session_id = session("goal-durability-failure");
+
+    let mut handle = harness
+        .runtime
+        .submit(&session_id, "set the goal")
+        .await
+        .expect("turn accepted");
+    while handle.next_event().await.is_some() {}
+    let error = handle
+        .join()
+        .await
+        .expect_err("degraded durability aborts the model loop");
+
+    assert!(matches!(
+        &error,
+        RuntimeError::Goal(claw_runtime::GoalError::Port(
+            PortError::CommittedButNotDurable(_)
+        ))
+    ));
+    assert_eq!(
+        error.failure_class(),
+        RuntimeFailureClass::CommittedButNotDurable
+    );
+    assert!(!error.is_retryable());
+    assert_eq!(
+        harness.provider.requests().len(),
+        1,
+        "the provider is not invited to retry the committed mutation"
+    );
 }
 
 fn states(events: &[RuntimeEventKind]) -> Vec<SessionState> {

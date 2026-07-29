@@ -490,12 +490,9 @@ impl MemoryContextEngine {
             .get(request.session_id.as_str())
             .ok_or_else(|| RuntimePortError::NotFound("context session is not open".to_owned()))?
             .session
-            .messages()
-            .last()
-            .map_or(Some(0), |message| message.id.get().checked_add(1))
-            .ok_or_else(|| {
-                RuntimePortError::Unavailable("memory session is exhausted".to_owned())
-            })?;
+            .next_message_id()
+            .ok_or_else(|| RuntimePortError::Unavailable("memory session is exhausted".to_owned()))?
+            .get();
         let record_id = RecordId::new(&format!(
             "mem:{:016x}:{}:{}",
             stable_hash(request.session_id.as_str()),
@@ -535,6 +532,7 @@ impl MemoryContextEngine {
         };
         if message_id.get() != next_ordinal {
             let _ = data.retriever.remove(&record_id);
+            let _ = entry.session.remove(message_id);
             return Err(RuntimePortError::Conflict(
                 "memory session changed during ingest".to_owned(),
             ));
@@ -1718,6 +1716,38 @@ mod tests {
             })
             .await
             .expect("goal clear");
+        memory
+            .ingest(ContextIngest {
+                session_id: session_id.clone(),
+                turn: TurnId::FIRST,
+                item: ContextItem::UserInput {
+                    text: "after clear".to_owned(),
+                },
+                at: Timestamp::from_millis(5),
+            })
+            .await
+            .expect("ordinary ingest after clear");
+        let (message_id, has_record) = {
+            let data = memory
+                .data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = data.sessions.get(session_id.as_str()).expect("session");
+            let observed = (
+                entry.session.messages()[0].id.get(),
+                entry
+                    .record_ids
+                    .iter()
+                    .any(|id| id.as_str().ends_with(":1")),
+            );
+            drop(data);
+            observed
+        };
+        assert_eq!(message_id, 1);
+        assert!(
+            has_record,
+            "record identity uses the session high-water rather than the visible tail"
+        );
         let assembled = memory
             .assemble(ContextAssembly {
                 session_id,
@@ -1726,7 +1756,12 @@ mod tests {
             })
             .await
             .expect("assembled");
-        assert!(assembled.messages.is_empty());
+        assert_eq!(
+            assembled.messages,
+            vec![PromptMessage::User {
+                text: "after clear".to_owned()
+            }]
+        );
     }
 
     #[test]

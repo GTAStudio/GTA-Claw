@@ -165,16 +165,7 @@ impl GoalService {
         goal_id: GoalId,
         objective: &str,
     ) -> Result<GoalRecord, GoalError> {
-        if self.config.max_progress_entries == 0 {
-            return Err(GoalError::InvalidBudget);
-        }
-        let objective = objective.trim();
-        if objective.is_empty() {
-            return Err(GoalError::InvalidObjective("must not be empty"));
-        }
-        if objective.len() > self.config.max_objective_bytes {
-            return Err(GoalError::InvalidObjective("is too long"));
-        }
+        let objective = self.validate_objective(objective)?;
 
         let now = self.clock.now();
 
@@ -183,7 +174,7 @@ impl GoalService {
         let record = GoalRecord {
             goal_id,
             session_id: session_id.clone(),
-            objective: objective.to_owned(),
+            objective,
             status: GoalStatus::Active,
             progress: Vec::new(),
             created_at: now,
@@ -295,10 +286,25 @@ impl GoalService {
         session_id: &SessionId,
         objective: &str,
     ) -> Result<GoalRecord, GoalError> {
+        let objective = self.validate_objective(objective)?;
         let ordinal = self.store.next_goal_ordinal(session_id).await?;
         let goal_id = GoalId::new(format!("{}:goal-{ordinal}", session_id.as_str()))
             .map_err(GoalError::UnusableGoalId)?;
-        self.set(session_id, goal_id, objective).await
+        if let Some(orphan) = self.store.load(&goal_id).await?
+            && Self::is_equivalent_new_goal(&orphan, session_id, &objective)
+        {
+            let previous = self.active(session_id).await?;
+            self.store.save(orphan.clone()).await?;
+            if let Some(mut previous) = previous {
+                previous.status = GoalStatus::Superseded;
+                previous.updated_at = orphan.created_at;
+                previous.closed_at = Some(orphan.created_at);
+                previous.revision = previous.revision.saturating_add(1);
+                self.store.save(previous).await?;
+            }
+            return Ok(orphan);
+        }
+        self.set(session_id, goal_id, &objective).await
     }
 
     /// Applies one model-authored goal action to the session's durable goal.
@@ -351,6 +357,35 @@ impl GoalService {
         }
 
         Ok(record)
+    }
+
+    fn validate_objective(&self, objective: &str) -> Result<String, GoalError> {
+        if self.config.max_progress_entries == 0 {
+            return Err(GoalError::InvalidBudget);
+        }
+        let objective = objective.trim();
+        if objective.is_empty() {
+            return Err(GoalError::InvalidObjective("must not be empty"));
+        }
+        if objective.len() > self.config.max_objective_bytes {
+            return Err(GoalError::InvalidObjective("is too long"));
+        }
+        Ok(objective.to_owned())
+    }
+
+    fn is_equivalent_new_goal(
+        record: &GoalRecord,
+        session_id: &SessionId,
+        objective: &str,
+    ) -> bool {
+        record.session_id == *session_id
+            && record.objective == objective
+            && record.status == GoalStatus::Active
+            && record.progress.is_empty()
+            && record.created_at == record.updated_at
+            && record.closed_at.is_none()
+            && record.compacted_entries == 0
+            && record.revision == 1
     }
 
     /// Folds the oldest entries into a single summary once the budget is exceeded.

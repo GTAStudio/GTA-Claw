@@ -354,6 +354,7 @@ impl StatePort for GatedLoadState {
 pub(crate) struct MemoryGoals {
     goals: Mutex<Vec<GoalRecord>>,
     high_water: Mutex<BTreeMap<String, u64>>,
+    save_error: Mutex<Option<PortError>>,
     saves: AtomicUsize,
 }
 
@@ -366,6 +367,11 @@ impl MemoryGoals {
     /// Returns how many writes the store accepted.
     pub(crate) fn saves(&self) -> usize {
         self.saves.load(Ordering::SeqCst)
+    }
+
+    /// Makes subsequent saves return `error` without mutating the store.
+    pub(crate) fn refuse_saves_with(&self, error: PortError) {
+        *guard(&self.save_error) = Some(error);
     }
 }
 
@@ -388,6 +394,10 @@ impl GoalStorePort for MemoryGoals {
     }
 
     fn save(&self, record: GoalRecord) -> PortFuture<'_, Result<(), PortError>> {
+        let save_error = guard(&self.save_error).clone();
+        if let Some(error) = save_error {
+            return Box::pin(async move { Err(error) });
+        }
         self.saves.fetch_add(1, Ordering::SeqCst);
         let mut goals = guard(&self.goals);
         let existing = goals
