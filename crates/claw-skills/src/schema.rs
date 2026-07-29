@@ -488,11 +488,18 @@ pub fn validate_parameters_with_limits(
     limits: ValidationLimits,
 ) -> Result<(), ParameterValidationError> {
     validate_schema_with_limits(schema, limits).map_err(ParameterValidationError::InvalidSchema)?;
+    let mut remaining_values = limits.max_input_nodes.get();
+    validate_input_node(
+        parameters,
+        0,
+        limits,
+        &mut remaining_values,
+        &mut Vec::new(),
+    )?;
     let mut context = ValidationContext {
         violations: Vec::new(),
         limits,
         limit_reached: false,
-        remaining_values: limits.max_input_nodes.get(),
         remaining_comparisons: limits.max_comparison_nodes.get(),
     };
     let _completed = validate_value(schema, parameters, "$", 0, &mut context)?;
@@ -510,7 +517,6 @@ struct ValidationContext {
     violations: Vec<ParameterViolation>,
     limits: ValidationLimits,
     limit_reached: bool,
-    remaining_values: usize,
     remaining_comparisons: usize,
 }
 
@@ -533,12 +539,78 @@ impl ValidationContext {
         path: &str,
         suffixes: &[&str],
     ) -> Result<String, ParameterValidationError> {
-        extend_path(path, suffixes, self.limits.max_path_bytes.get()).ok_or_else(|| {
-            ParameterValidationError::ResourceLimit {
-                path: path.to_owned(),
-            }
-        })
+        parameter_child_path(path, suffixes, self.limits)
     }
+}
+
+fn validate_input_node<'a>(
+    value: &'a Value,
+    depth: usize,
+    limits: ValidationLimits,
+    remaining_values: &mut usize,
+    path: &mut Vec<InputPathComponent<'a>>,
+) -> Result<(), ParameterValidationError> {
+    if depth >= limits.max_depth.get() || *remaining_values == 0 {
+        return Err(ParameterValidationError::ResourceLimit {
+            path: render_input_path(path, limits.max_path_bytes.get()),
+        });
+    }
+    *remaining_values -= 1;
+    match value {
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                path.push(InputPathComponent::Index(index));
+                let result = validate_input_node(value, depth + 1, limits, remaining_values, path);
+                path.pop();
+                result?;
+            }
+        }
+        Value::Object(values) => {
+            for (name, value) in values {
+                path.push(InputPathComponent::Key(name));
+                let result = validate_input_node(value, depth + 1, limits, remaining_values, path);
+                path.pop();
+                result?;
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+    Ok(())
+}
+
+enum InputPathComponent<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+fn render_input_path(path: &[InputPathComponent<'_>], max_bytes: usize) -> String {
+    let mut rendered = "$".to_owned();
+    for component in path {
+        let next = match component {
+            InputPathComponent::Key(name) => extend_path(&rendered, &[".", name], max_bytes),
+            InputPathComponent::Index(index) => {
+                let index_text = index.to_string();
+                extend_path(&rendered, &["[", &index_text, "]"], max_bytes)
+            }
+        };
+        let Some(next) = next else {
+            break;
+        };
+        rendered = next;
+    }
+    rendered
+}
+
+fn parameter_child_path(
+    path: &str,
+    suffixes: &[&str],
+    limits: ValidationLimits,
+) -> Result<String, ParameterValidationError> {
+    extend_path(path, suffixes, limits.max_path_bytes.get()).ok_or_else(|| {
+        ParameterValidationError::ResourceLimit {
+            path: path.to_owned(),
+        }
+    })
 }
 
 fn validate_value(
@@ -548,12 +620,11 @@ fn validate_value(
     depth: usize,
     context: &mut ValidationContext,
 ) -> Result<bool, ParameterValidationError> {
-    if depth >= context.limits.max_depth.get() || context.remaining_values == 0 {
+    if depth >= context.limits.max_depth.get() {
         return Err(ParameterValidationError::ResourceLimit {
             path: path.to_owned(),
         });
     }
-    context.remaining_values -= 1;
     let object = schema
         .as_object()
         .expect("schema validation guarantees object nodes");

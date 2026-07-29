@@ -1001,7 +1001,11 @@ fn is_link_like(metadata: &std::fs::Metadata) -> bool {
 
 #[cfg(windows)]
 fn apply_no_follow(options: &mut OpenOptions) {
-    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    options
+        // Keep the opened leaf from being renamed outside the pinned tree
+        // between verification and the final read/write.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
 #[cfg(unix)]
@@ -1070,10 +1074,11 @@ fn verify_handle_matches_path(file: &File, absolute: &Path) -> Result<(), Sandbo
 
 /// Windows counterpart, where the swap this guards against cannot happen.
 ///
-/// Pinned ancestors are held without `FILE_SHARE_DELETE`, so the kernel refuses
-/// to rename or delete them while the pin lives. That is prevention rather than
-/// detection, and it is why no identity comparison is needed here; Windows also
-/// exposes no stable file identity on stable Rust.
+/// Pinned ancestors and the opened leaf are held without `FILE_SHARE_DELETE`,
+/// so the kernel refuses to rename or delete them while the operation lives.
+/// That is prevention rather than detection, and it is why no identity
+/// comparison is needed here; Windows also exposes no stable file identity on
+/// stable Rust.
 #[cfg(not(unix))]
 fn verify_handle_matches_path(_file: &File, _absolute: &Path) -> Result<(), SandboxError> {
     Ok(())
@@ -1615,6 +1620,58 @@ mod tests {
         // A name that no longer resolves at all is equally not the open handle.
         std::fs::remove_file(&other).expect("remove the other file");
         assert!(verify_handle_matches_path(&file, &other).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_leaf_handle_blocks_concurrent_rename_outside_the_root() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        let root = std::env::temp_dir().join(format!("claw-write-leaf-share-{nanos}"));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).expect("create the workspace");
+        std::fs::create_dir_all(&outside).expect("create the outside directory");
+        let parent = open_directory_no_follow(&workspace).expect("pin the workspace");
+
+        for (leaf, mode) in [
+            ("existing.txt", WriteMode::Overwrite),
+            ("created.txt", WriteMode::CreateNew),
+        ] {
+            let inside = workspace.join(leaf);
+            let escaped = outside.join(leaf);
+            if mode == WriteMode::Overwrite {
+                std::fs::write(&inside, b"original").expect("create the existing leaf");
+            }
+            let file = open_write_no_follow(&parent, &inside, leaf, mode)
+                .expect("open the leaf without delete sharing");
+
+            let rename_inside = inside.clone();
+            let rename_escaped = escaped.clone();
+            let rename = std::thread::spawn(move || std::fs::rename(rename_inside, rename_escaped))
+                .join()
+                .expect("rename thread finishes");
+            assert!(
+                rename.is_err(),
+                "{mode:?} leaf was renamed outside while its writable handle remained open"
+            );
+            assert!(
+                inside.is_file(),
+                "the opened leaf must stay in the workspace"
+            );
+            assert!(
+                !escaped.exists(),
+                "the opened leaf must never appear outside the workspace"
+            );
+
+            drop(file);
+            std::fs::rename(&inside, &escaped)
+                .expect("the same rename succeeds once the leaf handle is closed");
+        }
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

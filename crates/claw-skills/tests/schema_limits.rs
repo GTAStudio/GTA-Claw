@@ -123,6 +123,22 @@ fn input_node_budget_bounds_successful_array_traversal() {
 }
 
 #[test]
+fn unconstrained_schema_still_walks_the_complete_input_tree() {
+    let schema = json!({});
+    let mut constrained = limits(4, 128);
+    constrained.max_input_nodes = NonZeroUsize::new(2).expect("positive input limit");
+
+    let error = validate_parameters_with_limits(&schema, &json!([1, 2]), constrained)
+        .expect_err("unconstrained subtrees still consume the input budget");
+    assert_eq!(
+        error,
+        ParameterValidationError::ResourceLimit {
+            path: "$[1]".to_owned()
+        }
+    );
+}
+
+#[test]
 fn enum_comparison_budget_bounds_nested_value_walks() {
     let schema = json!({"enum": [[1, 2]]});
     let mut constrained = limits(4, 128);
