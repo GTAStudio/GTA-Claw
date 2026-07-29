@@ -29,6 +29,7 @@ use crate::{
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 const MAX_IN_FLIGHT_CANCELLATIONS: usize = 8;
 const MAX_PENDING_CANCELLATIONS: usize = 64;
+const MAX_TRACKED_DISPATCH_TASKS: usize = MAX_IN_FLIGHT_REQUESTS + MAX_IN_FLIGHT_CANCELLATIONS + 1;
 const INCOMING_QUEUE_CAPACITY: usize = 64;
 const DISCONNECT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -137,6 +138,8 @@ pub struct AcpBridge {
     /// clone of the advertised capabilities: 3.3 ns against 23.8 ns per
     /// request. Only `initialize` needs an owned copy.
     capabilities: Arc<AgentCapabilities>,
+    #[cfg(test)]
+    task_count_peak: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl std::fmt::Debug for AcpBridge {
@@ -155,6 +158,21 @@ impl AcpBridge {
         Self {
             backend,
             capabilities: Arc::new(capabilities),
+            #[cfg(test)]
+            task_count_peak: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_task_count_peak(mut self, peak: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        self.task_count_peak = Some(peak);
+        self
+    }
+
+    #[cfg(test)]
+    fn observe_task_count(&self, tasks: &JoinSet<()>) {
+        if let Some(peak) = self.task_count_peak.as_ref() {
+            peak.fetch_max(tasks.len(), std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -204,6 +222,9 @@ impl AcpBridge {
         let mut pending_cancellations = VecDeque::new();
         let mut tasks = JoinSet::new();
         let terminal_error = loop {
+            if let Err(error) = reap_completed_tasks(&mut tasks) {
+                break Some(error);
+            }
             if let Err(error) = dispatch_cancellations(
                 &mut pending_cancellations,
                 &cancellation_slots,
@@ -212,16 +233,21 @@ impl AcpBridge {
             ) {
                 break Some(error);
             }
+            #[cfg(test)]
+            self.observe_task_count(&tasks);
+            if tasks.len() > MAX_TRACKED_DISPATCH_TASKS {
+                break Some(Error::internal_error().data("ACP dispatch task bound exceeded"));
+            }
             let message = tokio::select! {
                 biased;
                 () = peer.disconnected() => break None,
-                message = incoming.recv() => message,
                 completed = tasks.join_next(), if !tasks.is_empty() => {
                     if let Some(Err(error)) = completed {
                         break Some(Error::internal_error().data(error.to_string()));
                     }
                     continue;
                 }
+                message = incoming.recv() => message,
             };
             if !peer.is_connected() {
                 break None;
@@ -273,6 +299,11 @@ impl AcpBridge {
                     let _permit = permit;
                     dispatch_request(backend, capabilities, peer, method, params, id).await;
                 });
+                #[cfg(test)]
+                self.observe_task_count(&tasks);
+                if tasks.len() > MAX_TRACKED_DISPATCH_TASKS {
+                    break Some(Error::internal_error().data("ACP dispatch task bound exceeded"));
+                }
             } else if method == "session/cancel" {
                 let Ok(notification) = decode(params) else {
                     continue;
@@ -303,6 +334,9 @@ impl AcpBridge {
         let _ = reader.await;
         if timeout(DISCONNECT_DRAIN_TIMEOUT, async {
             loop {
+                if reap_completed_tasks(&mut tasks).is_err() {
+                    break;
+                }
                 if dispatch_cancellations(
                     &mut pending_cancellations,
                     &cancellation_slots,
@@ -313,6 +347,8 @@ impl AcpBridge {
                 {
                     break;
                 }
+                #[cfg(test)]
+                self.observe_task_count(&tasks);
                 if pending_cancellations.is_empty() {
                     while tasks.join_next().await.is_some() {}
                     break;
@@ -331,6 +367,13 @@ impl AcpBridge {
         peer.finish_disconnect();
         terminal_error.map_or_else(|| Ok(()), |error| Err(error.into()))
     }
+}
+
+fn reap_completed_tasks(tasks: &mut JoinSet<()>) -> std::result::Result<(), Error> {
+    while let Some(completed) = tasks.try_join_next() {
+        completed.map_err(|error| Error::internal_error().data(error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn dispatch_cancellations(
@@ -687,6 +730,41 @@ mod tests {
             .expect("bridge must stop after every cancellation is delivered")
             .expect("bridge task must not panic")
             .expect("clean input close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sustained_request_traffic_reaps_completed_dispatch_tasks() {
+        const REQUEST_COUNT: usize = 1_024;
+
+        let task_count_peak = Arc::new(AtomicUsize::new(0));
+        let (mut client, input) = duplex(256 * 1024);
+        let bridge = AcpBridge::new(Arc::new(TestBackend::default()), AgentCapabilities::new())
+            .with_task_count_peak(Arc::clone(&task_count_peak));
+        let server = tokio::spawn(bridge.serve(input, tokio::io::sink()));
+
+        for id in 0..REQUEST_COUNT {
+            let request = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "initialize",
+                "params": InitializeRequest::new(ProtocolVersion::V1),
+            }))
+            .expect("serialize initialize");
+            client.write_all(&request).await.expect("write initialize");
+            client.write_all(b"\n").await.expect("frame initialize");
+        }
+        client.flush().await.expect("flush initialize traffic");
+        drop(client);
+
+        timeout(Duration::from_secs(3), server)
+            .await
+            .expect("sustained request traffic must shut down")
+            .expect("bridge task must not panic")
+            .expect("sustained requests must drain cleanly");
+        assert!(
+            task_count_peak.load(Ordering::SeqCst) <= MAX_TRACKED_DISPATCH_TASKS,
+            "completed JoinSet entries must be reaped before admitting unbounded input"
+        );
     }
 
     #[tokio::test]

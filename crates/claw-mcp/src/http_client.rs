@@ -53,7 +53,6 @@ const DEFAULT_BODY_LIMIT: usize = 8 * 1024 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = DEFAULT_BODY_LIMIT;
 const MAX_SSE_STREAM_BYTES: usize = 64 * 1024 * 1024;
-const EVENT_STREAM_MIME_TYPE: &str = "text/event-stream";
 const JSON_MIME_TYPE: &str = "application/json";
 const HEADER_SESSION_ID: &str = "mcp-session-id";
 
@@ -694,6 +693,31 @@ fn content_type(response: &HttpResponse) -> Option<String> {
         .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum McpMediaType {
+    Json,
+    EventStream,
+}
+
+fn parse_mcp_media_type(value: &str) -> Option<McpMediaType> {
+    let essence = value
+        .split_once(';')
+        .map_or(value, |(essence, _)| essence)
+        .trim();
+    let (type_, subtype) = essence.split_once('/')?;
+    if type_.trim().eq_ignore_ascii_case("application")
+        && subtype.trim().eq_ignore_ascii_case("json")
+    {
+        Some(McpMediaType::Json)
+    } else if type_.trim().eq_ignore_ascii_case("text")
+        && subtype.trim().eq_ignore_ascii_case("event-stream")
+    {
+        Some(McpMediaType::EventStream)
+    } else {
+        None
+    }
+}
+
 fn response_session_id(response: &HttpResponse) -> Option<String> {
     response
         .headers
@@ -779,10 +803,8 @@ impl StreamableHttpClient for HttpClient {
         }
         let status = response.status;
         let content_type = content_type(&response);
-        let is_json = content_type
-            .as_deref()
-            .is_some_and(|value| value.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()));
-        if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) && !is_json {
+        let media_type = content_type.as_deref().and_then(parse_mcp_media_type);
+        if status == StatusCode::NO_CONTENT {
             return Ok(StreamableHttpPostResponse::Accepted);
         }
         if status == StatusCode::NOT_FOUND && session_was_attached {
@@ -794,9 +816,31 @@ impl StreamableHttpClient for HttpClient {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
         let session_id = response_session_id(&response);
+        if status == StatusCode::ACCEPTED {
+            let body = response
+                .bytes(DEFAULT_BODY_LIMIT)
+                .await
+                .map_err(StreamableHttpError::Client)?;
+            if body.is_empty()
+                && matches!(
+                    message,
+                    ClientJsonRpcMessage::Notification(_)
+                        | ClientJsonRpcMessage::Response(_)
+                        | ClientJsonRpcMessage::Error(_)
+                )
+            {
+                return Ok(StreamableHttpPostResponse::Accepted);
+            }
+            if media_type == Some(McpMediaType::Json) {
+                let message =
+                    serde_json::from_slice(&body).map_err(StreamableHttpError::Deserialize)?;
+                return Ok(StreamableHttpPostResponse::Json(message, session_id));
+            }
+            return Err(StreamableHttpError::UnexpectedContentType(content_type));
+        }
         if status.is_success()
             && content_length == Some(0)
-            && !is_json
+            && media_type != Some(McpMediaType::Json)
             && matches!(
                 message,
                 ClientJsonRpcMessage::Notification(_)
@@ -811,25 +855,21 @@ impl StreamableHttpClient for HttpClient {
                 .bytes(DEFAULT_BODY_LIMIT)
                 .await
                 .map_err(StreamableHttpError::Client)?;
-            if is_json && let Some(message) = parse_json_rpc_error(&body) {
+            if media_type == Some(McpMediaType::Json)
+                && let Some(message) = parse_json_rpc_error(&body)
+            {
                 return Ok(StreamableHttpPostResponse::Json(message, session_id));
             }
             return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
                 format!("HTTP {status}"),
             )));
         }
-        match content_type.as_deref() {
-            Some(value)
-                if value
-                    .as_bytes()
-                    .starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) =>
-            {
-                Ok(StreamableHttpPostResponse::Sse(
-                    response.into_sse_stream(),
-                    session_id,
-                ))
-            }
-            Some(value) if value.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()) => {
+        match media_type {
+            Some(McpMediaType::EventStream) => Ok(StreamableHttpPostResponse::Sse(
+                response.into_sse_stream(),
+                session_id,
+            )),
+            Some(McpMediaType::Json) => {
                 let body = response
                     .bytes(DEFAULT_BODY_LIMIT)
                     .await
@@ -839,7 +879,7 @@ impl StreamableHttpClient for HttpClient {
                 Ok(StreamableHttpPostResponse::Json(message, session_id))
             }
 
-            _ => Err(StreamableHttpError::UnexpectedContentType(content_type)),
+            None => Err(StreamableHttpError::UnexpectedContentType(content_type)),
         }
     }
 
@@ -926,12 +966,11 @@ impl StreamableHttpClient for HttpClient {
             )));
         }
         let content_type = content_type(&response);
-        if !content_type.as_deref().is_some_and(|value| {
-            value
-                .as_bytes()
-                .starts_with(EVENT_STREAM_MIME_TYPE.as_bytes())
-                || value.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes())
-        }) {
+        if content_type
+            .as_deref()
+            .and_then(parse_mcp_media_type)
+            .is_none()
+        {
             return Err(StreamableHttpError::UnexpectedContentType(content_type));
         }
         Ok(response.into_sse_stream())
@@ -1053,50 +1092,113 @@ mod tests {
         assert!(events.next().await.is_none());
     }
 
+    #[test]
+    fn mcp_media_types_ignore_ascii_case_and_parameters_but_not_suffixes() {
+        assert_eq!(
+            parse_mcp_media_type("ApPlIcAtIoN/JsOn; Charset=UTF-8"),
+            Some(McpMediaType::Json)
+        );
+        assert_eq!(
+            parse_mcp_media_type("TeXt/EvEnT-StReAm ; charset=utf-8"),
+            Some(McpMediaType::EventStream)
+        );
+        assert_eq!(parse_mcp_media_type("application/json-seq"), None);
+        assert_eq!(parse_mcp_media_type("text/event-streaming"), None);
+    }
+
     #[tokio::test]
-    async fn every_successful_application_json_body_must_decode_as_json_rpc() {
+    async fn successful_response_status_and_media_type_semantics_are_strict() {
+        fn request(id: u64) -> ClientJsonRpcMessage {
+            serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "ping"
+            }))
+            .expect("fixture JSON-RPC request")
+        }
+
+        fn notification() -> ClientJsonRpcMessage {
+            serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }))
+            .expect("fixture JSON-RPC notification")
+        }
+
         async fn malformed_json() -> impl IntoResponse {
             ([(CONTENT_TYPE, JSON_MIME_TYPE)], "{not-json")
         }
 
-        async fn empty_json() -> impl IntoResponse {
-            ([(CONTENT_TYPE, JSON_MIME_TYPE)], "")
+        async fn accepted_empty_json_header() -> impl IntoResponse {
+            (
+                StatusCode::ACCEPTED,
+                [(CONTENT_TYPE, "ApPlIcAtIoN/JsOn; charset=utf-8")],
+                "",
+            )
+        }
+
+        async fn no_content_json_header() -> impl IntoResponse {
+            (
+                StatusCode::NO_CONTENT,
+                [(CONTENT_TYPE, "APPLICATION/JSON; charset=utf-8")],
+                "",
+            )
         }
 
         async fn accepted_malformed_json() -> impl IntoResponse {
             (
                 StatusCode::ACCEPTED,
-                [(CONTENT_TYPE, JSON_MIME_TYPE)],
+                [(CONTENT_TYPE, "Application/Json; charset=utf-8")],
                 "{not-json",
+            )
+        }
+
+        async fn accepted_valid_json() -> impl IntoResponse {
+            (
+                StatusCode::ACCEPTED,
+                [(CONTENT_TYPE, "Application/Json; charset=utf-8")],
+                r#"{"jsonrpc":"2.0","id":3,"result":{}}"#,
+            )
+        }
+
+        async fn mixed_case_json() -> impl IntoResponse {
+            (
+                [(CONTENT_TYPE, "Application/Json; charset=utf-8")],
+                r#"{"jsonrpc":"2.0","id":4,"result":{}}"#,
+            )
+        }
+
+        async fn mixed_case_event_stream() -> impl IntoResponse {
+            (
+                [(CONTENT_TYPE, "Text/Event-Stream; charset=utf-8")],
+                "data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}\n\n",
             )
         }
 
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
-            .expect("bind malformed JSON fixture");
-        let address = listener.local_addr().expect("malformed JSON address");
+            .expect("bind HTTP semantics fixture");
+        let address = listener.local_addr().expect("HTTP semantics address");
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
                 Router::new()
                     .route("/malformed", post(malformed_json))
-                    .route("/empty", post(empty_json))
-                    .route("/accepted", post(accepted_malformed_json)),
+                    .route("/accepted-empty", post(accepted_empty_json_header))
+                    .route("/no-content", post(no_content_json_header))
+                    .route("/accepted-malformed", post(accepted_malformed_json))
+                    .route("/accepted-valid", post(accepted_valid_json))
+                    .route("/mixed-json", post(mixed_case_json))
+                    .route("/mixed-stream", get(mixed_case_event_stream)),
             )
             .await
         });
         let client = HttpClient::new(Duration::from_secs(5)).expect("HTTP client");
-        let request: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "ping"
-        }))
-        .expect("fixture JSON-RPC request");
 
         let malformed = client
             .post_message(
                 Arc::from(format!("http://{address}/malformed")),
-                request,
+                request(1),
                 None,
                 None,
                 HashMap::new(),
@@ -1107,38 +1209,95 @@ mod tests {
             Err(StreamableHttpError::Deserialize(_))
         ));
 
-        let notification: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        }))
-        .expect("fixture JSON-RPC notification");
-        let empty = client
+        let empty_accepted = client
             .post_message(
-                Arc::from(format!("http://{address}/empty")),
-                notification,
+                Arc::from(format!("http://{address}/accepted-empty")),
+                notification(),
                 None,
                 None,
                 HashMap::new(),
             )
             .await;
-        assert!(matches!(empty, Err(StreamableHttpError::Deserialize(_))));
+        assert!(matches!(
+            empty_accepted,
+            Ok(StreamableHttpPostResponse::Accepted)
+        ));
 
-        let request: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "ping"
-        }))
-        .expect("second fixture JSON-RPC request");
-        let accepted = client
+        let no_content = client
             .post_message(
-                Arc::from(format!("http://{address}/accepted")),
-                request,
+                Arc::from(format!("http://{address}/no-content")),
+                request(2),
                 None,
                 None,
                 HashMap::new(),
             )
             .await;
-        assert!(matches!(accepted, Err(StreamableHttpError::Deserialize(_))));
+        assert!(matches!(
+            no_content,
+            Ok(StreamableHttpPostResponse::Accepted)
+        ));
+
+        let malformed_accepted = client
+            .post_message(
+                Arc::from(format!("http://{address}/accepted-malformed")),
+                request(3),
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await;
+        assert!(matches!(
+            malformed_accepted,
+            Err(StreamableHttpError::Deserialize(_))
+        ));
+
+        let valid_accepted = client
+            .post_message(
+                Arc::from(format!("http://{address}/accepted-valid")),
+                request(3),
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await;
+        assert!(matches!(
+            valid_accepted,
+            Ok(StreamableHttpPostResponse::Json(_, None))
+        ));
+
+        let mixed_json = client
+            .post_message(
+                Arc::from(format!("http://{address}/mixed-json")),
+                request(4),
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await;
+        assert!(matches!(
+            mixed_json,
+            Ok(StreamableHttpPostResponse::Json(_, None))
+        ));
+
+        let mut mixed_stream = client
+            .get_stream(
+                Arc::from(format!("http://{address}/mixed-stream")),
+                Arc::from("fixture-session"),
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await
+            .expect("mixed-case event-stream Content-Type");
+        let event = mixed_stream
+            .next()
+            .await
+            .expect("one SSE event")
+            .expect("valid SSE event");
+        assert_eq!(
+            event.data.as_deref(),
+            Some(r#"{"jsonrpc":"2.0","id":5,"result":{}}"#)
+        );
         server.abort();
     }
 
