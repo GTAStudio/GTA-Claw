@@ -2759,6 +2759,112 @@ fn add_new_root_member_rejects_real_repository_collision() {
     );
 }
 
+/// `claw-migrate` reaches the operating system directly to publish a file only
+/// if it still holds the bytes that were compared: `renameat2` on Linux,
+/// `renamex_np` on Apple, `ReplaceFileW`/`MoveFileExW` on Windows. None of them
+/// has a safe `std` equivalent, and `forbid` cannot grant the local
+/// `expect(unsafe_code)` each call site carries, so the crate takes the weaker
+/// `deny` form of the exception the workspace already grants
+/// `claw-sqlite-file-control`.
+///
+/// The exception is pinned to that exact shape. Every direction it could drift —
+/// widened to `allow`, weakened elsewhere, extended with another lint, or copied
+/// onto a different member — is rejected below.
+#[test]
+fn migrate_native_ffi_lints_are_exactly_identity_bound() {
+    const MIGRATE_MANIFEST: &str = "crates/claw-migrate/Cargo.toml";
+    const EXPECTED: &str = "claw-migrate's audited native-FFI lint exception changed";
+
+    let accepted = final_tree("migrate-lints");
+    validate_final_static(
+        &SafeRoot::new(&accepted.path).expect("open the reviewed native-FFI member"),
+    )
+    .expect("accept the exact reviewed native-FFI lint exception");
+
+    let cases = [
+        (
+            "unsafe-code-widened",
+            "unsafe_code = \"deny\"",
+            "unsafe_code = \"allow\"",
+            EXPECTED,
+        ),
+        (
+            "unsafe-op-weakened",
+            "unsafe_op_in_unsafe_fn = \"deny\"",
+            "unsafe_op_in_unsafe_fn = \"allow\"",
+            EXPECTED,
+        ),
+        (
+            "missing-docs-weakened",
+            "missing_docs = \"warn\"",
+            "missing_docs = \"allow\"",
+            EXPECTED,
+        ),
+        (
+            "unreachable-pub-weakened",
+            "unreachable_pub = \"warn\"",
+            "unreachable_pub = \"allow\"",
+            EXPECTED,
+        ),
+        (
+            "additional-allow",
+            "unsafe_code = \"deny\"",
+            "unsafe_code = \"deny\"\nunused_variables = \"allow\"",
+            EXPECTED,
+        ),
+        (
+            "clippy-weakened",
+            "pedantic = { level = \"warn\", priority = -1 }",
+            "pedantic = { level = \"allow\", priority = -1 }",
+            EXPECTED,
+        ),
+        (
+            "rustdoc-weakened",
+            "broken_intra_doc_links = \"deny\"",
+            "broken_intra_doc_links = \"allow\"",
+            EXPECTED,
+        ),
+        (
+            "rust-table-dropped",
+            "[lints.rust]",
+            "[lints.rustsomethingelse]",
+            "claw-migrate Rust lints are missing",
+        ),
+    ];
+    for (label, from, to, expected) in cases {
+        let tree = final_tree(label);
+        replace(&tree.join(MIGRATE_MANIFEST), from, to);
+        let error = validate_final_static(&SafeRoot::new(&tree.path).expect("open mutated tree"))
+            .expect_err(label);
+        assert!(
+            error.to_string().contains(expected),
+            "{label}: unexpected rejection: {error}"
+        );
+    }
+
+    // The exception belongs to `claw-migrate` alone: no other member may adopt
+    // the same tables to buy itself an unsafe allowance.
+    let tree = final_tree("migrate-lints-not-transferable");
+    let migrate = fs::read_to_string(tree.join(MIGRATE_MANIFEST)).expect("read migrate manifest");
+    let lint_tables = migrate
+        .split_once("[lints.rust]")
+        .expect("migrate manifest carries the exception")
+        .1;
+    replace(
+        &tree.join("crates/claw-crestodian/Cargo.toml"),
+        "[lints]\nworkspace = true",
+        &format!("[lints.rust]{lint_tables}"),
+    );
+    let error = validate_final_static(&SafeRoot::new(&tree.path).expect("open transferred tree"))
+        .expect_err("another member must not adopt the exception");
+    assert!(
+        error
+            .to_string()
+            .contains("lints must inherit exactly from workspace"),
+        "unexpected rejection: {error}"
+    );
+}
+
 #[test]
 fn sqlite_file_control_native_ffi_lints_are_exactly_identity_bound() {
     assert_eq!(

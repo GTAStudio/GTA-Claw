@@ -39,6 +39,8 @@ const LEGACY_VALIDATOR: &str = "crates/claw-security/tests/desktop_supply_chain_
 const LEGACY_FIXTURES: &str = "crates/claw-security/tests/fixtures/desktop_supply_chain_policy";
 const SQLITE_FILE_CONTROL_MEMBER: &str = "crates/claw-sqlite-file-control";
 const SQLITE_FILE_CONTROL_PACKAGE: &str = "claw-sqlite-file-control";
+const MIGRATE_MEMBER: &str = "crates/claw-migrate";
+const MIGRATE_PACKAGE: &str = "claw-migrate";
 
 const FINAL_ROOT_DENY: &[u8] = include_bytes!("../policy/final/root-deny.toml.fixture");
 const FINAL_DESKTOP_MANIFEST: &[u8] = include_bytes!("../policy/final/desktop/Cargo.toml.fixture");
@@ -1114,6 +1116,68 @@ fn validate_sqlite_file_control_lints(manifest: &TomlValue) -> PolicyResult<()> 
     Ok(())
 }
 
+/// Validates `claw-migrate`'s audited native-FFI lint exception.
+///
+/// Compare-and-swap publication cannot be expressed in safe `std`. Replacing a
+/// file only if it still holds the bytes that were compared needs
+/// `renameat2(RENAME_EXCHANGE | RENAME_NOREPLACE)` on Linux,
+/// `renamex_np(RENAME_SWAP | RENAME_EXCL)` on Apple, and
+/// `ReplaceFileW`/`MoveFileExW`/`GetFileInformationByHandle` on Windows. Without
+/// them a migration can only rename unconditionally, which silently destroys a
+/// concurrent writer's bytes.
+///
+/// The exception is therefore the same category the workspace already grants
+/// `claw-sqlite-file-control`, and it is deliberately the weaker form: `deny`
+/// rather than `allow`, so every call site must carry its own audited
+/// `expect(unsafe_code)` with a written reason. All of them live in
+/// `crates/claw-migrate/src/atomicfs.rs`; the rest of the crate stays
+/// unsafe-free. `unsafe_op_in_unsafe_fn` stays `deny` and the documentation and
+/// visibility warnings are unchanged, so the only thing this admits is the FFI
+/// itself.
+fn validate_migrate_lints(manifest: &TomlValue) -> PolicyResult<()> {
+    let lints = table(manifest, "lints")?;
+    let rust = lints
+        .get("rust")
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| PolicyError::new("claw-migrate Rust lints are missing"))?;
+    let clippy = lints
+        .get("clippy")
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| PolicyError::new("claw-migrate Clippy lints are missing"))?;
+    let rustdoc = lints
+        .get("rustdoc")
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| PolicyError::new("claw-migrate rustdoc lints are missing"))?;
+    if keys(lints) != expected_keys(&["clippy", "rust", "rustdoc"])
+        || rust
+            != &toml::map::Map::from_iter([
+                (
+                    "missing_docs".to_owned(),
+                    TomlValue::String("warn".to_owned()),
+                ),
+                (
+                    "unsafe_code".to_owned(),
+                    TomlValue::String("deny".to_owned()),
+                ),
+                (
+                    "unsafe_op_in_unsafe_fn".to_owned(),
+                    TomlValue::String("deny".to_owned()),
+                ),
+                (
+                    "unreachable_pub".to_owned(),
+                    TomlValue::String("warn".to_owned()),
+                ),
+            ])
+        || clippy != &expected_clippy_lints()
+        || rustdoc != &expected_rustdoc_lints()
+    {
+        return Err(PolicyError::new(
+            "claw-migrate's audited native-FFI lint exception changed",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_member_manifest(
     root: &SafeRoot,
     member: &str,
@@ -1202,6 +1266,8 @@ fn validate_member_manifest(
         }
     } else if member == SQLITE_FILE_CONTROL_MEMBER && name == SQLITE_FILE_CONTROL_PACKAGE {
         validate_sqlite_file_control_lints(&manifest)?;
+    } else if member == MIGRATE_MEMBER && name == MIGRATE_PACKAGE {
+        validate_migrate_lints(&manifest)?;
     } else {
         let lints = table(&manifest, "lints")?;
         if keys(lints) != expected_keys(&["workspace"])
