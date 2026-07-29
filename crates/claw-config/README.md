@@ -42,8 +42,10 @@ because a model string is returned exactly as the document spelled it.
 
 Layered runtime resolution uses built-in, system, user, workspace, frozen
 legacy environment, then command-line precedence. Nested objects merge
-recursively while arrays and scalars replace lower layers. File migrations keep
-exact durable backups and expose rollback. `ConfigHub` and `ConfigFileWatcher`
+recursively while arrays and scalars replace lower layers. File migrations hold
+an advisory lock, use digest compare-and-swap, retain exact conflict backups,
+and keep a durable restart journal alongside the exact rollback backup.
+`ConfigHub` and `ConfigFileWatcher`
 publish complete immutable snapshots and ordered typed notifications.
 `ResolvedConfig::environment_diagnostics` records each exact legacy mapping that
 contributed and each unknown input that was ignored, while `applied_layers`

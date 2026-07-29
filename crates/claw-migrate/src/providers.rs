@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use crate::contract::{Diagnostic, DiagnosticSeverity};
 use crate::engine::{
     Detection, DetectionConfidence, MigrationError, MigrationOperation, MigrationPlan,
-    MigrationProvider, PlanContext, reject_executable_tree, rejected_plan, successful_plan,
+    MigrationProvider, PlanContext, reject_executable_tree, reject_symlink, rejected_plan,
+    successful_plan,
 };
 use crate::platform::{HostPlatform, PlatformPaths};
 
@@ -42,8 +43,10 @@ impl MigrationProvider for ClaudeMigrationProvider {
         ];
         let desktop = claude_desktop_config(paths);
         let user_json = paths.home_dir().join(".claude.json");
-        let high =
-            primary.iter().any(|path| path.is_file()) || desktop.is_file() || user_json.is_file();
+        let explicit_file = source.is_some() && root.is_file();
+        let high = explicit_file
+            || primary.iter().any(|path| path.is_file())
+            || source.is_none() && (desktop.is_file() || user_json.is_file());
         let medium = root.join("skills").is_dir()
             || root.join("commands").is_dir()
             || root.join("projects").is_dir()
@@ -54,7 +57,7 @@ impl MigrationProvider for ClaudeMigrationProvider {
         let found = high || medium;
         Ok(Detection {
             found,
-            source: if root.exists() {
+            source: if source.is_some() || root.exists() {
                 root
             } else if user_json.is_file() {
                 user_json
@@ -125,16 +128,16 @@ impl MigrationProvider for CodexMigrationProvider {
         let personal_agents = paths.home_dir().join(".agents");
         let high = root.join("config.toml").is_file()
             || root.join("auth.json").is_file()
-            || desktop.join("config.json").is_file();
+            || source.is_none() && desktop.join("config.json").is_file();
         let medium = root.join("sessions").is_dir()
             || root.join("skills").is_dir()
             || root.join("prompts").is_dir()
             || root.join("history.jsonl").is_file()
-            || personal_agents.join("skills").is_dir();
+            || source.is_none() && personal_agents.join("skills").is_dir();
         let found = high || medium;
         Ok(Detection {
             found,
-            source: if root.exists() {
+            source: if source.is_some() || root.exists() {
                 root
             } else if desktop.join("config.json").is_file() {
                 desktop
@@ -1021,6 +1024,7 @@ fn validate_text(path: &Path) -> Result<(), MigrationError> {
 }
 
 fn read_text(path: &Path) -> Result<String, MigrationError> {
+    reject_symlink(path)?;
     fs::read_to_string(path).map_err(|source| MigrationError::Io {
         action: "read UTF-8 source",
         path: path.to_path_buf(),

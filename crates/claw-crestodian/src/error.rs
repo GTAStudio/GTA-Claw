@@ -76,6 +76,13 @@ pub enum CrestodianError {
         /// Every restoration failure.
         restore_failures: Vec<RestoreFailure>,
     },
+    /// Recovery refused files written by an unsupported schema.
+    IncompatibleRecovery {
+        /// Unsupported configuration `(found, supported)` versions, if any.
+        config: Option<(u32, u32)>,
+        /// Unsupported Crestodian-state `(found, supported)` versions, if any.
+        state: Option<(u32, u32)>,
+    },
     /// A guided answer failed validation before any write.
     InvalidAnswer {
         /// Stable answer field.
@@ -145,6 +152,10 @@ impl Display for CrestodianError {
                 "{operation}; rollback had {} additional failure(s)",
                 restore_failures.len()
             ),
+            Self::IncompatibleRecovery { config, state } => write!(
+                formatter,
+                "recovery refused unsupported schema(s): config={config:?}, state={state:?}"
+            ),
             Self::InvalidAnswer { field, message } => {
                 write!(formatter, "setup answer {field}: {message}")
             }
@@ -164,6 +175,7 @@ impl Error for CrestodianError {
             | Self::AuditDecode { .. }
             | Self::AlreadyConfigured(_)
             | Self::UnsafePath { .. }
+            | Self::IncompatibleRecovery { .. }
             | Self::InvalidAnswer { .. } => None,
         }
     }

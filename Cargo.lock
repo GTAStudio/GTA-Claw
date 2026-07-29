@@ -302,6 +302,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_path_to_error",
+ "sha2 0.11.0",
  "url",
  "windows-sys 0.61.2",
 ]
@@ -466,6 +467,7 @@ dependencies = [
 name = "claw-migrate"
 version = "0.1.0"
 dependencies = [
+ "claw-config",
  "ed25519-dalek",
  "serde",
  "serde_json",

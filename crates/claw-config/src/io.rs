@@ -111,9 +111,55 @@ pub fn write_bytes_atomically(
     atomic_write_bytes(path, contents, || Ok(())).map_err(|error| ConfigError::io(path, error))
 }
 
+/// Atomically copies one regular file with the same destination hardening.
+///
+/// The source is streamed into a sibling temporary file, so memory usage is
+/// bounded independently of file size. The temporary file and destination
+/// directory receive the same durability treatment as [`write_bytes_atomically`].
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Io`] when the source is not a regular file, is a
+/// symlink or Windows reparse point, cannot be read, or when any destination
+/// preparation, copy, flush, synchronization, or publication step fails.
+pub fn copy_file_atomically(
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+) -> Result<WriteOutcome, ConfigError> {
+    let source = source.as_ref();
+    let destination = destination.as_ref();
+    let metadata = fs::symlink_metadata(source).map_err(|error| ConfigError::io(source, error))?;
+    if is_link_or_reparse(&metadata) || !metadata.is_file() {
+        return Err(ConfigError::io(
+            source,
+            unsafe_path("copy source must be a regular file, not a symlink or reparse point"),
+        ));
+    }
+    let permissions = metadata.permissions();
+    let mut input = File::open(source).map_err(|error| ConfigError::io(source, error))?;
+    atomic_replace(
+        destination,
+        |output| {
+            io::copy(&mut input, output)?;
+            output.set_permissions(permissions)?;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .map_err(|error| ConfigError::io(destination, error))
+}
+
 pub(crate) fn atomic_write_bytes(
     path: &Path,
     contents: &[u8],
+    precommit: impl FnOnce() -> io::Result<()>,
+) -> io::Result<WriteOutcome> {
+    atomic_replace(path, |file| file.write_all(contents), precommit)
+}
+
+fn atomic_replace(
+    path: &Path,
+    populate: impl FnOnce(&mut File) -> io::Result<()>,
     precommit: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<WriteOutcome> {
     let destination = prepare_destination(path)?;
@@ -122,7 +168,7 @@ pub(crate) fn atomic_write_bytes(
 
     let operation = (|| {
         set_permissions(existing.as_ref(), &file)?;
-        file.write_all(contents)?;
+        populate(&mut file)?;
         file.flush()?;
         file.sync_all()?;
         precommit()?;
@@ -162,7 +208,7 @@ pub(crate) fn atomic_write_bytes(
     }
 }
 
-fn prepare_destination(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn prepare_destination(path: &Path) -> io::Result<PathBuf> {
     let file_name = path
         .file_name()
         .ok_or_else(|| unsafe_path("destination has no file name"))?;

@@ -20,7 +20,7 @@ pub use contract::{
 pub use engine::{
     ApplyContext, ApplyReceipt, ArtifactSigner, Detection, DetectionConfidence,
     Ed25519ArtifactSigner, MigrationError, MigrationPlan, MigrationProvider, MigrationReport,
-    PlanContext, SecretStore, SecretStoreError, SecretValue,
+    PlanContext, SecretStore, SecretStoreError, SecretValue, recover_interrupted_migration,
 };
 pub use platform::{HostPlatform, PlatformPaths, SystemPlatformPaths};
 pub use providers::{ClaudeMigrationProvider, CodexMigrationProvider, HermesMigrationProvider};

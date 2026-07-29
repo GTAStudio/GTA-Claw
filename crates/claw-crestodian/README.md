@@ -6,9 +6,10 @@ recovery. It never discovers or writes real user directories by itself.
 Guided setup validates typed answers, writes the strict configuration
 atomically, then publishes non-secret setup state. A later failure restores the
 exact pre-setup bytes. Recovery distinguishes missing, corrupt, interrupted,
-and incompatible config/state, flushes exact backups before replacement,
-preserves orphaned atomic-write artifacts, and rolls earlier writes back when a
-later real filesystem operation fails. Setup questions expose machine-readable
+and incompatible config/state, refuses unsupported schemas without mutation,
+flushes exact backups before replacement, preserves orphaned atomic-write
+artifacts, and rolls earlier writes back when a later real filesystem operation
+fails while surfacing rollback directory-sync failures. Setup questions expose machine-readable
 constraints for immediate UI validation, and recovery assessments return a
 typed next step. Recovery parses each file from the same bytes it backs up and
 does not create an empty evidence directory when both files were absent.

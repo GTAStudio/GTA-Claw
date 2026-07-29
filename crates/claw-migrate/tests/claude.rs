@@ -504,3 +504,85 @@ fn claude_discovery_reads_only_the_injected_home() {
         )
     );
 }
+
+#[test]
+fn explicit_claude_file_is_isolated_from_default_sources() {
+    let root = TestDir::new("claude-explicit-file");
+    let target = root.join("target");
+    seed_claude_home(&root);
+    let explicit = root.join("isolated").join("claude.json");
+    write(
+        &explicit,
+        r#"{"mcpServers":{"isolated":{"command":"safe","env":{"TOKEN":"isolated-secret"}}}}"#,
+    );
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+
+    let detection = ClaudeMigrationProvider
+        .detect(&platform_paths, Some(&explicit))
+        .expect("detect isolated explicit file");
+    assert!(detection.found);
+    assert_eq!(detection.source, explicit);
+
+    let plan = ClaudeMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&explicit),
+            target_root: &target,
+            overwrite: false,
+            signer: &signer,
+        })
+        .expect("plan only the explicit file");
+    let mut secrets = MemorySecretStore::default();
+    let mut apply = ApplyContext {
+        target_root: &target,
+        backup_root: &root.join("backup"),
+        overwrite: false,
+        secret_store: &mut secrets,
+    };
+    ClaudeMigrationProvider
+        .apply(&mut apply, &plan)
+        .expect("apply isolated explicit file");
+
+    assert!(secrets.holds("isolated-secret"));
+    for default_secret in [
+        "claude-env-plaintext",
+        "claude-oauth-plaintext",
+        "claude-mcp-plaintext",
+        "claude-desktop-plaintext",
+    ] {
+        assert!(!secrets.holds(default_secret));
+    }
+    assert_eq!(
+        files_under(&target)
+            .into_iter()
+            .filter(|path| path != "config/migrations/claude.json5")
+            .collect::<Vec<_>>(),
+        vec!["config/migrations/claude/claude-desktop.json".to_owned()]
+    );
+}
+
+#[test]
+fn missing_explicit_claude_source_never_falls_back_to_defaults() {
+    let root = TestDir::new("claude-missing-explicit");
+    seed_claude_home(&root);
+    let missing = root.join("isolated").join("missing.json");
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+    let target = root.join("target");
+
+    let error = ClaudeMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&missing),
+            target_root: &target,
+            overwrite: false,
+            signer: &signer,
+        })
+        .expect_err("missing explicit source must fail");
+    assert_eq!(
+        error.to_string(),
+        format!("claude state was not found at {}", missing.display())
+    );
+    assert!(!target.exists());
+}

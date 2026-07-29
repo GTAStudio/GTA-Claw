@@ -177,7 +177,7 @@ independently testable units that a composition root adapts to a port.
 | `claw-crestodian` | Backup-first first-run setup, deterministic remote rescue and configuration recovery, restricted to a single ring-zero authority tool. |
 | `claw-security` | Transport- and storage-independent security primitives: device identity, roles, scopes. No network client, TLS terminator, database or keyring of its own. |
 | `claw-observability` | Transport-neutral telemetry, metrics, audit records and redaction, with security evidence kept off the lossy logging path. |
-| `claw-migrate` | Transactional, npm-free migration providers for Claude, Codex, Hermes and legacy GTA-Claw state, with verified backups and rollback. |
+| `claw-migrate` | Transactional, npm-free migration providers for Claude, Codex, Hermes and legacy GTA-Claw state, with staged durable publication, versioned recovery manifests, verified backups and rollback. |
 | `claw-discovery` | Wire-format and fail-closed policy oracles for discovery and fleet (DNS-SD codec and friends). No network runtime, process spawning or container client. |
 | `claw-conformance` | The data-driven parity harness over the frozen `compat/upstream` artifacts. Verifies that cited Rust tests actually exist before accepting an implementation claim. |
 | `claw-repo-policy` | Repository-wide architecture policy gates, including the JavaScript/TypeScript ratchet described above. |

@@ -13,7 +13,7 @@ use claw_migrate::{
     ApplyContext, ClaudeMigrationProvider, CodexMigrationProvider, DetectionConfidence,
     Ed25519ArtifactSigner, HermesMigrationProvider, HostPlatform, MigrationError,
     MigrationProvider, MigrationStatus, PlanContext, SecretStore, SecretStoreError, SecretValue,
-    SystemPlatformPaths,
+    SystemPlatformPaths, recover_interrupted_migration,
 };
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -33,6 +33,7 @@ impl TestDir {
             fs::remove_dir_all(&path).expect("remove stale test directory");
         }
         fs::create_dir_all(&path).expect("create test directory");
+        let path = fs::canonicalize(path).expect("canonicalize test directory");
         Self { path }
     }
 
@@ -992,6 +993,121 @@ fn corrupted_backup_never_replaces_current_target() {
     assert_eq!(
         fs::read_to_string(&soul).expect("current target remains"),
         "Imported soul."
+    );
+}
+
+#[test]
+fn restart_recovery_rolls_back_an_uncommitted_durable_manifest() {
+    let root = TestDir::new("restart-recovery");
+    let source = root.join("hermes-home");
+    let target = root.join("target");
+    let soul = target.join("workspace").join("SOUL.md");
+    write(&source.join("SOUL.md"), "Imported soul.");
+    write(&soul, "Original soul.");
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+    let plan = HermesMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&source),
+            target_root: &target,
+            overwrite: true,
+            signer: &signer,
+        })
+        .expect("plan overwrite");
+    let mut secrets = MemorySecretStore::default();
+    let receipt = {
+        let mut apply = ApplyContext {
+            target_root: &target,
+            backup_root: &root.join("backup"),
+            overwrite: true,
+            secret_store: &mut secrets,
+        };
+        HermesMigrationProvider
+            .apply(&mut apply, &plan)
+            .expect("apply overwrite")
+    };
+    let manifest_path = receipt.backup_dir.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read durable recovery manifest"))
+            .expect("decode durable recovery manifest");
+    manifest["phase"] = serde_json::Value::String("applying".to_owned());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("encode interrupted manifest"),
+    )
+    .expect("simulate crash before commit marker");
+
+    recover_interrupted_migration(&receipt.backup_dir).expect("restart rollback");
+
+    assert_eq!(
+        fs::read_to_string(&soul).expect("read restored target"),
+        "Original soul."
+    );
+    let recovered: serde_json::Value =
+        serde_json::from_slice(&fs::read(manifest_path).expect("read recovered manifest"))
+            .expect("decode recovered manifest");
+    assert_eq!(recovered["phase"], "rolled_back");
+}
+
+#[test]
+fn restart_recovery_preserves_an_unrecognized_concurrent_edit() {
+    let root = TestDir::new("restart-conflict");
+    let source = root.join("hermes-home");
+    let target = root.join("target");
+    let soul = target.join("workspace").join("SOUL.md");
+    write(&source.join("SOUL.md"), "Imported soul.");
+    write(&soul, "Original soul.");
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+    let plan = HermesMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&source),
+            target_root: &target,
+            overwrite: true,
+            signer: &signer,
+        })
+        .expect("plan overwrite");
+    let mut secrets = MemorySecretStore::default();
+    let receipt = {
+        let mut apply = ApplyContext {
+            target_root: &target,
+            backup_root: &root.join("backup"),
+            overwrite: true,
+            secret_store: &mut secrets,
+        };
+        HermesMigrationProvider
+            .apply(&mut apply, &plan)
+            .expect("apply overwrite")
+    };
+    let manifest_path = receipt.backup_dir.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+            .expect("decode manifest");
+    manifest["phase"] = serde_json::Value::String("applying".to_owned());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("encode interrupted manifest"),
+    )
+    .expect("simulate interrupted manifest");
+    write(&soul, "Concurrent user edit.");
+    let manifest_before = fs::read(&manifest_path).expect("capture manifest");
+
+    let error = recover_interrupted_migration(&receipt.backup_dir)
+        .expect_err("unknown target digest must block recovery");
+
+    assert_eq!(
+        error.to_string(),
+        format!("migration target exists: {}", soul.display())
+    );
+    assert_eq!(
+        fs::read_to_string(&soul).expect("read concurrent edit"),
+        "Concurrent user edit."
+    );
+    assert_eq!(
+        fs::read(manifest_path).expect("manifest remains unchanged"),
+        manifest_before
     );
 }
 

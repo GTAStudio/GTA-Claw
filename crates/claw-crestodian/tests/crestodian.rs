@@ -274,7 +274,8 @@ fn incompatible_config_and_state_are_detected_without_mutation() {
     std::fs::write(&config_path, future_config.as_bytes()).expect("write future config");
     std::fs::write(&state_path, future_state).expect("write future state");
 
-    let assessment = Crestodian::new(&config_path, &state_path).inspect();
+    let crestodian = Crestodian::new(&config_path, &state_path);
+    let assessment = crestodian.inspect();
 
     assert_eq!(
         assessment.config,
@@ -298,6 +299,39 @@ fn incompatible_config_and_state_are_detected_without_mutation() {
     assert_eq!(
         std::fs::read(&state_path).expect("state preserved"),
         future_state
+    );
+
+    let mut entries_before = std::fs::read_dir(directory.path())
+        .expect("read directory before recovery")
+        .map(|entry| entry.expect("directory entry").file_name())
+        .collect::<Vec<_>>();
+    entries_before.sort();
+    let error = crestodian
+        .recover(&baseline(), 42)
+        .expect_err("future schemas must be refused");
+    assert!(matches!(
+        error,
+        CrestodianError::IncompatibleRecovery {
+            config: Some((99, 1)),
+            state: Some((99, CRESTODIAN_STATE_SCHEMA_VERSION)),
+        }
+    ));
+    assert_eq!(
+        std::fs::read(&config_path).expect("config remains byte-identical"),
+        future_config.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(&state_path).expect("state remains byte-identical"),
+        future_state
+    );
+    let mut entries_after = std::fs::read_dir(directory.path())
+        .expect("read directory after recovery")
+        .map(|entry| entry.expect("directory entry").file_name())
+        .collect::<Vec<_>>();
+    entries_after.sort();
+    assert_eq!(
+        entries_after, entries_before,
+        "recovery must create no artifacts"
     );
 }
 

@@ -178,9 +178,11 @@ impl Crestodian {
     /// orphaned atomic-write artifact cannot be read, or a backup cannot be
     /// written, `fsync`-ed, and published into a synced directory. Returns
     /// [`CrestodianError::Config`] when the baseline itself cannot be written
-    /// atomically. If the state write fails after the configuration was already
-    /// replaced, both files are restored to their exact original bytes and the
-    /// original failure is returned as-is, or wrapped in
+    /// atomically, and [`CrestodianError::IncompatibleRecovery`] before any
+    /// mutation when either file uses an unsupported schema. If the state write
+    /// fails after the configuration was already replaced, both files are
+    /// restored to their exact original bytes and the original failure is
+    /// returned as-is, or wrapped in
     /// [`CrestodianError::Rollback`] listing every restoration that also failed.
     /// Nothing is ever replaced before its backup is durable.
     pub fn recover(
@@ -194,6 +196,20 @@ impl Crestodian {
             config: inspect_config_bytes(&self.config_path, original_config.as_deref()),
             state: inspect_state_bytes(&self.state_path, original_state.as_deref()),
         };
+        let incompatible_config = match &before.config {
+            ConfigCondition::Incompatible { found, supported } => Some((*found, *supported)),
+            _ => None,
+        };
+        let incompatible_state = match &before.state {
+            StateCondition::Incompatible { found, supported } => Some((*found, *supported)),
+            _ => None,
+        };
+        if incompatible_config.is_some() || incompatible_state.is_some() {
+            return Err(CrestodianError::IncompatibleRecovery {
+                config: incompatible_config,
+                state: incompatible_state,
+            });
+        }
         let repair_config = !matches!(before.config, ConfigCondition::Healthy);
         let repair_state = !matches!(before.state, StateCondition::Healthy);
         if !repair_config && !repair_state {

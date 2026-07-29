@@ -37,6 +37,7 @@ impl TestDir {
             fs::remove_dir_all(&path).expect("remove stale test directory");
         }
         fs::create_dir_all(&path).expect("create test directory");
+        let path = fs::canonicalize(path).expect("canonicalize test directory");
         Self { path }
     }
 

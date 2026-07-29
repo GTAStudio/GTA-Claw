@@ -445,6 +445,35 @@ fn codex_source_discovery_prefers_override_then_cli_home_then_desktop() {
 }
 
 #[test]
+fn missing_explicit_codex_source_never_imports_default_sources() {
+    let root = TestDir::new("codex-missing-explicit");
+    write(
+        &root.join("home").join(".codex").join("config.toml"),
+        "model = \"default-must-not-import\"\n",
+    );
+    let missing = root.join("missing-codex-home");
+    let target = root.join("target");
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+
+    let error = CodexMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&missing),
+            target_root: &target,
+            overwrite: false,
+            signer: &signer,
+        })
+        .expect_err("missing explicit source must not fall back");
+
+    assert_eq!(
+        error.to_string(),
+        format!("codex state was not found at {}", missing.display())
+    );
+    assert!(!target.exists());
+}
+
+#[test]
 fn codex_refuses_to_overwrite_an_existing_target() {
     let root = TestDir::new("codex-target-conflict");
     let target = root.join("target");
@@ -489,4 +518,63 @@ fn codex_refuses_to_overwrite_an_existing_target() {
     );
     assert_eq!(read(&occupied), "model = \"already-migrated\"\n");
     assert!(secrets.values.is_empty());
+}
+
+#[test]
+fn codex_inline_env_and_headers_tables_keep_their_toml_shape() {
+    let root = TestDir::new("codex-inline-tables");
+    let source = root.join("codex-home");
+    let target = root.join("target");
+    write(
+        &source.join("config.toml"),
+        r#"[mcp_servers.docs]
+command = "docs"
+env = { DOCS_TOKEN = "docs-private", REGION = "us-east-1" }
+headers = { Authorization = "Bearer private", "X-Api-Key" = "header-private" }
+"#,
+    );
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+    let plan = CodexMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&source),
+            target_root: &target,
+            overwrite: false,
+            signer: &signer,
+        })
+        .expect("plan inline tables");
+    let mut secrets = MemorySecretStore::default();
+    let mut apply = ApplyContext {
+        target_root: &target,
+        backup_root: &root.join("backup"),
+        overwrite: false,
+        secret_store: &mut secrets,
+    };
+    CodexMigrationProvider
+        .apply(&mut apply, &plan)
+        .expect("apply inline tables");
+
+    let migrated = read(
+        &target
+            .join("config")
+            .join("migrations")
+            .join("codex")
+            .join("config.toml"),
+    );
+    assert!(migrated.contains("env = { DOCS_TOKEN = \"keyring://"));
+    assert!(migrated.contains(", REGION = \"keyring://"));
+    assert!(migrated.contains("headers = { Authorization = \"keyring://"));
+    assert!(migrated.contains(", \"X-Api-Key\" = \"keyring://"));
+    assert!(!migrated.contains("env = \"keyring://"));
+    assert!(!migrated.contains("headers = \"keyring://"));
+    for plaintext in [
+        "docs-private",
+        "us-east-1",
+        "Bearer private",
+        "header-private",
+    ] {
+        assert!(secrets.holds(plaintext));
+        assert!(!migrated.contains(plaintext));
+    }
 }

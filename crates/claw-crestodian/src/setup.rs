@@ -329,28 +329,87 @@ pub(crate) fn restore_paths<const N: usize>(
 
 /// Puts one path back exactly as it was, byte for byte or absent.
 ///
-/// The rollback deliberately drops the [`claw_config::WriteWarning`] values the
-/// republication may raise: this runs while an operation is already failing, its
-/// result is folded into a [`RestoreFailure`] list that carries only a path and
-/// a message, and there is no caller here to hand a durability caveat to. Losing
-/// them is the price of not losing the original bytes.
 fn restore_path(path: &Path, original: Option<&[u8]>) -> Result<(), String> {
     let Some(bytes) = original else {
-        return match fs::remove_file(path) {
-            Ok(()) => Ok(()),
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
             Err(error)
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
                 ) =>
             {
-                Ok(())
+                return Ok(());
             }
-            Err(error) => Err(error.to_string()),
+            Err(error) => return Err(error.to_string()),
         };
+        if is_link_or_reparse(&metadata) || !metadata.is_file() {
+            return Err(
+                "rollback target must be a regular file, not a link or reparse point".to_owned(),
+            );
+        }
+        fs::remove_file(path).map_err(|error| error.to_string())?;
+        return sync_parent_directory(path).map_err(|error| error.to_string());
     };
     ensure_parent_directory(path).map_err(|error| error.to_string())?;
     let restored = write_bytes_atomically(path, bytes).map_err(|error| error.to_string())?;
-    drop(restored.warnings);
+    warnings_as_restore_result(&restored.warnings)
+}
+
+fn warnings_as_restore_result(warnings: &[claw_config::WriteWarning]) -> Result<(), String> {
+    if warnings.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "original bytes were restored with durability warning(s): {warnings:?}"
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(unix)]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use claw_config::WriteWarning;
+
+    use super::warnings_as_restore_result;
+
+    #[test]
+    fn rollback_directory_sync_warning_is_a_restore_failure() {
+        let error = warnings_as_restore_result(&[WriteWarning::DirectorySyncFailed {
+            path: PathBuf::from("/config"),
+            message: "injected directory sync failure".to_owned(),
+        }])
+        .expect_err("durability warning must be surfaced");
+
+        assert!(error.contains("injected directory sync failure"));
+    }
+}
+
+#[cfg(windows)]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
