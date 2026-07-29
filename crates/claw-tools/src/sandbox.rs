@@ -605,7 +605,7 @@ impl Sandbox {
     /// # Errors
     ///
     /// Returns [`SandboxError::NotAFile`] when `resolved` names the workspace
-    /// root itself, [`SandboxError::NotFound`] or
+    /// root or the opened leaf is not a regular file, [`SandboxError::NotFound`] or
     /// [`SandboxError::PermissionDenied`] when the open fails,
     /// [`SandboxError::SymlinkForbidden`] when an ancestor or the final
     /// component is a link, junction or other reparse point,
@@ -622,6 +622,7 @@ impl Sandbox {
         let absolute = pin.path().join(leaf);
         let file = open_read_no_follow(pin.handle()?, &absolute, leaf)?;
         verify_handle_is_not_reparse_point(&file)?;
+        verify_handle_is_regular(&file)?;
         self.verify_canonical(&absolute, components)?;
         pin.verify()?;
         // Last, because it is the only check that can see an ancestor swap
@@ -902,15 +903,12 @@ fn pin_child_directory(
     path: &Path,
     name: &str,
 ) -> Result<PinnedDirectory, SandboxError> {
-    use cap_primitives::fs::{OpenOptions as CapOpenOptions, OpenOptionsExt};
-
-    let mut options = CapOpenOptions::new();
-    options
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    let handle = cap_primitives::fs::open(parent, Path::new(name), &options)
-        .map_err(|error| map_io(&error))?;
+    let handle = claw_windows_handle_dir::open_relative(
+        parent,
+        Path::new(name),
+        claw_windows_handle_dir::OpenMode::Directory,
+    )
+    .map_err(|error| map_io(&error))?;
     pinned_directory_from_handle(path, handle)
 }
 
@@ -1015,25 +1013,20 @@ fn open_write_no_follow(
     leaf: &str,
     mode: WriteMode,
 ) -> Result<File, SandboxError> {
-    use cap_primitives::fs::{OpenOptions as CapOpenOptions, OpenOptionsExt};
-
     fn open_existing(parent: &File, leaf: &str) -> io::Result<File> {
-        let mut options = CapOpenOptions::new();
-        options
-            .write(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        cap_primitives::fs::open(parent, Path::new(leaf), &options)
+        claw_windows_handle_dir::open_relative(
+            parent,
+            Path::new(leaf),
+            claw_windows_handle_dir::OpenMode::Write,
+        )
     }
 
     fn create_new(parent: &File, leaf: &str) -> io::Result<File> {
-        let mut options = CapOpenOptions::new();
-        options
-            .write(true)
-            .create_new(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        cap_primitives::fs::open(parent, Path::new(leaf), &options)
+        claw_windows_handle_dir::open_relative(
+            parent,
+            Path::new(leaf),
+            claw_windows_handle_dir::OpenMode::CreateNew,
+        )
     }
 
     if mode == WriteMode::CreateNew {
@@ -1075,14 +1068,12 @@ fn open_write_no_follow(
 
 #[cfg(windows)]
 fn open_read_no_follow(parent: &File, _absolute: &Path, leaf: &str) -> Result<File, SandboxError> {
-    use cap_primitives::fs::{OpenOptions as CapOpenOptions, OpenOptionsExt};
-
-    let mut options = CapOpenOptions::new();
-    options
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    cap_primitives::fs::open(parent, Path::new(leaf), &options).map_err(|error| map_io(&error))
+    claw_windows_handle_dir::open_relative(
+        parent,
+        Path::new(leaf),
+        claw_windows_handle_dir::OpenMode::Read,
+    )
+    .map_err(|error| map_io(&error))
 }
 
 #[cfg(unix)]
@@ -1427,14 +1418,12 @@ fn stat_pinned_child(
     _path: &Path,
     name: &str,
 ) -> Result<(EntryKind, u64), SandboxError> {
-    use cap_primitives::fs::{OpenOptions as CapOpenOptions, OpenOptionsExt};
-
-    let mut options = CapOpenOptions::new();
-    options
-        .access_mode(0)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    let child = cap_primitives::fs::open(handle, Path::new(name), &options)
-        .map_err(|error| map_io(&error))?;
+    let child = claw_windows_handle_dir::open_relative(
+        handle,
+        Path::new(name),
+        claw_windows_handle_dir::OpenMode::Metadata,
+    )
+    .map_err(|error| map_io(&error))?;
     let metadata = child.metadata().map_err(|error| map_io(&error))?;
     Ok((classify(&metadata), metadata.len()))
 }

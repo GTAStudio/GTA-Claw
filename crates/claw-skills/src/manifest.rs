@@ -6,16 +6,17 @@ use std::fmt::{self, Debug, Display, Formatter};
 
 use serde::Deserialize;
 use serde_json::Value;
+use serde_json::value::RawValue;
 
-use crate::schema::{SchemaError, validate_schema};
+use crate::schema::{ExactJsonDocument, ExactNode, SchemaError, validate_schema};
 
 /// A validated modern skill manifest.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SkillManifest {
     id: String,
     description: String,
     parameters: Value,
+    exact_parameters: Option<ExactNode>,
     execution: SkillExecution,
 }
 
@@ -36,6 +37,10 @@ impl SkillManifest {
     #[must_use]
     pub const fn parameters(&self) -> &Value {
         &self.parameters
+    }
+
+    pub(crate) const fn exact_parameters(&self) -> Option<&ExactNode> {
+        self.exact_parameters.as_ref()
     }
 
     /// Returns the selected execution backend.
@@ -263,14 +268,39 @@ pub enum ManifestError {
 /// [`ManifestError::InvalidWasmTarget`] for an invalid plugin identifier or
 /// export name.
 pub fn load_manifest(json: &str) -> Result<SkillManifest, ManifestError> {
-    let manifest: SkillManifest =
+    let raw: RawSkillManifest<'_> =
         serde_json::from_str(json).map_err(|error| ManifestError::MalformedJson {
             line: error.line(),
             column: error.column(),
             message: error.to_string(),
         })?;
+    let parameters = ExactJsonDocument::parse(raw.parameters.get()).map_err(|error| {
+        ManifestError::MalformedJson {
+            line: error.line(),
+            column: error.column(),
+            message: error.to_string(),
+        }
+    })?;
+    let (parameters, exact_parameters) = parameters.into_parts();
+    let manifest = SkillManifest {
+        id: raw.id,
+        description: raw.description,
+        parameters,
+        exact_parameters: Some(exact_parameters),
+        execution: raw.execution,
+    };
     manifest.validate()?;
     Ok(manifest)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSkillManifest<'a> {
+    id: String,
+    description: String,
+    #[serde(borrow)]
+    parameters: &'a RawValue,
+    execution: SkillExecution,
 }
 
 impl Display for ManifestError {

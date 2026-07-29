@@ -75,7 +75,7 @@ fn schema_node_budget_is_enforced_deterministically() {
         }
     });
     let mut constrained = limits(4, 128);
-    constrained.max_schema_nodes = NonZeroUsize::new(2).expect("positive node limit");
+    constrained.max_schema_nodes = NonZeroUsize::new(4).expect("positive node limit");
 
     let error =
         validate_schema_with_limits(&schema, constrained).expect_err("third node exceeds budget");
@@ -90,17 +90,56 @@ fn schema_node_budget_includes_required_and_enum_entries() {
         "required": ["first", "second"]
     });
     let mut constrained = limits(4, 128);
-    constrained.max_schema_nodes = NonZeroUsize::new(2).expect("positive node limit");
+    constrained.max_schema_nodes = NonZeroUsize::new(4).expect("positive node limit");
     let error = validate_schema_with_limits(&required_schema, constrained)
         .expect_err("required entries consume the schema budget");
     assert_eq!(error.kind, SchemaErrorKind::ResourceLimit);
     assert_eq!(error.path, "$.required[1]");
 
     let enum_schema = json!({"enum": [1, 2]});
+    constrained.max_schema_nodes = NonZeroUsize::new(3).expect("positive node limit");
     let error = validate_schema_with_limits(&enum_schema, constrained)
         .expect_err("enum entries consume the schema budget");
     assert_eq!(error.kind, SchemaErrorKind::ResourceLimit);
     assert_eq!(error.path, "$.enum[1]");
+}
+
+#[test]
+fn unsupported_keywords_are_rejected_only_after_a_complete_bounded_walk() {
+    for keyword in [
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "const",
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contains",
+        "format",
+        "pattern",
+        "patternProperties",
+        "$ref",
+        "$dynamicRef",
+    ] {
+        let schema: Value =
+            serde_json::from_str(&format!(r#"{{"{keyword}":true}}"#)).expect("valid JSON");
+        let error = validate_schema_with_limits(&schema, limits(4, 128))
+            .expect_err("unsupported assertion and applicator keywords fail closed");
+        assert_eq!(error.kind, SchemaErrorKind::UnsupportedKeyword);
+        assert_eq!(error.path, format!("$.{keyword}"));
+    }
+
+    let schema = json!({"allOf": [{}, {}, {}]});
+    let mut constrained = limits(4, 128);
+    constrained.max_schema_nodes = NonZeroUsize::new(3).expect("positive node limit");
+    let error = validate_schema_with_limits(&schema, constrained)
+        .expect_err("complete traversal reaches its bound before keyword admission");
+    assert_eq!(error.kind, SchemaErrorKind::ResourceLimit);
+    assert_eq!(error.path, "$.allOf[1]");
 }
 
 #[test]

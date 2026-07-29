@@ -34,7 +34,8 @@ pub use runtime::{
     WasmHostErrorKind, WasmSkillHost, WasmSkillInvocation,
 };
 pub use schema::{
-    ParameterValidationError, ParameterViolation, ParameterViolationKind, SchemaError,
-    SchemaErrorKind, ValidationLimits, validate_parameters, validate_parameters_with_limits,
+    ExactJsonDocument, ParameterValidationError, ParameterViolation, ParameterViolationKind,
+    SchemaError, SchemaErrorKind, ValidationLimits, validate_exact_parameters,
+    validate_exact_parameters_with_limits, validate_parameters, validate_parameters_with_limits,
     validate_schema, validate_schema_with_limits,
 };

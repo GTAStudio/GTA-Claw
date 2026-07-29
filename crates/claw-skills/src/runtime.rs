@@ -11,7 +11,9 @@ use serde_json::Value;
 use crate::manifest::{
     HttpMethod, HttpParameterEncoding, HttpResponseMode, SkillExecution, SkillManifest,
 };
-use crate::schema::{ParameterValidationError, validate_parameters};
+use crate::schema::{
+    ExactJsonDocument, ExactNode, ParameterValidationError, validate_parameters_with_exact_schema,
+};
 
 const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
 
@@ -343,6 +345,20 @@ impl<'a> SkillRuntime<'a> {
         manifest: &SkillManifest,
         parameters: Value,
     ) -> Result<Value, SkillExecutionError> {
+        self.execute_inner(manifest, parameters.into(), None)
+    }
+
+    /// Validates and executes parameters parsed with their exact JSON number
+    /// lexemes retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns every error documented by [`SkillRuntime::execute`].
+    pub fn execute_exact(
+        &mut self,
+        manifest: &SkillManifest,
+        parameters: ExactJsonDocument,
+    ) -> Result<Value, SkillExecutionError> {
         self.execute_inner(manifest, parameters, None)
     }
 
@@ -363,13 +379,13 @@ impl<'a> SkillRuntime<'a> {
         parameters: Value,
         cancellation: &CancellationToken,
     ) -> Result<Value, SkillExecutionError> {
-        self.execute_inner(manifest, parameters, Some(cancellation))
+        self.execute_inner(manifest, parameters.into(), Some(cancellation))
     }
 
     fn execute_inner(
         &mut self,
         manifest: &SkillManifest,
-        parameters: Value,
+        parameters: ExactJsonDocument,
         cancellation: Option<&CancellationToken>,
     ) -> Result<Value, SkillExecutionError> {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -378,15 +394,29 @@ impl<'a> SkillRuntime<'a> {
         manifest
             .validate()
             .map_err(SkillExecutionError::InvalidManifest)?;
-        validate_parameters(manifest.parameters(), &parameters)
+        let fallback_schema = manifest
+            .exact_parameters()
+            .is_none()
+            .then(|| ExactNode::from_value(manifest.parameters()));
+        let exact_schema = manifest
+            .exact_parameters()
+            .or(fallback_schema.as_ref())
+            .expect("manifest schema always has an exact representation");
+        validate_parameters_with_exact_schema(manifest.parameters(), exact_schema, &parameters)
             .map_err(SkillExecutionError::InvalidParameters)?;
         match manifest.execution() {
-            SkillExecution::Native { handler } => self.native.execute(handler, parameters),
+            SkillExecution::Native { handler } => self.native.execute(
+                handler,
+                parameters
+                    .into_value()
+                    .ok_or(SkillExecutionError::ParameterEncoding)?,
+            ),
             SkillExecution::Http { request } => {
                 let mut headers = request.headers.clone();
                 let mut url = url::Url::parse(&request.url)
                     .expect("the HTTP URL was validated immediately before request construction");
-                let encoded = serde_json::to_vec(&parameters)
+                let encoded = parameters
+                    .to_json_vec()
                     .map_err(|_| SkillExecutionError::ParameterEncoding)?;
                 let (url, body) = match &request.parameters {
                     HttpParameterEncoding::JsonBody => {
@@ -416,7 +446,9 @@ impl<'a> SkillRuntime<'a> {
                 .invoke(WasmSkillInvocation {
                     plugin_id,
                     tool: export,
-                    parameters,
+                    parameters: parameters
+                        .into_value()
+                        .ok_or(SkillExecutionError::ParameterEncoding)?,
                     cancellation,
                 })
                 .map_err(SkillExecutionError::WasmHost),

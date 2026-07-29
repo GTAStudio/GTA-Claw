@@ -305,6 +305,38 @@ fn a_fifo_leaf_is_rejected_before_a_blocking_write_open() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_regular_read_leaf_replaced_by_a_fifo_is_rejected_after_open() {
+    use std::process::Command;
+
+    let (tree, sandbox) = workspace();
+    let leaf = tree.join("workspace/raced");
+    fs::write(&leaf, b"regular").expect("create regular fixture");
+    let path = sandbox.relative("raced").expect("legal name");
+    let resolved = sandbox
+        .resolve_file(&path)
+        .expect("resolve the initial regular file");
+
+    fs::remove_file(&leaf).expect("remove the resolved regular file");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&leaf)
+            .status()
+            .expect("run mkfifo")
+            .success(),
+        "replace the resolved leaf with a FIFO"
+    );
+
+    assert!(
+        matches!(
+            sandbox.open_no_follow(&resolved),
+            Err(SandboxError::NotAFile)
+        ),
+        "the nonblocking open must classify the raced handle before any read"
+    );
+}
+
 #[test]
 fn a_symlinked_directory_in_the_middle_of_a_path_is_refused() {
     let (tree, sandbox) = workspace();

@@ -4,10 +4,10 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use claw_skills::{
-    CancellationToken, HttpBridge, HttpBridgeError, HttpRequest, HttpResponse, ManifestError,
-    NativeSkillHandler, NativeSkillRegistry, ParameterValidationError, ParameterViolation,
-    ParameterViolationKind, SkillExecutionError, SkillRuntime, WasmHostError, WasmSkillHost,
-    WasmSkillInvocation, load_manifest,
+    CancellationToken, ExactJsonDocument, HttpBridge, HttpBridgeError, HttpRequest, HttpResponse,
+    ManifestError, NativeSkillHandler, NativeSkillRegistry, ParameterValidationError,
+    ParameterViolation, ParameterViolationKind, SkillExecutionError, SkillRuntime, WasmHostError,
+    WasmSkillHost, WasmSkillInvocation, load_manifest,
 };
 use serde_json::{Value, json};
 
@@ -98,6 +98,78 @@ fn native_handler_runs_only_after_exact_parameter_validation() {
                 limit_reached: false,
             }
         ))
+    );
+}
+
+#[test]
+fn exact_parameters_validate_and_encode_without_rounding() {
+    let manifest = load_manifest(
+        r#"{
+            "id":"exact-http",
+            "description":"Validate and forward an exact decimal.",
+            "parameters":{
+                "type":"object",
+                "properties":{"value":{"type":"number","minimum":9007199254740993.0}},
+                "required":["value"],
+                "additionalProperties":false
+            },
+            "execution":{
+                "kind":"http",
+                "request":{
+                    "method":"POST",
+                    "url":"https://example.test/exact",
+                    "response":"json"
+                }
+            }
+        }"#,
+    )
+    .expect("valid exact-number manifest");
+    let native_manifest = load_manifest(
+        r#"{
+            "id":"exact-native",
+            "description":"Refuse lossy conversion to a native handler.",
+            "parameters":{"type":"number"},
+            "execution":{"kind":"native","handler":"echo"}
+        }"#,
+    )
+    .expect("valid native manifest");
+    let (mut native, http, mut wasm) = ports();
+    assert_eq!(native.register("echo", Echo), Ok(()));
+    {
+        let mut runtime = SkillRuntime::new(&native, &http, &mut wasm);
+        assert_eq!(
+            runtime.execute_exact(
+                &manifest,
+                ExactJsonDocument::parse(r#"{"value":9007199254740992.9}"#).expect("valid input")
+            ),
+            Err(SkillExecutionError::InvalidParameters(
+                ParameterValidationError::Violations {
+                    violations: vec![ParameterViolation {
+                        path: "$.value".to_owned(),
+                        kind: ParameterViolationKind::NumberTooSmall,
+                    }],
+                    limit_reached: false,
+                }
+            ))
+        );
+        assert_eq!(
+            runtime.execute_exact(
+                &manifest,
+                ExactJsonDocument::parse(r#"{"value":9007199254740993.1}"#).expect("valid input")
+            ),
+            Ok(json!({"status":"ok"}))
+        );
+        assert_eq!(
+            runtime.execute_exact(
+                &native_manifest,
+                ExactJsonDocument::parse("9007199254740993.1").expect("valid input")
+            ),
+            Err(SkillExecutionError::ParameterEncoding)
+        );
+    }
+    assert_eq!(
+        http.requests.into_inner()[0].body,
+        br#"{"value":9007199254740993.1}"#
     );
 }
 
