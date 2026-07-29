@@ -866,6 +866,21 @@ impl ProductionService {
         options: &ProductionOptions,
         loaded: LoadedConfig,
         startup_cancellation: CancellationToken,
+    ) -> Result<Self, ProductionError> {
+        Self::start_owned(
+            options,
+            loaded,
+            startup_cancellation,
+            BlockingTaskHost::new(4),
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_owned(
+        options: &ProductionOptions,
+        loaded: LoadedConfig,
+        startup_cancellation: CancellationToken,
         blocking: BlockingTaskHost,
         telemetry: Option<TelemetryHandle>,
     ) -> Result<Self, ProductionError> {
@@ -1200,6 +1215,7 @@ impl ProductionService {
                         provider,
                         plugin_tools,
                         &state_dir,
+                        configured_model,
                         active_skill_count,
                         max_sessions,
                         idle_timeout,

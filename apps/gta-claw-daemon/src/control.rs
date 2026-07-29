@@ -13,7 +13,9 @@
 //! Handling only the latter would leave the packaged service to die at the
 //! default disposition, with no drain and no stop summary.
 
+use std::future::Future;
 use std::io::{self, Write};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -37,6 +39,19 @@ struct SupervisorOutput<W> {
     tasks: BlockingTaskHost,
 }
 
+struct DirectSupervisorOutput<'a, W> {
+    writer: Mutex<&'a mut W>,
+}
+
+trait ProductionOutput {
+    fn line<'a>(
+        &'a self,
+        line: impl Into<String> + 'a,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a>>;
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+}
+
 impl<W> SupervisorOutput<W>
 where
     W: Write + Send + 'static,
@@ -48,7 +63,7 @@ where
         }
     }
 
-    async fn line(&self, line: impl Into<String>) -> io::Result<()> {
+    async fn write_line(&self, line: impl Into<String>) -> io::Result<()> {
         let writer = Arc::clone(&self.writer);
         let line = line.into();
         let written = self.tasks.run("supervisor-output", move || {
@@ -66,7 +81,7 @@ where
             .map_err(io::Error::other)?
     }
 
-    async fn shutdown(&self) -> io::Result<()> {
+    async fn finish(&self) -> io::Result<()> {
         let ledger = self.tasks.shutdown_within(SUPERVISOR_OUTPUT_DEADLINE).await;
         if ledger.is_settled() {
             Ok(())
@@ -77,6 +92,42 @@ where
                 ledger.spawned(),
             )))
         }
+    }
+}
+
+impl<W> ProductionOutput for SupervisorOutput<W>
+where
+    W: Write + Send + 'static,
+{
+    fn line<'a>(
+        &'a self,
+        line: impl Into<String> + 'a,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a>> {
+        Box::pin(self.write_line(line))
+    }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(self.finish())
+    }
+}
+
+impl<W> ProductionOutput for DirectSupervisorOutput<'_, W>
+where
+    W: Write,
+{
+    fn line<'a>(
+        &'a self,
+        line: impl Into<String> + 'a,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a>> {
+        let line = line.into();
+        Box::pin(async move {
+            let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+            writeln!(&mut **writer, "{line}").and_then(|()| writer.flush())
+        })
+    }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(std::future::ready(Ok(())))
     }
 }
 
@@ -121,6 +172,27 @@ fn startup_error_with_cleanup(
         ));
     }
     Box::new(io::Error::other(failures.join("; ")))
+}
+
+async fn stop_startup_after_output_failure<F>(
+    startup: Pin<&mut F>,
+    cancellation: &CancellationToken,
+    blocking: &BlockingTaskHost,
+    telemetry: Option<TelemetryHandle>,
+    fault: String,
+) where
+    F: Future<Output = Result<ProductionService, crate::production::ProductionError>>,
+{
+    cancellation.cancel();
+    let started = Instant::now();
+    match tokio::time::timeout(PRODUCTION_STOP_DEADLINE, startup).await {
+        Ok(Ok(service)) => {
+            let _ = service.stop(Some(fault)).await;
+        }
+        Ok(Err(_)) | Err(_) => {
+            let _ = cleanup_startup_resources(blocking, telemetry, started).await;
+        }
+    }
 }
 
 /// The control word that ends a run.
@@ -504,15 +576,19 @@ pub async fn serve(
 /// Returns a startup error before readiness when signal installation or service
 /// composition fails. After readiness, returns an output error only after the
 /// service has been drained.
+#[allow(clippy::future_not_send)] // Preserves the existing non-Send reader/writer contract.
 pub async fn serve_production(
-    output: impl Write + Send + 'static,
+    mut output: impl Write,
     control: impl tokio::io::AsyncRead + Unpin,
     options: &ProductionOptions,
     loaded: LoadedConfig,
 ) -> Result<ProductionStopSummary, Box<dyn std::error::Error>> {
     let signals = StopSignals::install()?;
     let blocking = BlockingTaskHost::new(4);
-    serve_production_preinstalled(output, control, options, loaded, signals, blocking, None).await
+    let output = DirectSupervisorOutput {
+        writer: Mutex::new(&mut output),
+    };
+    serve_production_inner(&output, control, options, loaded, signals, blocking, None).await
 }
 
 /// Runs production with signal and blocking-task ownership established by the
@@ -522,21 +598,41 @@ pub async fn serve_production(
 ///
 /// Returns a startup, runtime, bounded-output, or shutdown error after owned
 /// work has been drained or represented in the returned stop accounting.
+#[allow(clippy::future_not_send)] // The shared core also serves the non-Send compatibility path.
 pub async fn serve_production_preinstalled(
     output: impl Write + Send + 'static,
+    control: impl tokio::io::AsyncRead + Unpin,
+    options: &ProductionOptions,
+    loaded: LoadedConfig,
+    signals: StopSignals,
+    blocking: BlockingTaskHost,
+    telemetry: Option<TelemetryHandle>,
+) -> Result<ProductionStopSummary, Box<dyn std::error::Error>> {
+    let output = SupervisorOutput::new(output);
+    serve_production_inner(
+        &output, control, options, loaded, signals, blocking, telemetry,
+    )
+    .await
+}
+
+#[allow(clippy::future_not_send)] // Generic over both bounded and non-Send compatibility output.
+async fn serve_production_inner<O>(
+    output: &O,
     control: impl tokio::io::AsyncRead + Unpin,
     options: &ProductionOptions,
     loaded: LoadedConfig,
     mut signals: StopSignals,
     blocking: BlockingTaskHost,
     telemetry: Option<TelemetryHandle>,
-) -> Result<ProductionStopSummary, Box<dyn std::error::Error>> {
-    let output = SupervisorOutput::new(output);
+) -> Result<ProductionStopSummary, Box<dyn std::error::Error>>
+where
+    O: ProductionOutput,
+{
     let application = Application::new(NativeSystemProbe);
     let mut control = ControlChannel::new(control);
     let startup_cancellation = CancellationToken::new();
     let startup_telemetry = telemetry.clone();
-    let startup = ProductionService::start(
+    let startup = ProductionService::start_owned(
         options,
         loaded,
         startup_cancellation.clone(),
@@ -599,8 +695,7 @@ pub async fn serve_production_preinstalled(
                             ProductionStopSummary::before_start(ledger, telemetry)
                         }
                     };
-                write_production_stop(&output, trigger.label(), &summary).await?;
-                output.shutdown().await?;
+                write_production_stop(output, trigger.label(), &summary).await?;
                 return Ok(summary);
             }
             StartupEvent::Control(ControlEvent::Stop) => {
@@ -637,20 +732,52 @@ pub async fn serve_production_preinstalled(
                             ProductionStopSummary::before_start(ledger, telemetry)
                         }
                     };
-                write_production_stop(&output, StopTrigger::Control.label(), &summary).await?;
-                output.shutdown().await?;
+                write_production_stop(output, StopTrigger::Control.label(), &summary).await?;
                 return Ok(summary);
             }
             StartupEvent::Signal(SignalEvent::Reload)
             | StartupEvent::Control(ControlEvent::Reload) => {
                 reload_deferred = true;
-                output.line("reload deferred phase=starting").await?;
+                if let Err(error) = output.line("reload deferred phase=starting").await {
+                    stop_startup_after_output_failure(
+                        startup.as_mut(),
+                        &startup_cancellation,
+                        &blocking,
+                        startup_telemetry.clone(),
+                        format!("supervisor output failed: {error}"),
+                    )
+                    .await;
+                    let _ = output.shutdown().await;
+                    return Err(Box::new(error));
+                }
             }
             StartupEvent::Control(ControlEvent::Status) => {
-                output.line("status ready=false phase=starting").await?;
+                if let Err(error) = output.line("status ready=false phase=starting").await {
+                    stop_startup_after_output_failure(
+                        startup.as_mut(),
+                        &startup_cancellation,
+                        &blocking,
+                        startup_telemetry.clone(),
+                        format!("supervisor output failed: {error}"),
+                    )
+                    .await;
+                    let _ = output.shutdown().await;
+                    return Err(Box::new(error));
+                }
             }
             StartupEvent::Control(ControlEvent::Ignored) => {
-                output.line("control ignored").await?;
+                if let Err(error) = output.line("control ignored").await {
+                    stop_startup_after_output_failure(
+                        startup.as_mut(),
+                        &startup_cancellation,
+                        &blocking,
+                        startup_telemetry.clone(),
+                        format!("supervisor output failed: {error}"),
+                    )
+                    .await;
+                    let _ = output.shutdown().await;
+                    return Err(Box::new(error));
+                }
             }
         }
     };
@@ -658,6 +785,7 @@ pub async fn serve_production_preinstalled(
         let _ = service
             .stop(Some(format!("supervisor output failed: {error}")))
             .await;
+        let _ = output.shutdown().await;
         return Err(Box::new(error));
     }
     let addresses = service.addresses();
@@ -682,6 +810,7 @@ pub async fn serve_production_preinstalled(
         let _ = service
             .stop(Some(format!("supervisor output failed: {error}")))
             .await;
+        let _ = output.shutdown().await;
         return Err(Box::new(error));
     }
 
@@ -735,8 +864,7 @@ pub async fn serve_production_preinstalled(
     };
 
     let summary = service.stop(fault).await;
-    write_production_stop(&output, reason, &summary).await?;
-    output.shutdown().await?;
+    write_production_stop(output, reason, &summary).await?;
     Ok(summary)
 }
 
@@ -749,6 +877,7 @@ pub async fn serve_production_preinstalled(
 ///
 /// Returns a bounded supervisor-output error when the summary cannot be
 /// delivered or its writer task cannot be joined.
+#[allow(clippy::future_not_send)] // Uses the shared generic summary writer.
 pub async fn report_pre_start_stop(
     output: impl Write + Send + 'static,
     trigger: StopTrigger,
@@ -758,7 +887,6 @@ pub async fn report_pre_start_stop(
     let output = SupervisorOutput::new(output);
     let summary = ProductionStopSummary::before_start(ledger, telemetry);
     write_production_stop(&output, trigger.label(), &summary).await?;
-    output.shutdown().await?;
     Ok(summary)
 }
 
@@ -780,27 +908,30 @@ async fn reload_line(service: &ProductionService) -> String {
     }
 }
 
-async fn write_production_stop<W>(
-    output: &SupervisorOutput<W>,
+#[allow(clippy::future_not_send)] // Supports the non-Send compatibility output adapter.
+async fn write_production_stop<O>(
+    output: &O,
     reason: &str,
     summary: &ProductionStopSummary,
 ) -> io::Result<()>
 where
-    W: Write + Send + 'static,
+    O: ProductionOutput,
 {
-    output
+    let written = output
         .line(format!(
-        "stopped reason={} clean={} drained={} completed={} abandoned={} tasks={}/{} telemetry={}",
-        reason,
-        summary.is_clean(),
-        summary.drained(),
-        summary.completed(),
-        summary.abandoned(),
-        summary.terminated(),
-        summary.spawned(),
-        summary.telemetry(),
-    ))
-        .await
+            "stopped reason={} clean={} drained={} completed={} abandoned={} tasks={}/{} telemetry={}",
+            reason,
+            summary.is_clean(),
+            summary.drained(),
+            summary.completed(),
+            summary.abandoned(),
+            summary.terminated(),
+            summary.spawned(),
+            summary.telemetry(),
+        ))
+        .await;
+    let shutdown = output.shutdown().await;
+    written.and(shutdown)
 }
 
 #[cfg(test)]

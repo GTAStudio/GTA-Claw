@@ -117,6 +117,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+#[allow(clippy::future_not_send)] // The process owns this future on `Runtime::block_on`.
 async fn run(command: CommandLine) -> Result<(), Box<dyn std::error::Error>> {
     match command.mode {
         // Answered in `main` before the runtime is built.
