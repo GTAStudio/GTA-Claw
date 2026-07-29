@@ -72,7 +72,7 @@ pub use services::{
     EventSink, FixedClock, HostCallControl, HostCallStop, HostEvent, HostServices, HttpTransport,
     InMemoryConfig, InMemoryStore, InboundResponse, LogRecord, LogSink, NullStore, OsRandom,
     OutboundRequest, RandomSource, RecordingSink, StoreBackend, SystemClock, ToolRegistration,
-    ToolSink, UnavailableRandom,
+    ToolRegistrationError, ToolSink, UnavailableRandom,
 };
 pub use state::{PluginState, ViolationPolicy};
 

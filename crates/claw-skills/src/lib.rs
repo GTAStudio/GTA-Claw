@@ -35,5 +35,6 @@ pub use runtime::{
 };
 pub use schema::{
     ParameterValidationError, ParameterViolation, ParameterViolationKind, SchemaError,
-    SchemaErrorKind, validate_parameters, validate_schema,
+    SchemaErrorKind, ValidationLimits, validate_parameters, validate_parameters_with_limits,
+    validate_schema, validate_schema_with_limits,
 };

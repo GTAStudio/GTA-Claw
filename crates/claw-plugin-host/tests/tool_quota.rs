@@ -6,16 +6,51 @@
 
 mod support;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use claw_plugin_api::capability::{CapabilityGrant, EventKind, EventsGrant, ToolsGrant};
 use claw_plugin_host::services::{HostServices, RecordingSink};
-use claw_plugin_host::{LifecycleState, PluginHost, TerminationCause};
-use support::{install_variant, probe_ceiling, unsigned_core_policy};
+use claw_plugin_host::{
+    HostError, LifecycleState, PluginHost, TerminationCause, ToolRegistration,
+    ToolRegistrationError, ToolSink,
+};
+use support::{
+    PROBE_ID, install_variant, probe_ceiling, probe_component_failing_deactivate,
+    unsigned_core_policy,
+};
 
 /// `permission-denied` is the second `error-code` case, so the guest sees `e1`.
 const DENIED: &str = "e1";
 const ALLOWED: &str = "o0";
+
+#[derive(Clone, Default)]
+struct RejectFirstSchema {
+    accepted: Arc<Mutex<Vec<ToolRegistration>>>,
+}
+
+impl ToolSink for RejectFirstSchema {
+    fn register(&self, registration: ToolRegistration) -> Result<(), ToolRegistrationError> {
+        let mut accepted = self.accepted.lock().unwrap_or_else(PoisonError::into_inner);
+        accepted.retain(|tool| {
+            tool.plugin_id != registration.plugin_id || tool.name != registration.name
+        });
+        if registration.name == "ta" {
+            return Err(ToolRegistrationError::rejected(
+                "daemon schema policy rejected the registration",
+            ));
+        }
+        accepted.push(registration);
+        drop(accepted);
+        Ok(())
+    }
+
+    fn unregister(&self, plugin_id: &str, name: &str) -> bool {
+        let mut accepted = self.accepted.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = accepted.len();
+        accepted.retain(|tool| tool.plugin_id != plugin_id || tool.name != name);
+        accepted.len() != before
+    }
+}
 
 fn tools_grant(max_tools: u32) -> Vec<CapabilityGrant> {
     vec![CapabilityGrant::Tools(ToolsGrant {
@@ -99,6 +134,42 @@ fn re_registering_the_same_name_does_not_consume_more_quota() {
 }
 
 #[test]
+fn a_sink_rejection_does_not_consume_tool_quota() {
+    let root = support::tempdir();
+    let component = support::probe_component_registering_tools(2);
+    let grants = tools_grant(1);
+    let dir = install_variant(root.path(), "probe", &component, grants.clone());
+    let sink = RejectFirstSchema::default();
+    let mut host = PluginHost::builder()
+        .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(probe_ceiling(grants))
+        .services(HostServices::deny_all().with_tools(Arc::new(sink.clone())))
+        .build()
+        .expect("host");
+    let id = host.load(&dir).expect("load");
+    host.activate(&id).expect("activate");
+
+    assert_eq!(
+        host.invoke_tool(&id, "z", "{}").expect("guest continues"),
+        ALLOWED,
+        "the second registration fits because the rejected first one held no quota"
+    );
+    assert_eq!(host.registered_tools(&id), Some(vec!["tb".to_owned()]));
+    let accepted = sink.accepted.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(
+        accepted.as_slice(),
+        [ToolRegistration {
+            plugin_id: id,
+            name: "tb".to_owned(),
+            summary: "probe tool".to_owned(),
+            input_schema: "{}".to_owned(),
+        }]
+    );
+    drop(accepted);
+    assert_eq!(host.denials(PROBE_ID).len(), 1);
+}
+
+#[test]
 fn deactivating_withdraws_every_tool_the_plugin_advertised() {
     let root = support::tempdir();
     let grants = tools_grant(4);
@@ -129,6 +200,39 @@ fn deactivating_withdraws_every_tool_the_plugin_advertised() {
     assert_eq!(host.registered_tools(&id), Some(Vec::new()));
     assert_eq!(host.invoke_tool(&id, "k", "{}").expect("register"), ALLOWED);
     assert_eq!(recorder.tools().len(), 1);
+}
+
+#[test]
+fn a_deactivation_error_quarantines_and_withdraws_every_tool() {
+    let root = support::tempdir();
+    let grants = tools_grant(1);
+    let component = probe_component_failing_deactivate();
+    let dir = install_variant(root.path(), "probe", &component, grants.clone());
+    let recorder = RecordingSink::new();
+    let mut host = PluginHost::builder()
+        .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(probe_ceiling(grants))
+        .services(HostServices::deny_all().with_tools(Arc::new(recorder.clone())))
+        .build()
+        .expect("host");
+    let id = host.load(&dir).expect("load");
+    host.activate(&id).expect("activate");
+    assert_eq!(host.invoke_tool(&id, "k", "{}").expect("register"), ALLOWED);
+
+    assert!(matches!(host.deactivate(&id), Err(HostError::Guest(_))));
+    assert_eq!(host.state(&id), Some(LifecycleState::Quarantined));
+    assert_eq!(host.registered_tools(&id), Some(Vec::new()));
+    assert!(
+        recorder.tools().is_empty(),
+        "a failed deactivation must still withdraw public tools"
+    );
+    assert!(matches!(
+        host.invoke_tool(&id, "x", "{}"),
+        Err(HostError::WrongState {
+            actual: "quarantined",
+            ..
+        })
+    ));
 }
 
 #[test]

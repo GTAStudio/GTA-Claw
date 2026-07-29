@@ -890,12 +890,21 @@ impl host_tools::Host for PluginState {
         }
         let plugin_id = self.plugin_id().to_owned();
         let name = tool.name.clone();
-        self.services().tools.register(ToolRegistration {
+        let registration = self.services().tools.register(ToolRegistration {
             plugin_id,
             name: tool.name,
             summary: tool.summary,
             input_schema: tool.input_schema,
         });
+        if let Err(error) = registration {
+            self.note_tool_unregistered(&name);
+            drop(permit);
+            return self.deny(CapabilityDenial::invalid_argument(
+                Capability::Tools,
+                "register",
+                error.to_string(),
+            ));
+        }
         self.note_tool_registered(name);
         drop(permit);
         Ok(Ok(()))

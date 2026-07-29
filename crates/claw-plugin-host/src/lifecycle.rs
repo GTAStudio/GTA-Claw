@@ -38,6 +38,16 @@ enum Purge {
     Always,
 }
 
+/// State/phase handling after a guest returns an ABI error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuestErrorState {
+    /// Activation did not happen, so restore the state and phase from before it.
+    RestorePrevious,
+    /// Deactivation was requested and capabilities were revoked, so the
+    /// instance stays retained only for explicit unload or reload.
+    Quarantine,
+}
+
 /// Everything one lifecycle transition does apart from calling the guest.
 ///
 /// Keeping the shape of a transition in one value is what lets `activate` and
@@ -59,6 +69,8 @@ struct Transition {
     after_success: LifecyclePhase,
     /// Whether the plugin's tools are withdrawn even on success.
     purge: Purge,
+    /// What a guest-returned ABI error does to the retained instance.
+    guest_error: GuestErrorState,
 }
 
 /// `activate`: reachable from `loaded` or `inactive`, runs with the full grant
@@ -70,6 +82,7 @@ const ACTIVATE: Transition = Transition {
     during: LifecyclePhase::Active,
     after_success: LifecyclePhase::Active,
     purge: Purge::OnFailure,
+    guest_error: GuestErrorState::RestorePrevious,
 };
 
 /// `deactivate`: reachable only from `active`, runs with the cleanup grants
@@ -81,6 +94,7 @@ const DEACTIVATE: Transition = Transition {
     during: LifecyclePhase::Deactivating,
     after_success: LifecyclePhase::Inactive,
     purge: Purge::Always,
+    guest_error: GuestErrorState::Quarantine,
 };
 
 /// The file every plugin directory must contain.
@@ -113,6 +127,9 @@ pub enum LifecycleState {
     Active,
     /// `deactivate` returned successfully.
     Inactive,
+    /// `deactivate` returned an ABI error. Capabilities and tools are revoked;
+    /// only explicit unload or reload may act on the retained instance.
+    Quarantined,
     /// A guest call was terminated by the sandbox. The instance is gone and
     /// only `unload` or `reload` are allowed.
     Faulted(TerminationCause),
@@ -126,6 +143,7 @@ impl LifecycleState {
             Self::Loaded => "loaded",
             Self::Active => "active",
             Self::Inactive => "inactive",
+            Self::Quarantined => "quarantined",
             Self::Faulted(_) => "faulted",
         }
     }
@@ -1431,14 +1449,24 @@ impl PluginHost {
     /// * [`HostError::Faulted`] when a previous call trapped, so there is no
     ///   instance left to deactivate.
     /// * [`HostError::WrongState`] when the plugin is not active.
-    /// * [`HostError::Guest`] when `deactivate` returned an ABI error.
+    /// * [`HostError::Guest`] when `deactivate` returned an ABI error. The
+    ///   plugin is quarantined with all capabilities and tools revoked; it
+    ///   cannot be invoked or reactivated, but may be unloaded or reloaded.
     /// * [`HostError::Terminated`] when `deactivate` exhausted its fuel, ran
     ///   past its wall-clock deadline, exceeded a memory or table ceiling,
     ///   overflowed its stack, trapped, or was trapped by a host call refused
     ///   under [`ViolationPolicy::Trap`]. The instance is destroyed and the
     ///   plugin is left faulted; its tools are withdrawn either way.
     pub fn deactivate(&mut self, id: &str) -> Result<(), HostError> {
-        self.transition(id, &DEACTIVATE, None, |bindings, store| {
+        self.deactivate_with_control(id, None)
+    }
+
+    fn deactivate_with_control(
+        &mut self,
+        id: &str,
+        control: Option<&HostCallControl>,
+    ) -> Result<(), HostError> {
+        self.transition(id, &DEACTIVATE, control, |bindings, store| {
             bindings.gta_claw_plugin_guest().call_deactivate(store)
         })
     }
@@ -1502,15 +1530,18 @@ impl PluginHost {
             )
         };
 
-        // The phase is restored before anything else can observe the instance,
-        // so a guest that fails its own activation never keeps the capabilities
-        // that activation would have given it.
+        // The phase is set before anything else can observe the instance. A
+        // failed activation restores its previous closed phase; a failed
+        // deactivation stays closed rather than restoring active capabilities.
         let succeeded = matches!(outcome, Ok(Ok(())));
         if outcome.is_ok() {
             let phase = if succeeded {
                 transition.after_success
             } else {
-                previous_phase
+                match transition.guest_error {
+                    GuestErrorState::RestorePrevious => previous_phase,
+                    GuestErrorState::Quarantine => LifecyclePhase::Inactive,
+                }
             };
             if let Some(instance) = self
                 .plugins
@@ -1535,7 +1566,15 @@ impl PluginHost {
                 }
                 Ok(())
             }
-            Ok(Err(error)) => Err(guest_error(&error, &limits)),
+            Ok(Err(error)) => {
+                if transition.guest_error == GuestErrorState::Quarantine {
+                    self.activation_order.retain(|active| active != id);
+                    if let Some(plugin) = self.plugins.get_mut(id) {
+                        plugin.state = LifecycleState::Quarantined;
+                    }
+                }
+                Err(guest_error(&error, &limits))
+            }
             Err(error) => {
                 self.fault(id, &error);
                 Err(error)
@@ -1808,17 +1847,23 @@ impl PluginHost {
     /// the guest's deactivation failure after the instance has still been
     /// removed and all of its tools withdrawn.
     pub fn unload(&mut self, id: &str) -> Result<(), HostError> {
+        self.unload_inner(id, None)
+    }
+
+    fn unload_inner(
+        &mut self,
+        id: &str,
+        control: Option<&HostCallControl>,
+    ) -> Result<(), HostError> {
         if !self.plugins.contains_key(id) {
             return Err(HostError::UnknownPlugin(id.to_owned()));
         }
         let deactivation_error = if self.state(id) == Some(LifecycleState::Active) {
-            self.deactivate(id).err()
+            self.deactivate_with_control(id, control).err()
         } else {
             None
         };
-        self.purge_tools(id);
-        self.plugins.remove(id);
-        self.activation_order.retain(|active| active != id);
+        self.discard_plugin(id);
         deactivation_error.map_or(Ok(()), Err)
     }
 
@@ -1831,6 +1876,10 @@ impl PluginHost {
     /// # Errors
     ///
     /// Returns [`HostError`] when the plugin is unknown or fails to reload.
+    /// When deactivation returns an ABI error, the old instance remains in the
+    /// explicit [`LifecycleState::Quarantined`] state. A caller may inspect or
+    /// unload it, or retry `reload`; the retry discards that closed instance and
+    /// loads the on-disk plugin from scratch.
     /// Every load error listed on [`PluginHost::load`] is possible here,
     /// because the component is re-validated from scratch: a component that
     /// changed on disk now fails its digest check, and a manifest that changed
@@ -1841,7 +1890,10 @@ impl PluginHost {
             .get(id)
             .map(|plugin| plugin.directory.clone())
             .ok_or_else(|| HostError::UnknownPlugin(id.to_owned()))?;
-        self.unload(id)?;
+        if self.state(id) == Some(LifecycleState::Active) {
+            self.deactivate(id)?;
+        }
+        self.discard_plugin(id);
         self.load(&directory)
     }
 
@@ -1852,6 +1904,19 @@ impl PluginHost {
     /// withdrawn, and the returned report retains the original error.
     #[must_use]
     pub fn shutdown(&mut self) -> DisposalReport {
+        self.shutdown_inner(None)
+    }
+
+    /// Performs [`PluginHost::shutdown`] under one absolute host-call control.
+    ///
+    /// The control narrows each guest's own timeout, allowing bounded cleanup
+    /// paths to interrupt a non-returning `deactivate` export.
+    #[must_use]
+    pub fn shutdown_with_control(&mut self, control: &HostCallControl) -> DisposalReport {
+        self.shutdown_inner(Some(control))
+    }
+
+    fn shutdown_inner(&mut self, control: Option<&HostCallControl>) -> DisposalReport {
         let mut ids: Vec<String> = self.activation_order.iter().rev().cloned().collect();
         for id in self.plugins.keys() {
             if !ids.contains(id) {
@@ -1861,7 +1926,7 @@ impl PluginHost {
         let outcomes = ids
             .into_iter()
             .map(|plugin_id| {
-                let result = self.unload(&plugin_id);
+                let result = self.unload_inner(&plugin_id, control);
                 DisposalOutcome { plugin_id, result }
             })
             .collect();

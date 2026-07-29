@@ -809,7 +809,7 @@ impl ProductionService {
         let mut plugin_task = tokio::task::spawn_blocking(move || {
             SignedPluginRuntime::activate(&plugin_diagnostics, task_cancellation)
         });
-        let plugins = tokio::select! {
+        let mut plugins = tokio::select! {
             result = &mut plugin_task => {
                 result
                     .map_err(|error| ProductionError::new("plugins", error))?
@@ -1290,6 +1290,7 @@ impl ProductionService {
             "all required dependencies are live"
         );
 
+        plugins.mark_startup_complete();
         Ok(Self {
             addresses,
             provider,

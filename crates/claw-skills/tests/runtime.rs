@@ -84,16 +84,19 @@ fn native_handler_runs_only_after_exact_parameter_validation() {
     assert_eq!(
         runtime.execute(&manifest, json!({"extra":true})),
         Err(SkillExecutionError::InvalidParameters(
-            ParameterValidationError::Violations(vec![
-                ParameterViolation {
-                    path: "$.message".to_owned(),
-                    kind: ParameterViolationKind::MissingRequiredProperty,
-                },
-                ParameterViolation {
-                    path: "$.extra".to_owned(),
-                    kind: ParameterViolationKind::AdditionalProperty,
-                },
-            ])
+            ParameterValidationError::Violations {
+                violations: vec![
+                    ParameterViolation {
+                        path: "$.message".to_owned(),
+                        kind: ParameterViolationKind::MissingRequiredProperty,
+                    },
+                    ParameterViolation {
+                        path: "$.extra".to_owned(),
+                        kind: ParameterViolationKind::AdditionalProperty,
+                    },
+                ],
+                limit_reached: false,
+            }
         ))
     );
 }
@@ -206,8 +209,13 @@ fn get_parameters_are_percent_encoded_in_an_explicit_query_parameter() {
         runtime.execute(&manifest, json!({"q":"rust skills"})),
         Ok(json!({"status":"ok"}))
     );
+    let requests = http.requests.into_inner();
     assert_eq!(
-        http.requests.into_inner(),
+        requests[0].url,
+        "https://example.test/search?fixed=true&input=%7B%22q%22%3A%22rust%20skills%22%7D"
+    );
+    assert_eq!(
+        requests,
         vec![HttpRequest {
             method: claw_skills::HttpMethod::Get,
             url: "https://example.test/search?fixed=true&input=%7B%22q%22%3A%22rust%20skills%22%7D"
@@ -215,6 +223,38 @@ fn get_parameters_are_percent_encoded_in_an_explicit_query_parameter() {
             headers: BTreeMap::new(),
             body: Vec::new(),
         }]
+    );
+}
+
+#[test]
+fn query_parameters_are_inserted_before_a_url_fragment() {
+    let manifest = load_manifest(
+        r#"{
+            "id":"http-fragment",
+            "description":"Append input without moving the fragment.",
+            "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]},
+            "execution":{
+                "kind":"http",
+                "request":{
+                    "method":"GET",
+                    "url":"https://example.test/search?lang=en#results",
+                    "parameters":{"kind":"query_parameter","name":"input"},
+                    "response":"json"
+                }
+            }
+        }"#,
+    )
+    .expect("valid HTTP manifest");
+    let (native, http, mut wasm) = ports();
+
+    let output = SkillRuntime::new(&native, &http, &mut wasm)
+        .execute(&manifest, json!({"query":"a&b"}))
+        .expect("execute");
+    assert_eq!(output, json!({"status":"ok"}));
+    let calls = http.requests.into_inner();
+    assert_eq!(
+        calls[0].url,
+        "https://example.test/search?lang=en&input=%7B%22query%22%3A%22a%26b%22%7D#results"
     );
 }
 

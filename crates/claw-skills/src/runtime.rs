@@ -425,12 +425,15 @@ impl<'a> SkillRuntime<'a> {
 }
 
 fn append_query_parameter(url: &str, name: &str, value: &str) -> String {
-    let separator = if url.contains('?') { '&' } else { '?' };
-    format!(
-        "{url}{separator}{}={}",
-        percent_encode(name),
-        percent_encode(value)
-    )
+    let mut parsed = url::Url::parse(url)
+        .expect("the HTTP URL was validated immediately before request construction");
+    let encoded_pair = format!("{}={}", percent_encode(name), percent_encode(value));
+    let query = parsed.query().map_or_else(
+        || encoded_pair.clone(),
+        |existing| format!("{existing}&{encoded_pair}"),
+    );
+    parsed.set_query(Some(&query));
+    parsed.into()
 }
 
 fn percent_encode(value: &str) -> String {

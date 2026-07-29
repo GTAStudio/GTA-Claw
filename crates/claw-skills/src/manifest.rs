@@ -117,13 +117,12 @@ pub struct HttpSkillDefinition {
 
 impl HttpSkillDefinition {
     fn validate(&self) -> Result<(), ManifestError> {
-        let remainder = self
-            .url
-            .strip_prefix("https://")
-            .or_else(|| self.url.strip_prefix("http://"))
-            .ok_or(ManifestError::InvalidHttpUrl)?;
-        let authority = remainder.split('/').next().unwrap_or_default();
-        if authority.is_empty() || authority.contains('@') || self.url.chars().any(char::is_control)
+        let parsed = url::Url::parse(&self.url).map_err(|_| ManifestError::InvalidHttpUrl)?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || self.url.chars().any(char::is_control)
         {
             return Err(ManifestError::InvalidHttpUrl);
         }

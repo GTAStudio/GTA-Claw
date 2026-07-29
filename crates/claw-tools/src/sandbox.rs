@@ -353,7 +353,8 @@ impl Sandbox {
     /// [`SandboxError::CaseCollision`] when a differently-cased name already
     /// exists in the parent, [`SandboxError::AlreadyExists`] when the leaf
     /// exists and `mode` is [`WriteMode::CreateNew`],
-    /// [`SandboxError::NotAFile`] when the leaf exists as a directory, and
+    /// [`SandboxError::NotAFile`] when the leaf exists but is not a regular
+    /// file, and
     /// [`SandboxError::EscapesRoot`] or [`SandboxError::CaseMismatch`] when an
     /// existing leaf does not canonicalize back onto the requested path.
     pub fn resolve_for_write(
@@ -388,28 +389,23 @@ impl Sandbox {
         // filesystem cannot silently redirect the write onto a differently
         // cased file, and so the refusal is identical on every platform.
         self.reject_case_collision(&pin, leaf)?;
-        let existed = match std::fs::symlink_metadata(&absolute) {
+        match std::fs::symlink_metadata(&absolute) {
             Ok(metadata) => {
                 if is_link_like(&metadata) {
                     return Err(SandboxError::SymlinkForbidden);
                 }
-                if metadata.is_dir() {
+                if !metadata.is_file() {
                     return Err(SandboxError::NotAFile);
                 }
                 if mode == WriteMode::CreateNew {
                     return Err(SandboxError::AlreadyExists);
                 }
                 self.verify_canonical(&absolute, &path.components)?;
-                true
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(map_io(&error)),
-        };
-        Ok(PreparedWrite {
-            pin,
-            absolute,
-            existed,
-        })
+        }
+        Ok(PreparedWrite { pin, absolute })
     }
 
     /// Reads an existing file, refusing links and oversized content.
@@ -473,12 +469,10 @@ impl Sandbox {
     /// file truncated. A process that wins a race to swap a directory therefore
     /// never gets a file truncated or written.
     ///
-    /// The residual on Unix is bounded and non-destructive: an ancestor swapped
-    /// and restored inside the window can cause an empty file to be created
-    /// outside the root, at a location the racing process already had the
-    /// access to create for itself. It is refused before any content is
-    /// written, but the cleanup path removes the in-root name rather than the
-    /// file that was actually created, so that empty file can persist.
+    /// Unix opens the leaf relative to the pinned parent handle, so renaming an
+    /// ancestor cannot redirect creation. If later verification fails after a
+    /// create, the empty file is retained: attempting pathname cleanup in a
+    /// mutable directory could delete a replacement planted after verification.
     ///
     /// # Errors
     ///
@@ -498,31 +492,18 @@ impl Sandbox {
             return Err(SandboxError::FileTooLarge);
         }
         let prepared = self.prepare_write(path, mode)?;
-        let mut options = OpenOptions::new();
-        options.write(true);
-        match mode {
-            WriteMode::CreateNew => {
-                options.create_new(true);
-            }
-            WriteMode::Overwrite => {
-                options.create(true);
-            }
-        }
-        apply_no_follow(&mut options);
-        let mut file = options
-            .open(&prepared.absolute)
-            .map_err(|error| map_io(&error))?;
+        let mut file = open_write_no_follow(
+            prepared.pin.handle()?,
+            &prepared.absolute,
+            path.file_name(),
+            mode,
+        )?;
         let verified = verify_handle_is_not_reparse_point(&file)
+            .and_then(|()| verify_handle_is_regular(&file))
             .and_then(|()| self.verify_canonical(&prepared.absolute, &path.components))
             .and_then(|()| prepared.pin.verify())
             .and_then(|()| verify_handle_matches_path(&file, &prepared.absolute));
-        if let Err(error) = verified {
-            drop(file);
-            if !prepared.existed {
-                remove_own_empty_file(&prepared.absolute);
-            }
-            return Err(error);
-        }
+        verified?;
         // The first mutation of the target happens here, after every check.
         file.set_len(0).map_err(|error| map_io(&error))?;
         file.write_all(content).map_err(|error| map_io(&error))?;
@@ -813,7 +794,6 @@ fn is_link_like(metadata: &std::fs::Metadata) -> bool {
 struct PreparedWrite {
     pin: DirectoryPin,
     absolute: PathBuf,
-    existed: bool,
 }
 
 /// Identity of a directory as reported by its own open handle.
@@ -939,18 +919,77 @@ fn open_directory_no_follow(path: &Path) -> Result<File, SandboxError> {
     File::open(path).map_err(|error| map_io(&error))
 }
 
-/// Removes a file this call created, and only if it is still empty.
+/// Opens a write target relative to its pinned parent without following links.
 ///
-/// Used on the failure path of a create that was invalidated after the fact.
-/// The size and type checks mean an attacker cannot turn cleanup into a
-/// deletion primitive for a file that was already there.
-fn remove_own_empty_file(path: &Path) {
-    if let Ok(metadata) = std::fs::symlink_metadata(path)
-        && metadata.is_file()
-        && !is_link_like(&metadata)
-        && metadata.len() == 0
-    {
-        let _ = std::fs::remove_file(path);
+/// Unix uses `openat`, so a renamed ancestor cannot redirect creation or
+/// overwrite through a different pathname. `NONBLOCK` makes a special file
+/// planted after the metadata check fail promptly instead of hanging on open.
+#[cfg(unix)]
+fn open_write_no_follow(
+    parent: &File,
+    _absolute: &Path,
+    leaf: &str,
+    mode: WriteMode,
+) -> Result<File, SandboxError> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let existing_flags = OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+    let create_flags = existing_flags | OFlags::CREATE | OFlags::EXCL;
+    let permissions = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH;
+    if mode == WriteMode::CreateNew {
+        return openat(parent, leaf, create_flags, permissions)
+            .map(File::from)
+            .map_err(map_errno);
+    }
+    match openat(parent, leaf, existing_flags, Mode::empty()) {
+        Ok(handle) => Ok(File::from(handle)),
+        Err(rustix::io::Errno::NOENT) => match openat(parent, leaf, create_flags, permissions) {
+            Ok(handle) => Ok(File::from(handle)),
+            Err(rustix::io::Errno::EXIST) => openat(parent, leaf, existing_flags, Mode::empty())
+                .map(File::from)
+                .map_err(map_errno),
+            Err(error) => Err(map_errno(error)),
+        },
+        Err(error) => Err(map_errno(error)),
+    }
+}
+
+/// Windows pins every ancestor without delete sharing before opening the full
+/// path, so the namespace cannot be redirected while this operation runs.
+#[cfg(not(unix))]
+fn open_write_no_follow(
+    _parent: &File,
+    absolute: &Path,
+    _leaf: &str,
+    mode: WriteMode,
+) -> Result<File, SandboxError> {
+    fn open_existing(absolute: &Path) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options.write(true);
+        apply_no_follow(&mut options);
+        options.open(absolute)
+    }
+
+    fn create_new(absolute: &Path) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        apply_no_follow(&mut options);
+        options.open(absolute)
+    }
+
+    if mode == WriteMode::CreateNew {
+        return create_new(absolute).map_err(|error| map_io(&error));
+    }
+    match open_existing(absolute) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match create_new(absolute) {
+            Ok(file) => Ok(file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                open_existing(absolute).map_err(|error| map_io(&error))
+            }
+            Err(error) => Err(map_io(&error)),
+        },
+        Err(error) => Err(map_io(&error)),
     }
 }
 
@@ -982,6 +1021,14 @@ fn verify_handle_is_not_reparse_point(file: &File) -> Result<(), SandboxError> {
         Ok(())
     } else {
         Err(SandboxError::SymlinkForbidden)
+    }
+}
+
+fn verify_handle_is_regular(file: &File) -> Result<(), SandboxError> {
+    if file.metadata().map_err(|error| map_io(&error))?.is_file() {
+        Ok(())
+    } else {
+        Err(SandboxError::NotAFile)
     }
 }
 
@@ -1568,6 +1615,38 @@ mod tests {
         // A name that no longer resolves at all is equally not the open handle.
         std::fs::remove_file(&other).expect("remove the other file");
         assert!(verify_handle_matches_path(&file, &other).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwrite_opens_the_preexisting_file_from_the_pinned_parent() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        let root = std::env::temp_dir().join(format!("claw-write-provenance-{nanos}"));
+        let honest = root.join("honest");
+        let moved = root.join("moved-aside");
+        std::fs::create_dir_all(&honest).expect("create the honest directory");
+        std::fs::write(honest.join("existing.txt"), []).expect("create an empty existing file");
+        let parent = open_directory_no_follow(&honest).expect("pin the honest directory");
+
+        std::fs::rename(&honest, &moved).expect("move the pinned directory aside");
+        std::fs::create_dir(&honest).expect("replace the validated pathname");
+        let file = open_write_no_follow(
+            &parent,
+            &honest.join("existing.txt"),
+            "existing.txt",
+            WriteMode::Overwrite,
+        )
+        .expect("open through the pinned parent");
+
+        drop(file);
+        assert!(
+            moved.join("existing.txt").is_file(),
+            "failed-write cleanup must never delete the pre-existing pinned file"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

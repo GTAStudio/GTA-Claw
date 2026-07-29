@@ -2,12 +2,19 @@
 
 mod support;
 
+use std::time::{Duration, Instant};
+
 use claw_plugin_api::capability::EventKind;
 use claw_plugin_host::services::HostEvent;
 use claw_plugin_host::{
-    EventOutcome, GuestFailure, HostError, LifecycleState, PluginHost, TerminationCause,
+    EventOutcome, GuestFailure, HostCallControl, HostError, LifecycleState, PluginHost,
+    TerminationCause,
 };
-use support::{PROBE_ID, PROBE_VERSION, install_probe, install_probe_named, unsigned_core_policy};
+use support::{
+    PROBE_ID, PROBE_VERSION, install_probe, install_probe_named, install_variant,
+    probe_component_failing_deactivate, probe_component_spinning_on_deactivate,
+    unsigned_core_policy,
+};
 
 fn event(kind: EventKind, sequence: u64) -> HostEvent {
     HostEvent {
@@ -246,6 +253,68 @@ fn reload_picks_up_new_bytes_from_disk() {
         host.denials(&id).is_empty(),
         "a reload clears the previous instance's audit log"
     );
+}
+
+#[test]
+fn reload_preserves_a_typed_recoverable_slot_when_deactivation_fails() {
+    let root = support::tempdir();
+    let component = probe_component_failing_deactivate();
+    let dir = install_variant(root.path(), "probe", &component, Vec::new());
+    let mut host = PluginHost::builder()
+        .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
+        .build()
+        .expect("host");
+    let id = host.load(&dir).expect("load");
+    host.activate(&id).expect("activate");
+    let original_digest = host.component_digest(&id).expect("digest").to_owned();
+
+    let error = host.reload(&id).expect_err("deactivation must fail");
+    assert!(matches!(error, HostError::Guest(_)));
+    assert_eq!(host.state(&id), Some(LifecycleState::Quarantined));
+    assert_eq!(
+        host.component_digest(&id),
+        Some(original_digest.as_str()),
+        "the old slot remains inspectable after the failed reload"
+    );
+    match host
+        .invoke_tool(&id, "x", "{}")
+        .expect_err("a quarantined plugin is not invocable")
+    {
+        HostError::WrongState { actual, .. } => assert_eq!(actual, "quarantined"),
+        other => panic!("expected a wrong-state error, got {other}"),
+    }
+
+    let reloaded = host.reload(&id).expect("retry reloads from scratch");
+    assert_eq!(reloaded, id);
+    assert_eq!(host.state(&id), Some(LifecycleState::Loaded));
+}
+
+#[test]
+fn controlled_shutdown_interrupts_a_non_returning_deactivation() {
+    let root = support::tempdir();
+    let component = probe_component_spinning_on_deactivate();
+    let dir = install_variant(root.path(), "probe", &component, Vec::new());
+    let mut host = PluginHost::builder()
+        .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
+        .build()
+        .expect("host");
+    let id = host.load(&dir).expect("load");
+    host.activate(&id).expect("activate");
+    let control = HostCallControl::new(Instant::now() + Duration::from_millis(50), None);
+
+    let report = host.shutdown_with_control(&control);
+
+    assert_eq!(report.outcomes().len(), 1);
+    assert!(matches!(
+        report.outcomes()[0].result,
+        Err(HostError::Terminated {
+            cause: TerminationCause::Timeout,
+            ..
+        })
+    ));
+    assert_eq!(host.state(&id), None);
 }
 
 #[test]

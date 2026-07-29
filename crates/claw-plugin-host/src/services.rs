@@ -50,6 +50,36 @@ pub struct ToolRegistration {
     pub input_schema: String,
 }
 
+/// A tool registration the embedding surface refused to publish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolRegistrationError {
+    reason: String,
+}
+
+impl ToolRegistrationError {
+    /// Creates an explicit publication rejection.
+    #[must_use]
+    pub fn rejected(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    /// Stable operator-facing rejection reason.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl core::fmt::Display for ToolRegistrationError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl core::error::Error for ToolRegistrationError {}
+
 /// An outbound HTTP request that already passed every host-side check.
 ///
 /// The transport must connect to one of [`OutboundRequest::addresses`]. Those
@@ -329,8 +359,16 @@ pub trait RandomSource: Send + Sync {
 
 /// Sink for tool registrations.
 pub trait ToolSink: Send + Sync {
-    /// Registers or replaces a tool.
-    fn register(&self, registration: ToolRegistration);
+    /// Atomically registers or replaces a tool.
+    ///
+    /// A rejection must leave no public entry for this plugin-local name,
+    /// including an older registration being replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolRegistrationError`] when the embedding surface rejects the
+    /// registration under its own publication policy.
+    fn register(&self, registration: ToolRegistration) -> Result<(), ToolRegistrationError>;
 
     /// Removes a tool, reporting whether one was registered.
     fn unregister(&self, plugin_id: &str, name: &str) -> bool;
@@ -651,12 +689,14 @@ impl LogSink for RecordingSink {
 }
 
 impl ToolSink for RecordingSink {
-    fn register(&self, registration: ToolRegistration) {
+    fn register(&self, registration: ToolRegistration) -> Result<(), ToolRegistrationError> {
         let mut guard = self.tools.lock().unwrap_or_else(PoisonError::into_inner);
         guard.retain(|existing| {
             existing.plugin_id != registration.plugin_id || existing.name != registration.name
         });
         guard.push(registration);
+        drop(guard);
+        Ok(())
     }
 
     fn unregister(&self, plugin_id: &str, name: &str) -> bool {
@@ -681,7 +721,9 @@ impl EventSink for RecordingSink {
 pub struct DiscardTools;
 
 impl ToolSink for DiscardTools {
-    fn register(&self, _registration: ToolRegistration) {}
+    fn register(&self, _registration: ToolRegistration) -> Result<(), ToolRegistrationError> {
+        Ok(())
+    }
 
     fn unregister(&self, _plugin_id: &str, _name: &str) -> bool {
         false
