@@ -13,8 +13,11 @@
 //! reader of these tests would expect them to catch.
 
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gta_claw_daemon::production::USAGE;
+
+static NEXT_STATE: AtomicU64 = AtomicU64::new(0);
 
 fn run(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
@@ -120,4 +123,43 @@ fn a_flag_missing_its_value_names_what_it_needed() {
             "{flag} must name the flag and the value it needed"
         );
     }
+}
+
+#[test]
+fn check_config_rejects_an_unusable_state_destination_without_mutating_it() {
+    let root = std::env::temp_dir().join(format!(
+        "gta-claw-check-state-{}-{}",
+        std::process::id(),
+        NEXT_STATE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("temporary root is created");
+    let state_file = root.join("not-a-directory");
+    std::fs::write(&state_file, "sentinel").expect("sentinel state file is written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
+        .env_clear()
+        .args(["--check-config", "--state-dir"])
+        .arg(&state_file)
+        .env("GITHUB_TOKEN", "test")
+        .env("ENABLE_TEAMS", "false")
+        .env("ENABLE_TELEGRAM", "false")
+        .env("ENABLE_DISCORD", "false")
+        .env("ENABLE_WHATSAPP", "false")
+        .env("COPILOT_MODEL", "gpt-4o")
+        .env("AGENT_ROLE_URL", "https://example.test/role")
+        .output()
+        .expect("configuration check runs");
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stdout_of(&output).is_empty(), "{output:?}");
+    assert!(
+        stderr_of(&output).contains("is not a directory"),
+        "{output:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&state_file).expect("sentinel remains readable"),
+        "sentinel",
+        "configuration checking mutated the state destination"
+    );
+    std::fs::remove_dir_all(root).expect("temporary root is removed");
 }

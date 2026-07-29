@@ -5,8 +5,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self as std_mpsc, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use claw_config::{ConfigDomain, ConfigSnapshot, ReloadManager, schema_json, to_json5};
 use claw_http_api::{
@@ -35,6 +37,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const MAX_HISTORY_MESSAGES: usize = 32;
+const AUDIT_QUEUE_CAPACITY: usize = 64;
+const AUDIT_WRITE_DEADLINE: Duration = Duration::from_secs(2);
+const RESPONSE_CONTINUITY_PREFIX: &str = "response_session_";
 
 /// Dependency state shared with `/ready` and operator diagnostics.
 #[derive(Debug)]
@@ -360,6 +365,9 @@ impl ProviderAdapter {
     }
 
     fn history(&self, session_id: &str) -> Vec<ChatMessage> {
+        if !session_id.starts_with(RESPONSE_CONTINUITY_PREFIX) {
+            return Vec::new();
+        }
         let now = Instant::now();
         let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
         history
@@ -376,6 +384,9 @@ impl ProviderAdapter {
     }
 
     fn remember(&self, session_id: &str, user: ChatMessage, assistant: AssistantMessage) {
+        if !session_id.starts_with(RESPONSE_CONTINUITY_PREFIX) {
+            return;
+        }
         let now = Instant::now();
         let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
         history
@@ -843,6 +854,38 @@ impl SwappableProvider {
         state.generation = state.generation.saturating_add(1);
     }
 
+    /// Returns the role prompt used by current and future provider activations.
+    #[must_use]
+    pub fn role_prompt(&self) -> String {
+        self.state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .role_prompt
+            .clone()
+    }
+
+    /// Validates and commits model and role selection as one provider update.
+    ///
+    /// # Errors
+    ///
+    /// Returns before changing either field when the active provider rejects the
+    /// candidate model or the provider slot lock is poisoned.
+    pub fn apply_configuration(&self, model: &str, prompt: &str) -> Result<(), String> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "provider slot is unavailable".to_owned())?;
+        if let Some(provider) = state.current.as_ref() {
+            provider.set_default_model(model)?;
+            provider.set_role_prompt(prompt);
+        }
+        model.clone_into(&mut state.default_model);
+        prompt.clone_into(&mut state.role_prompt);
+        state.generation = state.generation.saturating_add(1);
+        drop(state);
+        Ok(())
+    }
+
     /// Publishes provider readiness after every dependent runtime sees activation.
     pub fn mark_ready(&self) {
         self.ready_gate.store(true, Ordering::Release);
@@ -1168,6 +1211,27 @@ pub struct AppliedReload {
     pub changed: Vec<String>,
 }
 
+/// Optional role participant in one reload transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleReload {
+    /// Role-selected model, or the candidate configuration default.
+    pub model: Option<String>,
+    /// Complete role prompt for subsequent requests.
+    pub prompt: String,
+}
+
+/// Async reload surface shared by file, control, admin, and legacy ingress.
+pub trait ConfigurationReloader: Send + Sync {
+    /// Applies one JSON5 candidate through the runtime-admitted transaction.
+    fn apply(
+        &self,
+        source: String,
+        source_name: String,
+        role: Option<RoleReload>,
+        cancellation: CancellationToken,
+    ) -> PortFuture<'_, Result<AppliedReload, String>>;
+}
+
 /// Last-known-good configuration owner and hot-reload transaction.
 #[derive(Debug)]
 pub struct ConfigController {
@@ -1238,22 +1302,37 @@ impl ConfigController {
     /// failure, or a provider model refusal. Every failure restores the previous
     /// manager and provider selection before it returns.
     pub fn apply_json5(&self, source: &str, source_name: &str) -> Result<AppliedReload, String> {
+        self.apply_json5_with_role(source, source_name, None)
+    }
+
+    /// Prepares and commits configuration and optional role participants.
+    ///
+    /// An unchanged candidate returns the current generation without touching
+    /// provider history or runtime-owned sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse, hot-swap classification, provider validation, or
+    /// poisoned-lock failure before publishing a partial candidate.
+    pub fn apply_json5_with_role(
+        &self,
+        source: &str,
+        source_name: &str,
+        role: Option<RoleReload>,
+    ) -> Result<AppliedReload, String> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| "configuration reload lock is poisoned".to_owned())?;
         let previous = state.manager.snapshot();
         let previous_timeout = copilot_request_timeout_ms(&previous)?;
-        let outcome = state
-            .manager
+        let mut candidate_manager = ReloadManager::new((*previous).clone());
+        let outcome = candidate_manager
             .reload_json5(source, source_name)
             .map_err(|error| error.to_string())?;
         let candidate_timeout = match copilot_request_timeout_ms(&outcome.snapshot) {
             Ok(timeout) => timeout,
-            Err(error) => {
-                state.manager = ReloadManager::new((*previous).clone());
-                return Err(format!("reload rolled back: {error}"));
-            }
+            Err(error) => return Err(format!("reload rolled back: {error}")),
         };
         let has_unsupported = outcome
             .changed_domains
@@ -1264,7 +1343,6 @@ impl ConfigController {
             || has_unsupported
             || previous_timeout != candidate_timeout
         {
-            state.manager = ReloadManager::new((*previous).clone());
             return Err(format!(
                 "reload requires a restart or changes an adapter that is not hot-swappable: {:?}",
                 outcome.changed_domains
@@ -1272,28 +1350,43 @@ impl ConfigController {
         }
         let previous_model = previous.core().copilot().default_model();
         let candidate_model = outcome.snapshot.core().copilot().default_model();
-        if previous_model != candidate_model && self.provider.default_model() != previous_model {
-            state.manager = ReloadManager::new((*previous).clone());
+        let current_model = self.provider.default_model();
+        if role.is_none() && previous_model != candidate_model && current_model != previous_model {
             return Err(
                 "reload rolled back: the remote role owns model selection for this run".to_owned(),
             );
         }
-        if previous_model != candidate_model
-            && let Err(error) = self.provider.set_default_model(candidate_model)
-        {
-            state.manager = ReloadManager::new((*previous).clone());
-            return Err(format!("reload rolled back: {error}"));
-        }
-        if !outcome.changed_domains.is_empty() {
-            self.provider.clear_history();
-        }
-        state.generation = state.generation.saturating_add(1);
-        let generation = state.generation;
+        let current_prompt = self.provider.role_prompt();
+        let (selected_model, selected_prompt) = role.map_or_else(
+            || (candidate_model.to_owned(), current_prompt.clone()),
+            |role| {
+                (
+                    role.model.unwrap_or_else(|| candidate_model.to_owned()),
+                    role.prompt,
+                )
+            },
+        );
         let changed = outcome
             .changed_domains
             .iter()
             .map(|domain| format!("{domain:?}").to_ascii_lowercase())
             .collect::<Vec<_>>();
+        if changed.is_empty()
+            && selected_model == current_model
+            && selected_prompt == current_prompt
+        {
+            return Ok(AppliedReload {
+                generation: state.generation,
+                changed,
+            });
+        }
+        self.provider
+            .apply_configuration(&selected_model, &selected_prompt)
+            .map_err(|error| format!("reload rolled back: {error}"))?;
+        self.provider.clear_history();
+        state.manager = candidate_manager;
+        state.generation = state.generation.saturating_add(1);
+        let generation = state.generation;
         drop(state);
         self.diagnostics.record(format!(
             "configuration generation {generation} committed ({})",
@@ -1340,8 +1433,21 @@ pub(crate) fn updates_enabled(snapshot: &ConfigSnapshot) -> Result<bool, String>
 /// Durable JSON-lines adapter for HTTP authorization decisions.
 #[derive(Debug)]
 pub struct DurableSecurityAudit {
-    file: Mutex<File>,
+    sender: SyncSender<AuditCommand>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
     readiness: Arc<DependencyReadiness>,
+    failed: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+enum AuditCommand {
+    Persist {
+        encoded: Vec<u8>,
+        completed: SyncSender<io::Result<()>>,
+    },
+    Shutdown {
+        completed: SyncSender<io::Result<()>>,
+    },
 }
 
 impl DurableSecurityAudit {
@@ -1351,36 +1457,123 @@ impl DurableSecurityAudit {
     ///
     /// Returns the operating-system error raised while opening the file.
     pub fn open(path: &Path, readiness: Arc<DependencyReadiness>) -> io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Self::from_file(file, readiness)
+    }
+
+    fn from_file(file: File, readiness: Arc<DependencyReadiness>) -> io::Result<Self> {
+        let (sender, receiver) = std_mpsc::sync_channel(AUDIT_QUEUE_CAPACITY);
+        let failed = Arc::new(AtomicBool::new(false));
+        let writer_failed = Arc::clone(&failed);
+        let worker = thread::Builder::new()
+            .name("gta-claw-security-audit".to_owned())
+            .spawn(move || audit_writer(file, &receiver, &writer_failed))?;
         Ok(Self {
-            file: Mutex::new(OpenOptions::new().create(true).append(true).open(path)?),
+            sender,
+            worker: Mutex::new(Some(worker)),
             readiness,
+            failed,
         })
+    }
+
+    /// Flushes and joins the dedicated writer within `budget`.
+    #[must_use]
+    pub fn shutdown(&self, budget: Duration) -> bool {
+        let (completed, acknowledged) = std_mpsc::sync_channel(1);
+        if self
+            .sender
+            .try_send(AuditCommand::Shutdown { completed })
+            .is_err()
+        {
+            self.failed.store(true, Ordering::Release);
+            self.readiness.set("audit", false);
+            return false;
+        }
+        let flushed = if let Ok(result) = acknowledged.recv_timeout(budget) {
+            result.is_ok()
+        } else {
+            self.failed.store(true, Ordering::Release);
+            self.readiness.set("audit", false);
+            return false;
+        };
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let joined = worker.is_none_or(|worker| worker.join().is_ok());
+        let clean = flushed && joined && !self.failed.load(Ordering::Acquire);
+        self.readiness.set("audit", clean);
+        clean
     }
 }
 
 impl AuditPort for DurableSecurityAudit {
     fn persist(&self, event: &AuditEvent) -> Result<(), PortError> {
-        let result = (|| {
-            let encoded = serde_json::to_vec(&json!({
-                "action": audit_action(event.action),
-                "subject": audit_subject(&event.subject),
-                "outcome": audit_outcome(event.outcome),
-                "reason": audit_reason(event.reason),
-                "unixMillis": event.unix_millis,
-            }))
-            .map_err(|_| PortError::new(PortErrorKind::Internal, "audit encoding failed"))?;
-            let mut file = self
-                .file
-                .lock()
-                .map_err(|_| PortError::new(PortErrorKind::Internal, "audit writer lock failed"))?;
-            file.write_all(&encoded)
-                .and_then(|()| file.write_all(b"\n"))
-                .and_then(|()| file.flush())
-                .and_then(|()| file.sync_data())
-                .map_err(|_| PortError::new(PortErrorKind::Unavailable, "audit persistence failed"))
-        })();
+        let encoded = serde_json::to_vec(&json!({
+            "action": audit_action(event.action),
+            "subject": audit_subject(&event.subject),
+            "outcome": audit_outcome(event.outcome),
+            "reason": audit_reason(event.reason),
+            "unixMillis": event.unix_millis,
+        }))
+        .map_err(|_| PortError::new(PortErrorKind::Internal, "audit encoding failed"))?;
+        let (completed, acknowledged) = std_mpsc::sync_channel(1);
+        let result = self
+            .sender
+            .try_send(AuditCommand::Persist { encoded, completed })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => {
+                    PortError::new(PortErrorKind::Unavailable, "audit writer queue is full")
+                }
+                TrySendError::Disconnected(_) => {
+                    PortError::new(PortErrorKind::Unavailable, "audit writer is unavailable")
+                }
+            })
+            .and_then(|()| {
+                acknowledged
+                    .recv_timeout(AUDIT_WRITE_DEADLINE)
+                    .map_err(|_| {
+                        PortError::new(
+                            PortErrorKind::Unavailable,
+                            "audit persistence deadline expired",
+                        )
+                    })?
+                    .map_err(|_| {
+                        PortError::new(PortErrorKind::Unavailable, "audit persistence failed")
+                    })
+            });
+        if result.is_err() {
+            self.failed.store(true, Ordering::Release);
+        }
         self.readiness.set("audit", result.is_ok());
         result
+    }
+}
+
+fn audit_writer(mut file: File, receiver: &std_mpsc::Receiver<AuditCommand>, failed: &AtomicBool) {
+    while let Ok(command) = receiver.recv() {
+        match command {
+            AuditCommand::Persist { encoded, completed } => {
+                let result = file
+                    .write_all(&encoded)
+                    .and_then(|()| file.write_all(b"\n"))
+                    .and_then(|()| file.flush())
+                    .and_then(|()| file.sync_data());
+                if result.is_err() {
+                    failed.store(true, Ordering::Release);
+                }
+                let _ = completed.send(result);
+            }
+            AuditCommand::Shutdown { completed } => {
+                let result = file.flush().and_then(|()| file.sync_data());
+                if result.is_err() {
+                    failed.store(true, Ordering::Release);
+                }
+                let _ = completed.send(result);
+                break;
+            }
+        }
     }
 }
 
@@ -1520,15 +1713,23 @@ impl OperatorInventory {
 }
 
 /// Useful subset of the frozen admin surface plus explicit unavailable errors.
-#[derive(Debug)]
 pub struct OperatorAdmin {
     config: Arc<ConfigController>,
+    reloader: Arc<dyn ConfigurationReloader>,
     provider: Arc<SwappableProvider>,
     readiness: Arc<DependencyReadiness>,
     diagnostics: Arc<Diagnostics>,
     inventory: OperatorInventory,
-    reload_lock: Arc<tokio::sync::Mutex<()>>,
     gateway_pairing: Arc<dyn GatewayPairingAdmin>,
+}
+
+impl std::fmt::Debug for OperatorAdmin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OperatorAdmin")
+            .field("provider", &self.provider.provider_name())
+            .finish_non_exhaustive()
+    }
 }
 
 impl OperatorAdmin {
@@ -1536,20 +1737,20 @@ impl OperatorAdmin {
     #[must_use]
     pub const fn new(
         config: Arc<ConfigController>,
+        reloader: Arc<dyn ConfigurationReloader>,
         provider: Arc<SwappableProvider>,
         readiness: Arc<DependencyReadiness>,
         diagnostics: Arc<Diagnostics>,
         inventory: OperatorInventory,
-        reload_lock: Arc<tokio::sync::Mutex<()>>,
         gateway_pairing: Arc<dyn GatewayPairingAdmin>,
     ) -> Self {
         Self {
             config,
+            reloader,
             provider,
             readiness,
             diagnostics,
             inventory,
-            reload_lock,
             gateway_pairing,
         }
     }
@@ -1621,7 +1822,6 @@ impl AdminPort for OperatorAdmin {
                 )
                 .map_err(|_| admin_unavailable("configuration schema encoding failed"))?,
                 "config.apply" => {
-                    let _reload = self.reload_lock.lock().await;
                     let source = params
                         .as_ref()
                         .and_then(|value| value.get("source"))
@@ -1633,8 +1833,14 @@ impl AdminPort for OperatorAdmin {
                         .and_then(Value::as_str)
                         .unwrap_or("<admin>");
                     let applied = self
-                        .config
-                        .apply_json5(source, source_name)
+                        .reloader
+                        .apply(
+                            source.to_owned(),
+                            source_name.to_owned(),
+                            None,
+                            cancellation.clone(),
+                        )
+                        .await
                         .map_err(admin_invalid)?;
                     json!({"generation": applied.generation, "changed": applied.changed})
                 }
@@ -1949,13 +2155,18 @@ impl Provider for SmokeProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigController, DependencyReadiness, Diagnostics, EmptyModelTools, ProviderHistoryConfig,
-        SmokeProvider, SwappableProvider, admin_port_failure, copilot_request_timeout_ms,
+        ConfigController, DependencyReadiness, Diagnostics, DurableSecurityAudit, EmptyModelTools,
+        ProviderHistoryConfig, SmokeProvider, SwappableProvider, admin_port_failure,
+        copilot_request_timeout_ms,
     };
+    use std::fs::File;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use claw_config::{migrate_legacy_environment, to_json5};
-    use claw_http_api::{PortError, PortErrorKind};
+    use claw_http_api::{AuditPort, PortError, PortErrorKind};
+    use claw_security::audit::{AuditAction, AuditEvent, AuditOutcome, AuditReason, AuditSubject};
+    use claw_security::authorization::Role;
 
     fn snapshot(model: &str) -> claw_config::ConfigSnapshot {
         snapshot_with_timeout(model, "120000")
@@ -1971,6 +2182,33 @@ mod tests {
         ])
         .expect("fixture config")
         .config
+    }
+
+    #[test]
+    fn durable_audit_fails_closed_when_the_writer_cannot_commit() {
+        let path =
+            std::env::temp_dir().join(format!("gta-claw-audit-failure-{}", std::process::id()));
+        std::fs::write(&path, "").expect("audit fixture is created");
+        let file = File::open(&path).expect("audit fixture opens read-only");
+        let readiness = Arc::new(DependencyReadiness::new(["audit"]));
+        readiness.set("audit", true);
+        let audit = DurableSecurityAudit::from_file(file, Arc::clone(&readiness))
+            .expect("audit worker starts");
+        let error = audit
+            .persist(&AuditEvent {
+                action: AuditAction::AuthorizationEvaluated,
+                subject: AuditSubject::Role(Role::Operator),
+                outcome: AuditOutcome::Allowed,
+                reason: AuditReason::PolicySatisfied,
+                unix_millis: 1,
+            })
+            .expect_err("a read-only audit descriptor must fail closed");
+
+        assert_eq!(error.kind, PortErrorKind::Unavailable);
+        assert!(!readiness.is_ready());
+        assert!(!audit.shutdown(Duration::from_secs(1)));
+        assert!(!readiness.is_ready());
+        std::fs::remove_file(path).expect("audit fixture is removed");
     }
 
     #[test]

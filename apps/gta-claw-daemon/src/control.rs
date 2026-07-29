@@ -14,16 +14,114 @@
 //! default disposition, with no drain and no stop summary.
 
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use claw_application::Application;
+use claw_observability::TelemetryHandle;
 use claw_platform::NativeSystemProbe;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio_util::sync::CancellationToken;
 
 use crate::compose::{Daemon, STOP_DEADLINE, StopSummary};
 use crate::production::{
-    LoadedConfig, ProductionOptions, ProductionService, ProductionStopSummary,
+    LoadedConfig, PRODUCTION_STOP_DEADLINE, ProductionOptions, ProductionService,
+    ProductionStopSummary, shutdown_telemetry_within,
 };
+use crate::runtime::{BlockingTaskHost, TaskLedger};
+
+const SUPERVISOR_OUTPUT_DEADLINE: Duration = Duration::from_millis(250);
+
+struct SupervisorOutput<W> {
+    writer: Arc<Mutex<W>>,
+    tasks: BlockingTaskHost,
+}
+
+impl<W> SupervisorOutput<W>
+where
+    W: Write + Send + 'static,
+{
+    fn new(writer: W) -> Self {
+        Self {
+            writer: Arc::new(Mutex::new(writer)),
+            tasks: BlockingTaskHost::new(1),
+        }
+    }
+
+    async fn line(&self, line: impl Into<String>) -> io::Result<()> {
+        let writer = Arc::clone(&self.writer);
+        let line = line.into();
+        let written = self.tasks.run("supervisor-output", move || {
+            let mut writer = writer.lock().unwrap_or_else(PoisonError::into_inner);
+            writeln!(writer, "{line}").and_then(|()| writer.flush())
+        });
+        tokio::time::timeout(SUPERVISOR_OUTPUT_DEADLINE, written)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "supervisor output deadline expired",
+                )
+            })?
+            .map_err(io::Error::other)?
+    }
+
+    async fn shutdown(&self) -> io::Result<()> {
+        let ledger = self.tasks.shutdown_within(SUPERVISOR_OUTPUT_DEADLINE).await;
+        if ledger.is_settled() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "supervisor output left {} of {} writes unjoined",
+                ledger.spawned().saturating_sub(ledger.terminated()),
+                ledger.spawned(),
+            )))
+        }
+    }
+}
+
+async fn cleanup_startup_resources(
+    blocking: &BlockingTaskHost,
+    telemetry: Option<TelemetryHandle>,
+    started: Instant,
+) -> (TaskLedger, &'static str, Option<String>) {
+    let telemetry = shutdown_telemetry_within(
+        blocking,
+        telemetry,
+        PRODUCTION_STOP_DEADLINE.saturating_sub(started.elapsed()),
+    )
+    .await;
+    let (telemetry, telemetry_error) = match telemetry {
+        Ok(outcome) => (outcome, None),
+        Err(error) => ("failed", Some(error)),
+    };
+    let ledger = blocking
+        .shutdown_within(PRODUCTION_STOP_DEADLINE.saturating_sub(started.elapsed()))
+        .await;
+    (ledger, telemetry, telemetry_error)
+}
+
+fn startup_error_with_cleanup(
+    error: crate::production::ProductionError,
+    ledger: TaskLedger,
+    telemetry_error: Option<String>,
+) -> Box<dyn std::error::Error> {
+    if telemetry_error.is_none() && ledger.is_settled() {
+        return Box::new(error);
+    }
+    let mut failures = vec![error.to_string()];
+    if let Some(error) = telemetry_error {
+        failures.push(format!("telemetry cleanup failed: {error}"));
+    }
+    if !ledger.is_settled() {
+        failures.push(format!(
+            "startup cleanup left {} of {} blocking tasks unjoined",
+            ledger.spawned().saturating_sub(ledger.terminated()),
+            ledger.spawned(),
+        ));
+    }
+    Box::new(io::Error::other(failures.join("; ")))
+}
 
 /// The control word that ends a run.
 pub const SHUTDOWN_COMMAND: &str = "shutdown";
@@ -407,16 +505,44 @@ pub async fn serve(
 /// composition fails. After readiness, returns an output error only after the
 /// service has been drained.
 pub async fn serve_production(
-    mut output: impl Write,
+    output: impl Write + Send + 'static,
     control: impl tokio::io::AsyncRead + Unpin,
     options: &ProductionOptions,
     loaded: LoadedConfig,
 ) -> Result<ProductionStopSummary, Box<dyn std::error::Error>> {
-    let mut signals = StopSignals::install()?;
+    let signals = StopSignals::install()?;
+    let blocking = BlockingTaskHost::new(4);
+    serve_production_preinstalled(output, control, options, loaded, signals, blocking, None).await
+}
+
+/// Runs production with signal and blocking-task ownership established by the
+/// process entry point before configuration I/O.
+///
+/// # Errors
+///
+/// Returns a startup, runtime, bounded-output, or shutdown error after owned
+/// work has been drained or represented in the returned stop accounting.
+pub async fn serve_production_preinstalled(
+    output: impl Write + Send + 'static,
+    control: impl tokio::io::AsyncRead + Unpin,
+    options: &ProductionOptions,
+    loaded: LoadedConfig,
+    mut signals: StopSignals,
+    blocking: BlockingTaskHost,
+    telemetry: Option<TelemetryHandle>,
+) -> Result<ProductionStopSummary, Box<dyn std::error::Error>> {
+    let output = SupervisorOutput::new(output);
     let application = Application::new(NativeSystemProbe);
     let mut control = ControlChannel::new(control);
     let startup_cancellation = CancellationToken::new();
-    let startup = ProductionService::start(options, loaded, startup_cancellation.clone());
+    let startup_telemetry = telemetry.clone();
+    let startup = ProductionService::start(
+        options,
+        loaded,
+        startup_cancellation.clone(),
+        blocking.clone(),
+        telemetry,
+    );
     tokio::pin!(startup);
     let mut reload_deferred = false;
     let mut service = loop {
@@ -425,80 +551,133 @@ pub async fn serve_production(
             Signal(SignalEvent),
             Control(ControlEvent),
         }
+
         let event = tokio::select! {
             result = &mut startup => StartupEvent::Started(result),
             signal = signals.recv_event() => StartupEvent::Signal(signal),
             control = control.recv() => StartupEvent::Control(control),
         };
         match event {
-            StartupEvent::Started(result) => break result?,
+            StartupEvent::Started(Ok(service)) => break service,
+            StartupEvent::Started(Err(error)) => {
+                let (ledger, _, telemetry_error) =
+                    cleanup_startup_resources(&blocking, startup_telemetry.clone(), Instant::now())
+                        .await;
+                return Err(startup_error_with_cleanup(error, ledger, telemetry_error));
+            }
             StartupEvent::Signal(SignalEvent::Stop(trigger)) => {
                 startup_cancellation.cancel();
-                let summary = match startup.as_mut().await {
-                    Ok(service) => service.stop(None).await,
-                    Err(error) if error.stage() == "startup" => {
-                        ProductionStopSummary::before_start()
-                    }
-                    Err(error) => return Err(Box::new(error)),
-                };
-                write_production_stop(&mut output, trigger.label(), &summary)?;
+                let stop_started = Instant::now();
+                let summary =
+                    match tokio::time::timeout(PRODUCTION_STOP_DEADLINE, startup.as_mut()).await {
+                        Ok(Ok(service)) => service.stop(None).await,
+                        Ok(Err(error)) if error.stage() == "startup" => {
+                            let (ledger, telemetry, _) = cleanup_startup_resources(
+                                &blocking,
+                                startup_telemetry.clone(),
+                                stop_started,
+                            )
+                            .await;
+                            ProductionStopSummary::before_start(ledger, telemetry)
+                        }
+                        Ok(Err(error)) => {
+                            let (ledger, _, telemetry_error) = cleanup_startup_resources(
+                                &blocking,
+                                startup_telemetry.clone(),
+                                stop_started,
+                            )
+                            .await;
+                            return Err(startup_error_with_cleanup(error, ledger, telemetry_error));
+                        }
+                        Err(_) => {
+                            let (ledger, telemetry, _) = cleanup_startup_resources(
+                                &blocking,
+                                startup_telemetry.clone(),
+                                stop_started,
+                            )
+                            .await;
+                            ProductionStopSummary::before_start(ledger, telemetry)
+                        }
+                    };
+                write_production_stop(&output, trigger.label(), &summary).await?;
+                output.shutdown().await?;
                 return Ok(summary);
             }
             StartupEvent::Control(ControlEvent::Stop) => {
                 startup_cancellation.cancel();
-                let summary = match startup.as_mut().await {
-                    Ok(service) => service.stop(None).await,
-                    Err(error) if error.stage() == "startup" => {
-                        ProductionStopSummary::before_start()
-                    }
-                    Err(error) => return Err(Box::new(error)),
-                };
-                write_production_stop(&mut output, StopTrigger::Control.label(), &summary)?;
+                let stop_started = Instant::now();
+                let summary =
+                    match tokio::time::timeout(PRODUCTION_STOP_DEADLINE, startup.as_mut()).await {
+                        Ok(Ok(service)) => service.stop(None).await,
+                        Ok(Err(error)) if error.stage() == "startup" => {
+                            let (ledger, telemetry, _) = cleanup_startup_resources(
+                                &blocking,
+                                startup_telemetry.clone(),
+                                stop_started,
+                            )
+                            .await;
+                            ProductionStopSummary::before_start(ledger, telemetry)
+                        }
+                        Ok(Err(error)) => {
+                            let (ledger, _, telemetry_error) = cleanup_startup_resources(
+                                &blocking,
+                                startup_telemetry.clone(),
+                                stop_started,
+                            )
+                            .await;
+                            return Err(startup_error_with_cleanup(error, ledger, telemetry_error));
+                        }
+                        Err(_) => {
+                            let (ledger, telemetry, _) = cleanup_startup_resources(
+                                &blocking,
+                                startup_telemetry.clone(),
+                                stop_started,
+                            )
+                            .await;
+                            ProductionStopSummary::before_start(ledger, telemetry)
+                        }
+                    };
+                write_production_stop(&output, StopTrigger::Control.label(), &summary).await?;
+                output.shutdown().await?;
                 return Ok(summary);
             }
             StartupEvent::Signal(SignalEvent::Reload)
             | StartupEvent::Control(ControlEvent::Reload) => {
                 reload_deferred = true;
-                writeln!(output, "reload deferred phase=starting")?;
-                output.flush()?;
+                output.line("reload deferred phase=starting").await?;
             }
             StartupEvent::Control(ControlEvent::Status) => {
-                writeln!(output, "status ready=false phase=starting")?;
-                output.flush()?;
+                output.line("status ready=false phase=starting").await?;
             }
             StartupEvent::Control(ControlEvent::Ignored) => {
-                writeln!(output, "control ignored")?;
-                output.flush()?;
+                output.line("control ignored").await?;
             }
         }
     };
-    if reload_deferred {
-        let reload_write =
-            writeln!(output, "{}", reload_line(&service).await).and_then(|()| output.flush());
-        if let Err(error) = reload_write {
-            let _ = service
-                .stop(Some(format!("supervisor output failed: {error}")))
-                .await;
-            return Err(Box::new(error));
-        }
+    if reload_deferred && let Err(error) = output.line(reload_line(&service).await).await {
+        let _ = service
+            .stop(Some(format!("supervisor output failed: {error}")))
+            .await;
+        return Err(Box::new(error));
     }
     let addresses = service.addresses();
 
-    let startup_write = (|| -> io::Result<()> {
-        writeln!(output, "{}", application.ready())?;
-        writeln!(output, "{}", application.health())?;
-        writeln!(
-            output,
-            "service http={} legacy={} gateway={} mcp={} provider={} config_generation={}",
-            addresses.http,
-            addresses.legacy,
-            addresses.gateway,
-            addresses.mcp,
-            service.provider_name(),
-            service.config_generation(),
-        )?;
-        output.flush()
-    })();
+    let startup_write = async {
+        output.line(application.ready().to_string()).await?;
+        output.line(application.health().to_string()).await?;
+        output
+            .line(format!(
+                "service http={} legacy={} gateway={} mcp={} provider={} config_generation={}",
+                addresses.http,
+                addresses.legacy,
+                addresses.gateway,
+                addresses.mcp,
+                service.provider_name(),
+                service.config_generation(),
+            ))
+            .await
+    }
+    .await;
     if let Err(error) = startup_write {
         let _ = service
             .stop(Some(format!("supervisor output failed: {error}")))
@@ -529,7 +708,7 @@ pub async fn serve_production(
             }
             Event::Signal(SignalEvent::Reload) | Event::Control(ControlEvent::Reload) => {
                 let line = reload_line(&service).await;
-                if let Err(error) = writeln!(output, "{line}").and_then(|()| output.flush()) {
+                if let Err(error) = output.line(line).await {
                     break (
                         "runtime",
                         Some(format!("supervisor output failed: {error}")),
@@ -537,9 +716,7 @@ pub async fn serve_production(
                 }
             }
             Event::Control(ControlEvent::Status) => {
-                if let Err(error) =
-                    writeln!(output, "{}", service.status_line()).and_then(|()| output.flush())
-                {
+                if let Err(error) = output.line(service.status_line()).await {
                     break (
                         "runtime",
                         Some(format!("supervisor output failed: {error}")),
@@ -547,9 +724,7 @@ pub async fn serve_production(
                 }
             }
             Event::Control(ControlEvent::Ignored) => {
-                if let Err(error) =
-                    writeln!(output, "control ignored").and_then(|()| output.flush())
-                {
+                if let Err(error) = output.line("control ignored").await {
                     break (
                         "runtime",
                         Some(format!("supervisor output failed: {error}")),
@@ -560,7 +735,30 @@ pub async fn serve_production(
     };
 
     let summary = service.stop(fault).await;
-    write_production_stop(&mut output, reason, &summary)?;
+    write_production_stop(&output, reason, &summary).await?;
+    output.shutdown().await?;
+    Ok(summary)
+}
+
+/// Reports a stop received before a production service could be constructed.
+///
+/// The supplied ledger is rendered instead of the historically misleading
+/// clean `0/0`, so a blocked configuration or credential task remains visible.
+///
+/// # Errors
+///
+/// Returns a bounded supervisor-output error when the summary cannot be
+/// delivered or its writer task cannot be joined.
+pub async fn report_pre_start_stop(
+    output: impl Write + Send + 'static,
+    trigger: StopTrigger,
+    ledger: TaskLedger,
+    telemetry: &'static str,
+) -> Result<ProductionStopSummary, Box<dyn std::error::Error>> {
+    let output = SupervisorOutput::new(output);
+    let summary = ProductionStopSummary::before_start(ledger, telemetry);
+    write_production_stop(&output, trigger.label(), &summary).await?;
+    output.shutdown().await?;
     Ok(summary)
 }
 
@@ -582,14 +780,17 @@ async fn reload_line(service: &ProductionService) -> String {
     }
 }
 
-fn write_production_stop(
-    output: &mut impl Write,
+async fn write_production_stop<W>(
+    output: &SupervisorOutput<W>,
     reason: &str,
     summary: &ProductionStopSummary,
-) -> io::Result<()> {
-    writeln!(
-        output,
-        "stopped reason={} clean={} drained={} completed={} abandoned={} tasks={}/{}",
+) -> io::Result<()>
+where
+    W: Write + Send + 'static,
+{
+    output
+        .line(format!(
+        "stopped reason={} clean={} drained={} completed={} abandoned={} tasks={}/{} telemetry={}",
         reason,
         summary.is_clean(),
         summary.drained(),
@@ -597,8 +798,9 @@ fn write_production_stop(
         summary.abandoned(),
         summary.terminated(),
         summary.spawned(),
-    )?;
-    output.flush()
+        summary.telemetry(),
+    ))
+        .await
 }
 
 #[cfg(test)]

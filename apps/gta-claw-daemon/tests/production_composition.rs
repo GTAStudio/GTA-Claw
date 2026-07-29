@@ -371,6 +371,45 @@ fn bound_http_is_ready_and_dispatches_to_the_composed_provider() {
 }
 
 #[test]
+fn agent_runtime_one_shots_cannot_evict_responses_continuity() {
+    let daemon = Running::start("gpt-4o");
+    let first = request(
+        daemon.http,
+        "POST",
+        "/v1/responses",
+        Some("operator-token"),
+        Some(r#"{"model":"openclaw","input":"continuity-anchor"}"#),
+    );
+    let first_body: serde_json::Value =
+        serde_json::from_str(response_body(&first)).expect("first response body is JSON");
+    let first_id = first_body["id"].as_str().expect("first response has an id");
+
+    for sequence in 0..128 {
+        let body = format!(
+            r#"{{"message":"one-shot-{sequence}","conversation_id":"runtime-{sequence}"}}"#
+        );
+        let response = request(daemon.legacy, "POST", "/chat", None, Some(&body));
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    let continuation_body = format!(
+        r#"{{"model":"openclaw","input":"continuity-tail","previous_response_id":"{first_id}"}}"#
+    );
+    let continuation = request(
+        daemon.http,
+        "POST",
+        "/v1/responses",
+        Some("operator-token"),
+        Some(&continuation_body),
+    );
+    assert!(continuation.starts_with("HTTP/1.1 200"), "{continuation}");
+    assert!(continuation.contains("continuity-anchor"), "{continuation}");
+    assert!(continuation.contains("continuity-tail"), "{continuation}");
+
+    daemon.stop();
+}
+
+#[test]
 fn legacy_conditional_channel_routes_use_composed_adapters() {
     let daemon = Running::start_with_channels("gpt-4o", true, true);
 
@@ -600,6 +639,37 @@ fn reload_commits_a_live_model_and_rolls_back_a_bad_candidate() {
     daemon.stop();
 }
 
+#[test]
+fn unchanged_reload_is_a_true_no_op() {
+    let mut daemon = Running::start("gpt-4o");
+    let before = request(
+        daemon.legacy,
+        "POST",
+        "/chat",
+        None,
+        Some(r#"{"message":"retained-before-noop","conversation_id":"noop-session"}"#),
+    );
+    assert!(before.starts_with("HTTP/1.1 200"), "{before}");
+
+    let reloaded = daemon.control("reload");
+    assert_eq!(reloaded, "reloaded generation=0 changed=none");
+    let status = daemon.control("status");
+    assert!(status.contains("config_generation=0"), "{status}");
+    assert!(status.contains("model=gpt-4o"), "{status}");
+
+    let after = request(
+        daemon.legacy,
+        "POST",
+        "/chat",
+        None,
+        Some(r#"{"message":"retained-after-noop","conversation_id":"noop-session"}"#),
+    );
+    assert!(after.contains("retained-before-noop"), "{after}");
+    assert!(after.contains("retained-after-noop"), "{after}");
+
+    daemon.stop();
+}
+
 #[cfg(unix)]
 #[test]
 fn a_termination_during_dependency_startup_cancels_before_readiness() {
@@ -677,11 +747,17 @@ fn a_termination_during_dependency_startup_cancels_before_readiness() {
         .recv_timeout(Duration::from_secs(5))
         .expect("daemon reports its startup stop");
     assert!(
-        stopped.starts_with(
-            "stopped reason=terminate clean=true drained=0 completed=0 abandoned=0 tasks=0/0"
-        ),
+        stopped
+            .starts_with("stopped reason=terminate clean=true drained=0 completed=0 abandoned=0"),
         "unexpected startup stop: {stopped}"
     );
+    let tasks = field(&stopped, "tasks");
+    assert_ne!(
+        tasks, "0/0",
+        "startup blocking work disappeared from task accounting"
+    );
+    let (joined, spawned) = tasks.split_once('/').expect("task ledger is a ratio");
+    assert_eq!(joined, spawned, "startup cancellation left work alive");
     let deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
         if let Some(status) = child.0.try_wait().expect("child status is available") {
