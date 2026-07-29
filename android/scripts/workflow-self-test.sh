@@ -27,7 +27,7 @@ grep -F '46f267b4754ca3af59b4ef30d273425c9585f2cc5fd20481bac4125c1e6f8217' \
 grep -F 'd691c9891d153466d5b99c0003fc6891482b97fb900b72c27b460b648f4e9534' \
   "$workspace/scripts/fetch-skia.sh" >/dev/null
 grep -F 'cargo deny' "$workflow" >/dev/null
-grep -F 'RUST_FONTCONFIG_DLOPEN: "1"' "$workflow" >/dev/null
+grep -F 'libfontconfig1-dev' "$workflow" >/dev/null
 grep -F './android/scripts/check.sh' "$workflow" >/dev/null
 grep -F './android/scripts/check-targets.sh' "$workflow" >/dev/null
 grep -F './android/scripts/package.sh' "$workflow" >/dev/null

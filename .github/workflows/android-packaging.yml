@@ -63,10 +63,13 @@ jobs:
           "$destination/cargo-deny" --version
           printf '%s\n' "$destination" >> "$GITHUB_PATH"
 
+      - name: Install Android host test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libfontconfig1-dev
+
       - name: Run Android shell source tests
         shell: bash
-        env:
-          RUST_FONTCONFIG_DLOPEN: "1"
         run: |
           set -euo pipefail
           ./android/scripts/workflow-self-test.sh
