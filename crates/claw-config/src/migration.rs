@@ -278,6 +278,10 @@ fn apply_mappings(
                 wire.core.channels.whatsapp.access_token =
                     secret_reference(mapping, name, value, true)?;
             }
+            MappingId::WhatsappAppSecret => {
+                wire.core.channels.whatsapp.app_secret =
+                    secret_reference(mapping, name, value, true)?;
+            }
             MappingId::WhatsappPhoneNumberId => {
                 wire.core.channels.whatsapp.phone_number_id = trimmed_optional(value);
             }

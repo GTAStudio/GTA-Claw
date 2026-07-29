@@ -68,7 +68,8 @@ function createClient(onMessage = async () => "") {
   return { client, sockets, urls };
 }
 
-test("Discord handles requested heartbeats and reconnects when ACKs go stale", async () => {
+test("Discord resets heartbeat scheduling for an adjacent opcode 1", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const { client, sockets } = createClient();
   client.start();
   const socket = sockets[0];
@@ -77,17 +78,28 @@ test("Discord handles requested heartbeats and reconnects when ACKs go stale", a
     op: 10,
     t: null,
     s: null,
-    d: { heartbeat_interval: 60_000 },
+    d: { heartbeat_interval: 1_000 },
   });
   assert.equal(socket.sent[0].op, 2);
 
+  t.mock.timers.tick(999);
   packet(socket, { op: 1, t: null, s: 7, d: null });
   assert.deepEqual(socket.sent.at(-1), { op: 1, d: 7 });
+  const sendsAfterRequest = socket.sent.length;
+
+  t.mock.timers.tick(1);
+  assert.equal(socket.terminateCalls, 0);
+  assert.equal(socket.sent.length, sendsAfterRequest);
+
+  t.mock.timers.tick(998);
+  assert.equal(socket.terminateCalls, 0);
   packet(socket, { op: 11, t: null, s: null, d: null });
 
-  client.sendHeartbeat(socket, true);
+  t.mock.timers.tick(1);
   assert.deepEqual(socket.sent.at(-1), { op: 1, d: 7 });
-  client.sendHeartbeat(socket, true);
+  assert.equal(socket.sent.length, sendsAfterRequest + 1);
+
+  t.mock.timers.tick(1_000);
   assert.equal(socket.terminateCalls, 1);
 
   await client.stop();

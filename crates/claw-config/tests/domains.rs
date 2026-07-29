@@ -877,6 +877,7 @@ fn source_environment_strings_trim_and_apply_frozen_empty_defaults() {
             ("MicrosoftAppId", "  teams-app  "),
             ("DISCORD_GATEWAY_URL", " \t "),
             ("WHATSAPP_PHONE_NUMBER_ID", " 15551234 "),
+            ("WHATSAPP_APP_SECRET", " must-not-be-persisted-app-secret "),
             ("WHATSAPP_WEBHOOK_PATH", " "),
             ("MicrosoftAppPassword", "must-not-be-persisted"),
             ("https_proxy", "must-not-be-persisted"),
@@ -898,10 +899,23 @@ fn source_environment_strings_trim_and_apply_frozen_empty_defaults() {
         value["channels"]["whatsapp"]["webhookPath"],
         "/whatsapp/webhook"
     );
+    assert_eq!(
+        value["channels"]["whatsapp"]["appSecret"]["source"],
+        "env"
+    );
+    assert_eq!(
+        value["channels"]["whatsapp"]["appSecret"]["provider"],
+        "default"
+    );
+    assert_eq!(
+        value["channels"]["whatsapp"]["appSecret"]["id"],
+        "WHATSAPP_APP_SECRET"
+    );
     assert_eq!(value["channels"]["msteams"]["appPassword"], "[REDACTED]");
     assert_eq!(value["proxy"]["proxyUrl"], "[REDACTED]");
     let encoded = value.to_string();
     assert!(!encoded.contains("must-not-be-persisted"));
+    assert!(!encoded.contains("must-not-be-persisted-app-secret"));
 }
 
 #[test]

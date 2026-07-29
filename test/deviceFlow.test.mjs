@@ -272,3 +272,88 @@ test("Device Flow stop invalidates in-flight startup and polling work", async ()
   assert.equal(pollingClient.pollTimer, null);
   assert.deepEqual(activations, []);
 });
+
+test("Device Flow slow_down increases every subsequent poll interval cumulatively", async () => {
+  const scheduledPolls = [];
+  const pollResults = [
+    { error: "slow_down" },
+    { error: "slow_down" },
+    { error: "authorization_pending" },
+  ];
+  const client = new GitHubDeviceFlow({
+    clientId: "client-id",
+    scheduleFn: (callback, delayMs) => {
+      const timer = { callback, delayMs, cancelled: false };
+      scheduledPolls.push(timer);
+      return timer;
+    },
+    clearScheduleFn: (timer) => {
+      timer.cancelled = true;
+    },
+    fetchFn: async (url) => {
+      if (String(url).endsWith("/login/device/code")) {
+        return jsonResponse({
+          device_code: "device",
+          user_code: "CODE",
+          verification_uri: "https://github.com/login/device",
+          expires_in: 600,
+          interval: 1,
+        });
+      }
+      return jsonResponse(pollResults.shift());
+    },
+    onTokenAcquired: async () => undefined,
+  });
+
+  await client.getAuthMessage();
+  assert.equal(scheduledPolls[0].delayMs, 1_000);
+  await scheduledPolls[0].callback();
+  assert.equal(scheduledPolls[1].delayMs, 6_000);
+  await scheduledPolls[1].callback();
+  assert.equal(scheduledPolls[2].delayMs, 11_000);
+  await scheduledPolls[2].callback();
+  assert.equal(scheduledPolls[3].delayMs, 11_000);
+  client.stop();
+});
+
+test("Device Flow terminates every non-retryable OAuth poll error", async () => {
+  for (const oauthError of [
+    "incorrect_device_code",
+    "incorrect_client_credentials",
+    "unsupported_grant_type",
+    "device_flow_disabled",
+    "unexpected_oauth_error",
+  ]) {
+    const scheduledPolls = [];
+    const client = new GitHubDeviceFlow({
+      clientId: "client-id",
+      scheduleFn: (callback, delayMs) => {
+        const timer = { callback, delayMs, cancelled: false };
+        scheduledPolls.push(timer);
+        return timer;
+      },
+      clearScheduleFn: (timer) => {
+        timer.cancelled = true;
+      },
+      fetchFn: async (url) => {
+        if (String(url).endsWith("/login/device/code")) {
+          return jsonResponse({
+            device_code: "device",
+            user_code: "CODE",
+            verification_uri: "https://github.com/login/device",
+            expires_in: 600,
+            interval: 1,
+          });
+        }
+        return jsonResponse({ error: oauthError });
+      },
+      onTokenAcquired: async () => undefined,
+    });
+
+    await client.getAuthMessage();
+    await scheduledPolls[0].callback();
+    assert.equal(scheduledPolls.length, 1, oauthError);
+    assert.equal(client.pendingUserCode, null, oauthError);
+    assert.equal(client.pollTimer, null, oauthError);
+  }
+});

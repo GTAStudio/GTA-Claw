@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { TelegramPollingClient } from "../dist/channels/telegramPolling.js";
-import { MessageGraphemeTooLongError } from "../dist/utils/splitMessage.js";
 
 function update(updateId, text = "hello") {
   return {
@@ -298,29 +297,99 @@ test(
   },
 );
 
-test("Telegram checkpoints a generated reply before fallible chunking", async () => {
-  let handled = 0;
+test("Telegram dead-letters terminal 403 delivery once and continues", async () => {
+  const handled = [];
+  let sends = 0;
+  const client = new TelegramPollingClient({
+    botToken: "token",
+    pollIntervalMs: 60_000,
+    onMessage: async ({ text }) => {
+      handled.push(text);
+      return text === "forbidden" ? "reply" : "";
+    },
+    fetchFn: async () => {
+      sends += 1;
+      return new Response(null, { status: 403 });
+    },
+  });
+
+  await client.processUpdates([
+    update(30, "forbidden"),
+    update(31, "later"),
+  ]);
+  assert.equal(client.offset, 32);
+  assert.deepEqual(handled, ["forbidden", "later"]);
+  assert.equal(sends, 1);
+  assert.match(client.deadLetteredUpdates.get(30), /terminal status 403/);
+
+  await client.processUpdates([update(30, "forbidden")]);
+  assert.deepEqual(handled, ["forbidden", "later"]);
+  assert.equal(sends, 1);
+  assert.equal(client.deadLetteredUpdates.size, 1);
+});
+
+test("Telegram dead-letters an impossible grapheme without duplicate side effects", async () => {
+  const handled = [];
   const oversizedGrapheme = `a${"\u0301".repeat(4000)}`;
   const client = new TelegramPollingClient({
     botToken: "token",
     pollIntervalMs: 60_000,
-    onMessage: async () => {
-      handled += 1;
-      return oversizedGrapheme;
+    onMessage: async ({ text }) => {
+      handled.push(text);
+      return text === "impossible" ? oversizedGrapheme : "";
     },
     fetchFn: async () => {
       throw new Error("sendMessage must not run for an oversized grapheme");
     },
   });
 
-  await assert.rejects(
-    client.processUpdates([update(30)]),
-    MessageGraphemeTooLongError,
+  await client.processUpdates([
+    update(40, "impossible"),
+    update(41, "later"),
+  ]);
+  assert.equal(client.offset, 42);
+  assert.deepEqual(handled, ["impossible", "later"]);
+  assert.match(
+    client.deadLetteredUpdates.get(40),
+    /message grapheme uses 4001 UTF-16 code units/i,
   );
-  await assert.rejects(
-    client.processUpdates([update(30)]),
-    MessageGraphemeTooLongError,
-  );
-  assert.equal(client.offset, 0);
+
+  await client.processUpdates([update(40, "impossible")]);
+  assert.deepEqual(handled, ["impossible", "later"]);
+  assert.equal(client.deadLetteredUpdates.size, 1);
+});
+
+test("Telegram retains checkpoints for 429, 5xx, and network failures", async () => {
+  const failures = [
+    new Response(null, { status: 429 }),
+    new Response(null, { status: 503 }),
+    new Error("network failure"),
+    new Response(null, { status: 200 }),
+  ];
+  let handled = 0;
+  let sends = 0;
+  const client = new TelegramPollingClient({
+    botToken: "token",
+    pollIntervalMs: 60_000,
+    onMessage: async () => {
+      handled += 1;
+      return "reply";
+    },
+    fetchFn: async () => {
+      const result = failures[sends];
+      sends += 1;
+      if (result instanceof Error) throw result;
+      return result;
+    },
+  });
+
+  for (const pattern of [/429/, /503/, /network failure/]) {
+    await assert.rejects(client.processUpdates([update(50)]), pattern);
+    assert.equal(client.offset, 0);
+  }
+  await client.processUpdates([update(50)]);
+  assert.equal(client.offset, 51);
   assert.equal(handled, 1);
+  assert.equal(sends, 4);
+  assert.equal(client.deadLetteredUpdates.size, 0);
 });

@@ -1,6 +1,18 @@
 import { logger } from "../utils/logger.js";
 import { fetch as defaultFetch } from "../utils/proxy.js";
-import { splitMessage } from "../utils/splitMessage.js";
+import {
+  MessageGraphemeTooLongError,
+  splitMessage,
+} from "../utils/splitMessage.js";
+
+const MAX_DEAD_LETTERED_UPDATES = 1000;
+
+class TelegramTerminalDeliveryError extends Error {
+  constructor(readonly status: number) {
+    super(`Telegram sendMessage failed with terminal status ${status}`);
+    this.name = "TelegramTerminalDeliveryError";
+  }
+}
 
 interface TelegramUser {
   id: number;
@@ -63,6 +75,7 @@ export class TelegramPollingClient {
     number,
     TelegramDeliveryCheckpoint
   >();
+  private readonly deadLetteredUpdates = new Map<number, string>();
 
   constructor(options: TelegramPollingOptions) {
     this.baseUrl = `https://api.telegram.org/bot${options.botToken}`;
@@ -121,7 +134,18 @@ export class TelegramPollingClient {
 
   private async processUpdates(updates: TelegramUpdate[]): Promise<void> {
     for (const update of updates) {
-      await this.handleUpdate(update);
+      if (!this.deadLetteredUpdates.has(update.update_id)) {
+        try {
+          await this.handleUpdate(update);
+        } catch (err) {
+          const reason = this.terminalFailureReason(err);
+          if (!reason) {
+            throw err;
+          }
+          this.deliveryCheckpoints.delete(update.update_id);
+          this.recordDeadLetter(update.update_id, reason);
+        }
+      }
       this.offset = Math.max(this.offset, update.update_id + 1);
     }
   }
@@ -222,9 +246,41 @@ export class TelegramPollingClient {
       });
 
       if (!resp.ok) {
+        if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
+          throw new TelegramTerminalDeliveryError(resp.status);
+        }
         throw new Error(`Telegram sendMessage failed: ${resp.status}`);
       }
       checkpoint.nextChunk += 1;
+    }
+  }
+
+  private terminalFailureReason(err: unknown): string | null {
+    if (
+      err instanceof TelegramTerminalDeliveryError ||
+      err instanceof MessageGraphemeTooLongError
+    ) {
+      return err.message;
+    }
+    return null;
+  }
+
+  private recordDeadLetter(updateId: number, reason: string): void {
+    if (this.deadLetteredUpdates.has(updateId)) {
+      return;
+    }
+
+    this.deadLetteredUpdates.set(updateId, reason);
+    logger.error(
+      { updateId, reason },
+      "Telegram update permanently failed and was dead-lettered",
+    );
+
+    if (this.deadLetteredUpdates.size > MAX_DEAD_LETTERED_UPDATES) {
+      const oldest = this.deadLetteredUpdates.keys().next().value;
+      if (oldest !== undefined) {
+        this.deadLetteredUpdates.delete(oldest);
+      }
     }
   }
 }

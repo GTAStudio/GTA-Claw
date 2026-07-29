@@ -175,13 +175,14 @@ prompt_secret() {
   local prompt_text="$2"
   local value=""
   while [ -z "$value" ]; do
-    read -rsp "  $prompt_text: " value
-    echo ""
+    printf "  %s: " "$prompt_text" >&2
+    IFS= read -rs value
+    printf "\n" >&2
     if [ -z "$value" ]; then
-      log_error "$var_name 为必填项"
+      log_error "$var_name 为必填项" >&2
     fi
   done
-  echo "$value"
+  printf '%s\n' "$value"
 }
 
 select_model() {
@@ -757,6 +758,7 @@ do_help() {
 }
 
 # ---- Main ----
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 case "${1:-}" in
   --config|-c)
     check_prerequisites
@@ -797,3 +799,4 @@ case "${1:-}" in
     fi
     ;;
 esac
+fi

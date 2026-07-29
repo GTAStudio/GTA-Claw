@@ -52,6 +52,24 @@ fn migrates_supported_aliases_types_and_legacy_integer_prefixes() {
 }
 
 #[test]
+fn migrates_whatsapp_app_secret_as_a_secret_reference() {
+    let mut environment = minimum_environment();
+    environment.extend([
+        ("ENABLE_WHATSAPP", "true"),
+        ("WHATSAPP_VERIFY_TOKEN", "verify-token"),
+        ("WHATSAPP_ACCESS_TOKEN", "access-token"),
+        ("WHATSAPP_PHONE_NUMBER_ID", "15551234"),
+        ("WHATSAPP_APP_SECRET", "literal-app-secret"),
+    ]);
+
+    let result = migrate_legacy_environment(environment).expect("WhatsApp migration");
+    let output = to_json5(&result.config).expect("serialize migration");
+
+    assert!(output.contains("env:WHATSAPP_APP_SECRET"));
+    assert!(!output.contains("literal-app-secret"));
+}
+
+#[test]
 fn preserves_legacy_unvalidated_discord_gateway_value() {
     let mut environment = minimum_environment();
     environment.push(("DISCORD_GATEWAY_URL", "legacy-gateway-value"));

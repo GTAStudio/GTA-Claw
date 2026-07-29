@@ -50,8 +50,11 @@ export class DiscordGatewayClient {
   private seq: number | null = null;
   private sessionId: string | null = null;
   private resumeGatewayUrl: string | null = null;
-  private heartbeatAcked = true;
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private heartbeatIntervalMs: number | null = null;
+  private heartbeatNonce = 0;
+  private outstandingHeartbeatNonce: number | null = null;
+  private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatAckTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private conversationQueue: Promise<void> = Promise.resolve();
 
@@ -80,10 +83,7 @@ export class DiscordGatewayClient {
       this.reconnectTimer = null;
     }
 
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
+    this.clearHeartbeat();
 
     if (this.ws) {
       const ws = this.ws;
@@ -202,7 +202,7 @@ export class DiscordGatewayClient {
         break;
       }
       case 1: {
-        this.sendHeartbeat(ws, false);
+        this.sendHeartbeat(ws);
         break;
       }
       case 7: {
@@ -222,7 +222,7 @@ export class DiscordGatewayClient {
         break;
       }
       case 11: {
-        this.heartbeatAcked = true;
+        this.acknowledgeHeartbeat();
         break;
       }
       default:
@@ -233,27 +233,75 @@ export class DiscordGatewayClient {
   }
 
   private startHeartbeat(ws: WebSocket, intervalMs: number): void {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-    }
-
-    this.heartbeatAcked = true;
-    this.heartbeatTimer = setInterval(() => {
-      if (this.ws === ws) {
-        this.sendHeartbeat(ws, true);
-      }
-    }, intervalMs);
-  }
-
-  private sendHeartbeat(ws: WebSocket, enforceLiveness: boolean): void {
-    if (enforceLiveness && !this.heartbeatAcked) {
-      logger.warn("Discord heartbeat ACK was not received; reconnecting");
+    this.clearHeartbeat();
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+      logger.error(
+        { intervalMs },
+        "Discord gateway supplied an invalid heartbeat interval",
+      );
       this.terminateSocket(ws);
       return;
     }
 
-    if (this.sendOnSocket(ws, { op: 1, d: this.seq })) {
-      this.heartbeatAcked = false;
+    this.heartbeatIntervalMs = intervalMs;
+    this.scheduleHeartbeat(ws);
+  }
+
+  private scheduleHeartbeat(ws: WebSocket): void {
+    if (this.heartbeatTimer) {
+      clearTimeout(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    if (this.heartbeatIntervalMs === null) return;
+
+    this.heartbeatTimer = setTimeout(() => {
+      this.heartbeatTimer = null;
+      if (this.ws !== ws || this.outstandingHeartbeatNonce !== null) {
+        return;
+      }
+      this.sendHeartbeat(ws);
+    }, this.heartbeatIntervalMs);
+  }
+
+  private sendHeartbeat(ws: WebSocket): void {
+    if (!this.sendOnSocket(ws, { op: 1, d: this.seq }) || this.ws !== ws) {
+      return;
+    }
+
+    const nonce = ++this.heartbeatNonce;
+    this.outstandingHeartbeatNonce = nonce;
+
+    if (this.heartbeatAckTimer) {
+      clearTimeout(this.heartbeatAckTimer);
+      this.heartbeatAckTimer = null;
+    }
+    if (this.heartbeatIntervalMs !== null) {
+      this.heartbeatAckTimer = setTimeout(() => {
+        this.heartbeatAckTimer = null;
+        if (
+          this.ws !== ws ||
+          this.outstandingHeartbeatNonce !== nonce
+        ) {
+          return;
+        }
+        this.outstandingHeartbeatNonce = null;
+        logger.warn("Discord heartbeat ACK was not received; reconnecting");
+        this.terminateSocket(ws);
+      }, this.heartbeatIntervalMs);
+    }
+
+    this.scheduleHeartbeat(ws);
+  }
+
+  private acknowledgeHeartbeat(): void {
+    if (this.outstandingHeartbeatNonce === null) {
+      return;
+    }
+
+    this.outstandingHeartbeatNonce = null;
+    if (this.heartbeatAckTimer) {
+      clearTimeout(this.heartbeatAckTimer);
+      this.heartbeatAckTimer = null;
     }
   }
 
@@ -427,9 +475,15 @@ export class DiscordGatewayClient {
 
   private clearHeartbeat(): void {
     if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
+      clearTimeout(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
+    if (this.heartbeatAckTimer) {
+      clearTimeout(this.heartbeatAckTimer);
+      this.heartbeatAckTimer = null;
+    }
+    this.heartbeatIntervalMs = null;
+    this.outstandingHeartbeatNonce = null;
   }
 }
 

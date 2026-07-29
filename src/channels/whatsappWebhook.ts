@@ -4,9 +4,13 @@ import { promisify } from "node:util";
 import { gunzip } from "node:zlib";
 import { logger } from "../utils/logger.js";
 import { fetch as defaultFetch } from "../utils/proxy.js";
-import { splitMessage } from "../utils/splitMessage.js";
+import {
+  MessageGraphemeTooLongError,
+  splitMessage,
+} from "../utils/splitMessage.js";
 
 const MAX_COMPLETED_MESSAGE_IDS = 10_000;
+const MAX_DEAD_LETTERED_MESSAGE_IDS = 10_000;
 const MAX_PENDING_REPLIES = 10_000;
 const gunzipAsync = promisify(gunzip);
 
@@ -126,6 +130,7 @@ export class WhatsAppWebhookHandler {
   private readonly onMessage: WhatsAppWebhookOptions["onMessage"];
   private readonly fetchFn: typeof defaultFetch;
   private readonly completedMessageIds = new Set<string>();
+  private readonly deadLetteredMessageIds = new Map<string, string>();
   private readonly pendingReplies = new Map<string, PendingWhatsAppReply>();
   private readonly inFlightMessages = new Map<string, Promise<void>>();
 
@@ -294,7 +299,10 @@ export class WhatsAppWebhookHandler {
       return;
     }
 
-    if (this.completedMessageIds.has(messageId)) {
+    if (
+      this.completedMessageIds.has(messageId) ||
+      this.deadLetteredMessageIds.has(messageId)
+    ) {
       return;
     }
 
@@ -342,14 +350,27 @@ export class WhatsAppWebhookHandler {
       this.pendingReplies.set(messageId, pendingReply);
     }
 
-    pendingReply.chunks ??= pendingReply.reply.trim()
-      ? splitMessage(pendingReply.reply, 3500)
-      : [];
+    let chunks = pendingReply.chunks;
+    if (!chunks) {
+      try {
+        chunks = pendingReply.reply.trim()
+          ? splitMessage(pendingReply.reply, 3500)
+          : [];
+        pendingReply.chunks = chunks;
+      } catch (err) {
+        if (!(err instanceof MessageGraphemeTooLongError)) {
+          throw err;
+        }
+        this.pendingReplies.delete(messageId);
+        this.recordDeadLetter(messageId, err.message);
+        return;
+      }
+    }
 
-    while (pendingReply.nextChunk < pendingReply.chunks.length) {
+    while (pendingReply.nextChunk < chunks.length) {
       await this.sendText(
         pendingReply.to,
-        pendingReply.chunks[pendingReply.nextChunk],
+        chunks[pendingReply.nextChunk],
       );
       pendingReply.nextChunk += 1;
     }
@@ -379,6 +400,25 @@ export class WhatsAppWebhookHandler {
     const oldest = this.completedMessageIds.values().next().value;
     if (oldest !== undefined) {
       this.completedMessageIds.delete(oldest);
+    }
+  }
+
+  private recordDeadLetter(messageId: string, reason: string): void {
+    if (this.deadLetteredMessageIds.has(messageId)) {
+      return;
+    }
+
+    this.deadLetteredMessageIds.set(messageId, reason);
+    logger.error(
+      { messageId, reason },
+      "WhatsApp message permanently failed and was dead-lettered",
+    );
+
+    if (this.deadLetteredMessageIds.size > MAX_DEAD_LETTERED_MESSAGE_IDS) {
+      const oldest = this.deadLetteredMessageIds.keys().next().value;
+      if (oldest !== undefined) {
+        this.deadLetteredMessageIds.delete(oldest);
+      }
     }
   }
 

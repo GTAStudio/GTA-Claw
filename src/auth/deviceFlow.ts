@@ -151,6 +151,7 @@ export class GitHubDeviceFlow {
     signal: AbortSignal,
   ): void {
     this.stopPolling();
+    let pollIntervalSec = intervalSec;
 
     const poll = async (): Promise<void> => {
       if (!this.isCurrentFlow(generation)) {
@@ -184,7 +185,15 @@ export class GitHubDeviceFlow {
         }
 
         if (!resp.ok) {
-          this.schedulePoll(poll, intervalSec * 1000, generation);
+          if (resp.status === 429 || resp.status >= 500) {
+            this.schedulePoll(poll, pollIntervalSec * 1000, generation);
+          } else {
+            logger.warn(
+              { status: resp.status },
+              "Device Flow poll failed permanently",
+            );
+            this.clearPendingFlow(generation);
+          }
           return;
         }
 
@@ -214,10 +223,11 @@ export class GitHubDeviceFlow {
 
         switch (data.error) {
           case "authorization_pending":
-            this.schedulePoll(poll, intervalSec * 1000, generation);
+            this.schedulePoll(poll, pollIntervalSec * 1000, generation);
             break;
           case "slow_down":
-            this.schedulePoll(poll, (intervalSec + 5) * 1000, generation);
+            pollIntervalSec += 5;
+            this.schedulePoll(poll, pollIntervalSec * 1000, generation);
             break;
           case "expired_token":
             logger.warn("Device Flow code expired");
@@ -228,19 +238,22 @@ export class GitHubDeviceFlow {
             this.clearPendingFlow(generation);
             break;
           default:
-            logger.warn({ error: data.error }, "Device Flow poll unexpected error");
-            this.schedulePoll(poll, intervalSec * 1000, generation);
+            logger.warn(
+              { error: data.error },
+              "Device Flow poll failed permanently",
+            );
+            this.clearPendingFlow(generation);
         }
       } catch (err) {
         if (!this.isCurrentFlow(generation)) {
           return;
         }
         logger.error({ err }, "Device Flow poll error");
-        this.schedulePoll(poll, intervalSec * 1000, generation);
+        this.schedulePoll(poll, pollIntervalSec * 1000, generation);
       }
     };
 
-    this.schedulePoll(poll, intervalSec * 1000, generation);
+    this.schedulePoll(poll, pollIntervalSec * 1000, generation);
   }
 
   private async fetchUserLogin(

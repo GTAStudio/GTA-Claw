@@ -219,7 +219,7 @@ test("WhatsApp outbound retry resumes at the failed reply chunk", async () => {
   assert.equal(sentChunks[2], "b");
 });
 
-test("WhatsApp checkpoints a generated reply before grapheme validation", async () => {
+test("WhatsApp dead-letters an oversized grapheme once across redelivery", async () => {
   let handled = 0;
   let sends = 0;
   const handler = createHandler({
@@ -236,13 +236,22 @@ test("WhatsApp checkpoints a generated reply before grapheme validation", async 
 
   const first = responseRecorder();
   await handler.incoming(request, first, () => undefined);
-  assert.equal(first.calls[0].status, 500);
+  assert.equal(first.calls[0].status, 200);
+  assert.equal(handler.pendingReplies.size, 0);
+  assert.equal(handler.inFlightMessages.size, 0);
+  assert.match(
+    handler.deadLetteredMessageIds.get("wamid.oversized-grapheme"),
+    /message grapheme uses 3501 UTF-16 code units/i,
+  );
 
   const retried = responseRecorder();
   await handler.incoming(request, retried, () => undefined);
-  assert.equal(retried.calls[0].status, 500);
+  assert.equal(retried.calls[0].status, 200);
   assert.equal(handled, 1);
   assert.equal(sends, 0);
+  assert.equal(handler.pendingReplies.size, 0);
+  assert.equal(handler.inFlightMessages.size, 0);
+  assert.equal(handler.deadLetteredMessageIds.size, 1);
 });
 
 test("WhatsApp coalesces concurrent deliveries of the same message id", async () => {
