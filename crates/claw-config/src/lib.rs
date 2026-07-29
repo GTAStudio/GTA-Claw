@@ -11,7 +11,8 @@
 //! The transport half stays behind the [`RoleSourceFetcher`] port, because this
 //! crate has no HTTP client and does not gain one.
 
-mod atomicfs;
+#[doc(hidden)]
+pub mod atomicfs;
 /// Strongly typed source configuration for the frozen 47-domain contract.
 pub mod domains;
 mod error;

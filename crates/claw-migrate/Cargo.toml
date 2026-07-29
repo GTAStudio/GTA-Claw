@@ -9,8 +9,8 @@ repository.workspace = true
 include = ["Cargo.toml", "src/**", "tests/**"]
 
 [dependencies]
+claw-config.workspace = true
 ed25519-dalek = { version = "=3.0.0", features = ["zeroize"] }
-libc = "0.2.189"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -26,32 +26,5 @@ sha2.workspace = true
 # engine itself would refuse.
 toml_edit = { version = "=0.25.13", default-features = false, features = ["display", "parse"] }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = [
-  "Win32_Foundation",
-  "Win32_Storage_FileSystem",
-] }
-
-[lints.rust]
-missing_docs = "warn"
-# Compare-and-swap publication needs `renameat2`/`renamex_np` on Unix and
-# `ReplaceFileW`/`MoveFileExW`/`GetFileInformationByHandle` on Windows. None of
-# them has a safe `std` equivalent, and `forbid` cannot grant the local
-# `expect(unsafe_code)` those call sites carry, so `atomicfs` is the crate's
-# single audited FFI surface and every other module stays unsafe-free.
-unsafe_code = "deny"
-unsafe_op_in_unsafe_fn = "deny"
-unreachable_pub = "warn"
-
-[lints.rustdoc]
-broken_intra_doc_links = "deny"
-invalid_html_tags = "warn"
-private_intra_doc_links = "warn"
-unescaped_backticks = "warn"
-
-[lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
-redundant_pub_crate = "allow"
-too_many_lines = "allow"
+[lints]
+workspace = true

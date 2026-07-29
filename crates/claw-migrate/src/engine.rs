@@ -13,12 +13,12 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use toml_edit::{DocumentMut, Item, TableLike, Value as TomlValue};
 
-use crate::atomicfs::{self, ObjectIdentity};
 use crate::contract::{
     Artifact, ArtifactKind, ArtifactSignature, ContractViolation, Diagnostic, DiagnosticSeverity,
     InputKind, MIGRATION_CONTRACT_VERSION, MigrationInput, MigrationResult, MigrationStatus,
 };
 use crate::platform::PlatformPaths;
+use claw_config::atomicfs::{self, ObjectIdentity};
 
 static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const DURABLE_RECEIPT_VERSION: u32 = 1;

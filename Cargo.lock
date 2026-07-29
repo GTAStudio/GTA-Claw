@@ -469,13 +469,12 @@ dependencies = [
 name = "claw-migrate"
 version = "0.1.0"
 dependencies = [
+ "claw-config",
  "ed25519-dalek",
- "libc",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "toml_edit",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

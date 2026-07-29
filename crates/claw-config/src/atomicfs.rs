@@ -1,10 +1,8 @@
 //! Platform primitives for compare-and-swap publication.
 //!
-//! Configuration is published by *displacing* the object that currently occupies
-//! the destination, not by renaming over it. The shared advisory lock only
-//! orders writers that agreed to take it; a text editor, an installer, or any
-//! other process that simply writes the file does not, and a digest read a
-//! moment before an unconditional rename cannot see that write at all.
+//! Callers publish by *displacing* the object that currently occupies the
+//! destination, not by renaming over it. A digest read before an unconditional
+//! rename cannot see a write that lands between the read and publication.
 //!
 //! [`exchange_paths`] closes that window: it swaps the temporary file with the
 //! destination in one atomic step, so the object that was replaced is reachable
@@ -26,7 +24,7 @@ use std::path::Path;
 
 /// Volume-unique identity of one filesystem object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ObjectIdentity {
+pub struct ObjectIdentity {
     volume: u64,
     object: u128,
 }
@@ -297,18 +295,16 @@ mod platform {
     reason = "see the audited FFI note on the Windows platform module"
 )]
 mod rename {
+    use std::fs;
     use std::io;
     use std::path::Path;
-
-    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
-
-    use std::fs;
     use std::ptr;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, ReplaceFileW};
 
     use super::platform::wide;
+    use super::unsupported;
 
     static DISPLACEMENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -321,6 +317,11 @@ mod rename {
     /// callers see the same post-conditions as the Unix exchange. `second` names
     /// either the old object or the new one at every instant.
     pub(super) fn exchange_paths(first: &Path, second: &Path) -> io::Result<()> {
+        if fs::symlink_metadata(second)?.is_dir() || fs::symlink_metadata(first)?.is_dir() {
+            return Err(unsupported(
+                "atomic directory exchange is not available on Windows",
+            ));
+        }
         let displaced = reserve_displacement(second)?;
         let second_wide = wide(second);
         let first_wide = wide(first);
@@ -449,12 +450,9 @@ mod rename {
 }
 
 /// Refuses an operation the platform cannot perform, instead of approximating it.
-#[cfg(not(any(
-    windows,
-    all(
-        unix,
-        any(target_os = "linux", target_os = "android", target_vendor = "apple")
-    )
+#[cfg(not(all(
+    unix,
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
 )))]
 fn unsupported(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, message)
@@ -466,23 +464,29 @@ pub(crate) fn open_lock_no_follow(path: &Path) -> io::Result<File> {
 }
 
 /// Creates and opens `path`, refusing to traverse a link at the final component.
-pub(crate) fn create_new_no_follow(path: &Path) -> io::Result<File> {
+pub fn create_new_no_follow(path: &Path) -> io::Result<File> {
     platform::create_new_no_follow(path)
 }
 
+/// Opens an existing file or directory, refusing to traverse a link at the
+/// final component.
+pub fn open_no_follow(path: &Path) -> io::Result<File> {
+    platform::open_no_follow(path)
+}
+
 /// Reads the volume-unique identity behind an open handle.
-pub(crate) fn identity_of_handle(file: &File) -> io::Result<ObjectIdentity> {
+pub fn identity_of_handle(file: &File) -> io::Result<ObjectIdentity> {
     platform::identity_of_handle(file)
 }
 
 /// Reads the volume-unique identity of whatever `path` names right now, without
 /// following a link at the final component.
-pub(crate) fn identity_of_path(path: &Path) -> io::Result<ObjectIdentity> {
-    identity_of_handle(&platform::open_no_follow(path)?)
+pub fn identity_of_path(path: &Path) -> io::Result<ObjectIdentity> {
+    identity_of_handle(&open_no_follow(path)?)
 }
 
 /// Flushes a directory's entries to stable storage.
-pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
+pub fn sync_directory(path: &Path) -> io::Result<()> {
     platform::sync_directory(path)
 }
 
@@ -491,11 +495,11 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
 /// Both paths must exist. After a successful call each path names the object the
 /// other one named before, so a caller that staged new bytes at `first` can
 /// inspect the exact object it displaced from `second`.
-pub(crate) fn exchange_paths(first: &Path, second: &Path) -> io::Result<()> {
+pub fn exchange_paths(first: &Path, second: &Path) -> io::Result<()> {
     rename::exchange_paths(first, second)
 }
 
 /// Atomically renames `from` onto `to`, refusing to replace an existing object.
-pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     rename::rename_no_replace(from, to)
 }

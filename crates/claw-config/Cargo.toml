@@ -35,8 +35,8 @@ windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [lints.rust]
 missing_docs = "warn"
-# Windows-only `ReplaceFileW` atomic-rename FFI in `io::windows_replace` needs a
-# local `allow(unsafe_code)`, which `forbid` cannot grant.
+# Atomic compare-and-swap publication needs platform FFI in `atomicfs`; the
+# workspace's `forbid` cannot grant its audited `expect(unsafe_code)` sites.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 unreachable_pub = "warn"
