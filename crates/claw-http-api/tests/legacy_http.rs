@@ -1,6 +1,7 @@
 //! Frozen legacy `src/server.ts` HTTP acceptance and resource-bound regressions.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -186,6 +187,92 @@ struct ScriptedWhatsApp {
 }
 
 impl LegacyWhatsAppPort for ScriptedWhatsApp {
+    fn verify_webhook_signature(&self, payload: &[u8], signature: &str) -> Result<bool, PortError> {
+        Ok(signature == whatsapp_signature(payload))
+    }
+
+    fn handle_webhook(
+        &self,
+        payload: Vec<u8>,
+        messages: Arc<dyn LegacyChannelMessagePort>,
+        max_reply_bytes: usize,
+        cancellation: CancellationToken,
+    ) -> PortFuture<'_, Result<(), PortError>> {
+        let fail = self.fail.load(Ordering::Acquire);
+        Box::pin(async move {
+            if fail {
+                return Err(PortError::new(PortErrorKind::Unavailable, "webhook failed"));
+            }
+            let body: Value = serde_json::from_slice(&payload)
+                .map_err(|_| PortError::new(PortErrorKind::InvalidRequest, "invalid webhook"))?;
+            let entries = body
+                .get("entry")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten();
+            for entry in entries {
+                let changes = entry
+                    .get("changes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten();
+                for change in changes {
+                    let webhook_messages = change
+                        .get("value")
+                        .and_then(|value| value.get("messages"))
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten();
+                    for message in webhook_messages {
+                        if message.get("type").and_then(Value::as_str) != Some("text") {
+                            continue;
+                        }
+                        let Some(from) = message
+                            .get("from")
+                            .and_then(Value::as_str)
+                            .filter(|from| !from.trim().is_empty())
+                        else {
+                            continue;
+                        };
+                        let Some(text) = message
+                            .get("text")
+                            .and_then(|text| text.get("body"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|text| !text.is_empty())
+                        else {
+                            continue;
+                        };
+                        let reply = messages
+                            .process(
+                                LegacyChannelMessage {
+                                    channel: "whatsapp",
+                                    conversation_id: format!("whatsapp:{from}"),
+                                    user_name: from.to_owned(),
+                                    text: text.to_owned(),
+                                },
+                                cancellation.clone(),
+                            )
+                            .await?;
+                        if reply.len() > max_reply_bytes {
+                            return Err(PortError::new(
+                                PortErrorKind::InvalidRequest,
+                                "WhatsApp reply exceeds the byte limit",
+                            ));
+                        }
+                        for chunk in reply_chunks(&reply, 3_500) {
+                            self.sent
+                                .lock()
+                                .expect("send log")
+                                .push((from.to_owned(), chunk));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn send_text(
         &self,
         to: String,
@@ -772,14 +859,31 @@ async fn whatsapp_reload_system_and_exec_match_frozen_shapes() {
     let webhook = json!({
         "entry":[{
             "changes":[{
-                "value":{"messages":[
-                    {"from":"15551234567","type":"image"},
-                    {"from":"15551234567","type":"text","text":{"body":" hello "}}
+                "value":{
+                    "metadata":{"phone_number_id":"fixture-phone"},
+                    "messages":[
+                    {"from":"15551234567","id":"image","type":"image"},
+                    {"from":"15551234567","id":"message-1","type":"text","text":{"body":" hello "}}
                 ]}
             }]
         }]
     });
-    let incoming = json_request(&server, "/whatsapp/webhook", None, &webhook).await;
+    let unsigned = json_request(&server, "/whatsapp/webhook", None, &webhook).await;
+    assert_eq!(unsigned.status, 403);
+    let wrong_signature = request(
+        &server,
+        "POST",
+        "/whatsapp/webhook",
+        None,
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hub-Signature-256", "sha256=wrong"),
+        ],
+        &serde_json::to_vec(&webhook).expect("serialize webhook"),
+    )
+    .await;
+    assert_eq!(wrong_signature.status, 403);
+    let incoming = signed_whatsapp_request(&server, &webhook).await;
     assert_eq!(
         incoming.json(),
         frozen_response("whatsapp-incoming", "accepted")
@@ -803,7 +907,7 @@ async fn whatsapp_reload_system_and_exec_match_frozen_shapes() {
     }
 
     fixtures.whatsapp.fail.store(true, Ordering::Release);
-    let failed = json_request(&server, "/whatsapp/webhook", None, &webhook).await;
+    let failed = signed_whatsapp_request(&server, &webhook).await;
     assert_eq!(
         failed.json(),
         frozen_response("whatsapp-incoming", "handling-failed")
@@ -1086,6 +1190,48 @@ async fn json_request(
         &body,
     )
     .await
+}
+
+async fn signed_whatsapp_request(server: &Server, body: &Value) -> HttpResponse {
+    let body = serde_json::to_vec(body).expect("serialize request");
+    let signature = whatsapp_signature(&body);
+    request(
+        server,
+        "POST",
+        "/whatsapp/webhook",
+        None,
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hub-Signature-256", &signature),
+        ],
+        &body,
+    )
+    .await
+}
+
+fn whatsapp_signature(payload: &[u8]) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"fixture-app-secret");
+    let tag = ring::hmac::sign(&key, payload);
+    let mut encoded = String::with_capacity(64);
+    for byte in tag.as_ref() {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    format!("sha256={encoded}")
+}
+
+fn reply_chunks(text: &str, max_chars: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for character in text.chars() {
+        if current.chars().count() == max_chars {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push(character);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 async fn request(

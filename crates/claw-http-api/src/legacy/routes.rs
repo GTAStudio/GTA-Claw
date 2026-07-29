@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::{ConnectInfo, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -17,19 +18,18 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 use super::config::{LegacyApiConfig, LegacyConfigError};
 use super::ports::{
-    LEGACY_ADMIN_ACTIONS, LegacyAdminAction, LegacyApiServices, LegacyChannelMessage,
-    LegacyExecResult, LegacyTeamsRequestContext,
+    LEGACY_ADMIN_ACTIONS, LegacyAdminAction, LegacyApiServices, LegacyExecResult,
+    LegacyTeamsRequestContext,
 };
 use super::rate_limit::RateLimiter;
+use crate::ServingStatePort;
 use crate::auth::bearer_token;
 use crate::http_support::{
-    CancelOnDrop, close_connection_response, drain_request_body, json_response, read_json_value,
-    rejected_response,
+    CancelOnDrop, close_connection_response, drain_request_body, json_response, read_body,
+    read_json_value, rejected_response,
 };
-use crate::{PortError, PortErrorKind, ServingStatePort};
 
 const CHAT_HELP: &str = "GTA-Claw HTTP Chat Help\n\nUse: POST /chat with JSON body\n- message (or text/prompt): your question\n- conversation_id (optional): keep context across turns\n\nExamples:\n1) {\"message\":\"hello\"}\n2) {\"message\":\"continue\",\"conversation_id\":\"demo-1\"}\n\nAuth:\n- If not authenticated, call GET /auth/device and complete GitHub Device Flow.";
-const WHATSAPP_CHUNK_CHARS: usize = 3_500;
 const LEGACY_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Clone)]
@@ -439,15 +439,22 @@ async fn whatsapp_incoming(State(state): State<LegacyState>, request: Request) -
     if !state.inner.serving.serving_state().accepts_work() {
         return drain_for_refusal(&state, request, draining_error()).await;
     }
-    let value = match read_legacy_json(&state, request).await {
-        Ok(value) => value,
-        Err(response) => return response,
+    let signature = request
+        .headers()
+        .get("x-hub-signature-256")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let Some(signature) = signature else {
+        return drain_for_refusal(
+            &state,
+            request,
+            legacy_error(StatusCode::FORBIDDEN, "Forbidden"),
+        )
+        .await;
     };
-    let body: WhatsAppBody = match serde_json::from_value(value) {
-        Ok(body) => body,
-        Err(_) => {
-            return legacy_error(StatusCode::BAD_REQUEST, "Webhook handling failed");
-        }
+    let payload = match read_legacy_body(&state, request).await {
+        Ok(payload) => payload,
+        Err(response) => return response,
     };
     let services = state
         .inner
@@ -456,11 +463,40 @@ async fn whatsapp_incoming(State(state): State<LegacyState>, request: Request) -
         .as_ref()
         .expect("validated WhatsApp adapters")
         .clone();
+    let Ok(verified) = services
+        .sender
+        .verify_webhook_signature(&payload, &signature)
+    else {
+        return legacy_error(StatusCode::INTERNAL_SERVER_ERROR, "Webhook handling failed");
+    };
+    if !verified {
+        return legacy_error(StatusCode::FORBIDDEN, "Forbidden");
+    }
+    let body: WhatsAppBody = match serde_json::from_slice(&payload) {
+        Ok(body) => body,
+        Err(_) => {
+            return legacy_error(StatusCode::BAD_REQUEST, "Webhook handling failed");
+        }
+    };
+    let message_count = body
+        .entry
+        .iter()
+        .flat_map(|entry| &entry.changes)
+        .map(|change| change.value.messages.len())
+        .fold(0_usize, usize::saturating_add);
+    if message_count > state.inner.config.limits.whatsapp_messages {
+        return legacy_error(StatusCode::BAD_REQUEST, "Webhook handling failed");
+    }
     let cancellation = CancellationToken::new();
     let _cancel_on_drop = CancelOnDrop::new(&cancellation);
     match timeout(
         state.inner.config.limits.operation_timeout,
-        process_whatsapp(&state, services, body, cancellation),
+        services.sender.handle_webhook(
+            payload.to_vec(),
+            services.messages,
+            state.inner.config.limits.body_bytes,
+            cancellation,
+        ),
     )
     .await
     {
@@ -658,102 +694,6 @@ fn exec_response(action: LegacyAdminAction, mut outcome: LegacyExecResult) -> Re
     json_response(StatusCode::OK, &Value::Object(body))
 }
 
-async fn process_whatsapp(
-    state: &LegacyState,
-    services: super::ports::LegacyWhatsAppServices,
-    body: WhatsAppBody,
-    cancellation: CancellationToken,
-) -> Result<(), PortError> {
-    let mut traversed = 0_usize;
-    for entry in body.entry {
-        for change in entry.changes {
-            for message in change.value.messages {
-                traversed += 1;
-                if traversed > state.inner.config.limits.whatsapp_messages {
-                    return Err(PortError::new(
-                        PortErrorKind::InvalidRequest,
-                        "too many WhatsApp messages",
-                    ));
-                }
-                if message.kind.as_deref() != Some("text") {
-                    continue;
-                }
-                let Some(text) = message
-                    .text
-                    .and_then(|text| text.body)
-                    .map(|text| text.trim().to_owned())
-                    .filter(|text| !text.is_empty())
-                else {
-                    continue;
-                };
-                let Some(from) = message.from.filter(|from| !from.trim().is_empty()) else {
-                    continue;
-                };
-                let reply = services
-                    .messages
-                    .process(
-                        LegacyChannelMessage {
-                            channel: "whatsapp",
-                            conversation_id: format!("whatsapp:{from}"),
-                            user_name: from.clone(),
-                            text,
-                        },
-                        cancellation.clone(),
-                    )
-                    .await?;
-                if reply.trim().is_empty() {
-                    continue;
-                }
-                if reply.len() > state.inner.config.limits.body_bytes {
-                    return Err(PortError::new(
-                        PortErrorKind::InvalidRequest,
-                        "WhatsApp reply exceeds the byte limit",
-                    ));
-                }
-                for chunk in split_message(&reply, WHATSAPP_CHUNK_CHARS) {
-                    services
-                        .sender
-                        .send_text(from.clone(), chunk, cancellation.clone())
-                        .await?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn split_message(text: &str, max_chars: usize) -> Vec<String> {
-    if text.chars().count() <= max_chars {
-        return vec![text.to_owned()];
-    }
-    let mut chunks = Vec::new();
-    let mut remaining = text;
-    while remaining.chars().count() > max_chars {
-        let hard_end = byte_after_chars(remaining, max_chars);
-        let candidate = &remaining[..hard_end];
-        let mut split_at = candidate.rfind('\n').unwrap_or(0);
-        if candidate[..split_at].chars().count() < max_chars / 2 {
-            split_at = candidate.rfind(' ').unwrap_or(0);
-        }
-        if candidate[..split_at].chars().count() < max_chars * 3 / 10 {
-            split_at = hard_end;
-        }
-        chunks.push(remaining[..split_at].to_owned());
-        remaining = remaining[split_at..].trim_start();
-    }
-    if !remaining.is_empty() {
-        chunks.push(remaining.to_owned());
-    }
-    chunks
-}
-
-fn byte_after_chars(value: &str, count: usize) -> usize {
-    value
-        .char_indices()
-        .nth(count)
-        .map_or(value.len(), |(index, _)| index)
-}
-
 fn first_string<'a>(object: Option<&'a Map<String, Value>>, names: &[&str]) -> Option<&'a str> {
     names.iter().find_map(|name| {
         object
@@ -862,6 +802,32 @@ async fn read_legacy_json(state: &LegacyState, request: Request) -> Result<Value
     })
 }
 
+async fn read_legacy_body(state: &LegacyState, request: Request) -> Result<Bytes, Response> {
+    read_body(
+        request,
+        state.inner.config.limits.body_bytes,
+        state.inner.config.limits.body_timeout,
+    )
+    .await
+    .map_err(|error| {
+        let status = error.status;
+        let message = match status {
+            StatusCode::PAYLOAD_TOO_LARGE => "Payload too large",
+            StatusCode::REQUEST_TIMEOUT => "Request body timeout",
+            _ => "Invalid request body",
+        };
+        let response = legacy_error(status, message);
+        if matches!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE | StatusCode::REQUEST_TIMEOUT
+        ) {
+            close_connection_response(response)
+        } else {
+            response
+        }
+    })
+}
+
 fn legacy_error(status: StatusCode, message: &str) -> Response {
     json_response(status, &json!({"error":message}))
 }
@@ -909,18 +875,5 @@ struct WhatsAppChange {
 #[derive(Deserialize, Default)]
 struct WhatsAppValue {
     #[serde(default)]
-    messages: Vec<WhatsAppMessage>,
-}
-
-#[derive(Deserialize)]
-struct WhatsAppMessage {
-    from: Option<String>,
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    text: Option<WhatsAppText>,
-}
-
-#[derive(Deserialize)]
-struct WhatsAppText {
-    body: Option<String>,
+    messages: Vec<Value>,
 }

@@ -197,6 +197,23 @@ pub trait LegacyChannelMessagePort: Send + Sync {
 
 /// Sends one already-bounded `WhatsApp` text chunk.
 pub trait LegacyWhatsAppPort: Send + Sync {
+    /// Verifies Meta's app-secret signature over the exact request body.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed adapter failure when the signing credential cannot be
+    /// validated. A malformed or mismatched signature returns `Ok(false)`.
+    fn verify_webhook_signature(&self, payload: &[u8], signature: &str) -> Result<bool, PortError>;
+
+    /// Processes one verified raw webhook through the stateful channel adapter.
+    fn handle_webhook(
+        &self,
+        payload: Vec<u8>,
+        messages: Arc<dyn LegacyChannelMessagePort>,
+        max_reply_bytes: usize,
+        cancellation: CancellationToken,
+    ) -> PortFuture<'_, Result<(), PortError>>;
+
     /// Sends one chunk to a phone-number identity.
     fn send_text(
         &self,

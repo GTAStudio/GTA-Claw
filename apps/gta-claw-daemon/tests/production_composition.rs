@@ -80,6 +80,7 @@ impl Running {
             .env("MicrosoftAppPassword", "teams-password")
             .env("WHATSAPP_VERIFY_TOKEN", "verify-token")
             .env("WHATSAPP_ACCESS_TOKEN", "access-token")
+            .env("WHATSAPP_APP_SECRET", "app-secret")
             .env("WHATSAPP_PHONE_NUMBER_ID", "phone-id")
             .env("GTA_CLAW_LOG", "off")
             .stdin(Stdio::piped())
@@ -401,15 +402,46 @@ fn legacy_conditional_channel_routes_use_composed_adapters() {
     );
     assert!(verified.starts_with("HTTP/1.1 200"), "{verified}");
     assert!(verified.ends_with("challenge-1"), "{verified}");
-    let empty_webhook = request(
+    let unsigned_webhook = request(
         daemon.legacy,
         "POST",
         "/whatsapp/webhook",
         None,
         Some(r#"{"entry":[]}"#),
     );
-    assert!(empty_webhook.starts_with("HTTP/1.1 200"), "{empty_webhook}");
-    assert!(empty_webhook.contains(r#""ok":true"#), "{empty_webhook}");
+    assert!(
+        unsigned_webhook.starts_with("HTTP/1.1 403"),
+        "{unsigned_webhook}"
+    );
+    let signed_webhook = request_with_headers(
+        daemon.legacy,
+        "POST",
+        "/whatsapp/webhook",
+        None,
+        &[(
+            "X-Hub-Signature-256",
+            "sha256=fe6aaed5aff30b5679e782271914a2287bdd7de6bedb495c95c24ad91e5e3fdb",
+        )],
+        Some(r#"{"entry":[]}"#),
+    );
+    assert!(
+        signed_webhook.starts_with("HTTP/1.1 200"),
+        "{signed_webhook}"
+    );
+    assert!(signed_webhook.contains(r#""ok":true"#), "{signed_webhook}");
+    let wrong_phone_body = r#"{"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"other-phone"},"messages":[{"from":"15550001","id":"one","type":"text","text":{"body":"question"}}]}}]}]}"#;
+    let wrong_phone = request_with_headers(
+        daemon.legacy,
+        "POST",
+        "/whatsapp/webhook",
+        None,
+        &[(
+            "X-Hub-Signature-256",
+            "sha256=ca81a7b37df2a0898f86b64c63ab9c4b6894238377d47370e488d91c57c5a0a9",
+        )],
+        Some(wrong_phone_body),
+    );
+    assert!(wrong_phone.starts_with("HTTP/1.1 500"), "{wrong_phone}");
 
     daemon.stop();
 }
@@ -721,14 +753,22 @@ fn write_config_fixture(path: &Path, model: &str, role_url: &str, teams: bool, w
         ("ENABLE_WHATSAPP", if whatsapp { "true" } else { "false" }),
         ("WHATSAPP_VERIFY_TOKEN", "verify-token"),
         ("WHATSAPP_ACCESS_TOKEN", "access-token"),
+        ("WHATSAPP_APP_SECRET", "app-secret"),
         ("WHATSAPP_PHONE_NUMBER_ID", "phone-id"),
         ("COPILOT_MODEL", model),
         ("AGENT_ROLE_URL", role_url),
     ])
     .expect("fixture configuration migrates");
+    let encoded = to_json5(&migrated.config).expect("fixture configuration serializes");
+    let mut config: serde_json::Value =
+        json5::from_str(&encoded).expect("fixture configuration parses");
+    if whatsapp {
+        config["core"]["channels"]["whatsapp"]["app_secret"] =
+            serde_json::Value::String("env:WHATSAPP_APP_SECRET".to_owned());
+    }
     std::fs::write(
         path,
-        to_json5(&migrated.config).expect("fixture configuration serializes"),
+        serde_json::to_string(&config).expect("fixture configuration encodes"),
     )
     .expect("fixture configuration is written");
 }
@@ -759,6 +799,17 @@ fn request(
     bearer: Option<&str>,
     body: Option<&str>,
 ) -> String {
+    request_with_headers(address, method, path, bearer, &[], body)
+}
+
+fn request_with_headers(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> String {
     let mut stream = TcpStream::connect(address).expect("HTTP listener accepts");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -775,6 +826,9 @@ fn request(
     .expect("request head is written");
     if let Some(bearer) = bearer {
         write!(stream, "Authorization: Bearer {bearer}\r\n").expect("authorization is written");
+    }
+    for (name, value) in headers {
+        write!(stream, "{name}: {value}\r\n").expect("request header is written");
     }
     if !body.is_empty() {
         write!(stream, "Content-Type: application/json\r\n").expect("content type is written");
