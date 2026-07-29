@@ -427,7 +427,7 @@ fn codex_imports_config_auth_sessions_skills_and_sidecars() {
     .expect("read Codex config");
     assert_eq!(
         config,
-        "model = \"gpt-5\"\napi_key = \"keyring://gta-claw/codex-config-4f221e5cc3c539f4\"\n[mcp.servers.local.env]\nREGION = \"keyring://gta-claw/codex-config-f087189868ae4c7e\"\n"
+        "model = \"gpt-5\"\napi_key = \"keyring://gta-claw/codex-config-5e91930025efade8\"\n[mcp.servers.local.env]\nREGION = \"keyring://gta-claw/codex-config-cbf4cb1f1cabe3cd\"\n"
     );
     let auth = fs::read_to_string(
         target
@@ -1114,7 +1114,9 @@ fn rollback_restores_preexisting_secret_value() {
             signer: &signer,
         })
         .expect("plan secret replacement");
-    let secret_id = "codex-config-4a2082f529e356d5";
+    // Identifiers come from the document's structural path, so this is
+    // sha256("/api_key") truncated to 16 hexadecimal characters.
+    let secret_id = "codex-config-5e91930025efade8";
     let mut secrets = MemorySecretStore::default();
     secrets
         .values
@@ -1321,19 +1323,15 @@ fn overwrite_apply_crash_followed_by_restart_completes_migration() {
 
     // A durable Pending receipt must exist so that restart can reconstruct the
     // pre-crash state.
-    let pending_receipts: Vec<_> = fs::read_dir(&backup_root)
+    let pending_receipts = fs::read_dir(&backup_root)
         .expect("read backup root after crash")
         .collect::<Result<Vec<_>, _>>()
         .expect("collect backup entries")
         .into_iter()
-        .filter_map(|entry| {
-            let receipt = entry.path().join("receipt.json");
-            receipt.exists().then_some(receipt)
-        })
-        .collect();
+        .filter(|entry| entry.path().join("receipt.json").exists())
+        .count();
     assert_eq!(
-        pending_receipts.len(),
-        1,
+        pending_receipts, 1,
         "exactly one durable receipt must survive the simulated crash"
     );
 
