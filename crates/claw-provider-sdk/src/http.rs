@@ -713,7 +713,7 @@ impl HttpTransport {
         request: HttpRequest,
         cancel: &CancelToken,
     ) -> Result<HttpResponse, ProviderError> {
-        let deadline = Instant::now() + request.timeout.unwrap_or(self.request_timeout);
+        let deadline = deadline_after(request.timeout.unwrap_or(self.request_timeout));
         let response = self
             .dispatch(provider, operation, &request, deadline, cancel)
             .await?;
@@ -748,7 +748,7 @@ impl HttpTransport {
         // A streamed response has no total deadline, but both its handshake and
         // every silent interval are bounded so a dead upstream cannot retain a
         // connection forever.
-        let deadline = Instant::now() + request.timeout.unwrap_or(self.request_timeout);
+        let deadline = deadline_after(request.timeout.unwrap_or(self.request_timeout));
         let idle_timeout = request
             .stream_idle_timeout
             .unwrap_or(self.stream_idle_timeout);
@@ -893,6 +893,32 @@ async fn collect_bounded(
         buffer.extend_from_slice(&chunk);
     }
     Ok(buffer)
+}
+
+/// Converts a relative timeout to a representable absolute deadline.
+///
+/// Tokio's own [`tokio::time::sleep`] handles an overflowing duration by using
+/// a deadline roughly 30 years in the future. Preserve that non-panicking
+/// behavior while retaining one absolute deadline across exchange phases. The
+/// fallback is shortened only when a platform's [`Instant`] range requires it.
+fn deadline_after(timeout: Duration) -> Instant {
+    const FAR_FUTURE: Duration = Duration::from_hours(24 * 365 * 30);
+
+    let now = Instant::now();
+    if let Some(deadline) = now.checked_add(timeout) {
+        return deadline;
+    }
+
+    let mut horizon = FAR_FUTURE;
+    loop {
+        if let Some(deadline) = now.checked_add(horizon) {
+            return deadline;
+        }
+        if horizon.is_zero() {
+            return now;
+        }
+        horizon /= 2;
+    }
 }
 
 /// Races a future against the cancel token and a deadline.
@@ -1379,7 +1405,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cancelled_token_short_circuits_before_any_socket_is_opened() {
+    async fn a_cancelled_buffered_request_with_an_extreme_timeout_never_opens_a_socket() {
         let transport = HttpTransport::with_config(&TransportConfig {
             tls_policy: TlsPolicy::AllowLoopbackPlaintext,
             ..TransportConfig::default()
@@ -1393,7 +1419,8 @@ mod tests {
             .send(
                 "ollama",
                 Operation::Complete,
-                HttpRequest::new(Method::Get, url("http://127.0.0.1:1/api/tags")),
+                HttpRequest::new(Method::Get, url("http://127.0.0.1:1/api/tags"))
+                    .timeout(Duration::MAX),
                 &cancel,
             )
             .await
@@ -1403,6 +1430,40 @@ mod tests {
             error.detail(),
             "the request was cancelled before a response arrived"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_streaming_request_with_an_extreme_timeout_never_opens_a_socket() {
+        let transport = HttpTransport::with_config(&TransportConfig {
+            tls_policy: TlsPolicy::AllowLoopbackPlaintext,
+            ..TransportConfig::default()
+        })
+        .expect("transport builds");
+        let cancel = CancelToken::cancelled_token();
+        let error = transport
+            .send_streaming(
+                "ollama",
+                Operation::StreamCompletion,
+                HttpRequest::new(Method::Get, url("http://127.0.0.1:1/api/chat"))
+                    .timeout(Duration::MAX),
+                &cancel,
+            )
+            .await
+            .expect_err("cancelled");
+        assert_eq!(error.kind(), ErrorKind::Cancelled);
+        assert_eq!(error.operation(), Operation::StreamCompletion);
+        assert_eq!(
+            error.detail(),
+            "the request was cancelled before a response arrived"
+        );
+    }
+
+    #[test]
+    fn an_extreme_timeout_saturates_to_a_far_future_deadline() {
+        let now = Instant::now();
+        let deadline = deadline_after(Duration::MAX);
+
+        assert!(deadline > now);
     }
 
     #[tokio::test]
