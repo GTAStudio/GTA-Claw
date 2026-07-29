@@ -1238,6 +1238,13 @@ impl Default for ClaimDiscoveryLimits {
 struct PendingDirectory {
     path: PathBuf,
     depth: usize,
+    snapshot: DirectorySnapshot,
+}
+
+#[derive(Debug)]
+struct DiscoveredClaim {
+    path: PathBuf,
+    canonical_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1248,24 +1255,42 @@ enum DirectoryIdentity {
     Canonical(PathBuf),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectorySnapshot {
+    canonical_path: PathBuf,
+    identity: DirectoryIdentity,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct ClaimDiscoveryDirectoryGuard(same_file::Handle);
+
+#[cfg(not(windows))]
+#[derive(Debug)]
+struct ClaimDiscoveryDirectoryGuard;
+
 fn discover_claim_files_with_limits(
     repository_root: &Path,
     limits: ClaimDiscoveryLimits,
 ) -> Result<Vec<PathBuf>, ConformanceError> {
-    let root_metadata = claim_discovery_metadata(repository_root)?;
-    if is_symlink_or_reparse(&root_metadata) {
-        return Err(unsafe_traversal_error(
-            repository_root,
-            "repository root must not be a symlink or reparse point",
-        ));
-    }
-    if !root_metadata.is_dir() {
-        return Err(unsafe_traversal_error(
-            repository_root,
-            "repository root must be a directory",
-        ));
-    }
-    let canonical_root = claim_discovery_canonicalize(repository_root)?;
+    discover_claim_files_with_limits_and_hook(repository_root, limits, |_| {})
+}
+
+fn discover_claim_files_with_limits_and_hook(
+    repository_root: &Path,
+    limits: ClaimDiscoveryLimits,
+    mut before_directory_enumeration: impl FnMut(&Path),
+) -> Result<Vec<PathBuf>, ConformanceError> {
+    let repository_root = normalize_claim_discovery_root(repository_root);
+    let root_snapshot =
+        claim_discovery_directory_snapshot(&repository_root, None, "repository root")?;
+    let canonical_root = root_snapshot.canonical_path.clone();
+    let root_guard = open_claim_discovery_directory_guard(
+        &repository_root,
+        &root_snapshot,
+        None,
+        "repository root changed while claim discovery started",
+    )?;
     let mut found = Vec::new();
     let mut pending = Vec::new();
     for directory in ["apps", "crates"] {
@@ -1282,9 +1307,15 @@ fn discover_claim_files_with_limits(
             ));
         }
         if metadata.is_dir() {
+            let snapshot = claim_discovery_directory_snapshot(
+                &start,
+                Some(&canonical_root),
+                "claim discovery root",
+            )?;
             pending.push(PendingDirectory {
                 path: start,
                 depth: 1,
+                snapshot,
             });
         }
     }
@@ -1292,7 +1323,7 @@ fn discover_claim_files_with_limits(
     let mut directories_discovered = pending.len();
     if directories_discovered > limits.directories {
         return Err(traversal_limit_error(
-            repository_root,
+            &repository_root,
             format!(
                 "claim discovery exceeded {} directories",
                 limits.directories
@@ -1300,6 +1331,10 @@ fn discover_claim_files_with_limits(
         ));
     }
 
+    let max_entries_per_directory = limits
+        .directories
+        .saturating_add(limits.files)
+        .saturating_add(1);
     let mut visited_identities = BTreeSet::new();
     let mut visited_canonical_paths = BTreeSet::new();
     let mut files_examined = 0_usize;
@@ -1311,44 +1346,56 @@ fn discover_claim_files_with_limits(
             ));
         }
 
-        let metadata = claim_discovery_metadata(&directory.path)?;
-        if is_symlink_or_reparse(&metadata) {
-            return Err(unsafe_traversal_error(
-                &directory.path,
-                "directory entry must not be a symlink or reparse point",
-            ));
-        }
-        if !metadata.is_dir() {
-            return Err(unsafe_traversal_error(
-                &directory.path,
-                "queued claim discovery entry is no longer a directory",
-            ));
-        }
-
-        let canonical_directory = claim_discovery_canonicalize(&directory.path)?;
-        if !canonical_directory.starts_with(&canonical_root) {
-            return Err(unsafe_traversal_error(
-                &directory.path,
-                "directory resolves outside the repository root",
-            ));
-        }
-        let new_identity =
-            visited_identities.insert(directory_identity(&metadata, &canonical_directory));
-        let new_canonical_path = visited_canonical_paths.insert(canonical_directory);
+        verify_claim_discovery_directory_guard(
+            &repository_root,
+            &root_snapshot,
+            None,
+            &root_guard,
+            "repository root changed during claim discovery",
+        )?;
+        let directory_guard = open_claim_discovery_directory_guard(
+            &directory.path,
+            &directory.snapshot,
+            Some(&canonical_root),
+            "queued claim discovery directory changed before enumeration",
+        )?;
+        let new_identity = visited_identities.insert(directory.snapshot.identity.clone());
+        let new_canonical_path =
+            visited_canonical_paths.insert(directory.snapshot.canonical_path.clone());
         if !new_identity || !new_canonical_path {
             continue;
         }
 
-        let entries = fs::read_dir(&directory.path)
-            .map_err(|error| claim_discovery_io_error(&directory.path, &error))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| claim_discovery_io_error(&directory.path, &error))?;
-            let path = entry.path();
+        before_directory_enumeration(&directory.path);
+        let entries = claim_discovery_entries(&directory.path, max_entries_per_directory, &limits)?;
+        verify_claim_discovery_directory_guard(
+            &directory.path,
+            &directory.snapshot,
+            Some(&canonical_root),
+            &directory_guard,
+            "claim discovery directory changed during enumeration",
+        )?;
+        verify_claim_discovery_directory_guard(
+            &repository_root,
+            &root_snapshot,
+            None,
+            &root_guard,
+            "repository root changed during directory enumeration",
+        )?;
+
+        for path in entries {
             let metadata = claim_discovery_metadata(&path)?;
             if is_symlink_or_reparse(&metadata) {
                 return Err(unsafe_traversal_error(
                     &path,
                     "claim discovery entry must not be a symlink or reparse point",
+                ));
+            }
+            let canonical_path = claim_discovery_canonicalize(&path)?;
+            if !canonical_path.starts_with(&canonical_root) {
+                return Err(unsafe_traversal_error(
+                    &path,
+                    "claim discovery entry resolves outside the repository root",
                 ));
             }
             if metadata.is_dir() {
@@ -1369,7 +1416,14 @@ fn discover_claim_files_with_limits(
                         ),
                     ));
                 }
-                pending.push(PendingDirectory { path, depth });
+                pending.push(PendingDirectory {
+                    path,
+                    depth,
+                    snapshot: DirectorySnapshot {
+                        identity: directory_identity(&metadata, &canonical_path),
+                        canonical_path,
+                    },
+                });
                 continue;
             }
 
@@ -1380,14 +1434,188 @@ fn discover_claim_files_with_limits(
                     format!("claim discovery exceeded {} files", limits.files),
                 ));
             }
-            if metadata.is_file() && entry.file_name().to_str() == Some("conformance-claims.json") {
-                found.push(path);
+            if metadata.is_file()
+                && path.file_name().and_then(OsStr::to_str) == Some("conformance-claims.json")
+            {
+                found.push(DiscoveredClaim {
+                    path,
+                    canonical_path,
+                });
             }
         }
+
+        verify_claim_discovery_directory_guard(
+            &directory.path,
+            &directory.snapshot,
+            Some(&canonical_root),
+            &directory_guard,
+            "claim discovery directory changed while its entries were inspected",
+        )?;
+        verify_claim_discovery_directory_guard(
+            &repository_root,
+            &root_snapshot,
+            None,
+            &root_guard,
+            "repository root changed while directory entries were inspected",
+        )?;
     }
 
-    found.sort();
-    Ok(found)
+    found.sort_by(|left, right| left.path.cmp(&right.path));
+    verify_claim_discovery_directory_guard(
+        &repository_root,
+        &root_snapshot,
+        None,
+        &root_guard,
+        "repository root changed before claim discovery completed",
+    )?;
+    for claim in &found {
+        let metadata = claim_discovery_metadata(&claim.path)?;
+        if is_symlink_or_reparse(&metadata) || !metadata.is_file() {
+            return Err(unsafe_traversal_error(
+                &claim.path,
+                "discovered claim changed before it could be returned",
+            ));
+        }
+        let canonical_path = claim_discovery_canonicalize(&claim.path)?;
+        if !canonical_path.starts_with(&canonical_root) || canonical_path != claim.canonical_path {
+            return Err(unsafe_traversal_error(
+                &claim.path,
+                "discovered claim changed or resolves outside the repository root",
+            ));
+        }
+    }
+    verify_claim_discovery_directory_guard(
+        &repository_root,
+        &root_snapshot,
+        None,
+        &root_guard,
+        "repository root changed before claim discovery returned",
+    )?;
+    Ok(found.into_iter().map(|claim| claim.path).collect())
+}
+
+fn normalize_claim_discovery_root(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
+fn claim_discovery_directory_snapshot(
+    path: &Path,
+    canonical_root: Option<&Path>,
+    role: &str,
+) -> Result<DirectorySnapshot, ConformanceError> {
+    let metadata = claim_discovery_metadata(path)?;
+    if is_symlink_or_reparse(&metadata) {
+        return Err(unsafe_traversal_error(
+            path,
+            format!("{role} must not be a symlink or reparse point"),
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(unsafe_traversal_error(
+            path,
+            format!("{role} must be a directory"),
+        ));
+    }
+    let canonical_path = claim_discovery_canonicalize(path)?;
+    if canonical_root.is_some_and(|root| !canonical_path.starts_with(root)) {
+        return Err(unsafe_traversal_error(
+            path,
+            format!("{role} resolves outside the repository root"),
+        ));
+    }
+    Ok(DirectorySnapshot {
+        identity: directory_identity(&metadata, &canonical_path),
+        canonical_path,
+    })
+}
+
+fn claim_discovery_entries(
+    directory: &Path,
+    max_entries: usize,
+    limits: &ClaimDiscoveryLimits,
+) -> Result<Vec<PathBuf>, ConformanceError> {
+    let entries =
+        fs::read_dir(directory).map_err(|error| claim_discovery_io_error(directory, &error))?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| claim_discovery_io_error(directory, &error))?;
+        paths.push(entry.path());
+        if paths.len() > max_entries {
+            return Err(traversal_limit_error(
+                directory,
+                format!(
+                    "claim discovery exceeded the combined bounds of {} directories and {} files",
+                    limits.directories, limits.files
+                ),
+            ));
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn verify_claim_discovery_snapshot(
+    path: &Path,
+    expected: &DirectorySnapshot,
+    canonical_root: Option<&Path>,
+    message: &str,
+) -> Result<(), ConformanceError> {
+    let current =
+        claim_discovery_directory_snapshot(path, canonical_root, "claim discovery directory")?;
+    if current != *expected {
+        return Err(unsafe_traversal_error(path, message));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_claim_discovery_directory_guard(
+    path: &Path,
+    expected: &DirectorySnapshot,
+    canonical_root: Option<&Path>,
+    message: &str,
+) -> Result<ClaimDiscoveryDirectoryGuard, ConformanceError> {
+    let first = same_file::Handle::from_path(path)
+        .map_err(|error| claim_discovery_io_error(path, &error))?;
+    verify_claim_discovery_snapshot(path, expected, canonical_root, message)?;
+    let second = same_file::Handle::from_path(path)
+        .map_err(|error| claim_discovery_io_error(path, &error))?;
+    if first != second {
+        return Err(unsafe_traversal_error(path, message));
+    }
+    Ok(ClaimDiscoveryDirectoryGuard(second))
+}
+
+#[cfg(not(windows))]
+fn open_claim_discovery_directory_guard(
+    path: &Path,
+    expected: &DirectorySnapshot,
+    canonical_root: Option<&Path>,
+    message: &str,
+) -> Result<ClaimDiscoveryDirectoryGuard, ConformanceError> {
+    verify_claim_discovery_snapshot(path, expected, canonical_root, message)?;
+    Ok(ClaimDiscoveryDirectoryGuard)
+}
+
+fn verify_claim_discovery_directory_guard(
+    path: &Path,
+    expected: &DirectorySnapshot,
+    canonical_root: Option<&Path>,
+    guard: &ClaimDiscoveryDirectoryGuard,
+    message: &str,
+) -> Result<(), ConformanceError> {
+    verify_claim_discovery_snapshot(path, expected, canonical_root, message)?;
+    #[cfg(windows)]
+    {
+        let current = same_file::Handle::from_path(path)
+            .map_err(|error| claim_discovery_io_error(path, &error))?;
+        if guard.0 != current {
+            return Err(unsafe_traversal_error(path, message));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = guard;
+    Ok(())
 }
 
 fn claim_discovery_metadata(path: &Path) -> Result<fs::Metadata, ConformanceError> {
@@ -2457,9 +2685,8 @@ fn char_literal_end(bytes: &[u8], quote: usize) -> Option<usize> {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::env;
+    use std::ffi::OsString;
     use std::fs;
-    #[cfg(windows)]
-    use std::io;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
     use std::sync::Arc;
@@ -2467,6 +2694,8 @@ mod tests {
 
     use serde::Deserialize;
 
+    #[cfg(unix)]
+    use super::discover_claim_files_with_limits_and_hook;
     use super::{
         CargoTestTargets, ClaimDiscoveryLimits, OrdinalPathResolver, cargo_executable,
         cargo_pattern_matches, declares_enabled_test, discover_claim_files,
@@ -2547,6 +2776,16 @@ mod tests {
                 fs::remove_dir_all(&self.root).expect("remove claim discovery fixture");
             }
         }
+    }
+
+    fn root_path_spellings(path: &Path) -> [PathBuf; 3] {
+        let mut trailing_separator = OsString::from(path.as_os_str());
+        trailing_separator.push(std::path::MAIN_SEPARATOR.to_string());
+        [
+            path.to_path_buf(),
+            PathBuf::from(trailing_separator),
+            path.join("."),
+        ]
     }
 
     fn compiler_oracle_command(cargo: &Path, root: &Path) -> Command {
@@ -2786,6 +3025,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn claim_discovery_directory_replacement_never_returns_outside_claim() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ClaimDiscoveryFixture::new("replacement");
+        let outside = ClaimDiscoveryFixture::new("replacement-target");
+        let apps = fixture.root.join("apps");
+        let parked_apps = fixture.root.join("parked-apps");
+        let outside_claim = outside.root.join("conformance-claims.json");
+        fs::create_dir(&apps).expect("create original apps directory");
+        fs::write(&outside_claim, "{}").expect("write outside claim");
+        let mut replaced = false;
+
+        let result = discover_claim_files_with_limits_and_hook(
+            &fixture.root,
+            ClaimDiscoveryLimits::default(),
+            |directory| {
+                if !replaced && directory == apps {
+                    fs::rename(&apps, &parked_apps).expect("park verified apps directory");
+                    symlink(&outside.root, &apps).expect("replace apps with outside symlink");
+                    replaced = true;
+                }
+            },
+        );
+
+        assert!(
+            replaced,
+            "replacement hook must run before apps enumeration"
+        );
+        let error = match result {
+            Ok(paths) => panic!(
+                "directory replacement returned claim paths instead of failing closed: {paths:?}"
+            ),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
+        assert_eq!(error.subject(), Some(apps.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn claim_discovery_rejects_symlinked_top_level_root() {
         use std::os::unix::fs::symlink;
 
@@ -2812,31 +3091,59 @@ mod tests {
         fs::create_dir(&target).expect("create repository root target");
         symlink(&target, &link).expect("create repository root symlink");
 
-        let error = discover_claim_files(&link).expect_err("root symlink must be rejected");
-
-        assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
+        for spelling in root_path_spellings(&link) {
+            let error = discover_claim_files(spelling)
+                .expect_err("every root symlink form must be rejected");
+            assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
+            assert_eq!(error.subject(), Some(link.to_string_lossy().as_ref()));
+        }
     }
 
     #[cfg(windows)]
     #[test]
-    fn claim_discovery_rejects_directory_reparse_points() {
-        use std::os::windows::fs::symlink_dir;
+    fn claim_discovery_rejects_ntfs_root_junction() {
+        use std::os::windows::fs::MetadataExt as _;
 
-        let fixture = ClaimDiscoveryFixture::new("windows-reparse");
-        let outside = ClaimDiscoveryFixture::new("windows-reparse-target");
-        let apps = fixture.root.join("apps");
-        fs::create_dir(&apps).expect("create apps directory");
-        let link = apps.join("outside");
-        match symlink_dir(&outside.root, &link) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
-            Err(error) => panic!("create directory reparse point: {error}"),
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+        let fixture = ClaimDiscoveryFixture::new("windows-junction");
+        let target = fixture.root.join("repository-target");
+        let junction = fixture.root.join("repository-junction");
+        fs::create_dir(&target).expect("create junction target");
+        let output = Command::new("cmd.exe")
+            .args([
+                "/D",
+                "/C",
+                "mklink",
+                "/J",
+                "repository-junction",
+                "repository-target",
+            ])
+            .current_dir(&fixture.root)
+            .output()
+            .expect("run unprivileged mklink /J capability probe");
+        assert!(
+            output.status.success(),
+            "unprivileged NTFS junction creation failed; status: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let attributes = fs::symlink_metadata(&junction)
+            .expect("inspect created junction")
+            .file_attributes();
+        assert_ne!(
+            attributes & FILE_ATTRIBUTE_REPARSE_POINT,
+            0,
+            "mklink /J result must carry FILE_ATTRIBUTE_REPARSE_POINT"
+        );
+
+        for spelling in root_path_spellings(&junction) {
+            let error = discover_claim_files(spelling)
+                .expect_err("every root junction form must be rejected");
+            assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
+            assert_eq!(error.subject(), Some(junction.to_string_lossy().as_ref()));
         }
-
-        let error =
-            discover_claim_files(&fixture.root).expect_err("reparse point must be rejected");
-
-        assert_eq!(error.code(), ViolationCode::UnsafeTraversal);
     }
 
     #[test]
