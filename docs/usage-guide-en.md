@@ -30,18 +30,23 @@ guide says so instead of describing it.
 
 Read this first; it will save you time.
 
-The Rust workspace does **not** yet ship a complete agent service. `gta-claw-daemon` is the
-composition root, and its subsystem adapters are still deterministic stand-ins. What works today is:
+The Rust workspace does **not** yet ship a parity-complete agent service, but `gta-claw-daemon` is a
+real partial production composition. What works today is:
 
 - **Connecting to an existing OpenClaw Gateway** — with the CLI as a bounded diagnostic, with the
   TUI as an interactive client, and with the desktop shell as a native connection surface.
-- **Running the daemon's lifecycle**, including its health probe, signal handling and provable
-  shutdown drain.
+- **Serving the Rust daemon's usable transports**: the 17-route main HTTP API, the legacy HTTP
+  facade and Gateway, with a configured GitHub Copilot provider or the explicit smoke provider. The
+  daemon also binds a loopback MCP listener, but current production wiring cannot authenticate any
+  MCP caller.
+- **Running configured Teams, Telegram, Discord and WhatsApp paths**, plus signal handling,
+  configuration reload and a provable shutdown drain.
 - **Applying a signed update** with the standalone updater.
 
-There is no Rust command that starts a chat with a model provider, loads a role from a URL, or
-serves Teams/Telegram/Discord/WhatsApp traffic. The legacy Node service in `src/` still owns those,
-and is being deleted module by module — see
+The CLI still has no chat command, and the daemon is not parity-complete. In particular, session and
+turn state is not durable, interactive approvals and `claw-tools` are not composed, and skill
+execution is not dispatched. The legacy Node service in `src/` remains while those gaps and the
+frozen compatibility-evidence obligations are closed; see
 [legacy-node-port-obligations.md](legacy-node-port-obligations.md).
 
 ---
@@ -358,10 +363,20 @@ list, prints one rendered frame and exits. If the Gateway does not answer in tim
 ## 5. `gta-claw-daemon`
 
 ```text
-usage: gta-claw-daemon [--probe]
+usage: gta-claw-daemon [--probe | --check-config] [--config PATH] [--listen ADDRESS] [--legacy-listen ADDRESS] [--gateway-listen ADDRESS] [--mcp-listen ADDRESS] [--state-dir PATH] [--log-file PATH] [--tls-terminated-by-frontend] [--smoke]
 ```
 
-Any other argument is rejected.
+`--help` and `-h` are also accepted. Help is global: if either spelling appears anywhere, the daemon
+prints the usage line and exits successfully before creating the Tokio runtime, even if another
+argument is unknown or missing its value. Without help, each top-level option token must be Unicode
+and exactly match a supported flag. Address flags consume the next argument and require it to be a
+Unicode `SocketAddr`. The path flags `--config`, `--state-dir` and `--log-file` instead consume the
+next raw `OsString`, so the parser accepts non-Unicode paths and flag-like values. A value-taking
+flag is rejected as incomplete only when no following argument exists. A token that reaches
+top-level option matching is rejected if unsupported, as are prohibited mode/serving-option
+combinations; a token already consumed as a path never reaches that matching step. The parser does
+not recognize `--`. For example, `--config --smoke` selects a file literally named `--smoke` rather
+than enabling smoke mode.
 
 ### 5.1 Health probe
 
@@ -371,39 +386,131 @@ gta-claw-daemon --probe
 
 Writes one health line and exits.
 
-### 5.2 Serving
+`--probe` cannot be combined with `--check-config` or serving-only options. The parser accepts
+`--config` and `--state-dir` beside `--probe`, but probe mode does not load or use either value.
+
+### 5.2 Configuration check
+
+```sh
+gta-claw-daemon --check-config --config /etc/gta-claw/config.json5
+```
+
+Loads layered configuration and runs the current non-network subset: exposure policy over the
+options permitted in check mode, state-directory path resolution, proxy-policy construction,
+admin-token resolution, update and legacy/channel settings, channel coverage, and provider-auth
+configuration and secret resolution. It does not open listeners. It only computes the state
+directory path: it does not create the directory, test its usability or permissions, or open the
+pairing, audit or goal stores. It also does not initialize telemetry or test its output, fetch the
+role, discover or activate plugins, or initialize a provider.
+`--check-config` accepts `--config` and `--state-dir`; it cannot be combined with `--probe` or any
+listener, logging, TLS-assertion or smoke option. Consequently, although the check calls the exposure
+policy, it cannot preflight proposed listener overrides or a routable deployment.
+
+### 5.3 Serving
 
 ```sh
 gta-claw-daemon
 ```
 
-On startup it installs the stop signal handlers *before* starting any subsystem — so a supervisor
-that stops the process mid-start is still observed — then prints:
+Serving mode resolves configuration and initializes telemetry in `main`, then calls
+`serve_production`. `ProductionService` startup opens the durable Gateway pairing, security-audit
+and goal stores, activates signed plugins, conditionally activates the smoke provider or GitHub
+Copilot, starts configured channel transports, and binds four listener surfaces:
+
+- the main 17-route HTTP API;
+- the legacy Node-compatible HTTP facade;
+- the Gateway v4 server;
+- a separate loopback-only listener for the `/mcp` route.
+
+That fourth listener is bound and supervised but currently inaccessible. Production leaves both MCP
+bearer-token authenticators empty and wires no JWT authenticator, while the route authenticates
+before dispatch. Every MCP caller is therefore rejected.
+
+The four channel paths are conditional: Teams and WhatsApp are wired into the legacy HTTP facade,
+while Telegram and Discord are supervised outbound clients. A configured GitHub token activates
+GitHub Copilot at startup; otherwise the provider remains pending Device Flow. `--smoke` explicitly
+substitutes the local install-diagnostic provider.
+
+The complete option surface is:
+
+| Option | Serving behavior |
+|---|---|
+| `--config PATH` | Loads strict JSON5 from `PATH`; otherwise uses `GTA_CLAW_CONFIG`, then the audited legacy-environment migration. |
+| `--listen ADDRESS` | Main HTTP bind. Default: `127.0.0.1:0` (an OS-assigned port). |
+| `--legacy-listen ADDRESS` | Legacy HTTP bind. Default: loopback on `core.server.port`. A routable bind requires both a trusted TLS frontend and proxy-level caller authentication plus a strict route allowlist; the daemon's TLS assertion alone is insufficient. |
+| `--gateway-listen ADDRESS` | Gateway bind. Default: `127.0.0.1:0`. |
+| `--mcp-listen ADDRESS` | MCP bind. Default: `127.0.0.1:0`; non-loopback addresses are always rejected. This changes only the bound socket: without a production MCP token/JWT authenticator, every request is rejected. |
+| `--state-dir PATH` | State root; otherwise `GTA_CLAW_STATE_DIR`, then `$HOME/.gta-claw`. Pairings, security audit and goals are durable there, but sessions and turns are not. |
+| `--log-file PATH` | Writes ordinary telemetry to the file instead of standard error. |
+| `--tls-terminated-by-frontend` | Asserts that a trusted frontend terminates TLS. It does not enable TLS or add caller authentication; it only passes the daemon's bind policy for routable main HTTP, legacy HTTP or Gateway addresses. |
+| `--smoke` | Uses the deterministic local install-diagnostic provider. Every explicitly selected listener must remain loopback. |
+
+Do not expose the legacy listener merely by adding `--tls-terminated-by-frontend`. Legacy `/chat`
+has no application-level caller authentication. Setting `GTA_CLAW_ADMIN_TOKEN` does not change that:
+it supplies an operator/all-scopes bearer credential for exactly the six protected main-API routes
+`GET /v1/models`, `GET /v1/models/{id}`, `POST /v1/embeddings`,
+`POST /v1/chat/completions`, `POST /v1/responses` and `POST /tools/invoke`; the same credential
+authenticates `POST /api/v1/admin/rpc`. Its presence also registers legacy `/admin/reload`,
+`/admin/system` and `/admin/exec`. The reload route requires the exact token, but the system and exec
+routes accept either that token or a loopback peer. The token is not installed in the MCP-specific
+authenticators, and no JWT alternative is wired, so it cannot make `/mcp` accessible. A same-host
+reverse proxy appears loopback to the system and exec handlers. A frontend for a routable legacy
+bind must authenticate callers itself and forward only explicitly intended routes; block
+`/admin/*` unless the proxy enforces equivalent authorization, and do not forward `/chat` without a
+separate caller-authentication policy.
+
+Signal handling does not cover the entire serving-mode startup. `main` loads configuration and
+initializes telemetry before it calls `serve_production`; the operating system's default signal
+behavior still applies during those earlier phases. On entry, `serve_production` installs the stop
+handlers before starting `ProductionService` composition. From that point, a supervisor stop during
+composition is observed and startup is cancelled or drained; a signal during the earlier
+configuration or telemetry phase can terminate the process without a daemon drain summary. After
+composition has bound and started the listeners, the daemon prints:
 
 ```text
 ready protocol=1
 healthy runtime=<os>-<arch>
+service http=<address> legacy=<address> gateway=<address> mcp=<address> provider=<name> config_generation=<n>
 ```
+
+`ready protocol=1` and `healthy runtime=...` are process protocol/health announcements; the
+`service ...` line is a listener/startup announcement. None asserts dependency readiness. `/ready`,
+`/readyz` and the `status` control response report dependency and serving readiness. The listener
+announcement may name `device-flow-pending`; until Device Flow activates the provider, the provider
+dependency remains false and readiness remains false. The `mcp` dependency only records that the
+listener task started; it can be true while every MCP caller is still rejected.
 
 It then serves until one of:
 
 - a supervisor stop signal — `SIGTERM` on Unix (what `systemd`, `docker stop` and `kubectl delete`
   send), or a console close / system shutdown on Windows,
 - an interrupt — `SIGINT` on Unix, Ctrl-C or Ctrl-Break on Windows,
-- the line `shutdown` on its control channel (standard input).
+- the line `shutdown` on its control channel (standard input),
+- a supervised runtime/ingress fault: the main HTTP, MCP or legacy HTTP task fails, returns or
+  disappears unexpectedly,
+- a post-start failure writing a reload, status or other control response to the supervisor output.
 
 Reaching the end of standard input is **not** a stop condition: a daemon started with stdin closed
-keeps serving.
+keeps serving. The same channel accepts `status` and `reload`; reload either reports the applied
+generation and changed domains or a rejection while the previous generation keeps serving.
 
 On stop it prints one summary line:
 
 ```text
-stopped reason=<terminate|interrupt|control> clean=<bool> drained=<n> completed=<n> abandoned=<n> tasks=<terminated>/<spawned>
+stopped reason=<terminate|interrupt|control|runtime> clean=<bool> drained=<n> completed=<n> abandoned=<n> tasks=<terminated>/<spawned>
 ```
 
-If work was left behind, the process exits with an error describing how many tasks were abandoned.
-The task counters are real: terminations are counted from a guard's `Drop`, so a task cancelled
-part-way through still counts, which makes `tasks=t/s` a genuine leak check.
+`reason=runtime` identifies a post-start supervised fault: an ingress failure, return or
+disappearance, or a failure writing a reload, status or other control response to the supervisor.
+After an ingress fault the daemon drains, emits the stop summary and exits with an error because the
+fault makes the summary unclean. After an output fault it still drains and attempts the same summary,
+but the output is already broken, so the `stopped ...` line is not guaranteed to be emitted. A
+failure writing the initial startup announcements also drains and returns the I/O error before the
+event loop, without a `reason=runtime` stop line. Work left behind likewise produces an error.
+`tasks=t/s` is scoped service-task accounting for work explicitly included by the production stop
+ledger, such as ingress, Gateway, plugin, channel, Device Flow and updater tasks. Some included
+adapters use drop guards to record termination, but the counters are not a census of every Tokio,
+blocking or process task, and equality is not universal leak proof.
 
 Stopping it by hand:
 
@@ -411,14 +518,34 @@ Stopping it by hand:
 printf 'shutdown\n' | gta-claw-daemon
 ```
 
-### 5.3 Current limits
+### 5.4 Current limits
 
-The daemon composes deterministic stand-ins for the runtime subsystems. It does not connect to a
-model provider, serve chat traffic, or open a channel. Treat it today as a lifecycle and shutdown
-surface, not as the product service.
+- **Sessions and turns are process-memory only.** `RuntimeStateStore` keeps both in a
+  `Mutex<HashMap>`; restarting the daemon loses them. This does not apply to the separately durable
+  Gateway pairing, security-audit and goal stores.
+- **There is no interactive approval surface.** The runtime is constructed with
+  `SilentApprovalPort`, which drops presentation notifications. The currently composed plugin tool
+  descriptors are marked as not requiring approval.
+- **The production MCP listener is inaccessible.** The socket is bound, but no MCP bearer credential
+  or JWT authenticator is wired, so the route rejects every caller before dispatch.
+- **`claw-tools` is not composed.** Tool execution is not wholly absent: signed plugin registrations
+  and the durable goal tool are executable through the runtime and authenticated main HTTP surface.
+  They are not currently executable through MCP. The missing part is the `claw-tools` catalogue and
+  its schemas, authorization, path confinement and validated network destinations.
+- **Skill execution and migration-evidence ingestion are not dispatched.** Startup counts
+  `claw_skills::registry()` for inventory, but the production path has no caller for its
+  `WasmSkillHost` bridge and executes no bundled skill. It also has no application caller for
+  `validate_migration_evidence`; that validator is structural only, while cryptographic artifact
+  verification remains a separate plugin-trust responsibility.
+- **Compatibility evidence is outstanding.** No test under `apps/` replays `compat/legacy` against
+  the bound daemon. This is a parity-evidence gap, not a claim that security audit evidence is
+  absent: the serving path opens a durable security-audit log.
 
-A reviewed `systemd` unit exists at `packaging/linux/systemd/gta-claw-daemon.service` and is used by
-the Debian and RPM packaging prototypes.
+**Packaging blocker:** the current `packaging/linux/systemd/gta-claw-daemon.service`, used by the
+Debian and RPM prototypes, is incompatible with production serving and must not be deployed
+unchanged. `RestrictAddressFamilies=AF_UNIX` prevents the required `AF_INET`/`AF_INET6` TCP listeners
+from being created, and `IPAddressDeny=any` blocks required IP ingress and egress. This remains
+pending a packaging fix.
 
 ---
 
@@ -518,25 +645,31 @@ redact themselves in `Debug`, `Display` and Serde output.
 The version 1 runtime envelope requires `schema_version` plus these `core` domains: `auth`, `role`,
 `channels`, `server`, `logging`, `sessions`, `copilot`, `legacy`, `updates`, `admin`, `network`.
 
-**No shipped binary loads a config file yet.** `claw-config` is a library boundary waiting for the
-daemon composition.
+`gta-claw-daemon` loads this model from `--config PATH` or `GTA_CLAW_CONFIG`; when neither is set it
+uses the audited legacy-environment migration. `--check-config` validates the static subset listed
+in section 5.2 without serving; it is not a storage, telemetry, role, plugin or provider startup
+probe.
 
-### 8.2 Environment variables the binaries actually read
+### 8.2 Selected environment variables
 
 | Variable | Read by | Meaning |
 |---|---|---|
 | `GTA_CLAW_GATEWAY_URL` | `gta-claw-tui` | Default Gateway endpoint (`ws://127.0.0.1:18789`). |
-| `GTA_CLAW_GATEWAY_TOKEN` | `gta-claw-tui` | Shared Gateway token. |
+| `GTA_CLAW_GATEWAY_TOKEN` | `gta-claw-tui`, `gta-claw-daemon` | Shared Gateway token; the daemon uses it as the Gateway credential when set. |
+| `GTA_CLAW_CONFIG` | `gta-claw-daemon` | Config-file fallback when `--config` is absent. |
+| `GTA_CLAW_STATE_DIR` | `gta-claw-daemon` | State-root fallback when `--state-dir` is absent. |
+| `GTA_CLAW_ADMIN_TOKEN` | `gta-claw-daemon` | Overrides the configured admin bearer token. It authenticates the main API's six protected model/tool routes and `POST /api/v1/admin/rpc`, and registers legacy `/admin/*`. It does not authenticate `/mcp` or legacy `/chat`; legacy system/exec also trust a loopback peer. |
 | `NO_COLOR` | `gta-claw-tui` | Monochrome output. |
 | `TERM` | `gta-claw-tui` | `dumb` means non-interactive. |
 | `GTA_CLAW_CREDENTIALS_DIR` | `claw-provider-sdk` file secret store | Credential root override. Otherwise `$XDG_DATA_HOME/gta-claw/credentials`, else `$HOME` (or `%USERPROFILE%`) `/.local/share/gta-claw/credentials`. |
 | `CREDENTIALS_DIRECTORY` | `claw-provider-sdk` file secret store | The systemd credentials directory. |
 | `GTA_CLAW_ACPX_LEASE_ID`, `GTA_CLAW_ACPX_SESSION_KEY` | `claw-acp` | ACP extension lease and session key. |
 | `CODEX_HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `APPDATA`, `LOCALAPPDATA`, `HOME`, `USERPROFILE` | `claw-migrate`, `gta-claw-updater` | Source and state directory discovery. |
-| `GTA_CLAW_LOG` | `claw-observability` default | The tracing filter variable in `TelemetryConfig::default()`. No shipped binary installs that subscriber yet. |
+| `GTA_CLAW_LOG`, `GTA_CLAW_LOG_FORMAT` | `gta-claw-daemon` | Tracing filter and `human`/`json` format for serving-mode telemetry. |
 
-`.env.example`, `deploy/run.sh` and `deploy/conf/` belong to the **legacy Node service**. They do not
-configure any Rust binary. Do not use them as a guide to the Rust product.
+`.env.example`, `deploy/run.sh` and `deploy/conf/` are **legacy Node service** artifacts, not the
+authoritative Rust configuration surface. The daemon can translate the frozen subset of legacy
+process environment through its audited migration path; use typed JSON5 for new deployments.
 
 ---
 
@@ -574,8 +707,10 @@ will keep asking until it is paired.
 **`Gateway snapshot timed out`.** The Gateway did not return a session list within five seconds in
 plain mode.
 
-**The daemon exits with "shutdown left work behind".** Tasks were abandoned during the drain. The
-`tasks=<terminated>/<spawned>` counters in the stop line show the gap.
+**The daemon exits with "shutdown left work behind".** The summary's `abandoned` value, deadline
+state and scoped `tasks=<terminated>/<spawned>` ledger describe the recorded failure. A task-counter
+gap applies only to explicitly accounted service tasks; other abandoned work can leave those two
+numbers equal.
 
 **The desktop build fails on Linux.** Expected. Build it on Windows or macOS.
 
@@ -586,10 +721,12 @@ plain mode.
 State this plainly so nobody hunts for a flag that does not exist:
 
 - **No Rust chat command.** `gta-claw-cli send` fails on purpose.
-- **No Rust production service.** The daemon composes stand-in adapters.
-- **No channel traffic.** Teams, Telegram, Discord and WhatsApp are registry and auth metadata in
-  `claw-channels`, not working transports.
-- **No role or skill loading from remote URLs.** That was the legacy design and is not being ported.
+- **No parity-complete Rust production service.** The daemon serves real transports, providers and
+  four configured channel paths, but has the limitations listed in section 5.4.
+- **No transport for the other registered channels.** Teams, Telegram, Discord and WhatsApp are
+  composed conditionally; the remaining channel inventory is not a serving transport.
+- **No skill execution, concurrent remote skill fetch or skill-migration evidence ingestion.** Role
+  loading is composed, including its bounded remote fetch path; these skill paths are not.
 - **No JavaScript skills.** Skill execution is native Rust, a declarative HTTP port, or a WebAssembly
   component. An embedded JavaScript engine will never be added.
 - **No durable device identity** for CLI or desktop; both are ephemeral-only today.
