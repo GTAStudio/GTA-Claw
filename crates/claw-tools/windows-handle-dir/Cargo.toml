@@ -1,0 +1,15 @@
+[package]
+name = "claw-windows-handle-dir"
+description = "Handle-relative Windows directory enumeration for claw-tools"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+license = "MIT"
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+  "Wdk_Storage_FileSystem",
+  "Win32_Foundation",
+  "Win32_System_IO",
+] }

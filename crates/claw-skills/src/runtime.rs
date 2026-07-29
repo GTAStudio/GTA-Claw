@@ -384,20 +384,20 @@ impl<'a> SkillRuntime<'a> {
             SkillExecution::Native { handler } => self.native.execute(handler, parameters),
             SkillExecution::Http { request } => {
                 let mut headers = request.headers.clone();
+                let mut url = url::Url::parse(&request.url)
+                    .expect("the HTTP URL was validated immediately before request construction");
                 let encoded = serde_json::to_vec(&parameters)
                     .map_err(|_| SkillExecutionError::ParameterEncoding)?;
                 let (url, body) = match &request.parameters {
                     HttpParameterEncoding::JsonBody => {
                         headers.insert("content-type".to_owned(), "application/json".to_owned());
-                        (request.url.clone(), encoded)
+                        (url.into(), encoded)
                     }
                     HttpParameterEncoding::QueryParameter { name } => {
                         let encoded = String::from_utf8(encoded)
                             .map_err(|_| SkillExecutionError::ParameterEncoding)?;
-                        (
-                            append_query_parameter(&request.url, name, &encoded),
-                            Vec::new(),
-                        )
+                        append_query_parameter(&mut url, name, &encoded);
+                        (url.into(), Vec::new())
                     }
                 };
                 let response = self
@@ -424,16 +424,13 @@ impl<'a> SkillRuntime<'a> {
     }
 }
 
-fn append_query_parameter(url: &str, name: &str, value: &str) -> String {
-    let mut parsed = url::Url::parse(url)
-        .expect("the HTTP URL was validated immediately before request construction");
+fn append_query_parameter(url: &mut url::Url, name: &str, value: &str) {
     let encoded_pair = format!("{}={}", percent_encode(name), percent_encode(value));
-    let query = parsed.query().map_or_else(
+    let query = url.query().map_or_else(
         || encoded_pair.clone(),
         |existing| format!("{existing}&{encoded_pair}"),
     );
-    parsed.set_query(Some(&query));
-    parsed.into()
+    url.set_query(Some(&query));
 }
 
 fn percent_encode(value: &str) -> String {

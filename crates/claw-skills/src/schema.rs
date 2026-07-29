@@ -1,9 +1,10 @@
 //! Bounded JSON parameter-schema validation.
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 
-use serde_json::{Map, Value};
+use serde_json::{Map, Number, Value};
 
 const DEFAULT_MAX_VIOLATIONS: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 const DEFAULT_MAX_DEPTH: NonZeroUsize = NonZeroUsize::new(64).unwrap();
@@ -11,6 +12,9 @@ const DEFAULT_MAX_PATH_BYTES: NonZeroUsize = NonZeroUsize::new(1_024).unwrap();
 const DEFAULT_MAX_SCHEMA_NODES: NonZeroUsize = NonZeroUsize::new(4_096).unwrap();
 const DEFAULT_MAX_INPUT_NODES: NonZeroUsize = NonZeroUsize::new(65_536).unwrap();
 const DEFAULT_MAX_COMPARISON_NODES: NonZeroUsize = NonZeroUsize::new(65_536).unwrap();
+const I64_MIN_AS_F64: f64 = -9_223_372_036_854_775_808.0;
+const I64_UPPER_EXCLUSIVE_AS_F64: f64 = 9_223_372_036_854_775_808.0;
+const U64_UPPER_EXCLUSIVE_AS_F64: f64 = 18_446_744_073_709_551_616.0;
 
 /// Resource limits for untrusted parameter schemas and validation diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -677,19 +681,19 @@ fn validate_value(
             return Ok(false);
         }
     }
-    if let Some(value) = value.as_f64() {
+    if let Some(value) = value.as_number() {
         if object
             .get("minimum")
-            .and_then(Value::as_f64)
-            .is_some_and(|minimum| value < minimum)
+            .and_then(Value::as_number)
+            .is_some_and(|minimum| compare_numbers(value, minimum) == Ordering::Less)
             && !context.record(path, ParameterViolationKind::NumberTooSmall)
         {
             return Ok(false);
         }
         if object
             .get("maximum")
-            .and_then(Value::as_f64)
-            .is_some_and(|maximum| value > maximum)
+            .and_then(Value::as_number)
+            .is_some_and(|maximum| compare_numbers(value, maximum) == Ordering::Greater)
             && !context.record(path, ParameterViolationKind::NumberTooLarge)
         {
             return Ok(false);
@@ -728,7 +732,9 @@ fn json_equal_bounded(
     match (candidate, value) {
         (Value::Null, Value::Null) => Ok(true),
         (Value::Bool(left), Value::Bool(right)) => Ok(left == right),
-        (Value::Number(left), Value::Number(right)) => Ok(left == right),
+        (Value::Number(left), Value::Number(right)) => {
+            Ok(compare_numbers(left, right) == Ordering::Equal)
+        }
         (Value::String(left), Value::String(right)) => Ok(left == right),
         (Value::Array(left), Value::Array(right)) => {
             if left.len() != right.len() {
@@ -767,6 +773,94 @@ fn json_equal_bounded(
             | Value::Object(_),
             _,
         ) => Ok(false),
+    }
+}
+
+fn compare_numbers(left: &Number, right: &Number) -> Ordering {
+    if let Some(left) = left.as_i64() {
+        if let Some(right) = right.as_i64() {
+            return left.cmp(&right);
+        }
+        if let Some(right) = right.as_u64() {
+            return compare_i64_u64(left, right);
+        }
+        return compare_i64_f64(
+            left,
+            right
+                .as_f64()
+                .expect("JSON numbers outside the integer ranges are finite floats"),
+        );
+    }
+    if let Some(left) = left.as_u64() {
+        if let Some(right) = right.as_i64() {
+            return compare_i64_u64(right, left).reverse();
+        }
+        if let Some(right) = right.as_u64() {
+            return left.cmp(&right);
+        }
+        return compare_u64_f64(
+            left,
+            right
+                .as_f64()
+                .expect("JSON numbers outside the integer ranges are finite floats"),
+        );
+    }
+
+    let left = left
+        .as_f64()
+        .expect("JSON numbers outside the integer ranges are finite floats");
+    if let Some(right) = right.as_i64() {
+        return compare_i64_f64(right, left).reverse();
+    }
+    if let Some(right) = right.as_u64() {
+        return compare_u64_f64(right, left).reverse();
+    }
+    left.partial_cmp(
+        &right
+            .as_f64()
+            .expect("JSON numbers outside the integer ranges are finite floats"),
+    )
+    .expect("serde_json rejects non-finite numbers")
+}
+
+fn compare_i64_u64(signed: i64, unsigned: u64) -> Ordering {
+    u64::try_from(signed).map_or(Ordering::Less, |signed| signed.cmp(&unsigned))
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the explicit finite range guards make the truncating conversion exact and in-range"
+)]
+fn compare_i64_f64(integer: i64, float: f64) -> Ordering {
+    if float < I64_MIN_AS_F64 {
+        return Ordering::Greater;
+    }
+    if float >= I64_UPPER_EXCLUSIVE_AS_F64 {
+        return Ordering::Less;
+    }
+    compare_integer_to_bounded_float(&integer, float, &(float.trunc() as i64))
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the explicit finite range guards make the truncating conversion exact and in-range"
+)]
+fn compare_u64_f64(integer: u64, float: f64) -> Ordering {
+    if float < 0.0 {
+        return Ordering::Greater;
+    }
+    if float >= U64_UPPER_EXCLUSIVE_AS_F64 {
+        return Ordering::Less;
+    }
+    compare_integer_to_bounded_float(&integer, float, &(float.trunc() as u64))
+}
+
+fn compare_integer_to_bounded_float<T: Ord>(integer: &T, float: f64, truncated: &T) -> Ordering {
+    match integer.cmp(truncated) {
+        Ordering::Equal if float.fract() > 0.0 => Ordering::Less,
+        Ordering::Equal if float.fract() < 0.0 => Ordering::Greater,
+        ordering => ordering,
     }
 }
 

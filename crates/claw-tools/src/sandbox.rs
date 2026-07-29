@@ -620,10 +620,7 @@ impl Sandbox {
         };
         let pin = self.pin_ancestors(&components[..components.len() - 1])?;
         let absolute = pin.path().join(leaf);
-        let mut options = OpenOptions::new();
-        options.read(true);
-        apply_no_follow(&mut options);
-        let file = options.open(&absolute).map_err(|error| map_io(&error))?;
+        let file = open_read_no_follow(pin.handle()?, &absolute, leaf)?;
         verify_handle_is_not_reparse_point(&file)?;
         self.verify_canonical(&absolute, components)?;
         pin.verify()?;
@@ -636,11 +633,10 @@ impl Sandbox {
     /// Opens and holds a handle to the root and to every named directory below
     /// it, refusing links at every level.
     ///
-    /// On Windows the handles are opened without `FILE_SHARE_DELETE`, so the
-    /// operating system itself refuses to rename or delete any pinned
-    /// directory while the pin lives. On Unix, where no such lock exists, each
-    /// directory's device and inode are captured from its own handle and
-    /// re-compared in [`DirectoryPin::verify`].
+    /// Each descendant is opened relative to the preceding handle, so neither
+    /// rename nor an in-place reparse change can redirect descent. Windows also
+    /// withholds `FILE_SHARE_DELETE`; Unix additionally captures device/inode
+    /// identity for [`DirectoryPin::verify`].
     ///
     /// This runs once per directory visited, and measurement puts nearly all
     /// of a recursive walk here: enumerating one 20-entry directory two levels
@@ -679,7 +675,11 @@ impl Sandbox {
             if !metadata.is_dir() {
                 return Err(SandboxError::NotADirectory);
             }
-            levels.push(pin_directory(&absolute)?);
+            let parent = levels
+                .last()
+                .map(|level| &level.handle)
+                .ok_or(SandboxError::NotADirectory)?;
+            levels.push(pin_child_directory(parent, &absolute, component)?);
         }
         self.verify_canonical(&absolute, components)?;
         Ok(DirectoryPin { levels })
@@ -818,9 +818,8 @@ fn identity_of(metadata: &std::fs::Metadata) -> DirectoryIdentity {
 #[derive(Debug)]
 struct PinnedDirectory {
     path: PathBuf,
-    /// Held open for the whole check-and-use window, and enumerated through
-    /// directly by [`list_pinned_names`] on Unix. Even where nothing reads it,
-    /// its value is that the operating system knows it exists.
+    /// Held open for the whole check-and-use window. Unix and Windows enumerate
+    /// through it directly with [`list_pinned_names`].
     handle: File,
     #[cfg(unix)]
     identity: DirectoryIdentity,
@@ -875,6 +874,13 @@ impl DirectoryPin {
 /// Opens one directory handle without following a link at its final component.
 fn pin_directory(path: &Path) -> Result<PinnedDirectory, SandboxError> {
     let handle = open_directory_no_follow(path)?;
+    pinned_directory_from_handle(path, handle)
+}
+
+fn pinned_directory_from_handle(
+    path: &Path,
+    handle: File,
+) -> Result<PinnedDirectory, SandboxError> {
     let metadata = handle.metadata().map_err(|error| map_io(&error))?;
     if is_link_like(&metadata) {
         return Err(SandboxError::SymlinkForbidden);
@@ -891,12 +897,58 @@ fn pin_directory(path: &Path) -> Result<PinnedDirectory, SandboxError> {
 }
 
 #[cfg(windows)]
+fn pin_child_directory(
+    parent: &File,
+    path: &Path,
+    name: &str,
+) -> Result<PinnedDirectory, SandboxError> {
+    use cap_primitives::fs::{OpenOptions as CapOpenOptions, OpenOptionsExt};
+
+    let mut options = CapOpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let handle = cap_primitives::fs::open(parent, Path::new(name), &options)
+        .map_err(|error| map_io(&error))?;
+    pinned_directory_from_handle(path, handle)
+}
+
+#[cfg(unix)]
+fn pin_child_directory(
+    parent: &File,
+    path: &Path,
+    name: &str,
+) -> Result<PinnedDirectory, SandboxError> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let handle = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(map_errno)?;
+    pinned_directory_from_handle(path, handle)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn pin_child_directory(
+    _parent: &File,
+    path: &Path,
+    _name: &str,
+) -> Result<PinnedDirectory, SandboxError> {
+    pin_directory(path)
+}
+
+#[cfg(windows)]
 fn open_directory_no_follow(path: &Path) -> Result<File, SandboxError> {
     OpenOptions::new()
         .read(true)
-        // Withholding FILE_SHARE_DELETE makes Windows refuse to rename or
-        // delete this directory for as long as the handle lives, which is what
-        // stops a validated ancestor being swapped for a junction.
+        // Delete sharing is withheld to prevent rename/removal. In-place
+        // reparse changes remain possible, so every descendant is opened
+        // relative to this handle rather than by re-walking its path.
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
@@ -954,38 +1006,45 @@ fn open_write_no_follow(
     }
 }
 
-/// Windows pins every ancestor without delete sharing before opening the full
-/// path, so the namespace cannot be redirected while this operation runs.
-#[cfg(not(unix))]
+/// Windows resolves the leaf directly from the pinned parent handle. An
+/// in-place reparse change on that parent therefore cannot redirect this open.
+#[cfg(windows)]
 fn open_write_no_follow(
-    _parent: &File,
-    absolute: &Path,
-    _leaf: &str,
+    parent: &File,
+    _absolute: &Path,
+    leaf: &str,
     mode: WriteMode,
 ) -> Result<File, SandboxError> {
-    fn open_existing(absolute: &Path) -> io::Result<File> {
-        let mut options = OpenOptions::new();
-        options.write(true);
-        apply_no_follow(&mut options);
-        options.open(absolute)
+    use cap_primitives::fs::{OpenOptions as CapOpenOptions, OpenOptionsExt};
+
+    fn open_existing(parent: &File, leaf: &str) -> io::Result<File> {
+        let mut options = CapOpenOptions::new();
+        options
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        cap_primitives::fs::open(parent, Path::new(leaf), &options)
     }
 
-    fn create_new(absolute: &Path) -> io::Result<File> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        apply_no_follow(&mut options);
-        options.open(absolute)
+    fn create_new(parent: &File, leaf: &str) -> io::Result<File> {
+        let mut options = CapOpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        cap_primitives::fs::open(parent, Path::new(leaf), &options)
     }
 
     if mode == WriteMode::CreateNew {
-        return create_new(absolute).map_err(|error| map_io(&error));
+        return create_new(parent, leaf).map_err(|error| map_io(&error));
     }
-    match open_existing(absolute) {
+    match open_existing(parent, leaf) {
         Ok(file) => Ok(file),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => match create_new(absolute) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match create_new(parent, leaf) {
             Ok(file) => Ok(file),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                open_existing(absolute).map_err(|error| map_io(&error))
+                open_existing(parent, leaf).map_err(|error| map_io(&error))
             }
             Err(error) => Err(map_io(&error)),
         },
@@ -993,26 +1052,65 @@ fn open_write_no_follow(
     }
 }
 
+#[cfg(not(any(windows, unix)))]
+fn open_write_no_follow(
+    _parent: &File,
+    absolute: &Path,
+    _leaf: &str,
+    mode: WriteMode,
+) -> Result<File, SandboxError> {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    match mode {
+        WriteMode::CreateNew => {
+            options.create_new(true);
+        }
+        WriteMode::Overwrite => {
+            options.create(true);
+        }
+    }
+    apply_no_follow(&mut options);
+    options.open(absolute).map_err(|error| map_io(&error))
+}
+
+#[cfg(windows)]
+fn open_read_no_follow(parent: &File, _absolute: &Path, leaf: &str) -> Result<File, SandboxError> {
+    use cap_primitives::fs::{OpenOptions as CapOpenOptions, OpenOptionsExt};
+
+    let mut options = CapOpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    cap_primitives::fs::open(parent, Path::new(leaf), &options).map_err(|error| map_io(&error))
+}
+
+#[cfg(unix)]
+fn open_read_no_follow(parent: &File, _absolute: &Path, leaf: &str) -> Result<File, SandboxError> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    openat(
+        parent,
+        leaf,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(map_errno)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn open_read_no_follow(_parent: &File, absolute: &Path, _leaf: &str) -> Result<File, SandboxError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    apply_no_follow(&mut options);
+    options.open(absolute).map_err(|error| map_io(&error))
+}
+
 /// Returns whether metadata describes a symbolic link.
 #[cfg(not(windows))]
 fn is_link_like(metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
-}
-
-#[cfg(windows)]
-fn apply_no_follow(options: &mut OpenOptions) {
-    options
-        // Keep the opened leaf from being renamed outside the pinned tree
-        // between verification and the final read/write.
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-}
-
-#[cfg(unix)]
-fn apply_no_follow(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    options.custom_flags(libc::O_NOFOLLOW);
 }
 
 #[cfg(not(any(windows, unix)))]
@@ -1074,11 +1172,10 @@ fn verify_handle_matches_path(file: &File, absolute: &Path) -> Result<(), Sandbo
 
 /// Windows counterpart, where the swap this guards against cannot happen.
 ///
-/// Pinned ancestors and the opened leaf are held without `FILE_SHARE_DELETE`,
-/// so the kernel refuses to rename or delete them while the operation lives.
-/// That is prevention rather than detection, and it is why no identity
-/// comparison is needed here; Windows also exposes no stable file identity on
-/// stable Rust.
+/// Every descendant and leaf is opened relative to its already-open parent
+/// handle with `NtCreateFile`. In-place reparse changes can therefore make
+/// pathname verification fail, but cannot redirect the handle-relative open.
+/// Windows also exposes no stable file identity on stable Rust.
 #[cfg(not(unix))]
 fn verify_handle_matches_path(_file: &File, _absolute: &Path) -> Result<(), SandboxError> {
     Ok(())
@@ -1263,12 +1360,27 @@ fn list_pinned_names(
     Ok(names)
 }
 
-/// Windows and other platforms enumerate by path.
-///
-/// This is safe here for the reason the identity comparison is unnecessary
-/// there: pinned ancestors are held without `FILE_SHARE_DELETE`, so the kernel
-/// refuses to rename or delete them while the pin lives.
-#[cfg(not(unix))]
+/// Windows enumerates directly from the pinned directory handle so an
+/// in-place reparse-point toggle cannot redirect the operation.
+#[cfg(windows)]
+fn list_pinned_names(
+    handle: &File,
+    _path: &Path,
+    limit: usize,
+) -> Result<Vec<String>, SandboxError> {
+    let names = claw_windows_handle_dir::read_names(handle, limit.saturating_add(1))
+        .map_err(|error| map_io(&error))?;
+    if names.len() > limit {
+        return Err(SandboxError::DirectoryTooLarge);
+    }
+    Ok(names
+        .into_iter()
+        .filter_map(|name| name.into_string().ok())
+        .collect())
+}
+
+/// Other platforms do not have descriptor-relative enumeration support.
+#[cfg(not(any(unix, windows)))]
 fn list_pinned_names(
     _handle: &File,
     path: &Path,
@@ -1309,7 +1421,25 @@ fn stat_pinned_child(
     Ok((kind, u64::try_from(stat.st_size).unwrap_or(0)))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn stat_pinned_child(
+    handle: &File,
+    _path: &Path,
+    name: &str,
+) -> Result<(EntryKind, u64), SandboxError> {
+    use cap_primitives::fs::{OpenOptions as CapOpenOptions, OpenOptionsExt};
+
+    let mut options = CapOpenOptions::new();
+    options
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let child = cap_primitives::fs::open(handle, Path::new(name), &options)
+        .map_err(|error| map_io(&error))?;
+    let metadata = child.metadata().map_err(|error| map_io(&error))?;
+    Ok((classify(&metadata), metadata.len()))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn stat_pinned_child(
     _handle: &File,
     path: &Path,
@@ -1620,6 +1750,348 @@ mod tests {
         // A name that no longer resolves at all is equally not the open handle.
         std::fs::remove_file(&other).expect("remove the other file");
         assert!(verify_handle_matches_path(&file, &other).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    const WINDOWS_JUNCTION_TOGGLE_SCRIPT: &str = r#"
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using Microsoft.Win32.SafeHandles;
+
+public static class JunctionToggle
+{
+    private const uint GenericWrite = 0x40000000;
+    private const uint FileShareRead = 0x00000001;
+    private const uint FileShareWrite = 0x00000002;
+    private const uint FileShareDelete = 0x00000004;
+    private const uint OpenExisting = 3;
+    private const uint FileFlagOpenReparsePoint = 0x00200000;
+    private const uint FileFlagBackupSemantics = 0x02000000;
+    private const uint FsctlSetReparsePoint = 0x000900A4;
+    private const uint FsctlDeleteReparsePoint = 0x000900AC;
+    private const uint IoReparseTagMountPoint = 0xA0000003;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeviceIoControl(
+        SafeFileHandle device,
+        uint controlCode,
+        byte[] input,
+        int inputLength,
+        IntPtr output,
+        int outputLength,
+        out int bytesReturned,
+        IntPtr overlapped);
+
+    public static int Run(string path, string target, int attempts)
+    {
+        int successes = 0;
+        for (int index = 0; index < attempts; index++)
+        {
+            if (TryToggle(path, target))
+            {
+                successes++;
+            }
+            Thread.Sleep(1);
+        }
+        return successes;
+    }
+
+    private static bool TryToggle(string path, string target)
+    {
+        using (SafeFileHandle handle = CreateFile(
+            path,
+            GenericWrite,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagOpenReparsePoint | FileFlagBackupSemantics,
+            IntPtr.Zero))
+        {
+            if (handle.IsInvalid)
+            {
+                return false;
+            }
+
+            byte[] setData = MountPointData(target);
+            int ignored;
+            if (!DeviceIoControl(
+                handle,
+                FsctlSetReparsePoint,
+                setData,
+                setData.Length,
+                IntPtr.Zero,
+                0,
+                out ignored,
+                IntPtr.Zero))
+            {
+                return false;
+            }
+
+            Thread.Sleep(1);
+            byte[] deleteData = new byte[8];
+            Buffer.BlockCopy(BitConverter.GetBytes(IoReparseTagMountPoint), 0, deleteData, 0, 4);
+            if (!DeviceIoControl(
+                handle,
+                FsctlDeleteReparsePoint,
+                deleteData,
+                deleteData.Length,
+                IntPtr.Zero,
+                0,
+                out ignored,
+                IntPtr.Zero))
+            {
+                throw new InvalidOperationException("failed to remove test junction");
+            }
+            return true;
+        }
+    }
+
+    private static byte[] MountPointData(string target)
+    {
+        string printName = Path.GetFullPath(target);
+        string substituteName = @"\??\" + printName;
+        byte[] substitute = Encoding.Unicode.GetBytes(substituteName);
+        byte[] print = Encoding.Unicode.GetBytes(printName);
+        ushort printOffset = checked((ushort)(substitute.Length + 2));
+        ushort dataLength = checked((ushort)(8 + substitute.Length + 2 + print.Length + 2));
+        byte[] data = new byte[8 + dataLength];
+
+        Buffer.BlockCopy(BitConverter.GetBytes(IoReparseTagMountPoint), 0, data, 0, 4);
+        Buffer.BlockCopy(BitConverter.GetBytes(dataLength), 0, data, 4, 2);
+        Buffer.BlockCopy(BitConverter.GetBytes((ushort)0), 0, data, 8, 2);
+        Buffer.BlockCopy(BitConverter.GetBytes((ushort)substitute.Length), 0, data, 10, 2);
+        Buffer.BlockCopy(BitConverter.GetBytes(printOffset), 0, data, 12, 2);
+        Buffer.BlockCopy(BitConverter.GetBytes((ushort)print.Length), 0, data, 14, 2);
+        Buffer.BlockCopy(substitute, 0, data, 16, substitute.Length);
+        Buffer.BlockCopy(print, 0, data, 16 + printOffset, print.Length);
+        return data;
+    }
+}
+'@
+
+[IO.File]::WriteAllText($env:CLAW_TOGGLE_STARTED, "started")
+while (-not [IO.File]::Exists($env:CLAW_TOGGLE_RELEASE)) {
+    Start-Sleep -Milliseconds 1
+}
+$successes = [JunctionToggle]::Run(
+    $env:CLAW_TOGGLE_PATH,
+    $env:CLAW_TOGGLE_TARGET,
+    1000)
+[Console]::Out.WriteLine($successes)
+"#;
+
+    #[cfg(windows)]
+    #[test]
+    fn in_place_junction_toggle_cannot_redirect_a_concurrent_create() {
+        use std::process::{Command, Stdio};
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        let root = std::env::temp_dir().join(format!("claw-junction-toggle-{nanos}"));
+        let workspace = root.join("workspace");
+        let parent = workspace.join("flip");
+        let outside = root.join("outside");
+        let started = root.join("attacker-started");
+        let release = root.join("attacker-release");
+        std::fs::create_dir_all(&parent).expect("create the honest parent");
+        std::fs::create_dir_all(&outside).expect("create the outside directory");
+        let sandbox =
+            Sandbox::new(&workspace, SandboxLimits::default()).expect("adopt the workspace");
+        let relative = sandbox
+            .relative("flip/planted.txt")
+            .expect("legal target name");
+        let escaped = outside.join("planted.txt");
+
+        let mut attacker = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                WINDOWS_JUNCTION_TOGGLE_SCRIPT,
+            ])
+            .env("CLAW_TOGGLE_STARTED", &started)
+            .env("CLAW_TOGGLE_RELEASE", &release)
+            .env("CLAW_TOGGLE_PATH", &parent)
+            .env("CLAW_TOGGLE_TARGET", &outside)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the in-place junction attacker");
+
+        let startup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !started.is_file() {
+            if attacker.try_wait().expect("poll the attacker").is_some() {
+                let output = attacker
+                    .wait_with_output()
+                    .expect("collect attacker output");
+                panic!(
+                    "junction attacker exited before starting: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            assert!(
+                std::time::Instant::now() < startup_deadline,
+                "junction attacker did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        std::fs::write(&release, []).expect("release the junction attacker");
+        let mut writes = 0_u32;
+        while attacker
+            .try_wait()
+            .expect("poll the junction attacker")
+            .is_none()
+        {
+            writes += 1;
+            let _ = sandbox.write_file(&relative, b"confined", WriteMode::CreateNew);
+            assert!(
+                std::fs::symlink_metadata(&escaped).is_err(),
+                "an in-place junction toggle redirected creation outside the sandbox"
+            );
+            let _ = std::fs::remove_file(parent.join("planted.txt"));
+        }
+
+        let output = attacker
+            .wait_with_output()
+            .expect("collect attacker output");
+        assert!(
+            output.status.success(),
+            "junction attacker failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let toggles = String::from_utf8(output.stdout)
+            .expect("attacker output is UTF-8")
+            .trim()
+            .parse::<u32>()
+            .expect("attacker reports its successful toggles");
+        assert!(toggles > 0, "the in-place junction race was not exercised");
+        assert!(writes > 0, "no sandbox write overlapped the attacker");
+        assert!(
+            std::fs::symlink_metadata(&escaped).is_err(),
+            "the outside target must remain absent"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn in_place_junction_toggle_cannot_redirect_pinned_listing_or_stat() {
+        use std::process::{Command, Stdio};
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        let root = std::env::temp_dir().join(format!("claw-junction-read-toggle-{nanos}"));
+        let parent = root.join("workspace").join("flip");
+        let outside = root.join("outside");
+        let started = root.join("attacker-started");
+        let release = root.join("attacker-release");
+        std::fs::create_dir_all(&parent).expect("create the honest parent");
+        std::fs::create_dir_all(&outside).expect("create the outside directory");
+        std::fs::write(parent.join("shared.txt"), b"inside").expect("write the inside file");
+        std::fs::write(outside.join("shared.txt"), vec![b'x'; 4096])
+            .expect("write the outside file");
+        std::fs::write(outside.join("outside-only.txt"), b"secret")
+            .expect("write the outside-only file");
+        let handle = open_directory_no_follow(&parent).expect("pin the honest parent");
+
+        let mut attacker = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                WINDOWS_JUNCTION_TOGGLE_SCRIPT,
+            ])
+            .env("CLAW_TOGGLE_STARTED", &started)
+            .env("CLAW_TOGGLE_RELEASE", &release)
+            .env("CLAW_TOGGLE_PATH", &parent)
+            .env("CLAW_TOGGLE_TARGET", &outside)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the in-place junction attacker");
+
+        let startup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !started.is_file() {
+            if attacker.try_wait().expect("poll the attacker").is_some() {
+                let output = attacker
+                    .wait_with_output()
+                    .expect("collect attacker output");
+                panic!(
+                    "junction attacker exited before starting: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            assert!(
+                std::time::Instant::now() < startup_deadline,
+                "junction attacker did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        std::fs::write(&release, []).expect("release the junction attacker");
+        let mut reads = 0_u32;
+        while attacker
+            .try_wait()
+            .expect("poll the junction attacker")
+            .is_none()
+        {
+            reads += 1;
+            let names =
+                list_pinned_names(&handle, &parent, 64).expect("list through the pinned handle");
+            assert_eq!(
+                names,
+                vec!["shared.txt".to_owned()],
+                "listing exposed a name from the junction target"
+            );
+            let (kind, size) = stat_pinned_child(&handle, &parent, "shared.txt")
+                .expect("stat through the pinned handle");
+            assert_eq!(kind, EntryKind::File);
+            assert_eq!(size, 6, "stat exposed the junction target's file size");
+            assert_eq!(
+                stat_pinned_child(&handle, &parent, "outside-only.txt")
+                    .expect_err("outside-only child must not resolve from the pinned handle"),
+                SandboxError::NotFound
+            );
+        }
+
+        let output = attacker
+            .wait_with_output()
+            .expect("collect attacker output");
+        assert!(
+            output.status.success(),
+            "junction attacker failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let toggles = String::from_utf8(output.stdout)
+            .expect("attacker output is UTF-8")
+            .trim()
+            .parse::<u32>()
+            .expect("attacker reports its successful toggles");
+        assert!(toggles > 0, "the in-place junction race was not exercised");
+        assert!(reads > 0, "no pinned read overlapped the attacker");
         let _ = std::fs::remove_dir_all(&root);
     }
 

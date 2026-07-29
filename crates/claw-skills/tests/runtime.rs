@@ -259,6 +259,60 @@ fn query_parameters_are_inserted_before_a_url_fragment() {
 }
 
 #[test]
+fn every_http_parameter_mode_uses_the_same_canonical_url() {
+    let body_manifest = load_manifest(
+        r#"{
+            "id":"canonical-body",
+            "description":"Send a JSON body to a canonical endpoint.",
+            "parameters":{"type":"object","additionalProperties":false},
+            "execution":{
+                "kind":"http",
+                "request":{
+                    "method":"POST",
+                    "url":"HTTPS://Example.TEST:443/old/../status#result",
+                    "response":"json"
+                }
+            }
+        }"#,
+    )
+    .expect("valid body manifest");
+    let query_manifest = load_manifest(
+        r#"{
+            "id":"canonical-query",
+            "description":"Send a query parameter to the same canonical endpoint.",
+            "parameters":{"type":"object","additionalProperties":false},
+            "execution":{
+                "kind":"http",
+                "request":{
+                    "method":"POST",
+                    "url":"HTTPS://Example.TEST:443/old/../status#result",
+                    "parameters":{"kind":"query_parameter","name":"input"},
+                    "response":"json"
+                }
+            }
+        }"#,
+    )
+    .expect("valid query manifest");
+    let (native, http, mut wasm) = ports();
+    let mut runtime = SkillRuntime::new(&native, &http, &mut wasm);
+
+    assert_eq!(
+        runtime.execute(&body_manifest, json!({})),
+        Ok(json!({"status":"ok"}))
+    );
+    assert_eq!(
+        runtime.execute(&query_manifest, json!({})),
+        Ok(json!({"status":"ok"}))
+    );
+    let calls = http.requests.into_inner();
+    assert_eq!(calls[0].url, "https://example.test/status#result");
+    assert_eq!(
+        calls[1].url,
+        "https://example.test/status?input=%7B%7D#result"
+    );
+}
+
+#[test]
 fn unknown_manifest_fields_are_rejected_with_source_coordinates() {
     let json = r#"{
         "id":"native-echo",
