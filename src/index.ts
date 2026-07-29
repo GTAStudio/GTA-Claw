@@ -143,6 +143,7 @@ async function main(): Promise<void> {
         verifyToken: config.WHATSAPP_VERIFY_TOKEN!,
         accessToken: config.WHATSAPP_ACCESS_TOKEN!,
         phoneNumberId: config.WHATSAPP_PHONE_NUMBER_ID!,
+        appSecret: config.WHATSAPP_APP_SECRET!,
         onMessage: async (msg) =>
           processChannelMessage({ channel: "whatsapp", ...msg }),
       })

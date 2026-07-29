@@ -286,6 +286,7 @@ validate_channel_mode() {
   local whatsapp_verify_token="$7"
   local whatsapp_access_token="$8"
   local whatsapp_phone_number_id="$9"
+  local whatsapp_app_secret="${10}"
 
   validate_boolean "$enable_teams" "ENABLE_TEAMS" || return 1
   validate_boolean "$enable_telegram" "ENABLE_TELEGRAM" || return 1
@@ -303,8 +304,8 @@ validate_channel_mode() {
   fi
 
   if [ "$enable_whatsapp" = "true" ]; then
-    if [ -z "$whatsapp_verify_token" ] || [ -z "$whatsapp_access_token" ] || [ -z "$whatsapp_phone_number_id" ]; then
-      log_error "ENABLE_WHATSAPP=true 时必须提供 WHATSAPP_VERIFY_TOKEN / WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID"
+    if [ -z "$whatsapp_verify_token" ] || [ -z "$whatsapp_access_token" ] || [ -z "$whatsapp_phone_number_id" ] || [ -z "$whatsapp_app_secret" ]; then
+      log_error "ENABLE_WHATSAPP=true 时必须提供 WHATSAPP_VERIFY_TOKEN / WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID / WHATSAPP_APP_SECRET"
       return 1
     fi
   fi
@@ -389,7 +390,8 @@ do_config() {
     "$(grep '^ENABLE_WHATSAPP=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" \
     "$(grep '^WHATSAPP_VERIFY_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
     "$(grep '^WHATSAPP_ACCESS_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
-    "$(grep '^WHATSAPP_PHONE_NUMBER_ID=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)"
+    "$(grep '^WHATSAPP_PHONE_NUMBER_ID=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
+    "$(grep '^WHATSAPP_APP_SECRET=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)"
 
   log_info "配置文件验证通过"
   do_deploy
@@ -495,11 +497,13 @@ do_interactive() {
   whatsapp_verify_token=""
   whatsapp_access_token=""
   whatsapp_phone_number_id=""
+  whatsapp_app_secret=""
   whatsapp_webhook_path="/whatsapp/webhook"
   if [ "$enable_whatsapp" = "true" ]; then
     whatsapp_verify_token=$(prompt_secret "WHATSAPP_VERIFY_TOKEN" "WhatsApp Verify Token")
     whatsapp_access_token=$(prompt_secret "WHATSAPP_ACCESS_TOKEN" "WhatsApp Access Token")
     whatsapp_phone_number_id=$(prompt_required "WHATSAPP_PHONE_NUMBER_ID" "WhatsApp Phone Number ID")
+    whatsapp_app_secret=$(prompt_secret "WHATSAPP_APP_SECRET" "WhatsApp App Secret")
     whatsapp_webhook_path=$(prompt_optional "$(msg ask_wa_webhook_path)" "$whatsapp_webhook_path")
   fi
 
@@ -512,7 +516,8 @@ do_interactive() {
     "$enable_whatsapp" \
     "$whatsapp_verify_token" \
     "$whatsapp_access_token" \
-    "$whatsapp_phone_number_id"
+    "$whatsapp_phone_number_id" \
+    "$whatsapp_app_secret"
 
   log_step "$(msg step_advanced)"
   echo -e "  ${CYAN}$(msg domain_hint)${NC}"
@@ -571,6 +576,7 @@ ENABLE_WHATSAPP=${enable_whatsapp}
 WHATSAPP_VERIFY_TOKEN=${whatsapp_verify_token}
 WHATSAPP_ACCESS_TOKEN=${whatsapp_access_token}
 WHATSAPP_PHONE_NUMBER_ID=${whatsapp_phone_number_id}
+WHATSAPP_APP_SECRET=${whatsapp_app_secret}
 WHATSAPP_WEBHOOK_PATH=${whatsapp_webhook_path}
 EOF
 
