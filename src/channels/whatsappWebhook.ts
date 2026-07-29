@@ -1,11 +1,25 @@
 import type { Next, Request, Response } from "restify";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
+import { gunzip } from "node:zlib";
 import { logger } from "../utils/logger.js";
 import { fetch as defaultFetch } from "../utils/proxy.js";
 import { splitMessage } from "../utils/splitMessage.js";
 
 const MAX_COMPLETED_MESSAGE_IDS = 10_000;
 const MAX_PENDING_REPLIES = 10_000;
+const gunzipAsync = promisify(gunzip);
+
+class WhatsAppWebhookBodyError extends Error {
+  constructor(
+    readonly statusCode: number,
+    readonly clientMessage: string,
+    options?: ErrorOptions,
+  ) {
+    super(clientMessage, options);
+    this.name = "WhatsAppWebhookBodyError";
+  }
+}
 
 interface WhatsAppTextMessage {
   from: string;
@@ -39,24 +53,48 @@ interface WhatsAppRawRequest extends Request {
   whatsappRawBody?: Buffer;
 }
 
+export function isWhatsAppWebhookPost(
+  req: Pick<Request, "method" | "url">,
+  whatsappPath: string,
+): boolean {
+  return (
+    req.method === "POST" &&
+    req.url?.split("?", 1)[0] === whatsappPath
+  );
+}
+
 export function captureWhatsAppRawBody(whatsappPath: string) {
   return (req: Request, _res: Response, next: Next): void => {
-    const requestPath = req.url?.split("?", 1)[0];
-    if (req.method !== "POST" || requestPath !== whatsappPath) {
+    if (!isWhatsAppWebhookPost(req, whatsappPath)) {
       next();
       return;
     }
 
     const chunks: Buffer[] = [];
+    let settled = false;
+    const finish = (err?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (err) {
+        next(err);
+        return;
+      }
+      (req as WhatsAppRawRequest).whatsappRawBody = Buffer.concat(chunks);
+      next();
+    };
+
     req.on("data", (chunk: Buffer | string) => {
       chunks.push(
         Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(chunk),
       );
     });
-    req.once("end", () => {
-      (req as WhatsAppRawRequest).whatsappRawBody = Buffer.concat(chunks);
-    });
-    next();
+    req.once("end", () => finish());
+    req.once("error", (err) =>
+      finish(err instanceof Error ? err : new Error(String(err))),
+    );
+    req.once("aborted", () =>
+      finish(new Error("WhatsApp webhook request was aborted")),
+    );
   };
 }
 
@@ -131,7 +169,7 @@ export class WhatsAppWebhookHandler {
     }
 
     try {
-      const body = (req.body ?? {}) as WhatsAppWebhookBody;
+      const body = await this.parseAuthenticatedBody(req);
       const entries = body.entry ?? [];
 
       for (const entry of entries) {
@@ -147,8 +185,13 @@ export class WhatsAppWebhookHandler {
 
       res.send(200, { ok: true });
     } catch (err) {
-      logger.error({ err }, "WhatsApp webhook handling failed");
-      res.send(500, { error: "Webhook handling failed" });
+      if (err instanceof WhatsAppWebhookBodyError) {
+        logger.warn({ err }, "Invalid WhatsApp webhook body");
+        res.send(err.statusCode, { error: err.clientMessage });
+      } else {
+        logger.error({ err }, "WhatsApp webhook handling failed");
+        res.send(500, { error: "Webhook handling failed" });
+      }
     }
 
     next();
@@ -178,6 +221,66 @@ export class WhatsAppWebhookHandler {
       received.length === expected.length &&
       timingSafeEqual(received, expected)
     );
+  }
+
+  private async parseAuthenticatedBody(
+    req: Request,
+  ): Promise<WhatsAppWebhookBody> {
+    const rawBody = (req as WhatsAppRawRequest).whatsappRawBody;
+    if (!Buffer.isBuffer(rawBody)) {
+      throw new WhatsAppWebhookBodyError(
+        400,
+        "Missing WhatsApp webhook body",
+      );
+    }
+
+    const encodingHeader = req.headers["content-encoding"];
+    const encoding = (
+      Array.isArray(encodingHeader)
+        ? encodingHeader.join(",")
+        : encodingHeader ?? "identity"
+    )
+      .trim()
+      .toLowerCase();
+
+    let decodedBody: Buffer;
+    if (!encoding || encoding === "identity") {
+      decodedBody = rawBody;
+    } else if (encoding === "gzip") {
+      try {
+        decodedBody = await gunzipAsync(rawBody);
+      } catch (err) {
+        throw new WhatsAppWebhookBodyError(
+          400,
+          "Invalid gzip WhatsApp webhook body",
+          { cause: err },
+        );
+      }
+    } else {
+      throw new WhatsAppWebhookBodyError(
+        415,
+        `Unsupported Content-Encoding: ${encoding}`,
+      );
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(decodedBody.toString("utf8"));
+    } catch (err) {
+      throw new WhatsAppWebhookBodyError(
+        400,
+        "Invalid JSON WhatsApp webhook body",
+        { cause: err },
+      );
+    }
+
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new WhatsAppWebhookBodyError(
+        400,
+        "Invalid JSON WhatsApp webhook body",
+      );
+    }
+    return parsed as WhatsAppWebhookBody;
   }
 
   private async processMessage(
