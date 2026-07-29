@@ -1137,6 +1137,10 @@ fn apply_source_environment(
             "WHATSAPP_ACCESS_TOKEN",
             &["channels", "whatsapp", "accessToken"][..],
         ),
+        (
+            "WHATSAPP_APP_SECRET",
+            &["channels", "whatsapp", "appSecret"][..],
+        ),
     ] {
         if let Some(value) = variables.get(name).map(|value| value.trim())
             && !value.is_empty()

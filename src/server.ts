@@ -9,7 +9,11 @@ import { logger } from "./utils/logger.js";
 import type { AgentBot } from "./bot/teamsBot.js";
 import type { AppConfig } from "./config.js";
 import type { CopilotEngine } from "./engine/copilotEngine.js";
-import type { WhatsAppWebhookHandler } from "./channels/whatsappWebhook.js";
+import {
+  captureWhatsAppRawBody,
+  isWhatsAppWebhookPost,
+  type WhatsAppWebhookHandler,
+} from "./channels/whatsappWebhook.js";
 
 interface RuntimeStatus {
   skillCount: number;
@@ -91,7 +95,24 @@ export function createServer(deps: ServerDeps): restify.Server {
 
   const server = restify.createServer({ name: "GTA-Claw" });
   server.use(restify.plugins.queryParser());
-  server.use(restify.plugins.bodyParser());
+  const bodyParsers = restify.plugins.bodyParser();
+  if (deps.whatsappHandler) {
+    const whatsappPath = config.WHATSAPP_WEBHOOK_PATH;
+    server.use(captureWhatsAppRawBody(whatsappPath));
+    server.use(
+      bodyParsers.map((bodyParser) => {
+        return (req: Request, res: Response, next: Next): void => {
+          if (isWhatsAppWebhookPost(req, whatsappPath)) {
+            next();
+            return;
+          }
+          bodyParser(req, res, next);
+        };
+      }),
+    );
+  } else {
+    server.use(bodyParsers);
+  }
   const adapter = config.ENABLE_TEAMS
     ? new BotFrameworkAdapter({
         appId: config.MICROSOFT_APP_ID,
