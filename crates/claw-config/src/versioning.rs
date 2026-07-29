@@ -317,10 +317,17 @@ fn migrate_config_file_with_precommit(
             );
             let outcome = match published {
                 Ok(Publication::Published(outcome)) => outcome,
-                Ok(Publication::Conflict { actual }) => {
+                Ok(Publication::Conflict { actual, preserved }) => {
+                    // Publication already wrote a durable copy before it undid
+                    // the exchange, so the exact bytes are named rather than
+                    // written a second time.
+                    let backup_path = match preserved {
+                        Some(path) => path,
+                        None => create_backup(locked_path, &actual)?,
+                    };
                     return Err(ConfigMigrationError::ConcurrentEdit {
                         config_path: locked_path.to_owned(),
-                        backup_path: create_backup(locked_path, &actual)?,
+                        backup_path,
                     });
                 }
                 Err(source) => {

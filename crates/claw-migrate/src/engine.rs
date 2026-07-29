@@ -985,8 +985,13 @@ fn apply_plan(
         .and_then(|()| write_durable_receipt(&receipt, DurableReceiptState::FilesPublished))
         .and_then(|()| {
             test_publish_failpoint::trigger("after_files_published", context.target_root);
-            commit_secret_transaction(context.secret_store, &receipt)
+            // Secrets are finalized only once every published file is still the
+            // file this transaction wrote — the same gate recovery applies, so an
+            // apply that completes in one process cannot commit credentials for a
+            // configuration a concurrent writer has already replaced.
+            verify_published_receipt(context.target_root, &receipt)
         })
+        .and_then(|()| commit_secret_transaction(context.secret_store, &receipt))
         .and_then(|()| write_durable_receipt(&receipt, DurableReceiptState::Committed));
     if let Err(error) = apply_result {
         let rollback_errors = match rollback_receipt(context, &receipt) {
@@ -1116,7 +1121,12 @@ fn apply_operations(
             expected_current.as_deref(),
             &receipt.backup_dir,
         )?;
-        staged.into_published();
+        drop(staged);
+        // The staged digest stays authoritative. Re-reading the live target here
+        // would let a writer that landed in the window between the exchange and
+        // this line have its bytes recorded as this migration's own output, and
+        // rollback would then overwrite them without preserving anything.
+        verify_published_target(target, &expected_new, &receipt.backup_dir)?;
         record_applied_state(receipt, target)?;
         write_durable_receipt(receipt, DurableReceiptState::Pending)?;
     }
@@ -1130,6 +1140,37 @@ fn current_expectation(receipt: &ApplyReceipt, target: &Path) -> Option<String> 
         .iter()
         .find(|entry| entry.target == target)
         .and_then(BackupEntry::expected_current_digest)
+}
+
+/// Removes a staging path an interrupted publication left behind.
+///
+/// A crash in the window between the exchange and the comparison leaves the
+/// staging path holding whatever was displaced from the target — which, when a
+/// non-cooperating writer had got there first, is the only copy of that writer's
+/// bytes. Anything that is not already reproducible from the verified backup or
+/// from this migration's own staged output is copied into the durable conflict
+/// store before the staging path is reclaimed.
+fn discard_stale_stage(
+    stage: &Path,
+    entry: &BackupEntry,
+    conflict_root: &Path,
+) -> Result<(), MigrationError> {
+    if !path_is_occupied(stage) {
+        return Ok(());
+    }
+    let reproducible = match digest_path(stage) {
+        Ok(digest) => {
+            entry.original_digest.as_deref() == Some(digest.as_str())
+                || entry.expected_new_digest.as_deref() == Some(digest.as_str())
+        }
+        Err(MigrationError::Symlink(_)) => false,
+        Err(error) => return Err(error),
+    };
+    if !reproducible {
+        preserve_displaced_object(stage, conflict_root)?;
+    }
+    remove_path_if_exists(stage)?;
+    sync_parent_path(stage)
 }
 
 fn record_stage_reservation(receipt: &mut ApplyReceipt, target: &Path, stage: &Path) {
@@ -1242,7 +1283,7 @@ struct StagedArtifact {
     handle: Option<File>,
     identity: ObjectIdentity,
     directory: bool,
-    published: bool,
+    retained: bool,
 }
 
 impl StagedArtifact {
@@ -1273,7 +1314,7 @@ impl StagedArtifact {
                         handle: Some(handle),
                         identity,
                         directory: false,
-                        published: false,
+                        retained: false,
                     };
                     staged.verify_identity()?;
                     return Ok(staged);
@@ -1407,15 +1448,24 @@ impl StagedArtifact {
         self.handle = None;
     }
 
-    /// Marks the reservation as consumed so `Drop` leaves the filesystem alone.
-    fn into_published(mut self) {
-        self.published = true;
+    /// Stops cleanup from touching the staging path.
+    ///
+    /// Used both when the reservation has been consumed by publication and when
+    /// the staging path holds an object nobody else has a copy of, because
+    /// removing that object would turn a failed publication into data loss.
+    const fn retain(&mut self) {
+        self.retained = true;
+    }
+
+    /// Re-arms cleanup after the staging path is safe to remove again.
+    const fn rearm(&mut self) {
+        self.retained = false;
     }
 }
 
 impl Drop for StagedArtifact {
     fn drop(&mut self) {
-        if self.published {
+        if self.retained {
             return;
         }
         self.handle = None;
@@ -1449,25 +1499,36 @@ fn publish_staged_artifact(
     test_publish_failpoint::run_barrier("before_publish", target);
     staged.verify_identity()?;
     staged.release_handle();
-    swap_into_place(staged.path(), target, expected_current, conflict_root)
+    swap_into_place(staged, target, expected_current, conflict_root)
 }
 
-/// Compare-and-swap `replacement` onto `target`.
+/// Compare-and-swap the staged object onto `target`.
 ///
 /// `expected` is the digest the target must still carry, or `None` when the
-/// target must still be absent. On success `replacement` no longer exists.
+/// target must still be absent. On success the staging path no longer holds the
+/// staged object.
+///
+/// When the comparison fails, the object the exchange moved to the staging path
+/// is the *only* copy of what the target held a moment earlier. Cleanup is
+/// disarmed before anything else happens to it, a durable copy is taken, and
+/// only then is the exchange undone. If the platform refuses to undo it the
+/// staging path is left in place and named in the error, because deleting it
+/// would turn a refused publication into silent data loss.
 fn swap_into_place(
-    replacement: &Path,
+    staged: &mut StagedArtifact,
     target: &Path,
     expected: Option<&str>,
     conflict_root: &Path,
 ) -> Result<(), MigrationError> {
+    let replacement = staged.path().to_path_buf();
     let Some(expected) = expected else {
-        return match atomicfs::rename_no_replace(replacement, target) {
+        return match atomicfs::rename_no_replace(&replacement, target) {
             Ok(()) => {
+                staged.retain();
                 test_publish_failpoint::trigger("after_target_moved", target);
                 sync_parent_path(target)?;
                 test_publish_failpoint::trigger("after_target_published", target);
+                test_publish_failpoint::run_barrier("after_publish", target);
                 Ok(())
             }
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
@@ -1483,27 +1544,35 @@ fn swap_into_place(
     if !path_is_occupied(target) {
         return Err(MigrationError::Conflict(target.to_path_buf()));
     }
-    atomicfs::exchange_paths(replacement, target).map_err(|source| MigrationError::Io {
+    atomicfs::exchange_paths(&replacement, target).map_err(|source| MigrationError::Io {
         action: "publish staged migration target",
         path: target.to_path_buf(),
         source,
     })?;
+    // From here until the staging path is proven expendable it holds the only
+    // copy of whatever was displaced from the target.
+    staged.retain();
     test_publish_failpoint::trigger("after_target_moved", target);
-    match digest_path(replacement) {
-        Ok(displaced) if displaced == expected => {
-            remove_path_if_exists(replacement)?;
+    let displaced = digest_path(&replacement);
+    if matches!(&displaced, Ok(digest) if digest == expected) {
+        // The displaced object is the one the verified backup already holds.
+        staged.rearm();
+        remove_path_if_exists(&replacement)?;
+        sync_parent_path(target)?;
+        test_publish_failpoint::trigger("after_target_published", target);
+        test_publish_failpoint::run_barrier("after_publish", target);
+        return Ok(());
+    }
+    let preserved = preserve_displaced_object(&replacement, conflict_root);
+    let restored = test_publish_failpoint::injected_restore_failure(target)
+        .map_or_else(|| atomicfs::exchange_paths(&replacement, target), Err);
+    match restored {
+        Ok(()) => {
+            // The displaced object is back where it came from and the staging
+            // path holds this migration's own bytes again, so cleanup is safe.
+            staged.rearm();
             sync_parent_path(target)?;
-            test_publish_failpoint::trigger("after_target_published", target);
-            Ok(())
-        }
-        outcome => {
-            atomicfs::exchange_paths(replacement, target).map_err(|source| MigrationError::Io {
-                action: "restore concurrently changed migration target",
-                path: target.to_path_buf(),
-                source,
-            })?;
-            sync_parent_path(target)?;
-            match outcome {
+            match displaced {
                 // A link planted at the target is named by the target it was
                 // planted at, not by the staging path it was momentarily swapped
                 // to while the comparison ran.
@@ -1511,10 +1580,65 @@ fn swap_into_place(
                     Err(MigrationError::Symlink(target.to_path_buf()))
                 }
                 Err(error) => Err(error),
-                Ok(_) => Err(preserve_conflicting_target(target, conflict_root)?),
+                Ok(_) => Err(MigrationError::Conflict(preserved?)),
             }
         }
+        Err(source) => Err(unrestored_displacement(
+            target,
+            &replacement,
+            preserved.as_deref(),
+            &source,
+        )),
     }
+}
+
+/// Reports a displacement the platform refused to undo, naming every copy.
+///
+/// The error deliberately does not look like a partial success: the target still
+/// holds the newly published object, the displaced object is retained at the
+/// staging path, and a durable copy may also exist. All three are named so the
+/// state can be reconstructed by hand.
+fn unrestored_displacement(
+    target: &Path,
+    replacement: &Path,
+    preserved: Result<&Path, &MigrationError>,
+    source: &io::Error,
+) -> MigrationError {
+    let copies = match preserved {
+        Ok(path) => format!(
+            "the displaced object is retained at {} and copied to {}",
+            replacement.display(),
+            path.display()
+        ),
+        Err(error) => format!(
+            "the displaced object is retained at {} and could not be copied ({error})",
+            replacement.display()
+        ),
+    };
+    MigrationError::Io {
+        action: "restore concurrently changed migration target",
+        path: target.to_path_buf(),
+        source: io::Error::new(
+            source.kind(),
+            format!("{source}; the target still holds the newly published object; {copies}"),
+        ),
+    }
+}
+
+/// Copies an object into the durable conflict store and returns its path.
+fn preserve_displaced_object(
+    displaced: &Path,
+    conflict_root: &Path,
+) -> Result<PathBuf, MigrationError> {
+    let conflicts = conflict_root.join("conflicts");
+    create_dir_all(&conflicts)?;
+    let sequence = BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let preserved = conflicts.join(sequence.to_string());
+    remove_path_if_exists(&preserved)?;
+    copy_path(displaced, &preserved)?;
+    sync_path_tree(&preserved)?;
+    sync_parent_path(&preserved)?;
+    Ok(preserved)
 }
 
 /// Copies the exact object occupying `target` into the durable conflict store.
@@ -1529,15 +1653,10 @@ fn preserve_conflicting_target(
     if !path_is_occupied(target) {
         return Ok(MigrationError::Conflict(target.to_path_buf()));
     }
-    let conflicts = conflict_root.join("conflicts");
-    create_dir_all(&conflicts)?;
-    let sequence = BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let preserved = conflicts.join(sequence.to_string());
-    remove_path_if_exists(&preserved)?;
-    copy_path(target, &preserved)?;
-    sync_path_tree(&preserved)?;
-    sync_parent_path(&preserved)?;
-    Ok(MigrationError::Conflict(preserved))
+    Ok(MigrationError::Conflict(preserve_displaced_object(
+        target,
+        conflict_root,
+    )?))
 }
 
 fn recover_pending_backups(
@@ -1605,15 +1724,44 @@ fn verify_published_files(
     backup_dir: &Path,
     backups: &[DurableBackupEntry],
 ) -> Result<(), MigrationError> {
-    for entry in backups {
-        ensure_target_within(target_root, &entry.target)?;
-        ensure_no_symlink_ancestors(target_root, &entry.target)?;
-        let occupied = path_is_occupied(&entry.target);
-        match (&entry.expected_new_sha256, occupied) {
-            (Some(expected), true) if digest_path(&entry.target)? == *expected => {}
+    verify_published_targets(
+        target_root,
+        backup_dir,
+        backups
+            .iter()
+            .map(|entry| (entry.target.as_path(), entry.expected_new_sha256.as_deref())),
+    )
+}
+
+/// The same gate for a receipt this process is still holding in memory.
+fn verify_published_receipt(
+    target_root: &Path,
+    receipt: &ApplyReceipt,
+) -> Result<(), MigrationError> {
+    verify_published_targets(
+        target_root,
+        &receipt.backup_dir,
+        receipt
+            .backups
+            .iter()
+            .map(|entry| (entry.target.as_path(), entry.expected_new_digest.as_deref())),
+    )
+}
+
+fn verify_published_targets<'a>(
+    target_root: &Path,
+    backup_dir: &Path,
+    entries: impl Iterator<Item = (&'a Path, Option<&'a str>)>,
+) -> Result<(), MigrationError> {
+    for (target, expected_new) in entries {
+        ensure_target_within(target_root, target)?;
+        ensure_no_symlink_ancestors(target_root, target)?;
+        let occupied = path_is_occupied(target);
+        match (expected_new, occupied) {
+            (Some(expected), true) if digest_path(target)? == expected => {}
             (None, false) => {}
-            (_, true) => return Err(preserve_conflicting_target(&entry.target, backup_dir)?),
-            (Some(_), false) => return Err(MigrationError::Conflict(entry.target.clone())),
+            (_, true) => return Err(preserve_conflicting_target(target, backup_dir)?),
+            (Some(_), false) => return Err(MigrationError::Conflict(target.to_path_buf())),
         }
     }
     Ok(())
@@ -1645,8 +1793,7 @@ fn restore_pending_receipt(
         if let Some(stage) = &entry.stage
             && stage != &entry.target
         {
-            remove_path_if_exists(stage)?;
-            sync_parent_path(stage)?;
+            discard_stale_stage(stage, &backup, backup_dir)?;
         }
         if backup.backup.is_none() {
             cleanup_empty_parents(&backup.target, target_root);
@@ -1655,6 +1802,32 @@ fn restore_pending_receipt(
     Ok(())
 }
 
+/// Confirms the target still holds exactly the object that was just published.
+///
+/// The digest is the one taken from the staged object before the exchange, never
+/// a fresh read of the target, so this compares the receipt's claim against the
+/// filesystem rather than adopting whatever the filesystem happens to say. A
+/// writer that replaced the target in the window between the exchange and this
+/// check is preserved verbatim and reported, instead of being blessed as this
+/// migration's own output.
+fn verify_published_target(
+    target: &Path,
+    expected_new: &str,
+    conflict_root: &Path,
+) -> Result<(), MigrationError> {
+    if path_is_occupied(target) && digest_path(target)? == expected_new {
+        return Ok(());
+    }
+    Err(preserve_conflicting_target(target, conflict_root)?)
+}
+
+/// Records the effect of publishing `target`.
+///
+/// The entry for `target` itself keeps the digest recorded before the exchange:
+/// that value describes the object this migration staged and published, and it
+/// is the only value rollback and recovery can safely compare a later reading
+/// against. Entries that merely *contain* `target`, or are contained by it, do
+/// change as a result of the publication and are the only ones re-read.
 fn record_applied_state(receipt: &mut ApplyReceipt, target: &Path) -> Result<(), MigrationError> {
     for backup in receipt.backups.iter_mut().filter(|entry| {
         entry.target == target
@@ -1662,14 +1835,15 @@ fn record_applied_state(receipt: &mut ApplyReceipt, target: &Path) -> Result<(),
             || target.starts_with(&entry.target)
     }) {
         backup.applied = true;
+        if backup.target == target {
+            backup.stage = None;
+            continue;
+        }
         backup.expected_new_digest = if path_is_occupied(&backup.target) {
             Some(digest_path(&backup.target)?)
         } else {
             None
         };
-        if backup.target == target {
-            backup.stage = None;
-        }
     }
     Ok(())
 }
@@ -1968,13 +2142,11 @@ fn restore_backup(entry: &BackupEntry, conflict_root: &Path) -> Result<(), Migra
     }
     staged.release_handle();
     swap_into_place(
-        staged.path(),
+        &mut staged,
         &entry.target,
         expected_current.as_deref(),
         conflict_root,
-    )?;
-    staged.into_published();
-    Ok(())
+    )
 }
 
 /// Removes a target this apply created, refusing to delete foreign bytes.
@@ -2891,7 +3063,7 @@ fn write_durable_bytes(path: &Path, bytes: &[u8]) -> Result<(), MigrationError> 
         path: path.to_path_buf(),
         source,
     })?;
-    staged.into_published();
+    staged.retain();
     sync_parent_path(path)
 }
 
@@ -2981,6 +3153,10 @@ pub mod test_publish_failpoint {
 
     static BARRIERS: Mutex<Vec<(&'static str, PathBuf, BarrierAction)>> = Mutex::new(Vec::new());
 
+    // Targets whose next restoring exchange must be refused, so the durability of
+    // the displaced object can be tested without an unmountable filesystem.
+    static RESTORE_FAILURES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
     /// Held during the test; clears its own failpoint on drop.
     pub struct Guard {
         checkpoint: &'static str,
@@ -2991,6 +3167,25 @@ pub mod test_publish_failpoint {
     pub struct BarrierGuard {
         checkpoint: &'static str,
         target_path: PathBuf,
+    }
+
+    /// Held during the test; clears its own injected restore failure on drop.
+    pub struct RestoreFailureGuard {
+        target_path: PathBuf,
+    }
+
+    /// Makes the next attempt to undo a displacement of `target_path` fail.
+    ///
+    /// A refused restoring exchange is the one case in which the staging path
+    /// holds the only copy of what the target used to contain, so it has to be
+    /// reachable from a test.
+    pub fn fail_restore_for(target_path: impl AsRef<Path>) -> RestoreFailureGuard {
+        let target_path = target_path.as_ref().to_path_buf();
+        RESTORE_FAILURES
+            .lock()
+            .expect("lock restore failpoint")
+            .push(target_path.clone());
+        RestoreFailureGuard { target_path }
     }
 
     /// Arms a failpoint at `checkpoint` scoped to `target_path`.
@@ -3051,6 +3246,22 @@ pub mod test_publish_failpoint {
         assert!(!armed, "injected crash at {checkpoint}");
     }
 
+    pub(super) fn injected_restore_failure(target: &Path) -> Option<std::io::Error> {
+        let armed = {
+            let mut failures = RESTORE_FAILURES.lock().expect("lock restore failpoint");
+            failures
+                .iter()
+                .position(|path| path == target)
+                .map(|index| failures.swap_remove(index))
+        };
+        armed.map(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected restoring exchange failure",
+            )
+        })
+    }
+
     pub(super) fn run_barrier(checkpoint: &str, target: &Path) {
         let action = {
             let mut registrations = BARRIERS.lock().expect("lock failpoint barrier");
@@ -3068,6 +3279,15 @@ pub mod test_publish_failpoint {
         fn drop(&mut self) {
             let mut registrations = ACTIVE.lock().expect("lock failpoint");
             take(&mut registrations, self.checkpoint, &self.target_path);
+        }
+    }
+
+    impl Drop for RestoreFailureGuard {
+        fn drop(&mut self) {
+            let mut failures = RESTORE_FAILURES.lock().expect("lock restore failpoint");
+            if let Some(index) = failures.iter().position(|path| *path == self.target_path) {
+                failures.swap_remove(index);
+            }
         }
     }
 

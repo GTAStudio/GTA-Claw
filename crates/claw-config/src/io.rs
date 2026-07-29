@@ -131,6 +131,9 @@ pub(crate) enum Publication {
     Conflict {
         /// The exact bytes that occupied the destination instead.
         actual: Vec<u8>,
+        /// Durable copy of those bytes, written before the destination was
+        /// restored, so the only copy never depended on a step that can fail.
+        preserved: Option<PathBuf>,
     },
 }
 
@@ -232,6 +235,81 @@ pub(crate) fn publish_bytes_locked(
     }
 }
 
+/// Puts a displaced object back at `destination`, or refuses to lose it.
+///
+/// A refused exchange leaves the temporary holding the only copy of what the
+/// destination used to contain. The temporary stays disarmed and the error names
+/// it — and any durable copy — rather than reporting something success-shaped
+/// while cleanup deletes the evidence.
+fn undo_displacement(
+    temporary: &TemporaryArtifact,
+    destination: &Path,
+    preserved: Option<&PathBuf>,
+) -> io::Result<()> {
+    let restored = test_failpoint_restore_failure(destination).map_or_else(
+        || atomicfs::exchange_paths(temporary.path(), destination),
+        Err,
+    );
+    let Err(error) = restored else {
+        return Ok(());
+    };
+    let copies = preserved.map_or_else(
+        || " and was not copied anywhere else".to_owned(),
+        |path| format!(" and copied to {}", path.display()),
+    );
+    Err(io::Error::new(
+        error.kind(),
+        format!(
+            "could not restore the concurrently changed destination {}: {error}; the destination \
+             still holds the newly published bytes and the displaced object is retained at {}{}",
+            destination.display(),
+            temporary.path().display(),
+            copies
+        ),
+    ))
+}
+
+#[cfg(test)]
+fn test_failpoint_restore_failure(destination: &Path) -> Option<io::Error> {
+    test_failpoint::injected_restore_failure(destination)
+}
+
+#[cfg(not(test))]
+const fn test_failpoint_restore_failure(_destination: &Path) -> Option<io::Error> {
+    None
+}
+
+/// Writes an exact durable copy of displaced bytes beside the destination.
+fn write_durable_conflict_copy(destination: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    for _ in 0..128 {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = destination.with_file_name(format!(
+            "{}.gta-claw.conflict.{}.{sequence}.bak",
+            destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("config"),
+            std::process::id()
+        ));
+        match atomicfs::create_new_no_follow(&path) {
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                file.flush()?;
+                file.sync_all()?;
+                drop(file);
+                sync_parent(&path)?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique conflict backup",
+    ))
+}
+
 fn publish_temporary(
     temporary: &mut TemporaryArtifact,
     destination: &Path,
@@ -262,7 +340,10 @@ fn publish_temporary(
             // that is gone is as much a concurrent change as one that was
             // rewritten, and the caller decides what to do about it.
             if guarded {
-                return Ok(Publication::Conflict { actual: Vec::new() });
+                return Ok(Publication::Conflict {
+                    actual: Vec::new(),
+                    preserved: None,
+                });
             }
             match atomicfs::rename_no_replace(temporary.path(), destination) {
                 Ok(()) => {
@@ -278,19 +359,35 @@ fn publish_temporary(
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         }
+        // From here until the temporary is proven expendable it holds the only
+        // copy of whatever was displaced from the destination, so nothing may
+        // remove it — not the error path, not `Drop`.
+        temporary.disarm();
         let displaced = match fs::read(temporary.path()) {
             Ok(bytes) => bytes,
             Err(error) => {
-                atomicfs::exchange_paths(temporary.path(), destination)?;
+                undo_displacement(temporary, destination, None).map_err(|restore| {
+                    io::Error::new(restore.kind(), format!("{error}; {restore}"))
+                })?;
+                temporary.rearm();
                 return Err(error);
             }
         };
         if let PublicationGuard::Digest(expected) = guard
             && crate::versioning::digest_hex(&displaced) != expected
         {
-            atomicfs::exchange_paths(temporary.path(), destination)?;
-            return Ok(Publication::Conflict { actual: displaced });
+            // Durability first: the displaced bytes are already in hand, so an
+            // exact copy is written before the exchange that could fail is even
+            // attempted.
+            let preserved = write_durable_conflict_copy(destination, &displaced);
+            undo_displacement(temporary, destination, preserved.as_ref().ok())?;
+            temporary.rearm();
+            return Ok(Publication::Conflict {
+                actual: displaced,
+                preserved: Some(preserved?),
+            });
         }
+        temporary.rearm();
         // The temporary now holds the old destination bytes; removing it is the
         // last step, and a failure only leaves a stale copy of the *previous*
         // contents, which is reported rather than hidden.
@@ -482,6 +579,11 @@ pub(crate) fn inject_external_writer_for_tests(
 }
 
 #[cfg(test)]
+pub(crate) fn fail_restore_for_tests(destination: &Path) -> test_failpoint::RestoreFailureGuard {
+    test_failpoint::fail_restore(destination)
+}
+
+#[cfg(test)]
 mod test_failpoint {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -496,11 +598,57 @@ mod test_failpoint {
     // barriers instead of consuming each other's.
     static EXTERNAL_WRITERS: Mutex<Vec<(PathBuf, ExternalWriter)>> = Mutex::new(Vec::new());
 
+    // Destinations whose next restoring exchange must be refused, so the only
+    // case in which the temporary holds the sole copy of the displaced object is
+    // reachable without an unmountable filesystem.
+    static RESTORE_FAILURES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
     pub(crate) struct Guard;
 
     /// Held for the duration of a test; clears its own barrier on drop.
     pub(crate) struct ExternalWriterGuard {
         destination: PathBuf,
+    }
+
+    /// Held for the duration of a test; clears its own injected failure on drop.
+    pub(crate) struct RestoreFailureGuard {
+        destination: PathBuf,
+    }
+
+    /// Makes the next attempt to undo a displacement of `destination` fail.
+    pub(crate) fn fail_restore(destination: &Path) -> RestoreFailureGuard {
+        RESTORE_FAILURES
+            .lock()
+            .expect("lock restore failpoint")
+            .push(destination.to_path_buf());
+        RestoreFailureGuard {
+            destination: destination.to_path_buf(),
+        }
+    }
+
+    pub(super) fn injected_restore_failure(destination: &Path) -> Option<std::io::Error> {
+        let armed = {
+            let mut failures = RESTORE_FAILURES.lock().expect("lock restore failpoint");
+            failures
+                .iter()
+                .position(|path| path == destination)
+                .map(|index| failures.swap_remove(index))
+        };
+        armed.map(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected restoring exchange failure",
+            )
+        })
+    }
+
+    impl Drop for RestoreFailureGuard {
+        fn drop(&mut self) {
+            let mut failures = RESTORE_FAILURES.lock().expect("lock restore failpoint");
+            if let Some(index) = failures.iter().position(|path| *path == self.destination) {
+                failures.swap_remove(index);
+            }
+        }
     }
 
     /// Arms a one-shot write that lands after every pre-publication check and
@@ -652,6 +800,11 @@ impl TemporaryArtifact {
         self.armed = false;
     }
 
+    /// Re-arms cleanup after the temporary is safe to remove again.
+    const fn rearm(&mut self) {
+        self.armed = true;
+    }
+
     fn cleanup(&mut self) -> io::Result<()> {
         if !self.armed {
             return Ok(());
@@ -797,16 +950,94 @@ mod tests {
         })
         .expect("publication must not fail outright");
 
-        let Publication::Conflict { actual } = publication else {
+        let Publication::Conflict { actual, preserved } = publication else {
             panic!("publication must report a conflict, not overwrite foreign bytes");
         };
         assert_eq!(actual, b"external");
+        let preserved = preserved.expect("displaced bytes must be preserved durably");
+        assert_eq!(
+            std::fs::read(&preserved).expect("read preserved copy"),
+            b"external",
+            "the durable copy must hold the displaced bytes exactly"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).expect("read destination"),
             "external",
             "the external writer's bytes must survive"
         );
         drop(cleanup);
+    }
+
+    /// When the platform refuses to undo the displacement, the displaced object
+    /// must survive — in the durable copy *and* at the retained temporary path.
+    ///
+    /// The durable copy is written from bytes already in hand, before the
+    /// exchange that can fail is attempted, so the only copy never depends on a
+    /// step that might not happen. Cleanup is disarmed for the same reason: the
+    /// error path used to delete the very object it was reporting about.
+    #[test]
+    fn a_refused_restore_never_deletes_the_only_copy_of_the_displaced_object() {
+        use super::{PublicationGuard, publish_bytes_locked, with_destination_lock};
+
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let path = directory.join("config.json5");
+        std::fs::write(&path, "old").expect("write old file");
+        let expected = super::super::versioning::digest_hex(b"old");
+        let destination = std::fs::canonicalize(&path).expect("canonicalize destination");
+
+        let _barrier = super::inject_external_writer_for_tests(&destination, |destination| {
+            let staging = destination.with_file_name(".external-writer-refused");
+            std::fs::write(&staging, "external").expect("stage external bytes");
+            std::fs::rename(&staging, destination).expect("publish external bytes");
+        });
+        let _refuse = super::fail_restore_for_tests(&destination);
+        let error = with_destination_lock(&path, |locked| {
+            publish_bytes_locked(locked, b"new", PublicationGuard::Digest(&expected), || {
+                Ok(())
+            })
+        })
+        .expect_err("a refused restore must not look like success");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("could not restore the concurrently changed destination"),
+            "the error must say the destination was not restored: {message}"
+        );
+        assert!(
+            message.contains("still holds the newly published bytes"),
+            "the error must name the state the destination was left in: {message}"
+        );
+
+        // Both surviving copies are named, and both really exist.
+        let retained = retained_path(&message, "retained at ");
+        assert_eq!(
+            std::fs::read(&retained).expect("read retained temporary"),
+            b"external",
+            "the retained temporary must still hold the displaced bytes"
+        );
+        let preserved = retained_path(&message, "copied to ");
+        assert_eq!(
+            std::fs::read(&preserved).expect("read durable copy"),
+            b"external",
+            "the durable copy must hold the displaced bytes exactly"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read destination"),
+            "new",
+            "the destination state must be exactly what the error reports"
+        );
+        drop(cleanup);
+    }
+
+    /// Extracts a path the failure message names after `marker`.
+    fn retained_path(message: &str, marker: &str) -> PathBuf {
+        let rest = message
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("message must contain {marker:?}: {message}"))
+            .1;
+        let end = rest.find(" and ").unwrap_or(rest.len());
+        PathBuf::from(rest[..end].trim_end_matches(['.', ';']))
     }
 
     /// A destination removed in the same window is a concurrent change too, and
@@ -833,7 +1064,13 @@ mod tests {
         .expect("publication must not fail outright");
 
         assert!(
-            matches!(publication, Publication::Conflict { ref actual } if actual.is_empty()),
+            matches!(
+                publication,
+                Publication::Conflict {
+                    ref actual,
+                    preserved: None
+                } if actual.is_empty()
+            ),
             "removal must be reported as a conflict, got {publication:?}"
         );
         assert!(!path.exists(), "the destination must stay removed");

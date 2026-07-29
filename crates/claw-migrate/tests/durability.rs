@@ -507,3 +507,216 @@ provider = { api_key = "nested-direct-plaintext" }
         assert_eq!(secrets.plaintext(id).as_deref(), Some(expected));
     }
 }
+
+/// Reads the durable receipts' recorded post-publication digest for one target.
+fn recorded_new_digest(backup_root: &Path, target: &Path) -> Option<String> {
+    receipts(backup_root).into_iter().find_map(|receipt| {
+        receipt["backups"].as_array()?.iter().find_map(|entry| {
+            (entry["target"].as_str()? == target.to_string_lossy())
+                .then(|| entry["expected_new_sha256"].as_str().map(ToOwned::to_owned))
+                .flatten()
+        })
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(bytes);
+    digest.iter().fold(String::new(), |mut encoded, byte| {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+        encoded
+    })
+}
+
+/// The receipt records what this migration staged, never what a live read of the
+/// target happens to return afterwards.
+///
+/// A writer that lands in the window between the atomic exchange and the moment
+/// the receipt is finished would otherwise have its bytes recorded as this
+/// migration's own output: rollback would then overwrite them as if they were
+/// ours, and the secret transaction would be committed for a configuration that
+/// no longer exists.
+#[test]
+fn a_write_landing_after_publication_is_not_recorded_as_this_migrations_output() {
+    const FOREIGN: &str = "api_key = \"landed-after-publication\"\n";
+
+    // Control run: what the migration actually publishes, with nothing interfering.
+    let control_root = TestDir::new("post-publish-control");
+    let control_source = control_root.join("codex-home");
+    let control_target = control_root.join("target");
+    write(
+        &control_source.join("config.toml"),
+        "api_key = \"post-publish-secret\"\n",
+    );
+    let control_plan = codex_plan(&control_root, &control_source, &control_target, false);
+    let mut control_secrets = MemorySecretStore::default();
+    apply(
+        &control_target,
+        &control_root.join("backup"),
+        false,
+        &mut control_secrets,
+        &control_plan,
+    )
+    .expect("control apply");
+    let published_bytes = fs::read(
+        control_target
+            .join("config")
+            .join("migrations")
+            .join("codex")
+            .join("config.toml"),
+    )
+    .expect("read control output");
+    let published_digest = sha256_hex(&published_bytes);
+    assert_ne!(published_digest, sha256_hex(FOREIGN.as_bytes()));
+
+    let root = TestDir::new("post-publish-window");
+    let source = root.join("codex-home");
+    let target = root.join("target");
+    let backup_root = root.join("backup");
+    let published = target
+        .join("config")
+        .join("migrations")
+        .join("codex")
+        .join("config.toml");
+    write(
+        &source.join("config.toml"),
+        "api_key = \"post-publish-secret\"\n",
+    );
+
+    let plan = codex_plan(&root, &source, &target, false);
+    let mut secrets = MemorySecretStore::default();
+    let _barrier = test_publish_failpoint::set_barrier("after_publish", &published, |path| {
+        // The compare-and-swap already committed; this write lands in the
+        // cleanup and directory-sync window that follows it.
+        let sequence = CONFLICT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let staging = path.with_file_name(format!(".post-publish-writer.{sequence}"));
+        fs::write(&staging, FOREIGN).expect("stage foreign bytes");
+        fs::rename(&staging, path).expect("publish foreign bytes");
+    });
+    let error = apply(&target, &backup_root, false, &mut secrets, &plan)
+        .expect_err("a target replaced after publication must not be accepted");
+
+    // The receipt keeps the digest of what was staged and published.
+    assert_eq!(
+        recorded_new_digest(&backup_root, &published).as_deref(),
+        Some(published_digest.as_str()),
+        "the receipt must retain the staged digest, not adopt the foreign one"
+    );
+
+    // The foreign bytes are preserved, reported, and left where their writer put them.
+    let MigrationError::ApplyFailed { cause, .. } = &error else {
+        panic!("expected a wrapped apply failure, got {error}");
+    };
+    let MigrationError::Conflict(preserved) = cause.as_ref() else {
+        panic!("expected a conflict, got {cause}");
+    };
+    assert_eq!(read(preserved), FOREIGN);
+    assert!(preserved.starts_with(&backup_root));
+    assert_eq!(read(&published), FOREIGN);
+    assert!(
+        secrets.committed.is_empty(),
+        "no secret transaction may commit when a published file was replaced"
+    );
+    let states = receipts(&backup_root)
+        .into_iter()
+        .map(|receipt| receipt["state"].as_str().expect("state").to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        states,
+        vec!["pending".to_owned()],
+        "the transaction must not be recorded as a clean abort or a commit"
+    );
+
+    // Restart: recovery reports the same conflict, preserves the bytes again and
+    // still commits nothing.
+    let restart = codex_plan(&root, &source, &target, true);
+    let restart_error = apply(&target, &backup_root, true, &mut secrets, &restart)
+        .expect_err("recovery must refuse to roll over the foreign bytes");
+    let MigrationError::Conflict(recovered) = &restart_error else {
+        panic!("expected a conflict on restart, got {restart_error}");
+    };
+    assert_eq!(read(recovered), FOREIGN);
+    assert_eq!(read(&published), FOREIGN);
+    assert!(secrets.committed.is_empty());
+}
+
+/// When the platform refuses to undo a displacement, the displaced object must
+/// survive at both the durable copy and the retained staging path.
+///
+/// This is the one window in which the staging path holds the only copy of what
+/// the target contained. Cleanup used to run anyway and delete it, leaving the
+/// new object at the target and no trace of what it replaced.
+#[test]
+fn a_refused_restore_never_deletes_the_only_copy_of_the_displaced_object() {
+    const CONCURRENT: &str = "api_key = \"displaced-and-unrestorable\"\n";
+
+    let root = TestDir::new("refused-restore");
+    let source = root.join("codex-home");
+    let target = root.join("target");
+    let backup_root = root.join("backup");
+    let published = target
+        .join("config")
+        .join("migrations")
+        .join("codex")
+        .join("config.toml");
+    write(&source.join("config.toml"), "api_key = \"fresh\"\n");
+    write(&published, "api_key = \"first-value\"\n");
+
+    let plan = codex_plan(&root, &source, &target, true);
+    let mut secrets = MemorySecretStore::default();
+    let _barrier = test_publish_failpoint::set_barrier("before_publish", &published, |path| {
+        let sequence = CONFLICT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let staging = path.with_file_name(format!(".concurrent-unrestorable.{sequence}"));
+        fs::write(&staging, CONCURRENT).expect("stage concurrent bytes");
+        fs::rename(&staging, path).expect("publish concurrent bytes");
+    });
+    let _refuse = test_publish_failpoint::fail_restore_for(&published);
+
+    let error = apply(&target, &backup_root, true, &mut secrets, &plan)
+        .expect_err("a refused restore must not look like success");
+    let message = error.to_string();
+    assert!(
+        message.contains("restore concurrently changed migration target"),
+        "the error must say the displacement was not undone: {message}"
+    );
+    assert!(
+        message.contains("the target still holds the newly published object"),
+        "the error must name the state the target was left in: {message}"
+    );
+
+    // Both surviving copies are named, and both really exist after every
+    // destructor has had its chance to run.
+    let retained = named_path(&message, "retained at ");
+    assert_eq!(
+        read(&retained),
+        CONCURRENT,
+        "the retained staging path must still hold the displaced bytes"
+    );
+    let preserved = named_path(&message, "copied to ");
+    assert_eq!(
+        read(&preserved),
+        CONCURRENT,
+        "the durable copy must hold the displaced bytes exactly"
+    );
+    assert!(preserved.starts_with(&backup_root));
+    assert!(
+        !read(&published).contains("displaced-and-unrestorable"),
+        "the target is explicitly reported as holding the newly published object"
+    );
+    assert!(
+        secrets.committed.is_empty(),
+        "no secret transaction may commit behind a refused restore"
+    );
+}
+
+/// Extracts a path the failure message names after `marker`.
+fn named_path(message: &str, marker: &str) -> std::path::PathBuf {
+    let rest = message
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("message must contain {marker:?}: {message}"))
+        .1;
+    let end = rest.find(" and ").unwrap_or(rest.len());
+    std::path::PathBuf::from(rest[..end].trim_end_matches(['.', ';']))
+}

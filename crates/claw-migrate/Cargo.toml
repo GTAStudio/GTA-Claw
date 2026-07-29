@@ -17,6 +17,10 @@ sha2.workspace = true
 toml_edit = { version = "=0.25.13", default-features = false, features = ["display", "parse"] }
 
 [dev-dependencies]
+# The receipt assertions hash exactly what the engine hashes, so a test can
+# state which digest a receipt is required to carry rather than merely that it
+# differs from something.
+sha2.workspace = true
 # The migrated TOML assertions parse the published document with the same
 # reader the engine validates it with, so a test can never accept output the
 # engine itself would refuse.
