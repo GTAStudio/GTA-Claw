@@ -26,12 +26,13 @@ The root workspace excludes `desktop/` (`exclude = ["android", "desktop", "ios"]
 `cargo build` never resolves Slint. CI asserts this with `cargo metadata`.
 
 **Status caveat, stated up front:** `gta-claw-daemon` is a real but partial production composition.
-Its `main` path binds the main HTTP API, legacy HTTP facade, Gateway and loopback MCP transports,
-and conditionally activates a GitHub Copilot provider and configured Teams, Telegram, Discord and
-WhatsApp channels. It is not complete parity: sessions and turns are process-memory only,
-interactive approval presentation is absent, `claw-tools`, skill dispatch and skill-migration
-evidence ingestion are not composed, and the bound service has not been replayed against
-`compat/legacy`. See
+Its `main` path binds the 17-route main HTTP API, legacy HTTP facade, Gateway and a separate loopback
+MCP listener, and conditionally activates a GitHub Copilot provider and configured Teams, Telegram,
+Discord and WhatsApp channels. The MCP listener is not currently usable: production wiring supplies
+neither MCP bearer credentials nor a JWT authenticator, so every caller is rejected. It is not
+complete parity: sessions and turns are process-memory only, interactive approval presentation is
+absent, `claw-tools`, skill dispatch and skill-migration evidence ingestion are not composed, and
+the bound service has not been replayed against `compat/legacy`. See
 [`docs/PROGRESS.md`](docs/PROGRESS.md).
 
 ## Rust migration ratchet
@@ -164,7 +165,7 @@ independently testable units that a composition root adapts to a port.
 |---|---|
 | `claw-gateway` | The Gateway v4 WebSocket server: transport and upgrade, phase-aware frame limits, connection lifecycle, method dispatch, an event bus with per-connection sequence numbers, and role/scope authorization. |
 | `claw-gateway-client` | The bounded pure-Rust `ws://`/`wss://` client. Transport and lifecycle only — no server, RPC handlers or GUI. |
-| `claw-http-api` | The frozen 18-route OpenClaw HTTP/SSE surface on Axum, with providers, Gateway, persistence and pairing behind narrow ports. |
+| `claw-http-api` | The frozen 18-route OpenClaw HTTP/SSE surface on Axum: 17 routes on the main router plus a separate `/mcp` route, with providers, Gateway, persistence and pairing behind narrow ports. |
 | `claw-mcp` | Model Context Protocol: server, stdio/streamable-HTTP/legacy-SSE clients, OAuth authorization, configured-server lifecycle. |
 | `claw-acp` | Agent Client Protocol interoperability. |
 | `claw-channel-sdk` | Transport-neutral messaging contracts. Owns no network client and no credential persistence. |
@@ -193,7 +194,7 @@ independently testable units that a composition root adapts to a port.
 |---|---|
 | `gta-claw-cli` | `--version`, `--help`/`-h`, local `health`, a deliberately unsupported `send`, and `gateway health` — one real authenticated Gateway v4 connection, one `health` RPC, bounded shutdown, typed exit codes and an optional `--json` report. See [`apps/gta-claw-cli/README.md`](apps/gta-claw-cli/README.md). |
 | `gta-claw-tui` | A Crossterm terminal client over `claw-gateway-client` with Sessions, Workspace, Runs, Diff, Artifacts and Help screens, a command palette, and a non-TTY `--plain` snapshot mode. |
-| `gta-claw-daemon` | A partial production composition: `--probe`, `--check-config`, or a serving mode that binds real HTTP, legacy HTTP, Gateway and MCP listeners; conditionally activates a provider and four configured channel transports; handles reload, status and shutdown control; and reports a provable drain summary. Sessions/turns remain in memory, approval presentation is silent, `claw-tools`, skill dispatch and skill-migration evidence ingestion are not composed, and compatibility evidence remains outstanding. |
+| `gta-claw-daemon` | A partial production composition: `--probe`, `--check-config`, or a serving mode that binds the 17-route main HTTP API, legacy HTTP, Gateway and MCP listeners; conditionally activates a provider and four configured channel transports; handles reload, status and shutdown control; and reports a bounded drain summary. The MCP listener currently rejects every caller because production supplies no MCP token/JWT authenticator. Sessions/turns remain in memory, approval presentation is silent, `claw-tools`, skill dispatch and skill-migration evidence ingestion are not composed, and compatibility evidence remains outstanding. |
 | `gta-claw-updater` | A standalone signed, resumable, rollback-safe updater. On Linux it refuses and defers to the system package manager. |
 | `gta-claw-android` | The Android client core: endpoint/credential intake, Gateway identity, attempt lifecycle. **No Android UI exists in this repository** — see [`apps/gta-claw-android/README.md`](apps/gta-claw-android/README.md). |
 | `gta-claw-ios` | The iOS client core, on the same terms. See [`apps/gta-claw-ios/README.md`](apps/gta-claw-ios/README.md). |
@@ -284,6 +285,12 @@ process environment through its audited migration path; use typed JSON5 for new 
 Packaging lives in `packaging/` and runs from `linux-packaging.yml`, `macos-packaging.yml` and
 `windows-packaging.yml`. `docker-publish.yml` still builds the **legacy Node image** and is part of
 the deletion checklist, not the Rust product.
+
+**Linux packaging blocker:** the current `packaging/linux/systemd/gta-claw-daemon.service`, consumed
+by the Debian and RPM prototypes, is incompatible with production serving and must not be deployed
+unchanged. `RestrictAddressFamilies=AF_UNIX` prevents the daemon from creating its required
+`AF_INET`/`AF_INET6` TCP listeners, while `IPAddressDeny=any` blocks required IP ingress and egress.
+This remains pending a packaging fix.
 
 ## Security posture
 

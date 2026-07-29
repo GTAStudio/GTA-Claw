@@ -35,8 +35,10 @@ real partial production composition. What works today is:
 
 - **Connecting to an existing OpenClaw Gateway** — with the CLI as a bounded diagnostic, with the
   TUI as an interactive client, and with the desktop shell as a native connection surface.
-- **Serving the Rust daemon's real transports**: the main HTTP API, the legacy HTTP facade, Gateway
-  and loopback MCP, with a configured GitHub Copilot provider or the explicit smoke provider.
+- **Serving the Rust daemon's usable transports**: the 17-route main HTTP API, the legacy HTTP
+  facade and Gateway, with a configured GitHub Copilot provider or the explicit smoke provider. The
+  daemon also binds a loopback MCP listener, but current production wiring cannot authenticate any
+  MCP caller.
 - **Running configured Teams, Telegram, Discord and WhatsApp paths**, plus signal handling,
   configuration reload and a provable shutdown drain.
 - **Applying a signed update** with the standalone updater.
@@ -410,14 +412,19 @@ policy, it cannot preflight proposed listener overrides or a routable deployment
 gta-claw-daemon
 ```
 
-Serving mode calls `serve_production`. It resolves configuration, opens the durable Gateway pairing,
-security-audit and goal stores, activates signed plugins, conditionally activates the smoke provider
-or GitHub Copilot, starts configured channel transports, and binds all four ingress surfaces:
+Serving mode resolves configuration and initializes telemetry in `main`, then calls
+`serve_production`. `ProductionService` startup opens the durable Gateway pairing, security-audit
+and goal stores, activates signed plugins, conditionally activates the smoke provider or GitHub
+Copilot, starts configured channel transports, and binds four listener surfaces:
 
-- the main 18-route HTTP API;
+- the main 17-route HTTP API;
 - the legacy Node-compatible HTTP facade;
 - the Gateway v4 server;
-- the loopback-only MCP router.
+- a separate loopback-only listener for the `/mcp` route.
+
+That fourth listener is bound and supervised but currently inaccessible. Production leaves both MCP
+bearer-token authenticators empty and wires no JWT authenticator, while the route authenticates
+before dispatch. Every MCP caller is therefore rejected.
 
 The four channel paths are conditional: Teams and WhatsApp are wired into the legacy HTTP facade,
 while Telegram and Discord are supervised outbound clients. A configured GitHub token activates
@@ -432,7 +439,7 @@ The complete option surface is:
 | `--listen ADDRESS` | Main HTTP bind. Default: `127.0.0.1:0` (an OS-assigned port). |
 | `--legacy-listen ADDRESS` | Legacy HTTP bind. Default: loopback on `core.server.port`. A routable bind requires both a trusted TLS frontend and proxy-level caller authentication plus a strict route allowlist; the daemon's TLS assertion alone is insufficient. |
 | `--gateway-listen ADDRESS` | Gateway bind. Default: `127.0.0.1:0`. |
-| `--mcp-listen ADDRESS` | MCP bind. Default: `127.0.0.1:0`; non-loopback addresses are always rejected. |
+| `--mcp-listen ADDRESS` | MCP bind. Default: `127.0.0.1:0`; non-loopback addresses are always rejected. This changes only the bound socket: without a production MCP token/JWT authenticator, every request is rejected. |
 | `--state-dir PATH` | State root; otherwise `GTA_CLAW_STATE_DIR`, then `$HOME/.gta-claw`. Pairings, security audit and goals are durable there, but sessions and turns are not. |
 | `--log-file PATH` | Writes ordinary telemetry to the file instead of standard error. |
 | `--tls-terminated-by-frontend` | Asserts that a trusted frontend terminates TLS. It does not enable TLS or add caller authentication; it only passes the daemon's bind policy for routable main HTTP, legacy HTTP or Gateway addresses. |
@@ -446,13 +453,19 @@ it supplies an operator/all-scopes bearer credential for exactly the six protect
 authenticates `POST /api/v1/admin/rpc`. Its presence also registers legacy `/admin/reload`,
 `/admin/system` and `/admin/exec`. The reload route requires the exact token, but the system and exec
 routes accept either that token or a loopback peer. The token is not installed in the MCP-specific
-authenticators, so it does not authenticate `/mcp`. A same-host reverse proxy appears loopback to the
-system and exec handlers. A frontend for a routable legacy bind must authenticate callers itself and
-forward only explicitly intended routes; block `/admin/*` unless the proxy enforces equivalent
-authorization, and do not forward `/chat` without a separate caller-authentication policy.
+authenticators, and no JWT alternative is wired, so it cannot make `/mcp` accessible. A same-host
+reverse proxy appears loopback to the system and exec handlers. A frontend for a routable legacy
+bind must authenticate callers itself and forward only explicitly intended routes; block
+`/admin/*` unless the proxy enforces equivalent authorization, and do not forward `/chat` without a
+separate caller-authentication policy.
 
-On startup it installs the stop signal handlers before composition — so a supervisor stop during
-startup is still observed — and, after composition has bound and started the listeners, prints:
+Signal handling does not cover the entire serving-mode startup. `main` loads configuration and
+initializes telemetry before it calls `serve_production`; the operating system's default signal
+behavior still applies during those earlier phases. On entry, `serve_production` installs the stop
+handlers before starting `ProductionService` composition. From that point, a supervisor stop during
+composition is observed and startup is cancelled or drained; a signal during the earlier
+configuration or telemetry phase can terminate the process without a daemon drain summary. After
+composition has bound and started the listeners, the daemon prints:
 
 ```text
 ready protocol=1
@@ -464,7 +477,8 @@ service http=<address> legacy=<address> gateway=<address> mcp=<address> provider
 `service ...` line is a listener/startup announcement. None asserts dependency readiness. `/ready`,
 `/readyz` and the `status` control response report dependency and serving readiness. The listener
 announcement may name `device-flow-pending`; until Device Flow activates the provider, the provider
-dependency remains false and readiness remains false.
+dependency remains false and readiness remains false. The `mcp` dependency only records that the
+listener task started; it can be true while every MCP caller is still rejected.
 
 It then serves until one of:
 
@@ -492,9 +506,11 @@ After an ingress fault the daemon drains, emits the stop summary and exits with 
 fault makes the summary unclean. After an output fault it still drains and attempts the same summary,
 but the output is already broken, so the `stopped ...` line is not guaranteed to be emitted. A
 failure writing the initial startup announcements also drains and returns the I/O error before the
-event loop, without a `reason=runtime` stop line. Work left behind likewise produces an error. The
-task counters are real: terminations are counted from a guard's `Drop`, so a task cancelled part-way
-through still counts, which makes `tasks=t/s` a genuine leak check.
+event loop, without a `reason=runtime` stop line. Work left behind likewise produces an error.
+`tasks=t/s` is scoped service-task accounting for work explicitly included by the production stop
+ledger, such as ingress, Gateway, plugin, channel, Device Flow and updater tasks. Some included
+adapters use drop guards to record termination, but the counters are not a census of every Tokio,
+blocking or process task, and equality is not universal leak proof.
 
 Stopping it by hand:
 
@@ -510,10 +526,12 @@ printf 'shutdown\n' | gta-claw-daemon
 - **There is no interactive approval surface.** The runtime is constructed with
   `SilentApprovalPort`, which drops presentation notifications. The currently composed plugin tool
   descriptors are marked as not requiring approval.
+- **The production MCP listener is inaccessible.** The socket is bound, but no MCP bearer credential
+  or JWT authenticator is wired, so the route rejects every caller before dispatch.
 - **`claw-tools` is not composed.** Tool execution is not wholly absent: signed plugin registrations
-  and the durable goal tool are executable through the runtime and HTTP/MCP surfaces. The missing
-  part is the `claw-tools` catalogue and its schemas, authorization, path confinement and validated
-  network destinations.
+  and the durable goal tool are executable through the runtime and authenticated main HTTP surface.
+  They are not currently executable through MCP. The missing part is the `claw-tools` catalogue and
+  its schemas, authorization, path confinement and validated network destinations.
 - **Skill execution and migration-evidence ingestion are not dispatched.** Startup counts
   `claw_skills::registry()` for inventory, but the production path has no caller for its
   `WasmSkillHost` bridge and executes no bundled skill. It also has no application caller for
@@ -523,8 +541,11 @@ printf 'shutdown\n' | gta-claw-daemon
   the bound daemon. This is a parity-evidence gap, not a claim that security audit evidence is
   absent: the serving path opens a durable security-audit log.
 
-A reviewed `systemd` unit exists at `packaging/linux/systemd/gta-claw-daemon.service` and is used by
-the Debian and RPM packaging prototypes.
+**Packaging blocker:** the current `packaging/linux/systemd/gta-claw-daemon.service`, used by the
+Debian and RPM prototypes, is incompatible with production serving and must not be deployed
+unchanged. `RestrictAddressFamilies=AF_UNIX` prevents the required `AF_INET`/`AF_INET6` TCP listeners
+from being created, and `IPAddressDeny=any` blocks required IP ingress and egress. This remains
+pending a packaging fix.
 
 ---
 
@@ -686,8 +707,10 @@ will keep asking until it is paired.
 **`Gateway snapshot timed out`.** The Gateway did not return a session list within five seconds in
 plain mode.
 
-**The daemon exits with "shutdown left work behind".** Tasks were abandoned during the drain. The
-`tasks=<terminated>/<spawned>` counters in the stop line show the gap.
+**The daemon exits with "shutdown left work behind".** The summary's `abandoned` value, deadline
+state and scoped `tasks=<terminated>/<spawned>` ledger describe the recorded failure. A task-counter
+gap applies only to explicitly accounted service tasks; other abandoned work can leave those two
+numbers equal.
 
 **The desktop build fails on Linux.** Expected. Build it on Windows or macOS.
 
