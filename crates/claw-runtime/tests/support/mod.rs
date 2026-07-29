@@ -8,7 +8,7 @@
     reason = "this module is compiled separately into each integration-test binary, so a helper only one suite needs is genuinely unused in the others"
 )]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -353,6 +353,7 @@ impl StatePort for GatedLoadState {
 #[derive(Default)]
 pub(crate) struct MemoryGoals {
     goals: Mutex<Vec<GoalRecord>>,
+    high_water: Mutex<BTreeMap<String, u64>>,
     saves: AtomicUsize,
 }
 
@@ -369,6 +370,15 @@ impl MemoryGoals {
 }
 
 impl GoalStorePort for MemoryGoals {
+    fn next_goal_ordinal(&self, session_id: &SessionId) -> PortFuture<'_, Result<u64, PortError>> {
+        let ordinal = guard(&self.high_water)
+            .get(session_id.as_str())
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        Box::pin(async move { Ok(ordinal) })
+    }
+
     fn load(&self, goal_id: &GoalId) -> PortFuture<'_, Result<Option<GoalRecord>, PortError>> {
         let found = guard(&self.goals)
             .iter()
@@ -393,9 +403,22 @@ impl GoalStorePort for MemoryGoals {
                 )))
             });
         }
-        match existing {
-            Some(index) => goals[index] = record,
-            None => goals.push(record),
+        if let Some(index) = existing {
+            goals[index] = record;
+        } else {
+            if let Some(ordinal) = record
+                .goal_id
+                .as_str()
+                .strip_prefix(record.session_id.as_str())
+                .and_then(|suffix| suffix.strip_prefix(":goal-"))
+                .and_then(|ordinal| ordinal.parse::<u64>().ok())
+            {
+                guard(&self.high_water)
+                    .entry(record.session_id.as_str().to_owned())
+                    .and_modify(|high_water| *high_water = (*high_water).max(ordinal))
+                    .or_insert(ordinal);
+            }
+            goals.push(record);
         }
         drop(goals);
         Box::pin(async move { Ok(()) })
@@ -647,6 +670,7 @@ impl SimpleContext {
             | ContextItem::AssistantMessage { text }
             | ContextItem::SystemNote { text } => text.len(),
             ContextItem::GoalStatement { objective } => objective.len(),
+            ContextItem::GoalCleared => 0,
             ContextItem::ToolResult {
                 tool_name, output, ..
             } => tool_name.len() + output.len(),
@@ -696,7 +720,18 @@ impl ContextEnginePort for SimpleContext {
 
     fn ingest(&self, request: ContextIngest) -> PortFuture<'_, Result<ContextState, PortError>> {
         let mut data = guard(&self.data);
-        data.items.push(request.item);
+        match request.item {
+            item @ ContextItem::GoalStatement { .. } => {
+                data.items
+                    .retain(|item| !matches!(item, ContextItem::GoalStatement { .. }));
+                data.items.push(item);
+            }
+            ContextItem::GoalCleared => {
+                data.items
+                    .retain(|item| !matches!(item, ContextItem::GoalStatement { .. }));
+            }
+            item => data.items.push(item),
+        }
         let state = Self::snapshot(&data);
         drop(data);
         Box::pin(async move { Ok(state) })
@@ -719,6 +754,9 @@ impl ContextEnginePort for SimpleContext {
                 ContextItem::SystemNote { text } => PromptMessage::System { text: text.clone() },
                 ContextItem::GoalStatement { objective } => PromptMessage::System {
                     text: format!("goal: {objective}"),
+                },
+                ContextItem::GoalCleared => PromptMessage::System {
+                    text: String::new(),
                 },
                 ContextItem::ToolResult {
                     tool_name,

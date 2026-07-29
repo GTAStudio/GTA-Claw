@@ -12,6 +12,12 @@ use crate::model::ids::GoalId;
 /// write whose `revision` is not exactly one greater than the stored revision with
 /// [`PortError::Conflict`].
 pub trait GoalStorePort: Send + Sync + 'static {
+    /// Returns the next generated identifier ordinal from the persisted monotonic high-water mark.
+    ///
+    /// The ordinal is reserved by the subsequent successful [`Self::save`]. Until then, retries
+    /// receive the same value so a record published without its index can be adopted idempotently.
+    fn next_goal_ordinal(&self, session_id: &SessionId) -> PortFuture<'_, Result<u64, PortError>>;
+
     /// Loads one goal, or `None` when it is unknown.
     fn load(&self, goal_id: &GoalId) -> PortFuture<'_, Result<Option<GoalRecord>, PortError>>;
 

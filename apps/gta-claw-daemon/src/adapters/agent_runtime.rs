@@ -229,6 +229,7 @@ struct MemorySession {
     latest_query: Option<String>,
     latest_record: Option<RecordId>,
     record_ids: BTreeSet<RecordId>,
+    goal_context: Option<(claw_memory::MessageId, RecordId)>,
     used_tokens: usize,
     compacted_items: u32,
 }
@@ -357,7 +358,108 @@ impl MemoryContextEngine {
         data: &mut MemoryData,
         request: ContextIngest,
     ) -> Result<ContextState, RuntimePortError> {
+        if matches!(&request.item, ContextItem::GoalCleared) {
+            let entry = data
+                .sessions
+                .get_mut(request.session_id.as_str())
+                .ok_or_else(|| {
+                    RuntimePortError::NotFound("context session is not open".to_owned())
+                })?;
+            if let Some((message_id, record_id)) = entry.goal_context.take() {
+                let _ = entry.session.remove(message_id);
+                entry.record_ids.remove(&record_id);
+                let _ = data.retriever.remove(&record_id);
+            }
+            return Ok(Self::state(entry));
+        }
+
         let memory_id = Self::memory_session_id(&request.session_id)?;
+        if let ContextItem::GoalStatement { objective } = &request.item {
+            if !data.sessions.contains_key(request.session_id.as_str()) {
+                return Err(RuntimePortError::NotFound(
+                    "context session is not open".to_owned(),
+                ));
+            }
+            let content = format!("Current goal: {objective}");
+            let at = u64::try_from(request.at.as_millis()).unwrap_or_default();
+            let record_id = RecordId::new(&format!(
+                "mem:{:016x}:goal",
+                stable_hash(request.session_id.as_str())
+            ))
+            .map_err(|error| RuntimePortError::Invalid(error.to_string()))?;
+            let mut tags = BTreeSet::new();
+            tags.insert("goal".to_owned());
+            let (message_id, previous) = {
+                let entry = data
+                    .sessions
+                    .get_mut(request.session_id.as_str())
+                    .expect("session checked above");
+                if let Some((message_id, _)) = &entry.goal_context {
+                    let previous = entry
+                        .session
+                        .messages()
+                        .iter()
+                        .find(|message| message.id == *message_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            RuntimePortError::Conflict(
+                                "goal context message disappeared".to_owned(),
+                            )
+                        })?;
+                    entry
+                        .session
+                        .replace(*message_id, Role::System, content.clone(), at, true)
+                        .map_err(|error| RuntimePortError::Invalid(error.to_string()))?;
+                    (*message_id, Some(previous))
+                } else {
+                    let message_id = entry
+                        .session
+                        .append(Role::System, content.clone(), at)
+                        .map_err(|error| RuntimePortError::Invalid(error.to_string()))?;
+                    let _ = entry.session.pin(message_id);
+                    (message_id, None)
+                }
+            };
+            if let Err(error) = data.retriever.insert(MemoryRecord {
+                id: record_id.clone(),
+                session: memory_id,
+                kind: RecordKind::Message,
+                text: content,
+                unix_millis: at,
+                tags,
+            }) {
+                let entry = data
+                    .sessions
+                    .get_mut(request.session_id.as_str())
+                    .expect("session checked above");
+                if let Some(previous) = previous {
+                    let _ = entry.session.replace(
+                        previous.id,
+                        previous.role,
+                        previous.content,
+                        previous.unix_millis,
+                        previous.pinned,
+                    );
+                } else {
+                    let _ = entry.session.remove(message_id);
+                }
+                data.report.inserts_refused = data.report.inserts_refused.saturating_add(1);
+                return Err(match error {
+                    claw_memory::RetrievalError::RetrieverFull => RuntimePortError::Unavailable(
+                        "memory index is full; remove records or raise its bound".to_owned(),
+                    ),
+                    other => RuntimePortError::Invalid(other.to_string()),
+                });
+            }
+            let entry = data
+                .sessions
+                .get_mut(request.session_id.as_str())
+                .expect("session checked above");
+            entry.record_ids.insert(record_id.clone());
+            entry.goal_context = Some((message_id, record_id));
+            return Ok(Self::state(entry));
+        }
+
         let (role, content, pinned, tag, latest_query) = match request.item {
             ContextItem::UserInput { text } => {
                 (Role::User, text.clone(), false, "user", Some(text))
@@ -379,13 +481,7 @@ impl MemoryContextEngine {
                 "tool",
                 None,
             ),
-            ContextItem::GoalStatement { objective } => (
-                Role::System,
-                format!("Current goal: {objective}"),
-                true,
-                "goal",
-                None,
-            ),
+            ContextItem::GoalStatement { .. } | ContextItem::GoalCleared => unreachable!(),
             ContextItem::SystemNote { text } => (Role::System, text, true, "system", None),
         };
         let at = u64::try_from(request.at.as_millis()).unwrap_or_default();
@@ -475,6 +571,7 @@ impl ContextEnginePort for MemoryContextEngine {
                 latest_query: None,
                 latest_record: None,
                 record_ids: BTreeSet::new(),
+                goal_context: None,
                 used_tokens: 0,
                 compacted_items: 0,
             });
@@ -957,6 +1054,46 @@ pub struct AgentHttpTools {
     runtime: Arc<Runtime>,
 }
 
+fn goal_http_outcome(
+    result: Result<claw_goals::GoalToolOutcome, claw_goals::ToolInvocationError>,
+) -> HttpToolOutcome {
+    match result {
+        Ok(outcome) => HttpToolOutcome {
+            status: 200,
+            ok: true,
+            result: Some(json!({
+                "summary": outcome.summary(),
+                "goalId": outcome.record.goal_id.to_string(),
+                "status": outcome.record.status.to_string(),
+                "revision": outcome.record.revision,
+            })),
+            error_type: None,
+            error_message: None,
+            requires_approval: None,
+        },
+        Err(
+            error @ claw_goals::ToolInvocationError::Refused(claw_runtime::GoalError::Port(
+                RuntimePortError::CommittedButNotDurable(_),
+            )),
+        ) => HttpToolOutcome {
+            status: 500,
+            ok: false,
+            result: None,
+            error_type: Some("committed_but_not_durable".to_owned()),
+            error_message: Some(error.to_string()),
+            requires_approval: None,
+        },
+        Err(error) => HttpToolOutcome {
+            status: 400,
+            ok: false,
+            result: None,
+            error_type: Some("goal_refused".to_owned()),
+            error_message: Some(error.to_string()),
+            requires_approval: None,
+        },
+    }
+}
+
 impl ToolPort for AgentHttpTools {
     fn list(&self) -> PortFuture<'_, Result<Vec<HttpToolDefinition>, PortError>> {
         Box::pin(async move {
@@ -993,29 +1130,7 @@ impl ToolPort for AgentHttpTools {
                     return Err(PortError::new(PortErrorKind::Unavailable, "request cancelled"));
                 }
             };
-            Ok(match result {
-                Ok(outcome) => HttpToolOutcome {
-                    status: 200,
-                    ok: true,
-                    result: Some(json!({
-                        "summary": outcome.summary(),
-                        "goalId": outcome.record.goal_id.to_string(),
-                        "status": outcome.record.status.to_string(),
-                        "revision": outcome.record.revision,
-                    })),
-                    error_type: None,
-                    error_message: None,
-                    requires_approval: None,
-                },
-                Err(error) => HttpToolOutcome {
-                    status: 400,
-                    ok: false,
-                    result: None,
-                    error_type: Some("goal_refused".to_owned()),
-                    error_message: Some(error.to_string()),
-                    requires_approval: None,
-                },
-            })
+            Ok(goal_http_outcome(result))
         })
     }
 }
@@ -1426,7 +1541,8 @@ fn runtime_http_error(error: &RuntimeError) -> PortError {
         claw_runtime::RuntimeFailureClass::Busy
         | claw_runtime::RuntimeFailureClass::Unavailable
         | claw_runtime::RuntimeFailureClass::Cancelled => PortErrorKind::Unavailable,
-        claw_runtime::RuntimeFailureClass::Internal => PortErrorKind::Internal,
+        claw_runtime::RuntimeFailureClass::CommittedButNotDurable
+        | claw_runtime::RuntimeFailureClass::Internal => PortErrorKind::Internal,
     };
     PortError::new(kind, format!("{} ({})", error.user_message(), error))
 }
@@ -1452,10 +1568,11 @@ mod tests {
         BootstrapReason, ContextAssembly, ContextBootstrap, ContextEnginePort, ContextIngest,
         ContextItem,
     };
+    use claw_application::ports::provider::PromptMessage;
     use claw_application::ports::state::{SessionSnapshot, StatePort};
     use claw_domain::SessionId;
 
-    use super::{MemoryContextEngine, RuntimeStateStore};
+    use super::{MemoryContextEngine, RuntimeStateStore, goal_http_outcome};
 
     #[tokio::test]
     async fn runtime_state_rejects_stale_revisions() {
@@ -1547,5 +1664,92 @@ mod tests {
             })
             .await
             .expect("replacement record");
+    }
+
+    #[tokio::test]
+    async fn memory_goal_context_is_replaced_and_cleared_exactly() {
+        let diagnostics = Arc::new(crate::adapters::http_api::Diagnostics::new(8));
+        let memory = MemoryContextEngine::new(8, diagnostics).expect("memory engine");
+        let session_id = SessionId::new("goal-context").expect("session id");
+        memory
+            .bootstrap(ContextBootstrap {
+                session_id: session_id.clone(),
+                reason: BootstrapReason::NewSession,
+                token_budget: 128,
+                at: Timestamp::from_millis(1),
+            })
+            .await
+            .expect("bootstrap");
+
+        for (millis, objective) in [(2, "first"), (3, "replacement")] {
+            memory
+                .ingest(ContextIngest {
+                    session_id: session_id.clone(),
+                    turn: TurnId::FIRST,
+                    item: ContextItem::GoalStatement {
+                        objective: objective.to_owned(),
+                    },
+                    at: Timestamp::from_millis(millis),
+                })
+                .await
+                .expect("goal update");
+        }
+        let assembled = memory
+            .assemble(ContextAssembly {
+                session_id: session_id.clone(),
+                turn: TurnId::FIRST,
+                round: 0,
+            })
+            .await
+            .expect("assembled");
+        assert_eq!(
+            assembled.messages,
+            vec![PromptMessage::System {
+                text: "Current goal: replacement".to_owned()
+            }]
+        );
+
+        memory
+            .ingest(ContextIngest {
+                session_id: session_id.clone(),
+                turn: TurnId::FIRST,
+                item: ContextItem::GoalCleared,
+                at: Timestamp::from_millis(4),
+            })
+            .await
+            .expect("goal clear");
+        let assembled = memory
+            .assemble(ContextAssembly {
+                session_id,
+                turn: TurnId::FIRST,
+                round: 1,
+            })
+            .await
+            .expect("assembled");
+        assert!(assembled.messages.is_empty());
+    }
+
+    #[test]
+    fn committed_but_not_durable_goal_is_not_mapped_as_success_or_safe_retry() {
+        let outcome = goal_http_outcome(Err(claw_goals::ToolInvocationError::Refused(
+            claw_runtime::GoalError::Port(
+                claw_application::ports::PortError::CommittedButNotDurable(
+                    "record committed; do not retry blindly".to_owned(),
+                ),
+            ),
+        )));
+
+        assert_eq!(outcome.status, 500);
+        assert!(!outcome.ok);
+        assert_eq!(
+            outcome.error_type.as_deref(),
+            Some("committed_but_not_durable")
+        );
+        assert!(
+            outcome
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("do not retry blindly"))
+        );
     }
 }

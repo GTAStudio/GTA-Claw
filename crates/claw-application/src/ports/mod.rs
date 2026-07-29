@@ -36,6 +36,10 @@ pub enum PortError {
     NotFound(String),
     /// The request was malformed or violated an adapter invariant.
     Invalid(String),
+    /// The mutation committed, but its publication was not proven power-loss durable.
+    ///
+    /// Retrying the same request is unsafe because the committed state may already be visible.
+    CommittedButNotDurable(String),
     /// The adapter aborted the work because it was cancelled.
     Cancelled,
 }
@@ -49,6 +53,7 @@ impl PortError {
             Self::Conflict(_) => "conflict",
             Self::NotFound(_) => "not_found",
             Self::Invalid(_) => "invalid",
+            Self::CommittedButNotDurable(_) => "committed_but_not_durable",
             Self::Cancelled => "cancelled",
         }
     }
@@ -66,7 +71,10 @@ impl Display for PortError {
             Self::Unavailable(detail)
             | Self::Conflict(detail)
             | Self::NotFound(detail)
-            | Self::Invalid(detail) => write!(formatter, "{}: {detail}", self.label()),
+            | Self::Invalid(detail)
+            | Self::CommittedButNotDurable(detail) => {
+                write!(formatter, "{}: {detail}", self.label())
+            }
             Self::Cancelled => formatter.write_str("cancelled"),
         }
     }
@@ -85,6 +93,7 @@ mod tests {
             PortError::Conflict("revision 3".to_owned()),
             PortError::NotFound("session-1".to_owned()),
             PortError::Invalid("empty name".to_owned()),
+            PortError::CommittedButNotDurable("rename landed".to_owned()),
             PortError::Cancelled,
         ];
         let labels: Vec<&str> = errors.iter().map(PortError::label).collect();
@@ -96,6 +105,7 @@ mod tests {
                 "conflict",
                 "not_found",
                 "invalid",
+                "committed_but_not_durable",
                 "cancelled"
             ]
         );
@@ -107,6 +117,7 @@ mod tests {
         assert!(PortError::Conflict("x".to_owned()).is_retryable());
         assert!(!PortError::NotFound("x".to_owned()).is_retryable());
         assert!(!PortError::Invalid("x".to_owned()).is_retryable());
+        assert!(!PortError::CommittedButNotDurable("x".to_owned()).is_retryable());
         assert!(!PortError::Cancelled.is_retryable());
     }
 

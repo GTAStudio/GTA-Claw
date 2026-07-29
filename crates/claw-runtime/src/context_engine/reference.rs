@@ -56,6 +56,15 @@ impl EngineState {
         self.items.push(item);
     }
 
+    fn replace_goal(&mut self, replacement: Option<ContextItem>) {
+        self.items
+            .retain(|item| !matches!(item, ContextItem::GoalStatement { .. }));
+        if let Some(item) = replacement {
+            self.items.push(item);
+        }
+        self.bytes = self.items.iter().map(item_bytes).sum();
+    }
+
     /// Drops every item and resets the running byte total with them.
     fn clear(&mut self) {
         self.items.clear();
@@ -101,6 +110,7 @@ const fn item_bytes(item: &ContextItem) -> usize {
         | ContextItem::AssistantMessage { text }
         | ContextItem::SystemNote { text } => text.len(),
         ContextItem::GoalStatement { objective } => objective.len(),
+        ContextItem::GoalCleared => 0,
         ContextItem::ToolResult {
             tool_name, output, ..
         } => tool_name.len() + output.len(),
@@ -117,6 +127,9 @@ fn prompt_message(index: usize, item: &ContextItem) -> PromptMessage {
         ContextItem::SystemNote { text } => PromptMessage::System { text: text.clone() },
         ContextItem::GoalStatement { objective } => PromptMessage::System {
             text: format!("goal: {objective}"),
+        },
+        ContextItem::GoalCleared => PromptMessage::System {
+            text: String::new(),
         },
         ContextItem::ToolResult { output, failed, .. } => PromptMessage::ToolResult {
             call_id: ToolCallId::new(format!("context-item-{index}"))
@@ -195,7 +208,11 @@ impl ContextEnginePort for ReferenceContextEngine {
     fn ingest(&self, request: ContextIngest) -> PortFuture<'_, Result<ContextState, PortError>> {
         let mut state = self.lock();
         let outcome = state.ensure_open_for(&request.session_id).map(|()| {
-            state.push(request.item);
+            match request.item {
+                item @ ContextItem::GoalStatement { .. } => state.replace_goal(Some(item)),
+                ContextItem::GoalCleared => state.replace_goal(None),
+                item => state.push(item),
+            }
             state.snapshot()
         });
         drop(state);
@@ -350,6 +367,48 @@ mod tests {
             output: "ok".to_owned(),
             failed: false,
         }));
+    }
+
+    #[tokio::test]
+    async fn goal_updates_replace_and_clear_the_single_pinned_statement() {
+        let engine = ReferenceContextEngine::new();
+        let session_id = session("goal-lifecycle");
+        engine
+            .bootstrap(bootstrap(&session_id, BootstrapReason::NewSession, 128))
+            .await
+            .expect("bootstrap");
+
+        for objective in ["first", "replacement"] {
+            engine
+                .ingest(ingest(
+                    &session_id,
+                    ContextItem::GoalStatement {
+                        objective: objective.to_owned(),
+                    },
+                ))
+                .await
+                .expect("goal update");
+        }
+        assert_eq!(
+            engine
+                .items()
+                .iter()
+                .filter(|item| matches!(item, ContextItem::GoalStatement { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            engine.items(),
+            vec![ContextItem::GoalStatement {
+                objective: "replacement".to_owned()
+            }]
+        );
+
+        engine
+            .ingest(ingest(&session_id, ContextItem::GoalCleared))
+            .await
+            .expect("goal clear");
+        assert!(engine.items().is_empty());
     }
 
     #[tokio::test]

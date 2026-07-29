@@ -282,10 +282,9 @@ impl GoalService {
 
     /// Mints the next goal identifier for a session and records the objective.
     ///
-    /// Identifiers are `<session>:goal-N`, where `N` counts every goal the session ever had. The
-    /// session is part of the identifier because [`GoalStorePort::load`] is keyed by goal id
-    /// alone: a bare `goal-N` would collide between sessions in any real store. `N` is read from
-    /// the store rather than kept in memory, so it stays correct across restarts.
+    /// Identifiers are `<session>:goal-N`, where `N` comes from the store's persisted monotonic
+    /// high-water mark. The session is part of the identifier because [`GoalStorePort::load`] is
+    /// keyed by goal id alone: a bare `goal-N` would collide between sessions in any real store.
     ///
     /// # Errors
     ///
@@ -296,13 +295,9 @@ impl GoalService {
         session_id: &SessionId,
         objective: &str,
     ) -> Result<GoalRecord, GoalError> {
-        let existing = self.store.list_for_session(session_id).await?.len();
-        let goal_id = GoalId::new(format!(
-            "{}:goal-{}",
-            session_id.as_str(),
-            existing.saturating_add(1)
-        ))
-        .map_err(GoalError::UnusableGoalId)?;
+        let ordinal = self.store.next_goal_ordinal(session_id).await?;
+        let goal_id = GoalId::new(format!("{}:goal-{ordinal}", session_id.as_str()))
+            .map_err(GoalError::UnusableGoalId)?;
         self.set(session_id, goal_id, objective).await
     }
 

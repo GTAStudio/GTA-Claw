@@ -78,6 +78,10 @@ impl ConflictOnceStore {
 }
 
 impl GoalStorePort for ConflictOnceStore {
+    fn next_goal_ordinal(&self, session_id: &SessionId) -> PortFuture<'_, Result<u64, PortError>> {
+        self.inner.next_goal_ordinal(session_id)
+    }
+
     fn load(&self, goal_id: &GoalId) -> PortFuture<'_, Result<Option<GoalRecord>, PortError>> {
         self.inner.load(goal_id)
     }

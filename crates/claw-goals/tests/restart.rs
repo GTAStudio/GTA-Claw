@@ -255,6 +255,65 @@ fn an_index_naming_a_vanished_record_is_pruned_instead_of_failing_every_read() {
     let history = block_on(durable.service.history(&session)).expect("the store answers");
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].objective, "second");
+    let third = block_on(durable.service.start(&session, "third")).expect("set");
+    assert_eq!(
+        third.goal_id.as_str(),
+        "dangling:goal-3",
+        "pruning a lost record must not rewind the durable high-water mark"
+    );
+}
+
+#[test]
+fn a_legacy_index_migrates_its_high_water_before_record_loss_and_restart() {
+    let root = TempRoot::new("restart-high-water-migration");
+    let session = session_id("migrate");
+    {
+        let durable = open_durable(root.path(), 1_000);
+        block_on(durable.service.start(&session, "first")).expect("set");
+        block_on(durable.service.start(&session, "second")).expect("set");
+    }
+
+    let index_path = std::fs::read_dir(root.path().join("sessions"))
+        .expect("sessions directory")
+        .map(|entry| entry.expect("readable").path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .expect("session index");
+    let mut index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&index_path).expect("index reads"))
+            .expect("index JSON");
+    index
+        .as_object_mut()
+        .expect("index object")
+        .remove("goal_id_high_water");
+    std::fs::write(
+        &index_path,
+        serde_json::to_string_pretty(&index).expect("index encodes"),
+    )
+    .expect("legacy fixture writes");
+
+    {
+        let migrated = open_durable(root.path(), 50_000);
+        assert!(migrated.store.recovery().is_clean());
+    }
+
+    let second_record = std::fs::read_dir(root.path().join("goals"))
+        .expect("goals directory")
+        .map(|entry| entry.expect("readable").path())
+        .find(|path| {
+            std::fs::read_to_string(path)
+                .expect("record reads")
+                .contains("migrate:goal-2")
+        })
+        .expect("second record");
+    std::fs::remove_file(second_record).expect("record loss injected");
+
+    let reopened = open_durable(root.path(), 100_000);
+    assert_eq!(reopened.store.recovery().pruned_dangling, 1);
+    let third = block_on(reopened.service.start(&session, "third")).expect("set");
+    assert_eq!(third.goal_id.as_str(), "migrate:goal-3");
 }
 
 #[test]

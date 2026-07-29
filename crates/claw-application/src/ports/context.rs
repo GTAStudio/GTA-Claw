@@ -39,6 +39,8 @@ pub enum ContextItem {
         /// The objective text.
         objective: String,
     },
+    /// Removes the durable goal statement from the engine.
+    GoalCleared,
     /// A system instruction supplied by the host.
     SystemNote {
         /// The instruction text.

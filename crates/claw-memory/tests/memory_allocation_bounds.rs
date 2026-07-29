@@ -125,7 +125,7 @@ fn a_session_stops_accepting_summaries_at_the_retained_summary_bound() {
 }
 
 #[test]
-fn a_persisted_document_cannot_restore_a_session_past_its_bounds() {
+fn max_plus_one_persisted_items_are_rejected_by_bounded_visitors() {
     // Every bound above is enforced on the write path. Deserialization is the
     // one way into a `Session` that skips it, so a stored or transmitted
     // document is exactly where an unbounded history would come back in.
@@ -141,6 +141,7 @@ fn a_persisted_document_cannot_restore_a_session_past_its_bounds() {
              \"unix_millis\":{id},\"pinned\":false}}"
         ));
     }
+
     let summaries: Vec<String> = (0..=MAX_SUMMARIES)
         .map(|ordinal| {
             let first = ordinal as u64;
@@ -156,35 +157,33 @@ fn a_persisted_document_cannot_restore_a_session_past_its_bounds() {
         summaries.join(",")
     );
 
-    let restored: Session = serde_json::from_str(&document)
-        .expect("an over-bound document loads rather than failing an existing save");
-    assert_eq!(
-        restored.len(),
-        MAX_MESSAGES,
-        "the retained-message bound holds after loading"
+    assert!(
+        serde_json::from_str::<Session>(&document).is_err(),
+        "MAX+1 is detected without allocating another Message or Summary"
     );
-    assert_eq!(
-        restored.summaries().len(),
-        MAX_SUMMARIES,
-        "the retained-summary bound holds after loading"
-    );
-    assert_eq!(
-        restored.messages()[0].id,
-        MessageId::new(0),
-        "the anchor is never what gets shed"
-    );
-    assert_eq!(
-        restored.last().map(|message| message.id),
-        Some(MessageId::new(MAX_MESSAGES as u64)),
-        "the newest message survives"
+}
+
+#[test]
+fn max_plus_one_nested_strings_and_vectors_are_rejected_on_deserialization() {
+    let oversized_record = serde_json::json!({
+        "id": "record",
+        "session": "bounds",
+        "kind": "note",
+        "text": "x",
+        "unix_millis": 1,
+        "tags": ["x".repeat(MAX_TAG_BYTES + 1)],
+    });
+    assert!(
+        serde_json::from_value::<MemoryRecord>(oversized_record).is_err(),
+        "a tag is bounded before MemoryRecord construction"
     );
 
-    // The restored session is a working session, not just a bounded one: the
-    // next append is refused at the bound exactly as it would have been.
-    let mut restored = restored;
-    assert_eq!(
-        restored.append(Role::User, "one too many", 9_999).err(),
-        Some(SessionError::TooManyMessages)
+    let embedding = serde_json::json!({
+        "values": vec![1.0_f32; 8192 + 1],
+    });
+    assert!(
+        serde_json::from_value::<Embedding>(embedding).is_err(),
+        "MAX+1 is detected without allocating another retained vector component"
     );
 }
 

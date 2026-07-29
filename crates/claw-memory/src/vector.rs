@@ -13,8 +13,12 @@ use std::fmt::{self, Display, Formatter};
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
+use crate::bounded::{BoundedString, BoundedVec};
+
 /// Inclusive maximum embedding dimensionality accepted by this crate.
 const MAX_DIMENSIONS: usize = 8192;
+
+const MAX_RECORD_ID_BYTES: usize = 256;
 
 /// Default maximum number of records one in-crate index will hold.
 pub(crate) const DEFAULT_INDEX_CAPACITY: usize = 100_000;
@@ -48,7 +52,7 @@ pub struct Embedding {
 #[derive(Deserialize)]
 #[serde(rename = "Embedding")]
 struct RawEmbedding {
-    values: Vec<f32>,
+    values: BoundedVec<f32, MAX_DIMENSIONS>,
 }
 
 impl<'de> Deserialize<'de> for Embedding {
@@ -57,7 +61,7 @@ impl<'de> Deserialize<'de> for Embedding {
         D: Deserializer<'de>,
     {
         let raw = RawEmbedding::deserialize(deserializer)?;
-        Self::new(raw.values).map_err(de::Error::custom)
+        Self::new(raw.values.into_inner()).map_err(de::Error::custom)
     }
 }
 
@@ -240,7 +244,7 @@ impl RecordId {
     /// `_`, `.` and `:`, so an identifier is always safe as a storage key and
     /// in a log line.
     pub fn new(value: &str) -> Result<Self, VectorError> {
-        if value.is_empty() || value.len() > 256 {
+        if value.is_empty() || value.len() > MAX_RECORD_ID_BYTES {
             return Err(VectorError::InvalidRecordId);
         }
         let acceptable = value.chars().all(|character| {
@@ -271,7 +275,7 @@ impl<'de> Deserialize<'de> for RecordId {
     where
         D: Deserializer<'de>,
     {
-        let value = String::deserialize(deserializer)?;
+        let value = BoundedString::<MAX_RECORD_ID_BYTES>::deserialize(deserializer)?.into_inner();
         Self::new(&value).map_err(de::Error::custom)
     }
 }

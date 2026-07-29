@@ -64,6 +64,7 @@
 //! assert!(context.used_tokens <= budget.available());
 //! ```
 
+mod bounded;
 pub mod budget;
 pub mod context;
 pub mod retrieval;
