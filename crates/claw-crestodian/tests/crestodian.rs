@@ -330,6 +330,41 @@ fn incompatible_config_and_state_are_detected_without_mutation() {
 }
 
 #[test]
+fn future_config_and_state_with_added_fields_are_rejected_without_mutation() {
+    let directory = common::TestDirectory::create();
+    let config_path = directory.path().join("config.json5");
+    let state_path = directory.path().join("crestodian.json");
+    let future_config = VALID.replace("schema_version: 1", "schema_version: 99, future_flag: true");
+    let future_state = br#"{"schema_version":99,"setup_completed":false,"workspace":null,"last_recovery_unix_ms":null,"future_flag":true}"#;
+    std::fs::write(&config_path, future_config.as_bytes()).expect("write future config");
+    std::fs::write(&state_path, future_state).expect("write future state");
+
+    let assessment = Crestodian::new(&config_path, &state_path).inspect();
+    assert!(matches!(
+        assessment.config,
+        ConfigCondition::Incompatible {
+            found: 99,
+            supported: 1
+        }
+    ));
+    assert!(matches!(
+        assessment.state,
+        StateCondition::Incompatible {
+            found: 99,
+            supported: CRESTODIAN_STATE_SCHEMA_VERSION
+        }
+    ));
+    assert_eq!(
+        std::fs::read(&config_path).expect("config preserved"),
+        future_config.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(&state_path).expect("state preserved"),
+        future_state
+    );
+}
+
+#[test]
 fn missing_files_are_guided_to_setup_without_allocating_an_empty_backup() {
     let directory = common::TestDirectory::create();
     let config_path = directory.path().join("config.json5");

@@ -466,7 +466,9 @@ fn build_claude_operations(
                 diagnostics,
             )?;
         }
-        if let Some(home) = root.parent() {
+        if context.source.is_none()
+            && let Some(home) = root.parent()
+        {
             add_json_transform(
                 &mut operations,
                 &home.join(".claude.json"),
@@ -478,17 +480,19 @@ fn build_claude_operations(
                 "claude-user",
             )?;
         }
-        let desktop = claude_desktop_config(context.paths);
-        add_json_transform(
-            &mut operations,
-            &desktop,
-            &target
-                .join("config")
-                .join("migrations")
-                .join("claude")
-                .join("desktop.json"),
-            "claude-desktop",
-        )?;
+        if context.source.is_none() {
+            let desktop = claude_desktop_config(context.paths);
+            add_json_transform(
+                &mut operations,
+                &desktop,
+                &target
+                    .join("config")
+                    .join("migrations")
+                    .join("claude")
+                    .join("desktop.json"),
+                "claude-desktop",
+            )?;
+        }
         add_secret_document(
             &mut operations,
             &root.join(".credentials.json"),

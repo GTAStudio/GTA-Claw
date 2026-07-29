@@ -13,6 +13,7 @@ ed25519-dalek = { version = "=3.0.0", features = ["zeroize"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+toml_edit = { version = "=0.25.13", default-features = false, features = ["display", "parse"] }
 
 [lints]
 workspace = true

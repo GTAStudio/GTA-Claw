@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use claw_config::{ConfigError, ConfigSnapshot, WriteWarning, parse_json5, write_file};
 
 use crate::setup::{read_optional_file, restore_paths};
-use crate::state::{CrestodianState, decode_state, ensure_parent_directory, write_state};
+use crate::state::{
+    CrestodianState, decode_state, ensure_parent_directory, inspect_state_schema_version,
+    write_state,
+};
 use crate::{CRESTODIAN_STATE_SCHEMA_VERSION, CrestodianError};
 
 static RECOVERY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -326,6 +329,18 @@ fn inspect_config_bytes(path: &Path, bytes: Option<&[u8]>) -> ConfigCondition {
             };
         }
     };
+    if let Ok(document) = json5::from_str::<serde_json::Value>(source)
+        && let Some(found) = document
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+        && found != claw_config::CONFIG_SCHEMA_VERSION
+    {
+        return ConfigCondition::Incompatible {
+            found,
+            supported: claw_config::CONFIG_SCHEMA_VERSION,
+        };
+    }
     match parse_json5(source, &path.display().to_string()) {
         Ok(_) => ConfigCondition::Healthy,
         Err(ConfigError::UnsupportedVersion { found, supported }) => {
@@ -350,6 +365,20 @@ fn inspect_state_bytes(path: &Path, bytes: Option<&[u8]>) -> StateCondition {
     let Some(bytes) = bytes else {
         return StateCondition::Missing;
     };
+    match inspect_state_schema_version(path, bytes) {
+        Ok(found) if found != CRESTODIAN_STATE_SCHEMA_VERSION => {
+            return StateCondition::Incompatible {
+                found,
+                supported: CRESTODIAN_STATE_SCHEMA_VERSION,
+            };
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return StateCondition::Corrupt {
+                diagnostic: error.to_string(),
+            };
+        }
+    }
     match decode_state(path, bytes) {
         Ok(state) if state.schema_version == CRESTODIAN_STATE_SCHEMA_VERSION => {
             StateCondition::Healthy

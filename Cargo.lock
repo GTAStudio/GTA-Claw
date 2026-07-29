@@ -325,6 +325,7 @@ name = "claw-crestodian"
 version = "0.1.0"
 dependencies = [
  "claw-config",
+ "json5",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -471,6 +472,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "toml_edit",
 ]
 
 [[package]]
@@ -3172,6 +3174,7 @@ dependencies = [
  "indexmap 2.14.0",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

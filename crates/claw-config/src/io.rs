@@ -116,9 +116,18 @@ pub(crate) fn atomic_write_bytes(
     contents: &[u8],
     precommit: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<WriteOutcome> {
-    let destination = prepare_destination(path)?;
-    let existing = fs::symlink_metadata(&destination).ok();
-    let (mut temporary, mut file) = TemporaryArtifact::create(&destination, "tmp")?;
+    with_destination_lock(path, move |destination| {
+        atomic_write_bytes_locked(destination, contents, precommit)
+    })
+}
+
+pub(crate) fn atomic_write_bytes_locked(
+    destination: &Path,
+    contents: &[u8],
+    precommit: impl FnOnce() -> io::Result<()>,
+) -> io::Result<WriteOutcome> {
+    let existing = fs::symlink_metadata(destination).ok();
+    let (mut temporary, mut file) = TemporaryArtifact::create(destination, "tmp")?;
 
     let operation = (|| {
         set_permissions(existing.as_ref(), &file)?;
@@ -129,12 +138,12 @@ pub(crate) fn atomic_write_bytes(
         drop(file);
         let mut warnings = Vec::new();
         if let Some(warning) =
-            replace_destination(temporary.path(), &destination, existing.is_some())?
+            replace_destination(temporary.path(), destination, existing.is_some())?
         {
             warnings.push(warning);
         }
         temporary.disarm();
-        if let Err(error) = sync_parent(&destination) {
+        if let Err(error) = sync_parent(destination) {
             warnings.push(WriteWarning::DirectorySyncFailed {
                 path: destination
                     .parent()
@@ -160,6 +169,15 @@ pub(crate) fn atomic_write_bytes(
             )),
         },
     }
+}
+
+pub(crate) fn with_destination_lock<T>(
+    path: &Path,
+    action: impl FnOnce(&Path) -> io::Result<T>,
+) -> io::Result<T> {
+    let destination = prepare_destination(path)?;
+    let _lock = DestinationLock::acquire(&destination)?;
+    action(&destination)
 }
 
 fn prepare_destination(path: &Path) -> io::Result<PathBuf> {
@@ -239,6 +257,63 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 
 fn unsafe_path(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+struct DestinationLock {
+    file: File,
+}
+
+impl DestinationLock {
+    fn path(destination: &Path) -> PathBuf {
+        destination.with_file_name(format!(
+            ".{}.gta-claw.lock",
+            destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("config")
+        ))
+    }
+
+    fn acquire(destination: &Path) -> io::Result<Self> {
+        let lock_path = Self::path(destination);
+        reject_lock_link_or_reparse(&lock_path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        file.lock()?;
+        file.sync_all()?;
+        sync_parent(&lock_path)?;
+        reject_lock_link_or_reparse(&lock_path)?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for DestinationLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn destination_lock_path_for_tests(path: &Path) -> PathBuf {
+    prepare_destination(path).map_or_else(
+        |_| DestinationLock::path(path),
+        |destination| DestinationLock::path(&destination),
+    )
+}
+
+fn reject_lock_link_or_reparse(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if is_link_or_reparse(&metadata) => Err(unsafe_path(
+            "destination lock must not be a symlink or reparse point",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 struct TemporaryArtifact {
@@ -545,7 +620,14 @@ mod tests {
             .expect("read temporary directory")
             .collect::<Result<Vec<_>, _>>()
             .expect("collect directory entries");
-        assert_eq!(entries.len(), 1, "temporary artifacts must be removed");
+        assert!(
+            entries.iter().all(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name == "config.json5" || name == ".config.json5.gta-claw.lock"
+            }),
+            "temporary artifacts must be removed"
+        );
         drop(cleanup);
     }
 

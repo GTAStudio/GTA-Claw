@@ -333,7 +333,7 @@ pub(crate) fn restore_paths<const N: usize>(
 /// hard rollback failures.
 fn restore_path(path: &Path, original: Option<&[u8]>) -> Result<(), String> {
     let Some(bytes) = original else {
-        return match fs::remove_file(path) {
+        return match remove_path_with_parent_sync(path) {
             Ok(()) => Ok(()),
             Err(error)
                 if matches!(
@@ -364,6 +364,26 @@ fn restore_path(path: &Path, original: Option<&[u8]>) -> Result<(), String> {
             .join("; ");
         return Err(format!("restore durability warning: {warning}"));
     }
+    Ok(())
+}
+
+fn remove_path_with_parent_sync(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            sync_parent_directory(path)?;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path.parent().expect("restored path always has parent"))?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

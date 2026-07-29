@@ -55,6 +55,8 @@ struct MemorySecretStore {
     fail_get: bool,
     fail_put: bool,
     fail_remove: bool,
+    pending: BTreeMap<String, BTreeMap<String, Option<SecretValue>>>,
+    next_transaction: u64,
 }
 
 impl SecretStore for MemorySecretStore {
@@ -80,6 +82,75 @@ impl SecretStore for MemorySecretStore {
             )));
         }
         self.values.remove(id);
+        Ok(())
+    }
+
+    fn begin_transaction(&mut self) -> Result<String, SecretStoreError> {
+        let id = format!("tx-{}", self.next_transaction);
+        self.next_transaction += 1;
+        self.pending.insert(id.clone(), BTreeMap::new());
+        Ok(id)
+    }
+
+    fn put_transactional(
+        &mut self,
+        transaction_id: &str,
+        id: &str,
+        value: SecretValue,
+    ) -> Result<String, SecretStoreError> {
+        if self.fail_put {
+            return Err(SecretStoreError::new("injected put failure"));
+        }
+        let entry = self
+            .pending
+            .get_mut(transaction_id)
+            .ok_or_else(|| SecretStoreError::new("missing transaction"))?;
+        entry
+            .entry(id.to_owned())
+            .or_insert_with(|| self.values.get(id).cloned());
+        self.values.insert(id.to_owned(), value);
+        Ok(format!("keyring://gta-claw/{id}"))
+    }
+
+    fn remove_transactional(
+        &mut self,
+        transaction_id: &str,
+        id: &str,
+    ) -> Result<(), SecretStoreError> {
+        if self.fail_remove {
+            return Err(SecretStoreError::new(format!(
+                "injected remove failure for {id}"
+            )));
+        }
+        let entry = self
+            .pending
+            .get_mut(transaction_id)
+            .ok_or_else(|| SecretStoreError::new("missing transaction"))?;
+        entry
+            .entry(id.to_owned())
+            .or_insert_with(|| self.values.get(id).cloned());
+        self.values.remove(id);
+        Ok(())
+    }
+
+    fn commit_transaction(&mut self, transaction_id: &str) -> Result<(), SecretStoreError> {
+        if !self.pending.contains_key(transaction_id) {
+            return Err(SecretStoreError::new("missing transaction"));
+        }
+        Ok(())
+    }
+
+    fn rollback_transaction(&mut self, transaction_id: &str) -> Result<(), SecretStoreError> {
+        let Some(previous) = self.pending.remove(transaction_id) else {
+            return Ok(());
+        };
+        for (id, value) in previous {
+            if let Some(value) = value {
+                self.put(&id, value).map(|_| ())?;
+            } else {
+                self.remove(&id)?;
+            }
+        }
         Ok(())
     }
 }

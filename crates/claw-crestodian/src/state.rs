@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use claw_config::{WriteOutcome, write_bytes_atomically};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::CrestodianError;
 
@@ -59,6 +60,27 @@ pub(crate) fn decode_state(path: &Path, bytes: &[u8]) -> Result<CrestodianState,
         .end()
         .map_err(|error| refuse("<root>".to_owned(), error.to_string()))?;
     Ok(state)
+}
+
+pub(crate) fn inspect_state_schema_version(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<u32, CrestodianError> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|error| CrestodianError::StateDecode {
+            path: path.to_owned(),
+            json_path: "<root>".to_owned(),
+            message: error.to_string(),
+        })?;
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| CrestodianError::StateDecode {
+            path: path.to_owned(),
+            json_path: "schema_version".to_owned(),
+            message: "missing integer schema_version".to_owned(),
+        })
 }
 
 pub(crate) fn write_state(

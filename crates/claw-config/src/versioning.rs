@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::io::atomic_write_bytes;
+use crate::io::{atomic_write_bytes, atomic_write_bytes_locked, with_destination_lock};
 use crate::{CONFIG_SCHEMA_VERSION, ConfigError, parse_json5, to_json5};
 
 static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -212,67 +212,76 @@ fn migrate_config_file_with_precommit(
         });
     }
 
-    let _lock = MigrationLock::acquire(path)?;
-    let (source, mut document, version) = read_versioned_document(path)?;
-    if version == CONFIG_SCHEMA_VERSION {
-        let text = std::str::from_utf8(&source).map_err(|error| ConfigError::Syntax {
-            source_name: path.display().to_string(),
-            message: error.to_string(),
-        })?;
-        parse_json5(text, &path.display().to_string())?;
-        return Ok(ConfigMigrationOutcome::Current);
-    }
-    if version != 0 || CONFIG_SCHEMA_VERSION != 1 {
-        return Err(ConfigMigrationError::UnsupportedPath {
-            found: version,
-            current: CONFIG_SCHEMA_VERSION,
-        });
-    }
+    let mut outcome = None;
+    with_destination_lock(path, |locked_path| {
+        outcome = Some((|| {
+            let (source, mut document, version) = read_versioned_document(locked_path)?;
+            if version == CONFIG_SCHEMA_VERSION {
+                let text = std::str::from_utf8(&source).map_err(|error| ConfigError::Syntax {
+                    source_name: locked_path.display().to_string(),
+                    message: error.to_string(),
+                })?;
+                parse_json5(text, &locked_path.display().to_string())?;
+                return Ok(ConfigMigrationOutcome::Current);
+            }
+            if version != 0 || CONFIG_SCHEMA_VERSION != 1 {
+                return Err(ConfigMigrationError::UnsupportedPath {
+                    found: version,
+                    current: CONFIG_SCHEMA_VERSION,
+                });
+            }
 
-    let object = document
-        .as_object_mut()
-        .ok_or(ConfigMigrationError::MissingVersion)?;
-    object.insert(
-        "schema_version".to_owned(),
-        Value::from(CONFIG_SCHEMA_VERSION),
-    );
-    let candidate_source =
-        json5::to_string(&document).map_err(|error| ConfigError::Serialize(error.to_string()))?;
-    let candidate = parse_json5(&candidate_source, &path.display().to_string())?;
-    let destination_bytes = to_json5(&candidate)
-        .map_err(ConfigMigrationError::Config)?
-        .into_bytes();
-    let source_digest = digest_hex(&source);
-
-    let backup_path = create_backup(path, &source)?;
-    let mut conflict_backup = None;
-    if let Err(source) = atomic_write_bytes(path, &destination_bytes, || {
-        precommit(path);
-        let current = fs::read(path)?;
-        if digest_hex(&current) != source_digest {
-            let backup = create_backup_io(path, &current)?;
-            conflict_backup = Some(backup);
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "concurrent edit detected",
-            ));
-        }
+            let object = document
+                .as_object_mut()
+                .ok_or(ConfigMigrationError::MissingVersion)?;
+            object.insert(
+                "schema_version".to_owned(),
+                Value::from(CONFIG_SCHEMA_VERSION),
+            );
+            let candidate_source = json5::to_string(&document)
+                .map_err(|error| ConfigError::Serialize(error.to_string()))?;
+            let candidate = parse_json5(&candidate_source, &locked_path.display().to_string())?;
+            let destination_bytes = to_json5(&candidate)
+                .map_err(ConfigMigrationError::Config)?
+                .into_bytes();
+            let source_digest = digest_hex(&source);
+            let backup_path = create_backup(locked_path, &source)?;
+            let mut conflict_backup = None;
+            if let Err(source) = atomic_write_bytes_locked(locked_path, &destination_bytes, || {
+                precommit(locked_path);
+                let current = fs::read(locked_path)?;
+                if digest_hex(&current) != source_digest {
+                    let backup = create_backup_io(locked_path, &current)?;
+                    conflict_backup = Some(backup);
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "concurrent edit detected",
+                    ));
+                }
+                Ok(())
+            }) {
+                if let Some(concurrent_backup) = conflict_backup {
+                    return Err(ConfigMigrationError::ConcurrentEdit {
+                        config_path: locked_path.to_owned(),
+                        backup_path: concurrent_backup,
+                    });
+                }
+                return Err(ConfigMigrationError::Config(ConfigError::io(
+                    locked_path,
+                    source,
+                )));
+            }
+            Ok(ConfigMigrationOutcome::Migrated(ConfigMigrationRecord {
+                config_path: locked_path.to_owned(),
+                backup_path,
+                from_version: version,
+                to_version: CONFIG_SCHEMA_VERSION,
+            }))
+        })());
         Ok(())
-    }) {
-        if let Some(concurrent_backup) = conflict_backup {
-            return Err(ConfigMigrationError::ConcurrentEdit {
-                config_path: path.to_owned(),
-                backup_path: concurrent_backup,
-            });
-        }
-        return Err(ConfigMigrationError::Config(ConfigError::io(path, source)));
-    }
-    Ok(ConfigMigrationOutcome::Migrated(ConfigMigrationRecord {
-        config_path: path.to_owned(),
-        backup_path,
-        from_version: version,
-        to_version: CONFIG_SCHEMA_VERSION,
-    }))
+    })
+    .map_err(|source| ConfigMigrationError::Config(ConfigError::io(path, source)))?;
+    outcome.expect("locked migration always sets an outcome")
 }
 
 /// Restores exact pre-migration bytes from a migration record.
@@ -369,107 +378,10 @@ fn encode_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-struct MigrationLock {
-    file: File,
-}
-
-impl MigrationLock {
-    fn lock_path(config_path: &Path) -> PathBuf {
-        config_path.with_file_name(format!(
-            ".{}.schema-migrate.lock",
-            config_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("config")
-        ))
-    }
-
-    fn acquire(config_path: &Path) -> Result<Self, ConfigMigrationError> {
-        let lock_path = Self::lock_path(config_path);
-        reject_lock_link_or_reparse(&lock_path).map_err(|source| ConfigMigrationError::Lock {
-            path: lock_path.clone(),
-            source,
-        })?;
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|source| ConfigMigrationError::Lock {
-                path: lock_path.clone(),
-                source,
-            })?;
-        lock_file
-            .try_lock()
-            .map_err(|source| ConfigMigrationError::Lock {
-                path: lock_path.clone(),
-                source: source.into(),
-            })?;
-        lock_file
-            .sync_all()
-            .map_err(|source| ConfigMigrationError::Lock {
-                path: lock_path.clone(),
-                source,
-            })?;
-        sync_parent(&lock_path).map_err(|source| ConfigMigrationError::Lock {
-            path: lock_path.clone(),
-            source,
-        })?;
-        reject_lock_link_or_reparse(&lock_path).map_err(|source| ConfigMigrationError::Lock {
-            path: lock_path.clone(),
-            source,
-        })?;
-        Ok(Self { file: lock_file })
-    }
-}
-
-impl Drop for MigrationLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
-fn reject_lock_link_or_reparse(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if is_link_or_reparse(&metadata) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "lock must not be a symlink or reparse point",
-        )),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(unix)]
-fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
-#[cfg(windows)]
-fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(any(unix, windows)))]
-fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
-#[cfg(test)]
-impl MigrationLock {
-    fn test_lock_path(config_path: &Path) -> PathBuf {
-        Self::lock_path(config_path)
-    }
-}
-
 #[cfg(test)]
 mod lock_tests {
-    use super::{ConfigMigrationOutcome, MigrationLock, migrate_config_file_with_precommit};
+    use super::{ConfigMigrationOutcome, migrate_config_file_with_precommit};
+    use crate::io::destination_lock_path_for_tests;
 
     const VERSION_ZERO: &str = r#"
 {
@@ -500,7 +412,7 @@ mod lock_tests {
         std::fs::create_dir_all(&directory).expect("create directory");
         let path = directory.join("config.json5");
         std::fs::write(&path, VERSION_ZERO).expect("write version zero");
-        let lock = MigrationLock::test_lock_path(&path);
+        let lock = destination_lock_path_for_tests(&path);
         std::fs::write(&lock, b"stale owner").expect("write stale lock");
         let outcome = migrate_config_file_with_precommit(&path, |_| {}).expect("migrate");
         assert!(matches!(outcome, ConfigMigrationOutcome::Migrated(_)));
