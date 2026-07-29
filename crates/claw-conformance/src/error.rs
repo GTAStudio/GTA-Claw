@@ -23,6 +23,10 @@ pub enum ViolationCode {
     DuplicateClaim,
     /// A claim had missing or unverifiable evidence.
     ClaimEvidence,
+    /// Filesystem traversal encountered an unsafe root or directory entry.
+    UnsafeTraversal,
+    /// Filesystem traversal exceeded an explicit resource bound.
+    TraversalLimit,
 }
 
 impl ViolationCode {
@@ -39,6 +43,8 @@ impl ViolationCode {
             Self::UnknownClaim => "unknown_claim",
             Self::DuplicateClaim => "duplicate_claim",
             Self::ClaimEvidence => "claim_evidence",
+            Self::UnsafeTraversal => "unsafe_traversal",
+            Self::TraversalLimit => "traversal_limit",
         }
     }
 }

@@ -36,6 +36,7 @@ members = [
   "crates/claw-security",
   "crates/claw-skills",
   "crates/claw-tools",
+  "crates/claw-windows-file-id",
   "crates/claw-worker",
 ]
 exclude = ["android", "desktop", "ios"]
@@ -71,6 +72,7 @@ claw-runtime = { path = "crates/claw-runtime", version = "0.1.0" }
 claw-security = { path = "crates/claw-security", version = "0.1.0" }
 claw-skills = { path = "crates/claw-skills", version = "0.1.0" }
 claw-tools = { path = "crates/claw-tools", version = "0.1.0" }
+claw-windows-file-id = { path = "crates/claw-windows-file-id", version = "0.1.0" }
 serde = { version = "=1.0.229", features = ["derive"] }
 # `preserve_order` is not optional: `agent-client-protocol-schema` requires it,
 # and Cargo unifies features across the workspace. Declaring it here makes the

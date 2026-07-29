@@ -170,6 +170,73 @@ fn repository_legacy_javascript_surface_does_not_grow() {
 }
 
 #[test]
+fn windows_file_identity_ffi_is_isolated() {
+    let root = workspace_root();
+    let workspace_manifest =
+        fs::read_to_string(root.join("Cargo.toml")).expect("read workspace manifest");
+    let conformance_manifest = fs::read_to_string(root.join("crates/claw-conformance/Cargo.toml"))
+        .expect("read conformance manifest");
+    let conformance_source = fs::read_to_string(root.join("crates/claw-conformance/src/claims.rs"))
+        .expect("read conformance claims source");
+    let helper_manifest = fs::read_to_string(root.join("crates/claw-windows-file-id/Cargo.toml"))
+        .expect("read Windows file-ID helper manifest");
+    let helper_source = fs::read_to_string(root.join("crates/claw-windows-file-id/src/lib.rs"))
+        .expect("read Windows file-ID helper source");
+
+    assert!(
+        workspace_manifest.contains("\"crates/claw-windows-file-id\"")
+            && workspace_manifest.contains(
+                "claw-windows-file-id = { path = \"crates/claw-windows-file-id\", version = \"0.1.0\" }"
+            ),
+        "the audited helper must be an explicit workspace member and dependency"
+    );
+    assert!(
+        conformance_manifest.contains(
+            "[target.'cfg(windows)'.dependencies]\nclaw-windows-file-id.workspace = true"
+        ),
+        "conformance must consume the safe helper only on Windows"
+    );
+    assert!(
+        conformance_manifest.contains("[lints]\nworkspace = true")
+            && !conformance_manifest.contains("[lints.rust]")
+            && !conformance_manifest.contains("[lints.clippy]")
+            && !conformance_manifest.contains("[lints.rustdoc]"),
+        "conformance must inherit the workspace lint policy without local overrides"
+    );
+    assert!(
+        !conformance_manifest.contains("windows-sys")
+            && !conformance_source.contains("GetFileInformationByHandleEx")
+            && !conformance_source.contains("windows_sys::")
+            && !conformance_source.contains("unsafe {"),
+        "conformance must remain a safe consumer with no direct Windows FFI"
+    );
+    assert!(
+        helper_manifest.contains(
+            "windows-sys = { version = \"0.61.2\", features = [\"Win32_Foundation\", \"Win32_Storage_FileSystem\"] }"
+        ) && helper_manifest.contains("unsafe_code = \"deny\"")
+            && helper_manifest.contains("unsafe_op_in_unsafe_fn = \"deny\""),
+        "the helper must pin its Windows API surface and deny unsafe by default"
+    );
+    let helper_windows_dependencies = helper_manifest
+        .split_once("[target.'cfg(windows)'.dependencies]")
+        .and_then(|(_, tail)| tail.split_once("[lints.rust]"))
+        .map(|(dependencies, _)| dependencies.trim())
+        .expect("helper has one target dependency section before its lint policy");
+    assert_eq!(
+        helper_windows_dependencies,
+        "windows-sys = { version = \"0.61.2\", features = [\"Win32_Foundation\", \"Win32_Storage_FileSystem\"] }",
+        "the single-level helper must not acquire first-party or unrelated dependencies"
+    );
+    assert!(
+        helper_source.contains("GetFileInformationByHandleEx")
+            && helper_source.contains("FILE_ID_INFO")
+            && helper_source.contains("#[expect(\n    unsafe_code,")
+            && helper_source.matches("unsafe {").count() == 1,
+        "the helper must contain exactly one locally audited unsafe FFI call"
+    );
+}
+
+#[test]
 fn new_typescript_path_outside_legacy_inventory_is_rejected() {
     let fixture = TemporaryTree::new("new-typescript");
     fixture.write("src/index.ts", b"grandfathered");
