@@ -37,6 +37,7 @@ secrecy = "=0.10.3"
 semver = "=1.0.28"
 serde.workspace = true
 serde_json.workspace = true
+same-file = "=1.0.6"
 tokio = { version = "=1.53.1", features = [
   "io-std",
   "io-util",
@@ -58,6 +59,9 @@ url = "=2.5.8"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "=1.1.4", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+winapi-util = "=0.1.11"
 
 [lints]
 workspace = true
