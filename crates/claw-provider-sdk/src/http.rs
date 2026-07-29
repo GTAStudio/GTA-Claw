@@ -1469,7 +1469,7 @@ mod tests {
         let output = with_deadline(
             "test",
             Operation::Complete,
-            Instant::now() + Duration::from_secs(1),
+            deadline_after(Duration::from_secs(1)),
             &CancelToken::new(),
             "cancelled",
             async { 42_u8 },
