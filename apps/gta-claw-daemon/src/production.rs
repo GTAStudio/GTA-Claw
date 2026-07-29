@@ -44,17 +44,17 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::adapters::agent_runtime::{AgentRuntime, RuntimeModelTools};
 use crate::adapters::channels::{ChannelSupervisor, DiscordSettings, TelegramSettings};
 use crate::adapters::gateway_pairing::{GatewayPairingAuthenticator, GatewayPairingStore};
 use crate::adapters::http_api::{
-    AppliedReload, ConfigController, DependencyReadiness, Diagnostics, DisabledExternalPorts,
-    DurableSecurityAudit, GatewayPairingAdmin, ModelToolCatalog, OperatorAdmin, OperatorInventory,
-    OperatorRuntimeStatus, ProviderHistoryConfig, SmokeProvider, SwappableProvider,
-    copilot_request_timeout_ms, updates_enabled,
+    AppliedReload, ConfigController, ConfigurationReloader, DependencyReadiness, Diagnostics,
+    DisabledExternalPorts, DurableSecurityAudit, GatewayPairingAdmin, ModelToolCatalog,
+    OperatorAdmin, OperatorInventory, OperatorRuntimeStatus, ProviderHistoryConfig, RoleReload,
+    SmokeProvider, SwappableProvider, copilot_request_timeout_ms, updates_enabled,
 };
 use crate::adapters::legacy::{
     DeviceTaskReport, DeviceTokenActivator, GraphWhatsAppAdapter, LegacyDeviceFlowAdapter,
@@ -62,10 +62,10 @@ use crate::adapters::legacy::{
 };
 use crate::adapters::signed_plugins::SignedPluginRuntime;
 use crate::adapters::updater::UpdateMonitor;
+use crate::runtime::BlockingTaskHost;
 
 /// Whole-process shutdown ceiling.
 pub const PRODUCTION_STOP_DEADLINE: Duration = Duration::from_secs(10);
-const PLUGIN_ACTIVATION_CANCEL_GRACE: Duration = Duration::from_secs(2);
 const DEFAULT_GATEWAY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const DEFAULT_MCP: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 /// Supported invocation, printed for `--help` and for a rejected command line.
@@ -282,6 +282,23 @@ impl ProductionOptions {
         })
     }
 
+    /// Loads configuration through the daemon-owned bounded blocking host.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed configuration error as [`Self::load_config`], or
+    /// a startup error when blocking-task admission has already closed.
+    pub async fn load_config_owned(
+        &self,
+        blocking: &BlockingTaskHost,
+    ) -> Result<LoadedConfig, ProductionError> {
+        let options = self.clone();
+        blocking
+            .run("config-load", move || options.load_config())
+            .await
+            .map_err(|error| ProductionError::new("config", error))?
+    }
+
     fn state_dir(&self) -> Result<PathBuf, ProductionError> {
         if let Some(path) = self
             .state_dir
@@ -400,6 +417,33 @@ pub fn init_telemetry(
         output,
     )
     .map_err(|error| ProductionError::new("logging", error))
+}
+
+pub(crate) async fn shutdown_telemetry_within(
+    blocking: &BlockingTaskHost,
+    telemetry: Option<TelemetryHandle>,
+    budget: Duration,
+) -> Result<&'static str, String> {
+    let Some(telemetry) = telemetry else {
+        return Ok("not-configured");
+    };
+    let shutdown = blocking.run("telemetry-shutdown", move || {
+        let shutdown = telemetry.shutdown().map_err(|error| error.to_string());
+        let writer = telemetry
+            .take_writer_failure()
+            .map_err(|error| error.to_string())?;
+        shutdown?;
+        if let Some(error) = writer {
+            return Err(error.to_string());
+        }
+        Ok::<(), String>(())
+    });
+    match tokio::time::timeout(budget, shutdown).await {
+        Ok(Ok(Ok(()))) => Ok("clean"),
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("telemetry shutdown deadline expired".to_owned()),
+    }
 }
 
 /// One stage-qualified startup or runtime failure.
@@ -541,23 +585,193 @@ impl DeviceTokenActivator for CopilotDeviceActivator {
     }
 }
 
-struct DaemonLegacyReload {
+struct DaemonReload {
     reload_lock: Arc<tokio::sync::Mutex<()>>,
     config: Arc<ConfigController>,
     provider: Arc<SwappableProvider>,
     runtime: Arc<AgentRuntime>,
+    blocking: BlockingTaskHost,
+    config_path: Option<PathBuf>,
+    smoke: bool,
     proxy: ProxyPolicy,
     diagnostics: Arc<Diagnostics>,
     skill_count: usize,
 }
 
-impl LegacyReloadPort for DaemonLegacyReload {
+struct StartupPluginGuard {
+    plugins: Option<SignedPluginRuntime>,
+    blocking: BlockingTaskHost,
+}
+
+impl StartupPluginGuard {
+    const fn new(plugins: SignedPluginRuntime, blocking: BlockingTaskHost) -> Self {
+        Self {
+            plugins: Some(plugins),
+            blocking,
+        }
+    }
+
+    fn into_inner(mut self) -> SignedPluginRuntime {
+        self.plugins
+            .take()
+            .expect("startup plugin guard always owns its runtime")
+    }
+}
+
+impl std::ops::Deref for StartupPluginGuard {
+    type Target = SignedPluginRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        self.plugins
+            .as_ref()
+            .expect("startup plugin guard always owns its runtime")
+    }
+}
+
+impl Drop for StartupPluginGuard {
+    fn drop(&mut self) {
+        if let Some(mut plugins) = self.plugins.take() {
+            plugins.abandon_host();
+            self.blocking.record_abandoned();
+        }
+    }
+}
+
+impl DaemonReload {
+    async fn apply_candidate(
+        &self,
+        source: String,
+        source_name: String,
+        role: Option<RoleReload>,
+        cancellation: CancellationToken,
+    ) -> Result<AppliedReload, String> {
+        let reload = tokio::select! {
+            reload = self.reload_lock.lock() => reload,
+            () = cancellation.cancelled() => return Err("reload was cancelled".to_owned()),
+        };
+        let applied = self
+            .commit_candidate(source, source_name, role, cancellation)
+            .await;
+        drop(reload);
+        applied
+    }
+
+    async fn commit_candidate(
+        &self,
+        source: String,
+        source_name: String,
+        role: Option<RoleReload>,
+        cancellation: CancellationToken,
+    ) -> Result<AppliedReload, String> {
+        let admission = tokio::select! {
+            admission = self.runtime.reload_admission() => admission,
+            () = cancellation.cancelled() => return Err("reload was cancelled".to_owned()),
+        };
+        let previous_generation = self.config.generation();
+        let applied = self
+            .config
+            .apply_json5_with_role(&source, &source_name, role)?;
+        if applied.generation == previous_generation {
+            self.diagnostics
+                .record("reload candidate unchanged; participants were not disturbed");
+        } else {
+            let report = self.runtime.reload_sessions_admitted(&admission).await;
+            self.diagnostics.record(format!(
+                "runtime reload generation={} destroyed={} cancelled={} forced={}",
+                report.generation, report.destroyed, report.cancelled_turns, report.forced_turns
+            ));
+        }
+        drop(admission);
+        Ok(applied)
+    }
+
+    async fn reload_file(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<AppliedReload, ProductionError> {
+        let path = self.config_path.clone().ok_or_else(|| {
+            ProductionError::message(
+                "reload",
+                "legacy-environment startup has no reloadable file; use --config",
+            )
+        })?;
+        let resolved = self
+            .blocking
+            .run("reload-config", {
+                let path = path.clone();
+                move || resolve_file_config(&path, &process_environment())
+            })
+            .await
+            .map_err(|error| ProductionError::new("reload", error))?
+            .map_err(|error| ProductionError::new("reload", error))?;
+        if cancellation.is_cancelled() {
+            return Err(ProductionError::message("reload", "reload was cancelled"));
+        }
+        for diagnostic in &resolved.environment_diagnostics {
+            match diagnostic {
+                MigrationDiagnostic::Applied { .. } | MigrationDiagnostic::ManualRequired(_) => {
+                    self.diagnostics.record(format!("reload: {diagnostic}"));
+                }
+                MigrationDiagnostic::IgnoredUnknown { .. } => {}
+                _ => self
+                    .diagnostics
+                    .record("reload emitted an unrecognized configuration diagnostic"),
+            }
+        }
+        let role = if self.smoke {
+            RoleProfile {
+                prompt: "You are running the GTA Claw install diagnostic.".to_owned(),
+                model: None,
+                outcome: RoleDocumentOutcome::LoadedPlainText,
+                diagnostics: Vec::new(),
+            }
+        } else {
+            load_role(
+                &resolved.config,
+                self.proxy.clone(),
+                &self.blocking,
+                cancellation.clone(),
+            )
+            .await?
+        };
+        let source =
+            to_json5(&resolved.config).map_err(|error| ProductionError::new("reload", error))?;
+        self.apply_candidate(
+            source,
+            path.display().to_string(),
+            Some(RoleReload {
+                model: role.model,
+                prompt: role.prompt,
+            }),
+            cancellation,
+        )
+        .await
+        .map_err(|error| ProductionError::message("reload", error))
+    }
+}
+
+impl ConfigurationReloader for DaemonReload {
+    fn apply(
+        &self,
+        source: String,
+        source_name: String,
+        role: Option<RoleReload>,
+        cancellation: CancellationToken,
+    ) -> PortFuture<'_, Result<AppliedReload, String>> {
+        Box::pin(async move {
+            self.apply_candidate(source, source_name, role, cancellation)
+                .await
+        })
+    }
+}
+
+impl LegacyReloadPort for DaemonReload {
     fn reload(
         &self,
         cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<LegacyReloadResult, LegacyReloadError>> {
         Box::pin(async move {
-            let Ok(_reload) = self.reload_lock.try_lock() else {
+            let Ok(reload) = self.reload_lock.try_lock() else {
                 return Err(LegacyReloadError::InProgress);
             };
             let snapshot = self.config.snapshot().map_err(|error| {
@@ -566,7 +780,12 @@ impl LegacyReloadPort for DaemonLegacyReload {
                 LegacyReloadError::Failed
             })?;
             let role = tokio::select! {
-                result = load_role(&snapshot, self.proxy.clone()) => {
+                result = load_role(
+                    &snapshot,
+                    self.proxy.clone(),
+                    &self.blocking,
+                    cancellation.clone(),
+                ) => {
                     result.map_err(|error| {
                         self.diagnostics.record(format!("legacy role reload failed: {error}"));
                         LegacyReloadError::Failed
@@ -574,28 +793,37 @@ impl LegacyReloadPort for DaemonLegacyReload {
                 }
                 () = cancellation.cancelled() => return Err(LegacyReloadError::Failed),
             };
-            let model = role
-                .model
-                .as_deref()
-                .unwrap_or_else(|| snapshot.core().copilot().default_model());
-            self.provider.set_default_model(model).map_err(|error| {
+            let source = to_json5(&snapshot).map_err(|error| {
                 self.diagnostics
-                    .record(format!("legacy role model rejected: {error}"));
+                    .record(format!("legacy reload serialization failed: {error}"));
                 LegacyReloadError::Failed
             })?;
-            self.provider.set_role_prompt(&role.prompt);
-            self.provider.clear_history();
-            let report = self.runtime.reload_sessions().await;
-            self.diagnostics.record(format!(
-                "legacy runtime reload generation={} destroyed={} cancelled={} forced={}",
-                report.generation, report.destroyed, report.cancelled_turns, report.forced_turns
-            ));
+            self.commit_candidate(
+                source,
+                "<legacy-role>".to_owned(),
+                Some(RoleReload {
+                    model: role.model,
+                    prompt: role.prompt,
+                }),
+                cancellation,
+            )
+            .await
+            .map_err(|error| {
+                self.diagnostics
+                    .record(format!("legacy reload transaction failed: {error}"));
+                if error.contains("in progress") {
+                    LegacyReloadError::InProgress
+                } else {
+                    LegacyReloadError::Failed
+                }
+            })?;
+            drop(reload);
             for diagnostic in &role.diagnostics {
                 self.diagnostics
                     .record(format!("legacy role reload: {diagnostic}"));
             }
             Ok(LegacyReloadResult {
-                role_model: role.model,
+                role_model: Some(self.provider.default_model()),
                 skill_count: self.skill_count,
             })
         })
@@ -609,9 +837,11 @@ pub struct ProductionService {
     readiness: Arc<DependencyReadiness>,
     serving: ServingStateHandle,
     config: Arc<ConfigController>,
-    reload_lock: Arc<tokio::sync::Mutex<()>>,
-    config_path: Option<PathBuf>,
+    reloader: Arc<DaemonReload>,
     diagnostics: Arc<Diagnostics>,
+    audit: Arc<DurableSecurityAudit>,
+    blocking: BlockingTaskHost,
+    telemetry: Option<TelemetryHandle>,
     requests: RequestAccounting,
     http_shutdown: CancellationToken,
     http_tasks: JoinSet<(&'static str, io::Result<()>)>,
@@ -636,6 +866,8 @@ impl ProductionService {
         options: &ProductionOptions,
         loaded: LoadedConfig,
         startup_cancellation: CancellationToken,
+        blocking: BlockingTaskHost,
+        telemetry: Option<TelemetryHandle>,
     ) -> Result<Self, ProductionError> {
         if startup_cancellation.is_cancelled() {
             return Err(startup_cancelled());
@@ -736,25 +968,47 @@ impl ProductionService {
         );
 
         let state_dir = options.state_dir()?;
-        std::fs::create_dir_all(&state_dir)
-            .map_err(|error| ProductionError::new("state", error))?;
-        let gateway_pairing = GatewayPairingStore::open(state_dir.join("gateway-pairings.json"))
-            .map_err(|error| ProductionError::message("gateway-pairing", error))?;
+        let (gateway_pairing, audit) = blocking
+            .run("state-open", {
+                let state_dir = state_dir.clone();
+                let readiness = Arc::clone(&readiness);
+                move || {
+                    std::fs::create_dir_all(&state_dir)
+                        .map_err(|error| ProductionError::new("state", error))?;
+                    let gateway_pairing =
+                        GatewayPairingStore::open(state_dir.join("gateway-pairings.json"))
+                            .map_err(|error| ProductionError::message("gateway-pairing", error))?;
+                    let audit = DurableSecurityAudit::open(
+                        &state_dir.join("security-audit.jsonl"),
+                        readiness,
+                    )
+                    .map_err(|error| ProductionError::new("audit", error))?;
+                    Ok::<_, ProductionError>((gateway_pairing, audit))
+                }
+            })
+            .await
+            .map_err(|error| ProductionError::new("state", error))??;
+        let audit = Arc::new(audit);
         diagnostics.record(format!(
             "gateway pairing store opened with {} grants",
             gateway_pairing.len()
         ));
-        let audit = Arc::new(
-            DurableSecurityAudit::open(
-                &state_dir.join("security-audit.jsonl"),
-                Arc::clone(&readiness),
-            )
-            .map_err(|error| ProductionError::new("audit", error))?,
-        );
         readiness.set("audit", true);
         info!(stage = "audit", path = %state_dir.join("security-audit.jsonl").display(), "durable audit opened");
 
-        let proxy = proxy_policy(&loaded.snapshot)?;
+        let (proxy, mut legacy_settings, resolved_admin_token) = blocking
+            .run("startup-secrets", {
+                let snapshot = loaded.snapshot.clone();
+                move || {
+                    Ok::<_, ProductionError>((
+                        proxy_policy(&snapshot)?,
+                        legacy_settings(&snapshot)?,
+                        admin_token(&snapshot)?,
+                    ))
+                }
+            })
+            .await
+            .map_err(|error| ProductionError::new("secrets", error))??;
         let proxy_rules = proxy.rules();
         diagnostics.record(format!("proxy policy: {proxy:?}"));
         for diagnostic in proxy_rules.diagnostics() {
@@ -777,7 +1031,12 @@ impl ProductionService {
             }
         } else {
             tokio::select! {
-                result = load_role(&loaded.snapshot, proxy.clone()) => result?,
+                result = load_role(
+                    &loaded.snapshot,
+                    proxy.clone(),
+                    &blocking,
+                    startup_cancellation.clone(),
+                ) => result?,
                 () = startup_cancellation.cancelled() => return Err(startup_cancelled()),
             }
         };
@@ -806,9 +1065,11 @@ impl ProductionService {
         let plugin_diagnostics = Arc::clone(&diagnostics);
         let plugin_cancellation = claw_plugin_host::CancellationToken::new();
         let task_cancellation = plugin_cancellation.clone();
-        let mut plugin_task = tokio::task::spawn_blocking(move || {
+        let plugin_blocking = blocking.clone();
+        let plugin_task = plugin_blocking.run("plugin-activation", move || {
             SignedPluginRuntime::activate(&plugin_diagnostics, task_cancellation)
         });
+        tokio::pin!(plugin_task);
         let plugins = tokio::select! {
             result = &mut plugin_task => {
                 result
@@ -817,21 +1078,23 @@ impl ProductionService {
             }
             () = startup_cancellation.cancelled() => {
                 plugin_cancellation.cancel();
-                if tokio::time::timeout(
-                    PLUGIN_ACTIVATION_CANCEL_GRACE,
-                    &mut plugin_task,
-                )
-                .await
-                .is_err()
-                {
-                    plugin_task.abort();
-                    diagnostics.record(
-                        "plugin activation did not stop within the cancellation grace period",
-                    );
+                match plugin_task.as_mut().await {
+                    Ok(Ok(plugins)) => {
+                        match blocking
+                            .run("plugin-startup-shutdown", move || plugins.shutdown_host())
+                            .await
+                        {
+                            Ok(report) if report.failed == 0 => {}
+                            Ok(_) | Err(_) => blocking.record_abandoned(),
+                        }
+                    }
+                    Ok(Err(_)) => {}
+                    Err(_) => blocking.record_abandoned(),
                 }
                 return Err(startup_cancelled());
             }
         };
+        let plugins = StartupPluginGuard::new(plugins, blocking.clone());
         let plugin_tools = plugins.tools();
         let model_tools = RuntimeModelTools::new(Arc::clone(&plugin_tools));
         let active_skill_count = plugins.summary().activated();
@@ -845,7 +1108,6 @@ impl ProductionService {
         );
         readiness.set("skills", true);
 
-        let mut legacy_settings = legacy_settings(&loaded.snapshot)?;
         let channels = channel_statuses(&legacy_settings)?;
 
         let configured_model = role
@@ -854,7 +1116,7 @@ impl ProductionService {
             .unwrap_or_else(|| loaded.snapshot.core().copilot().default_model().to_owned());
         let provider = Arc::new(SwappableProvider::new(
             configured_model.clone(),
-            role.prompt,
+            role.prompt.clone(),
             ProviderHistoryConfig {
                 max_conversations: legacy_settings.session_max_entries,
                 idle_timeout: legacy_settings.session_idle_timeout,
@@ -862,16 +1124,31 @@ impl ProductionService {
             model_tools as Arc<dyn ModelToolCatalog>,
             Arc::clone(&readiness),
         ));
-        let provider_to_activate: Option<Arc<dyn Provider>> = if options.smoke {
+        let provider_to_activate: Option<Arc<dyn Provider>> = blocking
+            .run("provider-secrets", {
+                let snapshot = loaded.snapshot.clone();
+                let proxy = proxy.clone();
+                let smoke = options.smoke;
+                move || {
+                    if smoke {
+                        Ok(Some(Arc::new(
+                            SmokeProvider::new()
+                                .map_err(|error| ProductionError::new("provider", error))?,
+                        ) as Arc<dyn Provider>))
+                    } else if snapshot.core().auth().github_pat().is_some() {
+                        Ok(Some(
+                            Arc::new(build_copilot(&snapshot, proxy)?) as Arc<dyn Provider>
+                        ))
+                    } else {
+                        Ok(None)
+                    }
+                }
+            })
+            .await
+            .map_err(|error| ProductionError::new("provider", error))??;
+        if options.smoke {
             warn!(stage = "provider", "explicit smoke provider enabled");
-            Some(Arc::new(
-                SmokeProvider::new().map_err(|error| ProductionError::new("provider", error))?,
-            ))
-        } else if loaded.snapshot.core().auth().github_pat().is_some() {
-            Some(Arc::new(build_copilot(&loaded.snapshot, proxy.clone())?))
-        } else {
-            None
-        };
+        }
         if let Some(provider_to_activate) = provider_to_activate {
             let activation_cancel = CancelToken::new();
             tokio::select! {
@@ -910,17 +1187,29 @@ impl ProductionService {
             Arc::clone(&diagnostics),
         ));
         let reload_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let agent_runtime = AgentRuntime::new(
-            Arc::clone(&provider),
-            Arc::clone(&plugin_tools),
-            &state_dir,
-            configured_model.clone(),
-            active_skill_count,
-            legacy_settings.session_max_entries,
-            legacy_settings.session_idle_timeout,
-            Arc::clone(&diagnostics),
-        )
-        .map_err(|error| ProductionError::message("runtime", error))?;
+        let agent_runtime = blocking
+            .run("runtime-state-open", {
+                let provider = Arc::clone(&provider);
+                let plugin_tools = Arc::clone(&plugin_tools);
+                let state_dir = state_dir.clone();
+                let diagnostics = Arc::clone(&diagnostics);
+                let max_sessions = legacy_settings.session_max_entries;
+                let idle_timeout = legacy_settings.session_idle_timeout;
+                move || {
+                    AgentRuntime::new(
+                        provider,
+                        plugin_tools,
+                        &state_dir,
+                        active_skill_count,
+                        max_sessions,
+                        idle_timeout,
+                        diagnostics,
+                    )
+                }
+            })
+            .await
+            .map_err(|error| ProductionError::new("runtime", error))?
+            .map_err(|error| ProductionError::message("runtime", error))?;
         let http_tools = agent_runtime.http_tools(Arc::clone(&plugin_tools));
         readiness.set("runtime", true);
 
@@ -1038,11 +1327,14 @@ impl ProductionService {
             enabled = enabled_channel_count,
             "channel lifecycles are live"
         );
-        let reload = Arc::new(DaemonLegacyReload {
+        let reload = Arc::new(DaemonReload {
             reload_lock: Arc::clone(&reload_lock),
             config: Arc::clone(&config),
             provider: Arc::clone(&provider),
             runtime: Arc::clone(&agent_runtime),
+            blocking: blocking.clone(),
+            config_path: loaded.path.clone(),
+            smoke: options.smoke,
             proxy: proxy.clone(),
             diagnostics: Arc::clone(&diagnostics),
             skill_count: active_skill_count,
@@ -1054,6 +1346,7 @@ impl ProductionService {
                 .map_err(|error| ProductionError::message("updates", error))?;
         let admin = Arc::new(OperatorAdmin::new(
             Arc::clone(&config),
+            Arc::clone(&reload) as Arc<dyn ConfigurationReloader>,
             Arc::clone(&provider),
             Arc::clone(&readiness),
             Arc::clone(&diagnostics),
@@ -1066,10 +1359,9 @@ impl ProductionService {
                 plugin_activation,
                 Arc::clone(&agent_runtime) as Arc<dyn OperatorRuntimeStatus>,
             ),
-            Arc::clone(&reload_lock),
             Arc::clone(&gateway_pairing) as Arc<dyn GatewayPairingAdmin>,
         ));
-        let admin_token = admin_token(&loaded.snapshot)?;
+        let admin_token = resolved_admin_token;
         let external = Arc::new(DisabledExternalPorts);
         let services = ApiServices {
             provider: Arc::clone(&provider) as Arc<dyn claw_http_api::ProviderPort>,
@@ -1079,7 +1371,7 @@ impl ProductionService {
             watch_auth: Arc::clone(&external) as Arc<dyn claw_http_api::WatchAuthPort>,
             watch_results: Arc::clone(&external) as Arc<dyn claw_http_api::WatchResultPort>,
             webhooks: external,
-            audit,
+            audit: Arc::clone(&audit) as Arc<dyn claw_http_api::AuditPort>,
         };
         diagnostics.record("optional watch pairing and task-flow webhook routes are disabled");
 
@@ -1123,7 +1415,7 @@ impl ProductionService {
                 .as_ref()
                 .map(|teams| Arc::clone(teams) as Arc<dyn claw_http_api::LegacyTeamsPort>),
             whatsapp: whatsapp.map(|(_, services)| services),
-            reload: Some(reload),
+            reload: Some(Arc::clone(&reload) as Arc<dyn LegacyReloadPort>),
             admin: admin_token.as_ref().map(|_| {
                 NativeLegacyHostAdmin::new() as Arc<dyn claw_http_api::LegacyHostAdminPort>
             }),
@@ -1296,9 +1588,11 @@ impl ProductionService {
             readiness,
             serving,
             config,
-            reload_lock,
-            config_path: loaded.path,
+            reloader: reload,
             diagnostics,
+            audit,
+            blocking,
+            telemetry,
             requests,
             http_shutdown,
             http_tasks,
@@ -1307,7 +1601,7 @@ impl ProductionService {
             channels: channel_supervisor,
             agent_runtime,
             updater: update_monitor,
-            plugins: Some(plugins),
+            plugins: Some(plugins.into_inner()),
             terminated_http_tasks: 0,
         })
     }
@@ -1354,38 +1648,7 @@ impl ProductionService {
     /// Returns a `reload`-stage error when no file was configured, the file
     /// cannot be read, or the candidate is rejected and rolled back.
     pub async fn reload(&self) -> Result<AppliedReload, ProductionError> {
-        let _reload = self.reload_lock.lock().await;
-        let path = self.config_path.as_ref().ok_or_else(|| {
-            ProductionError::message(
-                "reload",
-                "legacy-environment startup has no reloadable file; use --config",
-            )
-        })?;
-        let resolved = resolve_file_config(path, &process_environment())
-            .map_err(|error| ProductionError::new("reload", error))?;
-        for diagnostic in &resolved.environment_diagnostics {
-            match diagnostic {
-                MigrationDiagnostic::Applied { .. } | MigrationDiagnostic::ManualRequired(_) => {
-                    self.diagnostics.record(format!("reload: {diagnostic}"));
-                }
-                MigrationDiagnostic::IgnoredUnknown { .. } => {}
-                _ => self
-                    .diagnostics
-                    .record("reload emitted an unrecognized configuration diagnostic"),
-            }
-        }
-        let source =
-            to_json5(&resolved.config).map_err(|error| ProductionError::new("reload", error))?;
-        let applied = self
-            .config
-            .apply_json5(&source, &path.display().to_string())
-            .map_err(|error| ProductionError::message("reload", error))?;
-        let report = self.agent_runtime.reload_sessions().await;
-        self.diagnostics.record(format!(
-            "runtime reload generation={} destroyed={} cancelled={} forced={}",
-            report.generation, report.destroyed, report.cancelled_turns, report.forced_turns
-        ));
-        Ok(applied)
+        self.reloader.reload_file(CancellationToken::new()).await
     }
 
     /// Waits for an ingress task to exit without a stop request.
@@ -1459,6 +1722,29 @@ impl ProductionService {
             .completed()
             .saturating_sub(completed_before_drain);
 
+        let audit_joined = {
+            let audit = Arc::clone(&self.audit);
+            let budget = remaining(started);
+            if tokio::time::timeout(
+                budget,
+                self.blocking
+                    .run("audit-shutdown", move || audit.shutdown(budget)),
+            )
+            .await
+                == Ok(Ok(true))
+            {
+                true
+            } else {
+                abandoned = abandoned.saturating_add(1);
+                warn!(
+                    stage = "shutdown",
+                    subsystem = "audit",
+                    "durable audit writer did not join cleanly"
+                );
+                false
+            }
+        };
+
         let channel_report = self.channels.shutdown(remaining(started)).await;
         abandoned = abandoned.saturating_add(channel_report.abandoned);
         let updater_spawned = u64::from(self.updater.is_enabled());
@@ -1526,7 +1812,10 @@ impl ProductionService {
                 );
                 plugins.abandon_host();
             } else {
-                let mut task = tokio::task::spawn_blocking(move || plugins.shutdown_host());
+                let task = self
+                    .blocking
+                    .run("plugin-shutdown", move || plugins.shutdown_host());
+                tokio::pin!(task);
                 match tokio::time::timeout(remaining(started), &mut task).await {
                     Ok(Ok(report)) => {
                         plugins_joined = true;
@@ -1547,7 +1836,6 @@ impl ProductionService {
                         warn!(stage = "shutdown", subsystem = "plugins", error = %error);
                     }
                     Err(_) => {
-                        task.abort();
                         abandoned = abandoned.saturating_add(1);
                         warn!(
                             stage = "shutdown",
@@ -1586,33 +1874,47 @@ impl ProductionService {
             }
         }
 
-        let spawned = 6_u64
+        let telemetry = match shutdown_telemetry_within(
+            &self.blocking,
+            self.telemetry.take(),
+            remaining(started),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                abandoned = abandoned.saturating_add(1);
+                self.diagnostics
+                    .record(format!("telemetry shutdown failed: {error}"));
+                "failed"
+            }
+        };
+        let blocking = self.blocking.shutdown_within(remaining(started)).await;
+        if !blocking.is_settled() {
+            abandoned = abandoned.saturating_add(
+                u32::try_from(blocking.outstanding())
+                    .unwrap_or(u32::MAX)
+                    .max(1),
+            );
+        }
+        let spawned = 7_u64
             .saturating_add(device_report.spawned)
             .saturating_add(channel_report.spawned)
             .saturating_add(updater_spawned)
-            .saturating_add(plugin_invocations_spawned);
+            .saturating_add(plugin_invocations_spawned)
+            .saturating_add(blocking.spawned());
         let terminated = self
             .terminated_http_tasks
             .saturating_add(if gateway_joined { 2 } else { 0 })
             .saturating_add(u64::from(plugins_joined))
+            .saturating_add(u64::from(audit_joined))
             .saturating_add(device_report.terminated)
             .saturating_add(channel_report.terminated)
             .saturating_add(u64::from(updater_spawned > 0 && updater_joined))
-            .saturating_add(plugin_invocations_terminated);
+            .saturating_add(plugin_invocations_terminated)
+            .saturating_add(blocking.terminated());
         let deadline_expired = started.elapsed() >= PRODUCTION_STOP_DEADLINE;
         let clean = abandoned == 0 && terminated == spawned && !deadline_expired && fault.is_none();
-        if clean {
-            info!(
-                stage = "shutdown",
-                elapsed_ms = started.elapsed().as_millis(),
-                "shutdown complete"
-            );
-        } else {
-            error!(
-                stage = "shutdown",
-                abandoned, terminated, spawned, deadline_expired, "shutdown incomplete"
-            );
-        }
         ProductionStopSummary {
             clean,
             drained: 4,
@@ -1622,6 +1924,7 @@ impl ProductionService {
             terminated,
             deadline_expired,
             fault,
+            telemetry,
         }
     }
 
@@ -1654,19 +1957,32 @@ pub struct ProductionStopSummary {
     terminated: u64,
     deadline_expired: bool,
     fault: Option<String>,
+    telemetry: &'static str,
 }
 
 impl ProductionStopSummary {
-    pub(crate) const fn before_start() -> Self {
+    pub(crate) fn before_start(
+        blocking: crate::runtime::TaskLedger,
+        telemetry: &'static str,
+    ) -> Self {
+        let telemetry_clean = matches!(telemetry, "clean" | "not-configured");
+        let blocking_abandoned = blocking
+            .spawned()
+            .saturating_sub(blocking.terminated())
+            .max(u64::try_from(blocking.outstanding()).unwrap_or(u64::MAX));
+        let abandoned = u32::try_from(blocking_abandoned)
+            .unwrap_or(u32::MAX)
+            .saturating_add(u32::from(!telemetry_clean));
         Self {
-            clean: true,
+            clean: blocking.is_settled() && telemetry_clean,
             drained: 0,
             completed: 0,
-            abandoned: 0,
-            spawned: 0,
-            terminated: 0,
+            abandoned,
+            spawned: blocking.spawned(),
+            terminated: blocking.terminated(),
             deadline_expired: false,
             fault: None,
+            telemetry,
         }
     }
 
@@ -1716,6 +2032,12 @@ impl ProductionStopSummary {
     #[must_use]
     pub fn fault(&self) -> Option<&str> {
         self.fault.as_deref()
+    }
+
+    /// Returns the final telemetry writer outcome.
+    #[must_use]
+    pub const fn telemetry(&self) -> &'static str {
+        self.telemetry
     }
 }
 
@@ -2121,41 +2443,53 @@ fn proxy_policy(snapshot: &ConfigSnapshot) -> Result<ProxyPolicy, ProductionErro
 struct TransportRoleFetcher {
     proxy: ProxyPolicy,
     runtime: tokio::runtime::Handle,
+    cancellation: CancellationToken,
 }
 
 impl RoleSourceFetcher for TransportRoleFetcher {
     type Error = ProductionError;
 
     fn fetch(&mut self, request: RoleFetchRequest<'_>) -> Result<RoleResponse, Self::Error> {
-        self.runtime
-            .block_on(fetch_role_response(request, self.proxy.clone()))
+        self.runtime.block_on(fetch_role_response(
+            request,
+            self.proxy.clone(),
+            self.cancellation.clone(),
+        ))
     }
 }
 
 async fn load_role(
     snapshot: &ConfigSnapshot,
     proxy: ProxyPolicy,
+    blocking: &BlockingTaskHost,
+    cancellation: CancellationToken,
 ) -> Result<RoleProfile, ProductionError> {
     let role_config = snapshot.core().role().clone();
     let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        let mut fetcher = TransportRoleFetcher { proxy, runtime };
-        let document = load_role_document(&mut fetcher, &role_config)
-            .map_err(|error| ProductionError::new("role", error))?;
-        Ok(RoleProfile {
-            prompt: document.content().to_owned(),
-            model: document.model().map(str::to_owned),
-            outcome: document.outcome(),
-            diagnostics: document.diagnostics().to_vec(),
+    blocking
+        .run("role-load", move || {
+            let mut fetcher = TransportRoleFetcher {
+                proxy,
+                runtime,
+                cancellation,
+            };
+            let document = load_role_document(&mut fetcher, &role_config)
+                .map_err(|error| ProductionError::new("role", error))?;
+            Ok(RoleProfile {
+                prompt: document.content().to_owned(),
+                model: document.model().map(str::to_owned),
+                outcome: document.outcome(),
+                diagnostics: document.diagnostics().to_vec(),
+            })
         })
-    })
-    .await
-    .map_err(|error| ProductionError::new("role", error))?
+        .await
+        .map_err(|error| ProductionError::new("role", error))?
 }
 
 async fn fetch_role_response(
     request: RoleFetchRequest<'_>,
     proxy: ProxyPolicy,
+    startup_cancellation: CancellationToken,
 ) -> Result<RoleResponse, ProductionError> {
     let url =
         Url::parse(request.url()).map_err(|error| ProductionError::new("role-fetch", error))?;
@@ -2178,7 +2512,7 @@ async fn fetch_role_response(
     .map_err(|error| ProductionError::new("role-transport", error))?;
     let cancellation = CancelToken::new();
     let timeout_cancellation = cancellation.clone();
-    let outcome = tokio::time::timeout(timeout, async move {
+    let request_future = async move {
         let response = transport
             .send_streaming(
                 "role-loader",
@@ -2226,15 +2560,22 @@ async fn fetch_role_response(
             body.extend_from_slice(&chunk);
         }
         Ok(role_response(status, content_type, declared_length, body))
-    })
-    .await;
-    outcome.unwrap_or_else(|_| {
-        timeout_cancellation.cancel();
-        Err(ProductionError::message(
-            "role-fetch",
-            format!("role fetch exceeded {} ms", request.timeout_ms()),
-        ))
-    })
+    };
+    tokio::select! {
+        outcome = tokio::time::timeout(timeout, request_future) => {
+            outcome.unwrap_or_else(|_| {
+                timeout_cancellation.cancel();
+                Err(ProductionError::message(
+                    "role-fetch",
+                    format!("role fetch exceeded {} ms", request.timeout_ms()),
+                ))
+            })
+        }
+        () = startup_cancellation.cancelled() => {
+            timeout_cancellation.cancel();
+            Err(startup_cancelled())
+        }
+    }
 }
 
 fn role_response(
@@ -2359,7 +2700,7 @@ pub fn check_configuration(
     loaded: &LoadedConfig,
 ) -> Result<(), ProductionError> {
     validate_exposure(options)?;
-    let _ = options.state_dir()?;
+    validate_state_destination(&options.state_dir()?)?;
     let _ = proxy_policy(&loaded.snapshot)?;
     let _ = admin_token(&loaded.snapshot)?;
     let _ = updates_enabled(&loaded.snapshot)
@@ -2378,6 +2719,56 @@ pub fn check_configuration(
         }
     }
     Ok(())
+}
+
+fn validate_state_destination(path: &Path) -> Result<(), ProductionError> {
+    let mut candidate = path;
+    loop {
+        match std::fs::metadata(candidate) {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    return Err(ProductionError::message(
+                        "state",
+                        format!(
+                            "state destination {} is not a directory",
+                            candidate.display()
+                        ),
+                    ));
+                }
+                if metadata.permissions().readonly() {
+                    return Err(ProductionError::message(
+                        "state",
+                        format!("state destination {} is read-only", candidate.display()),
+                    ));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    let mode = metadata.permissions().mode();
+                    if mode & 0o222 == 0 || mode & 0o111 == 0 {
+                        return Err(ProductionError::message(
+                            "state",
+                            format!(
+                                "state destination {} is not writable and searchable",
+                                candidate.display()
+                            ),
+                        ));
+                    }
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                candidate = candidate.parent().ok_or_else(|| {
+                    ProductionError::message(
+                        "state",
+                        format!("state destination {} has no usable parent", path.display()),
+                    )
+                })?;
+            }
+            Err(error) => return Err(ProductionError::new("state", error)),
+        }
+    }
 }
 
 #[cfg(test)]

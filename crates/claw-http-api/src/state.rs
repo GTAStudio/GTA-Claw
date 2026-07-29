@@ -95,7 +95,7 @@ impl ApiState {
             .filter(|entry| entry.subject == subject && entry.model == model)
             .map(|entry| entry.session_id.clone());
         drop(sessions);
-        Ok(resumed.unwrap_or_else(|| self.id("session")))
+        Ok(resumed.unwrap_or_else(|| self.id("response_session")))
     }
 
     pub(crate) fn remember_response_session(

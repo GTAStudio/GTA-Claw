@@ -785,7 +785,7 @@ impl RuntimeProviderAdapter {
             response_format: None,
             request_id: format!("runtime_{}_{}", request.turn.ordinal(), request.round),
             session_id: format!(
-                "runtime:{}:{}:{}",
+                "runtime_once:{}:{}:{}",
                 request.session_id,
                 request.turn.ordinal(),
                 request.round
@@ -1023,12 +1023,11 @@ impl ToolPort for AgentHttpTools {
 /// One composed agent runtime shared by HTTP and every channel.
 pub struct AgentRuntime {
     runtime: Arc<Runtime>,
-    admission: tokio::sync::RwLock<()>,
+    admission: Arc<tokio::sync::RwLock<()>>,
     provider: Arc<SwappableProvider>,
     state: Arc<RuntimeStateStore>,
     memory: Arc<MemoryContextEngine>,
     goals: Arc<FileGoalStore>,
-    model: String,
     skill_count: usize,
     diagnostics: Arc<Diagnostics>,
 }
@@ -1044,7 +1043,6 @@ impl AgentRuntime {
         provider: Arc<SwappableProvider>,
         plugin_tools: Arc<PluginToolSurface>,
         state_dir: &std::path::Path,
-        model: String,
         skill_count: usize,
         max_sessions: usize,
         idle_timeout: Duration,
@@ -1086,12 +1084,11 @@ impl AgentRuntime {
         ));
         Ok(Arc::new(Self {
             runtime,
-            admission: tokio::sync::RwLock::new(()),
+            admission: Arc::new(tokio::sync::RwLock::new(())),
             provider,
             state,
             memory,
             goals,
-            model,
             skill_count,
             diagnostics,
         }))
@@ -1149,7 +1146,7 @@ impl AgentRuntime {
         match command {
             "status" => Ok(format!(
                 "model={} authenticated={} sessions={} provider_generation={}",
-                self.model,
+                self.provider.default_model(),
                 self.authenticated(),
                 self.runtime.managed_session_ids().len(),
                 self.provider.provider_generation(),
@@ -1178,7 +1175,18 @@ impl AgentRuntime {
 
     /// Reload-fences and terminally removes every owned conversation.
     pub async fn reload_sessions(&self) -> claw_runtime::SessionReloadReport {
-        let _admission = self.admission.write().await;
+        let admission = self.reload_admission().await;
+        self.reload_sessions_admitted(&admission).await
+    }
+
+    pub(crate) async fn reload_admission(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.admission).write_owned().await
+    }
+
+    pub(crate) async fn reload_sessions_admitted(
+        &self,
+        _admission: &tokio::sync::OwnedRwLockWriteGuard<()>,
+    ) -> claw_runtime::SessionReloadReport {
         let report = self.runtime.reload_sessions().await;
         self.memory.clear();
         self.state.clear();
@@ -1191,6 +1199,7 @@ impl AgentRuntime {
     ///
     /// Returns the runtime's typed shutdown failure after all tasks are joined.
     pub async fn shutdown(&self) -> Result<(), RuntimeError> {
+        let _admission = self.reload_admission().await;
         self.runtime.shutdown().await
     }
 
@@ -1288,7 +1297,7 @@ impl LegacyRuntimePort for AgentRuntime {
     fn snapshot(&self) -> Result<LegacyRuntimeSnapshot, PortError> {
         Ok(LegacyRuntimeSnapshot {
             skill_count: self.skill_count,
-            active_model: self.model.clone(),
+            active_model: self.provider.default_model(),
             session_count: self.runtime.managed_session_ids().len(),
             authenticated: self.provider.is_active(),
         })
