@@ -33,7 +33,7 @@ validate_rpm_lifecycle_contract() {
   local contract
 
   for contract in \
-    "rpm -q --qf '%%{NEVRA}\\n' gta-claw" \
+    "rpm -q --qf '%{NEVRA}\\n' gta-claw" \
     'gta-claw-daemon.old-nevra' \
     'gta-claw-daemon.upgrade-prepared' \
     'gta-claw-daemon.upgrade-configured' \

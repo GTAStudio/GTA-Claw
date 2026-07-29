@@ -34,7 +34,8 @@ rpm_source="$(
     "$SCRIPT_DIR/rpm/post" \
     "$SCRIPT_DIR/rpm/preun" \
     "$SCRIPT_DIR/rpm/postun" \
-    "$SCRIPT_DIR/rpm/posttrans"
+    "$SCRIPT_DIR/rpm/posttrans" |
+    sed 's/%%{NEVRA}/%{NEVRA}/g'
 )"
 validate_rpm_lifecycle_contract "$rpm_source"
 "$SCRIPT_DIR/rpm-lifecycle-self-test.sh"

@@ -6,8 +6,18 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 work="$SCRIPT_DIR/.rpm-lifecycle-self-test-$$"
 rm -rf -- "$work"
-mkdir -m 0700 -- "$work" "$work/bin" "$work/state" "$work/systemd"
+mkdir -m 0700 -- \
+  "$work" \
+  "$work/bin" \
+  "$work/rendered" \
+  "$work/state" \
+  "$work/systemd"
 trap 'rm -rf -- "$work"' EXIT INT TERM
+
+for scriptlet in pre post preun postun posttrans; do
+  sed 's/%%{NEVRA}/%{NEVRA}/g' \
+    "$SCRIPT_DIR/rpm/$scriptlet" >"$work/rendered/$scriptlet"
+done
 
 printf 'gta-claw-0:0.1.0-1.x86_64\n' >"$work/installed-nevras"
 printf 'old daemon payload bytes\n' >"$work/daemon"
@@ -18,6 +28,14 @@ printf 'enabled\n' >"$work/enabled"
 cat >"$work/bin/rpm" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "$#" -ne 4 ||
+  "$1" != "-q" ||
+  "$2" != "--qf" ||
+  "$3" != '%{NEVRA}\n' ||
+  "$4" != "gta-claw" ]]; then
+  echo "unexpected rpm query: $*" >&2
+  exit 2
+fi
 cat "${RPM_TEST_ROOT:?}/installed-nevras"
 EOF
 cat >"$work/bin/systemctl" <<'EOF'
@@ -76,7 +94,7 @@ if PATH="$work/bin:$PATH" \
   GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
   GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
   GTA_CLAW_PACKAGE_TEST_FAIL_UPGRADE_PREPARE=1 \
-  sh "$SCRIPT_DIR/rpm/pre" 2; then
+  sh "$work/rendered/pre" 2; then
   echo "injected RPM preparation failure unexpectedly succeeded" >&2
   exit 1
 fi
@@ -103,7 +121,7 @@ PATH="$work/bin:$PATH" \
   GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
   GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
   RPM_TEST_FAIL_STOP=1 \
-  sh "$SCRIPT_DIR/rpm/preun" 0 &&
+  sh "$work/rendered/preun" 0 &&
   {
     echo "injected RPM erase failure unexpectedly succeeded" >&2
     exit 1
@@ -127,7 +145,7 @@ PATH="$work/bin:$PATH" \
   GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
   GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
   RPM_TEST_FAIL_STOP=1 \
-  sh "$SCRIPT_DIR/rpm/preun" 0 &&
+  sh "$work/rendered/preun" 0 &&
   {
     echo "runtime-enabled RPM erase failure unexpectedly succeeded" >&2
     exit 1
@@ -143,7 +161,7 @@ PATH="$work/bin:$PATH" \
   RPM_TEST_ROOT="$work" \
   GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
   GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
-  sh "$SCRIPT_DIR/rpm/preun" 0
+  sh "$work/rendered/preun" 0
 [[ "$(cat "$work/enabled")" == "disabled" ]] ||
   {
     echo "successful RPM erase retained runtime enablement" >&2
