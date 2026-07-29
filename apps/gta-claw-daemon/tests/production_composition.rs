@@ -753,22 +753,14 @@ fn write_config_fixture(path: &Path, model: &str, role_url: &str, teams: bool, w
         ("ENABLE_WHATSAPP", if whatsapp { "true" } else { "false" }),
         ("WHATSAPP_VERIFY_TOKEN", "verify-token"),
         ("WHATSAPP_ACCESS_TOKEN", "access-token"),
-        ("WHATSAPP_APP_SECRET", "app-secret"),
         ("WHATSAPP_PHONE_NUMBER_ID", "phone-id"),
         ("COPILOT_MODEL", model),
         ("AGENT_ROLE_URL", role_url),
     ])
     .expect("fixture configuration migrates");
-    let encoded = to_json5(&migrated.config).expect("fixture configuration serializes");
-    let mut config: serde_json::Value =
-        json5::from_str(&encoded).expect("fixture configuration parses");
-    if whatsapp {
-        config["core"]["channels"]["whatsapp"]["app_secret"] =
-            serde_json::Value::String("env:WHATSAPP_APP_SECRET".to_owned());
-    }
     std::fs::write(
         path,
-        serde_json::to_string(&config).expect("fixture configuration encodes"),
+        to_json5(&migrated.config).expect("fixture configuration serializes"),
     )
     .expect("fixture configuration is written");
 }
