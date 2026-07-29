@@ -226,6 +226,8 @@ pub trait LegacyWhatsAppPort: Send + Sync {
 /// Services required by the `WhatsApp` compatibility route.
 #[derive(Clone)]
 pub struct LegacyWhatsAppServices {
+    /// Configured phone-number identity accepted by this webhook route.
+    pub phone_number_id: String,
     /// Shared inbound channel-message processor.
     pub messages: Arc<dyn LegacyChannelMessagePort>,
     /// Concrete outbound `WhatsApp` transport.

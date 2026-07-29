@@ -18,9 +18,10 @@ use claw_channels::{
     DiscordGatewayRequest, DiscordPacketOutcome, DiscordTransport, OperatorDiagnostic,
     ProviderResponse, ReplySource, TEAMS_FAILURE_REPLY, TEAMS_GREETING, TeamsAction,
     TeamsActivityError, TeamsActivityHandler, TeamsActivityOutcome, TelegramChannel,
-    TelegramPollRequest, TelegramSendRequest, TelegramTransport, UnixClock, WhatsAppChannel,
-    WhatsAppSendRequest, WhatsAppTransport, WhatsAppVerificationQuery,
-    WhatsAppVerificationResponse, WhatsAppWebhookResponse, verify_whatsapp_webhook_signature,
+    TelegramPollRequest, TelegramSendRequest, TelegramTransport, UnixClock,
+    WHATSAPP_MAX_MESSAGES_PER_WEBHOOK, WhatsAppChannel, WhatsAppSendError, WhatsAppSendRequest,
+    WhatsAppTransport, WhatsAppVerificationQuery, WhatsAppVerificationResponse,
+    WhatsAppWebhookResponse, verify_whatsapp_webhook_signature,
 };
 
 const ACCOUNT: &str = "primary";
@@ -771,7 +772,7 @@ impl WhatsAppTransport for WhatsAppFixture {
     fn send_text(
         &mut self,
         request: &WhatsAppSendRequest<'_>,
-    ) -> Result<ProviderResponse, ChannelError> {
+    ) -> Result<ProviderResponse, WhatsAppSendError> {
         assert_eq!(request.access_token(), "whatsapp-secret");
         assert_eq!(request.phone_number_id(), "phone-id");
         assert_eq!(request.to(), "15550001");
@@ -781,7 +782,21 @@ impl WhatsAppTransport for WhatsAppFixture {
         self.debug.borrow_mut().push(format!("{request:?}"));
         let mut sent = self.sent.borrow_mut();
         sent.push(request.text().to_owned());
-        let status = self.responses.pop_front().unwrap_or(Ok(200))?;
+        let status = self
+            .responses
+            .pop_front()
+            .unwrap_or(Ok(200))
+            .map_err(|error| {
+                if matches!(
+                    &error,
+                    ChannelError::Transport(TransportErrorKind::Timeout | TransportErrorKind::Io,)
+                        | ChannelError::Protocol(_)
+                ) {
+                    WhatsAppSendError::AmbiguousAfterSend(error)
+                } else {
+                    WhatsAppSendError::FailedBeforeSend(error)
+                }
+            })?;
         Ok(ProviderResponse::new(
             status,
             format!(r#"{{"messages":[{{"id":"whatsapp-{}"}}]}}"#, sent.len()),
@@ -1036,52 +1051,87 @@ fn whatsapp_redelivery_skips_completed_messages_and_resumes_failed_reply() {
 }
 
 #[test]
-fn whatsapp_queue_pressure_returns_retry_and_redelivery_skips_completed_messages() {
-    let WhatsAppHarness { mut channel, .. } = whatsapp_channel(1, VecDeque::new());
+fn whatsapp_capacity_one_retains_a_four_message_batch_after_acknowledgement() {
+    let WhatsAppHarness {
+        mut channel, sent, ..
+    } = whatsapp_channel(1, VecDeque::new());
     let access = token_credential("whatsapp", "graph.facebook.com", "whatsapp-secret");
     let payload =
         br#"{"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"phone-id"},"messages":[
-        {"from":"15550001","id":"one","type":"text","text":{"body":"first"}},
-        {"from":"15550002","id":"two","type":"text","text":{"body":"second"}}
+        {"from":"15550001","id":"a","type":"text","text":{"body":"first"}},
+        {"from":"15550001","id":"b","type":"text","text":{"body":"second"}},
+        {"from":"15550001","id":"c","type":"text","text":{"body":"third"}},
+        {"from":"15550001","id":"d","type":"text","text":{"body":"fourth"}}
     ]}}]}]}"#;
     let processed = RefCell::new(Vec::new());
     channel.start(&mut ()).expect("started");
+    let mut process = |message: &InboundMessage| {
+        processed.borrow_mut().push(message.id.clone());
+        Ok(Some(format!("reply-{}", message.id)))
+    };
 
-    let first = channel.handle_webhook(
-        payload,
-        &access,
-        |message| {
-            processed
-                .borrow_mut()
-                .push(message.text.as_deref().expect("text").to_owned());
-            Ok(None)
-        },
-        &mut (),
-    );
+    for expected in ["a", "b", "c"] {
+        assert_eq!(
+            channel.handle_webhook(payload, &access, &mut process, &mut ()),
+            Err(ChannelError::RateLimited {
+                retry_after: Duration::from_secs(1)
+            })
+        );
+        assert_eq!(
+            processed.borrow().last().map(String::as_str),
+            Some(expected)
+        );
+    }
+
+    let acknowledged = channel
+        .handle_webhook(payload, &access, &mut process, &mut ())
+        .expect("fourth delivery completes the batch");
+    assert_eq!(acknowledged.ingestion.ignored, 3);
+    assert_eq!(acknowledged.processed, 1);
+    assert_eq!(processed.borrow().as_slice(), ["a", "b", "c", "d"]);
     assert_eq!(
-        first,
-        Err(ChannelError::RateLimited {
-            retry_after: Duration::from_secs(1)
-        })
+        sent.borrow().as_slice(),
+        ["reply-a", "reply-b", "reply-c", "reply-d"]
     );
-    assert_eq!(processed.borrow().as_slice(), ["first"]);
 
-    let second = channel
+    let duplicate = channel
         .handle_webhook(
             payload,
             &access,
-            |message| {
-                processed
-                    .borrow_mut()
-                    .push(message.text.as_deref().expect("text").to_owned());
-                Ok(None)
-            },
+            |_| panic!("an acknowledged message must not be processed again"),
             &mut (),
         )
-        .expect("redelivery completed");
-    assert_eq!(second.ingestion.ignored, 1);
-    assert_eq!(second.processed, 1);
-    assert_eq!(processed.borrow().as_slice(), ["first", "second"]);
+        .expect("completed batch redelivery is acknowledged");
+    assert_eq!(duplicate.ingestion.ignored, 4);
+    assert_eq!(duplicate.processed, 0);
+    assert_eq!(processed.borrow().as_slice(), ["a", "b", "c", "d"]);
+    assert_eq!(
+        sent.borrow().as_slice(),
+        ["reply-a", "reply-b", "reply-c", "reply-d"]
+    );
+}
+
+#[test]
+fn whatsapp_rejects_webhooks_over_the_message_bound_before_queueing() {
+    let WhatsAppHarness { mut channel, .. } = whatsapp_channel(1, VecDeque::new());
+    channel.start(&mut ()).expect("started");
+    let messages = (0..=WHATSAPP_MAX_MESSAGES_PER_WEBHOOK)
+        .map(|index| {
+            format!(
+                r#"{{"from":"15550001","id":"message-{index}","type":"text","text":{{"body":"text"}}}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let payload = format!(
+        r#"{{"entry":[{{"changes":[{{"value":{{"metadata":{{"phone_number_id":"phone-id"}},"messages":[{messages}]}}}}]}}]}}"#
+    );
+
+    assert_eq!(
+        channel.ingest_webhook(payload.as_bytes(), &mut ()),
+        Err(ChannelError::Protocol(ProtocolErrorKind::PayloadTooLarge))
+    );
+    assert_eq!(channel.queued_inbound(), 0);
 }
 
 #[test]

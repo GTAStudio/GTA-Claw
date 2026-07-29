@@ -965,6 +965,7 @@ impl ProductionService {
             Some((
                 whatsapp.route,
                 LegacyWhatsAppServices {
+                    phone_number_id: whatsapp.phone_number_id,
                     messages: Arc::clone(&agent_runtime)
                         as Arc<dyn claw_http_api::LegacyChannelMessagePort>,
                     sender,

@@ -487,6 +487,19 @@ async fn whatsapp_incoming(State(state): State<LegacyState>, request: Request) -
     if message_count > state.inner.config.limits.whatsapp_messages {
         return legacy_error(StatusCode::BAD_REQUEST, "Webhook handling failed");
     }
+    if body
+        .entry
+        .iter()
+        .flat_map(|entry| &entry.changes)
+        .any(|change| {
+            !change.value.messages.is_empty()
+                && change.value.metadata.as_ref().is_none_or(|metadata| {
+                    metadata.phone_number_id != services.phone_number_id.as_str()
+                })
+        })
+    {
+        return legacy_error(StatusCode::BAD_REQUEST, "Webhook handling failed");
+    }
     let cancellation = CancellationToken::new();
     let _cancel_on_drop = CancelOnDrop::new(&cancellation);
     match timeout(
@@ -874,6 +887,12 @@ struct WhatsAppChange {
 
 #[derive(Deserialize, Default)]
 struct WhatsAppValue {
+    metadata: Option<WhatsAppMetadata>,
     #[serde(default)]
     messages: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+struct WhatsAppMetadata {
+    phone_number_id: String,
 }

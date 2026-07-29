@@ -441,7 +441,20 @@ fn legacy_conditional_channel_routes_use_composed_adapters() {
         )],
         Some(wrong_phone_body),
     );
-    assert!(wrong_phone.starts_with("HTTP/1.1 500"), "{wrong_phone}");
+    assert_eq!(
+        wrong_phone.split("\r\n").next(),
+        Some("HTTP/1.1 400 Bad Request"),
+        "{wrong_phone}"
+    );
+    assert_eq!(
+        response_body(&wrong_phone),
+        r#"{"error":"Webhook handling failed"}"#
+    );
+    let health_after_wrong_phone = request(daemon.legacy, "GET", "/health", None, None);
+    assert!(
+        health_after_wrong_phone.contains(r#""sessions":0"#),
+        "wrong-phone webhook must not reach the channel message adapter: {health_after_wrong_phone}"
+    );
 
     daemon.stop();
 }

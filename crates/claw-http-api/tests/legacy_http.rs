@@ -184,10 +184,19 @@ impl LegacyChannelMessagePort for ScriptedMessages {
 struct ScriptedWhatsApp {
     fail: AtomicBool,
     sent: Mutex<Vec<(String, String)>>,
+    signature_calls: AtomicUsize,
+    signature_payloads: Mutex<Vec<Vec<u8>>>,
+    webhook_calls: AtomicUsize,
+    webhook_payloads: Mutex<Vec<Vec<u8>>>,
 }
 
 impl LegacyWhatsAppPort for ScriptedWhatsApp {
     fn verify_webhook_signature(&self, payload: &[u8], signature: &str) -> Result<bool, PortError> {
+        self.signature_calls.fetch_add(1, Ordering::AcqRel);
+        self.signature_payloads
+            .lock()
+            .expect("signature payloads")
+            .push(payload.to_vec());
         Ok(signature == whatsapp_signature(payload))
     }
 
@@ -198,6 +207,11 @@ impl LegacyWhatsAppPort for ScriptedWhatsApp {
         max_reply_bytes: usize,
         cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<(), PortError>> {
+        self.webhook_calls.fetch_add(1, Ordering::AcqRel);
+        self.webhook_payloads
+            .lock()
+            .expect("webhook payloads")
+            .push(payload.clone());
         let fail = self.fail.load(Ordering::Acquire);
         Box::pin(async move {
             if fail {
@@ -419,6 +433,7 @@ impl Fixtures {
             device_flow: Some(self.device.clone()),
             teams: Some(self.teams.clone()),
             whatsapp: Some(LegacyWhatsAppServices {
+                phone_number_id: "fixture-phone".to_owned(),
                 messages: self.messages.clone(),
                 sender: self.whatsapp.clone(),
             }),
@@ -985,6 +1000,113 @@ async fn whatsapp_reload_system_and_exec_match_frozen_shapes() {
 }
 
 #[tokio::test]
+async fn whatsapp_webhook_authenticates_bounded_raw_bytes_before_parse_and_scope() {
+    const BODY_LIMIT: usize = 512;
+
+    let fixtures = Fixtures::new(true);
+    let mut config = LegacyApiConfig::default();
+    config.channels.set_whatsapp(true);
+    config.whatsapp = Some(
+        LegacyWhatsAppConfig::new("/whatsapp/webhook", "fixture-token").expect("valid webhook"),
+    );
+    config.limits.body_bytes = BODY_LIMIT;
+    let server = spawn(config, fixtures.services()).await;
+
+    let mut exact_body = br#"{"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"fixture-phone"},"messages":[{"from":"15551234567","id":"exact","type":"text","text":{"body":"hello"}}]}}]}]}"#.to_vec();
+    assert!(exact_body.len() < BODY_LIMIT);
+    exact_body.resize(BODY_LIMIT, b' ');
+    let exact = signed_whatsapp_bytes(&server, &exact_body).await;
+    assert_eq!(exact.status, 200);
+    assert_eq!(fixtures.whatsapp.signature_calls.load(Ordering::Acquire), 1);
+    {
+        let payloads = fixtures
+            .whatsapp
+            .signature_payloads
+            .lock()
+            .expect("signature payloads");
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].as_slice(), exact_body.as_slice());
+        drop(payloads);
+    }
+    {
+        let payloads = fixtures
+            .whatsapp
+            .webhook_payloads
+            .lock()
+            .expect("webhook payloads");
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].as_slice(), exact_body.as_slice());
+        drop(payloads);
+    }
+
+    let malformed = br#"{"entry":["#;
+    let malformed_response = signed_whatsapp_bytes(&server, malformed).await;
+    assert_eq!(malformed_response.status, 400);
+    assert_eq!(
+        fixtures.whatsapp.signature_calls.load(Ordering::Acquire),
+        2,
+        "a signed malformed body must be authenticated before JSON parsing"
+    );
+    assert_eq!(
+        fixtures.whatsapp.webhook_calls.load(Ordering::Acquire),
+        1,
+        "malformed JSON must not reach the stateful adapter"
+    );
+    assert_eq!(
+        fixtures
+            .whatsapp
+            .signature_payloads
+            .lock()
+            .expect("signature payloads")
+            .last()
+            .map(Vec::as_slice),
+        Some(&malformed[..])
+    );
+
+    for metadata in [Value::Null, json!({"phone_number_id":"other-phone"})] {
+        let payload = serde_json::to_vec(&json!({
+            "entry":[{
+                "changes":[{
+                    "value":{
+                        "metadata":metadata,
+                        "messages":[{
+                            "from":"15551234567",
+                            "id":"cross-phone",
+                            "type":"text",
+                            "text":{"body":"must not process"}
+                        }]
+                    }
+                }]
+            }]
+        }))
+        .expect("serialize scoped webhook");
+        let response = signed_whatsapp_bytes(&server, &payload).await;
+        assert_eq!(response.status, 400);
+        assert_eq!(response.json(), json!({"error":"Webhook handling failed"}));
+    }
+    assert_eq!(
+        fixtures.whatsapp.webhook_calls.load(Ordering::Acquire),
+        1,
+        "missing or mismatched phone metadata must not reach the adapter"
+    );
+
+    let signature_calls = fixtures.whatsapp.signature_calls.load(Ordering::Acquire);
+    let oversized = vec![b'x'; BODY_LIMIT + 1];
+    let oversized_response = signed_whatsapp_bytes(&server, &oversized).await;
+    assert_eq!(oversized_response.status, 413);
+    assert_eq!(oversized_response.header("connection"), Some("close"));
+    assert_eq!(
+        fixtures.whatsapp.signature_calls.load(Ordering::Acquire),
+        signature_calls,
+        "an over-limit body must be rejected before HMAC verification"
+    );
+    assert_eq!(
+        fixtures.messages.received.lock().expect("messages").len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn legacy_facade_exposes_readiness_and_refuses_new_work_while_draining() {
     let fixtures = Fixtures::new(true);
     let serving = ServingStateHandle::serving();
@@ -1194,7 +1316,11 @@ async fn json_request(
 
 async fn signed_whatsapp_request(server: &Server, body: &Value) -> HttpResponse {
     let body = serde_json::to_vec(body).expect("serialize request");
-    let signature = whatsapp_signature(&body);
+    signed_whatsapp_bytes(server, &body).await
+}
+
+async fn signed_whatsapp_bytes(server: &Server, body: &[u8]) -> HttpResponse {
+    let signature = whatsapp_signature(body);
     request(
         server,
         "POST",
@@ -1204,7 +1330,7 @@ async fn signed_whatsapp_request(server: &Server, body: &Value) -> HttpResponse 
             ("Content-Type", "application/json"),
             ("X-Hub-Signature-256", &signature),
         ],
-        &body,
+        body,
     )
     .await
 }

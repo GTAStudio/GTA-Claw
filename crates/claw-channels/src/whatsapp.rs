@@ -25,6 +25,14 @@ pub const WHATSAPP_SEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// `WhatsApp` Graph API version used by the legacy adapter.
 pub const WHATSAPP_GRAPH_API_VERSION: u8 = 20;
 
+/// Largest number of message objects accepted in one webhook payload.
+///
+/// The same bound sizes completion retention so a fully acknowledged batch
+/// remains deduplicated even when the inbound queue is much smaller.
+pub const WHATSAPP_MAX_MESSAGES_PER_WEBHOOK: usize = 1_024;
+
+const WHATSAPP_COMPLETED_ID_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
 /// Borrowed webhook verification query.
 pub struct WhatsAppVerificationQuery<'a> {
     /// `hub.mode`.
@@ -200,12 +208,35 @@ pub trait WhatsAppTransport {
     ///
     /// # Errors
     ///
-    /// Returns typed transport or framing failures. Provider statuses remain in
+    /// Returns a stage-aware failure so resumable webhook delivery advances only
+    /// after transport invocation. Provider statuses remain in
     /// [`ProviderResponse`].
     fn send_text(
         &mut self,
         request: &WhatsAppSendRequest<'_>,
-    ) -> Result<ProviderResponse, ChannelError>;
+    ) -> Result<ProviderResponse, WhatsAppSendError>;
+}
+
+/// Delivery-stage failure from one `WhatsApp` Graph API send.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WhatsAppSendError {
+    /// Cancellation was observed before the transport was invoked.
+    CancelledBeforeSend,
+    /// Request construction failed before transport invocation.
+    FailedBeforeSend(ChannelError),
+    /// The transport was invoked, but delivery cannot be proven either way.
+    AmbiguousAfterSend(ChannelError),
+}
+
+impl WhatsAppSendError {
+    const fn into_channel_error(self) -> ChannelError {
+        match self {
+            Self::CancelledBeforeSend => {
+                ChannelError::Transport(claw_channel_sdk::TransportErrorKind::CancelledBeforeSend)
+            }
+            Self::FailedBeforeSend(error) | Self::AmbiguousAfterSend(error) => error,
+        }
+    }
 }
 
 /// Counters from one parsed `WhatsApp` webhook.
@@ -267,9 +298,9 @@ pub struct WhatsAppChannel<T, C> {
     clock: C,
     lifecycle: ConnectionStateMachine,
     inbound: BoundedQueue<InboundMessage>,
-    delivery_history_capacity: usize,
+    completed_message_capacity: usize,
     pending_reply_capacity: usize,
-    completed_message_ids: VecDeque<String>,
+    completed_messages: VecDeque<CompletedWhatsAppMessage>,
     pending_replies: VecDeque<PendingWhatsAppReply>,
 }
 
@@ -281,8 +312,9 @@ impl<T, C> WhatsAppChannel<T, C> {
     /// Returns [`ChannelError::Configuration`] for invalid account or phone
     /// routing, or when `graph_origin` is not the exact enrolled
     /// `https://graph.facebook.com` origin for this account. `inbound_capacity`
-    /// bounds recent completion IDs. Partial reply checkpoints are capped at
-    /// twice that size so one failed bounded batch cannot starve the next batch.
+    /// bounds queued work. Partial reply checkpoints are capped at twice that
+    /// size, and completion history covers the full inbound queue, those
+    /// checkpoints, and one maximum webhook batch.
     pub fn new(
         account_id: impl Into<String>,
         phone_number_id: impl Into<String>,
@@ -299,6 +331,11 @@ impl<T, C> WhatsAppChannel<T, C> {
             ));
         }
         require_official_origin(&graph_origin, "whatsapp", &account_id, "graph.facebook.com")?;
+        let inbound_message_capacity = inbound_capacity.get();
+        let pending_reply_capacity = inbound_message_capacity.saturating_mul(2);
+        let completed_message_capacity = WHATSAPP_MAX_MESSAGES_PER_WEBHOOK
+            .saturating_add(pending_reply_capacity)
+            .saturating_add(inbound_message_capacity);
         Ok(Self {
             account_id,
             phone_number_id,
@@ -307,9 +344,9 @@ impl<T, C> WhatsAppChannel<T, C> {
             clock,
             lifecycle: ConnectionStateMachine::new(),
             inbound: BoundedQueue::new(inbound_capacity),
-            delivery_history_capacity: inbound_capacity.get(),
-            pending_reply_capacity: inbound_capacity.get().saturating_mul(2),
-            completed_message_ids: VecDeque::new(),
+            completed_message_capacity,
+            pending_reply_capacity,
+            completed_messages: VecDeque::new(),
             pending_replies: VecDeque::new(),
         })
     }
@@ -371,7 +408,7 @@ impl<T, C> WhatsAppChannel<T, C> {
         self.lifecycle
             .apply(LifecycleEvent::ShutdownRequested, &mut ())?;
         self.inbound.clear();
-        self.completed_message_ids.clear();
+        self.completed_messages.clear();
         self.pending_replies.clear();
         diagnostics.record(self.diagnostic(
             DiagnosticLevel::Info,
@@ -497,7 +534,7 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
     /// # Errors
     ///
     /// Returns [`ChannelError::NotConnected`] unless started and typed protocol
-    /// errors for over-large or malformed JSON.
+    /// errors for over-large byte or message counts and malformed JSON.
     pub fn ingest_webhook(
         &mut self,
         payload: &[u8],
@@ -524,6 +561,23 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
             ));
             ChannelError::Protocol(ProtocolErrorKind::MalformedResponse)
         })?;
+        let message_count = body
+            .entry
+            .iter()
+            .flat_map(|entry| &entry.changes)
+            .filter_map(|change| change.value.as_ref())
+            .map(|value| value.messages.len())
+            .sum::<usize>();
+        if message_count > WHATSAPP_MAX_MESSAGES_PER_WEBHOOK {
+            diagnostics.record(self.diagnostic(
+                DiagnosticLevel::Warning,
+                DiagnosticCode::MalformedPayload,
+                None,
+                None,
+                None,
+            ));
+            return Err(ChannelError::Protocol(ProtocolErrorKind::PayloadTooLarge));
+        }
         if body
             .entry
             .iter()
@@ -545,6 +599,7 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
             ));
             return Err(ChannelError::Protocol(ProtocolErrorKind::InvalidField));
         }
+        self.prune_completed_messages();
         let mut stats = WhatsAppWebhookStats::default();
         for entry in body.entry {
             for change in entry.changes {
@@ -553,10 +608,7 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
                 };
                 for message in value.messages {
                     stats.messages += 1;
-                    if self
-                        .completed_message_ids
-                        .iter()
-                        .any(|message_id| message_id == message.id)
+                    if self.refresh_completed_message(message.id)
                         || self.inbound.iter().any(|queued| queued.id == message.id)
                         || self
                             .pending_replies
@@ -740,18 +792,11 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
                             text: chunk.as_ref(),
                         }) {
                             Ok(response) => response,
-                            Err(error) => {
-                                if matches!(
-                                    error,
-                                    ChannelError::Transport(
-                                        claw_channel_sdk::TransportErrorKind::Timeout
-                                            | claw_channel_sdk::TransportErrorKind::Io
-                                    ) | ChannelError::Protocol(_)
-                                ) {
-                                    pending.next_chunk = index + 1;
-                                }
+                            Err(WhatsAppSendError::AmbiguousAfterSend(error)) => {
+                                pending.next_chunk = index + 1;
                                 return Err(error);
                             }
+                            Err(error) => return Err(error.into_channel_error()),
                         };
                         classify_response(&response)?;
                         pending.next_chunk = index + 1;
@@ -765,10 +810,41 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
     }
 
     fn remember_completed(&mut self, message_id: String) {
-        if self.completed_message_ids.len() == self.delivery_history_capacity {
-            self.completed_message_ids.pop_front();
+        self.prune_completed_messages();
+        while self.completed_messages.len() >= self.completed_message_capacity {
+            self.completed_messages.pop_front();
         }
-        self.completed_message_ids.push_back(message_id);
+        self.completed_messages.push_back(CompletedWhatsAppMessage {
+            message_id,
+            completed_at_unix_ms: self.clock.now_unix_ms(),
+        });
+    }
+
+    fn refresh_completed_message(&mut self, message_id: &str) -> bool {
+        let Some(index) = self
+            .completed_messages
+            .iter()
+            .position(|completed| completed.message_id == message_id)
+        else {
+            return false;
+        };
+        let Some(mut completed) = self.completed_messages.remove(index) else {
+            return false;
+        };
+        // Keep IDs in this acknowledgment behind older history while the
+        // bounded inbound queue and pending replies drain.
+        completed.completed_at_unix_ms = self.clock.now_unix_ms();
+        self.completed_messages.push_back(completed);
+        true
+    }
+
+    fn prune_completed_messages(&mut self) {
+        let now = self.clock.now_unix_ms();
+        while self.completed_messages.front().is_some_and(|completed| {
+            now.saturating_sub(completed.completed_at_unix_ms) >= WHATSAPP_COMPLETED_ID_TTL_MS
+        }) {
+            self.completed_messages.pop_front();
+        }
     }
 
     fn send_text_to(
@@ -788,12 +864,15 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
                 |access_token| -> Result<(), ChannelError> {
                     for chunk in segments {
                         let chunk = chunk?;
-                        let response = self.transport.send_text(&WhatsAppSendRequest {
-                            access_token,
-                            phone_number_id: &self.phone_number_id,
-                            to,
-                            text: chunk.as_ref(),
-                        })?;
+                        let response = self
+                            .transport
+                            .send_text(&WhatsAppSendRequest {
+                                access_token,
+                                phone_number_id: &self.phone_number_id,
+                                to,
+                                text: chunk.as_ref(),
+                            })
+                            .map_err(WhatsAppSendError::into_channel_error)?;
                         classify_response(&response)?;
                         response.require_bounded()?;
                         if !response.body().is_empty() {
@@ -931,6 +1010,11 @@ struct PendingWhatsAppReply {
     next_chunk: usize,
 }
 
+struct CompletedWhatsAppMessage {
+    message_id: String,
+    completed_at_unix_ms: u64,
+}
+
 fn classify_response(response: &ProviderResponse) -> Result<(), ChannelError> {
     match response.status() {
         200..=299 => Ok(()),
@@ -980,4 +1064,192 @@ const fn decode_hex(byte: u8) -> Option<u8> {
 
 const fn map_credential_binding(error: CredentialBindingError) -> ChannelError {
     ChannelError::CredentialBinding(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use claw_channel_sdk::{
+        CredentialBinding, CredentialRequest, NetworkOrigin, OriginTrustError, OriginTrustStore,
+        authorize_origin,
+    };
+
+    use super::*;
+
+    const ACCOUNT: &str = "account";
+
+    struct AllowTrust;
+
+    impl OriginTrustStore for AllowTrust {
+        fn is_enrolled(
+            &self,
+            _channel_id: &str,
+            _account_id: &str,
+            _origin: &NetworkOrigin,
+        ) -> Result<bool, OriginTrustError> {
+            Ok(true)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FixedClock(u64);
+
+    impl UnixClock for FixedClock {
+        fn now_unix_ms(&self) -> u64 {
+            self.0
+        }
+    }
+
+    struct RecordingTransport {
+        sent: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl WhatsAppTransport for RecordingTransport {
+        fn send_text(
+            &mut self,
+            request: &WhatsAppSendRequest<'_>,
+        ) -> Result<ProviderResponse, WhatsAppSendError> {
+            self.sent.borrow_mut().push(request.text().to_owned());
+            Ok(ProviderResponse::new(200, Vec::new()))
+        }
+    }
+
+    fn approved_origin() -> ApprovedOrigin {
+        let origin =
+            NetworkOrigin::https("graph.facebook.com", None).expect("valid WhatsApp origin");
+        authorize_origin(&AllowTrust, "whatsapp", ACCOUNT, &origin).expect("approved origin")
+    }
+
+    fn credential(origin: ApprovedOrigin) -> ChannelCredential {
+        ChannelCredential::bind(
+            "access-token",
+            CredentialRequest {
+                channel_id: "whatsapp".to_owned(),
+                account_id: ACCOUNT.to_owned(),
+                kind: CredentialKind::Token,
+                binding: CredentialBinding::Origin(origin),
+            },
+        )
+        .expect("bound credential")
+    }
+
+    fn inbound(id: String) -> InboundMessage {
+        InboundMessage {
+            id,
+            channel_id: "whatsapp".to_owned(),
+            account_id: ACCOUNT.to_owned(),
+            conversation_id: "whatsapp:15550001".to_owned(),
+            sender_id: "15550001".to_owned(),
+            text: Some("queued".to_owned()),
+            attachments: Vec::new(),
+            received_at_unix_ms: 1,
+        }
+    }
+
+    #[test]
+    fn current_maximum_batch_survives_near_full_history_and_existing_work() {
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let origin = approved_origin();
+        let access = credential(origin.clone());
+        let mut channel = WhatsAppChannel::new(
+            ACCOUNT,
+            "phone-id",
+            origin,
+            RecordingTransport {
+                sent: Rc::clone(&sent),
+            },
+            FixedClock(10_000),
+            NonZeroUsize::new(3).expect("non-zero capacity"),
+        )
+        .expect("WhatsApp channel");
+        channel.start(&mut ()).expect("started");
+
+        for index in 0..WHATSAPP_MAX_MESSAGES_PER_WEBHOOK {
+            channel
+                .completed_messages
+                .push_back(CompletedWhatsAppMessage {
+                    message_id: format!("payload-{index}"),
+                    completed_at_unix_ms: 10_000,
+                });
+        }
+        for index in 0..channel.pending_reply_capacity {
+            channel
+                .completed_messages
+                .push_back(CompletedWhatsAppMessage {
+                    message_id: format!("old-{index}"),
+                    completed_at_unix_ms: 10_000,
+                });
+        }
+        assert_eq!(
+            channel.completed_messages.len(),
+            channel.completed_message_capacity - 3
+        );
+        assert_eq!(
+            channel.completed_message_capacity,
+            WHATSAPP_MAX_MESSAGES_PER_WEBHOOK + channel.pending_reply_capacity + 3
+        );
+
+        for index in 0..3 {
+            channel
+                .inbound
+                .push(inbound(format!("queued-{index}")))
+                .expect("existing inbound capacity");
+        }
+        for index in 0..3 {
+            channel.pending_replies.push_back(PendingWhatsAppReply {
+                message_id: format!("pending-{index}"),
+                to: "15550001".to_owned(),
+                text: format!("pending reply {index}"),
+                next_chunk: 0,
+            });
+        }
+        assert_eq!(channel.inbound.len(), 3);
+        assert_eq!(channel.pending_replies.len(), 3);
+
+        let messages = (0..WHATSAPP_MAX_MESSAGES_PER_WEBHOOK)
+            .map(|index| {
+                format!(
+                    r#"{{"from":"15550001","id":"payload-{index}","type":"text","text":{{"body":"duplicate"}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let payload = format!(
+            r#"{{"entry":[{{"changes":[{{"value":{{"metadata":{{"phone_number_id":"phone-id"}},"messages":[{messages}]}}}}]}}]}}"#
+        );
+        let processed = Cell::new(0);
+
+        let handled = channel
+            .handle_webhook(
+                payload.as_bytes(),
+                &access,
+                |_| {
+                    processed.set(processed.get() + 1);
+                    Ok(None)
+                },
+                &mut (),
+            )
+            .expect("current payload acknowledged");
+        assert_eq!(handled.ingestion.ignored, WHATSAPP_MAX_MESSAGES_PER_WEBHOOK);
+        assert_eq!(handled.processed, 6);
+        assert_eq!(processed.get(), 3);
+        assert_eq!(sent.borrow().len(), 3);
+
+        let sent_before_replay = sent.borrow().len();
+        let processed_before_replay = processed.get();
+        let replay = channel
+            .handle_webhook(
+                payload.as_bytes(),
+                &access,
+                |_| panic!("the acknowledged maximum batch must remain completed"),
+                &mut (),
+            )
+            .expect("immediate replay acknowledged");
+        assert_eq!(replay.ingestion.ignored, WHATSAPP_MAX_MESSAGES_PER_WEBHOOK);
+        assert_eq!(replay.processed, 0);
+        assert_eq!(processed.get(), processed_before_replay);
+        assert_eq!(sent.borrow().len(), sent_before_replay);
+    }
 }
