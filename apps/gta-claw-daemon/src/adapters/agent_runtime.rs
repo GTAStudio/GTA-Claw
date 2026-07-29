@@ -1159,6 +1159,7 @@ impl AgentRuntime {
         provider: Arc<SwappableProvider>,
         plugin_tools: Arc<PluginToolSurface>,
         state_dir: &std::path::Path,
+        _model: String,
         skill_count: usize,
         max_sessions: usize,
         idle_timeout: Duration,
