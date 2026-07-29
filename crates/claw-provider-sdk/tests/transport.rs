@@ -307,6 +307,42 @@ async fn a_streaming_exchange_treats_duration_max_as_a_far_future_deadline() {
 }
 
 #[tokio::test]
+async fn a_streaming_idle_duration_max_allows_continued_chunk_delivery() {
+    let server = TestServer::start(vec![Reply::sse(&[
+        "data: {\"n\":1}\n\n",
+        "data: {\"n\":2}\n\n",
+        "data: [DONE]\n\n",
+    ])])
+    .await;
+
+    let stream = transport()
+        .send_streaming(
+            "test",
+            Operation::StreamCompletion,
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions"))
+                .stream_idle_timeout(Duration::MAX),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("stream must open");
+
+    let mut chunks = stream.into_chunks();
+    let mut collected = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        collected.push(chunk.expect("chunk must decode").to_vec());
+    }
+
+    assert!(
+        collected.len() >= 2,
+        "each flushed chunk must continue through an extreme idle reset"
+    );
+    assert_eq!(
+        String::from_utf8(collected.concat()).expect("utf-8"),
+        "data: {\"n\":1}\n\ndata: {\"n\":2}\n\ndata: [DONE]\n\n"
+    );
+}
+
+#[tokio::test]
 async fn a_pre_cancelled_streaming_exchange_with_duration_max_is_cancelled() {
     let server = TestServer::start(vec![Reply::sse(&["data: [DONE]\n\n"])]).await;
     let cancel = CancelToken::cancelled_token();
@@ -347,7 +383,8 @@ async fn cancelling_an_in_flight_stream_closes_the_socket() {
         .send_streaming(
             "test",
             Operation::StreamCompletion,
-            HttpRequest::new(Method::Post, server.url("v1/chat/completions")),
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions"))
+                .stream_idle_timeout(Duration::MAX),
             &cancel,
         )
         .await

@@ -899,7 +899,7 @@ async fn collect_bounded(
 ///
 /// Tokio's own [`tokio::time::sleep`] handles an overflowing duration by using
 /// a deadline roughly 30 years in the future. Preserve that non-panicking
-/// behavior while retaining one absolute deadline across exchange phases. The
+/// behavior for absolute request deadlines and rolling stream-idle resets. The
 /// fallback is shortened only when a platform's [`Instant`] range requires it.
 fn deadline_after(timeout: Duration) -> Instant {
     const FAR_FUTURE: Duration = Duration::from_hours(24 * 365 * 30);
@@ -1062,9 +1062,7 @@ impl Stream for CancellableChunks {
                 }
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                     Ok(chunk) => {
-                        this.idle
-                            .as_mut()
-                            .reset(tokio::time::Instant::now() + this.idle_timeout);
+                        this.idle.as_mut().reset(deadline_after(this.idle_timeout));
                         Poll::Ready(Some(Ok(chunk)))
                     }
                     // Trailers carry no body bytes, so keep polling rather than
