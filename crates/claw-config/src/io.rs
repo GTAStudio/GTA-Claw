@@ -54,10 +54,11 @@ pub fn load_file(path: impl AsRef<Path>) -> Result<ConfigSnapshot, ConfigError> 
 /// Atomically writes a validated snapshot in the destination directory.
 ///
 /// The caller must place configuration in a trusted directory that untrusted
-/// processes cannot rename while this operation runs. Every existing path
-/// component and the destination are rejected when they are a Unix symlink or
-/// Windows reparse point, but path-based platform replacement APIs cannot close
-/// every ancestor race without a permanently held directory handle.
+/// processes cannot rename while this operation runs. The configuration directory
+/// and destination are rejected when they are a Unix symlink or Windows reparse
+/// point. Ancestors above the configuration directory are canonicalized before the
+/// resulting chain is validated, but path-based platform replacement APIs cannot
+/// close every ancestor race without a permanently held directory handle.
 ///
 /// Temporary contents are flushed before publication. Unix synchronizes the
 /// containing directory after rename. Windows uses `ReplaceFileW` for an
@@ -70,13 +71,14 @@ pub fn load_file(path: impl AsRef<Path>) -> Result<ConfigSnapshot, ConfigError> 
 ///
 /// Returns [`ConfigError::Serialize`] when `snapshot` cannot be encoded as
 /// JSON5. Otherwise returns [`ConfigError::Io`] carrying `path` when any step of
-/// the atomic write fails: `path` has no file name, an ancestor directory or the
-/// destination itself is a symlink or Windows reparse point, the destination
-/// exists but is not a regular file, the parent cannot be canonicalized, no
-/// unique temporary name could be allocated in 128 attempts, or writing,
-/// flushing, `fsync`-ing, or publishing the temporary file failed. When
-/// publication fails the destination keeps its previous bytes; if removing the
-/// temporary file also fails, its path is appended to the returned message.
+/// the atomic write fails: `path` has no file name, the configuration directory or
+/// destination itself is a symlink or Windows reparse point, the canonical ancestor
+/// chain is unsafe, the destination exists but is not a regular file, the parent
+/// cannot be canonicalized, no unique temporary name could be allocated in 128
+/// attempts, or writing, flushing, `fsync`-ing, or publishing the temporary file
+/// failed. When publication fails the destination keeps its previous bytes; if
+/// removing the temporary file also fails, its path is appended to the returned
+/// message.
 ///
 /// A successful call can still report non-fatal [`WriteWarning`] values in
 /// [`WriteOutcome::warnings`]; those are not errors and the new bytes are
@@ -99,11 +101,11 @@ pub fn write_file(
 /// # Errors
 ///
 /// Returns [`ConfigError::Io`] carrying `path` under exactly the same conditions
-/// as [`write_file`]: a rejected path shape, a symlink or reparse point anywhere
-/// in the ancestor chain or at the destination, a destination that exists but is
-/// not a regular file, exhausted temporary-name attempts, or a failed write,
-/// flush, `fsync`, or publication. The destination is left untouched whenever
-/// this returns an error.
+/// as [`write_file`]: a rejected path shape, a symlink or reparse point at the
+/// configuration directory or destination, an unsafe canonical ancestor chain, a
+/// destination that exists but is not a regular file, exhausted temporary-name
+/// attempts, or a failed write, flush, `fsync`, or publication. The destination is
+/// left untouched whenever this returns an error.
 pub fn write_bytes_atomically(
     path: impl AsRef<Path>,
     contents: &[u8],
