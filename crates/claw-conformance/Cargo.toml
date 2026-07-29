@@ -19,29 +19,10 @@ toml_edit = { version = "=0.25.13", default-features = false, features = ["parse
 url = "=2.5.8"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+claw-windows-file-id.workspace = true
 
-[lints.rust]
-missing_docs = "warn"
-# Windows has no safe std API for the 128-bit FILE_ID_INFO identity. The single
-# audited FFI module in claims.rs is locally expected; unsafe remains denied
-# everywhere else in this crate.
-unsafe_code = "deny"
-unsafe_op_in_unsafe_fn = "deny"
-unreachable_pub = "warn"
-
-[lints.rustdoc]
-broken_intra_doc_links = "deny"
-invalid_html_tags = "warn"
-private_intra_doc_links = "warn"
-unescaped_backticks = "warn"
-
-[lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
-redundant_pub_crate = "allow"
-too_many_lines = "allow"
+[lints]
+workspace = true
 
 [[bin]]
 name = "claw-conformance"

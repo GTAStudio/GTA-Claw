@@ -21,6 +21,8 @@ use cap_std::fs::{
     Dir as CapabilityDir, File as CapabilityFile, Metadata as CapabilityMetadata,
     OpenOptions as CapabilityOpenOptions,
 };
+#[cfg(windows)]
+use claw_windows_file_id::FileId as WindowsFileId;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ConformanceError, ViolationCode};
@@ -1447,10 +1449,7 @@ enum FilesystemIdentity {
     #[cfg(unix)]
     Unix { device: u64, inode: u64 },
     #[cfg(windows)]
-    Windows {
-        volume_serial_number: u64,
-        file_id: [u8; 16],
-    },
+    Windows(WindowsFileId),
 }
 
 #[cfg(unix)]
@@ -1458,55 +1457,6 @@ fn filesystem_identity(metadata: &CapabilityMetadata) -> FilesystemIdentity {
     FilesystemIdentity::Unix {
         device: metadata.dev(),
         inode: metadata.ino(),
-    }
-}
-
-#[cfg(windows)]
-#[expect(
-    unsafe_code,
-    reason = "Windows exposes full 128-bit file identity only through FILE_ID_INFO; this is the \
-              crate's single audited FFI boundary and accepts only already-open handles"
-)]
-mod windows_file_id {
-    use std::io;
-    use std::mem::{self, MaybeUninit};
-    use std::os::windows::io::AsRawHandle;
-
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
-    };
-
-    use super::FilesystemIdentity;
-
-    pub(super) fn from_handle(
-        handle: &(impl AsRawHandle + ?Sized),
-    ) -> io::Result<FilesystemIdentity> {
-        let mut info = MaybeUninit::<FILE_ID_INFO>::uninit();
-        let buffer_size =
-            u32::try_from(mem::size_of::<FILE_ID_INFO>()).expect("FILE_ID_INFO size fits in u32");
-        let raw_handle: HANDLE = handle.as_raw_handle();
-        // SAFETY: `handle` remains borrowed for the call, `info` points to
-        // writable storage of exactly FILE_ID_INFO size, and the initialized
-        // value is read only after the API reports success.
-        let succeeded = unsafe {
-            GetFileInformationByHandleEx(
-                raw_handle,
-                FileIdInfo,
-                info.as_mut_ptr().cast(),
-                buffer_size,
-            )
-        };
-        if succeeded == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: A successful GetFileInformationByHandleEx call initialized
-        // the complete FILE_ID_INFO buffer.
-        let info = unsafe { info.assume_init() };
-        Ok(FilesystemIdentity::Windows {
-            volume_serial_number: info.VolumeSerialNumber,
-            file_id: info.FileId.Identifier,
-        })
     }
 }
 
@@ -1553,7 +1503,9 @@ fn directory_handle_identity(
     #[cfg(windows)]
     {
         let _ = metadata;
-        windows_file_id::from_handle(directory).map(Some)
+        claw_windows_file_id::from_handle(directory)
+            .map(FilesystemIdentity::Windows)
+            .map(Some)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1581,7 +1533,9 @@ fn file_handle_identity(
     #[cfg(windows)]
     {
         let _ = metadata;
-        windows_file_id::from_handle(file).map(Some)
+        claw_windows_file_id::from_handle(file)
+            .map(FilesystemIdentity::Windows)
+            .map(Some)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -4399,14 +4353,8 @@ mod tests {
         second_file_id[15] = 1;
         assert_eq!(&first_file_id[..8], &second_file_id[..8]);
 
-        let first = FilesystemIdentity::Windows {
-            volume_serial_number: 7,
-            file_id: first_file_id,
-        };
-        let second = FilesystemIdentity::Windows {
-            volume_serial_number: 7,
-            file_id: second_file_id,
-        };
+        let first = FilesystemIdentity::Windows(super::WindowsFileId::new(7, first_file_id));
+        let second = FilesystemIdentity::Windows(super::WindowsFileId::new(7, second_file_id));
         assert_ne!(first, second);
         assert_ne!(
             super::ClaimFileKey(super::ClaimFileKeyKind::Identity(first)),

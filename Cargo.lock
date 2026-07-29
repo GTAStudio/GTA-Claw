@@ -360,6 +360,7 @@ version = "0.1.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "claw-windows-file-id",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -367,7 +368,6 @@ dependencies = [
  "toml",
  "toml_edit",
  "url",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -680,6 +680,13 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "claw-windows-file-id"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
