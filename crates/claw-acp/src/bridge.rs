@@ -1,12 +1,12 @@
 //! ACP stdio server bridge backed by GTA-Claw application ports.
 
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::VecDeque, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use serde::Serialize;
 use serde_json::Value;
 use tokio::{
     io::{AsyncRead, AsyncWrite, BufReader},
-    sync::{Semaphore, mpsc},
+    sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc},
     task::JoinSet,
     time::timeout,
 };
@@ -28,6 +28,7 @@ use crate::{
 
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 const MAX_IN_FLIGHT_CANCELLATIONS: usize = 8;
+const MAX_PENDING_CANCELLATIONS: usize = 64;
 const INCOMING_QUEUE_CAPACITY: usize = 64;
 const DISCONNECT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -187,21 +188,30 @@ impl AcpBridge {
                 match read_message(&mut reader, &mut frame).await {
                     Ok(Some(message)) => {
                         if incoming_sender.send(Ok(message)).await.is_err() {
-                            return;
+                            break;
                         }
                     }
-                    Ok(None) => return,
+                    Ok(None) => break,
                     Err(error) => {
                         let _ = incoming_sender.send(Err(error)).await;
-                        return;
+                        break;
                     }
                 }
             }
         });
         let request_slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
         let cancellation_slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT_CANCELLATIONS));
+        let mut pending_cancellations = VecDeque::new();
         let mut tasks = JoinSet::new();
         let terminal_error = loop {
+            if let Err(error) = dispatch_cancellations(
+                &mut pending_cancellations,
+                &cancellation_slots,
+                &mut tasks,
+                &self.backend,
+            ) {
+                break Some(error);
+            }
             let message = tokio::select! {
                 biased;
                 () = peer.disconnected() => break None,
@@ -267,14 +277,23 @@ impl AcpBridge {
                 let Ok(notification) = decode(params) else {
                     continue;
                 };
-                let Ok(permit) = Arc::clone(&cancellation_slots).try_acquire_owned() else {
-                    continue;
-                };
-                let backend = Arc::clone(&self.backend);
-                tasks.spawn(async move {
-                    let _permit = permit;
-                    let _ = backend.cancel(notification).await;
-                });
+                if pending_cancellations.len() >= MAX_PENDING_CANCELLATIONS
+                    && let Err(error) = dispatch_cancellations(
+                        &mut pending_cancellations,
+                        &cancellation_slots,
+                        &mut tasks,
+                        &self.backend,
+                    )
+                {
+                    break Some(error);
+                }
+                if pending_cancellations.len() >= MAX_PENDING_CANCELLATIONS {
+                    break Some(Error::server_error(
+                        -32099,
+                        "Too many queued ACP cancellations",
+                    ));
+                }
+                pending_cancellations.push_back(notification);
             }
         };
         peer.begin_disconnect();
@@ -283,7 +302,25 @@ impl AcpBridge {
         }
         let _ = reader.await;
         if timeout(DISCONNECT_DRAIN_TIMEOUT, async {
-            while tasks.join_next().await.is_some() {}
+            loop {
+                if dispatch_cancellations(
+                    &mut pending_cancellations,
+                    &cancellation_slots,
+                    &mut tasks,
+                    &self.backend,
+                )
+                .is_err()
+                {
+                    break;
+                }
+                if pending_cancellations.is_empty() {
+                    while tasks.join_next().await.is_some() {}
+                    break;
+                }
+                if tasks.join_next().await.is_none() {
+                    break;
+                }
+            }
         })
         .await
         .is_err()
@@ -294,6 +331,42 @@ impl AcpBridge {
         peer.finish_disconnect();
         terminal_error.map_or_else(|| Ok(()), |error| Err(error.into()))
     }
+}
+
+fn dispatch_cancellations(
+    pending: &mut VecDeque<CancelNotification>,
+    slots: &Arc<Semaphore>,
+    tasks: &mut JoinSet<()>,
+    backend: &Arc<dyn AcpBackend>,
+) -> std::result::Result<(), Error> {
+    loop {
+        let Some(notification) = pending.pop_front() else {
+            return Ok(());
+        };
+        match Arc::clone(slots).try_acquire_owned() {
+            Ok(permit) => spawn_cancellation(tasks, Arc::clone(backend), notification, permit),
+            Err(TryAcquireError::NoPermits) => {
+                pending.push_front(notification);
+                return Ok(());
+            }
+            Err(TryAcquireError::Closed) => {
+                pending.push_front(notification);
+                return Err(Error::internal_error().data("ACP cancellation semaphore closed"));
+            }
+        }
+    }
+}
+
+fn spawn_cancellation(
+    tasks: &mut JoinSet<()>,
+    backend: Arc<dyn AcpBackend>,
+    notification: CancelNotification,
+    permit: OwnedSemaphorePermit,
+) {
+    tasks.spawn(async move {
+        let _permit = permit;
+        let _ = backend.cancel(notification).await;
+    });
 }
 
 async fn dispatch_request(
@@ -411,16 +484,28 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::task::{Context, Poll};
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll},
+    };
 
     use tokio::io::{AsyncWriteExt, duplex};
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
 
-    #[derive(Debug)]
-    struct UnusedBackend;
+    #[derive(Clone, Debug)]
+    struct CancellationControl {
+        started: Arc<AtomicUsize>,
+        release: CancellationToken,
+    }
 
-    impl AcpBackend for UnusedBackend {
+    #[derive(Debug, Default)]
+    struct TestBackend {
+        cancellation: Option<CancellationControl>,
+    }
+
+    impl AcpBackend for TestBackend {
         fn new_session(
             &self,
             _request: NewSessionRequest,
@@ -482,7 +567,14 @@ mod tests {
         }
 
         fn cancel(&self, _notification: CancelNotification) -> AcpFuture<'_, ()> {
-            panic!("backend must not receive a cancellation")
+            let Some(control) = self.cancellation.clone() else {
+                panic!("backend must not receive a cancellation")
+            };
+            Box::pin(async move {
+                control.started.fetch_add(1, Ordering::SeqCst);
+                control.release.cancelled().await;
+                Ok(())
+            })
         }
     }
 
@@ -519,7 +611,7 @@ mod tests {
     #[tokio::test]
     async fn writer_failure_terminates_dispatch_while_input_remains_open() {
         let (mut client, input) = duplex(1024);
-        let bridge = AcpBridge::new(Arc::new(UnusedBackend), AgentCapabilities::new());
+        let bridge = AcpBridge::new(Arc::new(TestBackend::default()), AgentCapabilities::new());
         let server = tokio::spawn(bridge.serve(input, BrokenWriter));
         let request = serde_json::to_vec(&serde_json::json!({
             "jsonrpc": "2.0",
@@ -539,5 +631,147 @@ mod tests {
 
         result.expect("writer disconnect is a clean bridge shutdown");
         drop(client);
+    }
+
+    async fn write_cancellations(client: &mut (impl AsyncWrite + Unpin), count: usize) {
+        for index in 0..count {
+            let message = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": format!("fixture-{index}")},
+            }))
+            .expect("serialize cancellation");
+            client
+                .write_all(&message)
+                .await
+                .expect("write cancellation");
+            client.write_all(b"\n").await.expect("frame cancellation");
+        }
+        client.flush().await.expect("flush cancellations");
+    }
+
+    async fn wait_for_cancellations(started: &AtomicUsize, expected: usize) {
+        timeout(Duration::from_secs(1), async {
+            while started.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("expected {expected} cancellation calls"));
+    }
+
+    #[tokio::test]
+    async fn saturated_cancellations_wait_for_a_permit_instead_of_disappearing() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = CancellationToken::new();
+        let backend = TestBackend {
+            cancellation: Some(CancellationControl {
+                started: Arc::clone(&started),
+                release: release.clone(),
+            }),
+        };
+        let (mut client, input) = duplex(4096);
+        let bridge = AcpBridge::new(Arc::new(backend), AgentCapabilities::new());
+        let server = tokio::spawn(bridge.serve(input, tokio::io::sink()));
+
+        write_cancellations(&mut client, MAX_IN_FLIGHT_CANCELLATIONS + 1).await;
+        wait_for_cancellations(&started, MAX_IN_FLIGHT_CANCELLATIONS).await;
+        assert_eq!(started.load(Ordering::SeqCst), MAX_IN_FLIGHT_CANCELLATIONS);
+
+        release.cancel();
+        wait_for_cancellations(&started, MAX_IN_FLIGHT_CANCELLATIONS + 1).await;
+        drop(client);
+
+        timeout(Duration::from_secs(1), server)
+            .await
+            .expect("bridge must stop after every cancellation is delivered")
+            .expect("bridge task must not panic")
+            .expect("clean input close");
+    }
+
+    #[tokio::test]
+    async fn saturated_cancellation_backpressure_has_a_bounded_eof_shutdown() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let backend = TestBackend {
+            cancellation: Some(CancellationControl {
+                started: Arc::clone(&started),
+                release: CancellationToken::new(),
+            }),
+        };
+        let (mut client, input) = duplex(4096);
+        let bridge = AcpBridge::new(Arc::new(backend), AgentCapabilities::new());
+        let server = tokio::spawn(bridge.serve(input, tokio::io::sink()));
+
+        write_cancellations(
+            &mut client,
+            MAX_IN_FLIGHT_CANCELLATIONS + MAX_PENDING_CANCELLATIONS,
+        )
+        .await;
+        wait_for_cancellations(&started, MAX_IN_FLIGHT_CANCELLATIONS).await;
+        drop(client);
+
+        timeout(3 * DISCONNECT_DRAIN_TIMEOUT, server)
+            .await
+            .expect("EOF must stop a cancellation-saturated bridge")
+            .expect("bridge task must not panic")
+            .expect("forced cancellation drain is a clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn cancellation_queue_overflow_fails_the_connection_explicitly() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let backend = TestBackend {
+            cancellation: Some(CancellationControl {
+                started: Arc::clone(&started),
+                release: CancellationToken::new(),
+            }),
+        };
+        let (mut client, input) = duplex(64 * 1024);
+        let bridge = AcpBridge::new(Arc::new(backend), AgentCapabilities::new());
+        let server = tokio::spawn(bridge.serve(input, tokio::io::sink()));
+
+        write_cancellations(
+            &mut client,
+            MAX_IN_FLIGHT_CANCELLATIONS + MAX_PENDING_CANCELLATIONS + 1,
+        )
+        .await;
+
+        let result = timeout(3 * DISCONNECT_DRAIN_TIMEOUT, server)
+            .await
+            .expect("overflow must terminate the bridge")
+            .expect("bridge task must not panic");
+        assert!(
+            result.is_err(),
+            "overflow must not silently discard a cancel"
+        );
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn cancellation_saturation_preserves_a_following_framing_error() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let backend = TestBackend {
+            cancellation: Some(CancellationControl {
+                started: Arc::clone(&started),
+                release: CancellationToken::new(),
+            }),
+        };
+        let (mut client, input) = duplex(4096);
+        let bridge = AcpBridge::new(Arc::new(backend), AgentCapabilities::new());
+        let server = tokio::spawn(bridge.serve(input, tokio::io::sink()));
+
+        write_cancellations(&mut client, MAX_IN_FLIGHT_CANCELLATIONS + 1).await;
+        client
+            .write_all(b"{not-json}\n")
+            .await
+            .expect("write malformed frame");
+        client.flush().await.expect("flush malformed frame");
+        drop(client);
+
+        let result = timeout(3 * DISCONNECT_DRAIN_TIMEOUT, server)
+            .await
+            .expect("framing error must terminate the bridge")
+            .expect("bridge task must not panic");
+        assert!(result.is_err(), "framing error must survive saturation");
     }
 }

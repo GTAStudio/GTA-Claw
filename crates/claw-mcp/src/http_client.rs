@@ -11,7 +11,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures_util::{StreamExt, stream::BoxStream};
+use futures_util::{Stream, StreamExt, stream::BoxStream};
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri,
     header::{
@@ -50,6 +50,9 @@ use zeroize::Zeroize;
 use crate::is_literal_loopback_host;
 
 const DEFAULT_BODY_LIMIT: usize = 8 * 1024 * 1024;
+const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
+const MAX_SSE_EVENT_BYTES: usize = DEFAULT_BODY_LIMIT;
+const MAX_SSE_STREAM_BYTES: usize = 64 * 1024 * 1024;
 const EVENT_STREAM_MIME_TYPE: &str = "text/event-stream";
 const JSON_MIME_TYPE: &str = "application/json";
 const HEADER_SESSION_ID: &str = "mcp-session-id";
@@ -194,6 +197,181 @@ pub(crate) struct HttpResponse {
     deadline: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SseBounds {
+    line: usize,
+    event: usize,
+    stream: usize,
+}
+
+impl Default for SseBounds {
+    fn default() -> Self {
+        Self {
+            line: MAX_SSE_LINE_BYTES,
+            event: MAX_SSE_EVENT_BYTES,
+            stream: MAX_SSE_STREAM_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+enum SseLimitError {
+    #[error("SSE line exceeded {limit} bytes")]
+    Line { limit: usize },
+    #[error("SSE event exceeded {limit} bytes")]
+    Event { limit: usize },
+    #[error("SSE stream exceeded {limit} bytes")]
+    Stream { limit: usize },
+}
+
+#[derive(Debug)]
+struct SseBudget {
+    bounds: SseBounds,
+    line_bytes: usize,
+    event_bytes: usize,
+    stream_bytes: usize,
+    skip_lf_after_cr: bool,
+}
+
+impl SseBudget {
+    const fn new(bounds: SseBounds) -> Self {
+        Self {
+            bounds,
+            line_bytes: 0,
+            event_bytes: 0,
+            stream_bytes: 0,
+            skip_lf_after_cr: false,
+        }
+    }
+
+    fn observe(&mut self, chunk: &[u8]) -> Result<(), SseLimitError> {
+        if chunk.len() > self.bounds.stream.saturating_sub(self.stream_bytes) {
+            return Err(SseLimitError::Stream {
+                limit: self.bounds.stream,
+            });
+        }
+        self.stream_bytes += chunk.len();
+
+        for &byte in chunk {
+            if self.skip_lf_after_cr {
+                self.skip_lf_after_cr = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+
+            self.event_bytes += 1;
+            if self.event_bytes > self.bounds.event {
+                return Err(SseLimitError::Event {
+                    limit: self.bounds.event,
+                });
+            }
+
+            match byte {
+                b'\r' => {
+                    self.finish_line();
+                    self.skip_lf_after_cr = true;
+                }
+                b'\n' => self.finish_line(),
+                _ => {
+                    self.line_bytes += 1;
+                    if self.line_bytes > self.bounds.line {
+                        return Err(SseLimitError::Line {
+                            limit: self.bounds.line,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    const fn finish_line(&mut self) {
+        let event_finished = self.line_bytes == 0;
+        self.line_bytes = 0;
+        if event_finished {
+            self.event_bytes = 0;
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+enum BoundedSseStreamError<E>
+where
+    E: StdError + Send + Sync + 'static,
+{
+    #[error("SSE response body failed: {0}")]
+    Body(#[source] E),
+    #[error(transparent)]
+    Limit(#[from] SseLimitError),
+}
+
+struct BoundedSseBytesStream<E> {
+    inner: BoxStream<'static, Result<Bytes, E>>,
+    budget: SseBudget,
+    done: bool,
+}
+
+impl<E> BoundedSseBytesStream<E>
+where
+    E: StdError + Send + Sync + 'static,
+{
+    fn new(
+        stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+        bounds: SseBounds,
+    ) -> Self {
+        Self {
+            inner: stream.boxed(),
+            budget: SseBudget::new(bounds),
+            done: false,
+        }
+    }
+}
+
+impl<E> Unpin for BoundedSseBytesStream<E> {}
+
+impl<E> Stream for BoundedSseBytesStream<E>
+where
+    E: StdError + Send + Sync + 'static,
+{
+    type Item = Result<Bytes, BoundedSseStreamError<E>>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
+        match this.inner.as_mut().poll_next(context) {
+            Poll::Ready(Some(Ok(chunk))) => match this.budget.observe(&chunk) {
+                Ok(()) => Poll::Ready(Some(Ok(chunk))),
+                Err(error) => {
+                    this.done = true;
+                    Poll::Ready(Some(Err(error.into())))
+                }
+            },
+            Poll::Ready(Some(Err(error))) => {
+                this.done = true;
+                Poll::Ready(Some(Err(BoundedSseStreamError::Body(error))))
+            }
+            Poll::Ready(None) => {
+                this.done = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn bounded_sse_stream<E>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    bounds: SseBounds,
+) -> BoxStream<'static, Result<Sse, SseError>>
+where
+    E: StdError + Send + Sync + 'static,
+{
+    SseStream::from_bytes_stream(BoundedSseBytesStream::new(stream, bounds)).boxed()
+}
+
 impl HttpResponse {
     pub(crate) async fn bytes(self, limit: usize) -> Result<Vec<u8>, HttpClientError> {
         let mut body = self.body;
@@ -231,7 +409,7 @@ impl HttpResponse {
     }
 
     pub(crate) fn into_sse_stream(self) -> BoxStream<'static, Result<Sse, SseError>> {
-        SseStream::from_bytes_stream(self.body.into_data_stream()).boxed()
+        bounded_sse_stream(self.body.into_data_stream(), SseBounds::default())
     }
 }
 
@@ -600,13 +778,16 @@ impl StreamableHttpClient for HttpClient {
             ));
         }
         let status = response.status;
-        if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) {
+        let content_type = content_type(&response);
+        let is_json = content_type
+            .as_deref()
+            .is_some_and(|value| value.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()));
+        if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) && !is_json {
             return Ok(StreamableHttpPostResponse::Accepted);
         }
         if status == StatusCode::NOT_FOUND && session_was_attached {
             return Err(StreamableHttpError::SessionExpired);
         }
-        let content_type = content_type(&response);
         let content_length = response
             .headers
             .get(CONTENT_LENGTH)
@@ -615,6 +796,7 @@ impl StreamableHttpClient for HttpClient {
         let session_id = response_session_id(&response);
         if status.is_success()
             && content_length == Some(0)
+            && !is_json
             && matches!(
                 message,
                 ClientJsonRpcMessage::Notification(_)
@@ -629,11 +811,7 @@ impl StreamableHttpClient for HttpClient {
                 .bytes(DEFAULT_BODY_LIMIT)
                 .await
                 .map_err(StreamableHttpError::Client)?;
-            if content_type
-                .as_deref()
-                .is_some_and(|value| value.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()))
-                && let Some(message) = parse_json_rpc_error(&body)
-            {
+            if is_json && let Some(message) = parse_json_rpc_error(&body) {
                 return Ok(StreamableHttpPostResponse::Json(message, session_id));
             }
             return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
@@ -656,10 +834,9 @@ impl StreamableHttpClient for HttpClient {
                     .bytes(DEFAULT_BODY_LIMIT)
                     .await
                     .map_err(StreamableHttpError::Client)?;
-                Ok(serde_json::from_slice(&body)
-                    .map_or(StreamableHttpPostResponse::Accepted, |message| {
-                        StreamableHttpPostResponse::Json(message, session_id)
-                    }))
+                let message =
+                    serde_json::from_slice(&body).map_err(StreamableHttpError::Deserialize)?;
+                Ok(StreamableHttpPostResponse::Json(message, session_id))
             }
 
             _ => Err(StreamableHttpError::UnexpectedContentType(content_type)),
@@ -764,6 +941,8 @@ impl StreamableHttpClient for HttpClient {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
+        io,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -771,8 +950,14 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use axum::{Router, extract::State, response::Redirect, routing::get};
+    use axum::{
+        Router,
+        extract::State,
+        response::{IntoResponse, Redirect},
+        routing::{get, post},
+    };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use futures_util::stream;
     use rustls::{
         ServerConfig,
         client::{WebPkiServerVerifier, danger::ServerCertVerifier},
@@ -781,11 +966,181 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
         net::{TcpListener, TcpStream},
-        time::sleep,
+        time::{sleep, timeout},
     };
     use tokio_rustls::TlsAcceptor;
 
     use super::*;
+
+    async fn bounded_stream_error(chunks: &[&'static [u8]], bounds: SseBounds) -> SseError {
+        let chunks = chunks
+            .iter()
+            .map(|chunk| Ok::<_, io::Error>(Bytes::from_static(chunk)))
+            .collect::<Vec<_>>();
+        let input = stream::iter(chunks).chain(stream::pending());
+        let mut events = bounded_sse_stream(input, bounds);
+        timeout(Duration::from_secs(1), async {
+            loop {
+                match events.next().await {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return error,
+                    None => panic!("bounded SSE stream ended before reporting its limit"),
+                }
+            }
+        })
+        .await
+        .expect("SSE limit must fire without waiting for the body to end")
+    }
+
+    #[tokio::test]
+    async fn sse_bounds_reject_unterminated_lines_events_and_streams() {
+        let line = bounded_stream_error(
+            &[b"da", b"ta", b":"],
+            SseBounds {
+                line: 4,
+                event: 32,
+                stream: 64,
+            },
+        )
+        .await;
+        assert!(line.to_string().contains("SSE line exceeded 4 bytes"));
+
+        let event = bounded_stream_error(
+            &[b"data:a\n", b"data:b"],
+            SseBounds {
+                line: 16,
+                event: 10,
+                stream: 64,
+            },
+        )
+        .await;
+        assert!(event.to_string().contains("SSE event exceeded 10 bytes"));
+
+        let aggregate = bounded_stream_error(
+            &[b"data:a\n\n", b"data:b\n\n"],
+            SseBounds {
+                line: 16,
+                event: 16,
+                stream: 12,
+            },
+        )
+        .await;
+        assert!(
+            aggregate
+                .to_string()
+                .contains("SSE stream exceeded 12 bytes")
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_bounds_accept_crlf_events_at_the_exact_limits() {
+        let input = stream::iter([Ok::<_, io::Error>(Bytes::from_static(b"data: ok\r\n\r\n"))]);
+        let mut events = bounded_sse_stream(
+            input,
+            SseBounds {
+                line: 8,
+                event: 10,
+                stream: 12,
+            },
+        );
+
+        let event = events
+            .next()
+            .await
+            .expect("one bounded event")
+            .expect("event at the exact bounds");
+        assert_eq!(event.data.as_deref(), Some("ok"));
+        assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn every_successful_application_json_body_must_decode_as_json_rpc() {
+        async fn malformed_json() -> impl IntoResponse {
+            ([(CONTENT_TYPE, JSON_MIME_TYPE)], "{not-json")
+        }
+
+        async fn empty_json() -> impl IntoResponse {
+            ([(CONTENT_TYPE, JSON_MIME_TYPE)], "")
+        }
+
+        async fn accepted_malformed_json() -> impl IntoResponse {
+            (
+                StatusCode::ACCEPTED,
+                [(CONTENT_TYPE, JSON_MIME_TYPE)],
+                "{not-json",
+            )
+        }
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind malformed JSON fixture");
+        let address = listener.local_addr().expect("malformed JSON address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/malformed", post(malformed_json))
+                    .route("/empty", post(empty_json))
+                    .route("/accepted", post(accepted_malformed_json)),
+            )
+            .await
+        });
+        let client = HttpClient::new(Duration::from_secs(5)).expect("HTTP client");
+        let request: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping"
+        }))
+        .expect("fixture JSON-RPC request");
+
+        let malformed = client
+            .post_message(
+                Arc::from(format!("http://{address}/malformed")),
+                request,
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await;
+        assert!(matches!(
+            malformed,
+            Err(StreamableHttpError::Deserialize(_))
+        ));
+
+        let notification: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .expect("fixture JSON-RPC notification");
+        let empty = client
+            .post_message(
+                Arc::from(format!("http://{address}/empty")),
+                notification,
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await;
+        assert!(matches!(empty, Err(StreamableHttpError::Deserialize(_))));
+
+        let request: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "ping"
+        }))
+        .expect("second fixture JSON-RPC request");
+        let accepted = client
+            .post_message(
+                Arc::from(format!("http://{address}/accepted")),
+                request,
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await;
+        assert!(matches!(accepted, Err(StreamableHttpError::Deserialize(_))));
+        server.abort();
+    }
 
     fn tls_fixture() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
         let certificate = STANDARD

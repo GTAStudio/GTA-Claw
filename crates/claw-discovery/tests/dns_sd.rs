@@ -552,6 +552,83 @@ fn compression_pointer_that_does_not_point_backwards_is_refused() {
     assert_eq!(Message::decode(&cycle), Err(DnsSdError::BadPointer));
 }
 
+fn repeated_maximum_name(answer_count: u16) -> Vec<u8> {
+    let mut wire = Vec::new();
+    wire.extend_from_slice(&0_u16.to_be_bytes());
+    wire.extend_from_slice(&FLAG_RESPONSE.to_be_bytes());
+    wire.extend_from_slice(&1_u16.to_be_bytes());
+    wire.extend_from_slice(&answer_count.to_be_bytes());
+    wire.extend_from_slice(&0_u16.to_be_bytes());
+    wire.extend_from_slice(&0_u16.to_be_bytes());
+
+    for length in [63_usize, 63, 63, 61] {
+        wire.push(u8::try_from(length).expect("fixture label length"));
+        wire.extend(std::iter::repeat_n(b'a', length));
+    }
+    wire.push(0);
+    wire.extend_from_slice(&TYPE_PTR.to_be_bytes());
+    wire.extend_from_slice(&CLASS_IN.to_be_bytes());
+
+    for _ in 0..answer_count {
+        wire.extend_from_slice(&[0xc0, 0x0c]);
+        wire.extend_from_slice(&TYPE_PTR.to_be_bytes());
+        wire.extend_from_slice(&CLASS_IN.to_be_bytes());
+        wire.extend_from_slice(&0_u32.to_be_bytes());
+        wire.extend_from_slice(&2_u16.to_be_bytes());
+        wire.extend_from_slice(&[0xc0, 0x0c]);
+    }
+    wire
+}
+
+fn repeated_many_label_name(answer_count: u16) -> Vec<u8> {
+    let mut wire = Vec::new();
+    wire.extend_from_slice(&0_u16.to_be_bytes());
+    wire.extend_from_slice(&FLAG_RESPONSE.to_be_bytes());
+    wire.extend_from_slice(&1_u16.to_be_bytes());
+    wire.extend_from_slice(&answer_count.to_be_bytes());
+    wire.extend_from_slice(&0_u16.to_be_bytes());
+    wire.extend_from_slice(&0_u16.to_be_bytes());
+
+    for _ in 0..127 {
+        wire.extend_from_slice(&[1, b'a']);
+    }
+    wire.push(0);
+    wire.extend_from_slice(&TYPE_A.to_be_bytes());
+    wire.extend_from_slice(&CLASS_IN.to_be_bytes());
+
+    for _ in 0..answer_count {
+        wire.extend_from_slice(&[0xc0, 0x0c]);
+        wire.extend_from_slice(&TYPE_A.to_be_bytes());
+        wire.extend_from_slice(&CLASS_IN.to_be_bytes());
+        wire.extend_from_slice(&0_u32.to_be_bytes());
+        wire.extend_from_slice(&4_u16.to_be_bytes());
+        wire.extend_from_slice(&[192, 0, 2, 1]);
+    }
+    wire
+}
+
+#[test]
+fn compressed_name_work_is_linear_in_the_wire_message() {
+    let ordinary = repeated_maximum_name(10);
+    Message::decode(&ordinary).expect("valid compressed message within the work budget");
+
+    let amplified = repeated_maximum_name(12);
+    assert!(matches!(
+        Message::decode(&amplified),
+        Err(DnsSdError::DecodeWorkLimit { .. })
+    ));
+
+    let ordinary_many_labels = repeated_many_label_name(2);
+    Message::decode(&ordinary_many_labels)
+        .expect("valid many-label message within the allocation-work budget");
+
+    let allocation_amplified = repeated_many_label_name(4);
+    assert!(matches!(
+        Message::decode(&allocation_amplified),
+        Err(DnsSdError::DecodeWorkLimit { .. })
+    ));
+}
+
 #[test]
 fn truncated_and_overlong_wire_forms_are_refused() {
     let wire = pinned_announcement();

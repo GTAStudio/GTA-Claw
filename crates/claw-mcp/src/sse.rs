@@ -221,7 +221,6 @@ impl LegacySseTransport {
         self,
         mut context: WorkerContext<Self>,
     ) -> Result<(), WorkerQuitReason<LegacySseError>> {
-        let mut post_endpoint = None;
         let mut last_event_id = None;
         let mut pending: VecDeque<WorkerSendRequest<Self>> = VecDeque::new();
         let mut reconnects = 0;
@@ -241,6 +240,7 @@ impl LegacySseTransport {
                         "connecting legacy SSE stream",
                     ))?,
             };
+            let mut post_endpoint = None;
             let mut stream = response.into_sse_stream();
             loop {
                 tokio::select! {

@@ -58,6 +58,16 @@ pub enum DnsSdError {
     /// A compression pointer did not point strictly backwards, or a label
     /// length byte used a reserved high-bit pattern.
     BadPointer,
+    /// One encoded name exceeded the compression-pointer hop ceiling.
+    CompressionPointerLimit {
+        /// Maximum pointer hops accepted for one expanded name.
+        limit: usize,
+    },
+    /// Expanding compressed names exhausted the message-wide decode-work budget.
+    DecodeWorkLimit {
+        /// Maximum units of name-decode work allowed for this message.
+        limit: usize,
+    },
     /// The rdata of the named record type had the wrong shape.
     BadRdata(u16),
     /// A section held more entries, or an rdata more bytes, than the wire
@@ -110,6 +120,18 @@ impl fmt::Display for DnsSdError {
             ),
             Self::BadPointer => {
                 formatter.write_str("DNS name compression pointer did not point strictly backwards")
+            }
+            Self::CompressionPointerLimit { limit } => {
+                write!(
+                    formatter,
+                    "DNS name compression exceeded the {limit}-pointer hop limit"
+                )
+            }
+            Self::DecodeWorkLimit { limit } => {
+                write!(
+                    formatter,
+                    "DNS name expansion exceeded the {limit}-unit message decode budget"
+                )
             }
             Self::BadRdata(record_type) => {
                 write!(formatter, "malformed rdata for record type {record_type}")

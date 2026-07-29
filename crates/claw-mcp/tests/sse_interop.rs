@@ -35,6 +35,7 @@ struct SseFixtureState {
     get_count: Arc<AtomicUsize>,
     authenticated_requests: Arc<AtomicUsize>,
     resumed_with_event_id: Arc<AtomicBool>,
+    stale_posts: Arc<AtomicUsize>,
 }
 
 impl SseFixtureState {
@@ -70,17 +71,27 @@ async fn sse(
         .current
         .lock()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? = Some(sender);
-    let endpoint = stream::once(async { Ok(Event::default().event("endpoint").data("/messages")) });
+    let endpoint = stream::once(async move {
+        if connection > 0 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let path = if connection == 0 {
+            "/messages/first"
+        } else {
+            "/messages/current"
+        };
+        Ok(Event::default().event("endpoint").data(path))
+    });
     let messages = stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|event| (event, receiver))
     });
     Ok(Sse::new(endpoint.chain(messages)))
 }
 
-async fn messages(
-    State(state): State<SseFixtureState>,
+async fn handle_message(
+    state: SseFixtureState,
     headers: HeaderMap,
-    Json(request): Json<Value>,
+    request: Value,
 ) -> Result<StatusCode, StatusCode> {
     state.authenticate(&headers)?;
     let Some(method) = request.get("method").and_then(Value::as_str) else {
@@ -153,6 +164,25 @@ async fn messages(
     Ok(StatusCode::ACCEPTED)
 }
 
+async fn first_messages(
+    State(state): State<SseFixtureState>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    if state.get_count.load(Ordering::SeqCst) >= 2 {
+        state.stale_posts.fetch_add(1, Ordering::SeqCst);
+    }
+    handle_message(state, headers, request).await
+}
+
+async fn current_messages(
+    State(state): State<SseFixtureState>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    handle_message(state, headers, request).await
+}
+
 #[tokio::test]
 async fn legacy_sse_reconnects_with_event_id_and_authenticates_get_and_post() {
     let state = SseFixtureState {
@@ -160,10 +190,12 @@ async fn legacy_sse_reconnects_with_event_id_and_authenticates_get_and_post() {
         get_count: Arc::new(AtomicUsize::new(0)),
         authenticated_requests: Arc::new(AtomicUsize::new(0)),
         resumed_with_event_id: Arc::new(AtomicBool::new(false)),
+        stale_posts: Arc::new(AtomicUsize::new(0)),
     };
     let router = Router::new()
         .route("/sse", get(sse))
-        .route("/messages", post(messages))
+        .route("/messages/first", post(first_messages))
+        .route("/messages/current", post(current_messages))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -203,6 +235,11 @@ async fn legacy_sse_reconnects_with_event_id_and_authenticates_get_and_post() {
     .await
     .expect("legacy SSE must reconnect after established stream closes");
     assert!(state.resumed_with_event_id.load(Ordering::SeqCst));
+    assert_eq!(
+        state.stale_posts.load(Ordering::SeqCst),
+        0,
+        "a reconnected stream must advertise a fresh POST endpoint before sends resume"
+    );
 
     let tools = client.list_tools().await.expect("tools/list must succeed");
     assert_eq!(tools.tools.len(), 1);

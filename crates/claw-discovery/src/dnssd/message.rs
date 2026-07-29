@@ -1,9 +1,9 @@
 //! DNS message encoding and decoding, including RFC 1035 name compression.
 //!
 //! The decoder is the security-relevant half. It refuses a compression pointer
-//! that does not point strictly backwards, which is what makes the pointer walk
-//! provably terminating, and it enforces the 255-byte name ceiling across the
-//! whole expansion rather than per fragment.
+//! that does not point strictly backwards, caps pointer hops and aggregate name
+//! expansion work, and enforces the 255-byte name ceiling across the whole
+//! expansion rather than per fragment.
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -40,6 +40,9 @@ pub const TYPE_ANY: u16 = 255;
 
 const POINTER_MASK: u8 = 0xc0;
 const MAX_POINTER_OFFSET: usize = 0x3fff;
+const MAX_COMPRESSION_POINTER_HOPS: usize = 128;
+const DECODE_WORK_PER_MESSAGE_BYTE: usize = 16;
+const DECODE_WORK_PER_LABEL: usize = 8;
 const MIN_QUESTION_WIRE_BYTES: usize = 5;
 const MIN_RECORD_WIRE_BYTES: usize = 11;
 
@@ -221,9 +224,11 @@ impl Message {
     /// transport ceiling, [`DnsSdError::ImpossibleSectionCounts`] when the
     /// declared entries cannot fit in the body, [`DnsSdError::BadPointer`] for a
     /// compression pointer that does not point strictly backwards,
-    /// [`DnsSdError::NameTooLong`] when an expansion runs past 255 bytes and
-    /// [`DnsSdError::TrailingBytes`] when bytes remain after the declared
-    /// sections.
+    /// [`DnsSdError::CompressionPointerLimit`] or
+    /// [`DnsSdError::DecodeWorkLimit`] when compressed-name expansion exceeds a
+    /// CPU bound, [`DnsSdError::NameTooLong`] when an expansion runs past 255
+    /// bytes and [`DnsSdError::TrailingBytes`] when bytes remain after the
+    /// declared sections.
     pub fn decode(bytes: &[u8]) -> Result<Self, DnsSdError> {
         ensure_message_size(bytes.len())?;
         if bytes.len() < 12 {
@@ -239,9 +244,10 @@ impl Message {
         ];
         validate_declared_counts(counts, bytes.len() - 12)?;
         let mut cursor = 12usize;
+        let mut decode_work = DecodeWork::new(bytes.len());
         let mut questions = Vec::with_capacity(counts[0].min(64));
         for _ in 0..counts[0] {
-            let name = decode_name(bytes, &mut cursor)?;
+            let name = decode_name(bytes, &mut cursor, &mut decode_work)?;
             let query_type = read_u16(bytes, &mut cursor)?;
             let raw_class = read_u16(bytes, &mut cursor)?;
             questions.push(Question {
@@ -251,9 +257,9 @@ impl Message {
                 unicast_response: raw_class & UNICAST_RESPONSE != 0,
             });
         }
-        let answers = decode_records(bytes, &mut cursor, counts[1])?;
-        let authorities = decode_records(bytes, &mut cursor, counts[2])?;
-        let additionals = decode_records(bytes, &mut cursor, counts[3])?;
+        let answers = decode_records(bytes, &mut cursor, counts[1], &mut decode_work)?;
+        let authorities = decode_records(bytes, &mut cursor, counts[2], &mut decode_work)?;
+        let additionals = decode_records(bytes, &mut cursor, counts[3], &mut decode_work)?;
         if cursor != bytes.len() {
             return Err(DnsSdError::TrailingBytes);
         }
@@ -380,10 +386,11 @@ fn decode_records(
     bytes: &[u8],
     cursor: &mut usize,
     count: usize,
+    decode_work: &mut DecodeWork,
 ) -> Result<Vec<ResourceRecord>, DnsSdError> {
     let mut records = Vec::with_capacity(count.min(64));
     for _ in 0..count {
-        let name = decode_name(bytes, cursor)?;
+        let name = decode_name(bytes, cursor, decode_work)?;
         let record_type = read_u16(bytes, cursor)?;
         let raw_class = read_u16(bytes, cursor)?;
         let ttl = read_u32(bytes, cursor)?;
@@ -393,7 +400,7 @@ fn decode_records(
             return Err(DnsSdError::Truncated);
         }
         let rdata = &bytes[*cursor..rdata_end];
-        let data = decode_rdata(bytes, record_type, rdata, *cursor)?;
+        let data = decode_rdata(bytes, record_type, rdata, *cursor, decode_work)?;
         *cursor = rdata_end;
         records.push(ResourceRecord {
             name,
@@ -411,6 +418,7 @@ fn decode_rdata(
     record_type: u16,
     rdata: &[u8],
     rdata_start: usize,
+    decode_work: &mut DecodeWork,
 ) -> Result<RecordData, DnsSdError> {
     match record_type {
         TYPE_A => {
@@ -425,7 +433,7 @@ fn decode_rdata(
         }
         TYPE_PTR => {
             let mut inner = rdata_start;
-            let target = decode_name(message, &mut inner)?;
+            let target = decode_name(message, &mut inner, decode_work)?;
             if inner != rdata_start + rdata.len() {
                 return Err(DnsSdError::BadRdata(TYPE_PTR));
             }
@@ -439,7 +447,7 @@ fn decode_rdata(
             let weight = u16::from_be_bytes([rdata[2], rdata[3]]);
             let port = u16::from_be_bytes([rdata[4], rdata[5]]);
             let mut inner = rdata_start + 6;
-            let target = decode_name(message, &mut inner)?;
+            let target = decode_name(message, &mut inner, decode_work)?;
             if inner != rdata_start + rdata.len() {
                 return Err(DnsSdError::BadRdata(TYPE_SRV));
             }
@@ -458,16 +466,53 @@ fn decode_rdata(
     }
 }
 
-fn decode_name(bytes: &[u8], cursor: &mut usize) -> Result<Name, DnsSdError> {
+#[derive(Clone, Copy, Debug)]
+struct DecodeWork {
+    limit: usize,
+    remaining: usize,
+}
+
+impl DecodeWork {
+    const fn new(message_bytes: usize) -> Self {
+        let limit = message_bytes.saturating_mul(DECODE_WORK_PER_MESSAGE_BYTE);
+        Self {
+            limit,
+            remaining: limit,
+        }
+    }
+
+    fn consume(&mut self, units: usize) -> Result<(), DnsSdError> {
+        self.remaining = self
+            .remaining
+            .checked_sub(units)
+            .ok_or(DnsSdError::DecodeWorkLimit { limit: self.limit })?;
+        Ok(())
+    }
+}
+
+fn decode_name(
+    bytes: &[u8],
+    cursor: &mut usize,
+    decode_work: &mut DecodeWork,
+) -> Result<Name, DnsSdError> {
     let mut labels: Vec<Vec<u8>> = Vec::new();
     let mut position = *cursor;
     let mut followed_pointer = false;
     let mut budget = MAX_NAME_BYTES;
+    let mut pointer_hops = 0usize;
 
     loop {
         let length_byte = *bytes.get(position).ok_or(DnsSdError::Truncated)?;
+        decode_work.consume(1)?;
         if length_byte & POINTER_MASK == POINTER_MASK {
             let second = *bytes.get(position + 1).ok_or(DnsSdError::Truncated)?;
+            decode_work.consume(1)?;
+            pointer_hops += 1;
+            if pointer_hops > MAX_COMPRESSION_POINTER_HOPS {
+                return Err(DnsSdError::CompressionPointerLimit {
+                    limit: MAX_COMPRESSION_POINTER_HOPS,
+                });
+            }
             let target = usize::from(u16::from_be_bytes([length_byte & !POINTER_MASK, second]));
             // A pointer must move strictly backwards. Combined with the 255-byte
             // budget every label consumes, that makes the walk provably
@@ -493,6 +538,7 @@ fn decode_name(bytes: &[u8], cursor: &mut usize) -> Result<Name, DnsSdError> {
             }
             break;
         }
+        decode_work.consume(length + DECODE_WORK_PER_LABEL)?;
         budget = budget
             .checked_sub(length + 1)
             .ok_or(DnsSdError::NameTooLong(MAX_NAME_BYTES + 1))?;
@@ -530,4 +576,39 @@ fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, DnsSdError> {
     ]);
     *cursor = end;
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pointer_chain(hops: usize) -> (Vec<u8>, usize) {
+        let mut bytes = vec![0];
+        let mut target = 0usize;
+        for _ in 0..hops {
+            let position = bytes.len();
+            let pointer = 0xc000 | u16::try_from(target).expect("fixture pointer offset");
+            bytes.extend_from_slice(&pointer.to_be_bytes());
+            target = position;
+        }
+        (bytes, target)
+    }
+
+    #[test]
+    fn compression_pointer_hops_are_bounded_at_the_declared_boundary() {
+        let (accepted, mut cursor) = pointer_chain(MAX_COMPRESSION_POINTER_HOPS);
+        let mut work = DecodeWork::new(accepted.len());
+        let name =
+            decode_name(&accepted, &mut cursor, &mut work).expect("pointer chain at the hop limit");
+        assert!(name.labels().is_empty());
+
+        let (rejected, mut cursor) = pointer_chain(MAX_COMPRESSION_POINTER_HOPS + 1);
+        let mut work = DecodeWork::new(rejected.len());
+        assert_eq!(
+            decode_name(&rejected, &mut cursor, &mut work),
+            Err(DnsSdError::CompressionPointerLimit {
+                limit: MAX_COMPRESSION_POINTER_HOPS,
+            })
+        );
+    }
 }
