@@ -492,13 +492,19 @@ fn cdp_target_discovery_addresses_only_explicitly_shared_tabs() {
     bridge.connect_cdp(client).expect("first CDP client");
 
     assert!(!bridge.is_paired());
-    let unpaired = serve_discovery(
-        &endpoint,
-        &bridge,
-        &discovery_request("GET", "/json/version", Some(TOKEN)),
-    );
-    assert_eq!(unpaired.status, 503);
-    assert_eq!(unpaired.body, json!({ "error": NOT_PAIRED_MESSAGE }));
+    for path in ["/json/version", "/json", "/json/list"] {
+        let unpaired = serve_discovery(
+            &endpoint,
+            &bridge,
+            &discovery_request("GET", path, Some(TOKEN)),
+        );
+        assert_eq!(unpaired.status, 503, "{path}");
+        assert_eq!(
+            unpaired.body,
+            json!({ "error": NOT_PAIRED_MESSAGE }),
+            "{path}"
+        );
+    }
 
     assert_eq!(
         bridge

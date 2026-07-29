@@ -109,11 +109,17 @@ pub fn serve_discovery(
     }
     match request.path.trim_end_matches('/') {
         "/json/version" => version_response(bridge, &request.host),
-        "/json" | "/json/list" => DiscoveryResponse {
-            status: 200,
-            authenticate: false,
-            body: json!(bridge.shared_tabs()),
-        },
+        "/json" | "/json/list" => {
+            if bridge.is_paired() {
+                DiscoveryResponse {
+                    status: 200,
+                    authenticate: false,
+                    body: json!(bridge.shared_tabs()),
+                }
+            } else {
+                not_paired_response()
+            }
+        }
         _ => DiscoveryResponse {
             status: 404,
             authenticate: false,
@@ -124,11 +130,7 @@ pub fn serve_discovery(
 
 fn version_response(bridge: &CdpBridge, authority: &str) -> DiscoveryResponse {
     let Some(identity) = bridge.identity() else {
-        return DiscoveryResponse {
-            status: 503,
-            authenticate: false,
-            body: json!({ "error": NOT_PAIRED_MESSAGE }),
-        };
+        return not_paired_response();
     };
     let version = VersionInfo {
         browser: identity.browser_version,
@@ -140,5 +142,13 @@ fn version_response(bridge: &CdpBridge, authority: &str) -> DiscoveryResponse {
         status: 200,
         authenticate: false,
         body: json!(version),
+    }
+}
+
+fn not_paired_response() -> DiscoveryResponse {
+    DiscoveryResponse {
+        status: 503,
+        authenticate: false,
+        body: json!({ "error": NOT_PAIRED_MESSAGE }),
     }
 }
