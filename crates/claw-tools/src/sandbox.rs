@@ -1812,53 +1812,87 @@ public static class JunctionToggle
         return successes;
     }
 
+    public static int Hold(
+        string path,
+        string target,
+        string activePath,
+        string checkedPath)
+    {
+        using (SafeFileHandle handle = OpenForToggle(path))
+        {
+            if (handle.IsInvalid || !Set(handle, target))
+            {
+                return 0;
+            }
+
+            File.WriteAllText(activePath, "active");
+            while (!File.Exists(checkedPath))
+            {
+                Thread.Sleep(1);
+            }
+            Delete(handle);
+            return 1;
+        }
+    }
+
     private static bool TryToggle(string path, string target)
     {
-        using (SafeFileHandle handle = CreateFile(
+        using (SafeFileHandle handle = OpenForToggle(path))
+        {
+            if (handle.IsInvalid || !Set(handle, target))
+            {
+                return false;
+            }
+
+            Thread.Sleep(1);
+            Delete(handle);
+            return true;
+        }
+    }
+
+    private static SafeFileHandle OpenForToggle(string path)
+    {
+        return CreateFile(
             path,
             GenericWrite,
             FileShareRead | FileShareWrite | FileShareDelete,
             IntPtr.Zero,
             OpenExisting,
             FileFlagOpenReparsePoint | FileFlagBackupSemantics,
+            IntPtr.Zero);
+    }
+
+    private static bool Set(SafeFileHandle handle, string target)
+    {
+        byte[] setData = MountPointData(target);
+        int ignored;
+        return DeviceIoControl(
+            handle,
+            FsctlSetReparsePoint,
+            setData,
+            setData.Length,
+            IntPtr.Zero,
+            0,
+            out ignored,
+            IntPtr.Zero);
+    }
+
+    private static void Delete(SafeFileHandle handle)
+    {
+        byte[] deleteData = new byte[8];
+        Buffer.BlockCopy(BitConverter.GetBytes(IoReparseTagMountPoint), 0, deleteData, 0, 4);
+        int ignored;
+        if (!DeviceIoControl(
+            handle,
+            FsctlDeleteReparsePoint,
+            deleteData,
+            deleteData.Length,
+            IntPtr.Zero,
+            0,
+            out ignored,
             IntPtr.Zero))
         {
-            if (handle.IsInvalid)
-            {
-                return false;
-            }
-
-            byte[] setData = MountPointData(target);
-            int ignored;
-            if (!DeviceIoControl(
-                handle,
-                FsctlSetReparsePoint,
-                setData,
-                setData.Length,
-                IntPtr.Zero,
-                0,
-                out ignored,
-                IntPtr.Zero))
-            {
-                return false;
-            }
-
-            Thread.Sleep(1);
-            byte[] deleteData = new byte[8];
-            Buffer.BlockCopy(BitConverter.GetBytes(IoReparseTagMountPoint), 0, deleteData, 0, 4);
-            if (!DeviceIoControl(
-                handle,
-                FsctlDeleteReparsePoint,
-                deleteData,
-                deleteData.Length,
-                IntPtr.Zero,
-                0,
-                out ignored,
-                IntPtr.Zero))
-            {
-                throw new InvalidOperationException("failed to remove test junction");
-            }
-            return true;
+            throw new InvalidOperationException("failed to remove test junction");
         }
     }
 
@@ -1885,14 +1919,22 @@ public static class JunctionToggle
 }
 '@
 
-[IO.File]::WriteAllText($env:CLAW_TOGGLE_STARTED, "started")
-while (-not [IO.File]::Exists($env:CLAW_TOGGLE_RELEASE)) {
-    Start-Sleep -Milliseconds 1
+if ($env:CLAW_TOGGLE_CHECKED) {
+    $successes = [JunctionToggle]::Hold(
+        $env:CLAW_TOGGLE_PATH,
+        $env:CLAW_TOGGLE_TARGET,
+        $env:CLAW_TOGGLE_STARTED,
+        $env:CLAW_TOGGLE_CHECKED)
+} else {
+    [IO.File]::WriteAllText($env:CLAW_TOGGLE_STARTED, "started")
+    while (-not [IO.File]::Exists($env:CLAW_TOGGLE_RELEASE)) {
+        Start-Sleep -Milliseconds 1
+    }
+    $successes = [JunctionToggle]::Run(
+        $env:CLAW_TOGGLE_PATH,
+        $env:CLAW_TOGGLE_TARGET,
+        1000)
 }
-$successes = [JunctionToggle]::Run(
-    $env:CLAW_TOGGLE_PATH,
-    $env:CLAW_TOGGLE_TARGET,
-    1000)
 [Console]::Out.WriteLine($successes)
 "#;
 
@@ -2005,13 +2047,10 @@ $successes = [JunctionToggle]::Run(
         let root = std::env::temp_dir().join(format!("claw-junction-read-toggle-{nanos}"));
         let parent = root.join("workspace").join("flip");
         let outside = root.join("outside");
-        let started = root.join("attacker-started");
-        let release = root.join("attacker-release");
+        let active = root.join("junction-active");
+        let checked = root.join("junction-checked");
         std::fs::create_dir_all(&parent).expect("create the honest parent");
         std::fs::create_dir_all(&outside).expect("create the outside directory");
-        std::fs::write(parent.join("shared.txt"), b"inside").expect("write the inside file");
-        std::fs::write(outside.join("shared.txt"), vec![b'x'; 4096])
-            .expect("write the outside file");
         std::fs::write(outside.join("outside-only.txt"), b"secret")
             .expect("write the outside-only file");
         let handle = open_directory_no_follow(&parent).expect("pin the honest parent");
@@ -2024,8 +2063,8 @@ $successes = [JunctionToggle]::Run(
                 "-Command",
                 WINDOWS_JUNCTION_TOGGLE_SCRIPT,
             ])
-            .env("CLAW_TOGGLE_STARTED", &started)
-            .env("CLAW_TOGGLE_RELEASE", &release)
+            .env("CLAW_TOGGLE_STARTED", &active)
+            .env("CLAW_TOGGLE_CHECKED", &checked)
             .env("CLAW_TOGGLE_PATH", &parent)
             .env("CLAW_TOGGLE_TARGET", &outside)
             .stdout(Stdio::piped())
@@ -2034,7 +2073,7 @@ $successes = [JunctionToggle]::Run(
             .expect("start the in-place junction attacker");
 
         let startup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while !started.is_file() {
+        while !active.is_file() {
             if attacker.try_wait().expect("poll the attacker").is_some() {
                 let output = attacker
                     .wait_with_output()
@@ -2051,31 +2090,12 @@ $successes = [JunctionToggle]::Run(
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        std::fs::write(&release, []).expect("release the junction attacker");
-        let mut reads = 0_u32;
-        while attacker
-            .try_wait()
-            .expect("poll the junction attacker")
-            .is_none()
-        {
-            reads += 1;
-            let names =
-                list_pinned_names(&handle, &parent, 64).expect("list through the pinned handle");
-            assert_eq!(
-                names,
-                vec!["shared.txt".to_owned()],
-                "listing exposed a name from the junction target"
-            );
-            let (kind, size) = stat_pinned_child(&handle, &parent, "shared.txt")
-                .expect("stat through the pinned handle");
-            assert_eq!(kind, EntryKind::File);
-            assert_eq!(size, 6, "stat exposed the junction target's file size");
-            assert_eq!(
-                stat_pinned_child(&handle, &parent, "outside-only.txt")
-                    .expect_err("outside-only child must not resolve from the pinned handle"),
-                SandboxError::NotFound
-            );
-        }
+        // The attacker writes `active` only after setting the junction and does
+        // not restore it until `checked` exists, so both operations occur while
+        // pathname resolution is actively redirected outside the sandbox.
+        let names = list_pinned_names(&handle, &parent, 64);
+        let outside_stat = stat_pinned_child(&handle, &parent, "outside-only.txt");
+        std::fs::write(&checked, []).expect("allow the junction attacker to restore the directory");
 
         let output = attacker
             .wait_with_output()
@@ -2091,7 +2111,21 @@ $successes = [JunctionToggle]::Run(
             .parse::<u32>()
             .expect("attacker reports its successful toggles");
         assert!(toggles > 0, "the in-place junction race was not exercised");
-        assert!(reads > 0, "no pinned read overlapped the attacker");
+        assert_eq!(
+            names.expect("list through the pinned handle"),
+            Vec::<String>::new(),
+            "listing exposed a name from the active junction target"
+        );
+        assert_eq!(
+            outside_stat.expect_err("outside-only child must not resolve from the pinned handle"),
+            SandboxError::NotFound
+        );
+        let restored = std::fs::symlink_metadata(&parent).expect("stat the restored directory");
+        assert!(restored.is_dir(), "the toggled path was not restored");
+        assert!(
+            !is_link_like(&restored),
+            "the toggled path remained a reparse point"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
