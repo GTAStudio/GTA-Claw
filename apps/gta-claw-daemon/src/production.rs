@@ -1968,9 +1968,7 @@ fn legacy_settings(snapshot: &ConfigSnapshot) -> Result<LegacySettings, Producti
             })?;
         let app_secret_reference = get(&["core", "channels", "whatsapp", "app_secret"])
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ProductionError::message("legacy-config", "WhatsApp app secret is missing")
-            })?;
+            .unwrap_or("env:WHATSAPP_APP_SECRET");
         let verify_reference = SecretRef::parse(verify_reference)
             .map_err(|error| ProductionError::message("legacy-config", error))?;
         let access_reference = SecretRef::parse(access_reference)
