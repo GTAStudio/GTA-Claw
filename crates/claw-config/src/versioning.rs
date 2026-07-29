@@ -583,6 +583,9 @@ mod tests {
         let path = directory.join("config.json5");
         let concurrent = VERSION_ZERO.replace("schema_version: 0", "schema_version: 99");
         std::fs::write(&path, VERSION_ZERO.as_bytes()).expect("write source");
+        // Reported paths are the canonical ones the migration actually operated
+        // on, which differ from the path handed in whenever a prefix is a link.
+        let canonical = std::fs::canonicalize(&path).expect("canonicalize destination");
 
         let error = migrate_config_file_with_precommit(&path, |path| {
             std::fs::write(path, concurrent.as_bytes()).expect("write concurrent bytes");
@@ -594,7 +597,7 @@ mod tests {
                 config_path,
                 backup_path,
             } => {
-                assert_eq!(config_path, path);
+                assert_eq!(config_path, canonical);
                 assert_eq!(
                     std::fs::read(&backup_path).expect("read conflict backup"),
                     concurrent.as_bytes()

@@ -440,13 +440,40 @@ fn prepare_destination(path: &Path) -> io::Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(parent)
     };
-    reject_unsafe_ancestors(&absolute_parent)?;
+    // The directory configuration is kept *in* must be a real directory. Every
+    // object this module creates — the temporary file, the lock sentinel and the
+    // destination itself — is created inside it, so a link there could be
+    // re-pointed to redirect all three at once.
+    //
+    // Components *above* it are a different matter: they are platform layout the
+    // caller did not choose. macOS reaches its per-user temporary directory
+    // through `/var`, which is a link to `private/var`, and `/tmp` is a link on
+    // most installs. Refusing those rejected every configuration path under them
+    // outright. They are resolved by canonicalization instead, and the resolved
+    // path is what everything below is validated and operated against.
+    let parent_metadata = fs::symlink_metadata(&absolute_parent)?;
+    if is_link_or_reparse(&parent_metadata) {
+        return Err(unsafe_path(
+            "destination parent chain must not contain symlinks or reparse points",
+        ));
+    }
     let canonical_parent = fs::canonicalize(&absolute_parent)?;
+
+    // `canonicalize` resolved every link, so the canonical path cannot contain
+    // one — unless a component was substituted in the meantime. The walk below
+    // is that check, and the identity recorded here is re-read afterwards so a
+    // directory swapped *during* the walk is caught rather than followed.
+    let pinned = atomicfs::identity_of_path(&canonical_parent)?;
     reject_unsafe_ancestors(&canonical_parent)?;
 
     let metadata = fs::symlink_metadata(&canonical_parent)?;
     if !metadata.is_dir() {
         return Err(unsafe_path("destination parent is not a directory"));
+    }
+    if atomicfs::identity_of_path(&canonical_parent)? != pinned {
+        return Err(unsafe_path(
+            "destination parent identity changed during validation",
+        ));
     }
 
     let destination = canonical_parent.join(file_name);
@@ -964,6 +991,135 @@ mod tests {
             std::fs::read_to_string(&path).expect("read destination"),
             "external",
             "the external writer's bytes must survive"
+        );
+        drop(cleanup);
+    }
+
+    /// A link somewhere *above* the configuration directory is platform layout,
+    /// not an attack, and must be resolved rather than refused.
+    ///
+    /// macOS reaches its per-user temporary directory through `/var`, a link to
+    /// `private/var`, and `/tmp` is a link on most installs. Refusing those
+    /// rejected every configuration path underneath them. The write still lands
+    /// in the real directory, and the reported path is the resolved one.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_above_the_configuration_directory_is_resolved_and_published_into() {
+        use std::os::unix::fs::symlink;
+
+        use super::WriteWarning;
+
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let real_prefix = directory.join("real-prefix");
+        let linked_prefix = directory.join("linked-prefix");
+        let configuration = real_prefix.join("configuration");
+        std::fs::create_dir_all(&configuration).expect("create configuration directory");
+        symlink(&real_prefix, &linked_prefix).expect("create prefix link");
+
+        // The caller names the directory through the link; only a component
+        // *above* the configuration directory is a link.
+        let through_link = linked_prefix.join("configuration").join("config.json5");
+        let outcome = super::atomic_write_bytes(&through_link, b"published", || Ok(()))
+            .expect("a resolved link above the directory must not be refused");
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .all(|warning| !matches!(warning, WriteWarning::BackupCleanupFailed { .. }))
+        );
+
+        // The bytes landed in the real directory, not somewhere the link could
+        // later be re-pointed to.
+        assert_eq!(
+            std::fs::read_to_string(configuration.join("config.json5")).expect("read published"),
+            "published"
+        );
+        assert!(
+            !std::fs::symlink_metadata(configuration.join("config.json5"))
+                .expect("stat published")
+                .file_type()
+                .is_symlink()
+        );
+        drop(cleanup);
+    }
+
+    /// The configuration directory itself may not be a link, because every
+    /// object this module creates is created inside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_configuration_directory_itself_is_still_refused() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let real_parent = directory.join("real-parent");
+        let linked_parent = directory.join("linked-parent");
+        std::fs::create_dir(&real_parent).expect("create real parent");
+        symlink(&real_parent, &linked_parent).expect("create parent link");
+
+        let error =
+            super::atomic_write_bytes(&linked_parent.join("config.json5"), b"new", || Ok(()))
+                .expect_err("a link at the configuration directory must be refused");
+        assert!(
+            error.to_string().contains("parent chain"),
+            "unexpected refusal: {error}"
+        );
+        assert!(
+            !real_parent.join("config.json5").exists(),
+            "nothing may be written through the refused link"
+        );
+        drop(cleanup);
+    }
+
+    /// A link at the destination is refused, and never followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_destination_is_refused_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let outside = directory.join("outside.json5");
+        let link = directory.join("config.json5");
+        std::fs::write(&outside, "untouched").expect("write outside file");
+        symlink(&outside, &link).expect("create destination link");
+
+        let error = super::atomic_write_bytes(&link, b"new", || Ok(()))
+            .expect_err("a link at the destination must be refused");
+        assert!(
+            error.to_string().contains("must not be a symlink"),
+            "unexpected refusal: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("read outside file"),
+            "untouched",
+            "the link must not have been followed"
+        );
+        drop(cleanup);
+    }
+
+    /// The canonical-path walk is what catches a component substituted after
+    /// canonicalization resolved it, so it must still reject a link it is
+    /// handed directly.
+    #[cfg(unix)]
+    #[test]
+    fn the_canonical_ancestor_walk_still_rejects_a_substituted_component() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let real = directory.join("real");
+        let substituted = directory.join("substituted");
+        std::fs::create_dir_all(real.join("inner")).expect("create real tree");
+        symlink(&real, &substituted).expect("substitute a component with a link");
+
+        super::reject_unsafe_ancestors(&real.join("inner")).expect("a real chain is accepted");
+        let error = super::reject_unsafe_ancestors(&substituted.join("inner"))
+            .expect_err("a substituted component must be refused");
+        assert!(
+            error.to_string().contains("parent chain"),
+            "unexpected refusal: {error}"
         );
         drop(cleanup);
     }
