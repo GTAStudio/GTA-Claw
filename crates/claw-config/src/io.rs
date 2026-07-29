@@ -1,8 +1,9 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::atomicfs::{self, ObjectIdentity};
 use crate::error::ConfigError;
 use crate::{ConfigSnapshot, to_json5};
 
@@ -111,6 +112,46 @@ pub fn write_bytes_atomically(
     atomic_write_bytes(path, contents, || Ok(())).map_err(|error| ConfigError::io(path, error))
 }
 
+/// What the destination must still hold when publication actually happens.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PublicationGuard<'a> {
+    /// Publish whatever is there; no comparison is made.
+    #[default]
+    Unchecked,
+    /// The destination must still hold bytes with exactly this SHA-256 digest.
+    Digest(&'a str),
+}
+
+/// Outcome of a guarded publication.
+#[derive(Debug)]
+pub(crate) enum Publication {
+    /// The new bytes were published.
+    Published(WriteOutcome),
+    /// The destination held something else; it was left exactly as found.
+    Conflict {
+        /// The exact bytes that occupied the destination instead.
+        actual: Vec<u8>,
+    },
+}
+
+/// Flushes a directory's entries to stable storage.
+///
+/// Rename-based publication is only durable once the directory entry itself has
+/// reached stable storage, so subsystems that publish files next to
+/// configuration need the same primitive the atomic writer uses.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Io`] carrying `path` when the directory cannot be
+/// opened or flushed, including when the platform provides no way to flush a
+/// directory at all. The failure is reported rather than swallowed: a caller
+/// that treated it as success would claim a durability guarantee the filesystem
+/// never gave.
+pub fn sync_directory(path: impl AsRef<Path>) -> Result<(), ConfigError> {
+    let path = path.as_ref();
+    atomicfs::sync_directory(path).map_err(|error| ConfigError::io(path, error))
+}
+
 pub(crate) fn atomic_write_bytes(
     path: &Path,
     contents: &[u8],
@@ -126,42 +167,57 @@ pub(crate) fn atomic_write_bytes_locked(
     contents: &[u8],
     precommit: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<WriteOutcome> {
+    match publish_bytes_locked(
+        destination,
+        contents,
+        PublicationGuard::Unchecked,
+        precommit,
+    )? {
+        Publication::Published(outcome) => Ok(outcome),
+        Publication::Conflict { .. } => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "unchecked publication cannot report a conflict",
+        )),
+    }
+}
+
+/// Publishes `contents` over `destination` under a compare-and-swap.
+///
+/// The comparison is bound to the publication rather than performed before it.
+/// The advisory lock only orders writers that agreed to take it: an editor or an
+/// installer that simply writes the file does not, and a digest read before an
+/// unconditional rename cannot see a write that lands in between. Exchanging the
+/// temporary file with the destination moves the previous occupant to the
+/// temporary path in the same atomic step, so the object that is inspected is
+/// exactly the object that was replaced. When it is not what the caller
+/// expected, the exchange is undone and the destination is left byte for byte as
+/// the other writer left it.
+pub(crate) fn publish_bytes_locked(
+    destination: &Path,
+    contents: &[u8],
+    guard: PublicationGuard<'_>,
+    precommit: impl FnOnce() -> io::Result<()>,
+) -> io::Result<Publication> {
     let existing = fs::symlink_metadata(destination).ok();
     let (mut temporary, mut file) = TemporaryArtifact::create(destination, "tmp")?;
 
     let operation = (|| {
         set_permissions(existing.as_ref(), &file)?;
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
         file.write_all(contents)?;
         file.flush()?;
         file.sync_all()?;
         precommit()?;
-        drop(file);
-        let mut warnings = Vec::new();
-        if let Some(warning) =
-            replace_destination(temporary.path(), destination, existing.is_some())?
-        {
-            warnings.push(warning);
-        }
-        temporary.disarm();
+        temporary.verify_identity()?;
         #[cfg(test)]
-        if let Some(warning) = test_failpoint::directory_sync_warning(destination) {
-            warnings.push(warning);
-            return Ok(WriteOutcome { warnings });
-        }
-        if let Err(error) = sync_parent(destination) {
-            warnings.push(WriteWarning::DirectorySyncFailed {
-                path: destination
-                    .parent()
-                    .expect("prepared destination always has a parent")
-                    .to_owned(),
-                message: error.to_string(),
-            });
-        }
-        Ok(WriteOutcome { warnings })
+        test_failpoint::run_external_writer_barrier(destination);
+        drop(file);
+        publish_temporary(&mut temporary, destination, guard)
     })();
 
     match operation {
-        Ok(outcome) => Ok(outcome),
+        Ok(publication) => Ok(publication),
         Err(operation_error) => match temporary.cleanup() {
             Ok(()) => Err(operation_error),
             Err(cleanup_error) => Err(io::Error::new(
@@ -174,6 +230,95 @@ pub(crate) fn atomic_write_bytes_locked(
             )),
         },
     }
+}
+
+fn publish_temporary(
+    temporary: &mut TemporaryArtifact,
+    destination: &Path,
+    guard: PublicationGuard<'_>,
+) -> io::Result<Publication> {
+    let guarded = matches!(guard, PublicationGuard::Digest(_));
+    let mut warnings = Vec::new();
+    // The destination can be created or removed by a non-cooperating writer
+    // between the shape check and the operation chosen for it. Each attempt is
+    // decided by the operation's own atomic outcome, and the loop only re-runs
+    // when the shape genuinely changed underneath it.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        if attempts > 16 {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "destination kept changing shape during publication",
+            ));
+        }
+        let occupied = match fs::symlink_metadata(destination) {
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        if !occupied {
+            // A guarded publication expected specific prior bytes; a destination
+            // that is gone is as much a concurrent change as one that was
+            // rewritten, and the caller decides what to do about it.
+            if guarded {
+                return Ok(Publication::Conflict { actual: Vec::new() });
+            }
+            match atomicfs::rename_no_replace(temporary.path(), destination) {
+                Ok(()) => {
+                    temporary.disarm();
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        match atomicfs::exchange_paths(temporary.path(), destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+        let displaced = match fs::read(temporary.path()) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                atomicfs::exchange_paths(temporary.path(), destination)?;
+                return Err(error);
+            }
+        };
+        if let PublicationGuard::Digest(expected) = guard
+            && crate::versioning::digest_hex(&displaced) != expected
+        {
+            atomicfs::exchange_paths(temporary.path(), destination)?;
+            return Ok(Publication::Conflict { actual: displaced });
+        }
+        // The temporary now holds the old destination bytes; removing it is the
+        // last step, and a failure only leaves a stale copy of the *previous*
+        // contents, which is reported rather than hidden.
+        if let Err(error) = temporary.cleanup() {
+            let path = temporary.path().to_owned();
+            temporary.disarm();
+            warnings.push(WriteWarning::BackupCleanupFailed {
+                path,
+                message: error.to_string(),
+            });
+        }
+        break;
+    }
+    #[cfg(test)]
+    if let Some(warning) = test_failpoint::directory_sync_warning(destination) {
+        warnings.push(warning);
+        return Ok(Publication::Published(WriteOutcome { warnings }));
+    }
+    if let Err(error) = sync_parent(destination) {
+        warnings.push(WriteWarning::DirectorySyncFailed {
+            path: destination
+                .parent()
+                .expect("prepared destination always has a parent")
+                .to_owned(),
+            message: error.to_string(),
+        });
+    }
+    Ok(Publication::Published(WriteOutcome { warnings }))
 }
 
 pub(crate) fn with_destination_lock<T>(
@@ -282,7 +427,7 @@ impl DestinationLock {
     fn acquire(destination: &Path) -> io::Result<Self> {
         let lock_path = Self::path(destination);
         reject_lock_link_or_reparse(&lock_path)?;
-        let file = open_destination_lock_file(&lock_path)?;
+        let file = atomicfs::open_lock_no_follow(&lock_path)?;
         file.lock()?;
         // The OS file lock is advisory; syncing the lock file itself adds latency
         // with no correctness benefit.  The durable backup written during the
@@ -297,42 +442,16 @@ impl DestinationLock {
     }
 }
 
-#[cfg(unix)]
-fn open_destination_lock_file(lock_path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(lock_path)
-}
-
-#[cfg(not(unix))]
-fn open_destination_lock_file(lock_path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)
-}
-
-#[cfg(unix)]
+/// Confirms the sentinel path still names the object the lock is held on.
+///
+/// The comparison is by volume and file identifier on every supported platform.
+/// Trusting the path alone would let another process unlink the sentinel between
+/// the open and the lock and leave a different file — or a link — behind, and
+/// two writers would then each hold a lock on a different object.
 fn lock_file_matches_path(file: &File, lock_path: &Path) -> io::Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-
-    let handle = file.metadata()?;
-    let on_disk = fs::symlink_metadata(lock_path)?;
-    Ok(on_disk.is_file() && handle.dev() == on_disk.dev() && handle.ino() == on_disk.ino())
-}
-
-#[cfg(not(unix))]
-fn lock_file_matches_path(_file: &File, _lock_path: &Path) -> io::Result<bool> {
-    Ok(true)
+    let handle = atomicfs::identity_of_handle(file)?;
+    let on_disk = atomicfs::identity_of_path(lock_path)?;
+    Ok(handle == on_disk)
 }
 
 impl Drop for DestinationLock {
@@ -355,15 +474,78 @@ pub(crate) fn inject_directory_sync_warning_for_tests() -> test_failpoint::Guard
 }
 
 #[cfg(test)]
+pub(crate) fn inject_external_writer_for_tests(
+    destination: &Path,
+    action: impl Fn(&Path) + Send + Sync + 'static,
+) -> test_failpoint::ExternalWriterGuard {
+    test_failpoint::inject_external_writer(destination, action)
+}
+
+#[cfg(test)]
 mod test_failpoint {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     use super::WriteWarning;
 
     static INJECT_DIRECTORY_SYNC_WARNING: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
 
+    type ExternalWriter = Box<dyn Fn(&Path) + Send + Sync>;
+
+    // Keyed by destination so tests running in parallel arm independent
+    // barriers instead of consuming each other's.
+    static EXTERNAL_WRITERS: Mutex<Vec<(PathBuf, ExternalWriter)>> = Mutex::new(Vec::new());
+
     pub(crate) struct Guard;
+
+    /// Held for the duration of a test; clears its own barrier on drop.
+    pub(crate) struct ExternalWriterGuard {
+        destination: PathBuf,
+    }
+
+    /// Arms a one-shot write that lands after every pre-publication check and
+    /// immediately before the atomic exchange.
+    pub(crate) fn inject_external_writer(
+        destination: &Path,
+        action: impl Fn(&Path) + Send + Sync + 'static,
+    ) -> ExternalWriterGuard {
+        EXTERNAL_WRITERS
+            .lock()
+            .expect("lock external writer barrier")
+            .push((destination.to_path_buf(), Box::new(action)));
+        ExternalWriterGuard {
+            destination: destination.to_path_buf(),
+        }
+    }
+
+    pub(super) fn run_external_writer_barrier(destination: &Path) {
+        let armed = {
+            let mut writers = EXTERNAL_WRITERS
+                .lock()
+                .expect("lock external writer barrier");
+            writers
+                .iter()
+                .position(|(path, _)| path == destination)
+                .map(|index| writers.swap_remove(index))
+        };
+        if let Some((_, action)) = armed {
+            action(destination);
+        }
+    }
+
+    impl Drop for ExternalWriterGuard {
+        fn drop(&mut self) {
+            let mut writers = EXTERNAL_WRITERS
+                .lock()
+                .expect("lock external writer barrier");
+            if let Some(index) = writers
+                .iter()
+                .position(|(path, _)| *path == self.destination)
+            {
+                drop(writers.swap_remove(index));
+            }
+        }
+    }
 
     pub(crate) fn inject_directory_sync_warning() -> Guard {
         *INJECT_DIRECTORY_SYNC_WARNING
@@ -414,6 +596,7 @@ fn reject_lock_link_or_reparse(path: &Path) -> io::Result<()> {
 
 struct TemporaryArtifact {
     path: PathBuf,
+    identity: ObjectIdentity,
     armed: bool,
 }
 
@@ -430,9 +613,16 @@ impl TemporaryArtifact {
                 std::process::id()
             );
             let path = destination.with_file_name(name);
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
+            match atomicfs::create_new_no_follow(&path) {
                 Ok(file) => {
-                    return Ok((Self { path, armed: true }, file));
+                    let identity = atomicfs::identity_of_handle(&file)?;
+                    let artifact = Self {
+                        path,
+                        identity,
+                        armed: true,
+                    };
+                    artifact.verify_identity()?;
+                    return Ok((artifact, file));
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error),
@@ -444,26 +634,13 @@ impl TemporaryArtifact {
         ))
     }
 
-    #[cfg(windows)]
-    fn reserve_path(destination: &Path, label: &str) -> io::Result<Self> {
-        for _ in 0..128 {
-            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let name = format!(
-                ".{}.gta-claw.{label}.{}.{sequence}",
-                destination
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("config"),
-                std::process::id()
-            );
-            let path = destination.with_file_name(name);
-            if !path.try_exists()? {
-                return Ok(Self { path, armed: true });
-            }
+    /// Confirms the reservation path still names the object opened at creation.
+    fn verify_identity(&self) -> io::Result<()> {
+        if atomicfs::identity_of_path(&self.path)? == self.identity {
+            return Ok(());
         }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not allocate a unique backup path",
+        Err(unsafe_path(
+            "temporary file identity changed before publication",
         ))
     }
 
@@ -509,171 +686,34 @@ fn set_permissions(existing: Option<&fs::Metadata>, file: &File) -> io::Result<(
     file.set_permissions(fs::Permissions::from_mode(mode))
 }
 
+/// Permission propagation has no counterpart outside Unix.
+///
+/// Windows keeps the destination's own security descriptor across the exchange,
+/// so there is nothing for the temporary file to inherit and nothing that can
+/// fail; the signature matches the Unix one only so the caller stays uniform.
 #[cfg(not(unix))]
+#[expect(
+    clippy::missing_const_for_fn,
+    clippy::unnecessary_wraps,
+    reason = "the signature mirrors the fallible Unix implementation the caller is written against"
+)]
 fn set_permissions(_existing: Option<&fs::Metadata>, _file: &File) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn replace_destination(
-    temporary: &Path,
-    destination: &Path,
-    _exists: bool,
-) -> io::Result<Option<WriteWarning>> {
-    fs::rename(temporary, destination)?;
-    Ok(None)
-}
-
-#[cfg(windows)]
-fn replace_destination(
-    temporary: &Path,
-    destination: &Path,
-    exists: bool,
-) -> io::Result<Option<WriteWarning>> {
-    if !exists {
-        fs::rename(temporary, destination)?;
-        return Ok(None);
-    }
-    windows_replace::replace_with_backup(destination, temporary)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn replace_destination(
-    temporary: &Path,
-    destination: &Path,
-    _exists: bool,
-) -> io::Result<Option<WriteWarning>> {
-    fs::rename(temporary, destination)?;
-    Ok(None)
-}
-
-#[cfg(unix)]
+/// Flushes the directory entry that publication just changed.
+///
+/// The operating-system failure is returned rather than swallowed. A platform
+/// that cannot honour the request has not made the rename durable, and reporting
+/// success would let a caller claim a guarantee the filesystem never gave; the
+/// caller turns the failure into a [`WriteWarning::DirectorySyncFailed`] that
+/// migration and rollback refuse to treat as success.
 fn sync_parent(destination: &Path) -> io::Result<()> {
-    File::open(
+    atomicfs::sync_directory(
         destination
             .parent()
             .expect("prepared destination always has a parent"),
-    )?
-    .sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_parent(_destination: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(windows)]
-#[expect(
-    unsafe_code,
-    reason = "publishing over an existing Windows destination requires ReplaceFileW, which has \
-              no safe std equivalent; the crate denies unsafe everywhere else so this module is \
-              the single audited FFI surface"
-)]
-mod windows_replace {
-    use std::fs;
-    use std::io;
-    use std::os::windows::ffi::OsStrExt;
-    use std::path::Path;
-    use std::ptr;
-
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
-
-    use super::{TemporaryArtifact, WriteWarning};
-
-    /// Publishes `replacement` over an existing `destination` via `ReplaceFileW`.
-    ///
-    /// `ReplaceFileW` keeps the destination's ACLs, attributes, creation time,
-    /// named streams, encryption, and compression, which a plain rename would
-    /// discard. It writes the old destination to a reserved backup path first,
-    /// so a failed replacement can be rolled back to the exact original bytes.
-    ///
-    /// Returns `Ok(Some(_))` when the new bytes were published but the backup
-    /// could not be removed afterwards; the caller surfaces that as a non-fatal
-    /// [`WriteWarning::BackupCleanupFailed`] naming the retained backup.
-    pub(super) fn replace_with_backup(
-        destination: &Path,
-        replacement: &Path,
-    ) -> io::Result<Option<WriteWarning>> {
-        replace_with_backup_and_cleanup(destination, replacement, TemporaryArtifact::cleanup)
-    }
-
-    fn replace_with_backup_and_cleanup(
-        destination: &Path,
-        replacement: &Path,
-        cleanup: impl FnOnce(&mut TemporaryArtifact) -> io::Result<()>,
-    ) -> io::Result<Option<WriteWarning>> {
-        let mut backup = TemporaryArtifact::reserve_path(destination, "backup")?;
-        let destination_wide = wide(destination);
-        let replacement_wide = wide(replacement);
-        let backup_wide = wide(backup.path());
-
-        // SAFETY: All three buffers are valid, NUL-terminated UTF-16 paths for
-        // the duration of the call. Reserved pointers are null as required.
-        let replaced = unsafe {
-            ReplaceFileW(
-                destination_wide.as_ptr(),
-                replacement_wide.as_ptr(),
-                backup_wide.as_ptr(),
-                0,
-                ptr::null_mut(),
-                ptr::null_mut(),
-            )
-        };
-        if replaced != 0 {
-            return match cleanup(&mut backup) {
-                Ok(()) => Ok(None),
-                Err(error) => {
-                    let path = backup.path().to_owned();
-                    backup.disarm();
-                    Ok(Some(WriteWarning::BackupCleanupFailed {
-                        path,
-                        message: error.to_string(),
-                    }))
-                }
-            };
-        }
-
-        let replace_error = io::Error::last_os_error();
-        let replace_error_kind = replace_error.kind();
-        restore_backup(destination, &mut backup).map_err(|restore_error| {
-            io::Error::new(
-                replace_error_kind,
-                format!(
-                    "{replace_error}; additionally failed to restore Windows replacement backup \
-                     {}: {restore_error}",
-                    backup.path().display()
-                ),
-            )
-        })?;
-        Err(replace_error)
-    }
-
-    #[cfg(test)]
-    pub(super) fn replace_with_injected_cleanup_failure(
-        destination: &Path,
-        replacement: &Path,
-    ) -> io::Result<Option<WriteWarning>> {
-        replace_with_backup_and_cleanup(destination, replacement, |_| {
-            Err(io::Error::other("injected backup cleanup failure"))
-        })
-    }
-
-    fn restore_backup(destination: &Path, backup: &mut TemporaryArtifact) -> io::Result<()> {
-        if !backup.path().try_exists()? {
-            backup.disarm();
-            return Ok(());
-        }
-        if destination.try_exists()? {
-            return backup.cleanup();
-        }
-        fs::rename(backup.path(), destination)?;
-        backup.disarm();
-        Ok(())
-    }
-
-    fn wide(path: &Path) -> Vec<u16> {
-        path.as_os_str().encode_wide().chain(Some(0)).collect()
-    }
+    )
 }
 
 #[cfg(test)]
@@ -727,39 +767,76 @@ mod tests {
         drop(cleanup);
     }
 
-    #[cfg(windows)]
+    /// A writer that lands after every pre-publication check and immediately
+    /// before the atomic exchange must not have its bytes destroyed.
+    ///
+    /// The advisory lock only orders writers that take it. This barrier stands
+    /// in for the ones that do not — a text editor saving the file, an installer
+    /// dropping a new copy — and lands in the exact window an unconditional
+    /// rename cannot see.
     #[test]
-    fn postcommit_backup_cleanup_failure_returns_warning_with_new_bytes_published() {
-        use super::{WriteWarning, windows_replace};
+    fn an_external_write_immediately_before_publication_is_preserved() {
+        use super::{Publication, PublicationGuard, publish_bytes_locked, with_destination_lock};
 
         let directory = temporary_directory();
         let cleanup = Cleanup(directory.clone());
-        let destination = directory.join("config.json5");
-        let replacement = directory.join("replacement.json5");
-        std::fs::write(&destination, "old").expect("write destination");
-        std::fs::write(&replacement, "new").expect("write replacement");
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&replacement)
-            .expect("open replacement")
-            .sync_all()
-            .expect("sync replacement");
+        let path = directory.join("config.json5");
+        std::fs::write(&path, "old").expect("write old file");
+        let expected = super::super::versioning::digest_hex(b"old");
+        let destination = std::fs::canonicalize(&path).expect("canonicalize destination");
 
-        let warning =
-            windows_replace::replace_with_injected_cleanup_failure(&destination, &replacement)
-                .expect("replacement succeeds")
-                .expect("cleanup warning");
+        let _barrier = super::inject_external_writer_for_tests(&destination, |destination| {
+            let staging = destination.with_file_name(".external-writer");
+            std::fs::write(&staging, "external").expect("stage external bytes");
+            std::fs::rename(&staging, destination).expect("publish external bytes");
+        });
+        let publication = with_destination_lock(&path, |locked| {
+            publish_bytes_locked(locked, b"new", PublicationGuard::Digest(&expected), || {
+                Ok(())
+            })
+        })
+        .expect("publication must not fail outright");
 
-        assert_eq!(
-            std::fs::read_to_string(&destination).expect("read destination"),
-            "new"
-        );
-        let WriteWarning::BackupCleanupFailed { path, message } = warning else {
-            panic!("unexpected warning: {warning:?}");
+        let Publication::Conflict { actual } = publication else {
+            panic!("publication must report a conflict, not overwrite foreign bytes");
         };
-        assert!(message.contains("injected backup cleanup failure"));
-        assert_eq!(std::fs::read_to_string(&path).expect("read backup"), "old");
-        std::fs::remove_file(path).expect("remove retained backup");
+        assert_eq!(actual, b"external");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read destination"),
+            "external",
+            "the external writer's bytes must survive"
+        );
+        drop(cleanup);
+    }
+
+    /// A destination removed in the same window is a concurrent change too, and
+    /// a guarded publication must not recreate the file it no longer describes.
+    #[test]
+    fn a_destination_removed_immediately_before_publication_is_not_recreated() {
+        use super::{Publication, PublicationGuard, publish_bytes_locked, with_destination_lock};
+
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let path = directory.join("config.json5");
+        std::fs::write(&path, "old").expect("write old file");
+        let expected = super::super::versioning::digest_hex(b"old");
+        let destination = std::fs::canonicalize(&path).expect("canonicalize destination");
+
+        let _barrier = super::inject_external_writer_for_tests(&destination, |destination| {
+            std::fs::remove_file(destination).expect("remove destination");
+        });
+        let publication = with_destination_lock(&path, |locked| {
+            publish_bytes_locked(locked, b"new", PublicationGuard::Digest(&expected), || {
+                Ok(())
+            })
+        })
+        .expect("publication must not fail outright");
+
+        assert!(
+            matches!(publication, Publication::Conflict { ref actual } if actual.is_empty()),
+            "removal must be reported as a conflict, got {publication:?}"
+        );
+        assert!(!path.exists(), "the destination must stay removed");
         drop(cleanup);
     }
 

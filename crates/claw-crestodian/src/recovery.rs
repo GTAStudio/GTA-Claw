@@ -522,14 +522,11 @@ fn action(backup: Option<PathBuf>) -> RecoveryAction {
     })
 }
 
-#[cfg(unix)]
+/// Flushes a directory entry through the same primitive the atomic writer uses.
+///
+/// The operating-system failure is reported rather than swallowed, on every
+/// platform. A rescue that could not make its directory entry durable has not
+/// finished, and saying otherwise would be a claim the filesystem never made.
 fn sync_directory(path: &Path) -> Result<(), CrestodianError> {
-    fs::File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| CrestodianError::io(path, source))
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), CrestodianError> {
-    Ok(())
+    claw_config::sync_directory(path).map_err(CrestodianError::Config)
 }

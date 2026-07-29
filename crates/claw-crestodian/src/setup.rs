@@ -335,7 +335,7 @@ fn restore_path(path: &Path, original: Option<&[u8]>) -> Result<(), String> {
     let Some(bytes) = original else {
         return match remove_path_with_parent_sync(path) {
             Ok(()) => Ok(()),
-            Err(error)
+            Err(RemovalFailure::Remove(error))
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
@@ -343,7 +343,8 @@ fn restore_path(path: &Path, original: Option<&[u8]>) -> Result<(), String> {
             {
                 Ok(())
             }
-            Err(error) => Err(error.to_string()),
+            Err(RemovalFailure::Remove(error)) => Err(error.to_string()),
+            Err(RemovalFailure::Sync(error)) => Err(format!("restore durability warning: {error}")),
         };
     };
     ensure_parent_directory(path).map_err(|error| error.to_string())?;
@@ -367,24 +368,26 @@ fn restore_path(path: &Path, original: Option<&[u8]>) -> Result<(), String> {
     Ok(())
 }
 
-fn remove_path_with_parent_sync(path: &Path) -> std::io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {
-            sync_parent_directory(path)?;
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+fn remove_path_with_parent_sync(path: &Path) -> Result<(), RemovalFailure> {
+    fs::remove_file(path).map_err(RemovalFailure::Remove)?;
+    sync_parent_directory(path).map_err(RemovalFailure::Sync)
 }
 
-#[cfg(unix)]
-fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
-    std::fs::File::open(path.parent().expect("restored path always has parent"))?.sync_all()
+/// Why an absent-file restoration could not be completed.
+enum RemovalFailure {
+    /// The path itself could not be removed.
+    Remove(std::io::Error),
+    /// The removal happened but its directory entry is not durable.
+    Sync(claw_config::ConfigError),
 }
 
-#[cfg(not(unix))]
-fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+/// Flushes the directory entry a removal just cleared, on every platform.
+///
+/// Returning success from a platform that cannot flush would let rollback report
+/// a restoration that a power loss could still undo, so the failure is surfaced
+/// into the restore failure list instead.
+fn sync_parent_directory(path: &Path) -> Result<(), claw_config::ConfigError> {
+    claw_config::sync_directory(path.parent().expect("restored path always has parent"))
 }
 
 fn restore_bytes_atomically(

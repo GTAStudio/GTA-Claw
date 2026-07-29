@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use toml_edit::{DocumentMut, Item, TableLike, Value as TomlValue};
 
+use crate::atomicfs::{self, ObjectIdentity};
 use crate::contract::{
     Artifact, ArtifactKind, ArtifactSignature, ContractViolation, Diagnostic, DiagnosticSeverity,
     InputKind, MIGRATION_CONTRACT_VERSION, MigrationInput, MigrationResult, MigrationStatus,
@@ -494,7 +495,24 @@ struct BackupEntry {
     original_digest: Option<String>,
     original_absent: bool,
     expected_new_digest: Option<String>,
+    stage: Option<PathBuf>,
     applied: bool,
+}
+
+impl BackupEntry {
+    /// Digest the target must still carry for this entry's next publication.
+    ///
+    /// Before the entry is published that is the pre-apply digest; afterwards it
+    /// is whatever this apply itself wrote, so a second operation aimed at the
+    /// same target (an append, for instance) compares against the bytes the
+    /// first one published rather than against bytes that no longer exist.
+    fn expected_current_digest(&self) -> Option<String> {
+        if self.applied {
+            self.expected_new_digest.clone()
+        } else {
+            self.original_digest.clone()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -513,6 +531,17 @@ struct DurableBackupEntry {
     original_sha256: Option<String>,
     expected_new_sha256: Option<String>,
     original_absent: bool,
+    /// Reserved staging path whose publication was in flight when the record was
+    /// written, so recovery can remove the leftover after restoring the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stage: Option<PathBuf>,
+    /// Whether publication of this entry had already been attempted.
+    ///
+    /// Recorded *before* the atomic displacement so a crash between the rename
+    /// and the parent-directory sync still leaves a receipt that names the entry
+    /// as one recovery must inspect and restore.
+    #[serde(default)]
+    published: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -954,13 +983,24 @@ fn apply_plan(
     let apply_result = apply_operations(context, &plan.operations, &mut receipt)
         .and_then(|()| verify_source_digests(plan))
         .and_then(|()| write_durable_receipt(&receipt, DurableReceiptState::FilesPublished))
-        .and_then(|()| commit_secret_transaction(context.secret_store, &receipt))
+        .and_then(|()| {
+            test_publish_failpoint::trigger("after_files_published", context.target_root);
+            commit_secret_transaction(context.secret_store, &receipt)
+        })
         .and_then(|()| write_durable_receipt(&receipt, DurableReceiptState::Committed));
     if let Err(error) = apply_result {
         let rollback_errors = match rollback_receipt(context, &receipt) {
-            Ok(()) => write_durable_receipt(&receipt, DurableReceiptState::Aborted)
-                .err()
-                .map_or_else(Vec::new, |error| vec![error.to_string()]),
+            // `Aborted` is a durable claim that nothing of this apply survives.
+            // It is only written once every entry has been re-read from disk and
+            // proven to match its pre-apply state, so a rollback that restored
+            // the bytes but could not sync the directory entry never gets
+            // recorded as a clean abort.
+            Ok(()) => match verify_restored_to_original(&receipt) {
+                Ok(()) => write_durable_receipt(&receipt, DurableReceiptState::Aborted)
+                    .err()
+                    .map_or_else(Vec::new, |error| vec![error.to_string()]),
+                Err(error) => vec![error.to_string()],
+            },
             Err(error) => rollback_failure_messages(error),
         };
         return Err(MigrationError::ApplyFailed {
@@ -969,6 +1009,51 @@ fn apply_plan(
         });
     }
     Ok(receipt)
+}
+
+/// Re-reads every target and proves it carries exactly its pre-apply state.
+fn verify_restored_to_original(receipt: &ApplyReceipt) -> Result<(), MigrationError> {
+    for backup in &receipt.backups {
+        let occupied = path_is_occupied(&backup.target);
+        let restored = match (&backup.original_digest, occupied) {
+            (Some(expected), true) => digest_path(&backup.target)? == *expected,
+            (None, false) => true,
+            _ => false,
+        };
+        if !restored {
+            return Err(MigrationError::Conflict(backup.target.clone()));
+        }
+        sync_nearest_existing_ancestor(&backup.target)?;
+    }
+    Ok(())
+}
+
+/// Flushes the closest directory that still exists above `path`.
+///
+/// Rollback removes the directories it created, so the immediate parent of a
+/// restored-to-absent target is often gone by the time the abort is verified.
+/// The entry that must reach stable storage is the one in the directory that
+/// still holds the (now missing) name.
+fn sync_nearest_existing_ancestor(path: &Path) -> Result<(), MigrationError> {
+    let mut current = path.parent();
+    while let Some(directory) = current {
+        if directory.as_os_str().is_empty() {
+            return Ok(());
+        }
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.is_dir() => return sync_directory(directory),
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => current = directory.parent(),
+            Err(source) => {
+                return Err(MigrationError::Io {
+                    action: "inspect",
+                    path: directory.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn verify_source_digests(plan: &MigrationPlan) -> Result<(), MigrationError> {
@@ -1000,211 +1085,459 @@ fn apply_operations(
     operations: &[MigrationOperation],
     receipt: &mut ApplyReceipt,
 ) -> Result<(), MigrationError> {
-    for (index, operation) in operations.iter().enumerate() {
-        if let MigrationOperation::AppendFile {
-            source,
-            target,
-            heading,
-        } = operation
-        {
-            append_file(source, target, heading)?;
-            record_applied_state(receipt, target)?;
-            continue;
-        }
-
+    for operation in operations {
         let target = operation.target();
-        let staged = reserve_publish_path(target, "stage")?;
-        remove_path_if_exists(&staged)?;
+        let mut staged = StagedArtifact::reserve(target, "stage")?;
+        record_stage_reservation(receipt, target, staged.path());
+        write_durable_receipt(receipt, DurableReceiptState::Pending)?;
         let secret_transaction = receipt.secret_transaction.clone();
-        apply_operation_to_target(
+        materialize_operation(
             context,
             operation,
-            &staged,
+            &mut staged,
             secret_transaction.as_deref(),
             &mut receipt.secrets,
         )?;
-        sync_path_tree(&staged)?;
+        staged.sync()?;
+        let expected_new = digest_path(staged.path())?;
+        let expected_current = current_expectation(receipt, target);
+
+        // The digest of what is about to be published is recorded *before* the
+        // displacement, so a crash between the rename and the parent sync still
+        // leaves a receipt that describes the bytes now sitting at the target.
+        // Without it, recovery would read its own output as a foreign edit.
+        record_publication_intent(receipt, target, &expected_new);
+        write_durable_receipt(receipt, DurableReceiptState::Pending)?;
         test_publish_failpoint::trigger("after_staging_write", target);
-        publish_staged_path(context.overwrite, target, &staged, index)?;
+        publish_staged_artifact(
+            context.target_root,
+            target,
+            &mut staged,
+            expected_current.as_deref(),
+            &receipt.backup_dir,
+        )?;
+        staged.into_published();
         record_applied_state(receipt, target)?;
+        write_durable_receipt(receipt, DurableReceiptState::Pending)?;
     }
     Ok(())
 }
 
-fn apply_operation_to_target(
+/// Digest the next publication of `target` must find in place.
+fn current_expectation(receipt: &ApplyReceipt, target: &Path) -> Option<String> {
+    receipt
+        .backups
+        .iter()
+        .find(|entry| entry.target == target)
+        .and_then(BackupEntry::expected_current_digest)
+}
+
+fn record_stage_reservation(receipt: &mut ApplyReceipt, target: &Path, stage: &Path) {
+    for backup in receipt
+        .backups
+        .iter_mut()
+        .filter(|entry| entry.target == target)
+    {
+        backup.stage = Some(stage.to_path_buf());
+    }
+}
+
+fn record_publication_intent(receipt: &mut ApplyReceipt, target: &Path, expected_new: &str) {
+    for backup in receipt
+        .backups
+        .iter_mut()
+        .filter(|entry| entry.target == target)
+    {
+        backup.expected_new_digest = Some(expected_new.to_owned());
+        backup.applied = true;
+    }
+}
+
+fn materialize_operation(
     context: &mut ApplyContext<'_>,
     operation: &MigrationOperation,
-    target: &Path,
+    staged: &mut StagedArtifact,
     secret_transaction: Option<&str>,
     secret_undo: &mut Vec<SecretUndo>,
 ) -> Result<(), MigrationError> {
     match operation {
-        MigrationOperation::CopyPath { source, .. } => copy_path(source, target),
+        MigrationOperation::AppendFile {
+            source,
+            target,
+            heading,
+        } => {
+            let bytes = appended_bytes(source, target, heading)?;
+            staged.write_bytes(&bytes)
+        }
+        MigrationOperation::CopyPath { source, .. } => copy_into_stage(source, staged),
         MigrationOperation::GeneratedCommandSkill { source, name, .. } => {
-            generate_command_skill(source, target, name)
+            let generated = command_skill_bytes(source, name)?;
+            staged.make_directory()?;
+            let skill = staged.path().join("SKILL.md");
+            write_bytes(&skill, generated.as_bytes())
         }
         MigrationOperation::TransformJson {
             source, namespace, ..
-        } => transform_json(
-            source,
-            target,
-            namespace,
-            context.secret_store,
-            secret_transaction,
-            secret_undo,
-        ),
+        } => {
+            let bytes = transform_json(
+                source,
+                namespace,
+                context.secret_store,
+                secret_transaction,
+                secret_undo,
+            )?;
+            staged.write_bytes(&bytes)
+        }
         MigrationOperation::TransformText {
             source, namespace, ..
-        } => transform_text(
-            source,
-            target,
-            namespace,
-            context.secret_store,
-            secret_transaction,
-            secret_undo,
-        ),
+        } => {
+            let bytes = transform_text(
+                source,
+                namespace,
+                context.secret_store,
+                secret_transaction,
+                secret_undo,
+            )?;
+            staged.write_bytes(&bytes)
+        }
         MigrationOperation::ImportEnvironment {
             source, namespace, ..
-        } => import_environment(
-            source,
-            target,
-            namespace,
-            context.secret_store,
-            secret_transaction,
-            secret_undo,
-        ),
+        } => {
+            let bytes = import_environment(
+                source,
+                namespace,
+                context.secret_store,
+                secret_transaction,
+                secret_undo,
+            )?;
+            staged.write_bytes(&bytes)
+        }
         MigrationOperation::StoreDocument {
             source, secret_id, ..
-        } => store_document(
-            source,
-            target,
-            secret_id,
-            context.secret_store,
-            secret_transaction,
-            secret_undo,
-        ),
-        MigrationOperation::WriteBytes { bytes, .. } => write_bytes(target, bytes),
-        MigrationOperation::AppendFile { .. } => {
-            unreachable!("append operations are handled inline")
+        } => {
+            let bytes = store_document(
+                source,
+                secret_id,
+                context.secret_store,
+                secret_transaction,
+                secret_undo,
+            )?;
+            staged.write_bytes(&bytes)
         }
+        MigrationOperation::WriteBytes { bytes, .. } => staged.write_bytes(bytes),
     }
 }
 
-fn reserve_publish_path(target: &Path, label: &str) -> Result<PathBuf, MigrationError> {
-    create_parent(target)?;
-    for _ in 0..128 {
-        let sequence = BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let file_name = target
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("target");
-        let candidate = target.with_file_name(format!(
-            ".{file_name}.migration-{label}-{}.{}",
-            std::process::id(),
-            sequence
-        ));
-        match reserve_path_candidate(&candidate) {
-            Ok(file) => {
-                if !reserved_candidate_matches(&file, &candidate)? {
+/// A reserved publication path and the handle that proves what it names.
+///
+/// The handle stays open from reservation until publication. Dropping it and
+/// re-opening by path would give up exactly the guarantee the `O_NOFOLLOW`
+/// creation bought: between the two opens another process could delete the
+/// reservation and leave a symbolic link in its place, and the migration would
+/// then write through that link. Every byte therefore goes through the retained
+/// handle, and [`StagedArtifact::verify_identity`] re-checks that the path still
+/// names the same object immediately before the displacement.
+struct StagedArtifact {
+    path: PathBuf,
+    handle: Option<File>,
+    identity: ObjectIdentity,
+    directory: bool,
+    published: bool,
+}
+
+impl StagedArtifact {
+    fn reserve(target: &Path, label: &str) -> Result<Self, MigrationError> {
+        create_parent(target)?;
+        for _ in 0..128 {
+            let sequence = BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let file_name = target
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("target");
+            let candidate = target.with_file_name(format!(
+                ".{file_name}.migration-{label}-{}.{}",
+                std::process::id(),
+                sequence
+            ));
+            match atomicfs::create_new_no_follow(&candidate) {
+                Ok(handle) => {
+                    let identity = atomicfs::identity_of_handle(&handle).map_err(|source| {
+                        MigrationError::Io {
+                            action: "inspect reserved publication path",
+                            path: candidate.clone(),
+                            source,
+                        }
+                    })?;
+                    let staged = Self {
+                        path: candidate,
+                        handle: Some(handle),
+                        identity,
+                        directory: false,
+                        published: false,
+                    };
+                    staged.verify_identity()?;
+                    return Ok(staged);
+                }
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(source) => {
                     return Err(MigrationError::Io {
                         action: "reserve temporary publication path",
                         path: candidate,
-                        source: io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "temporary publication path identity changed during reservation",
-                        ),
+                        source,
                     });
                 }
-                drop(file);
-                return Ok(candidate);
-            }
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(source) => {
-                return Err(MigrationError::Io {
-                    action: "reserve temporary publication path",
-                    path: candidate,
-                    source,
-                });
             }
         }
-    }
-    Err(MigrationError::Io {
-        action: "reserve temporary publication path",
-        path: target.to_path_buf(),
-        source: io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not allocate a unique migration publication path",
-        ),
-    })
-}
-
-#[cfg(unix)]
-fn reserve_path_candidate(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn reserve_path_candidate(path: &Path) -> io::Result<File> {
-    OpenOptions::new().write(true).create_new(true).open(path)
-}
-
-#[cfg(unix)]
-fn reserved_candidate_matches(file: &File, path: &Path) -> Result<bool, MigrationError> {
-    use std::os::unix::fs::MetadataExt;
-
-    let handle = file.metadata().map_err(|source| MigrationError::Io {
-        action: "inspect reserved publication path",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let on_disk = fs::symlink_metadata(path).map_err(|source| MigrationError::Io {
-        action: "inspect reserved publication path",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(on_disk.is_file() && handle.dev() == on_disk.dev() && handle.ino() == on_disk.ino())
-}
-
-#[cfg(not(unix))]
-fn reserved_candidate_matches(_file: &File, _path: &Path) -> Result<bool, MigrationError> {
-    Ok(true)
-}
-
-fn publish_staged_path(
-    overwrite: bool,
-    target: &Path,
-    staged: &Path,
-    _operation_index: usize,
-) -> Result<(), MigrationError> {
-    test_publish_failpoint::trigger("after_staging_write", target);
-    if path_is_occupied(target) {
-        if !overwrite {
-            return Err(MigrationError::Conflict(target.to_path_buf()));
-        }
-        test_publish_failpoint::trigger("after_target_moved", target);
-        fs::rename(staged, target).map_err(|source| MigrationError::Io {
-            action: "publish staged migration target",
+        Err(MigrationError::Io {
+            action: "reserve temporary publication path",
             path: target.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not allocate a unique migration publication path",
+            ),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Confirms the reservation path still names the object opened at creation.
+    fn verify_identity(&self) -> Result<(), MigrationError> {
+        let observed =
+            atomicfs::identity_of_path(&self.path).map_err(|source| MigrationError::Io {
+                action: "inspect reserved publication path",
+                path: self.path.clone(),
+                source,
+            })?;
+        if observed == self.identity {
+            return Ok(());
+        }
+        Err(MigrationError::Io {
+            action: "inspect reserved publication path",
+            path: self.path.clone(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "temporary publication path identity changed before publication",
+            ),
+        })
+    }
+
+    /// Replaces the reserved regular file with a freshly created directory.
+    ///
+    /// The reservation is removed through its own verified path and the
+    /// directory is created with `create_dir`, which fails rather than adopting
+    /// an object another process slipped in, and the new object's identity is
+    /// recorded so publication still verifies what it is about to move.
+    fn make_directory(&mut self) -> Result<(), MigrationError> {
+        self.verify_identity()?;
+        self.handle = None;
+        remove_path_if_exists(&self.path)?;
+        fs::create_dir(&self.path).map_err(|source| MigrationError::Io {
+            action: "create staged directory",
+            path: self.path.clone(),
             source,
         })?;
-        sync_parent_path(target)?;
-        test_publish_failpoint::trigger("after_target_published", target);
-        return Ok(());
+        self.identity =
+            atomicfs::identity_of_path(&self.path).map_err(|source| MigrationError::Io {
+                action: "inspect staged directory",
+                path: self.path.clone(),
+                source,
+            })?;
+        self.directory = true;
+        Ok(())
     }
-    fs::rename(staged, target).map_err(|source| MigrationError::Io {
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), MigrationError> {
+        self.with_handle("write staged migration bytes", |handle| {
+            handle.set_len(0)?;
+            handle.seek(SeekFrom::Start(0))?;
+            handle.write_all(bytes)?;
+            handle.flush()
+        })
+    }
+
+    /// Streams a regular file through the reservation's own handle.
+    fn copy_from_file(&mut self, source: &Path) -> Result<(), MigrationError> {
+        let mut reader = atomicfs::open_no_follow(source).map_err(|error| MigrationError::Io {
+            action: "read",
+            path: source.to_path_buf(),
+            source: error,
+        })?;
+        self.with_handle("write staged migration bytes", |handle| {
+            handle.set_len(0)?;
+            handle.seek(SeekFrom::Start(0))?;
+            io::copy(&mut reader, handle)?;
+            handle.flush()
+        })
+    }
+
+    fn with_handle<T>(
+        &mut self,
+        action: &'static str,
+        operation: impl FnOnce(&mut File) -> io::Result<T>,
+    ) -> Result<T, MigrationError> {
+        let path = self.path.clone();
+        let handle = self.handle.as_mut().ok_or_else(|| MigrationError::Io {
+            action,
+            path: path.clone(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "staged directory has no regular-file handle",
+            ),
+        })?;
+        operation(handle).map_err(|source| MigrationError::Io {
+            action,
+            path,
+            source,
+        })
+    }
+
+    fn sync(&mut self) -> Result<(), MigrationError> {
+        if self.directory {
+            sync_path_tree(&self.path)?;
+        } else {
+            self.with_handle("sync staged migration bytes", |handle| handle.sync_all())?;
+        }
+        self.verify_identity()
+    }
+
+    /// Releases the handle so the platform can move the staged object.
+    fn release_handle(&mut self) {
+        self.handle = None;
+    }
+
+    /// Marks the reservation as consumed so `Drop` leaves the filesystem alone.
+    fn into_published(mut self) {
+        self.published = true;
+    }
+}
+
+impl Drop for StagedArtifact {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        self.handle = None;
+        let _ = remove_path_if_exists(&self.path);
+    }
+}
+
+/// Publishes a staged object over `target` under a compare-and-swap.
+///
+/// The comparison is bound to the displacement rather than performed before it.
+/// A digest read a moment earlier proves nothing: two applies can both observe
+/// the same prior bytes, both stage a replacement, and the second rename then
+/// destroys whatever the first one published. Exchanging the staged object with
+/// the target moves the previous occupant to the staging path in the same atomic
+/// step, so the object that is inspected is exactly the object that was
+/// replaced. A mismatch is undone by swapping back and the displaced bytes are
+/// preserved verbatim in the durable backup directory.
+///
+/// The target is occupied by either the old object or the new one at every
+/// instant, including for a non-empty directory, which a plain rename cannot
+/// replace at all.
+fn publish_staged_artifact(
+    target_root: &Path,
+    target: &Path,
+    staged: &mut StagedArtifact,
+    expected_current: Option<&str>,
+    conflict_root: &Path,
+) -> Result<(), MigrationError> {
+    ensure_no_symlink_ancestors(target_root, target)?;
+    staged.verify_identity()?;
+    test_publish_failpoint::run_barrier("before_publish", target);
+    staged.verify_identity()?;
+    staged.release_handle();
+    swap_into_place(staged.path(), target, expected_current, conflict_root)
+}
+
+/// Compare-and-swap `replacement` onto `target`.
+///
+/// `expected` is the digest the target must still carry, or `None` when the
+/// target must still be absent. On success `replacement` no longer exists.
+fn swap_into_place(
+    replacement: &Path,
+    target: &Path,
+    expected: Option<&str>,
+    conflict_root: &Path,
+) -> Result<(), MigrationError> {
+    let Some(expected) = expected else {
+        return match atomicfs::rename_no_replace(replacement, target) {
+            Ok(()) => {
+                test_publish_failpoint::trigger("after_target_moved", target);
+                sync_parent_path(target)?;
+                test_publish_failpoint::trigger("after_target_published", target);
+                Ok(())
+            }
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                Err(preserve_conflicting_target(target, conflict_root)?)
+            }
+            Err(source) => Err(MigrationError::Io {
+                action: "publish staged migration target",
+                path: target.to_path_buf(),
+                source,
+            }),
+        };
+    };
+    if !path_is_occupied(target) {
+        return Err(MigrationError::Conflict(target.to_path_buf()));
+    }
+    atomicfs::exchange_paths(replacement, target).map_err(|source| MigrationError::Io {
         action: "publish staged migration target",
         path: target.to_path_buf(),
         source,
     })?;
-    sync_parent_path(target)?;
-    test_publish_failpoint::trigger("after_target_published", target);
-    Ok(())
+    test_publish_failpoint::trigger("after_target_moved", target);
+    match digest_path(replacement) {
+        Ok(displaced) if displaced == expected => {
+            remove_path_if_exists(replacement)?;
+            sync_parent_path(target)?;
+            test_publish_failpoint::trigger("after_target_published", target);
+            Ok(())
+        }
+        outcome => {
+            atomicfs::exchange_paths(replacement, target).map_err(|source| MigrationError::Io {
+                action: "restore concurrently changed migration target",
+                path: target.to_path_buf(),
+                source,
+            })?;
+            sync_parent_path(target)?;
+            match outcome {
+                // A link planted at the target is named by the target it was
+                // planted at, not by the staging path it was momentarily swapped
+                // to while the comparison ran.
+                Err(MigrationError::Symlink(_)) => {
+                    Err(MigrationError::Symlink(target.to_path_buf()))
+                }
+                Err(error) => Err(error),
+                Ok(_) => Err(preserve_conflicting_target(target, conflict_root)?),
+            }
+        }
+    }
+}
+
+/// Copies the exact object occupying `target` into the durable conflict store.
+///
+/// The copy is what makes a refusal actionable: the bytes another writer
+/// published are kept verbatim next to the receipt, and the target itself is
+/// left exactly as that writer left it.
+fn preserve_conflicting_target(
+    target: &Path,
+    conflict_root: &Path,
+) -> Result<MigrationError, MigrationError> {
+    if !path_is_occupied(target) {
+        return Ok(MigrationError::Conflict(target.to_path_buf()));
+    }
+    let conflicts = conflict_root.join("conflicts");
+    create_dir_all(&conflicts)?;
+    let sequence = BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let preserved = conflicts.join(sequence.to_string());
+    remove_path_if_exists(&preserved)?;
+    copy_path(target, &preserved)?;
+    sync_path_tree(&preserved)?;
+    sync_parent_path(&preserved)?;
+    Ok(MigrationError::Conflict(preserved))
 }
 
 fn recover_pending_backups(
@@ -1240,12 +1573,19 @@ fn recover_pending_backups(
         }
         match receipt.state {
             DurableReceiptState::Pending => {
-                restore_pending_receipt(target_root, &receipt.backups)?;
+                restore_pending_receipt(target_root, &backup_dir, &receipt.backups)?;
                 rollback_secret_transaction(secret_store, receipt.secret_transaction.as_deref())?;
                 receipt.state = DurableReceiptState::Aborted;
                 write_durable_receipt_at(&backup_dir, &receipt)?;
             }
             DurableReceiptState::FilesPublished => {
+                // Secrets are only finalized once every published file is proven
+                // to still carry the exact bytes this transaction wrote. A target
+                // that was edited or deleted after publication means the
+                // configuration a committed credential belongs to no longer
+                // exists, so the transaction stays open and the receipt keeps its
+                // pre-commit state.
+                verify_published_files(target_root, &backup_dir, &receipt.backups)?;
                 commit_secret_transaction_by_id(
                     secret_store,
                     receipt.secret_transaction.as_deref(),
@@ -1259,11 +1599,37 @@ fn recover_pending_backups(
     Ok(())
 }
 
-fn restore_pending_receipt(
+/// Confirms every entry still carries the digest this transaction published.
+fn verify_published_files(
     target_root: &Path,
+    backup_dir: &Path,
     backups: &[DurableBackupEntry],
 ) -> Result<(), MigrationError> {
-    for entry in backups.iter().rev() {
+    for entry in backups {
+        ensure_target_within(target_root, &entry.target)?;
+        ensure_no_symlink_ancestors(target_root, &entry.target)?;
+        let occupied = path_is_occupied(&entry.target);
+        match (&entry.expected_new_sha256, occupied) {
+            (Some(expected), true) if digest_path(&entry.target)? == *expected => {}
+            (None, false) => {}
+            (_, true) => return Err(preserve_conflicting_target(&entry.target, backup_dir)?),
+            (Some(_), false) => return Err(MigrationError::Conflict(entry.target.clone())),
+        }
+    }
+    Ok(())
+}
+
+fn restore_pending_receipt(
+    target_root: &Path,
+    backup_dir: &Path,
+    backups: &[DurableBackupEntry],
+) -> Result<(), MigrationError> {
+    let targets = backups
+        .iter()
+        .map(|entry| entry.target.as_path())
+        .collect::<Vec<_>>();
+    for index in restoration_order(&targets) {
+        let entry = &backups[index];
         ensure_target_within(target_root, &entry.target)?;
         ensure_no_symlink_ancestors(target_root, &entry.target)?;
         let backup = BackupEntry {
@@ -1272,9 +1638,16 @@ fn restore_pending_receipt(
             original_digest: entry.original_sha256.clone(),
             original_absent: entry.original_absent,
             expected_new_digest: entry.expected_new_sha256.clone(),
+            stage: entry.stage.clone(),
             applied: true,
         };
-        restore_backup(&backup)?;
+        restore_backup(&backup, backup_dir)?;
+        if let Some(stage) = &entry.stage
+            && stage != &entry.target
+        {
+            remove_path_if_exists(stage)?;
+            sync_parent_path(stage)?;
+        }
         if backup.backup.is_none() {
             cleanup_empty_parents(&backup.target, target_root);
         }
@@ -1294,6 +1667,9 @@ fn record_applied_state(receipt: &mut ApplyReceipt, target: &Path) -> Result<(),
         } else {
             None
         };
+        if backup.target == target {
+            backup.stage = None;
+        }
     }
     Ok(())
 }
@@ -1323,11 +1699,17 @@ fn rollback_receipt(
     {
         errors.push(format!("secret transaction: {error}"));
     }
-    for backup in receipt.backups.iter().rev() {
+    let targets = receipt
+        .backups
+        .iter()
+        .map(|entry| entry.target.as_path())
+        .collect::<Vec<_>>();
+    for index in restoration_order(&targets) {
+        let backup = &receipt.backups[index];
         if !backup.applied {
             continue;
         }
-        let result = restore_backup(backup);
+        let result = restore_backup(backup, &receipt.backup_dir);
         if let Err(error) = result {
             errors.push(error.to_string());
         }
@@ -1341,6 +1723,21 @@ fn rollback_receipt(
     } else {
         Err(MigrationError::RollbackFailed { errors })
     }
+}
+
+/// Order in which recorded targets must be put back.
+///
+/// Undo is reverse-of-apply, except that an ancestor is always restored before
+/// anything nested inside it. Restoring a nested target first would rewrite the
+/// ancestor directory's contents, and the ancestor's recorded post-apply digest
+/// would then no longer describe what is on disk — indistinguishable from a
+/// foreign edit, which rollback is required to refuse. Putting the ancestor back
+/// restores the whole subtree in one atomic exchange and leaves every nested
+/// entry already matching its own pre-apply state.
+fn restoration_order(targets: &[&Path]) -> Vec<usize> {
+    let mut order = (0..targets.len()).rev().collect::<Vec<_>>();
+    order.sort_by_key(|&index| targets[index].components().count());
+    order
 }
 
 fn rollback_failure_messages(error: MigrationError) -> Vec<String> {
@@ -1425,6 +1822,7 @@ fn backup_targets(
                 original_digest: Some(backup_digest),
                 original_absent: false,
                 expected_new_digest: None,
+                stage: None,
                 applied: false,
             });
         } else {
@@ -1434,6 +1832,7 @@ fn backup_targets(
                 original_digest: None,
                 original_absent: true,
                 expected_new_digest: None,
+                stage: None,
                 applied: false,
             });
         }
@@ -1497,6 +1896,8 @@ fn write_durable_receipt(
                 original_sha256: entry.original_digest.clone(),
                 expected_new_sha256: entry.expected_new_digest.clone(),
                 original_absent: entry.original_absent,
+                stage: entry.stage.clone(),
+                published: entry.applied,
             })
             .collect(),
         secret_transaction: receipt.secret_transaction.clone(),
@@ -1523,8 +1924,15 @@ fn read_durable_receipt(path: &Path) -> Result<DurableReceipt, MigrationError> {
     })
 }
 
-fn restore_backup(entry: &BackupEntry) -> Result<(), MigrationError> {
-    let target_is_directory = fs::metadata(&entry.target).is_ok_and(|metadata| metadata.is_dir());
+/// Puts one entry back exactly as apply found it.
+///
+/// Restoration is published the same way apply publishes: the replacement is
+/// materialized beside the target and exchanged into place, so a non-empty
+/// directory can be restored at all and the target is never momentarily missing.
+/// The exchange is compared against the digest the entry is expected to carry,
+/// so a target another writer changed after apply is preserved instead of
+/// silently overwritten.
+fn restore_backup(entry: &BackupEntry, conflict_root: &Path) -> Result<(), MigrationError> {
     let occupied = path_is_occupied(&entry.target);
     let matches_original = match (&entry.original_digest, occupied) {
         (Some(expected), true) => digest_path(&entry.target)? == *expected,
@@ -1534,52 +1942,49 @@ fn restore_backup(entry: &BackupEntry) -> Result<(), MigrationError> {
     if matches_original {
         return Ok(());
     }
-    match (&entry.expected_new_digest, occupied) {
-        (None, false) => {}
-        (Some(expected), true) if digest_path(&entry.target)? == *expected => {}
-        (Some(_), true) if target_is_directory => {}
-        _ => return backup_conflicting_target(&entry.target),
-    }
-    if let Some(backup) = &entry.backup {
-        let expected = entry.original_digest.as_deref().unwrap_or_default();
-        if digest_path(backup)? != expected {
-            return Err(MigrationError::BackupVerification(backup.clone()));
+    let expected_current = match (&entry.expected_new_digest, occupied) {
+        (Some(expected), true) if digest_path(&entry.target)? == *expected => {
+            Some(expected.clone())
         }
-        create_parent(&entry.target)?;
-        let sequence = BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let file_name = entry
-            .target
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("target");
-        let temporary = entry
-            .target
-            .with_file_name(format!(".{file_name}.rollback-{sequence}"));
-        remove_path_if_exists(&temporary)?;
-        copy_path(backup, &temporary)?;
-        if digest_path(&temporary)? != expected {
-            return Err(MigrationError::BackupVerification(temporary));
-        }
-        fs::rename(&temporary, &entry.target).map_err(|source| MigrationError::Io {
-            action: "restore backup",
-            path: entry.target.clone(),
-            source,
-        })?;
-    } else {
-        remove_path_if_exists(&entry.target)?;
+        (None, false) => None,
+        _ => return Err(preserve_conflicting_target(&entry.target, conflict_root)?),
+    };
+    let Some(backup) = &entry.backup else {
+        remove_verified_target(&entry.target, expected_current.as_deref())?;
+        sync_parent_path(&entry.target)?;
+        return Ok(());
+    };
+    let expected = entry.original_digest.as_deref().unwrap_or_default();
+    if digest_path(backup)? != expected {
+        return Err(MigrationError::BackupVerification(backup.clone()));
     }
-    sync_parent_path(&entry.target)?;
+    let mut staged = StagedArtifact::reserve(&entry.target, "rollback")?;
+    copy_into_stage(backup, &mut staged)?;
+    staged.sync()?;
+    if digest_path(staged.path())? != expected {
+        return Err(MigrationError::BackupVerification(
+            staged.path().to_path_buf(),
+        ));
+    }
+    staged.release_handle();
+    swap_into_place(
+        staged.path(),
+        &entry.target,
+        expected_current.as_deref(),
+        conflict_root,
+    )?;
+    staged.into_published();
     Ok(())
 }
 
-fn backup_conflicting_target(target: &Path) -> Result<(), MigrationError> {
-    if !path_is_occupied(target) {
+/// Removes a target this apply created, refusing to delete foreign bytes.
+fn remove_verified_target(target: &Path, expected: Option<&str>) -> Result<(), MigrationError> {
+    if let Some(expected) = expected
+        && digest_path(target)? != *expected
+    {
         return Err(MigrationError::Conflict(target.to_path_buf()));
     }
-    let conflict = reserve_publish_path(target, "conflict-backup")?;
-    remove_path_if_exists(&conflict)?;
-    copy_path(target, &conflict)?;
-    Err(MigrationError::Conflict(conflict))
+    remove_path_if_exists(target)
 }
 
 fn cleanup_empty_parents(target: &Path, root: &Path) {
@@ -1606,10 +2011,31 @@ fn path_is_occupied(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
-fn append_file(source: &Path, target: &Path, heading: &str) -> Result<(), MigrationError> {
+/// Materializes `source` into a reserved staging artifact.
+///
+/// A regular file is streamed through the reservation's own handle so the bytes
+/// never travel through a path that could be re-pointed underneath them; a
+/// directory tree is written into a directory created in place of the
+/// reservation, whose identity is recorded and re-verified before publication.
+fn copy_into_stage(source: &Path, staged: &mut StagedArtifact) -> Result<(), MigrationError> {
+    reject_symlink(source)?;
+    if source.is_dir() {
+        staged.make_directory()?;
+        let destination = staged.path().to_path_buf();
+        return copy_path(source, &destination);
+    }
+    if source.is_file() {
+        return staged.copy_from_file(source);
+    }
+    Err(MigrationError::SourceNotFound {
+        provider: "migration",
+        path: source.to_path_buf(),
+    })
+}
+
+fn appended_bytes(source: &Path, target: &Path, heading: &str) -> Result<Vec<u8>, MigrationError> {
     reject_symlink(source)?;
     let content = read_bytes(source)?;
-    create_parent(target)?;
     let mut existing = if path_is_occupied(target) {
         reject_symlink(target)?;
         read_bytes(target)?
@@ -1624,14 +2050,10 @@ fn append_file(source: &Path, target: &Path, heading: &str) -> Result<(), Migrat
     if !existing.ends_with(b"\n") {
         existing.push(b'\n');
     }
-    let staged = reserve_publish_path(target, "append")?;
-    write_bytes(&staged, &existing)?;
-    sync_path_tree(&staged)?;
-    test_publish_failpoint::trigger("after_staging_write", target);
-    publish_staged_path(true, target, &staged, 0)
+    Ok(existing)
 }
 
-fn generate_command_skill(source: &Path, target: &Path, name: &str) -> Result<(), MigrationError> {
+fn command_skill_bytes(source: &Path, name: &str) -> Result<String, MigrationError> {
     let content = read_text(source)?;
     let description = content
         .split("\n\n")
@@ -1640,24 +2062,21 @@ fn generate_command_skill(source: &Path, target: &Path, name: &str) -> Result<()
         .unwrap_or("Imported Claude command")
         .replace('\n', " ");
     let description = description.chars().take(180).collect::<String>();
-    let generated = format!(
+    Ok(format!(
         "---\nname: {name}\ndescription: {}\ndisable-model-invocation: true\n---\n\n<!-- Imported inert Claude command -->\n\n{}\n",
         serde_json::to_string(&description)
             .map_err(|error| MigrationError::Signing(error.to_string()))?,
         content.trim_end()
-    );
-    create_dir_all(target)?;
-    write_bytes(&target.join("SKILL.md"), generated.as_bytes())
+    ))
 }
 
 fn transform_json(
     source: &Path,
-    target: &Path,
     namespace: &str,
     store: &mut dyn SecretStore,
     transaction_id: Option<&str>,
     undo: &mut Vec<SecretUndo>,
-) -> Result<(), MigrationError> {
+) -> Result<Vec<u8>, MigrationError> {
     let text = read_text(source)?;
     let mut value: Value =
         serde_json::from_str(&text).map_err(|_| MigrationError::InvalidInput {
@@ -1673,11 +2092,10 @@ fn transform_json(
         transaction_id,
         undo,
     )?;
-    let bytes = serde_json::to_vec_pretty(&value).map_err(|_| MigrationError::InvalidInput {
+    serde_json::to_vec_pretty(&value).map_err(|_| MigrationError::InvalidInput {
         path: source.to_path_buf(),
         reason: "JSON configuration could not be serialized".to_owned(),
-    })?;
-    write_bytes(target, &bytes)
+    })
 }
 
 fn redact_json_value(
@@ -1740,30 +2158,20 @@ fn redact_json_value(
 
 fn transform_text(
     source: &Path,
-    target: &Path,
     namespace: &str,
     store: &mut dyn SecretStore,
     transaction_id: Option<&str>,
     undo: &mut Vec<SecretUndo>,
-) -> Result<(), MigrationError> {
+) -> Result<Vec<u8>, MigrationError> {
     let input = read_text(source)?;
     if source
         .extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case("toml"))
     {
-        return transform_toml(
-            source,
-            &input,
-            target,
-            namespace,
-            store,
-            transaction_id,
-            undo,
-        );
+        return transform_toml(source, &input, namespace, store, transaction_id, undo);
     }
     let mut output = String::new();
-    let mut toml_secret_section = false;
     let mut yaml_secret_indent = None;
     for (index, line) in input.lines().enumerate() {
         let trimmed = line.trim_start();
@@ -1774,13 +2182,6 @@ fn transform_text(
             && indentation <= container_indent
         {
             yaml_secret_indent = None;
-        }
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            let section = trimmed.trim_matches(['[', ']']);
-            toml_secret_section = section
-                .split('.')
-                .next_back()
-                .is_some_and(secret_container_key);
         }
         let transformed = if trimmed.starts_with('#') || trimmed.is_empty() {
             line.to_owned()
@@ -1794,34 +2195,16 @@ fn transform_text(
                 line.to_owned()
             } else if secret_key(normalized_key)
                 || secret_container_key(normalized_key)
-                || toml_secret_section
                 || yaml_secret_indent.is_some()
             {
-                if separator == '='
-                    && secret_container_key(normalized_key)
-                    && raw.starts_with('{')
-                    && raw.ends_with('}')
-                    && let Some(inline) = redact_inline_secret_table(
-                        raw,
-                        namespace,
-                        index,
-                        store,
-                        transaction_id,
-                        undo,
-                    )?
-                {
-                    format!("{key}{separator} {inline}")
+                let value = unquote(raw);
+                if value.is_empty() {
+                    line.to_owned()
                 } else {
-                    let value = unquote(raw);
-                    if value.is_empty() {
-                        line.to_owned()
-                    } else {
-                        let id =
-                            secret_identifier(namespace, &format!("/{index}/{normalized_key}"));
-                        let reference =
-                            route_secret(store, transaction_id, undo, &id, value.as_bytes())?;
-                        format!("{key}{separator} \"{reference}\"")
-                    }
+                    let id = secret_identifier(namespace, &format!("/{index}/{normalized_key}"));
+                    let reference =
+                        route_secret(store, transaction_id, undo, &id, value.as_bytes())?;
+                    format!("{key}{separator} \"{reference}\"")
                 }
             } else {
                 line.to_owned()
@@ -1833,18 +2216,27 @@ fn transform_text(
         output.push('\n');
     }
 
-    write_bytes(target, output.as_bytes())
+    Ok(output.into_bytes())
 }
 
+/// Rewrites a TOML document structurally, routing every secret it finds.
+///
+/// Identifiers come from the same traversal that rewrites the values, so a
+/// document's secret identities are a function of its structure alone. The
+/// earlier design planned identifiers from a separate line scan and consumed
+/// them in document order, which broke on anything the scan could not see: a
+/// trailing comment after an inline table hid every entry in it, the two
+/// sequences fell out of step, and later values were routed under identifiers
+/// belonging to earlier keys or under one shared fallback that overwrote each
+/// credential with the next.
 fn transform_toml(
     source: &Path,
     input: &str,
-    target: &Path,
     namespace: &str,
     store: &mut dyn SecretStore,
     transaction_id: Option<&str>,
     undo: &mut Vec<SecretUndo>,
-) -> Result<(), MigrationError> {
+) -> Result<Vec<u8>, MigrationError> {
     let mut document =
         input
             .parse::<DocumentMut>()
@@ -1852,15 +2244,13 @@ fn transform_toml(
                 path: source.to_path_buf(),
                 reason: format!("TOML configuration is malformed: {error}"),
             })?;
-    let mut identifiers = planned_toml_secret_ids(input, namespace);
-    redact_toml_item(
-        document.as_item_mut(),
+    let mut context = TomlRedaction {
+        namespace,
         store,
         transaction_id,
         undo,
-        &mut identifiers,
-        false,
-    )?;
+    };
+    context.item(document.as_item_mut(), "", false)?;
     let output = document.to_string();
     output
         .parse::<DocumentMut>()
@@ -1868,335 +2258,150 @@ fn transform_toml(
             path: source.to_path_buf(),
             reason: format!("TOML configuration could not be serialized: {error}"),
         })?;
-    write_bytes(target, output.as_bytes())
+    Ok(output.into_bytes())
 }
 
-fn redact_toml_item(
-    item: &mut Item,
-    store: &mut dyn SecretStore,
-    transaction_id: Option<&str>,
-    undo: &mut Vec<SecretUndo>,
-    identifiers: &mut VecDeque<String>,
-    secret_container: bool,
-) -> Result<(), MigrationError> {
-    match item {
-        Item::Table(table) => redact_toml_table_like(
-            table,
-            store,
-            transaction_id,
-            undo,
-            identifiers,
-            secret_container,
-        ),
-        Item::Value(TomlValue::InlineTable(table)) => redact_toml_inline_table(
-            table,
-            store,
-            transaction_id,
-            undo,
-            identifiers,
-            secret_container,
-        ),
-        Item::Value(TomlValue::Array(array)) => {
-            for value in array.iter_mut() {
-                redact_toml_value(
-                    value,
-                    store,
-                    transaction_id,
-                    undo,
-                    identifiers,
-                    secret_container,
-                )?;
+/// One structural TOML redaction pass.
+struct TomlRedaction<'a> {
+    namespace: &'a str,
+    store: &'a mut dyn SecretStore,
+    transaction_id: Option<&'a str>,
+    undo: &'a mut Vec<SecretUndo>,
+}
+
+impl TomlRedaction<'_> {
+    fn item(
+        &mut self,
+        item: &mut Item,
+        path: &str,
+        secret_container: bool,
+    ) -> Result<(), MigrationError> {
+        match item {
+            Item::Table(table) => self.table_like(table, path, secret_container),
+            Item::Value(TomlValue::InlineTable(table)) => {
+                self.inline_table(table, path, secret_container)
             }
-            Ok(())
-        }
-        Item::Value(value) => redact_toml_value(
-            value,
-            store,
-            transaction_id,
-            undo,
-            identifiers,
-            secret_container,
-        ),
-        Item::ArrayOfTables(array) => {
-            for table in array.iter_mut() {
-                redact_toml_table_like(
-                    table,
-                    store,
-                    transaction_id,
-                    undo,
-                    identifiers,
-                    secret_container,
-                )?;
+            Item::Value(TomlValue::Array(array)) => {
+                for (index, value) in array.iter_mut().enumerate() {
+                    self.value(value, &format!("{path}/{index}"), secret_container)?;
+                }
+                Ok(())
             }
-            Ok(())
-        }
-        Item::None => Ok(()),
-    }
-}
-
-fn redact_toml_table_like(
-    table: &mut dyn TableLike,
-    store: &mut dyn SecretStore,
-    transaction_id: Option<&str>,
-    undo: &mut Vec<SecretUndo>,
-    identifiers: &mut VecDeque<String>,
-    secret_container: bool,
-) -> Result<(), MigrationError> {
-    let keys = table
-        .iter()
-        .map(|(key, _)| key.to_owned())
-        .collect::<Vec<_>>();
-    for key in keys {
-        let child_container = secret_container_key(&key);
-        let Some(child) = table.get_mut(&key) else {
-            continue;
-        };
-        if let Item::Value(TomlValue::String(secret)) = child
-            && (secret_container || secret_key(&key))
-        {
-            let id = next_toml_secret_id(identifiers);
-            let reference =
-                route_secret(store, transaction_id, undo, &id, secret.value().as_bytes())?;
-            *child = Item::Value(TomlValue::from(reference));
-            continue;
-        }
-        redact_toml_item(
-            child,
-            store,
-            transaction_id,
-            undo,
-            identifiers,
-            secret_container || child_container,
-        )?;
-    }
-    Ok(())
-}
-
-fn redact_toml_inline_table(
-    table: &mut toml_edit::InlineTable,
-    store: &mut dyn SecretStore,
-    transaction_id: Option<&str>,
-    undo: &mut Vec<SecretUndo>,
-    identifiers: &mut VecDeque<String>,
-    secret_container: bool,
-) -> Result<(), MigrationError> {
-    let keys = table
-        .iter()
-        .map(|(key, _)| key.to_owned())
-        .collect::<Vec<_>>();
-    for key in keys {
-        let child_container = secret_container_key(&key);
-        let Some(value) = table.get_mut(&key) else {
-            continue;
-        };
-        redact_toml_value(
-            value,
-            store,
-            transaction_id,
-            undo,
-            identifiers,
-            secret_container || child_container,
-        )?;
-    }
-    Ok(())
-}
-
-fn redact_toml_value(
-    value: &mut TomlValue,
-    store: &mut dyn SecretStore,
-    transaction_id: Option<&str>,
-    undo: &mut Vec<SecretUndo>,
-    identifiers: &mut VecDeque<String>,
-    secret_container: bool,
-) -> Result<(), MigrationError> {
-    match value {
-        TomlValue::String(secret) if secret_container => {
-            let id = next_toml_secret_id(identifiers);
-            let reference =
-                route_secret(store, transaction_id, undo, &id, secret.value().as_bytes())?;
-            *value = TomlValue::from(reference);
-            Ok(())
-        }
-        TomlValue::InlineTable(table) => redact_toml_inline_table(
-            table,
-            store,
-            transaction_id,
-            undo,
-            identifiers,
-            secret_container,
-        ),
-        TomlValue::Array(array) => {
-            for child in array.iter_mut() {
-                redact_toml_value(
-                    child,
-                    store,
-                    transaction_id,
-                    undo,
-                    identifiers,
-                    secret_container,
-                )?;
+            Item::Value(value) => self.value(value, path, secret_container),
+            Item::ArrayOfTables(array) => {
+                for (index, table) in array.iter_mut().enumerate() {
+                    self.table_like(table, &format!("{path}/{index}"), secret_container)?;
+                }
+                Ok(())
             }
-            Ok(())
+            Item::None => Ok(()),
         }
-        _ => Ok(()),
     }
-}
 
-fn planned_toml_secret_ids(input: &str, namespace: &str) -> VecDeque<String> {
-    let mut identifiers = VecDeque::new();
-    let mut toml_secret_section = false;
-    for (index, line) in input.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            let section = trimmed.trim_matches(['[', ']']);
-            toml_secret_section = section
-                .split('.')
-                .next_back()
-                .is_some_and(secret_container_key);
-        }
-        if trimmed.starts_with('#') || trimmed.is_empty() {
-            continue;
-        }
-        let Some((key, separator, raw)) = split_assignment(line) else {
-            continue;
-        };
-        if separator != '=' {
-            continue;
-        }
-        let normalized_key = key.trim().trim_matches(['"', '\'']);
-        let raw = raw.trim();
-        if secret_container_key(normalized_key) && raw.starts_with('{') && raw.ends_with('}') {
-            for (position, entry) in split_inline_table_entries(
-                raw.trim()
-                    .strip_prefix('{')
-                    .and_then(|value| value.strip_suffix('}'))
-                    .unwrap_or_default(),
-            )
+    fn table_like(
+        &mut self,
+        table: &mut dyn TableLike,
+        path: &str,
+        secret_container: bool,
+    ) -> Result<(), MigrationError> {
+        let keys = table
             .iter()
-            .enumerate()
+            .map(|(key, _)| key.to_owned())
+            .collect::<Vec<_>>();
+        for key in keys {
+            let child_path = format!("{path}/{key}");
+            let child_container = secret_container_key(&key);
+            let Some(child) = table.get_mut(&key) else {
+                continue;
+            };
+            if let Item::Value(TomlValue::String(secret)) = child
+                && (secret_container || secret_key(&key))
             {
-                if let Some((entry_key, _)) = entry.split_once('=') {
-                    identifiers.push_back(secret_identifier(
-                        namespace,
-                        &format!("/{index}/inline/{position}/{}", entry_key.trim()),
-                    ));
+                let reference = self.route(&child_path, secret.value())?;
+                *child = Item::Value(TomlValue::from(reference));
+                continue;
+            }
+            self.item(child, &child_path, secret_container || child_container)?;
+        }
+        Ok(())
+    }
+
+    /// Redacts an inline table, including keys that are themselves secret names.
+    ///
+    /// A direct secret key nested inside an inline table — `provider = { api_key
+    /// = "..." }` — is exactly as sensitive as the same key spelled out in a
+    /// standard table. Checking only whether the *parent* key was `env` or
+    /// `headers` left those credentials in plaintext in the migrated file.
+    fn inline_table(
+        &mut self,
+        table: &mut toml_edit::InlineTable,
+        path: &str,
+        secret_container: bool,
+    ) -> Result<(), MigrationError> {
+        let keys = table
+            .iter()
+            .map(|(key, _)| key.to_owned())
+            .collect::<Vec<_>>();
+        for key in keys {
+            let child_path = format!("{path}/{key}");
+            let child_container = secret_container_key(&key);
+            let Some(value) = table.get_mut(&key) else {
+                continue;
+            };
+            if let TomlValue::String(secret) = value
+                && (secret_container || secret_key(&key))
+            {
+                let reference = self.route(&child_path, secret.value())?;
+                *value = TomlValue::from(reference);
+                continue;
+            }
+            self.value(value, &child_path, secret_container || child_container)?;
+        }
+        Ok(())
+    }
+
+    fn value(
+        &mut self,
+        value: &mut TomlValue,
+        path: &str,
+        secret_container: bool,
+    ) -> Result<(), MigrationError> {
+        match value {
+            TomlValue::String(secret) if secret_container => {
+                let reference = self.route(path, secret.value())?;
+                *value = TomlValue::from(reference);
+                Ok(())
+            }
+            TomlValue::InlineTable(table) => self.inline_table(table, path, secret_container),
+            TomlValue::Array(array) => {
+                for (index, child) in array.iter_mut().enumerate() {
+                    self.value(child, &format!("{path}/{index}"), secret_container)?;
                 }
+                Ok(())
             }
-        } else if secret_key(normalized_key)
-            || secret_container_key(normalized_key)
-            || toml_secret_section
-        {
-            identifiers.push_back(secret_identifier(
-                namespace,
-                &format!("/{index}/{normalized_key}"),
-            ));
+            _ => Ok(()),
         }
     }
-    identifiers
-}
 
-fn next_toml_secret_id(identifiers: &mut VecDeque<String>) -> String {
-    identifiers
-        .pop_front()
-        .unwrap_or_else(|| secret_identifier("toml-fallback", "/missing"))
-}
-
-fn redact_inline_secret_table(
-    raw: &str,
-    namespace: &str,
-    index: usize,
-    store: &mut dyn SecretStore,
-    transaction_id: Option<&str>,
-    undo: &mut Vec<SecretUndo>,
-) -> Result<Option<String>, MigrationError> {
-    let body = raw
-        .trim()
-        .strip_prefix('{')
-        .and_then(|value| value.strip_suffix('}'));
-    let Some(body) = body else {
-        return Ok(None);
-    };
-    let entries = split_inline_table_entries(body);
-    if entries.is_empty() {
-        return Ok(Some("{ }".to_owned()));
+    fn route(&mut self, path: &str, secret: &str) -> Result<String, MigrationError> {
+        let id = secret_identifier(self.namespace, path);
+        route_secret(
+            self.store,
+            self.transaction_id,
+            self.undo,
+            &id,
+            secret.as_bytes(),
+        )
     }
-    let mut rewritten = Vec::with_capacity(entries.len());
-    for (position, entry) in entries.iter().enumerate() {
-        let Some((key, value)) = entry.split_once('=') else {
-            return Ok(None);
-        };
-        let key = key.trim();
-        let value = unquote(value.trim());
-        if value.is_empty() {
-            rewritten.push(format!("{key} = \"\""));
-            continue;
-        }
-        let id = secret_identifier(namespace, &format!("/{index}/inline/{position}/{key}"));
-        let reference = route_secret(store, transaction_id, undo, &id, value.as_bytes())?;
-        rewritten.push(format!("{key} = \"{reference}\""));
-    }
-    Ok(Some(format!("{{ {} }}", rewritten.join(", "))))
-}
-
-fn split_inline_table_entries(body: &str) -> Vec<String> {
-    let mut entries = Vec::new();
-    let mut current = String::new();
-    let mut single_quote = false;
-    let mut double_quote = false;
-    let mut escaped = false;
-    let mut depth = 0_u32;
-    for character in body.chars() {
-        if escaped {
-            current.push(character);
-            escaped = false;
-            continue;
-        }
-        match character {
-            '\\' if single_quote || double_quote => {
-                current.push(character);
-                escaped = true;
-            }
-            '\'' if !double_quote => {
-                single_quote = !single_quote;
-                current.push(character);
-            }
-            '"' if !single_quote => {
-                double_quote = !double_quote;
-                current.push(character);
-            }
-            '{' | '[' if !single_quote && !double_quote => {
-                depth += 1;
-                current.push(character);
-            }
-            '}' | ']' if !single_quote && !double_quote && depth > 0 => {
-                depth -= 1;
-                current.push(character);
-            }
-            ',' if !single_quote && !double_quote && depth == 0 => {
-                let entry = current.trim();
-                if !entry.is_empty() {
-                    entries.push(entry.to_owned());
-                }
-                current.clear();
-            }
-            _ => current.push(character),
-        }
-    }
-    let tail = current.trim();
-    if !tail.is_empty() {
-        entries.push(tail.to_owned());
-    }
-    entries
 }
 
 fn import_environment(
     source: &Path,
-    target: &Path,
     namespace: &str,
     store: &mut dyn SecretStore,
     transaction_id: Option<&str>,
     undo: &mut Vec<SecretUndo>,
-) -> Result<(), MigrationError> {
+) -> Result<Vec<u8>, MigrationError> {
     let input = read_text(source)?;
     let mut references = BTreeMap::new();
     for (index, line) in input.lines().enumerate() {
@@ -2224,27 +2429,24 @@ fn import_environment(
             references.insert(key.to_owned(), reference);
         }
     }
-    let bytes = serde_json::to_vec_pretty(&references).map_err(|error| {
+    serde_json::to_vec_pretty(&references).map_err(|error| {
         MigrationError::Signing(format!("environment reference serialization: {error}"))
-    })?;
-    write_bytes(target, &bytes)
+    })
 }
 
 fn store_document(
     source: &Path,
-    target: &Path,
     secret_id: &str,
     store: &mut dyn SecretStore,
     transaction_id: Option<&str>,
     undo: &mut Vec<SecretUndo>,
-) -> Result<(), MigrationError> {
+) -> Result<Vec<u8>, MigrationError> {
     let content = read_bytes(source)?;
     let reference = route_secret(store, transaction_id, undo, secret_id, &content)?;
     let mut object = Map::new();
     object.insert("secret_ref".to_owned(), Value::String(reference));
-    let bytes = serde_json::to_vec_pretty(&Value::Object(object))
-        .map_err(|error| MigrationError::Signing(error.to_string()))?;
-    write_bytes(target, &bytes)
+    serde_json::to_vec_pretty(&Value::Object(object))
+        .map_err(|error| MigrationError::Signing(error.to_string()))
 }
 
 fn route_secret(
@@ -2677,44 +2879,20 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), MigrationError> {
 
 fn write_durable_bytes(path: &Path, bytes: &[u8]) -> Result<(), MigrationError> {
     create_parent(path)?;
-    let temporary = reserve_publish_path(path, "receipt")?;
-    let write_result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&temporary)
-            .map_err(|source| MigrationError::Io {
-                action: "create durable file",
-                path: temporary.clone(),
-                source,
-            })?;
-        file.write_all(bytes).map_err(|source| MigrationError::Io {
-            action: "write durable file",
-            path: temporary.clone(),
-            source,
-        })?;
-        file.flush().map_err(|source| MigrationError::Io {
-            action: "flush durable file",
-            path: temporary.clone(),
-            source,
-        })?;
-        file.sync_all().map_err(|source| MigrationError::Io {
-            action: "sync durable file",
-            path: temporary.clone(),
-            source,
-        })?;
-        drop(file);
-        fs::rename(&temporary, path).map_err(|source| MigrationError::Io {
-            action: "publish durable file",
-            path: path.to_path_buf(),
-            source,
-        })?;
-        sync_parent_path(path)
-    })();
-    if write_result.is_err() {
-        let _ = remove_path_if_exists(&temporary);
-    }
-    write_result
+    let mut staged = StagedArtifact::reserve(path, "receipt")?;
+    staged.write_bytes(bytes)?;
+    staged.sync()?;
+    staged.release_handle();
+    // Receipts are internal bookkeeping under the backup root, not a migration
+    // target another writer competes for, so publication is an unconditional
+    // rename rather than a compare-and-swap.
+    fs::rename(staged.path(), path).map_err(|source| MigrationError::Io {
+        action: "publish durable file",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    staged.into_published();
+    sync_parent_path(path)
 }
 
 fn create_parent(path: &Path) -> Result<(), MigrationError> {
@@ -2754,22 +2932,17 @@ fn sync_file(path: &Path) -> Result<(), MigrationError> {
         })
 }
 
+/// Flushes a directory entry to stable storage.
+///
+/// The failure is reported rather than swallowed. A platform that cannot honour
+/// the request has not made the rename durable, and returning success there
+/// would let apply record a publication that a power loss could still undo.
 fn sync_directory(path: &Path) -> Result<(), MigrationError> {
-    #[cfg(unix)]
-    {
-        File::open(path)
-            .and_then(|file| file.sync_all())
-            .map_err(|source| MigrationError::Io {
-                action: "sync directory",
-                path: path.to_path_buf(),
-                source,
-            })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
+    atomicfs::sync_directory(path).map_err(|source| MigrationError::Io {
+        action: "sync directory",
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn sync_parent_path(path: &Path) -> Result<(), MigrationError> {
@@ -2799,141 +2972,114 @@ pub mod test_publish_failpoint {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    // Path-scoped so concurrent tests operating on different target paths cannot
-    // trigger each other's injected crash.
-    static ACTIVE: Mutex<Option<(&'static str, PathBuf)>> = Mutex::new(None);
+    // Registrations are keyed by `(checkpoint, target path)` and held in a list
+    // rather than a single slot, so tests that run in parallel inside one binary
+    // arm independent failpoints instead of overwriting each other's.
+    static ACTIVE: Mutex<Vec<(&'static str, PathBuf)>> = Mutex::new(Vec::new());
 
-    /// Held during the test; clears the active failpoint on drop.
-    pub struct Guard;
+    type BarrierAction = Box<dyn Fn(&Path) + Send + Sync>;
+
+    static BARRIERS: Mutex<Vec<(&'static str, PathBuf, BarrierAction)>> = Mutex::new(Vec::new());
+
+    /// Held during the test; clears its own failpoint on drop.
+    pub struct Guard {
+        checkpoint: &'static str,
+        target_path: PathBuf,
+    }
+
+    /// Held during the test; clears its own barrier on drop.
+    pub struct BarrierGuard {
+        checkpoint: &'static str,
+        target_path: PathBuf,
+    }
 
     /// Arms a failpoint at `checkpoint` scoped to `target_path`.
     ///
     /// Only a `trigger` call for the same `(checkpoint, target_path)` pair will
     /// panic; concurrent tests operating on different paths are unaffected.
     pub fn set_for(checkpoint: &'static str, target_path: impl AsRef<Path>) -> Guard {
-        *ACTIVE.lock().expect("lock failpoint") =
-            Some((checkpoint, target_path.as_ref().to_path_buf()));
-        Guard
+        let target_path = target_path.as_ref().to_path_buf();
+        ACTIVE
+            .lock()
+            .expect("lock failpoint")
+            .push((checkpoint, target_path.clone()));
+        Guard {
+            checkpoint,
+            target_path,
+        }
+    }
+
+    /// Arms a one-shot action that runs at `checkpoint` for `target_path`.
+    ///
+    /// `before_publish` runs after every pre-publication check and immediately
+    /// before the atomic displacement, which is the window a compare-and-swap
+    /// exists to close.
+    pub fn set_barrier(
+        checkpoint: &'static str,
+        target_path: impl AsRef<Path>,
+        action: impl Fn(&Path) + Send + Sync + 'static,
+    ) -> BarrierGuard {
+        let target_path = target_path.as_ref().to_path_buf();
+        BARRIERS.lock().expect("lock failpoint barrier").push((
+            checkpoint,
+            target_path.clone(),
+            Box::new(action),
+        ));
+        BarrierGuard {
+            checkpoint,
+            target_path,
+        }
+    }
+
+    fn take(
+        registrations: &mut Vec<(&'static str, PathBuf)>,
+        checkpoint: &str,
+        target: &Path,
+    ) -> bool {
+        registrations
+            .iter()
+            .position(|(armed, path)| *armed == checkpoint && path == target)
+            .map(|index| registrations.swap_remove(index))
+            .is_some()
     }
 
     pub(super) fn trigger(checkpoint: &str, target: &Path) {
         let armed = {
-            let mut guard = ACTIVE.lock().expect("lock failpoint");
-            if guard
-                .as_ref()
-                .is_some_and(|(c, p)| *c == checkpoint && p == target)
-            {
-                *guard = None; // fire once, then disarm
-                true
-            } else {
-                false
-            }
+            let mut registrations = ACTIVE.lock().expect("lock failpoint");
+            take(&mut registrations, checkpoint, target)
         };
         assert!(!armed, "injected crash at {checkpoint}");
     }
 
+    pub(super) fn run_barrier(checkpoint: &str, target: &Path) {
+        let action = {
+            let mut registrations = BARRIERS.lock().expect("lock failpoint barrier");
+            registrations
+                .iter()
+                .position(|(armed, path, _)| *armed == checkpoint && path == target)
+                .map(|index| registrations.swap_remove(index))
+        };
+        if let Some((_, _, action)) = action {
+            action(target);
+        }
+    }
+
     impl Drop for Guard {
         fn drop(&mut self) {
-            *ACTIVE.lock().expect("lock failpoint") = None;
-        }
-    }
-}
-
-#[cfg(test)]
-mod crash_recovery_tests {
-    use super::*;
-
-    #[derive(Default)]
-    struct NoopSecretStore;
-
-    impl SecretStore for NoopSecretStore {
-        fn get(&mut self, _id: &str) -> Result<Option<SecretValue>, SecretStoreError> {
-            Ok(None)
-        }
-
-        fn put(&mut self, id: &str, _value: SecretValue) -> Result<String, SecretStoreError> {
-            Ok(format!("keyring://gta-claw/{id}"))
-        }
-
-        fn remove(&mut self, _id: &str) -> Result<(), SecretStoreError> {
-            Ok(())
+            let mut registrations = ACTIVE.lock().expect("lock failpoint");
+            take(&mut registrations, self.checkpoint, &self.target_path);
         }
     }
 
-    fn temporary_root(label: &str) -> PathBuf {
-        let directory = std::env::temp_dir().join(format!(
-            "claw-migrate-crash-recovery-{label}-{}-{}",
-            std::process::id(),
-            BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).expect("create test root");
-        directory
-    }
-
-    #[test]
-    fn overwrite_publication_recovers_pending_receipt_deterministically_for_all_crash_phases() {
-        for checkpoint in [
-            "after_staging_write",
-            "after_target_moved",
-            "after_target_published",
-        ] {
-            let root = temporary_root(checkpoint);
-            let target_root = root.join("target");
-            let backup_root = root.join("backup-root");
-            let backup_dir = backup_root.join("tx-1");
-            fs::create_dir_all(&backup_dir).expect("create backup directory");
-            let target = target_root.join("workspace").join("AGENTS.md");
-            create_parent(&target).expect("create target parent");
-            fs::write(&target, b"old-bytes").expect("write original target");
-            let backup = backup_dir.join("items").join("0");
-            create_parent(&backup).expect("create backup parent");
-            fs::copy(&target, &backup).expect("copy original to backup");
-            let digest = digest_path(&backup).expect("digest backup");
-            let receipt = ApplyReceipt {
-                provider_id: "test",
-                backup_dir: backup_dir.clone(),
-                backups: vec![BackupEntry {
-                    target: target.clone(),
-                    backup: Some(backup),
-                    original_digest: Some(digest),
-                    original_absent: false,
-                    expected_new_digest: Some(digest_bytes(b"new-bytes")),
-                    applied: true,
-                }],
-                secrets: Vec::new(),
-                secret_transaction: None,
-            };
-            write_durable_receipt(&receipt, DurableReceiptState::Pending)
-                .expect("write pending receipt");
-
-            let staged = reserve_publish_path(&target, "stage").expect("reserve stage");
-            write_bytes(&staged, b"new-bytes").expect("write staged bytes");
-            let crash = std::panic::catch_unwind(|| {
-                let _guard = test_publish_failpoint::set_for(checkpoint, &target);
-                publish_staged_path(true, &target, &staged, 0).expect("publish staged path");
-            });
-            assert!(crash.is_err(), "expected injected crash at {checkpoint}");
-            let observed = fs::read(&target).expect("read target after injected crash");
-            assert!(
-                observed == b"old-bytes" || observed == b"new-bytes",
-                "target must be immediately old-or-new at {checkpoint}"
-            );
-
-            let mut secrets = NoopSecretStore;
-            recover_pending_backups(&backup_root, &target_root, &mut secrets)
-                .expect("recover pending receipt");
-            assert_eq!(
-                fs::read(&target).expect("read recovered target"),
-                b"old-bytes"
-            );
-            recover_pending_backups(&backup_root, &target_root, &mut secrets)
-                .expect("second recovery pass stays idempotent");
-            assert_eq!(
-                fs::read(&target).expect("read idempotent recovered target"),
-                b"old-bytes"
-            );
-            let _ = fs::remove_dir_all(root);
+    impl Drop for BarrierGuard {
+        fn drop(&mut self) {
+            let mut registrations = BARRIERS.lock().expect("lock failpoint barrier");
+            if let Some(index) = registrations
+                .iter()
+                .position(|(armed, path, _)| *armed == self.checkpoint && *path == self.target_path)
+            {
+                drop(registrations.swap_remove(index));
+            }
         }
     }
 }

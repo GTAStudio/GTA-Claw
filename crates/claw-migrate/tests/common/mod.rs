@@ -62,6 +62,8 @@ impl Drop for TestDir {
 pub(crate) struct MemorySecretStore {
     pub(crate) values: BTreeMap<String, SecretValue>,
     pub(crate) fail_put: bool,
+    /// Transaction identifiers that reached `commit_transaction`.
+    pub(crate) committed: Vec<String>,
     pending: BTreeMap<String, BTreeMap<String, Option<SecretValue>>>,
     next_transaction: u64,
 }
@@ -147,6 +149,7 @@ impl SecretStore for MemorySecretStore {
         if !self.pending.contains_key(transaction_id) {
             return Err(SecretStoreError::new("missing transaction"));
         }
+        self.committed.push(transaction_id.to_owned());
         Ok(())
     }
 

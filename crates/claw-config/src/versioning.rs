@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,8 +9,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::io::{
-    WriteOutcome, WriteWarning, atomic_write_bytes, atomic_write_bytes_locked,
-    with_destination_lock,
+    Publication, PublicationGuard, WriteOutcome, WriteWarning, atomic_write_bytes,
+    publish_bytes_locked, with_destination_lock,
 };
 use crate::{CONFIG_SCHEMA_VERSION, ConfigError, parse_json5, to_json5};
 
@@ -292,36 +292,51 @@ fn migrate_config_file_with_precommit(
             let source_digest = digest_hex(&source);
             let backup_path = create_backup(locked_path, &source)?;
             let mut conflict_backup = None;
-            let write_outcome = atomic_write_bytes_locked(locked_path, &destination_bytes, || {
-                precommit(locked_path);
-                let current = fs::read(locked_path)?;
-                if digest_hex(&current) != source_digest {
-                    let backup = create_backup_io(locked_path, &current)?;
-                    conflict_backup = Some(backup);
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "concurrent edit detected",
-                    ));
-                }
-                Ok(())
-            });
-            if let Err(source) = write_outcome {
-                if let Some(concurrent_backup) = conflict_backup {
+            // The early read is a cheap way to fail before a backup-consuming
+            // publication, but it is not the guarantee: `PublicationGuard`
+            // re-checks the destination as part of the atomic exchange, which is
+            // the only point at which a non-cooperating writer can no longer slip
+            // in between the comparison and the replacement.
+            let published = publish_bytes_locked(
+                locked_path,
+                &destination_bytes,
+                PublicationGuard::Digest(&source_digest),
+                || {
+                    precommit(locked_path);
+                    let current = fs::read(locked_path)?;
+                    if digest_hex(&current) != source_digest {
+                        let backup = create_backup_io(locked_path, &current)?;
+                        conflict_backup = Some(backup);
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "concurrent edit detected",
+                        ));
+                    }
+                    Ok(())
+                },
+            );
+            let outcome = match published {
+                Ok(Publication::Published(outcome)) => outcome,
+                Ok(Publication::Conflict { actual }) => {
                     return Err(ConfigMigrationError::ConcurrentEdit {
                         config_path: locked_path.to_owned(),
-                        backup_path: concurrent_backup,
+                        backup_path: create_backup(locked_path, &actual)?,
                     });
                 }
-                return Err(ConfigMigrationError::Config(ConfigError::io(
-                    locked_path,
-                    source,
-                )));
-            }
-            surface_durability_warnings(
-                locked_path,
-                Some(&backup_path),
-                write_outcome.expect("checked above"),
-            )?;
+                Err(source) => {
+                    if let Some(concurrent_backup) = conflict_backup {
+                        return Err(ConfigMigrationError::ConcurrentEdit {
+                            config_path: locked_path.to_owned(),
+                            backup_path: concurrent_backup,
+                        });
+                    }
+                    return Err(ConfigMigrationError::Config(ConfigError::io(
+                        locked_path,
+                        source,
+                    )));
+                }
+            };
+            surface_durability_warnings(locked_path, Some(&backup_path), outcome)?;
             Ok(ConfigMigrationOutcome::Migrated(ConfigMigrationRecord {
                 config_path: locked_path.to_owned(),
                 backup_path,
@@ -406,11 +421,7 @@ fn create_backup_io(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
             std::process::id(),
             sequence
         ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&backup_path)
-        {
+        match crate::atomicfs::create_new_no_follow(&backup_path) {
             Ok(mut file) => {
                 file.write_all(bytes)
                     .and_then(|()| file.flush())
@@ -429,7 +440,7 @@ fn create_backup_io(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     ))
 }
 
-fn digest_hex(bytes: &[u8]) -> String {
+pub(crate) fn digest_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     encode_hex(&hasher.finalize())
@@ -509,18 +520,15 @@ mod lock_tests {
     }
 }
 
-#[cfg(unix)]
+/// Flushes the directory entry that now names a freshly written backup.
+///
+/// The operating-system failure is propagated: a backup whose directory entry
+/// is not durable is not a backup a destructive migration may rely on.
 fn sync_parent(path: &Path) -> io::Result<()> {
-    fs::File::open(
+    crate::atomicfs::sync_directory(
         path.parent()
             .expect("allocated backup paths always have a parent"),
-    )?
-    .sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> io::Result<()> {
-    Ok(())
+    )
 }
 
 #[cfg(test)]
@@ -532,7 +540,10 @@ mod tests {
         ConfigMigrationError, ConfigMigrationOutcome, migrate_config_file_with_precommit,
         rollback_config_migration,
     };
-    use crate::io::{inject_directory_sync_warning_for_tests, write_bytes_atomically};
+    use crate::io::{
+        inject_directory_sync_warning_for_tests, inject_external_writer_for_tests,
+        write_bytes_atomically,
+    };
 
     const VERSION_ZERO: &str = r#"
 {
@@ -595,6 +606,55 @@ mod tests {
                     | Ok(ConfigMigrationOutcome::Current)
             ),
             "post-conflict source remains untouched by failed migration"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A non-cooperating writer that publishes after the digest check and
+    /// immediately before the exchange must keep its bytes.
+    ///
+    /// The shared advisory lock only orders writers that take it. A text editor
+    /// saving the file does not, so the comparison has to be part of the
+    /// publication rather than a read that precedes it.
+    #[test]
+    fn an_external_writer_between_the_check_and_publication_is_reported_and_backed_up() {
+        const EXTERNAL: &str = "{ /* hand edited outside the lock */ }";
+
+        let directory = std::env::temp_dir().join(format!(
+            "claw-config-versioning-external-writer-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create directory");
+        let path = directory.join("config.json5");
+        std::fs::write(&path, VERSION_ZERO.as_bytes()).expect("write source");
+        let destination = std::fs::canonicalize(&path).expect("canonicalize destination");
+
+        let _barrier = inject_external_writer_for_tests(&destination, |destination| {
+            let staging = destination.with_file_name(".external-editor-save");
+            std::fs::write(&staging, EXTERNAL).expect("stage external bytes");
+            std::fs::rename(&staging, destination).expect("publish external bytes");
+        });
+        let error = migrate_config_file_with_precommit(&path, |_| {})
+            .expect_err("publication over foreign bytes must be refused");
+
+        let ConfigMigrationError::ConcurrentEdit {
+            config_path,
+            backup_path,
+        } = error
+        else {
+            panic!("expected a concurrent edit, got {error}");
+        };
+        assert_eq!(config_path, destination);
+        assert_eq!(
+            std::fs::read_to_string(&backup_path).expect("read conflict backup"),
+            EXTERNAL,
+            "the backup must hold the displaced bytes exactly"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read destination"),
+            EXTERNAL,
+            "the external writer's bytes must survive at the destination"
         );
         let _ = std::fs::remove_dir_all(&directory);
     }

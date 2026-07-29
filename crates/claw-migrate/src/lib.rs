@@ -6,6 +6,7 @@
 //! verifies backups before writing, while rollback restores files and
 //! secret-store entries and reports every independent restoration failure.
 
+mod atomicfs;
 mod contract;
 mod engine;
 mod platform;
