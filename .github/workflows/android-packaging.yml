@@ -65,6 +65,8 @@ jobs:
 
       - name: Run Android shell source tests
         shell: bash
+        env:
+          RUST_FONTCONFIG_DLOPEN: "1"
         run: |
           set -euo pipefail
           ./android/scripts/workflow-self-test.sh

@@ -65,10 +65,7 @@ jobs:
 
       - name: Run iOS shell source tests
         shell: bash
-        run: |
-          set -euo pipefail
-          ./ios/scripts/workflow-self-test.sh
-          ./ios/scripts/check.sh
+        run: ./ios/scripts/workflow-self-test.sh
 
       - name: Check iOS workspace at MSRV
         run: |

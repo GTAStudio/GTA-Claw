@@ -13,6 +13,8 @@ run_mount_failure() (
   set -e
   source "$SCRIPT_DIR/lib/container-mount.sh"
   mount_root="$work/partial-root"
+  # Called indirectly by the sourced mount helper.
+  # shellcheck disable=SC2317,SC2329
   sudo() {
     local tool="$1"
     shift
@@ -44,6 +46,8 @@ fi
   mount_root="$work/cleanup-root"
   mkdir -m 0700 -- "$mount_root" "$mount_root/repository" "$mount_root/target"
   ANCHORED_MOUNT_ROOT="$mount_root"
+  # Called indirectly by the sourced mount helper.
+  # shellcheck disable=SC2317,SC2329
   sudo() {
     local tool="$1"
     shift

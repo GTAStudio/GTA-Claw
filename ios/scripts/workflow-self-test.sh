@@ -4,9 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 workspace="$repo_root/ios"
 workflow="$repo_root/.github/workflows/ios-packaging.yml"
-controller="$workspace/apps/gta-claw-ios-shell/src/controller.rs"
 host="$workspace/apps/gta-claw-ios-shell/src/host.rs"
-main="$workspace/apps/gta-claw-ios-shell/src/main.rs"
 
 find "$workspace/scripts" -type f -name '*.sh' -print0 |
   while IFS= read -r -d '' script; do
