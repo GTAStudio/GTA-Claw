@@ -1,0 +1,108 @@
+# shellcheck shell=sh disable=SC2329
+set -eu
+
+state_root="${GTA_CLAW_PACKAGE_STATE_ROOT:-/run}"
+systemd_runtime="${GTA_CLAW_SYSTEMD_RUNTIME_DIR:-/run/systemd/system}"
+old_nevra="$state_root/gta-claw-daemon.old-nevra"
+was_active="$state_root/gta-claw-daemon.was-active"
+prepared_marker="$state_root/gta-claw-daemon.upgrade-prepared"
+configured_marker="$state_root/gta-claw-daemon.upgrade-configured"
+remove_was_active="$state_root/gta-claw-daemon.remove-was-active"
+remove_was_enabled="$state_root/gta-claw-daemon.remove-was-enabled"
+remove_was_enabled_runtime="$state_root/gta-claw-daemon.remove-was-enabled-runtime"
+remove_prepared="$state_root/gta-claw-daemon.remove-prepared"
+prepared=0
+
+retire_remove_journal() {
+  rm -f \
+    "$remove_was_active" \
+    "$remove_was_enabled" \
+    "$remove_was_enabled_runtime" \
+    "$remove_prepared"
+}
+
+restore_erase_failure() {
+  status=$?
+  trap - 0 1 2 15
+  if [ "$prepared" -eq 0 ] && [ -d "$systemd_runtime" ]; then
+    if [ -e "$remove_was_enabled" ]; then
+      systemctl enable gta-claw-daemon.service >/dev/null
+    elif [ -e "$remove_was_enabled_runtime" ]; then
+      systemctl enable --runtime gta-claw-daemon.service >/dev/null
+    fi
+    if [ -e "$remove_was_active" ] &&
+      ! systemctl is-active --quiet gta-claw-daemon.service; then
+      systemctl start gta-claw-daemon.service >/dev/null
+    fi
+  fi
+  retire_remove_journal
+  exit "$status"
+}
+
+if [ "$1" -gt 0 ]; then
+  if [ -e "$prepared_marker" ] && [ ! -e "$configured_marker" ]; then
+    echo "Refusing to erase the old RPM after an incomplete replacement" >&2
+    exit 1
+  fi
+  if [ -e "$was_active" ] && [ -d "$systemd_runtime" ]; then
+    systemctl is-active --quiet gta-claw-daemon.service
+  fi
+  exit 0
+fi
+
+if [ -e "$prepared_marker" ] || [ -e "$configured_marker" ] || [ -e "$old_nevra" ]; then
+  echo "Refusing RPM erase while an upgrade lifecycle journal exists" >&2
+  exit 1
+fi
+
+if [ -d "$systemd_runtime" ]; then
+  for marker in \
+    "$remove_was_active" \
+    "$remove_was_enabled" \
+    "$remove_was_enabled_runtime" \
+    "$remove_prepared"; do
+    if [ -e "$marker" ] || [ -L "$marker" ]; then
+      echo "Refusing erase with a stale RPM removal marker: $marker" >&2
+      exit 1
+    fi
+  done
+
+  trap restore_erase_failure 0 1 2 15
+  umask 077
+  if systemctl is-active --quiet gta-claw-daemon.service; then
+    touch "$remove_was_active"
+  fi
+  enabled_state=""
+  if enabled_state="$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null)"; then
+    :
+  fi
+  case "$enabled_state" in
+    enabled) touch "$remove_was_enabled" ;;
+    enabled-runtime) touch "$remove_was_enabled_runtime" ;;
+    disabled | indirect | static | generated | transient | not-found | masked | masked-runtime | '') ;;
+    *)
+      echo "Unexpected service enablement before RPM erase: $enabled_state" >&2
+      exit 1
+      ;;
+  esac
+  touch "$remove_prepared"
+
+  case "$enabled_state" in
+    enabled)
+      systemctl disable gta-claw-daemon.service >/dev/null
+      ;;
+    enabled-runtime)
+      systemctl disable --runtime gta-claw-daemon.service >/dev/null
+      ;;
+  esac
+  systemctl stop gta-claw-daemon.service >/dev/null
+  if systemctl is-active --quiet gta-claw-daemon.service; then
+    echo "RPM erase did not stop gta-claw-daemon.service" >&2
+    exit 1
+  fi
+
+  prepared=1
+  trap - 0 1 2 15
+fi
+
+exit 0

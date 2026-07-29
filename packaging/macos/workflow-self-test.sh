@@ -49,8 +49,22 @@ grep -F 'shasum -a 256 -c SHA256SUMS' "$workflow" >/dev/null
 grep -F "github.event_name == 'workflow_dispatch' && inputs.release == true" \
   <<<"$protected_release" >/dev/null
 grep -F 'environment: macos-release' <<<"$protected_release" >/dev/null
+grep -F 'contents: write' <<<"$protected_release" >/dev/null
 grep -F 'actions/download-artifact@' <<<"$protected_release" >/dev/null
 grep -F 'if: always()' <<<"$protected_release" >/dev/null
+grep -F 'SHA256SUMS-macos' <<<"$protected_release" >/dev/null
+grep -F 'manifest="$state/SHA256SUMS-macos"' <<<"$protected_release" >/dev/null
+grep -F '"${artifact#./}"' <<<"$protected_release" >/dev/null
+grep -F 'name: Publish exact bytes to GitHub Release' <<<"$protected_release" >/dev/null
+grep -F 'gh release upload "$tag" "$distribution/SHA256SUMS-macos"' \
+  <<<"$protected_release" >/dev/null
+if grep -F -- '--clobber' <<<"$protected_release" >/dev/null; then
+  echo "protected release publishing must not replace existing asset bytes" >&2
+  exit 1
+fi
+grep -F 'needs: protected-release-contract' <<<"$protected_release" >/dev/null
+grep -F 'uses: ./.github/workflows/joint-release-finalize.yml' \
+  <<<"$protected_release" >/dev/null
 
 test "$(grep -c 'uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' <<<"$protected_release")" -eq 1
 # shellcheck disable=SC2016
@@ -81,5 +95,7 @@ if ! awk '
   echo "release secrets must exist only in individual step env mappings" >&2
   exit 1
 fi
+
+"$SCRIPT_DIR/joint-release-self-test.sh"
 
 echo "macOS workflow trust-boundary self-tests passed"

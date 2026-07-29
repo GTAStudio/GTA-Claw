@@ -12,6 +12,7 @@ DynamicUser=yes
 User=gta-claw
 Group=gta-claw
 EnvironmentFile=-/etc/gta-claw/gta-claw.env
+Environment=GTA_CLAW_STATE_DIR=/var/lib/gta-claw
 LoadCredential=gta-claw-config:/etc/gta-claw/credentials/daemon.conf
 StateDirectory=gta-claw
 StateDirectoryMode=0700
@@ -38,7 +39,8 @@ ProtectProc=invisible
 ProcSubset=pid
 CapabilityBoundingSet=
 AmbientCapabilities=
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressAllow=localhost
 IPAddressDeny=any
 RestrictNamespaces=yes
 RestrictRealtime=yes

@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/windows-packaging.yml"
+      - ".github/workflows/joint-release-finalize.yml"
       - "packaging/windows/**"
       - "apps/**"
       - "crates/**"
@@ -429,61 +430,42 @@ jobs:
           }
           $existingAssets = @(gh release view $tag --json assets --jq '.assets[].name')
           if ('SHA256SUMS-windows' -in $existingAssets) {
-            gh release delete-asset $tag SHA256SUMS-windows --yes
-            if ($LASTEXITCODE -ne 0) {
-              throw 'Failed to remove the previous Windows release completion manifest.'
+            Write-Host 'Windows release completion is already immutable; retaining published bytes.'
+            exit 0
+          }
+          $publication = (Resolve-Path packaging\windows\out\release).Path
+          $existingDirectory = Join-Path $env:RUNNER_TEMP 'gta-claw-existing-windows-release'
+          if (Test-Path -LiteralPath $existingDirectory) {
+            Remove-Item -LiteralPath $existingDirectory -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $existingDirectory | Out-Null
+          $paths = @()
+          foreach ($file in @(Get-ChildItem $publication -File |
+              Where-Object { $_.Name -ne 'SHA256SUMS-windows' })) {
+            if ($file.Name -in $existingAssets) {
+              gh release download $tag --pattern $file.Name --dir $existingDirectory
+              if ($LASTEXITCODE -ne 0) {
+                throw "Failed to download existing Windows release asset: $($file.Name)"
+              }
+              $remote = Join-Path $existingDirectory $file.Name
+              $localHash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash
+              $remoteHash = (Get-FileHash $remote -Algorithm SHA256).Hash
+              if ($localHash -cne $remoteHash) {
+                throw "Refusing to discard different existing release bytes: $($file.Name)"
+              }
+            } else {
+              $paths += $file.FullName
             }
           }
-          $existingAssets = @(gh release view $tag --json assets --jq '.assets[].name')
-          if ('SHA256SUMS-windows' -in $existingAssets) {
-            throw 'Windows release completion manifest remains after deletion.'
+          if ($paths.Count -gt 0) {
+            gh release upload $tag @paths
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Windows release asset upload failed.'
+            }
           }
-          $paths = @(Get-ChildItem packaging\windows\out\release -File |
-            Where-Object { $_.Name -ne 'SHA256SUMS-windows' } |
-            Select-Object -ExpandProperty FullName)
-          gh release upload $tag @paths --clobber
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Windows release asset upload failed.'
-          }
-          gh release upload $tag packaging\windows\out\release\SHA256SUMS-windows --clobber
+          gh release upload $tag (Join-Path $publication 'SHA256SUMS-windows')
           if ($LASTEXITCODE -ne 0) {
             throw 'Windows release checksum upload failed.'
-          }
-          $assets = @(gh release view $tag --json assets --jq '.assets[].name')
-          if ('SHA256SUMS-windows' -in $assets -and 'SHA256SUMS-macos' -in $assets) {
-            $verify = Join-Path $env:RUNNER_TEMP 'gta-claw-joint-release'
-            if (Test-Path -LiteralPath $verify) {
-              Remove-Item -LiteralPath $verify -Recurse -Force
-            }
-            New-Item -ItemType Directory -Path $verify | Out-Null
-            gh release download $tag --dir $verify
-            if ($LASTEXITCODE -ne 0) {
-              throw 'Joint release download failed.'
-            }
-            $expected = @('SHA256SUMS-macos', 'SHA256SUMS-windows')
-            foreach ($manifestName in @('SHA256SUMS-macos', 'SHA256SUMS-windows')) {
-              $manifest = Join-Path $verify $manifestName
-              foreach ($line in [IO.File]::ReadAllLines($manifest)) {
-                if ($line -notmatch '^([0-9a-f]{64})  ([^\\/]+)$') {
-                  throw "Invalid joint release checksum entry: $line"
-                }
-                $name = $Matches[2]
-                $expected += $name
-                $fileHash = Get-FileHash (Join-Path $verify $name) -Algorithm SHA256
-                $actual = $fileHash.Hash.ToLowerInvariant()
-                if ($actual -ne $Matches[1]) {
-                  throw "Joint release checksum mismatch: $name"
-                }
-              }
-            }
-            $actualNames = @(Get-ChildItem $verify -File |
-              Select-Object -ExpandProperty Name |
-              Sort-Object)
-            $expectedNames = @($expected | Sort-Object)
-            if (($actualNames -join "`n") -cne ($expectedNames -join "`n")) {
-              throw 'Joint release asset set differs from both checksum manifests.'
-            }
-            gh release edit $tag --draft=false
           }
 
       - name: Always remove signing identity
@@ -496,3 +478,13 @@ jobs:
           }
           Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'gta-claw-signing.pfx') `
             -Force -ErrorAction SilentlyContinue
+
+  finalize-release:
+    name: Finalize joint desktop release
+    if: github.event_name == 'workflow_dispatch' && inputs.release == true
+    needs: release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/joint-release-finalize.yml
+    with:
+      tag: ${{ github.ref_name }}

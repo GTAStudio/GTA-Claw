@@ -35,7 +35,18 @@ cleanup() {
   sudo rm -f \
     /etc/gta-claw/gta-claw.env.rpmsave \
     /run/gta-claw-daemon.deb-was-active \
-    /run/gta-claw-daemon.deb-was-enabled
+    /run/gta-claw-daemon.deb-was-enabled \
+    /run/gta-claw-daemon.old-nevra \
+    /run/gta-claw-daemon.was-active \
+    /run/gta-claw-daemon.was-enabled \
+    /run/gta-claw-daemon.was-enabled-runtime \
+    /run/gta-claw-daemon.upgrade-prepared \
+    /run/gta-claw-daemon.upgrade-configured \
+    /run/gta-claw-daemon.remove-was-active \
+    /run/gta-claw-daemon.remove-was-enabled \
+    /run/gta-claw-daemon.remove-was-enabled-runtime \
+    /run/gta-claw-daemon.remove-prepared \
+    /run/gta-claw-daemon.operator-lifecycle-marker
   sudo systemctl daemon-reload >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
@@ -141,13 +152,47 @@ fi
 remove_failure_dropin
 sudo systemctl enable --now gta-claw-daemon.service
 rpm_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
-install_failure_dropin Service 'ExecStartPre=/bin/false'
-if sudo rpm -Uvh --nodeps "$rpm2"; then
-  die "RPM upgrade swallowed an intentional restart failure"
+old_nevra="$(rpm -q --qf '%{NEVRA}\n' gta-claw)"
+old_payload="$(
+  rpm -ql gta-claw |
+    while IFS= read -r path; do
+      if sudo test -f "$path" && ! sudo test -L "$path"; then
+        sudo sha256sum "$path"
+      fi
+    done
+)"
+printf 'operator lifecycle marker\n' |
+  sudo tee /run/gta-claw-daemon.operator-lifecycle-marker >/dev/null
+old_marker="$(
+  sudo sha256sum /run/gta-claw-daemon.operator-lifecycle-marker |
+    awk '{print $1}'
+)"
+if sudo env GTA_CLAW_PACKAGE_TEST_FAIL_UPGRADE_PREPARE=1 \
+  rpm -Uvh --nodeps "$rpm2"; then
+  die "RPM pre-mutation upgrade failure unexpectedly succeeded"
 fi
-remove_failure_dropin
-sudo systemctl start gta-claw-daemon.service
-sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"
+[[ "$(rpm -q --qf '%{NEVRA}\n' gta-claw)" == "$old_nevra" ]] ||
+  die "failed RPM upgrade did not retain exactly the old installed NEVRA"
+current_payload="$(
+  rpm -ql gta-claw |
+    while IFS= read -r path; do
+      if sudo test -f "$path" && ! sudo test -L "$path"; then
+        sudo sha256sum "$path"
+      fi
+    done
+)"
+[[ "$current_payload" == "$old_payload" ]] ||
+  die "failed RPM upgrade changed the prior package payload"
+[[ "$(
+  sudo sha256sum /run/gta-claw-daemon.operator-lifecycle-marker |
+    awk '{print $1}'
+)" == "$old_marker" ]] ||
+  die "failed RPM upgrade changed the lifecycle marker"
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "pre-mutation RPM failure changed the active service state"
+[[ "$(systemctl is-enabled gta-claw-daemon.service)" == "enabled" ]] ||
+  die "pre-mutation RPM failure changed service enablement"
+sudo rpm -Uvh --nodeps "$rpm2"
 assert_active_restart "$rpm_pid"
 [[ "$(sudo cat /etc/gta-claw/gta-claw.env)" == \
   "RPM_LIFECYCLE_MARKER=preserved" ]] ||
@@ -165,6 +210,8 @@ fi
   die "RPM removal unlinked daemon after stop failure"
 systemctl is-active --quiet gta-claw-daemon.service ||
   die "RPM removal stopped daemon despite refused stop"
+[[ "$(systemctl is-enabled gta-claw-daemon.service)" == "enabled" ]] ||
+  die "failed RPM removal did not restore the enabled service state"
 remove_failure_dropin
 sudo rpm -Uvh \
   --nodeps \
@@ -186,5 +233,6 @@ sudo rpm -e --nodeps gta-claw
     "RPM_LIFECYCLE_MARKER=preserved" ]] ||
   die "RPM removal did not preserve administrator configuration as .rpmsave"
 
+sudo rm -f /run/gta-claw-daemon.operator-lifecycle-marker
 trap - EXIT INT TERM
 echo "Debian and RPM install/start/upgrade/remove lifecycle tests passed"

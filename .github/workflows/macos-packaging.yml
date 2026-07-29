@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - ".github/workflows/macos-packaging.yml"
+      - ".github/workflows/joint-release-finalize.yml"
       - "packaging/macos/**"
       - "apps/**"
       - "crates/**"
@@ -16,6 +17,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/macos-packaging.yml"
+      - ".github/workflows/joint-release-finalize.yml"
       - "packaging/macos/**"
       - "apps/**"
       - "crates/**"
@@ -420,7 +422,7 @@ jobs:
     environment: macos-release
     permissions:
       actions: read
-      contents: read
+      contents: write
     steps:
       - name: Checkout exact trusted release verifier
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -776,7 +778,7 @@ jobs:
             xcrun stapler validate "$artifact"
           done
 
-      - name: Validate protected release outputs without publishing
+      - name: Validate protected release outputs
         shell: bash
         run: |
           set -euo pipefail
@@ -794,8 +796,73 @@ jobs:
             grep -F 'Developer ID Installer:' >/dev/null
           xcrun stapler validate "$distribution"/*.dmg
           xcrun stapler validate "$distribution"/*.pkg
-          (cd "$distribution" && shasum -a 256 * >SHA256SUMS)
-          echo "Protected release contract passed. Artifacts are intentionally not uploaded or published."
+          manifest="$state/SHA256SUMS-macos"
+          (
+            cd "$distribution"
+            for artifact in ./*; do
+              digest="$(shasum -a 256 "$artifact" | awk '{print $1}')"
+              printf '%s  %s\n' "$digest" "${artifact#./}"
+            done
+          ) >"$manifest"
+          mv "$manifest" "$distribution/SHA256SUMS-macos"
+          echo "Protected release contract passed."
+
+      - name: Publish exact bytes to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          distribution="$RUNNER_TEMP/gta-claw-release/distribution"
+          tag="$GITHUB_REF_NAME"
+          gh release view "$tag" >/dev/null 2>&1 || {
+            gh release create "$tag" \
+              --draft \
+              --verify-tag \
+              --title "GTA Claw $tag" \
+              --notes 'Native Rust release artifacts. Verify platform SHA256SUMS, SBOMs, and provenance before installation.' ||
+              gh release view "$tag" >/dev/null
+          }
+          release_json="$(gh release view "$tag" --json isDraft)"
+          if [[ "$(jq -r '.isDraft' <<<"$release_json")" != "true" ]]; then
+            echo "Refusing to replace assets on an already-published release." >&2
+            exit 1
+          fi
+          existing="$(gh release view "$tag" --json assets --jq '.assets[].name')"
+          if grep -Fqx SHA256SUMS-macos <<<"$existing"; then
+            echo "macOS release completion is already immutable; retaining published bytes."
+            exit 0
+          fi
+          existing_dir="$(mktemp -d "$RUNNER_TEMP/gta-claw-existing-macos-release.XXXXXX")"
+          paths=()
+          for path in "$distribution"/*; do
+            if [[ ! -f "$path" || -L "$path" ]]; then
+              echo "Refusing non-regular macOS release asset: $path" >&2
+              exit 1
+            fi
+            name="$(basename "$path")"
+            if [[ "$name" == "SHA256SUMS-macos" ]]; then
+              continue
+            fi
+            if grep -Fqx "$name" <<<"$existing"; then
+              gh release download "$tag" --pattern "$name" --dir "$existing_dir"
+              if ! cmp "$path" "$existing_dir/$name"; then
+                echo "Refusing to discard different existing release bytes: $name" >&2
+                exit 1
+              fi
+            else
+              paths+=("$path")
+            fi
+          done
+          [[ "${#paths[@]}" -gt 0 || -n "$existing" ]] || {
+            echo "No macOS release artifacts are available to upload." >&2
+            exit 1
+          }
+          if [[ "${#paths[@]}" -gt 0 ]]; then
+            gh release upload "$tag" "${paths[@]}"
+          fi
+          gh release upload "$tag" "$distribution/SHA256SUMS-macos"
 
       - name: Always remove temporary keychain and credentials
         if: always()
@@ -811,3 +878,13 @@ jobs:
           fi
           rm -rf -- "$RUNNER_TEMP/gta-claw-release-download"
           rm -rf -- "$state"
+
+  finalize-release:
+    name: Finalize joint desktop release
+    if: github.event_name == 'workflow_dispatch' && inputs.release == true
+    needs: protected-release-contract
+    permissions:
+      contents: write
+    uses: ./.github/workflows/joint-release-finalize.yml
+    with:
+      tag: ${{ github.ref_name }}

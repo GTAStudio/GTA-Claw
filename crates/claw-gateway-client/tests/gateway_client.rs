@@ -1914,9 +1914,12 @@ async fn unique_request_identifier_budget_is_bounded_without_eviction() {
 
 #[tokio::test]
 async fn cancellation_is_safe_during_connect_auth_and_reconnect() {
-    let (url, raw_cancel, raw_tasks) = raw_stalled_server().await;
+    let (url, raw_cancel, raw_tasks, handshake_received) = raw_stalled_server().await;
     let (client, _) = GatewayClient::start(config(url)).expect("start");
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    tokio::time::timeout(Duration::from_secs(2), handshake_received)
+        .await
+        .expect("server received the WebSocket handshake")
+        .expect("handshake readiness signal sent");
     client.shutdown().await.expect("cancel connect");
     raw_cancel.cancel();
     raw_tasks.close();

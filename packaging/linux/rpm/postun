@@ -1,0 +1,18 @@
+# shellcheck shell=sh
+set -eu
+
+state_root="${GTA_CLAW_PACKAGE_STATE_ROOT:-/run}"
+systemd_runtime="${GTA_CLAW_SYSTEMD_RUNTIME_DIR:-/run/systemd/system}"
+
+if [ -d "$systemd_runtime" ]; then
+  systemctl daemon-reload >/dev/null
+fi
+if [ "$1" -eq 0 ]; then
+  rm -f \
+    "$state_root/gta-claw-daemon.remove-was-active" \
+    "$state_root/gta-claw-daemon.remove-was-enabled" \
+    "$state_root/gta-claw-daemon.remove-was-enabled-runtime" \
+    "$state_root/gta-claw-daemon.remove-prepared"
+fi
+
+exit 0

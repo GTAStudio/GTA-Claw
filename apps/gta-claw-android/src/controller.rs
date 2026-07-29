@@ -5,7 +5,7 @@
 
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use claw_application::{Application, SystemProbe};
@@ -47,7 +47,6 @@ enum ControllerCommand {
     Reject(SubmissionRejection),
     Disconnect,
     Retry,
-    Lifecycle(AppLifecycle),
     NetworkChanged(NetworkStatus),
     DiscoveryReadinessChanged(DiscoveryReadiness),
 }
@@ -59,9 +58,6 @@ impl Debug for ControllerCommand {
             Self::Reject(rejection) => formatter.debug_tuple("Reject").field(rejection).finish(),
             Self::Disconnect => formatter.write_str("Disconnect"),
             Self::Retry => formatter.write_str("Retry"),
-            Self::Lifecycle(lifecycle) => {
-                formatter.debug_tuple("Lifecycle").field(lifecycle).finish()
-            }
             Self::NetworkChanged(network) => formatter
                 .debug_tuple("NetworkChanged")
                 .field(network)
@@ -70,6 +66,43 @@ impl Debug for ControllerCommand {
                 .debug_tuple("DiscoveryReadinessChanged")
                 .field(readiness)
                 .finish(),
+        }
+    }
+}
+
+/// A lifecycle transition reported by the Android activity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActivityLifecycleEvent {
+    /// The activity started or resumed.
+    Foreground,
+    /// The activity paused.
+    Paused,
+    /// The activity stopped.
+    Stopped,
+    /// The activity was destroyed and cannot resume.
+    Destroyed,
+}
+
+impl ActivityLifecycleEvent {
+    const fn app_lifecycle(self) -> AppLifecycle {
+        match self {
+            Self::Foreground => AppLifecycle::Foreground,
+            Self::Paused | Self::Stopped | Self::Destroyed => AppLifecycle::Background,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LifecycleSender {
+    current: Mutex<ActivityLifecycleEvent>,
+    events: mpsc::UnboundedSender<ActivityLifecycleEvent>,
+}
+
+impl LifecycleSender {
+    fn new(events: mpsc::UnboundedSender<ActivityLifecycleEvent>) -> Self {
+        Self {
+            current: Mutex::new(ActivityLifecycleEvent::Foreground),
+            events,
         }
     }
 }
@@ -119,6 +152,7 @@ impl Error for CommandRejection {}
 #[derive(Clone, Debug)]
 pub struct ControllerHandle {
     commands: mpsc::Sender<ControllerCommand>,
+    lifecycle: Arc<LifecycleSender>,
 }
 
 impl ControllerHandle {
@@ -179,10 +213,10 @@ impl ControllerHandle {
     ///
     /// Returns [`CommandRejection`] when the command cannot be queued.
     pub fn app_foregrounded(&self) -> Result<(), CommandRejection> {
-        self.send(ControllerCommand::Lifecycle(AppLifecycle::Foreground))
+        self.lifecycle_changed(ActivityLifecycleEvent::Foreground)
     }
 
-    /// Reports that the Android activity left the foreground.
+    /// Reports that the Android activity paused.
     ///
     /// A live socket is cancelled and its request is retained for foreground
     /// resume, avoiding radio and retry work while the activity is suspended.
@@ -190,8 +224,54 @@ impl ControllerHandle {
     /// # Errors
     ///
     /// Returns [`CommandRejection`] when the command cannot be queued.
+    pub fn app_paused(&self) -> Result<(), CommandRejection> {
+        self.lifecycle_changed(ActivityLifecycleEvent::Paused)
+    }
+
+    /// Reports that the Android activity stopped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRejection`] when the controller has stopped.
+    pub fn app_stopped(&self) -> Result<(), CommandRejection> {
+        self.lifecycle_changed(ActivityLifecycleEvent::Stopped)
+    }
+
+    /// Reports that the Android activity was destroyed.
+    ///
+    /// Destruction is terminal and cannot be replaced by a later lifecycle
+    /// callback. Delivery is independent of the bounded command queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRejection`] when the controller has stopped.
+    pub fn app_destroyed(&self) -> Result<(), CommandRejection> {
+        self.lifecycle_changed(ActivityLifecycleEvent::Destroyed)
+    }
+
+    /// Reports that the Android activity left the foreground.
+    ///
+    /// Prefer [`Self::app_paused`] or [`Self::app_stopped`] when the native
+    /// callback is known.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRejection`] when the controller has stopped.
     pub fn app_backgrounded(&self) -> Result<(), CommandRejection> {
-        self.send(ControllerCommand::Lifecycle(AppLifecycle::Background))
+        self.app_paused()
+    }
+
+    /// Reports an exact Android activity lifecycle transition.
+    ///
+    /// Duplicate transitions are coalesced, pause and stop retain their order,
+    /// and destruction is terminal. This non-blocking path is independent of
+    /// the normal bounded command queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRejection::Stopped`] when the controller has stopped.
+    pub fn lifecycle_changed(&self, event: ActivityLifecycleEvent) -> Result<(), CommandRejection> {
+        self.send_lifecycle(event)
     }
 
     /// Reports the latest Android default-network status.
@@ -227,6 +307,23 @@ impl ControllerHandle {
                 mpsc::error::TrySendError::Full(_) => CommandRejection::QueueFull,
                 mpsc::error::TrySendError::Closed(_) => CommandRejection::Stopped,
             })
+    }
+
+    fn send_lifecycle(&self, event: ActivityLifecycleEvent) -> Result<(), CommandRejection> {
+        let mut current = self
+            .lifecycle
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *current == ActivityLifecycleEvent::Destroyed || *current == event {
+            return Ok(());
+        }
+        self.lifecycle
+            .events
+            .send(event)
+            .map_err(|_| CommandRejection::Stopped)?;
+        *current = event;
+        Ok(())
     }
 }
 
@@ -272,10 +369,13 @@ impl AndroidController {
             .thread_name("gta-claw-gateway")
             .build()?;
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
-        runtime.spawn(run_with_platform(commands_rx, sink, platform));
+        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        let lifecycle = Arc::new(LifecycleSender::new(lifecycle_tx));
+        runtime.spawn(run_with_platform(commands_rx, lifecycle_rx, sink, platform));
         Ok(Self {
             handle: ControllerHandle {
                 commands: commands_tx,
+                lifecycle,
             },
             runtime,
         })
@@ -487,11 +587,20 @@ impl SnapshotPublisher {
 
 #[cfg(test)]
 async fn run(commands: mpsc::Receiver<ControllerCommand>, sink: SnapshotSink) {
-    run_with_platform(commands, sink, Arc::new(PortablePlatformFacilities)).await;
+    let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+    let _lifecycle = LifecycleSender::new(lifecycle_tx);
+    run_with_platform(
+        commands,
+        lifecycle_rx,
+        sink,
+        Arc::new(PortablePlatformFacilities),
+    )
+    .await;
 }
 
 async fn run_with_platform(
     mut commands: mpsc::Receiver<ControllerCommand>,
+    mut lifecycle: mpsc::UnboundedReceiver<ActivityLifecycleEvent>,
     sink: SnapshotSink,
     platform: Arc<dyn PlatformFacilities>,
 ) {
@@ -509,6 +618,53 @@ async fn run_with_platform(
 
     loop {
         tokio::select! {
+            biased;
+            lifecycle_event = lifecycle.recv() => {
+                let Some(event) = lifecycle_event else { break };
+                if event == ActivityLifecycleEvent::Destroyed {
+                    let directive = policy.disconnect();
+                    model.set_environment(AppLifecycle::Background, policy.network);
+                    model.request_stop();
+                    publisher.publish(&model, &sink);
+                    if matches!(directive, AttemptDirective::Stop) {
+                        stop_attempt(active.take()).await;
+                    }
+                    break;
+                }
+
+                let directive = policy.set_lifecycle(event.app_lifecycle());
+                model.set_environment(policy.lifecycle, policy.network);
+                match directive {
+                    AttemptDirective::Stop => {
+                        model.suspend(
+                            policy.blocker().expect("a lifecycle stop has a blocker"),
+                        );
+                        publisher.publish(&model, &sink);
+                        stop_attempt(active.take()).await;
+                    }
+                    AttemptDirective::Start => {
+                        if let Some(retained) = request.as_ref() {
+                            let launched = start_requested_attempt(
+                                false,
+                                retained,
+                                &mut active,
+                                &mut model,
+                                &mut identity,
+                                platform.as_ref(),
+                                capabilities,
+                                &slot,
+                                &updates_tx,
+                            )
+                            .await;
+                            if !launched {
+                                policy.attempt_finished();
+                            }
+                        }
+                    }
+                    AttemptDirective::None | AttemptDirective::Restart => {}
+                }
+                publisher.publish(&model, &sink);
+            }
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 match command {
@@ -583,39 +739,6 @@ async fn run_with_platform(
                                     policy.attempt_finished();
                                 }
                             }
-                        }
-                    }
-                    ControllerCommand::Lifecycle(lifecycle) => {
-                        let directive = policy.set_lifecycle(lifecycle);
-                        model.set_environment(policy.lifecycle, policy.network);
-                        match directive {
-                            AttemptDirective::Stop => {
-                                model.suspend(
-                                    policy.blocker().expect("a lifecycle stop has a blocker"),
-                                );
-                                publisher.publish(&model, &sink);
-                                stop_attempt(active.take()).await;
-                            }
-                            AttemptDirective::Start => {
-                                if let Some(retained) = request.as_ref() {
-                                    let launched = start_requested_attempt(
-                                        false,
-                                        retained,
-                                        &mut active,
-                                        &mut model,
-                                        &mut identity,
-                                        platform.as_ref(),
-                                        capabilities,
-                                        &slot,
-                                        &updates_tx,
-                                    )
-                                    .await;
-                                    if !launched {
-                                        policy.attempt_finished();
-                                    }
-                                }
-                            }
-                            AttemptDirective::None | AttemptDirective::Restart => {}
                         }
                     }
                     ControllerCommand::NetworkChanged(network) => {
@@ -925,16 +1048,17 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        AttemptDirective, COMMAND_QUEUE_CAPACITY, CommandRejection, ControllerCommand,
-        ControllerHandle, MobileRunPolicy, SnapshotSink, core_protocol_summary,
-        native_runtime_summary, run, run_with_platform, runtime_summary, send_attempt_update,
+        ActivityLifecycleEvent, AttemptDirective, COMMAND_QUEUE_CAPACITY, CommandRejection,
+        ControllerCommand, ControllerHandle, LifecycleSender, MobileRunPolicy, SnapshotSink,
+        core_protocol_summary, native_runtime_summary, run, run_with_platform, runtime_summary,
+        send_attempt_update,
     };
     use crate::onboarding::{
         ConnectRequest, DiagnosticCode, RemedyKind, SubmissionRejection, ViewSnapshot,
     };
     use crate::platform::{
         AppLifecycle, DiscoveryReadiness, IdentityFailure, IdentityPersistence, NetworkStatus,
-        NetworkTransport, PlatformCapabilities, PlatformFacilities,
+        NetworkTransport, PlatformCapabilities, PlatformFacilities, PortablePlatformFacilities,
     };
 
     #[derive(Debug)]
@@ -1043,6 +1167,118 @@ mod tests {
                 "{rejection:?} must tell the operator what to do, got {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn lifecycle_delivery_bypasses_a_saturated_command_queue() {
+        let (commands_tx, _commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let handle = ControllerHandle {
+            commands: commands_tx,
+            lifecycle: Arc::new(LifecycleSender::new(lifecycle_tx)),
+        };
+
+        for _ in 0..COMMAND_QUEUE_CAPACITY {
+            handle.retry().expect("fill the normal command queue");
+        }
+        assert_eq!(
+            handle.retry(),
+            Err(CommandRejection::QueueFull),
+            "the fixture must saturate the normal command queue"
+        );
+
+        handle.app_paused().expect("pause bypasses saturation");
+        handle.app_stopped().expect("stop bypasses saturation");
+        handle.app_destroyed().expect("destroy bypasses saturation");
+
+        assert_eq!(lifecycle_rx.try_recv(), Ok(ActivityLifecycleEvent::Paused));
+        assert_eq!(lifecycle_rx.try_recv(), Ok(ActivityLifecycleEvent::Stopped));
+        assert_eq!(
+            lifecycle_rx.try_recv(),
+            Ok(ActivityLifecycleEvent::Destroyed)
+        );
+        assert!(
+            lifecycle_rx.try_recv().is_err(),
+            "only the three distinct transitions must be queued"
+        );
+    }
+
+    #[test]
+    fn lifecycle_updates_coalesce_duplicates_and_destruction_is_terminal() {
+        let (commands_tx, _commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let handle = ControllerHandle {
+            commands: commands_tx,
+            lifecycle: Arc::new(LifecycleSender::new(lifecycle_tx)),
+        };
+
+        handle
+            .app_foregrounded()
+            .expect("duplicate initial foreground");
+        handle.app_paused().expect("pause");
+        handle.app_paused().expect("duplicate pause");
+        handle.app_stopped().expect("stop");
+        handle.app_stopped().expect("duplicate stop");
+        handle.app_foregrounded().expect("foreground");
+        handle.app_destroyed().expect("destroy");
+        handle
+            .app_foregrounded()
+            .expect("late foreground is safely ignored");
+        let delivered = std::iter::from_fn(|| lifecycle_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            delivered,
+            vec![
+                ActivityLifecycleEvent::Paused,
+                ActivityLifecycleEvent::Stopped,
+                ActivityLifecycleEvent::Foreground,
+                ActivityLifecycleEvent::Destroyed,
+            ]
+        );
+        assert!(
+            lifecycle_rx.try_recv().is_err(),
+            "duplicates and callbacks after destruction must be coalesced"
+        );
+    }
+
+    #[test]
+    fn destroy_ends_the_controller_with_a_saturated_normal_queue() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+
+        runtime.block_on(async {
+            let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+            let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+            let handle = ControllerHandle {
+                commands: commands_tx,
+                lifecycle: Arc::new(LifecycleSender::new(lifecycle_tx)),
+            };
+            for _ in 0..COMMAND_QUEUE_CAPACITY {
+                handle.retry().expect("fill the normal command queue");
+            }
+            handle
+                .app_destroyed()
+                .expect("destroy bypasses the saturated queue");
+
+            let sink: SnapshotSink = Arc::new(|_| {});
+            let control = tokio::spawn(run_with_platform(
+                commands_rx,
+                lifecycle_rx,
+                sink,
+                Arc::new(PortablePlatformFacilities),
+            ));
+            tokio::time::timeout(Duration::from_secs(1), control)
+                .await
+                .expect("destroy must end the controller promptly")
+                .expect("the controller must not panic");
+
+            assert_eq!(
+                handle.retry(),
+                Err(CommandRejection::Stopped),
+                "destruction must close the normal command path"
+            );
+        });
     }
 
     #[test]
@@ -1202,8 +1438,11 @@ mod tests {
 
         runtime.block_on(async move {
             let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+            let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+            let _lifecycle = LifecycleSender::new(lifecycle_tx);
             let control = tokio::spawn(run_with_platform(
                 commands_rx,
+                lifecycle_rx,
                 sink,
                 Arc::new(FailingPlatform),
             ));
@@ -1295,10 +1534,13 @@ mod tests {
     #[test]
     fn a_handle_outliving_the_loop_refuses_commands_instead_of_queueing_them() {
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
         let handle = ControllerHandle {
             commands: commands_tx,
+            lifecycle: Arc::new(LifecycleSender::new(lifecycle_tx)),
         };
         drop(commands_rx);
+        drop(lifecycle_rx);
 
         let rejection = handle
             .disconnect()

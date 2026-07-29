@@ -5,6 +5,8 @@ use std::error::Error;
 #[cfg(target_os = "android")]
 use std::sync::{Arc, OnceLock};
 
+#[cfg(any(target_os = "android", test))]
+use gta_claw_android::controller::ActivityLifecycleEvent;
 #[cfg(target_os = "android")]
 use gta_claw_android::controller::{
     AndroidController, core_protocol_summary, native_runtime_summary,
@@ -68,6 +70,28 @@ const fn lifecycle_label(lifecycle: AppLifecycle) -> &'static str {
     match lifecycle {
         AppLifecycle::Foreground => "Foreground",
         AppLifecycle::Background => "Background",
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellLifecycleEvent {
+    Start,
+    Resume,
+    Pause,
+    Stop,
+    Destroy,
+}
+
+#[cfg(any(target_os = "android", test))]
+const fn lifecycle_transition(event: ShellLifecycleEvent) -> ActivityLifecycleEvent {
+    match event {
+        ShellLifecycleEvent::Start | ShellLifecycleEvent::Resume => {
+            ActivityLifecycleEvent::Foreground
+        }
+        ShellLifecycleEvent::Pause => ActivityLifecycleEvent::Paused,
+        ShellLifecycleEvent::Stop => ActivityLifecycleEvent::Stopped,
+        ShellLifecycleEvent::Destroy => ActivityLifecycleEvent::Destroyed,
     }
 }
 
@@ -221,23 +245,27 @@ fn run_android(app: slint::android::AndroidApp) -> Result<(), Box<dyn Error>> {
 
     let lifecycle_handle = Arc::new(OnceLock::<ControllerHandle>::new());
     let event_handle = Arc::clone(&lifecycle_handle);
-    slint::android::init_with_event_listener(app, move |event| match event {
-        PollEvent::Main(MainEvent::Start) => {
-            if let Some(handle) = event_handle.get() {
-                report_platform_command(handle.app_foregrounded(), "foreground state");
+    slint::android::init_with_event_listener(app, move |event| {
+        let lifecycle = match event {
+            PollEvent::Main(MainEvent::Start) => Some((ShellLifecycleEvent::Start, "start state")),
+            PollEvent::Main(MainEvent::Resume { .. }) => {
+                Some((ShellLifecycleEvent::Resume, "resume state"))
             }
-        }
-        PollEvent::Main(MainEvent::Resume { .. }) => {
-            if let Some(handle) = event_handle.get() {
-                report_platform_command(handle.app_foregrounded(), "foreground state");
+            PollEvent::Main(MainEvent::Pause) => Some((ShellLifecycleEvent::Pause, "paused state")),
+            PollEvent::Main(MainEvent::Stop) => Some((ShellLifecycleEvent::Stop, "stopped state")),
+            PollEvent::Main(MainEvent::Destroy) => {
+                Some((ShellLifecycleEvent::Destroy, "destroyed state"))
             }
+            _ => None,
+        };
+        if let Some((event, action)) = lifecycle
+            && let Some(handle) = event_handle.get()
+        {
+            report_platform_command(
+                handle.lifecycle_changed(lifecycle_transition(event)),
+                action,
+            );
         }
-        PollEvent::Main(MainEvent::Pause | MainEvent::Stop | MainEvent::Destroy) => {
-            if let Some(handle) = event_handle.get() {
-                report_platform_command(handle.app_backgrounded(), "background state");
-            }
-        }
-        _ => {}
     })?;
 
     let window = AppWindow::new()?;
@@ -283,7 +311,9 @@ mod tests {
     use gta_claw_android::onboarding::{ConnectRequest, ConnectionPhase, ViewModel};
     use gta_claw_android::platform::AppLifecycle;
 
-    use super::{lifecycle_label, phase_label, status_tone};
+    use super::{
+        ShellLifecycleEvent, lifecycle_label, lifecycle_transition, phase_label, status_tone,
+    };
     use crate::generated_ui::StatusTone;
 
     #[test]
@@ -327,5 +357,31 @@ mod tests {
         assert_eq!(phase_label(ConnectionPhase::Reconnecting), "Reconnecting");
         assert_eq!(lifecycle_label(AppLifecycle::Foreground), "Foreground");
         assert_eq!(lifecycle_label(AppLifecycle::Background), "Background");
+    }
+
+    #[test]
+    fn native_activity_events_map_to_exact_controller_transitions() {
+        use gta_claw_android::controller::ActivityLifecycleEvent;
+
+        assert_eq!(
+            lifecycle_transition(ShellLifecycleEvent::Start),
+            ActivityLifecycleEvent::Foreground
+        );
+        assert_eq!(
+            lifecycle_transition(ShellLifecycleEvent::Resume),
+            ActivityLifecycleEvent::Foreground
+        );
+        assert_eq!(
+            lifecycle_transition(ShellLifecycleEvent::Pause),
+            ActivityLifecycleEvent::Paused
+        );
+        assert_eq!(
+            lifecycle_transition(ShellLifecycleEvent::Stop),
+            ActivityLifecycleEvent::Stopped
+        );
+        assert_eq!(
+            lifecycle_transition(ShellLifecycleEvent::Destroy),
+            ActivityLifecycleEvent::Destroyed
+        );
     }
 }

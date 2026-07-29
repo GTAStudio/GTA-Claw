@@ -65,7 +65,10 @@ jobs:
 
       - name: Run iOS shell source tests
         shell: bash
-        run: ./ios/scripts/workflow-self-test.sh
+        run: |
+          set -euo pipefail
+          ./ios/scripts/workflow-self-test.sh
+          ./ios/scripts/check.sh
 
       - name: Check iOS workspace at MSRV
         run: |
@@ -158,6 +161,29 @@ jobs:
           diff -u \
             <(xcrun dwarfdump --uuid "$executable" | awk '{print $2}' | sort) \
             <(xcrun dwarfdump --uuid "$dsym" | awk '{print $2}' | sort)
+
+      - name: Build iOS simulator app
+        shell: bash
+        env:
+          SKIA_CACHE_DIR: ${{ runner.temp }}/gta-claw-skia
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project ios/GTAClaw.xcodeproj \
+            -scheme GTAClaw \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/gta-claw-ios-simulator"
+
+      - name: Run required iOS simulator smoke
+        shell: bash
+        env:
+          MOBILE_SMOKE_REQUIRED: "1"
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/gta-claw-ios-simulator/Build/Products/Release-iphonesimulator/GTA Claw.app"
+          ./ios/scripts/simulator-smoke.sh "$app"
 
       - name: Upload unsigned archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

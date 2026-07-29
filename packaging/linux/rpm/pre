@@ -1,0 +1,88 @@
+# shellcheck shell=sh disable=SC2329
+set -eu
+
+state_root="${GTA_CLAW_PACKAGE_STATE_ROOT:-/run}"
+systemd_runtime="${GTA_CLAW_SYSTEMD_RUNTIME_DIR:-/run/systemd/system}"
+old_nevra="$state_root/gta-claw-daemon.old-nevra"
+was_active="$state_root/gta-claw-daemon.was-active"
+was_enabled="$state_root/gta-claw-daemon.was-enabled"
+was_enabled_runtime="$state_root/gta-claw-daemon.was-enabled-runtime"
+prepared_marker="$state_root/gta-claw-daemon.upgrade-prepared"
+configured_marker="$state_root/gta-claw-daemon.upgrade-configured"
+prepared=0
+
+restore_pre_failure() {
+  status=$?
+  trap - 0 1 2 15
+  if [ "$prepared" -eq 0 ]; then
+    rm -f \
+      "$old_nevra.tmp" \
+      "$old_nevra" \
+      "$was_active" \
+      "$was_enabled" \
+      "$was_enabled_runtime" \
+      "$prepared_marker" \
+      "$configured_marker"
+  fi
+  exit "$status"
+}
+
+if [ "$1" -gt 1 ]; then
+  if [ ! -d "$state_root" ] || [ -L "$state_root" ]; then
+    echo "RPM lifecycle state root is not a physical directory: $state_root" >&2
+    exit 1
+  fi
+  for marker in \
+    "$old_nevra" \
+    "$was_active" \
+    "$was_enabled" \
+    "$was_enabled_runtime" \
+    "$prepared_marker" \
+    "$configured_marker"; do
+    if [ -e "$marker" ] || [ -L "$marker" ]; then
+      echo "Refusing upgrade with an incomplete RPM lifecycle marker: $marker" >&2
+      exit 1
+    fi
+  done
+
+  installed_nevras="$(rpm -q --qf '%%{NEVRA}\n' gta-claw)"
+  installed_count="$(printf '%s\n' "$installed_nevras" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [ "$installed_count" -ne 1 ]; then
+    echo "RPM upgrade requires exactly one installed gta-claw NEVRA; found $installed_count" >&2
+    exit 1
+  fi
+
+  trap restore_pre_failure 0 1 2 15
+  umask 077
+  printf '%s\n' "$installed_nevras" >"$old_nevra.tmp"
+  mv "$old_nevra.tmp" "$old_nevra"
+  if [ -d "$systemd_runtime" ]; then
+    if systemctl is-active --quiet gta-claw-daemon.service; then
+      touch "$was_active"
+    fi
+    enabled_state=""
+    if enabled_state="$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null)"; then
+      :
+    fi
+    case "$enabled_state" in
+      enabled) touch "$was_enabled" ;;
+      enabled-runtime) touch "$was_enabled_runtime" ;;
+      disabled | indirect | static | generated | transient | not-found | masked | masked-runtime | '') ;;
+      *)
+        echo "Unexpected service enablement before RPM upgrade: $enabled_state" >&2
+        exit 1
+        ;;
+    esac
+  fi
+  touch "$prepared_marker"
+
+  if [ "${GTA_CLAW_PACKAGE_TEST_FAIL_UPGRADE_PREPARE:-0}" = "1" ]; then
+    echo "Injected RPM upgrade preparation failure before payload mutation" >&2
+    exit 1
+  fi
+
+  prepared=1
+  trap - 0 1 2 15
+fi
+
+exit 0

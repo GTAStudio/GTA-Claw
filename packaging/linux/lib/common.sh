@@ -804,10 +804,14 @@ validate_service_contract() {
     'PrivateDevices=yes' \
     'ProtectSystem=strict' \
     'ProtectHome=yes' \
+    'StateDirectory=gta-claw' \
+    'StateDirectoryMode=0700' \
+    'Environment=GTA_CLAW_STATE_DIR=/var/lib/gta-claw' \
     'ProtectKernelTunables=yes' \
     'ProtectControlGroups=yes' \
     'CapabilityBoundingSet=' \
-    'RestrictAddressFamilies=AF_UNIX' \
+    'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' \
+    'IPAddressAllow=localhost' \
     'IPAddressDeny=any' \
     'SystemCallFilter=@system-service' \
     'LoadCredential=gta-claw-config:/etc/gta-claw/credentials/daemon.conf'; do

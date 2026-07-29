@@ -232,10 +232,22 @@ expect_failure forbidden-runtime \
 
 cp "$SCRIPT_DIR/systemd/gta-claw-daemon.service" "$work/service-good"
 grep -v '^NoNewPrivileges=yes$' "$work/service-good" >"$work/service-weakened"
+grep -v '^Environment=GTA_CLAW_STATE_DIR=/var/lib/gta-claw$' \
+  "$work/service-good" >"$work/service-no-state-wiring"
+grep -v '^IPAddressAllow=localhost$' \
+  "$work/service-good" >"$work/service-no-loopback"
+sed 's/^RestrictAddressFamilies=.*/RestrictAddressFamilies=AF_UNIX/' \
+  "$work/service-good" >"$work/service-no-tcp"
 expect_success hardened-service \
   bash -c "source '$common'; validate_service_contract '$work/service-good'"
 expect_failure weakened-service \
   bash -c "source '$common'; validate_service_contract '$work/service-weakened'"
+expect_failure missing-state-directory-wiring \
+  bash -c "source '$common'; validate_service_contract '$work/service-no-state-wiring'"
+expect_failure blocked-loopback \
+  bash -c "source '$common'; validate_service_contract '$work/service-no-loopback'"
+expect_failure blocked-tcp-families \
+  bash -c "source '$common'; validate_service_contract '$work/service-no-tcp'"
 {
   cat "$work/service-good"
   printf 'Environment=API_TOKEN=plaintext\n'

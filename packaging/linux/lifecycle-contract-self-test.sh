@@ -28,8 +28,16 @@ expect_failure() {
 }
 
 validate_debian_lifecycle_contract "$SCRIPT_DIR/debian"
-rpm_source="$(sed -n '/^%pre$/,/^%changelog$/p' "$SCRIPT_DIR/package.sh")"
+rpm_source="$(
+  cat \
+    "$SCRIPT_DIR/rpm/pre" \
+    "$SCRIPT_DIR/rpm/post" \
+    "$SCRIPT_DIR/rpm/preun" \
+    "$SCRIPT_DIR/rpm/postun" \
+    "$SCRIPT_DIR/rpm/posttrans"
+)"
 validate_rpm_lifecycle_contract "$rpm_source"
+"$SCRIPT_DIR/rpm-lifecycle-self-test.sh"
 
 cp -R "$SCRIPT_DIR/debian" "$work/missing-disable"
 sed -i.bak \
