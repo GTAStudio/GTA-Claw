@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use claw_skills::{
     CancellationToken, ExactJsonDocument, HttpBridge, HttpBridgeError, HttpRequest, HttpResponse,
     ManifestError, NativeSkillHandler, NativeSkillRegistry, ParameterValidationError,
-    ParameterViolation, ParameterViolationKind, SkillExecutionError, SkillRuntime, WasmHostError,
-    WasmSkillHost, WasmSkillInvocation, load_manifest,
+    ParameterViolation, ParameterViolationKind, SchemaErrorKind, SkillExecutionError, SkillRuntime,
+    WasmHostError, WasmSkillHost, WasmSkillInvocation, load_manifest,
 };
 use serde_json::{Value, json};
 
@@ -102,6 +102,25 @@ fn native_handler_runs_only_after_exact_parameter_validation() {
 }
 
 #[test]
+fn manifest_rejects_unrepresentable_exact_length_bounds() {
+    let error = load_manifest(
+        r#"{
+            "id":"invalid-length",
+            "description":"Reject an unusable exact length.",
+            "parameters":{"type":"string","minLength":18446744073709551616},
+            "execution":{"kind":"native","handler":"echo"}
+        }"#,
+    )
+    .expect_err("the exact bound does not fit the supported length representation");
+    assert!(matches!(
+        error,
+        ManifestError::InvalidParameterSchema(schema)
+            if schema.path == "$.minLength"
+                && schema.kind == SchemaErrorKind::InvalidLengthBound
+    ));
+}
+
+#[test]
 fn exact_parameters_validate_and_encode_without_rounding() {
     let manifest = load_manifest(
         r#"{
@@ -161,16 +180,23 @@ fn exact_parameters_validate_and_encode_without_rounding() {
         );
         assert_eq!(
             runtime.execute_exact(
+                &manifest,
+                ExactJsonDocument::parse(r#"{"value":1,"value":9007199254740993.2}"#)
+                    .expect("valid duplicate-key input")
+            ),
+            Ok(json!({"status":"ok"}))
+        );
+        assert_eq!(
+            runtime.execute_exact(
                 &native_manifest,
                 ExactJsonDocument::parse("9007199254740993.1").expect("valid input")
             ),
             Err(SkillExecutionError::ParameterEncoding)
         );
     }
-    assert_eq!(
-        http.requests.into_inner()[0].body,
-        br#"{"value":9007199254740993.1}"#
-    );
+    let requests = http.requests.into_inner();
+    assert_eq!(requests[0].body, br#"{"value":9007199254740993.1}"#);
+    assert_eq!(requests[1].body, br#"{"value":9007199254740993.2}"#);
 }
 
 #[test]

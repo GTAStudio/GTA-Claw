@@ -22,7 +22,7 @@ use windows_sys::Wdk::Storage::FileSystem::{
 };
 use windows_sys::Win32::Foundation::{
     GENERIC_READ, GENERIC_WRITE, HANDLE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
-    STATUS_NO_MORE_FILES, STATUS_SUCCESS, UNICODE_STRING,
+    STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, STATUS_SUCCESS, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
@@ -181,9 +181,7 @@ pub fn read_names(directory: &File, max_names: usize) -> io::Result<Vec<OsString
             )
         };
         restart_scan = false;
-        if status == STATUS_NO_MORE_FILES
-            || (status == STATUS_SUCCESS && status_block.Information == 0)
-        {
+        if enumeration_exhausted(status, status_block.Information) {
             break;
         }
         if status != STATUS_SUCCESS {
@@ -221,6 +219,12 @@ pub fn read_names(directory: &File, max_names: usize) -> io::Result<Vec<OsString
     Ok(names)
 }
 
+const fn enumeration_exhausted(status: i32, information: usize) -> bool {
+    status == STATUS_NO_MORE_FILES
+        || status == STATUS_NO_SUCH_FILE
+        || (status == STATUS_SUCCESS && information == 0)
+}
+
 const fn as_bytes(words: &[u64]) -> &[u8] {
     // SAFETY: `u8` has alignment one, and the byte slice covers exactly the
     // initialized storage of `words` for the duration of the shared borrow.
@@ -232,4 +236,17 @@ fn status_error(status: i32) -> io::Error {
     // memory-safety preconditions.
     let code = unsafe { RtlNtStatusToDosError(status) };
     io::Error::from_raw_os_error(i32::try_from(code).unwrap_or(i32::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_directory_statuses_are_exhaustion() {
+        assert!(enumeration_exhausted(STATUS_NO_MORE_FILES, 0));
+        assert!(enumeration_exhausted(STATUS_NO_SUCH_FILE, 1));
+        assert!(enumeration_exhausted(STATUS_SUCCESS, 0));
+        assert!(!enumeration_exhausted(STATUS_SUCCESS, 1));
+    }
 }

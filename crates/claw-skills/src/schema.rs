@@ -1,7 +1,7 @@
 //! Bounded JSON parameter-schema validation.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::num::NonZeroUsize;
 
@@ -15,6 +15,13 @@ const DEFAULT_MAX_PATH_BYTES: NonZeroUsize = NonZeroUsize::new(1_024).unwrap();
 const DEFAULT_MAX_SCHEMA_NODES: NonZeroUsize = NonZeroUsize::new(4_096).unwrap();
 const DEFAULT_MAX_INPUT_NODES: NonZeroUsize = NonZeroUsize::new(65_536).unwrap();
 const DEFAULT_MAX_COMPARISON_NODES: NonZeroUsize = NonZeroUsize::new(65_536).unwrap();
+// Exact decimals stay useful well beyond binary-float precision while bounding
+// parse allocation and the exponent arithmetic performed on untrusted values.
+const MAX_NUMBER_LEXEME_BYTES: usize = 1_040;
+const MAX_NUMBER_MANTISSA_DIGITS: usize = 1_024;
+const MAX_NUMBER_EXPONENT: u32 = 1_000_000;
+const MAX_NUMBER_EXPONENT_DIGITS: usize = 7;
+const COMPARISON_DIGITS_PER_UNIT: usize = 32;
 const SUPPORTED_SCHEMA_KEYWORDS: [&str; 18] = [
     "$comment",
     "additionalProperties",
@@ -49,7 +56,7 @@ pub struct ValidationLimits {
     pub max_schema_nodes: NonZeroUsize,
     /// Maximum number of input values visited during validation.
     pub max_input_nodes: NonZeroUsize,
-    /// Maximum number of value pairs visited while evaluating enums.
+    /// Maximum work spent on enum traversal and exact numeric comparisons.
     pub max_comparison_nodes: NonZeroUsize,
 }
 
@@ -129,10 +136,41 @@ impl From<Value> for ExactJsonDocument {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExactNode {
-    Number(String),
+    Number(ExactNumber),
     Array(Vec<Self>),
-    Object(Vec<(String, Self)>),
+    Object(BTreeMap<String, Self>),
     Other,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExactNumber {
+    raw: String,
+    decimal: Option<ExactDecimal>,
+}
+
+impl ExactNumber {
+    fn new(raw: String) -> Self {
+        let decimal = ExactDecimal::parse_bounded(&raw);
+        Self { raw, decimal }
+    }
+
+    fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    const fn decimal(&self) -> Option<&ExactDecimal> {
+        self.decimal.as_ref()
+    }
+
+    fn nonnegative_integer(&self) -> Option<u64> {
+        self.decimal.as_ref().and_then(ExactDecimal::to_u64)
+    }
+
+    fn comparison_units(&self) -> usize {
+        self.decimal
+            .as_ref()
+            .map_or(usize::MAX, ExactDecimal::comparison_units)
+    }
 }
 
 impl ExactNode {
@@ -142,15 +180,16 @@ impl ExactNode {
             Some(b'{') => {
                 let RawObject(entries) = serde_json::from_str(raw)?;
                 let mut object = Map::with_capacity(entries.len());
-                let mut exact = Vec::with_capacity(entries.len());
-                let mut lossless = true;
+                let mut exact = BTreeMap::new();
+                let mut lossless_by_name = BTreeMap::new();
                 for (name, raw_value) in entries {
                     let (child_value, child_exact, child_lossless) =
                         Self::parse_document(raw_value.get())?;
-                    lossless &= child_lossless;
                     object.insert(name.clone(), child_value);
-                    exact.push((name, child_exact));
+                    exact.insert(name.clone(), child_exact);
+                    lossless_by_name.insert(name, child_lossless);
                 }
+                let lossless = lossless_by_name.values().all(|lossless| *lossless);
                 Ok((Value::Object(object), Self::Object(exact), lossless))
             }
             Some(b'[') => {
@@ -168,16 +207,21 @@ impl ExactNode {
                 Ok((Value::Array(array), Self::Array(exact), lossless))
             }
             Some(b'-' | b'0'..=b'9') => {
+                let exact = ExactNumber::new(raw.to_owned());
                 let (value, representable) = serde_json::from_str(raw).map_or_else(
                     |_| (Value::from(0), false),
                     |value: Value| {
                         let representable = value.as_number().is_some_and(|number| {
-                            compare_numbers(raw, &number.to_string()) == Ordering::Equal
+                            let normalized = ExactNumber::new(number.to_string());
+                            exact
+                                .decimal()
+                                .zip(normalized.decimal())
+                                .is_some_and(|(left, right)| left == right)
                         });
                         (value, representable)
                     },
                 );
-                Ok((value, Self::Number(raw.to_owned()), representable))
+                Ok((value, Self::Number(exact), representable))
             }
             Some(_) | None => Ok((serde_json::from_str(raw)?, Self::Other, true)),
         }
@@ -185,7 +229,7 @@ impl ExactNode {
 
     pub(crate) fn from_value(value: &Value) -> Self {
         match value {
-            Value::Number(number) => Self::Number(number.to_string()),
+            Value::Number(number) => Self::Number(ExactNumber::new(number.to_string())),
             Value::Array(values) => Self::Array(values.iter().map(Self::from_value).collect()),
             Value::Object(values) => Self::Object(
                 values
@@ -197,7 +241,7 @@ impl ExactNode {
         }
     }
 
-    fn number(&self) -> Option<&str> {
+    const fn number(&self) -> Option<&ExactNumber> {
         if let Self::Number(number) = self {
             Some(number)
         } else {
@@ -215,10 +259,7 @@ impl ExactNode {
 
     fn key(&self, key: &str) -> Option<&Self> {
         if let Self::Object(values) = self {
-            values
-                .iter()
-                .rev()
-                .find_map(|(name, value)| (name == key).then_some(value))
+            values.get(key)
         } else {
             None
         }
@@ -237,6 +278,7 @@ fn write_exact_json(
                 exact
                     .number()
                     .expect("exact document mirrors the JSON value")
+                    .raw()
                     .as_bytes(),
             );
             Ok(())
@@ -338,7 +380,7 @@ pub enum SchemaErrorKind {
     DuplicateRequiredProperty,
     /// `enum` is empty.
     EmptyEnum,
-    /// Schema traversal, nesting, or diagnostic path limits were exceeded.
+    /// Schema traversal, numeric, nesting, or diagnostic path limits were exceeded.
     ResourceLimit,
 }
 
@@ -384,7 +426,7 @@ pub enum ParameterValidationError {
         /// Whether traversal stopped immediately after reaching the configured cap.
         limit_reached: bool,
     },
-    /// Input nesting or a diagnostic path exceeded configured limits.
+    /// Input nesting, exact comparison work, or a diagnostic path exceeded configured limits.
     ResourceLimit {
         /// Last bounded path reached before validation stopped.
         path: String,
@@ -465,13 +507,23 @@ pub fn validate_schema_with_limits(
     schema: &Value,
     limits: ValidationLimits,
 ) -> Result<(), SchemaError> {
+    let exact = ExactNode::from_value(schema);
+    validate_schema_with_exact(schema, &exact, limits)
+}
+
+pub(crate) fn validate_schema_with_exact(
+    schema: &Value,
+    exact_schema: &ExactNode,
+    limits: ValidationLimits,
+) -> Result<(), SchemaError> {
     let mut remaining_nodes = limits.max_schema_nodes.get();
     validate_json_node(schema, 0, limits, &mut remaining_nodes, &mut Vec::new())?;
-    validate_schema_at(schema, "$", 0, limits)
+    validate_schema_at(schema, exact_schema, "$", 0, limits)
 }
 
 fn validate_schema_at(
     schema: &Value,
+    exact_schema: &ExactNode,
     path: &str,
     depth: usize,
     limits: ValidationLimits,
@@ -488,13 +540,13 @@ fn validate_schema_at(
     })?;
     validate_supported_keywords(object, path, limits)?;
     validate_type_keyword(object, path, limits)?;
-    validate_object_keywords(object, path, depth, limits)?;
-    validate_items_keyword(object, path, depth, limits)?;
+    validate_object_keywords(object, exact_schema, path, depth, limits)?;
+    validate_items_keyword(object, exact_schema, path, depth, limits)?;
     validate_enum_keyword(object, path, limits)?;
-    validate_length_keyword(object, path, "minLength", limits)?;
-    validate_length_keyword(object, path, "maxLength", limits)?;
-    validate_number_keyword(object, path, "minimum", limits)?;
-    validate_number_keyword(object, path, "maximum", limits)?;
+    validate_length_keyword(object, exact_schema, path, "minLength", limits)?;
+    validate_length_keyword(object, exact_schema, path, "maxLength", limits)?;
+    validate_number_keyword(object, exact_schema, path, "minimum", limits)?;
+    validate_number_keyword(object, exact_schema, path, "maximum", limits)?;
     Ok(())
 }
 
@@ -538,6 +590,7 @@ fn validate_type_keyword(
 
 fn validate_object_keywords(
     object: &Map<String, Value>,
+    exact_schema: &ExactNode,
     path: &str,
     depth: usize,
     limits: ValidationLimits,
@@ -548,9 +601,21 @@ fn validate_object_keywords(
             path: properties_path,
             kind: SchemaErrorKind::InvalidKeywordType,
         })?;
+        let exact_properties = exact_schema
+            .key("properties")
+            .expect("exact schema mirrors the schema value");
         for (name, property_schema) in properties {
             let property_path = schema_child_path(path, &[".properties.", name.as_str()], limits)?;
-            validate_schema_at(property_schema, &property_path, depth + 1, limits)?;
+            let exact_property_schema = exact_properties
+                .key(name)
+                .expect("exact schema mirrors the schema value");
+            validate_schema_at(
+                property_schema,
+                exact_property_schema,
+                &property_path,
+                depth + 1,
+                limits,
+            )?;
         }
     }
     if let Some(required) = object.get("required") {
@@ -590,13 +655,17 @@ fn validate_object_keywords(
 
 fn validate_items_keyword(
     object: &Map<String, Value>,
+    exact_schema: &ExactNode,
     path: &str,
     depth: usize,
     limits: ValidationLimits,
 ) -> Result<(), SchemaError> {
     if let Some(items) = object.get("items") {
         let item_path = schema_child_path(path, &[".items"], limits)?;
-        validate_schema_at(items, &item_path, depth + 1, limits)?;
+        let exact_items = exact_schema
+            .key("items")
+            .expect("exact schema mirrors the schema value");
+        validate_schema_at(items, exact_items, &item_path, depth + 1, limits)?;
     }
     Ok(())
 }
@@ -624,13 +693,17 @@ fn validate_enum_keyword(
 
 fn validate_length_keyword(
     object: &Map<String, Value>,
+    exact_schema: &ExactNode,
     path: &str,
     keyword: &str,
     limits: ValidationLimits,
 ) -> Result<(), SchemaError> {
-    if object
-        .get(keyword)
-        .is_some_and(|value| value.as_u64().is_none())
+    if object.contains_key(keyword)
+        && exact_schema
+            .key(keyword)
+            .and_then(ExactNode::number)
+            .and_then(ExactNumber::nonnegative_integer)
+            .is_none()
     {
         return Err(SchemaError {
             path: schema_child_path(path, &[".", keyword], limits)?,
@@ -642,14 +715,24 @@ fn validate_length_keyword(
 
 fn validate_number_keyword(
     object: &Map<String, Value>,
+    exact_schema: &ExactNode,
     path: &str,
     keyword: &str,
     limits: ValidationLimits,
 ) -> Result<(), SchemaError> {
-    if object.get(keyword).is_some_and(|value| !value.is_number()) {
+    let Some(_) = object.get(keyword) else {
+        return Ok(());
+    };
+    let Some(number) = exact_schema.key(keyword).and_then(ExactNode::number) else {
         return Err(SchemaError {
             path: schema_child_path(path, &[".", keyword], limits)?,
             kind: SchemaErrorKind::InvalidKeywordType,
+        });
+    };
+    if number.decimal().is_none() {
+        return Err(SchemaError {
+            path: schema_child_path(path, &[".", keyword], limits)?,
+            kind: SchemaErrorKind::ResourceLimit,
         });
     }
     Ok(())
@@ -810,7 +893,8 @@ fn validate_parameters_inner(
     exact_parameters: &ExactNode,
     limits: ValidationLimits,
 ) -> Result<(), ParameterValidationError> {
-    validate_schema_with_limits(schema, limits).map_err(ParameterValidationError::InvalidSchema)?;
+    validate_schema_with_exact(schema, exact_schema, limits)
+        .map_err(ParameterValidationError::InvalidSchema)?;
     let mut remaining_values = limits.max_input_nodes.get();
     validate_input_node(
         parameters,
@@ -871,6 +955,38 @@ impl ValidationContext {
         suffixes: &[&str],
     ) -> Result<String, ParameterValidationError> {
         parameter_child_path(path, suffixes, self.limits)
+    }
+
+    fn consume_comparisons(
+        &mut self,
+        count: usize,
+        path: &str,
+    ) -> Result<(), ParameterValidationError> {
+        let Some(remaining) = self.remaining_comparisons.checked_sub(count) else {
+            return Err(ParameterValidationError::ResourceLimit {
+                path: path.to_owned(),
+            });
+        };
+        self.remaining_comparisons = remaining;
+        Ok(())
+    }
+
+    fn compare_numbers(
+        &mut self,
+        left: &ExactNumber,
+        right: &ExactNumber,
+        path: &str,
+        unit_already_charged: bool,
+    ) -> Result<Ordering, ParameterValidationError> {
+        let units = left.comparison_units().max(right.comparison_units());
+        let charge = units.saturating_sub(usize::from(unit_already_charged));
+        self.consume_comparisons(charge, path)?;
+        let (Some(left), Some(right)) = (left.decimal(), right.decimal()) else {
+            return Err(ParameterValidationError::ResourceLimit {
+                path: path.to_owned(),
+            });
+        };
+        Ok(left.cmp(right))
     }
 }
 
@@ -1017,18 +1133,30 @@ fn validate_value(
         }
     }
     if let Some(value) = value.as_str() {
-        let length = value.chars().count() as u64;
+        let length = u64::try_from(value.chars().count()).unwrap_or(u64::MAX);
         if object
-            .get("minLength")
-            .and_then(Value::as_u64)
+            .contains_key("minLength")
+            .then(|| {
+                exact_schema
+                    .key("minLength")
+                    .and_then(ExactNode::number)
+                    .and_then(ExactNumber::nonnegative_integer)
+                    .expect("schema validation guarantees a representable length bound")
+            })
             .is_some_and(|minimum| length < minimum)
             && !context.record(path, ParameterViolationKind::StringTooShort)
         {
             return Ok(false);
         }
         if object
-            .get("maxLength")
-            .and_then(Value::as_u64)
+            .contains_key("maxLength")
+            .then(|| {
+                exact_schema
+                    .key("maxLength")
+                    .and_then(ExactNode::number)
+                    .and_then(ExactNumber::nonnegative_integer)
+                    .expect("schema validation guarantees a representable length bound")
+            })
             .is_some_and(|maximum| length > maximum)
             && !context.record(path, ParameterViolationKind::StringTooLong)
         {
@@ -1036,41 +1164,30 @@ fn validate_value(
         }
     }
     if value.is_number() {
-        if object
-            .get("minimum")
-            .and_then(Value::as_number)
-            .is_some_and(|_| {
-                compare_numbers(
-                    exact_value
-                        .number()
-                        .expect("exact parameters mirror the parameter value"),
-                    exact_schema
-                        .key("minimum")
-                        .and_then(ExactNode::number)
-                        .expect("exact schema mirrors the validated schema"),
-                ) == Ordering::Less
-            })
-            && !context.record(path, ParameterViolationKind::NumberTooSmall)
-        {
-            return Ok(false);
+        let exact_value = exact_value
+            .number()
+            .expect("exact parameters mirror the parameter value");
+        if object.contains_key("minimum") {
+            let minimum = exact_schema
+                .key("minimum")
+                .and_then(ExactNode::number)
+                .expect("exact schema mirrors the validated schema");
+            if context.compare_numbers(exact_value, minimum, path, false)? == Ordering::Less
+                && !context.record(path, ParameterViolationKind::NumberTooSmall)
+            {
+                return Ok(false);
+            }
         }
-        if object
-            .get("maximum")
-            .and_then(Value::as_number)
-            .is_some_and(|_| {
-                compare_numbers(
-                    exact_value
-                        .number()
-                        .expect("exact parameters mirror the parameter value"),
-                    exact_schema
-                        .key("maximum")
-                        .and_then(ExactNode::number)
-                        .expect("exact schema mirrors the validated schema"),
-                ) == Ordering::Greater
-            })
-            && !context.record(path, ParameterViolationKind::NumberTooLarge)
-        {
-            return Ok(false);
+        if object.contains_key("maximum") {
+            let maximum = exact_schema
+                .key("maximum")
+                .and_then(ExactNode::number)
+                .expect("exact schema mirrors the validated schema");
+            if context.compare_numbers(exact_value, maximum, path, false)? == Ordering::Greater
+                && !context.record(path, ParameterViolationKind::NumberTooLarge)
+            {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
@@ -1117,18 +1234,22 @@ fn json_equal_bounded(
             path: path.to_owned(),
         });
     }
-    context.remaining_comparisons -= 1;
+    context.consume_comparisons(1, path)?;
     match (candidate, value) {
         (Value::Null, Value::Null) => Ok(true),
         (Value::Bool(left), Value::Bool(right)) => Ok(left == right),
-        (Value::Number(_), Value::Number(_)) => Ok(compare_numbers(
-            exact_candidate
-                .number()
-                .expect("exact schema mirrors the validated schema"),
-            exact_value
-                .number()
-                .expect("exact parameters mirror the parameter value"),
-        ) == Ordering::Equal),
+        (Value::Number(_), Value::Number(_)) => context
+            .compare_numbers(
+                exact_candidate
+                    .number()
+                    .expect("exact schema mirrors the validated schema"),
+                exact_value
+                    .number()
+                    .expect("exact parameters mirror the parameter value"),
+                path,
+                true,
+            )
+            .map(|ordering| ordering == Ordering::Equal),
         (Value::String(left), Value::String(right)) => Ok(left == right),
         (Value::Array(left), Value::Array(right)) => {
             if left.len() != right.len() {
@@ -1198,15 +1319,11 @@ fn json_equal_bounded(
     }
 }
 
-fn compare_numbers(left: &str, right: &str) -> Ordering {
-    ExactDecimal::parse(left).cmp(&ExactDecimal::parse(right))
+fn number_is_integer(number: &ExactNumber) -> bool {
+    number.decimal().is_some_and(ExactDecimal::is_integer)
 }
 
-fn number_is_integer(number: &str) -> bool {
-    ExactDecimal::parse(number).is_integer()
-}
-
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ExactDecimal {
     negative: bool,
     significant: Vec<u8>,
@@ -1215,7 +1332,10 @@ struct ExactDecimal {
 }
 
 impl ExactDecimal {
-    fn parse(raw: &str) -> Self {
+    fn parse_bounded(raw: &str) -> Option<Self> {
+        if raw.len() > MAX_NUMBER_LEXEME_BYTES {
+            return None;
+        }
         let (negative, unsigned) = raw
             .strip_prefix('-')
             .map_or((false, raw), |unsigned| (true, unsigned));
@@ -1225,18 +1345,22 @@ impl ExactDecimal {
         let (integer, fraction) = mantissa
             .split_once('.')
             .map_or((mantissa, ""), |parts| parts);
+        let mantissa_digits = integer.len().checked_add(fraction.len())?;
+        if mantissa_digits > MAX_NUMBER_MANTISSA_DIGITS || !bounded_exponent(exponent) {
+            return None;
+        }
         let digits = integer
             .bytes()
             .chain(fraction.bytes())
             .map(|digit| digit - b'0')
             .collect::<Vec<_>>();
         let Some(first_nonzero) = digits.iter().position(|digit| *digit != 0) else {
-            return Self {
+            return Some(Self {
                 negative: false,
                 significant: Vec::new(),
                 highest_exponent: BigSigned::zero(),
                 least_exponent: BigSigned::zero(),
-            };
+            });
         };
         let last_nonzero = digits
             .iter()
@@ -1246,12 +1370,12 @@ impl ExactDecimal {
         let exponent = BigSigned::parse(exponent);
         let highest_adjustment = BigSigned::from_difference(integer.len(), first_nonzero + 1);
         let least_adjustment = BigSigned::from_difference(trailing_zeros, fraction.len());
-        Self {
+        Some(Self {
             negative,
             significant: digits[first_nonzero..=last_nonzero].to_vec(),
             highest_exponent: exponent.clone().add(&highest_adjustment),
             least_exponent: exponent.add(&least_adjustment),
-        }
+        })
     }
 
     const fn is_zero(&self) -> bool {
@@ -1260,6 +1384,36 @@ impl ExactDecimal {
 
     const fn is_integer(&self) -> bool {
         self.is_zero() || !self.least_exponent.negative
+    }
+
+    fn to_u64(&self) -> Option<u64> {
+        if self.is_zero() {
+            return Some(0);
+        }
+        if self.negative || !self.is_integer() {
+            return None;
+        }
+        if self.highest_exponent > BigSigned::from_usize(19, false) {
+            return None;
+        }
+        let trailing_zeros = self.least_exponent.to_usize()?;
+        let mut value = 0_u64;
+        for digit in &self.significant {
+            value = value.checked_mul(10)?.checked_add(u64::from(*digit))?;
+        }
+        for _ in 0..trailing_zeros {
+            value = value.checked_mul(10)?;
+        }
+        Some(value)
+    }
+
+    fn comparison_units(&self) -> usize {
+        self.significant
+            .len()
+            .saturating_add(self.highest_exponent.digits.len())
+            .saturating_add(self.least_exponent.digits.len())
+            .max(1)
+            .div_ceil(COMPARISON_DIGITS_PER_UNIT)
     }
 
     fn cmp_magnitude(&self, other: &Self) -> Ordering {
@@ -1379,6 +1533,15 @@ impl BigSigned {
         }
     }
 
+    fn to_usize(&self) -> Option<usize> {
+        if self.negative {
+            return None;
+        }
+        self.digits.iter().try_fold(0_usize, |value, digit| {
+            value.checked_mul(10)?.checked_add(usize::from(*digit))
+        })
+    }
+
     fn add(self, other: &Self) -> Self {
         if self.negative == other.negative {
             return Self {
@@ -1398,6 +1561,18 @@ impl BigSigned {
             },
         }
     }
+}
+
+fn bounded_exponent(raw: &str) -> bool {
+    let magnitude = match raw.as_bytes().first() {
+        Some(b'-' | b'+') => &raw[1..],
+        Some(_) | None => raw,
+    };
+    !magnitude.is_empty()
+        && magnitude.len() <= MAX_NUMBER_EXPONENT_DIGITS
+        && magnitude
+            .parse::<u32>()
+            .is_ok_and(|exponent| exponent <= MAX_NUMBER_EXPONENT)
 }
 
 impl Ord for BigSigned {

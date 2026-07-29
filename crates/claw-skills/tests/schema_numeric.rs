@@ -2,7 +2,7 @@
 
 use claw_skills::{
     ExactJsonDocument, ParameterValidationError, ParameterViolation, ParameterViolationKind,
-    validate_exact_parameters, validate_parameters,
+    SchemaError, SchemaErrorKind, validate_exact_parameters, validate_parameters,
 };
 use serde_json::{Value, json};
 
@@ -33,6 +33,18 @@ fn assert_exact_violation(
             }],
             limit_reached: false,
         })
+    );
+}
+
+fn assert_exact_schema_error(schema: &str, path: &str, kind: SchemaErrorKind) {
+    let schema = ExactJsonDocument::parse(schema).expect("valid schema JSON");
+    let input = ExactJsonDocument::parse(r#""""#).expect("valid input");
+    assert_eq!(
+        validate_exact_parameters(&schema, &input),
+        Err(ParameterValidationError::InvalidSchema(SchemaError {
+            path: path.to_owned(),
+            kind,
+        }))
     );
 }
 
@@ -106,9 +118,8 @@ fn decimal_lexemes_are_compared_without_binary_float_rounding() {
         ParameterViolationKind::NotInEnum,
     );
 
-    let huge_exponent =
-        ExactJsonDocument::parse(r#"{"minimum":1e100000000000000000000}"#).expect("valid schema");
-    let smaller = ExactJsonDocument::parse("9e99999999999999999999").expect("valid input");
+    let huge_exponent = ExactJsonDocument::parse(r#"{"minimum":1e100000}"#).expect("valid schema");
+    let smaller = ExactJsonDocument::parse("9e99999").expect("valid input");
     assert_exact_violation(
         &huge_exponent,
         &smaller,
@@ -127,5 +138,67 @@ fn decimal_lexemes_are_compared_without_binary_float_rounding() {
         &integer_schema,
         &ExactJsonDocument::parse("9007199254740993.1").expect("valid input"),
         ParameterViolationKind::TypeMismatch,
+    );
+}
+
+#[test]
+fn exact_length_bounds_accept_only_bounded_representable_integers() {
+    let minimum = ExactJsonDocument::parse(r#"{"minLength":1.0}"#).expect("valid schema");
+    assert_exact_violation(
+        &minimum,
+        &ExactJsonDocument::parse(r#""""#).expect("valid input"),
+        ParameterViolationKind::StringTooShort,
+    );
+    assert_eq!(
+        validate_exact_parameters(
+            &minimum,
+            &ExactJsonDocument::parse(r#""x""#).expect("valid input")
+        ),
+        Ok(())
+    );
+
+    for schema in [
+        r#"{"minLength":-1}"#,
+        r#"{"minLength":1.5}"#,
+        r#"{"minLength":18446744073709551616}"#,
+        r#"{"minLength":1e1000001}"#,
+        r#"{"maxLength":-1}"#,
+    ] {
+        let path = if schema.contains("maxLength") {
+            "$.maxLength"
+        } else {
+            "$.minLength"
+        };
+        assert_exact_schema_error(schema, path, SchemaErrorKind::InvalidLengthBound);
+    }
+}
+
+#[test]
+fn oversized_numeric_bounds_are_rejected_during_schema_admission() {
+    assert_exact_schema_error(
+        r#"{"minimum":1e1000001}"#,
+        "$.minimum",
+        SchemaErrorKind::ResourceLimit,
+    );
+}
+
+#[test]
+fn duplicate_object_keys_use_the_last_exact_value() {
+    let schema =
+        ExactJsonDocument::parse(r#"{"enum":[{"value":9007199254740993}]}"#).expect("valid schema");
+    let matching =
+        ExactJsonDocument::parse(r#"{"value":1,"value":9007199254740993}"#).expect("valid input");
+    assert_eq!(validate_exact_parameters(&schema, &matching), Ok(()));
+
+    let nonmatching =
+        ExactJsonDocument::parse(r#"{"value":9007199254740993,"value":1}"#).expect("valid input");
+    assert_exact_violation(&schema, &nonmatching, ParameterViolationKind::NotInEnum);
+
+    assert!(
+        ExactJsonDocument::parse(r#"{"value":1e1000001,"value":1}"#)
+            .expect("valid input")
+            .value()
+            .is_some(),
+        "an overwritten lossy value must not taint the retained object"
     );
 }

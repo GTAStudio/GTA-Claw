@@ -3,8 +3,9 @@
 use std::num::NonZeroUsize;
 
 use claw_skills::{
-    ParameterValidationError, ParameterViolationKind, SchemaErrorKind, ValidationLimits,
-    validate_parameters_with_limits, validate_schema_with_limits,
+    ExactJsonDocument, ParameterValidationError, ParameterViolationKind, SchemaErrorKind,
+    ValidationLimits, validate_exact_parameters_with_limits, validate_parameters_with_limits,
+    validate_schema_with_limits,
 };
 use serde_json::{Value, json};
 
@@ -185,6 +186,28 @@ fn enum_comparison_budget_bounds_nested_value_walks() {
 
     let error = validate_parameters_with_limits(&schema, &json!([1, 3]), constrained)
         .expect_err("nested enum comparison exceeds its own budget");
+    assert_eq!(
+        error,
+        ParameterValidationError::ResourceLimit {
+            path: "$[1]".to_owned()
+        }
+    );
+}
+
+#[test]
+fn decimal_comparison_work_is_charged_per_array_item() {
+    let number = "1".repeat(64);
+    let schema = ExactJsonDocument::parse(&format!(
+        r#"{{"type":"array","items":{{"minimum":{number}}}}}"#
+    ))
+    .expect("valid exact schema");
+    let parameters =
+        ExactJsonDocument::parse(&format!("[{number},{number}]")).expect("valid exact parameters");
+    let mut constrained = limits(4, 128);
+    constrained.max_comparison_nodes = NonZeroUsize::new(3).expect("positive comparison limit");
+
+    let error = validate_exact_parameters_with_limits(&schema, &parameters, constrained)
+        .expect_err("the second large-decimal comparison exceeds the work budget");
     assert_eq!(
         error,
         ParameterValidationError::ResourceLimit {

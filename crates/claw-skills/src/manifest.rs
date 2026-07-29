@@ -8,7 +8,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
 
-use crate::schema::{ExactJsonDocument, ExactNode, SchemaError, validate_schema};
+use crate::schema::{
+    ExactJsonDocument, ExactNode, SchemaError, ValidationLimits, validate_schema_with_exact,
+};
 
 /// A validated modern skill manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,7 +58,21 @@ impl SkillManifest {
         if self.description.trim().is_empty() {
             return Err(ManifestError::EmptyDescription);
         }
-        validate_schema(&self.parameters).map_err(ManifestError::InvalidParameterSchema)?;
+        let fallback_exact = self
+            .exact_parameters
+            .is_none()
+            .then(|| ExactNode::from_value(&self.parameters));
+        let exact_parameters = self
+            .exact_parameters
+            .as_ref()
+            .or(fallback_exact.as_ref())
+            .expect("manifest parameters always have an exact representation");
+        validate_schema_with_exact(
+            &self.parameters,
+            exact_parameters,
+            ValidationLimits::default(),
+        )
+        .map_err(ManifestError::InvalidParameterSchema)?;
         self.execution.validate()
     }
 }
