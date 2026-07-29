@@ -139,6 +139,7 @@ pub(crate) struct WhatsappWire {
     pub(crate) enabled: bool,
     pub(crate) verify_token: Option<String>,
     pub(crate) access_token: Option<String>,
+    pub(crate) app_secret: Option<String>,
     pub(crate) phone_number_id: Option<String>,
     pub(crate) webhook_path: String,
 }
@@ -149,6 +150,7 @@ impl Default for WhatsappWire {
             enabled: false,
             verify_token: None,
             access_token: None,
+            app_secret: None,
             phone_number_id: None,
             webhook_path: "/whatsapp/webhook".to_owned(),
         }
@@ -424,6 +426,10 @@ impl EnvelopeWire {
                 self.core.channels.whatsapp.access_token,
                 "core.channels.whatsapp.access_token",
             )?,
+            app_secret: secret(
+                self.core.channels.whatsapp.app_secret,
+                "core.channels.whatsapp.app_secret",
+            )?,
             phone_number_id: nonempty_optional(
                 self.core.channels.whatsapp.phone_number_id,
                 "core.channels.whatsapp.phone_number_id",
@@ -544,6 +550,12 @@ impl From<&ConfigSnapshot> for EnvelopeWire {
                             .channels
                             .whatsapp
                             .access_token
+                            .as_ref()
+                            .map(secret_string),
+                        app_secret: core
+                            .channels
+                            .whatsapp
+                            .app_secret
                             .as_ref()
                             .map(secret_string),
                         phone_number_id: core.channels.whatsapp.phone_number_id.clone(),

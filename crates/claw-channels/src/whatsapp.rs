@@ -11,6 +11,7 @@ use claw_channel_sdk::{
     DeliveryState, InboundMessage, InvalidMessageReason, LifecycleEvent, OutboundMessage,
     OutboundRetrySafety, ProtocolErrorKind, SecretStoreError, UnsupportedOperation,
 };
+use ring::hmac;
 use serde::Deserialize;
 
 use crate::bounded::BoundedQueue;
@@ -214,7 +215,7 @@ pub struct WhatsAppWebhookStats {
     pub messages: usize,
     /// Text messages accepted into the bounded inbound queue.
     pub queued: usize,
-    /// Non-text, blank, malformed, self-authored, or completed duplicate messages ignored.
+    /// Non-text, blank, malformed, self-authored, completed, or pending duplicates ignored.
     pub ignored: usize,
     /// Messages dropped after the bounded queue filled.
     pub dropped: usize,
@@ -229,6 +230,34 @@ pub struct WhatsAppWebhookHandling {
     pub processed: usize,
 }
 
+/// Verifies Meta's `X-Hub-Signature-256` over the exact webhook bytes.
+///
+/// # Errors
+///
+/// Returns a credential binding error unless `app_secret` is a local-only
+/// [`CredentialKind::WebhookSecret`] for this `WhatsApp` account.
+pub fn verify_whatsapp_webhook_signature(
+    account_id: &str,
+    payload: &[u8],
+    signature: &str,
+    app_secret: &ChannelCredential,
+) -> Result<bool, ChannelError> {
+    let Some(tag) = decode_sha256_signature(signature) else {
+        return Ok(false);
+    };
+    app_secret
+        .expose_local(
+            "whatsapp",
+            account_id,
+            CredentialKind::WebhookSecret,
+            |secret| {
+                let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+                hmac::verify(&key, payload, &tag).is_ok()
+            },
+        )
+        .map_err(map_credential_binding)
+}
+
 /// `WhatsApp` webhook plus Graph API text adapter.
 pub struct WhatsAppChannel<T, C> {
     account_id: String,
@@ -239,6 +268,7 @@ pub struct WhatsAppChannel<T, C> {
     lifecycle: ConnectionStateMachine,
     inbound: BoundedQueue<InboundMessage>,
     delivery_history_capacity: usize,
+    pending_reply_capacity: usize,
     completed_message_ids: VecDeque<String>,
     pending_replies: VecDeque<PendingWhatsAppReply>,
 }
@@ -251,8 +281,8 @@ impl<T, C> WhatsAppChannel<T, C> {
     /// Returns [`ChannelError::Configuration`] for invalid account or phone
     /// routing, or when `graph_origin` is not the exact enrolled
     /// `https://graph.facebook.com` origin for this account. `inbound_capacity`
-    /// also bounds recent completion IDs and partial reply checkpoints used to
-    /// make webhook redelivery resumable.
+    /// bounds recent completion IDs. Partial reply checkpoints are capped at
+    /// twice that size so one failed bounded batch cannot starve the next batch.
     pub fn new(
         account_id: impl Into<String>,
         phone_number_id: impl Into<String>,
@@ -278,6 +308,7 @@ impl<T, C> WhatsAppChannel<T, C> {
             lifecycle: ConnectionStateMachine::new(),
             inbound: BoundedQueue::new(inbound_capacity),
             delivery_history_capacity: inbound_capacity.get(),
+            pending_reply_capacity: inbound_capacity.get().saturating_mul(2),
             completed_message_ids: VecDeque::new(),
             pending_replies: VecDeque::new(),
         })
@@ -432,12 +463,15 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
     /// This is the compatibility path an HTTP adapter should call: an `Ok`
     /// result maps to [`WhatsAppWebhookResponse::Accepted`], while any error maps
     /// to [`WhatsAppWebhookResponse::Failed`]. Entries, changes, messages, and
-    /// segmented replies are processed sequentially.
+    /// segmented replies are processed sequentially. Each queued item and prior
+    /// checkpoint gets at most one attempt per call, so a failing item cannot
+    /// keep a later redelivered item from making progress.
     ///
     /// # Errors
     ///
     /// Returns the first parsing, callback, credential, transport, provider, or
-    /// protocol error. No later message or segment is sent.
+    /// protocol error after preserving failed work and attempting the remaining
+    /// bounded items once.
     pub fn handle_webhook(
         &mut self,
         payload: &[u8],
@@ -490,6 +524,27 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
             ));
             ChannelError::Protocol(ProtocolErrorKind::MalformedResponse)
         })?;
+        if body
+            .entry
+            .iter()
+            .flat_map(|entry| &entry.changes)
+            .filter_map(|change| change.value.as_ref())
+            .any(|value| {
+                !value.messages.is_empty()
+                    && value
+                        .metadata
+                        .is_none_or(|metadata| metadata.phone_number_id != self.phone_number_id)
+            })
+        {
+            diagnostics.record(self.diagnostic(
+                DiagnosticLevel::Warning,
+                DiagnosticCode::MalformedPayload,
+                None,
+                None,
+                None,
+            ));
+            return Err(ChannelError::Protocol(ProtocolErrorKind::InvalidField));
+        }
         let mut stats = WhatsAppWebhookStats::default();
         for entry in body.entry {
             for change in entry.changes {
@@ -503,6 +558,10 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
                         .iter()
                         .any(|message_id| message_id == message.id)
                         || self.inbound.iter().any(|queued| queued.id == message.id)
+                        || self
+                            .pending_replies
+                            .iter()
+                            .any(|pending| pending.message_id == message.id)
                     {
                         stats.ignored += 1;
                         continue;
@@ -576,14 +635,15 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
     /// Processes queued webhook messages and sends replies sequentially.
     ///
     /// The callback owns engine and command composition. Returning `None` or
-    /// blank text suppresses a reply. The first processing or send error stops
-    /// the webhook, allowing the HTTP layer to return
+    /// blank text suppresses a reply. Failed callbacks are requeued and failed
+    /// replies retain their next-segment checkpoint. Other bounded items still
+    /// receive one attempt before the HTTP layer returns
     /// [`WhatsAppWebhookResponse::Failed`].
     ///
     /// # Errors
     ///
     /// Returns the first callback, credential, transport, provider, or protocol
-    /// error. No later message or segment is sent.
+    /// error after every item present at entry receives at most one attempt.
     pub fn process_webhook_queue(
         &mut self,
         access_credential: &ChannelCredential,
@@ -591,46 +651,70 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
     ) -> Result<usize, ChannelError> {
         self.require_running()?;
         let mut processed = 0;
-        while let Some(message) = self.inbound.pop() {
-            let pending_index = self
-                .pending_replies
-                .iter()
-                .position(|pending| pending.message_id == message.id);
-            let mut pending = if let Some(index) = pending_index {
-                let Some(pending) = self.pending_replies.remove(index) else {
-                    return Err(ChannelError::Protocol(ProtocolErrorKind::InvalidField));
-                };
-                pending
-            } else {
-                let reply = process(&message)?;
-                let Some(reply) = reply.filter(|reply| !reply.trim().is_empty()) else {
-                    self.remember_completed(message.id);
-                    processed += 1;
+        let pending_attempts = self.pending_replies.len();
+        let inbound_attempts = self.inbound.len();
+        let mut first_error = None;
+
+        for _ in 0..inbound_attempts {
+            let Some(message) = self.inbound.pop() else {
+                break;
+            };
+            if self.pending_replies.len() >= self.pending_reply_capacity {
+                self.inbound
+                    .push(message)
+                    .map_err(|_| ChannelError::Protocol(ProtocolErrorKind::InvalidField))?;
+                first_error.get_or_insert(ChannelError::RateLimited {
+                    retry_after: Duration::from_secs(1),
+                });
+                continue;
+            }
+            let reply = match process(&message) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    self.inbound
+                        .push(message)
+                        .map_err(|_| ChannelError::Protocol(ProtocolErrorKind::InvalidField))?;
+                    first_error.get_or_insert(error);
                     continue;
-                };
-                if self.pending_replies.len() == self.delivery_history_capacity {
-                    return Err(ChannelError::RateLimited {
-                        retry_after: Duration::from_secs(1),
-                    });
                 }
-                let to = message.conversation_id.strip_prefix("whatsapp:").ok_or(
-                    ChannelError::Configuration(ConfigurationError::ConversationScopeMismatch),
-                )?;
-                PendingWhatsAppReply {
-                    message_id: message.id,
-                    to: to.to_owned(),
-                    text: reply,
-                    next_chunk: 0,
-                }
+            };
+            let Some(reply) = reply.filter(|reply| !reply.trim().is_empty()) else {
+                self.remember_completed(message.id);
+                processed += 1;
+                continue;
+            };
+            let to = message.conversation_id.strip_prefix("whatsapp:").ok_or(
+                ChannelError::Configuration(ConfigurationError::ConversationScopeMismatch),
+            )?;
+            let mut pending = PendingWhatsAppReply {
+                message_id: message.id,
+                to: to.to_owned(),
+                text: reply,
+                next_chunk: 0,
             };
             if let Err(error) = self.resume_pending_reply(&mut pending, access_credential) {
                 self.pending_replies.push_back(pending);
-                return Err(error);
+                first_error.get_or_insert(error);
+                continue;
             }
             self.remember_completed(pending.message_id);
             processed += 1;
         }
-        Ok(processed)
+
+        for _ in 0..pending_attempts {
+            let Some(mut pending) = self.pending_replies.pop_front() else {
+                break;
+            };
+            if let Err(error) = self.resume_pending_reply(&mut pending, access_credential) {
+                self.pending_replies.push_back(pending);
+                first_error.get_or_insert(error);
+                continue;
+            }
+            self.remember_completed(pending.message_id);
+            processed += 1;
+        }
+
+        first_error.map_or(Ok(processed), Err)
     }
 
     fn resume_pending_reply(
@@ -802,8 +886,15 @@ struct WhatsAppChange<'a> {
 
 #[derive(Deserialize)]
 struct WhatsAppValue<'a> {
+    #[serde(borrow)]
+    metadata: Option<WhatsAppMetadata<'a>>,
     #[serde(default, borrow)]
     messages: Vec<WhatsAppMessage<'a>>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+struct WhatsAppMetadata<'a> {
+    phone_number_id: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -862,6 +953,29 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         difference |= usize::from(left_byte ^ right_byte);
     }
     difference == 0
+}
+
+fn decode_sha256_signature(signature: &str) -> Option<[u8; 32]> {
+    let encoded = signature.strip_prefix("sha256=")?;
+    if encoded.len() != 64 {
+        return None;
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let high = decode_hex(pair[0])?;
+        let low = decode_hex(pair[1])?;
+        decoded[index] = (high << 4) | low;
+    }
+    Some(decoded)
+}
+
+const fn decode_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 const fn map_credential_binding(error: CredentialBindingError) -> ChannelError {

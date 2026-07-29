@@ -45,7 +45,7 @@ pub(crate) async fn read_json_value(
     })
 }
 
-async fn read_body(
+pub(crate) async fn read_body(
     request: Request,
     max_bytes: usize,
     body_timeout: Duration,

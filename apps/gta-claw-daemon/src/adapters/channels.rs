@@ -1,21 +1,24 @@
 //! Supervised Telegram and Discord channel transports.
 
+use std::fmt::{self, Display, Formatter};
+use std::future::Future;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use claw_channel_sdk::{
-    Channel, ChannelCredential, ChannelError, CredentialBinding, CredentialKind, CredentialRequest,
-    InboundMessage, NetworkOrigin, OriginTrustError, OriginTrustStore, OutboundMessage,
-    TransportErrorKind, authorize_origin,
+    ApprovedOrigin, Channel, ChannelCredential, ChannelError, CredentialBinding, CredentialKind,
+    CredentialRequest, InboundMessage, NetworkOrigin, OriginTrustError, OriginTrustStore,
+    OutboundMessage, TransportErrorKind, authorize_origin,
 };
 use claw_channels::{
     AuthenticationPrompt, DiagnosticLevel, DiagnosticSink, DiscordChannel,
     DiscordCreateMessageRequest, DiscordGatewayRequest, DiscordPacketOutcome, DiscordTransport,
-    DispatchInput, DispatchOutcome, OperatorDiagnostic, ProviderResponse, SystemClock,
-    TelegramChannel, TelegramPollRequest, TelegramSendRequest, TelegramTransport,
-    dispatch_incoming, segment_outbound_text_iter,
+    DispatchInput, DispatchOutcome, MAX_PROVIDER_RESPONSE_BYTES, OperatorDiagnostic,
+    ProviderResponse, SystemClock, TelegramChannel, TelegramPollRequest, TelegramSendRequest,
+    TelegramTransport, dispatch_incoming, segment_outbound_text_iter,
 };
 use claw_provider_sdk::http::{
     Body, HttpRequest, HttpTransport, Method, ProxyPolicy, TransportConfig,
@@ -31,10 +34,13 @@ use tokio_util::task::TaskTracker;
 use url::Url;
 
 use super::agent_runtime::AgentRuntime;
-use super::http_api::Diagnostics;
+use super::http_api::{DependencyReadiness, Diagnostics};
 
 const CHANNEL_START_TIMEOUT: Duration = Duration::from_secs(20);
 const CHANNEL_STOP_GRACE: Duration = Duration::from_secs(2);
+const DISCORD_REPLY_MAX_ATTEMPTS: u32 = 3;
+const TELEGRAM_READINESS_ATTEMPTS: u32 = 3;
+const TELEGRAM_PERSISTENT_FAILURES: u32 = 3;
 
 /// Configured Telegram worker.
 pub struct TelegramSettings {
@@ -52,6 +58,36 @@ pub struct DiscordSettings {
     pub gateway_url: String,
     /// Gateway intent bitset.
     pub intents: u64,
+}
+
+type TelegramProbeFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ChannelError>> + Send + 'a>>;
+
+trait TelegramReadinessProbe: Sync {
+    fn probe<'a>(
+        &'a self,
+        credential: &'a ChannelCredential,
+        origin: &'a ApprovedOrigin,
+        cancellation: &'a CancellationToken,
+    ) -> TelegramProbeFuture<'a>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TelegramReadinessError {
+    Cancelled,
+    Terminal(ChannelError),
+    Persistent(ChannelError),
+}
+
+impl Display for TelegramReadinessError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("Telegram readiness was cancelled"),
+            Self::Terminal(error) => write!(formatter, "Telegram readiness failed: {error}"),
+            Self::Persistent(error) => {
+                write!(formatter, "Telegram readiness repeatedly failed: {error}")
+            }
+        }
+    }
 }
 
 /// Shutdown accounting for live channel tasks.
@@ -166,6 +202,59 @@ fn cancel_requests(requests: &RequestCancellations) {
     }
 }
 
+async fn wait_for_telegram_readiness<P: TelegramReadinessProbe>(
+    probe: &P,
+    credential: &ChannelCredential,
+    origin: &ApprovedOrigin,
+    cancellation: &CancellationToken,
+    default_retry_after: Duration,
+    max_attempts: u32,
+) -> Result<(), TelegramReadinessError> {
+    for attempt in 1..=max_attempts {
+        let result = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(TelegramReadinessError::Cancelled),
+            result = probe.probe(credential, origin, cancellation) => result,
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if telegram_failure_is_terminal(&error) => {
+                return Err(TelegramReadinessError::Terminal(error));
+            }
+            Err(error) if attempt == max_attempts => {
+                return Err(TelegramReadinessError::Persistent(error));
+            }
+            Err(error) => {
+                let retry_after = error.retry_after().unwrap_or(default_retry_after);
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {
+                        return Err(TelegramReadinessError::Cancelled);
+                    }
+                    () = tokio::time::sleep(retry_after) => {}
+                }
+            }
+        }
+    }
+    unreachable!("the non-zero readiness attempt loop always returns")
+}
+
+const fn telegram_failure_is_terminal(error: &ChannelError) -> bool {
+    matches!(
+        error,
+        ChannelError::InvalidMessage(_)
+            | ChannelError::Configuration(_)
+            | ChannelError::Credential(_)
+            | ChannelError::CredentialBinding(_)
+            | ChannelError::Authentication
+            | ChannelError::Protocol(_)
+            | ChannelError::Unsupported(_)
+            | ChannelError::Lifecycle(_)
+            | ChannelError::NotConnected { .. }
+            | ChannelError::RemoteRejected { status: 400..=499 }
+    )
+}
+
 impl ChannelSupervisor {
     /// Builds and starts every configured channel.
     ///
@@ -181,6 +270,7 @@ impl ChannelSupervisor {
         authentication: Arc<RwLock<Option<String>>>,
         proxy: ProxyPolicy,
         diagnostics: Arc<Diagnostics>,
+        readiness: Arc<DependencyReadiness>,
         startup_cancellation: CancellationToken,
     ) -> Result<Self, String> {
         let cancellation = startup_cancellation.child_token();
@@ -195,6 +285,7 @@ impl ChannelSupervisor {
             armed: true,
         };
         let mut spawned = 0_u64;
+        readiness.set("channels", true);
 
         if let Some(settings) = telegram {
             let request_cancel = Arc::new(Mutex::new(None));
@@ -208,6 +299,27 @@ impl ChannelSupervisor {
                 origin.clone(),
                 &settings.token,
             )?;
+            request_cancellations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Arc::clone(&request_cancel));
+            match tokio::time::timeout(
+                CHANNEL_START_TIMEOUT,
+                wait_for_telegram_readiness(
+                    &transport,
+                    &credential,
+                    &origin,
+                    &cancellation,
+                    settings.poll_interval,
+                    TELEGRAM_READINESS_ATTEMPTS,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(error.to_string()),
+                Err(_) => return Err("Telegram channel readiness timed out".to_owned()),
+            }
             let inbound_capacity = NonZeroUsize::new(64)
                 .ok_or_else(|| "Telegram inbound capacity must be non-zero".to_owned())?;
             let mut channel = TelegramChannel::new(
@@ -226,6 +338,7 @@ impl ChannelSupervisor {
             let task_runtime = Arc::clone(&runtime);
             let task_authentication = Arc::clone(&authentication);
             let task_diagnostics = Arc::clone(&diagnostics);
+            let task_readiness = Arc::clone(&readiness);
             let task_terminated = Arc::clone(&terminated);
             let handle = tracker.spawn(async move {
                 let _guard = TerminationGuard(task_terminated);
@@ -235,6 +348,7 @@ impl ChannelSupervisor {
                     task_runtime,
                     task_authentication,
                     task_diagnostics,
+                    task_readiness,
                     task_cancel,
                 )
                 .await;
@@ -244,10 +358,6 @@ impl ChannelSupervisor {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(handle.abort_handle());
             drop(handle);
-            request_cancellations
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(request_cancel);
             spawned = spawned.saturating_add(1);
         }
 
@@ -525,6 +635,14 @@ impl Drop for RequestSlotGuard<'_> {
     }
 }
 
+struct RequestCancelGuard(CancelToken);
+
+impl Drop for RequestCancelGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 fn blocking_http(
     transport: &HttpTransport,
     request: HttpRequest,
@@ -559,6 +677,63 @@ impl TelegramHttpTransport {
             })
             .map_err(|error| error.to_string())?,
             request_cancel,
+        })
+    }
+}
+
+impl TelegramReadinessProbe for TelegramHttpTransport {
+    fn probe<'a>(
+        &'a self,
+        credential: &'a ChannelCredential,
+        origin: &'a ApprovedOrigin,
+        cancellation: &'a CancellationToken,
+    ) -> TelegramProbeFuture<'a> {
+        Box::pin(async move {
+            let request = credential
+                .expose_for_origin(
+                    "telegram",
+                    "default",
+                    CredentialKind::Token,
+                    origin,
+                    |bot_token| {
+                        let url =
+                            Url::parse(&format!("https://api.telegram.org/bot{bot_token}/getMe"))
+                                .map_err(|_| {
+                                ChannelError::Protocol(
+                                    claw_channel_sdk::ProtocolErrorKind::InvalidField,
+                                )
+                            })?;
+                        Ok::<HttpRequest, ChannelError>(
+                            HttpRequest::new(Method::Get, url)
+                                .header("accept", "application/json")
+                                .timeout(Duration::from_secs(10)),
+                        )
+                    },
+                )
+                .map_err(ChannelError::CredentialBinding)??;
+            let cancel = CancelToken::new();
+            *self
+                .request_cancel
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(cancel.clone());
+            let _cancel_on_drop = RequestCancelGuard(cancel.clone());
+            let _guard = RequestSlotGuard {
+                slot: self.request_cancel.as_ref(),
+            };
+            let response = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    cancel.cancel();
+                    return Err(ChannelError::Transport(TransportErrorKind::Io));
+                }
+                response = self.transport.send(
+                    "telegram",
+                    Operation::Transport,
+                    request,
+                    &cancel,
+                ) => response.map_err(|error| provider_channel_error(&error))?,
+            };
+            classify_telegram_probe_response(&provider_response(&response))
         })
     }
 }
@@ -733,6 +908,18 @@ impl DiscordTransport for DiscordTransportAdapter {
                 }
             }),
             1 => json!({"op":1,"d":request.sequence()}),
+            6 => json!({
+                "op": 6,
+                "d": {
+                    "token": request.bot_token().ok_or(ChannelError::Authentication)?,
+                    "session_id": request.session_id().ok_or(ChannelError::Protocol(
+                        claw_channel_sdk::ProtocolErrorKind::MissingField,
+                    ))?,
+                    "seq": request.sequence().ok_or(ChannelError::Protocol(
+                        claw_channel_sdk::ProtocolErrorKind::MissingField,
+                    ))?,
+                }
+            }),
             _ => {
                 return Err(ChannelError::Protocol(
                     claw_channel_sdk::ProtocolErrorKind::InvalidField,
@@ -918,18 +1105,40 @@ async fn run_telegram(
     runtime: Arc<AgentRuntime>,
     authentication: Arc<RwLock<Option<String>>>,
     diagnostics: Arc<Diagnostics>,
+    readiness: Arc<DependencyReadiness>,
     cancellation: CancellationToken,
 ) {
+    let mut consecutive_failures = 0_u32;
     loop {
         if cancellation.is_cancelled() {
             break;
         }
-        if let Err(error) = channel.poll_once(
+        let poll_result = channel.poll_once(
             &credential,
             &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
-        ) {
-            diagnostics.record(format!("Telegram poll failed: {error}"));
-        }
+        );
+        let retry_after = match &poll_result {
+            Ok(_) => {
+                consecutive_failures = 0;
+                readiness.set("channels", true);
+                channel.poll_interval()
+            }
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                diagnostics.record(format!("Telegram poll failed: {error}"));
+                if telegram_failure_is_terminal(error) {
+                    readiness.set("channels", false);
+                    diagnostics.record("Telegram worker stopped after a terminal failure");
+                    break;
+                }
+                if consecutive_failures >= TELEGRAM_PERSISTENT_FAILURES {
+                    readiness.set("channels", false);
+                }
+                error
+                    .retry_after()
+                    .unwrap_or_else(|| channel.poll_interval())
+            }
+        };
         while let Ok(Some(message)) = channel.poll_inbound() {
             match process_inbound(
                 &message,
@@ -971,7 +1180,7 @@ async fn run_telegram(
         }
         tokio::select! {
             () = cancellation.cancelled() => break,
-            () = tokio::time::sleep(channel.poll_interval()) => {}
+            () = tokio::time::sleep(retry_after) => {}
         }
     }
     let _ = channel.stop(&mut ChannelDiagnostics(diagnostics));
@@ -1022,8 +1231,15 @@ async fn run_discord_dispatch(
         .await
         {
             Ok(Some(reply)) => {
-                if let Err(error) =
-                    send_discord_reply(&transport, &origin, &credential, &message, &reply)
+                if let Err(error) = send_discord_reply(
+                    &transport,
+                    &origin,
+                    &credential,
+                    &message,
+                    &reply,
+                    &cancellation,
+                )
+                .await
                 {
                     diagnostics.record(format!("Discord reply failed: {error}"));
                 }
@@ -1034,12 +1250,33 @@ async fn run_discord_dispatch(
     }
 }
 
-fn send_discord_reply(
-    transport: &DiscordTransportAdapter,
+trait DiscordReplyTransport: Sync {
+    fn send_reply_raw(
+        &self,
+        bot_token: &str,
+        channel_id: &str,
+        content: &str,
+    ) -> Result<ProviderResponse, ChannelError>;
+}
+
+impl DiscordReplyTransport for DiscordTransportAdapter {
+    fn send_reply_raw(
+        &self,
+        bot_token: &str,
+        channel_id: &str,
+        content: &str,
+    ) -> Result<ProviderResponse, ChannelError> {
+        self.create_message_raw(bot_token, channel_id, content)
+    }
+}
+
+async fn send_discord_reply<T: DiscordReplyTransport>(
+    transport: &T,
     origin: &claw_channel_sdk::ApprovedOrigin,
     credential: &ChannelCredential,
     message: &InboundMessage,
     reply: &str,
+    cancellation: &CancellationToken,
 ) -> Result<(), ChannelError> {
     let route =
         message
@@ -1056,31 +1293,48 @@ fn send_discord_reply(
             claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
         )
     })?;
-    credential
-        .expose_for_origin(
-            "discord",
-            "default",
-            CredentialKind::Token,
-            origin,
-            |bot_token| -> Result<(), ChannelError> {
-                for segment in segments {
-                    let segment = segment.map_err(|_| {
-                        ChannelError::Configuration(
-                            claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
-                        )
-                    })?;
-                    let response =
-                        transport.create_message_raw(bot_token, channel_id, segment.as_ref())?;
-                    if !(200..300).contains(&response.status()) {
-                        return Err(ChannelError::RemoteRejected {
-                            status: response.status(),
-                        });
+    for segment in segments {
+        let segment = segment
+            .map_err(|_| {
+                ChannelError::Configuration(
+                    claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
+                )
+            })?
+            .into_owned();
+        for attempt in 1..=DISCORD_REPLY_MAX_ATTEMPTS {
+            let response = credential
+                .expose_for_origin(
+                    "discord",
+                    "default",
+                    CredentialKind::Token,
+                    origin,
+                    |bot_token| transport.send_reply_raw(bot_token, channel_id, &segment),
+                )
+                .map_err(ChannelError::CredentialBinding)??;
+            require_provider_response_bounded(&response)?;
+            match response.status() {
+                200..=299 => break,
+                401 | 403 => return Err(ChannelError::Authentication),
+                429 => {
+                    let retry_after = response
+                        .retry_after()
+                        .unwrap_or_else(|| Duration::from_secs(1));
+                    if attempt == DISCORD_REPLY_MAX_ATTEMPTS {
+                        return Err(ChannelError::RateLimited { retry_after });
+                    }
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => {
+                            return Err(ChannelError::Transport(TransportErrorKind::Io));
+                        }
+                        () = tokio::time::sleep(retry_after) => {}
                     }
                 }
-                Ok(())
-            },
-        )
-        .map_err(ChannelError::CredentialBinding)?
+                status => return Err(ChannelError::RemoteRejected { status }),
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn process_inbound(
@@ -1151,9 +1405,64 @@ fn outbound(message: &InboundMessage, text: String) -> OutboundMessage {
 fn provider_response(response: &claw_provider_sdk::http::HttpResponse) -> ProviderResponse {
     let retry_after = response
         .header("retry-after")
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs);
+        .and_then(parse_retry_after_header);
     ProviderResponse::with_retry_after(response.status(), response.body().to_vec(), retry_after)
+}
+
+fn parse_retry_after_header(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    Duration::try_from_secs_f64(value.parse::<f64>().ok()?).ok()
+}
+
+fn require_provider_response_bounded(response: &ProviderResponse) -> Result<(), ChannelError> {
+    if response.body().len() > MAX_PROVIDER_RESPONSE_BYTES {
+        Err(ChannelError::Protocol(
+            claw_channel_sdk::ProtocolErrorKind::PayloadTooLarge,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn classify_telegram_probe_response(response: &ProviderResponse) -> Result<(), ChannelError> {
+    match response.status() {
+        200..=299 => {
+            require_provider_response_bounded(response)?;
+            let body: serde_json::Value =
+                serde_json::from_slice(response.body()).map_err(|_| {
+                    ChannelError::Protocol(claw_channel_sdk::ProtocolErrorKind::MalformedResponse)
+                })?;
+            if body.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+                Ok(())
+            } else {
+                Err(ChannelError::Protocol(
+                    claw_channel_sdk::ProtocolErrorKind::InvalidField,
+                ))
+            }
+        }
+        401 | 403 => Err(ChannelError::Authentication),
+        429 => {
+            require_provider_response_bounded(response)?;
+            let body_retry_after = serde_json::from_slice::<serde_json::Value>(response.body())
+                .ok()
+                .and_then(|body| {
+                    body.get("parameters")
+                        .and_then(|parameters| parameters.get("retry_after"))
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .map(Duration::from_secs);
+            Err(ChannelError::RateLimited {
+                retry_after: response
+                    .retry_after()
+                    .or(body_retry_after)
+                    .unwrap_or_else(|| Duration::from_secs(1)),
+            })
+        }
+        status => Err(ChannelError::RemoteRejected { status }),
+    }
 }
 
 fn provider_channel_error(error: &claw_provider_sdk::ProviderError) -> ChannelError {
@@ -1177,14 +1486,122 @@ fn provider_channel_error(error: &claw_provider_sdk::ProviderError) -> ChannelEr
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use claw_provider_sdk::CancelToken;
+    use claw_channel_sdk::{
+        ApprovedOrigin, ChannelCredential, ChannelError, CredentialKind, InboundMessage,
+        TransportErrorKind,
+    };
+    use claw_channels::ProviderResponse;
+    use claw_provider_sdk::{CancelToken, SecretString};
     use tokio_util::sync::CancellationToken;
     use tokio_util::task::TaskTracker;
 
-    use super::ChannelStartGuard;
+    use super::{
+        ChannelStartGuard, DiscordReplyTransport, TelegramProbeFuture, TelegramReadinessError,
+        TelegramReadinessProbe, approved_origin, bind_credential, classify_telegram_probe_response,
+        parse_retry_after_header, send_discord_reply, wait_for_telegram_readiness,
+    };
+
+    struct ScriptedTelegramProbe {
+        results: Mutex<VecDeque<Result<(), ChannelError>>>,
+        calls: AtomicUsize,
+    }
+
+    impl TelegramReadinessProbe for ScriptedTelegramProbe {
+        fn probe<'a>(
+            &'a self,
+            _credential: &'a ChannelCredential,
+            _origin: &'a ApprovedOrigin,
+            _cancellation: &'a CancellationToken,
+        ) -> TelegramProbeFuture<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.results
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pop_front()
+                    .expect("scripted Telegram readiness result")
+            })
+        }
+    }
+
+    fn telegram_probe_credential() -> (ApprovedOrigin, ChannelCredential) {
+        let origin = approved_origin("telegram", "default", "api.telegram.org").expect("origin");
+        let credential = bind_credential(
+            "telegram",
+            "default",
+            CredentialKind::Token,
+            origin.clone(),
+            &SecretString::new("telegram-secret"),
+        )
+        .expect("credential");
+        (origin, credential)
+    }
+
+    struct ScriptedDiscordReplies {
+        responses: Mutex<VecDeque<Result<ProviderResponse, ChannelError>>>,
+        calls: AtomicUsize,
+    }
+
+    impl DiscordReplyTransport for ScriptedDiscordReplies {
+        fn send_reply_raw(
+            &self,
+            bot_token: &str,
+            channel_id: &str,
+            content: &str,
+        ) -> Result<ProviderResponse, ChannelError> {
+            assert_eq!(bot_token, "discord-secret");
+            assert_eq!(channel_id, "room");
+            assert_eq!(content, "reply");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.responses
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+                .expect("scripted Discord response")
+        }
+    }
+
+    fn discord_reply_fixture(
+        responses: VecDeque<Result<ProviderResponse, ChannelError>>,
+    ) -> (
+        ScriptedDiscordReplies,
+        claw_channel_sdk::ApprovedOrigin,
+        claw_channel_sdk::ChannelCredential,
+        InboundMessage,
+    ) {
+        let origin = approved_origin("discord", "default", "discord.com").expect("origin");
+        let credential = bind_credential(
+            "discord",
+            "default",
+            CredentialKind::Token,
+            origin.clone(),
+            &SecretString::new("discord-secret"),
+        )
+        .expect("credential");
+        (
+            ScriptedDiscordReplies {
+                responses: Mutex::new(responses),
+                calls: AtomicUsize::new(0),
+            },
+            origin,
+            credential,
+            InboundMessage {
+                id: "message-1".to_owned(),
+                channel_id: "discord".to_owned(),
+                account_id: "default".to_owned(),
+                conversation_id: "discord:room:user".to_owned(),
+                sender_id: "user".to_owned(),
+                text: Some("question".to_owned()),
+                attachments: Vec::new(),
+                received_at_unix_ms: 1,
+            },
+        )
+    }
 
     #[tokio::test]
     async fn dropping_channel_start_aborts_accepted_workers() {
@@ -1219,5 +1636,190 @@ mod tests {
             aborts.lock().unwrap_or_else(PoisonError::into_inner).len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn discord_reply_honors_retry_after_and_retries_only_429() {
+        let retry_after = Duration::from_millis(20);
+        let (transport, origin, credential, message) = discord_reply_fixture(VecDeque::from([
+            Ok(ProviderResponse::with_retry_after(
+                429,
+                Vec::new(),
+                Some(retry_after),
+            )),
+            Ok(ProviderResponse::new(200, Vec::new())),
+        ]));
+        let started = Instant::now();
+
+        send_discord_reply(
+            &transport,
+            &origin,
+            &credential,
+            &message,
+            "reply",
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("rate-limited reply recovers");
+
+        assert!(started.elapsed() >= retry_after);
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn discord_reply_bounds_persistent_rate_limit_retries() {
+        let retry_after = Duration::from_millis(1);
+        let limited = || {
+            Ok(ProviderResponse::with_retry_after(
+                429,
+                Vec::new(),
+                Some(retry_after),
+            ))
+        };
+        let (transport, origin, credential, message) =
+            discord_reply_fixture(VecDeque::from([limited(), limited(), limited()]));
+
+        assert_eq!(
+            send_discord_reply(
+                &transport,
+                &origin,
+                &credential,
+                &message,
+                "reply",
+                &CancellationToken::new(),
+            )
+            .await,
+            Err(ChannelError::RateLimited { retry_after })
+        );
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn telegram_readiness_requires_a_success_and_honors_retry_after() {
+        let retry_after = Duration::from_millis(20);
+        let probe = ScriptedTelegramProbe {
+            results: Mutex::new(VecDeque::from([
+                Err(ChannelError::RateLimited { retry_after }),
+                Ok(()),
+            ])),
+            calls: AtomicUsize::new(0),
+        };
+        let (origin, credential) = telegram_probe_credential();
+        let started = Instant::now();
+
+        wait_for_telegram_readiness(
+            &probe,
+            &credential,
+            &origin,
+            &CancellationToken::new(),
+            Duration::from_millis(1),
+            3,
+        )
+        .await
+        .expect("probe eventually succeeds");
+
+        assert!(started.elapsed() >= retry_after);
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn telegram_readiness_fails_fast_terminal_and_bounds_persistent_failure() {
+        let (origin, credential) = telegram_probe_credential();
+        let terminal = ScriptedTelegramProbe {
+            results: Mutex::new(VecDeque::from([Err(ChannelError::Authentication), Ok(())])),
+            calls: AtomicUsize::new(0),
+        };
+        assert_eq!(
+            wait_for_telegram_readiness(
+                &terminal,
+                &credential,
+                &origin,
+                &CancellationToken::new(),
+                Duration::from_millis(1),
+                3,
+            )
+            .await,
+            Err(TelegramReadinessError::Terminal(
+                ChannelError::Authentication
+            ))
+        );
+        assert_eq!(terminal.calls.load(Ordering::SeqCst), 1);
+
+        let failure = ChannelError::Transport(TransportErrorKind::Timeout);
+        let persistent = ScriptedTelegramProbe {
+            results: Mutex::new(VecDeque::from([
+                Err(failure.clone()),
+                Err(failure.clone()),
+                Err(failure.clone()),
+            ])),
+            calls: AtomicUsize::new(0),
+        };
+        assert_eq!(
+            wait_for_telegram_readiness(
+                &persistent,
+                &credential,
+                &origin,
+                &CancellationToken::new(),
+                Duration::from_millis(1),
+                3,
+            )
+            .await,
+            Err(TelegramReadinessError::Persistent(failure))
+        );
+        assert_eq!(persistent.calls.load(Ordering::SeqCst), 3);
+
+        let cancelled_probe = ScriptedTelegramProbe {
+            results: Mutex::new(VecDeque::from([Ok(())])),
+            calls: AtomicUsize::new(0),
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert_eq!(
+            wait_for_telegram_readiness(
+                &cancelled_probe,
+                &credential,
+                &origin,
+                &cancellation,
+                Duration::from_millis(1),
+                3,
+            )
+            .await,
+            Err(TelegramReadinessError::Cancelled)
+        );
+        assert_eq!(cancelled_probe.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn telegram_probe_requires_a_bounded_ok_envelope() {
+        assert_eq!(
+            classify_telegram_probe_response(&ProviderResponse::new(
+                200,
+                br#"{"ok":true,"result":{"id":1}}"#.as_slice(),
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            classify_telegram_probe_response(&ProviderResponse::new(
+                200,
+                br#"{"ok":false}"#.as_slice(),
+            )),
+            Err(ChannelError::Protocol(
+                claw_channel_sdk::ProtocolErrorKind::InvalidField
+            ))
+        );
+    }
+
+    #[test]
+    fn discord_fractional_retry_after_header_is_preserved() {
+        assert_eq!(
+            parse_retry_after_header("0.25"),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            parse_retry_after_header("17"),
+            Some(Duration::from_secs(17))
+        );
+        assert_eq!(parse_retry_after_header("-1"), None);
+        assert_eq!(parse_retry_after_header("NaN"), None);
     }
 }

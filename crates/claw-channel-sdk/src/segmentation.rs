@@ -411,10 +411,17 @@ fn place_split<'a>(
     // the next segment. It is only possible when the fence starts inside this
     // segment and something precedes it, otherwise the block must be cut and
     // reopened.
-    match open.line_start {
-        Some(line_start) if line_start >= 2 && text.as_bytes()[line_start - 1] == b'\n' => {
-            (line_start - 1, None)
-        }
+    match open.line_start.and_then(|line_start| {
+        let newline = line_start.checked_sub(1)?;
+        (text.as_bytes().get(newline) == Some(&b'\n')).then_some(
+            if newline > 0 && text.as_bytes().get(newline - 1) == Some(&b'\r') {
+                newline - 1
+            } else {
+                newline
+            },
+        )
+    }) {
+        Some(line_ending_start) if line_ending_start > 0 => (line_ending_start, None),
         _ => (split, Some(open.fence)),
     }
 }
@@ -1000,6 +1007,21 @@ mod tests {
         assert_eq!(
             produced,
             vec!["intro paragraph here", "```rust\nlet x = 1;\n```\ntail"]
+        );
+    }
+
+    #[test]
+    fn relocating_a_fence_never_splits_the_preceding_crlf() {
+        let text = "intro paragraph here\r\n```rust\r\nlet x = 1;\r\n```\r\ntail";
+        let produced = segments(text, chars(30));
+
+        assert!(
+            produced.iter().all(|segment| !segment.ends_with('\r')),
+            "{produced:?}"
+        );
+        assert!(
+            produced.iter().all(|segment| !segment.starts_with('\n')),
+            "{produced:?}"
         );
     }
 

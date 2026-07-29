@@ -469,6 +469,7 @@ struct LegacyTeamsSettings {
 struct LegacyWhatsAppSettings {
     route: LegacyWhatsAppConfig,
     access_token: SecretString,
+    app_secret: SecretString,
     phone_number_id: String,
 }
 
@@ -957,6 +958,7 @@ impl ProductionService {
                 transport,
                 &whatsapp.phone_number_id,
                 &whatsapp.access_token,
+                &whatsapp.app_secret,
                 Arc::clone(&diagnostics),
             )
             .map_err(|error| ProductionError::new("whatsapp", error))?;
@@ -1028,11 +1030,11 @@ impl ProductionService {
                 Arc::clone(&channel_authentication),
                 proxy.clone(),
                 Arc::clone(&diagnostics),
+                Arc::clone(&readiness),
                 startup_cancellation.clone(),
             ) => result.map_err(|error| ProductionError::message("channels", error))?,
             () = startup_cancellation.cancelled() => return Err(startup_cancelled()),
         };
-        readiness.set("channels", true);
         info!(
             stage = "channels",
             enabled = enabled_channel_count,
@@ -1964,12 +1966,20 @@ fn legacy_settings(snapshot: &ConfigSnapshot) -> Result<LegacySettings, Producti
             .ok_or_else(|| {
                 ProductionError::message("legacy-config", "WhatsApp access token is missing")
             })?;
+        let app_secret_reference = get(&["core", "channels", "whatsapp", "app_secret"])
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProductionError::message("legacy-config", "WhatsApp app secret is missing")
+            })?;
         let verify_reference = SecretRef::parse(verify_reference)
             .map_err(|error| ProductionError::message("legacy-config", error))?;
         let access_reference = SecretRef::parse(access_reference)
             .map_err(|error| ProductionError::message("legacy-config", error))?;
+        let app_secret_reference = SecretRef::parse(app_secret_reference)
+            .map_err(|error| ProductionError::message("legacy-config", error))?;
         let verify_token = resolve_secret(&verify_reference)?;
         let access_token = resolve_secret(&access_reference)?;
+        let app_secret = resolve_secret(&app_secret_reference)?;
         let path = get(&["core", "channels", "whatsapp", "webhook_path"])
             .and_then(Value::as_str)
             .ok_or_else(|| {
@@ -1984,6 +1994,7 @@ fn legacy_settings(snapshot: &ConfigSnapshot) -> Result<LegacySettings, Producti
             route: LegacyWhatsAppConfig::new(path, verify_token.expose())
                 .map_err(|error| ProductionError::new("legacy-config", error))?,
             access_token,
+            app_secret,
             phone_number_id: phone_number_id.to_owned(),
         })
     } else {

@@ -65,7 +65,7 @@ pub use whatsapp::{
     WHATSAPP_GRAPH_API_VERSION, WHATSAPP_SEND_REQUEST_TIMEOUT, WhatsAppChannel,
     WhatsAppSendRequest, WhatsAppTransport, WhatsAppVerificationQuery,
     WhatsAppVerificationResponse, WhatsAppWebhookHandling, WhatsAppWebhookResponse,
-    WhatsAppWebhookStats,
+    WhatsAppWebhookStats, verify_whatsapp_webhook_signature,
 };
 
 const CATALOG_PATH: &str = "scripts/lib/official-external-channel-catalog.json";

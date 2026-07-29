@@ -280,6 +280,7 @@ name = "claw-channels"
 version = "0.1.0"
 dependencies = [
  "claw-channel-sdk",
+ "ring",
  "serde",
  "serde_json",
 ]
