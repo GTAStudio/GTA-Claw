@@ -359,8 +359,15 @@ test("Telegram dead-letters an impossible grapheme without duplicate side effect
   assert.equal(client.deadLetteredUpdates.size, 1);
 });
 
-test("Telegram retains checkpoints for 429, 5xx, and network failures", async () => {
+test("Telegram retains checkpoints for 408, 429, 5xx, and network failures", async () => {
   const failures = [
+    new Response(
+      JSON.stringify({ ok: false, error_code: 408 }),
+      {
+        status: 408,
+        headers: { "Content-Type": "application/json" },
+      },
+    ),
     new Response(null, { status: 429 }),
     new Response(null, { status: 503 }),
     new Error("network failure"),
@@ -383,18 +390,20 @@ test("Telegram retains checkpoints for 429, 5xx, and network failures", async ()
     },
   });
 
-  for (const pattern of [/429/, /503/, /network failure/]) {
+  for (const pattern of [/408/, /429/, /503/, /network failure/]) {
     await assert.rejects(client.processUpdates([update(50)]), pattern);
     assert.equal(client.offset, 0);
+    assert.equal(client.deliveryCheckpoints.has(50), true);
+    assert.equal(client.deadLetteredUpdates.size, 0);
   }
   await client.processUpdates([update(50)]);
   assert.equal(client.offset, 51);
   assert.equal(handled, 1);
-  assert.equal(sends, 4);
+  assert.equal(sends, 5);
   assert.equal(client.deadLetteredUpdates.size, 0);
 });
 
-test("Telegram honors retry_after before polling again", async () => {
+test("Telegram honors sendMessage retry_after before polling again", async () => {
   const waitStarted = deferred();
   const waits = [];
   let handled = 0;
@@ -442,6 +451,46 @@ test("Telegram honors retry_after before polling again", async () => {
   assert.equal(handled, 1);
   assert.equal(client.offset, 0);
   assert.equal(client.deliveryCheckpoints.has(60), true);
+});
+
+test("Telegram honors getUpdates 429 retry_after instead of poll interval", async () => {
+  const waitStarted = deferred();
+  const waits = [];
+  let polls = 0;
+  const client = new TelegramPollingClient({
+    botToken: "token",
+    pollIntervalMs: 60_000,
+    onMessage: async () => {
+      throw new Error("getUpdates failure must not dispatch a message");
+    },
+    fetchFn: async () => {
+      polls += 1;
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error_code: 429,
+          parameters: { retry_after: 7 },
+        }),
+        {
+          status: 429,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    },
+    waitFn: async (delayMs) => {
+      waits.push(delayMs);
+      client.running = false;
+      waitStarted.resolve();
+    },
+  });
+
+  await client.start();
+  await waitStarted.promise;
+  await client.stop();
+
+  assert.equal(polls, 1);
+  assert.deepEqual(waits, [7_000]);
+  assert.equal(client.offset, 0);
 });
 
 test("Telegram migrates a checkpoint destination without duplicate side effects", async () => {

@@ -6,6 +6,8 @@ import {
 } from "../utils/splitMessage.js";
 
 const MAX_DEAD_LETTERED_UPDATES = 1000;
+const RETRYABLE_TELEGRAM_STATUSES = new Set([408, 429]);
+const TERMINAL_TELEGRAM_DELIVERY_STATUSES = new Set([400, 401, 403, 404]);
 
 class TelegramTerminalDeliveryError extends Error {
   constructor(readonly status: number) {
@@ -14,13 +16,14 @@ class TelegramTerminalDeliveryError extends Error {
   }
 }
 
-class TelegramRetryableDeliveryError extends Error {
+class TelegramRetryableError extends Error {
   constructor(
+    readonly operation: "getUpdates" | "sendMessage",
     readonly status: number,
     readonly retryAfterMs: number | null,
   ) {
-    super(`Telegram sendMessage failed with retryable status ${status}`);
-    this.name = "TelegramRetryableDeliveryError";
+    super(`Telegram ${operation} failed with retryable status ${status}`);
+    this.name = "TelegramRetryableError";
   }
 }
 
@@ -152,10 +155,10 @@ export class TelegramPollingClient {
         }
         logger.error({ err }, "Telegram polling loop error");
         if (
-          err instanceof TelegramRetryableDeliveryError &&
+          err instanceof TelegramRetryableError &&
           err.retryAfterMs !== null
         ) {
-          nextPollDelayMs = Math.max(nextPollDelayMs, err.retryAfterMs);
+          nextPollDelayMs = err.retryAfterMs;
         }
       }
 
@@ -196,6 +199,15 @@ export class TelegramPollingClient {
     });
 
     if (!resp.ok) {
+      const parameters = await this.readResponseParameters(resp);
+      const retryAfterMs = this.retryAfterMs(parameters);
+      if (this.isRetryableStatus(resp.status) || retryAfterMs !== null) {
+        throw new TelegramRetryableError(
+          "getUpdates",
+          resp.status,
+          retryAfterMs,
+        );
+      }
       throw new Error(`Telegram getUpdates failed: ${resp.status}`);
     }
 
@@ -264,21 +276,26 @@ export class TelegramPollingClient {
 
       if (!resp.ok) {
         const parameters = await this.readResponseParameters(resp);
-        const retryAfterMs =
-          parameters?.retry_after !== undefined
-            ? parameters.retry_after * 1000
-            : null;
+        const retryAfterMs = this.retryAfterMs(parameters);
         if (parameters?.migrate_to_chat_id !== undefined) {
           checkpoint.chatId = parameters.migrate_to_chat_id;
-          throw new TelegramRetryableDeliveryError(resp.status, retryAfterMs);
+          throw new TelegramRetryableError(
+            "sendMessage",
+            resp.status,
+            retryAfterMs,
+          );
         }
-        if (retryAfterMs !== null) {
-          throw new TelegramRetryableDeliveryError(resp.status, retryAfterMs);
-        }
-        if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
+        if (
+          TERMINAL_TELEGRAM_DELIVERY_STATUSES.has(resp.status) &&
+          retryAfterMs === null
+        ) {
           throw new TelegramTerminalDeliveryError(resp.status);
         }
-        throw new TelegramRetryableDeliveryError(resp.status, null);
+        throw new TelegramRetryableError(
+          "sendMessage",
+          resp.status,
+          retryAfterMs,
+        );
       }
       checkpoint.nextChunk += 1;
     }
@@ -321,6 +338,18 @@ export class TelegramPollingClient {
       parsed.migrate_to_chat_id = parameters.migrate_to_chat_id;
     }
     return parsed;
+  }
+
+  private retryAfterMs(
+    parameters: TelegramResponseParameters | null,
+  ): number | null {
+    return parameters?.retry_after !== undefined
+      ? parameters.retry_after * 1000
+      : null;
+  }
+
+  private isRetryableStatus(status: number): boolean {
+    return RETRYABLE_TELEGRAM_STATUSES.has(status) || status >= 500;
   }
 
   private terminalFailureReason(err: unknown): string | null {
