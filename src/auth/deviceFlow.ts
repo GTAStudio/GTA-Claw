@@ -14,12 +14,19 @@ interface TokenPollResponse {
   error?: string;
 }
 
+class DeviceFlowInvalidatedError extends Error {
+  constructor() {
+    super("Device Flow was invalidated");
+    this.name = "DeviceFlowInvalidatedError";
+  }
+}
+
 export interface DeviceFlowOptions {
   clientId: string;
   onTokenAcquired: (token: string, login: string) => Promise<void>;
   fetchFn?: typeof defaultFetch;
   scheduleFn?: (
-    callback: () => void,
+    callback: () => void | Promise<void>,
     delayMs: number,
   ) => ReturnType<typeof setTimeout>;
   clearScheduleFn?: (timer: ReturnType<typeof setTimeout>) => void;
@@ -50,6 +57,8 @@ export class GitHubDeviceFlow {
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private flowExpiresAt = 0;
   private flowStartPromise: Promise<string> | null = null;
+  private flowGeneration = 0;
+  private flowController: AbortController | null = null;
   private acquiredToken: { token: string; login: string } | null = null;
   private activationPromise: Promise<void> | null = null;
 
@@ -84,10 +93,15 @@ export class GitHubDeviceFlow {
       return this.flowStartPromise;
     }
 
-    const startPromise = this.startFlow().catch((err: unknown) => {
-      logger.error({ err }, "Failed to start Device Flow");
-      return "Failed to start GitHub Device Flow. Please check the logs.";
-    });
+    const { generation, signal } = this.beginFlow();
+    const startPromise = this.startFlow(generation, signal).catch(
+      (err: unknown) => {
+        if (this.isCurrentFlow(generation)) {
+          logger.error({ err }, "Failed to start Device Flow");
+        }
+        return "Failed to start GitHub Device Flow. Please check the logs.";
+      },
+    );
     this.flowStartPromise = startPromise;
     try {
       return await startPromise;
@@ -98,24 +112,29 @@ export class GitHubDeviceFlow {
     }
   }
 
-  private async startFlow(): Promise<string> {
+  private async startFlow(
+    generation: number,
+    signal: AbortSignal,
+  ): Promise<string> {
     const resp = await this.fetchFn("https://github.com/login/device/code", {
       method: "POST",
       headers: { Accept: "application/json", "Content-Type": "application/json" },
       body: JSON.stringify({ client_id: this.clientId, scope: "copilot" }),
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
     });
+    this.assertCurrentFlow(generation);
 
     if (!resp.ok) {
       throw new Error(`Device code request failed: ${resp.status}`);
     }
 
     const data = (await resp.json()) as DeviceCodeResponse;
+    this.assertCurrentFlow(generation);
     this.pendingUserCode = data.user_code;
     this.pendingVerificationUri = data.verification_uri;
     this.flowExpiresAt = Date.now() + data.expires_in * 1000;
 
-    this.startPolling(data.device_code, data.interval);
+    this.startPolling(data.device_code, data.interval, generation, signal);
 
     logger.info(
       { userCode: data.user_code },
@@ -125,14 +144,21 @@ export class GitHubDeviceFlow {
     return this.formatAuthMessage(data.verification_uri, data.user_code);
   }
 
-  private startPolling(deviceCode: string, intervalSec: number): void {
+  private startPolling(
+    deviceCode: string,
+    intervalSec: number,
+    generation: number,
+    signal: AbortSignal,
+  ): void {
     this.stopPolling();
 
     const poll = async (): Promise<void> => {
-      this.pollTimer = null;
+      if (!this.isCurrentFlow(generation)) {
+        return;
+      }
       if (Date.now() >= this.flowExpiresAt) {
         logger.warn("Device Flow expired");
-        this.clearPendingFlow();
+        this.clearPendingFlow(generation);
         return;
       }
 
@@ -150,20 +176,29 @@ export class GitHubDeviceFlow {
               device_code: deviceCode,
               grant_type: "urn:ietf:params:oauth:grant-type:device_code",
             }),
-            signal: AbortSignal.timeout(15_000),
+            signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
           },
         );
+        if (!this.isCurrentFlow(generation)) {
+          return;
+        }
 
         if (!resp.ok) {
-          this.schedulePoll(poll, intervalSec * 1000);
+          this.schedulePoll(poll, intervalSec * 1000, generation);
           return;
         }
 
         const data = (await resp.json()) as TokenPollResponse;
+        if (!this.isCurrentFlow(generation)) {
+          return;
+        }
 
         if (data.access_token) {
-          const login = await this.fetchUserLogin(data.access_token);
-          this.clearPendingFlow();
+          const login = await this.fetchUserLogin(data.access_token, signal);
+          if (!this.isCurrentFlow(generation)) {
+            return;
+          }
+          this.clearPendingFlow(generation);
           this.acquiredToken = { token: data.access_token, login };
           logger.info({ login }, "Device Flow authorization completed");
           try {
@@ -179,33 +214,39 @@ export class GitHubDeviceFlow {
 
         switch (data.error) {
           case "authorization_pending":
-            this.schedulePoll(poll, intervalSec * 1000);
+            this.schedulePoll(poll, intervalSec * 1000, generation);
             break;
           case "slow_down":
-            this.schedulePoll(poll, (intervalSec + 5) * 1000);
+            this.schedulePoll(poll, (intervalSec + 5) * 1000, generation);
             break;
           case "expired_token":
             logger.warn("Device Flow code expired");
-            this.clearPendingFlow();
+            this.clearPendingFlow(generation);
             break;
           case "access_denied":
             logger.warn("Device Flow authorization denied by user");
-            this.clearPendingFlow();
+            this.clearPendingFlow(generation);
             break;
           default:
             logger.warn({ error: data.error }, "Device Flow poll unexpected error");
-            this.schedulePoll(poll, intervalSec * 1000);
+            this.schedulePoll(poll, intervalSec * 1000, generation);
         }
       } catch (err) {
+        if (!this.isCurrentFlow(generation)) {
+          return;
+        }
         logger.error({ err }, "Device Flow poll error");
-        this.schedulePoll(poll, intervalSec * 1000);
+        this.schedulePoll(poll, intervalSec * 1000, generation);
       }
     };
 
-    this.schedulePoll(poll, intervalSec * 1000);
+    this.schedulePoll(poll, intervalSec * 1000, generation);
   }
 
-  private async fetchUserLogin(token: string): Promise<string> {
+  private async fetchUserLogin(
+    token: string,
+    signal: AbortSignal,
+  ): Promise<string> {
     try {
       const resp = await this.fetchFn("https://api.github.com/user", {
         headers: {
@@ -213,7 +254,7 @@ export class GitHubDeviceFlow {
           Authorization: `Bearer ${token}`,
           "User-Agent": "gta-claw",
         },
-        signal: AbortSignal.timeout(10_000),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
       });
       if (!resp.ok) return "unknown";
       const user = (await resp.json()) as { login?: string };
@@ -235,8 +276,27 @@ export class GitHubDeviceFlow {
     ].join("\n");
   }
 
-  private schedulePoll(poll: () => Promise<void>, delayMs: number): void {
-    this.pollTimer = this.scheduleFn(poll, delayMs);
+  private schedulePoll(
+    poll: () => Promise<void>,
+    delayMs: number,
+    generation: number,
+  ): void {
+    if (!this.isCurrentFlow(generation)) {
+      return;
+    }
+
+    let timer: ReturnType<typeof setTimeout>;
+    timer = this.scheduleFn(async () => {
+      if (
+        !this.isCurrentFlow(generation) ||
+        this.pollTimer !== timer
+      ) {
+        return;
+      }
+      this.pollTimer = null;
+      await poll();
+    }, delayMs);
+    this.pollTimer = timer;
   }
 
   private async activateAcquiredToken(): Promise<void> {
@@ -274,15 +334,51 @@ export class GitHubDeviceFlow {
     }
   }
 
-  private clearPendingFlow(): void {
+  private beginFlow(): { generation: number; signal: AbortSignal } {
+    this.invalidatePendingFlow();
+    const controller = new AbortController();
+    this.flowController = controller;
+    return {
+      generation: this.flowGeneration,
+      signal: controller.signal,
+    };
+  }
+
+  private isCurrentFlow(generation: number): boolean {
+    return generation === this.flowGeneration;
+  }
+
+  private assertCurrentFlow(generation: number): void {
+    if (!this.isCurrentFlow(generation)) {
+      throw new DeviceFlowInvalidatedError();
+    }
+  }
+
+  private clearPendingFlow(generation: number): void {
+    if (!this.isCurrentFlow(generation)) {
+      return;
+    }
+    this.flowController?.abort();
+    this.flowController = null;
     this.stopPolling();
     this.pendingUserCode = null;
     this.pendingVerificationUri = null;
     this.flowExpiresAt = 0;
   }
 
+  private invalidatePendingFlow(): void {
+    this.flowGeneration += 1;
+    this.flowController?.abort();
+    this.flowController = null;
+    this.stopPolling();
+    this.flowStartPromise = null;
+    this.pendingUserCode = null;
+    this.pendingVerificationUri = null;
+    this.flowExpiresAt = 0;
+  }
+
   stop(): void {
-    this.clearPendingFlow();
+    this.invalidatePendingFlow();
     this.acquiredToken = null;
   }
 }

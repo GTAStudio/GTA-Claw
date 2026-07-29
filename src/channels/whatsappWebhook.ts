@@ -5,6 +5,7 @@ import { fetch as defaultFetch } from "../utils/proxy.js";
 import { splitMessage } from "../utils/splitMessage.js";
 
 const MAX_COMPLETED_MESSAGE_IDS = 10_000;
+const MAX_PENDING_REPLIES = 10_000;
 
 interface WhatsAppTextMessage {
   from: string;
@@ -34,6 +35,37 @@ interface WhatsAppWebhookBody {
   entry?: WhatsAppEntry[];
 }
 
+interface WhatsAppRawRequest extends Request {
+  whatsappRawBody?: Buffer;
+}
+
+export function captureWhatsAppRawBody(whatsappPath: string) {
+  return (req: Request, _res: Response, next: Next): void => {
+    const requestPath = req.url?.split("?", 1)[0];
+    if (req.method !== "POST" || requestPath !== whatsappPath) {
+      next();
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer | string) => {
+      chunks.push(
+        Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(chunk),
+      );
+    });
+    req.once("end", () => {
+      (req as WhatsAppRawRequest).whatsappRawBody = Buffer.concat(chunks);
+    });
+    next();
+  };
+}
+
+interface PendingWhatsAppReply {
+  to: string;
+  chunks: string[];
+  nextChunk: number;
+}
+
 export interface WhatsAppWebhookOptions {
   verifyToken: string;
   accessToken: string;
@@ -55,6 +87,7 @@ export class WhatsAppWebhookHandler {
   private readonly onMessage: WhatsAppWebhookOptions["onMessage"];
   private readonly fetchFn: typeof defaultFetch;
   private readonly completedMessageIds = new Set<string>();
+  private readonly pendingReplies = new Map<string, PendingWhatsAppReply>();
   private readonly inFlightMessages = new Map<string, Promise<void>>();
 
   constructor(options: WhatsAppWebhookOptions) {
@@ -132,12 +165,8 @@ export class WhatsAppWebhookHandler {
       return false;
     }
 
-    const rawBody = req.rawBody;
-    if (
-      typeof rawBody !== "string" &&
-      !Buffer.isBuffer(rawBody) &&
-      !(rawBody instanceof Uint8Array)
-    ) {
+    const rawBody = (req as WhatsAppRawRequest).whatsappRawBody;
+    if (!Buffer.isBuffer(rawBody)) {
       return false;
     }
 
@@ -171,9 +200,7 @@ export class WhatsAppWebhookHandler {
       return;
     }
 
-    const processing = this.processTextMessage(msg.from, text).then(() => {
-      this.rememberCompletedMessage(messageId);
-    });
+    const processing = this.processIdentifiedMessage(messageId, msg.from, text);
     this.inFlightMessages.set(messageId, processing);
 
     try {
@@ -183,6 +210,44 @@ export class WhatsAppWebhookHandler {
         this.inFlightMessages.delete(messageId);
       }
     }
+  }
+
+  private async processIdentifiedMessage(
+    messageId: string,
+    from: string,
+    text: string,
+  ): Promise<void> {
+    let pendingReply = this.pendingReplies.get(messageId);
+    if (!pendingReply) {
+      if (
+        this.pendingReplies.size + this.inFlightMessages.size >=
+        MAX_PENDING_REPLIES
+      ) {
+        throw new Error("WhatsApp pending reply capacity exceeded");
+      }
+      const reply = await this.onMessage({
+        conversationId: `whatsapp:${from}`,
+        userName: from,
+        text,
+      });
+      pendingReply = {
+        to: from,
+        chunks: reply.trim() ? splitMessage(reply, 3500) : [],
+        nextChunk: 0,
+      };
+      this.pendingReplies.set(messageId, pendingReply);
+    }
+
+    while (pendingReply.nextChunk < pendingReply.chunks.length) {
+      await this.sendText(
+        pendingReply.to,
+        pendingReply.chunks[pendingReply.nextChunk],
+      );
+      pendingReply.nextChunk += 1;
+    }
+
+    this.pendingReplies.delete(messageId);
+    this.rememberCompletedMessage(messageId);
   }
 
   private async processTextMessage(from: string, text: string): Promise<void> {

@@ -9,6 +9,7 @@ class FakeWebSocket extends EventEmitter {
   closeCalls = 0;
   terminateCalls = 0;
   sendError = null;
+  closeError = null;
 
   send(payload, callback) {
     this.sent.push(JSON.parse(payload));
@@ -19,6 +20,9 @@ class FakeWebSocket extends EventEmitter {
     this.closeCalls += 1;
     this.readyState = 3;
     this.emit("close", code);
+    if (this.closeError) {
+      setImmediate(() => this.emit("error", this.closeError));
+    }
   }
 
   terminate() {
@@ -85,6 +89,46 @@ test("Discord handles requested heartbeats and reconnects when ACKs go stale", a
   assert.deepEqual(socket.sent.at(-1), { op: 1, d: 7 });
   client.sendHeartbeat(socket, true);
   assert.equal(socket.terminateCalls, 1);
+
+  await client.stop();
+});
+
+test("Discord retains sequence when Hello and ACK omit s", async () => {
+  const { client, sockets } = createClient();
+  client.start();
+  const first = sockets[0];
+  packet(first, {
+    op: 10,
+    t: null,
+    d: { heartbeat_interval: 60_000 },
+  });
+  packet(first, {
+    op: 0,
+    t: "READY",
+    s: 42,
+    d: {
+      session_id: "session-1",
+      resume_gateway_url: "wss://resume.example",
+    },
+  });
+  packet(first, { op: 11, t: null, d: null });
+  packet(first, { op: 1, t: null, d: null });
+  assert.deepEqual(first.sent.at(-1), { op: 1, d: 42 });
+
+  first.close();
+  clearTimeout(client.reconnectTimer);
+  client.reconnectTimer = null;
+  client.connect();
+  const resumed = sockets[1];
+  packet(resumed, {
+    op: 10,
+    t: null,
+    d: { heartbeat_interval: 60_000 },
+  });
+  assert.deepEqual(resumed.sent[0], {
+    op: 6,
+    d: { token: "token", session_id: "session-1", seq: 42 },
+  });
 
   await client.stop();
 });
@@ -193,6 +237,127 @@ test("Discord stops reconnecting after an unrecoverable gateway close", async ()
   assert.equal(client.running, false);
   assert.equal(client.heartbeatTimer, null);
   assert.equal(client.reconnectTimer, null);
+
+  await client.stop();
+});
+
+test("Discord contains close-time errors when stopped while connecting", async () => {
+  const { client, sockets } = createClient();
+  client.start();
+  const socket = sockets[0];
+  socket.readyState = 0;
+  socket.closeError = new Error(
+    "WebSocket was closed before the connection was established",
+  );
+
+  await client.stop();
+  await new Promise(setImmediate);
+  assert.equal(sockets.length, 1);
+  assert.equal(client.reconnectTimer, null);
+  assert.equal(socket.listenerCount("error"), 1);
+});
+
+test("Discord falls back after the resume gateway factory fails", async () => {
+  const sockets = [];
+  const urls = [];
+  const client = new DiscordGatewayClient({
+    botToken: "token",
+    gatewayUrl: "wss://gateway.example/?v=10&encoding=json",
+    intents: 1,
+    onMessage: async () => "",
+    webSocketFactory: (url) => {
+      urls.push(url);
+      if (urls.length === 2) {
+        throw new Error("resume endpoint unavailable");
+      }
+      const socket = new FakeWebSocket();
+      sockets.push(socket);
+      return socket;
+    },
+  });
+  client.start();
+  packet(sockets[0], {
+    op: 10,
+    t: null,
+    d: { heartbeat_interval: 60_000 },
+  });
+  packet(sockets[0], {
+    op: 0,
+    t: "READY",
+    s: 42,
+    d: {
+      session_id: "session-1",
+      resume_gateway_url: "wss://resume.example",
+    },
+  });
+
+  sockets[0].close();
+  clearTimeout(client.reconnectTimer);
+  client.reconnectTimer = null;
+  client.connect();
+  clearTimeout(client.reconnectTimer);
+  client.reconnectTimer = null;
+  client.connect();
+
+  assert.deepEqual(urls, [
+    "wss://gateway.example/?v=10&encoding=json",
+    "wss://resume.example/?v=10&encoding=json",
+    "wss://gateway.example/?v=10&encoding=json",
+  ]);
+  packet(sockets[1], {
+    op: 10,
+    t: null,
+    d: { heartbeat_interval: 60_000 },
+  });
+  assert.deepEqual(sockets[1].sent[0], {
+    op: 6,
+    d: { token: "token", session_id: "session-1", seq: 42 },
+  });
+
+  await client.stop();
+});
+
+test("Discord falls back after a pre-Hello resume gateway close", async () => {
+  const { client, sockets, urls } = createClient();
+  client.start();
+  packet(sockets[0], {
+    op: 10,
+    t: null,
+    d: { heartbeat_interval: 60_000 },
+  });
+  packet(sockets[0], {
+    op: 0,
+    t: "READY",
+    s: 42,
+    d: {
+      session_id: "session-1",
+      resume_gateway_url: "wss://resume.example",
+    },
+  });
+
+  sockets[0].close();
+  clearTimeout(client.reconnectTimer);
+  client.reconnectTimer = null;
+  client.connect();
+  sockets[1].close();
+  clearTimeout(client.reconnectTimer);
+  client.reconnectTimer = null;
+  client.connect();
+
+  assert.deepEqual(urls, [
+    "wss://gateway.example/?v=10&encoding=json",
+    "wss://resume.example/?v=10&encoding=json",
+    "wss://gateway.example/?v=10&encoding=json",
+  ]);
+  packet(sockets[2], {
+    op: 10,
+    t: null,
+    d: { heartbeat_interval: 60_000 },
+  });
+  assert.deepEqual(sockets[2].sent[0], {
+    op: 6,
+    d: { token: "token", session_id: "session-1", seq: 42 },
+  });
 
   await client.stop();
 });

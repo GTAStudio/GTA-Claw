@@ -35,7 +35,7 @@ function signedRequest(body, rawBody = JSON.stringify(body), signature) {
     `sha256=${createHmac("sha256", APP_SECRET).update(rawBody).digest("hex")}`;
   return {
     body,
-    rawBody,
+    whatsappRawBody: Buffer.from(rawBody),
     headers: { "x-hub-signature-256": digest },
   };
 }
@@ -83,7 +83,7 @@ test("WhatsApp authenticates the exact raw body and rejects unsafe signatures", 
   assert.equal(handled, 1);
 
   const rejectedRequests = [
-    { body, rawBody, headers: {} },
+    { body, whatsappRawBody: Buffer.from(rawBody), headers: {} },
     signedRequest(body, rawBody, "sha1=abc"),
     signedRequest(body, rawBody, "sha256=xyz"),
     signedRequest(body, rawBody, `sha256=${"0".repeat(64)}`),
@@ -98,9 +98,13 @@ test("WhatsApp authenticates the exact raw body and rejects unsafe signatures", 
   assert.equal(handled, 1);
 });
 
-test("WhatsApp retries failed deliveries and remembers only successful message ids", async () => {
+test("WhatsApp retries only outbound delivery after a send failure", async () => {
   let handled = 0;
   let sends = 0;
+  let resolveRetry;
+  const retryResult = new Promise((resolve) => {
+    resolveRetry = resolve;
+  });
   const handler = createHandler({
     onMessage: async () => {
       handled += 1;
@@ -108,12 +112,14 @@ test("WhatsApp retries failed deliveries and remembers only successful message i
     },
     fetchFn: async () => {
       sends += 1;
-      return sends === 1
-        ? new Response("temporary failure", {
-            status: 503,
-            statusText: "Unavailable",
-          })
-        : new Response(null, { status: 200 });
+      if (sends === 1) {
+        return new Response("temporary failure", {
+          status: 503,
+          statusText: "Unavailable",
+        });
+      }
+      await retryResult;
+      return new Response(null, { status: 200 });
     },
   });
   const request = signedRequest(webhookBody("wamid.retry"));
@@ -123,14 +129,94 @@ test("WhatsApp retries failed deliveries and remembers only successful message i
   assert.equal(failed.calls[0].status, 500);
 
   const retried = responseRecorder();
-  await handler.incoming(request, retried, () => undefined);
+  const concurrentRetry = responseRecorder();
+  const firstRetry = handler.incoming(request, retried, () => undefined);
+  const secondRetry = handler.incoming(
+    request,
+    concurrentRetry,
+    () => undefined,
+  );
+  await new Promise(setImmediate);
+  assert.equal(handled, 1);
+  assert.equal(sends, 2);
+  resolveRetry();
+  await Promise.all([firstRetry, secondRetry]);
   assert.equal(retried.calls[0].status, 200);
+  assert.equal(concurrentRetry.calls[0].status, 200);
 
   const duplicate = responseRecorder();
   await handler.incoming(request, duplicate, () => undefined);
   assert.equal(duplicate.calls[0].status, 200);
-  assert.equal(handled, 2);
+  assert.equal(handled, 1);
   assert.equal(sends, 2);
+});
+
+test("WhatsApp retries inbound handling only when the handler fails", async () => {
+  let handled = 0;
+  let sends = 0;
+  const handler = createHandler({
+    onMessage: async () => {
+      handled += 1;
+      if (handled === 1) {
+        throw new Error("inbound processing failed");
+      }
+      return "reply";
+    },
+    fetchFn: async () => {
+      sends += 1;
+      return new Response(null, { status: 200 });
+    },
+  });
+  const request = signedRequest(webhookBody("wamid.inbound-retry"));
+
+  const failed = responseRecorder();
+  await handler.incoming(request, failed, () => undefined);
+  assert.equal(failed.calls[0].status, 500);
+
+  const retried = responseRecorder();
+  await handler.incoming(request, retried, () => undefined);
+  assert.equal(retried.calls[0].status, 200);
+  assert.equal(handled, 2);
+  assert.equal(sends, 1);
+});
+
+test("WhatsApp outbound retry resumes at the failed reply chunk", async () => {
+  let handled = 0;
+  const sentChunks = [];
+  let attempt = 0;
+  const handler = createHandler({
+    onMessage: async () => {
+      handled += 1;
+      return `${"a".repeat(3500)}b`;
+    },
+    fetchFn: async (_url, init) => {
+      attempt += 1;
+      sentChunks.push(JSON.parse(init.body).text.body);
+      if (attempt === 2) {
+        return new Response("temporary failure", {
+          status: 503,
+          statusText: "Unavailable",
+        });
+      }
+      return new Response(null, { status: 200 });
+    },
+  });
+  const request = signedRequest(webhookBody("wamid.chunk-retry"));
+
+  const failed = responseRecorder();
+  await handler.incoming(request, failed, () => undefined);
+  assert.equal(failed.calls[0].status, 500);
+
+  const retried = responseRecorder();
+  await handler.incoming(request, retried, () => undefined);
+  assert.equal(retried.calls[0].status, 200);
+  assert.equal(handled, 1);
+  assert.deepEqual(
+    sentChunks.map((chunk) => chunk.length),
+    [3500, 1, 1],
+  );
+  assert.equal(sentChunks[1], "b");
+  assert.equal(sentChunks[2], "b");
 });
 
 test("WhatsApp coalesces concurrent deliveries of the same message id", async () => {

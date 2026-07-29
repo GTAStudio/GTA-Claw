@@ -123,3 +123,152 @@ test("Device Flow coalesces startup and retains an acquired token for activation
 
   client.stop();
 });
+
+test("Device Flow ignores stale polling work after flow rollover", async () => {
+  const scheduledPolls = [];
+  const activations = [];
+  let deviceCodeRequests = 0;
+  let resolveFirstPoll;
+  const firstPollResponse = new Promise((resolve) => {
+    resolveFirstPoll = resolve;
+  });
+  const client = new GitHubDeviceFlow({
+    clientId: "client-id",
+    scheduleFn: (callback, delayMs) => {
+      const timer = { callback, delayMs, cancelled: false };
+      scheduledPolls.push(timer);
+      return timer;
+    },
+    clearScheduleFn: (timer) => {
+      timer.cancelled = true;
+    },
+    fetchFn: async (url, init) => {
+      if (String(url).endsWith("/login/device/code")) {
+        deviceCodeRequests += 1;
+        return jsonResponse({
+          device_code: `device-${deviceCodeRequests}`,
+          user_code: `CODE-${deviceCodeRequests}`,
+          verification_uri: "https://github.com/login/device",
+          expires_in: 600,
+          interval: 1,
+        });
+      }
+      if (String(url).endsWith("/login/oauth/access_token")) {
+        const body = JSON.parse(init.body);
+        if (body.device_code === "device-1") {
+          return firstPollResponse;
+        }
+        return jsonResponse({ access_token: "token-2" });
+      }
+      if (String(url).endsWith("/user")) {
+        return jsonResponse({ login: "octocat-2" });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    },
+    onTokenAcquired: async (token, login) => {
+      activations.push({ token, login });
+    },
+  });
+
+  await client.getAuthMessage();
+  assert.equal(scheduledPolls.length, 1);
+  const stalePoll = scheduledPolls[0].callback();
+
+  client.flowExpiresAt = 0;
+  await client.getAuthMessage();
+  assert.equal(scheduledPolls.length, 2);
+  const currentTimer = scheduledPolls[1];
+  assert.equal(client.pollTimer, currentTimer);
+
+  resolveFirstPoll(jsonResponse({ authorization_pending: true }));
+  await stalePoll;
+  assert.equal(scheduledPolls.length, 2);
+  assert.equal(client.pollTimer, currentTimer);
+  assert.deepEqual(activations, []);
+
+  await currentTimer.callback();
+  assert.deepEqual(activations, [
+    { token: "token-2", login: "octocat-2" },
+  ]);
+  client.stop();
+});
+
+test("Device Flow stop invalidates in-flight startup and polling work", async () => {
+  const startupTimers = [];
+  let resolveStartup;
+  const startupResponse = new Promise((resolve) => {
+    resolveStartup = resolve;
+  });
+  const startupClient = new GitHubDeviceFlow({
+    clientId: "client-id",
+    scheduleFn: (callback, delayMs) => {
+      const timer = { callback, delayMs, cancelled: false };
+      startupTimers.push(timer);
+      return timer;
+    },
+    clearScheduleFn: (timer) => {
+      timer.cancelled = true;
+    },
+    fetchFn: async () => startupResponse,
+    onTokenAcquired: async () => undefined,
+  });
+
+  const startupMessage = startupClient.getAuthMessage();
+  startupClient.stop();
+  resolveStartup(
+    jsonResponse({
+      device_code: "stale-device",
+      user_code: "STALE",
+      verification_uri: "https://github.com/login/device",
+      expires_in: 600,
+      interval: 1,
+    }),
+  );
+  await startupMessage;
+  assert.equal(startupTimers.length, 0);
+  assert.equal(startupClient.pendingUserCode, null);
+  assert.equal(startupClient.pollTimer, null);
+
+  const pollTimers = [];
+  const activations = [];
+  let resolvePoll;
+  const pollResponse = new Promise((resolve) => {
+    resolvePoll = resolve;
+  });
+  const pollingClient = new GitHubDeviceFlow({
+    clientId: "client-id",
+    scheduleFn: (callback, delayMs) => {
+      const timer = { callback, delayMs, cancelled: false };
+      pollTimers.push(timer);
+      return timer;
+    },
+    clearScheduleFn: (timer) => {
+      timer.cancelled = true;
+    },
+    fetchFn: async (url) => {
+      if (String(url).endsWith("/login/device/code")) {
+        return jsonResponse({
+          device_code: "device",
+          user_code: "CODE",
+          verification_uri: "https://github.com/login/device",
+          expires_in: 600,
+          interval: 1,
+        });
+      }
+      return pollResponse;
+    },
+    onTokenAcquired: async (token, login) => {
+      activations.push({ token, login });
+    },
+  });
+
+  await pollingClient.getAuthMessage();
+  const inFlightPoll = pollTimers[0].callback();
+  pollingClient.stop();
+  resolvePoll(jsonResponse({ access_token: "stale-token" }));
+  await inFlightPoll;
+  assert.equal(pollTimers.length, 1);
+  assert.equal(pollingClient.pendingUserCode, null);
+  assert.equal(pollingClient.pollTimer, null);
+  assert.deepEqual(activations, []);
+});

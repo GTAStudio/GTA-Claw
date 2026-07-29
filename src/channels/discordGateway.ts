@@ -6,7 +6,7 @@ import { splitMessage } from "../utils/splitMessage.js";
 interface DiscordGatewayPacket {
   op: number;
   t: string | null;
-  s: number | null;
+  s?: number | null;
   d: unknown;
 }
 
@@ -89,6 +89,9 @@ export class DiscordGatewayClient {
       const ws = this.ws;
       this.ws = null;
       ws.removeAllListeners();
+      ws.on("error", (err) => {
+        logger.debug({ err }, "Discord gateway error during shutdown");
+      });
       try {
         ws.close();
       } catch (err) {
@@ -102,15 +105,20 @@ export class DiscordGatewayClient {
   private connect(): void {
     if (!this.running) return;
 
+    const connection = this.getConnectionTarget();
     let ws: WebSocket;
     try {
-      ws = this.webSocketFactory(this.getConnectionUrl());
+      ws = this.webSocketFactory(connection.url);
     } catch (err) {
       logger.error({ err }, "Failed to create Discord gateway connection");
+      if (connection.isResume) {
+        this.resumeGatewayUrl = null;
+      }
       this.scheduleReconnect();
       return;
     }
     this.ws = ws;
+    let receivedHello = false;
 
     ws.on("open", () => {
       if (this.ws !== ws) return;
@@ -120,7 +128,7 @@ export class DiscordGatewayClient {
     ws.on("message", (raw) => {
       if (this.ws !== ws) return;
       try {
-        this.handlePacket(raw.toString(), ws);
+        receivedHello = this.handlePacket(raw.toString(), ws) || receivedHello;
       } catch (err) {
         logger.error({ err }, "Discord gateway packet handling failed");
       }
@@ -130,6 +138,9 @@ export class DiscordGatewayClient {
       if (this.ws !== ws) return;
       this.ws = null;
       this.clearHeartbeat();
+      if (connection.isResume && !receivedHello) {
+        this.resumeGatewayUrl = null;
+      }
       if (NON_RESUMABLE_CLOSE_CODES.has(code)) {
         this.clearSession();
       }
@@ -165,9 +176,13 @@ export class DiscordGatewayClient {
     }, 3000);
   }
 
-  private handlePacket(raw: string, ws: WebSocket): void {
+  private handlePacket(raw: string, ws: WebSocket): boolean {
     const packet = JSON.parse(raw) as DiscordGatewayPacket;
-    if (packet.s !== null) {
+    if (
+      typeof packet.s === "number" &&
+      Number.isSafeInteger(packet.s) &&
+      packet.s >= 0
+    ) {
       this.seq = packet.s;
     }
 
@@ -213,6 +228,8 @@ export class DiscordGatewayClient {
       default:
         break;
     }
+
+    return packet.op === 10;
   }
 
   private startHeartbeat(ws: WebSocket, intervalMs: number): void {
@@ -359,9 +376,9 @@ export class DiscordGatewayClient {
     }
   }
 
-  private getConnectionUrl(): string {
+  private getConnectionTarget(): { url: string; isResume: boolean } {
     if (!this.resumeGatewayUrl) {
-      return this.gatewayUrl;
+      return { url: this.gatewayUrl, isResume: false };
     }
 
     try {
@@ -372,13 +389,14 @@ export class DiscordGatewayClient {
       if (!url.searchParams.has("encoding")) {
         url.searchParams.set("encoding", "json");
       }
-      return url.toString();
+      return { url: url.toString(), isResume: true };
     } catch (err) {
       logger.error(
         { err, resumeGatewayUrl: this.resumeGatewayUrl },
         "Invalid Discord resume gateway URL",
       );
-      return this.gatewayUrl;
+      this.resumeGatewayUrl = null;
+      return { url: this.gatewayUrl, isResume: false };
     }
   }
 
