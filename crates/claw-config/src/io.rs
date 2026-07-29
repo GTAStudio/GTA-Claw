@@ -143,6 +143,11 @@ pub(crate) fn atomic_write_bytes_locked(
             warnings.push(warning);
         }
         temporary.disarm();
+        #[cfg(test)]
+        if let Some(warning) = test_failpoint::directory_sync_warning(destination) {
+            warnings.push(warning);
+            return Ok(WriteOutcome { warnings });
+        }
         if let Err(error) = sync_parent(destination) {
             warnings.push(WriteWarning::DirectorySyncFailed {
                 path: destination
@@ -303,6 +308,58 @@ pub(crate) fn destination_lock_path_for_tests(path: &Path) -> PathBuf {
         |_| DestinationLock::path(path),
         |destination| DestinationLock::path(&destination),
     )
+}
+
+#[cfg(test)]
+pub(crate) fn inject_directory_sync_warning_for_tests() -> test_failpoint::Guard {
+    test_failpoint::inject_directory_sync_warning()
+}
+
+#[cfg(test)]
+mod test_failpoint {
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use super::WriteWarning;
+
+    static INJECT_DIRECTORY_SYNC_WARNING: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn inject_directory_sync_warning() -> Guard {
+        *INJECT_DIRECTORY_SYNC_WARNING
+            .lock()
+            .expect("lock io warning failpoint") = Some(std::thread::current().id());
+        Guard
+    }
+
+    pub(crate) fn directory_sync_warning(destination: &Path) -> Option<WriteWarning> {
+        let inject = {
+            let mut enabled = INJECT_DIRECTORY_SYNC_WARNING
+                .lock()
+                .expect("lock io warning failpoint");
+            let inject = enabled.is_some_and(|thread_id| thread_id == std::thread::current().id());
+            if inject {
+                *enabled = None;
+            }
+            inject
+        };
+        inject.then(|| WriteWarning::DirectorySyncFailed {
+            path: destination
+                .parent()
+                .expect("prepared destination always has a parent")
+                .to_path_buf(),
+            message: "injected directory sync warning".to_owned(),
+        })
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *INJECT_DIRECTORY_SYNC_WARNING
+                .lock()
+                .expect("lock io warning failpoint") = None;
+        }
+    }
 }
 
 fn reject_lock_link_or_reparse(path: &Path) -> io::Result<()> {

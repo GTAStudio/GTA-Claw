@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::io::{atomic_write_bytes, atomic_write_bytes_locked, with_destination_lock};
+use crate::io::{
+    WriteOutcome, WriteWarning, atomic_write_bytes, atomic_write_bytes_locked,
+    with_destination_lock,
+};
 use crate::{CONFIG_SCHEMA_VERSION, ConfigError, parse_json5, to_json5};
 
 static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -79,6 +82,15 @@ pub enum ConfigMigrationError {
         /// Exact original bytes retained for manual recovery.
         backup_path: PathBuf,
     },
+    /// Publication finished but durability warnings prevent claiming success.
+    DurabilityWarning {
+        /// Published path whose parent directory did not sync cleanly.
+        path: PathBuf,
+        /// Exact backup that still reconstructs the pre-migration bytes.
+        backup_path: Option<PathBuf>,
+        /// Non-fatal warnings from atomic publication.
+        warnings: Vec<WriteWarning>,
+    },
 }
 
 impl Display for ConfigMigrationError {
@@ -124,6 +136,38 @@ impl Display for ConfigMigrationError {
                  {restore}; backup remains at {}",
                 backup_path.display()
             ),
+            Self::DurabilityWarning {
+                path,
+                backup_path,
+                warnings,
+            } => {
+                let detail = warnings
+                    .iter()
+                    .map(|warning| match warning {
+                        WriteWarning::BackupCleanupFailed { path, message } => {
+                            format!("backup cleanup failed at {}: {message}", path.display())
+                        }
+                        WriteWarning::DirectorySyncFailed { path, message } => {
+                            format!("directory sync failed at {}: {message}", path.display())
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                match backup_path {
+                    Some(backup_path) => write!(
+                        formatter,
+                        "{}: published bytes but durability is uncertain: {detail}; exact backup \
+                         remains at {}",
+                        path.display(),
+                        backup_path.display()
+                    ),
+                    None => write!(
+                        formatter,
+                        "{}: published bytes but durability is uncertain: {detail}",
+                        path.display()
+                    ),
+                }
+            }
         }
     }
 }
@@ -134,9 +178,10 @@ impl Error for ConfigMigrationError {
             Self::Config(error) => Some(error),
             Self::Backup { source, .. } | Self::Lock { source, .. } => Some(source),
             Self::Restore { migration, .. } => Some(migration),
-            Self::MissingVersion | Self::UnsupportedPath { .. } | Self::ConcurrentEdit { .. } => {
-                None
-            }
+            Self::MissingVersion
+            | Self::UnsupportedPath { .. }
+            | Self::ConcurrentEdit { .. }
+            | Self::DurabilityWarning { .. } => None,
         }
     }
 }
@@ -247,7 +292,7 @@ fn migrate_config_file_with_precommit(
             let source_digest = digest_hex(&source);
             let backup_path = create_backup(locked_path, &source)?;
             let mut conflict_backup = None;
-            if let Err(source) = atomic_write_bytes_locked(locked_path, &destination_bytes, || {
+            let write_outcome = atomic_write_bytes_locked(locked_path, &destination_bytes, || {
                 precommit(locked_path);
                 let current = fs::read(locked_path)?;
                 if digest_hex(&current) != source_digest {
@@ -259,7 +304,8 @@ fn migrate_config_file_with_precommit(
                     ));
                 }
                 Ok(())
-            }) {
+            });
+            if let Err(source) = write_outcome {
                 if let Some(concurrent_backup) = conflict_backup {
                     return Err(ConfigMigrationError::ConcurrentEdit {
                         config_path: locked_path.to_owned(),
@@ -271,6 +317,11 @@ fn migrate_config_file_with_precommit(
                     source,
                 )));
             }
+            surface_durability_warnings(
+                locked_path,
+                Some(&backup_path),
+                write_outcome.expect("checked above"),
+            )?;
             Ok(ConfigMigrationOutcome::Migrated(ConfigMigrationRecord {
                 config_path: locked_path.to_owned(),
                 backup_path,
@@ -298,9 +349,25 @@ pub fn rollback_config_migration(
 ) -> Result<(), ConfigMigrationError> {
     let bytes = fs::read(&record.backup_path)
         .map_err(|source| ConfigError::io(&record.backup_path, source))?;
-    atomic_write_bytes(&record.config_path, &bytes, || Ok(()))
+    let outcome = atomic_write_bytes(&record.config_path, &bytes, || Ok(()))
         .map_err(|source| ConfigError::io(&record.config_path, source))?;
+    surface_durability_warnings(&record.config_path, Some(&record.backup_path), outcome)?;
     Ok(())
+}
+
+fn surface_durability_warnings(
+    path: &Path,
+    backup_path: Option<&Path>,
+    outcome: WriteOutcome,
+) -> Result<(), ConfigMigrationError> {
+    if outcome.warnings.is_empty() {
+        return Ok(());
+    }
+    Err(ConfigMigrationError::DurabilityWarning {
+        path: path.to_owned(),
+        backup_path: backup_path.map(Path::to_owned),
+        warnings: outcome.warnings,
+    })
 }
 
 fn read_versioned_document(path: &Path) -> Result<(Vec<u8>, Value, u32), ConfigMigrationError> {
@@ -436,7 +503,14 @@ fn sync_parent(_path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigMigrationError, ConfigMigrationOutcome, migrate_config_file_with_precommit};
+    use std::sync::mpsc;
+    use std::thread;
+
+    use super::{
+        ConfigMigrationError, ConfigMigrationOutcome, migrate_config_file_with_precommit,
+        rollback_config_migration,
+    };
+    use crate::io::{inject_directory_sync_warning_for_tests, write_bytes_atomically};
 
     const VERSION_ZERO: &str = r#"
 {
@@ -500,6 +574,67 @@ mod tests {
             ),
             "post-conflict source remains untouched by failed migration"
         );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn migration_and_regular_writes_share_one_publication_lock() {
+        let directory = std::env::temp_dir().join(format!(
+            "claw-config-versioning-shared-lock-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create directory");
+        let path = directory.join("config.json5");
+        let replacement = VERSION_ZERO.replace("schema_version: 0", "schema_version: 1");
+        let expected = replacement.clone();
+        std::fs::write(&path, VERSION_ZERO.as_bytes()).expect("write source");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || {
+            ready_rx.recv().expect("wait for migration precommit");
+            write_bytes_atomically(&writer_path, replacement.as_bytes()).expect("writer publish");
+            finish_tx.send(()).expect("report writer completion");
+        });
+
+        let outcome = migrate_config_file_with_precommit(&path, |_| {
+            ready_tx.send(()).expect("release concurrent writer");
+            assert!(
+                finish_rx.try_recv().is_err(),
+                "regular writer must still be blocked by the migration lock"
+            );
+        })
+        .expect("migrate");
+        assert!(matches!(outcome, ConfigMigrationOutcome::Migrated(_)));
+        writer.join().expect("join writer");
+        assert_eq!(
+            std::fs::read(&path).expect("read final bytes"),
+            expected.as_bytes()
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn rollback_directory_sync_warning_is_not_reported_as_success() {
+        let directory = std::env::temp_dir().join(format!(
+            "claw-config-versioning-rollback-warning-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create directory");
+        let path = directory.join("config.json5");
+        std::fs::write(&path, VERSION_ZERO.as_bytes()).expect("write source");
+        let record = match migrate_config_file_with_precommit(&path, |_| {}).expect("migrate") {
+            ConfigMigrationOutcome::Migrated(record) => record,
+            ConfigMigrationOutcome::Current => panic!("expected a migration record"),
+        };
+        let _guard = inject_directory_sync_warning_for_tests();
+        let error = rollback_config_migration(&record).expect_err("rollback warning must surface");
+        assert!(matches!(
+            error,
+            ConfigMigrationError::DurabilityWarning { .. }
+        ));
         let _ = std::fs::remove_dir_all(&directory);
     }
 }
