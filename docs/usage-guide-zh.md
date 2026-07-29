@@ -445,7 +445,8 @@ service http=<address> legacy=<address> gateway=<address> mcp=<address> provider
   它），或 Windows 上的控制台关闭 / 系统关机；
 - 中断信号——Unix 上的 `SIGINT`，Windows 上的 Ctrl-C 或 Ctrl-Break；
 - 控制通道（标准输入）上收到 `shutdown` 一行文本；
-- 发生受监管的运行时/入口故障：主 HTTP、MCP 或遗留 HTTP 任务意外失败、返回或消失。
+- 发生受监管的运行时/入口故障：主 HTTP、MCP 或遗留 HTTP 任务意外失败、返回或消失；
+- 启动后向监管输出写入 reload、status 或其他控制响应失败。
 
 标准输入到达末尾**不是**停止条件：以关闭的 stdin 启动的守护进程会继续提供服务。
 同一控制通道还接受 `status` 和 `reload`；重载会报告已应用的代次及变化域，或报告拒绝原因并让上一代配置
@@ -457,10 +458,12 @@ service http=<address> legacy=<address> gateway=<address> mcp=<address> provider
 stopped reason=<terminate|interrupt|control|runtime> clean=<bool> drained=<n> completed=<n> abandoned=<n> tasks=<terminated>/<spawned>
 ```
 
-`reason=runtime` 表示启动后发生了受监管故障，通常是入口任务失败、返回或消失；向监管方写入控制响应失败
-时也使用这一原因。入口故障发生后，守护进程会排空、输出停止汇总，并因该故障使汇总不再 clean 而以错误
-退出；仍有工作遗留时也会以错误退出。任务计数是真实的：终止计数由守卫对象的 `Drop` 累加，因此中途被取消
-的任务同样计入，这让 `tasks=t/s` 成为一次真正的泄漏检查，而不是"关停函数返回了"。
+`reason=runtime` 表示启动后发生了受监管故障：入口任务失败、返回或消失，或者向监管方写入 reload、status
+或其他控制响应失败。入口故障发生后，守护进程会排空、输出停止汇总，并因该故障使汇总不再 clean 而以错误
+退出。输出故障发生后仍会排空并尝试写入同一汇总，但由于输出已经损坏，不能保证 `stopped ...` 行真正发出。
+如果最初的启动公告写入失败，守护进程同样会排空并返回 I/O 错误，但此时尚未进入事件循环，不会产生
+`reason=runtime` 停止行。仍有工作遗留时也会以错误退出。任务计数是真实的：终止计数由守卫对象的 `Drop`
+累加，因此中途被取消的任务同样计入，这让 `tasks=t/s` 成为一次真正的泄漏检查，而不是"关停函数返回了"。
 
 手动停止：
 

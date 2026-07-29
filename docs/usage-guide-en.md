@@ -473,7 +473,8 @@ It then serves until one of:
 - an interrupt — `SIGINT` on Unix, Ctrl-C or Ctrl-Break on Windows,
 - the line `shutdown` on its control channel (standard input),
 - a supervised runtime/ingress fault: the main HTTP, MCP or legacy HTTP task fails, returns or
-  disappears unexpectedly.
+  disappears unexpectedly,
+- a post-start failure writing a reload, status or other control response to the supervisor output.
 
 Reaching the end of standard input is **not** a stop condition: a daemon started with stdin closed
 keeps serving. The same channel accepts `status` and `reload`; reload either reports the applied
@@ -485,12 +486,15 @@ On stop it prints one summary line:
 stopped reason=<terminate|interrupt|control|runtime> clean=<bool> drained=<n> completed=<n> abandoned=<n> tasks=<terminated>/<spawned>
 ```
 
-`reason=runtime` identifies a post-start supervised fault: normally an ingress failure, return or
-disappearance; a failure to write a control response to the supervisor uses the same reason. After
-an ingress fault the daemon drains, emits the stop summary and exits with an error because the fault
-makes the summary unclean. Work left behind also produces an error. The task counters are real:
-terminations are counted from a guard's `Drop`, so a task cancelled part-way through still counts,
-which makes `tasks=t/s` a genuine leak check.
+`reason=runtime` identifies a post-start supervised fault: an ingress failure, return or
+disappearance, or a failure writing a reload, status or other control response to the supervisor.
+After an ingress fault the daemon drains, emits the stop summary and exits with an error because the
+fault makes the summary unclean. After an output fault it still drains and attempts the same summary,
+but the output is already broken, so the `stopped ...` line is not guaranteed to be emitted. A
+failure writing the initial startup announcements also drains and returns the I/O error before the
+event loop, without a `reason=runtime` stop line. Work left behind likewise produces an error. The
+task counters are real: terminations are counted from a guard's `Drop`, so a task cancelled part-way
+through still counts, which makes `tasks=t/s` a genuine leak check.
 
 Stopping it by hand:
 
