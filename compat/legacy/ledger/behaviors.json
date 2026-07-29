@@ -1,6 +1,6 @@
 {
   "$schema": "../schemas/behavior-inventory.schema.json",
-  "source_revision": "3f2dfebcab1a1395f2445e9261b908cc4093f602",
+  "source_revision": "b2896426f3fcc5bb149402a38e09aac5e836d70b",
   "behaviors": [
     {
       "behavior_id": "behavior.config.booleans",
@@ -35,14 +35,14 @@
       "feature_id": "legacy.config.runtime",
       "classification": "preserved",
       "summary": "Enabled Teams requires both Microsoft credentials; enabled Telegram requires its token; enabled Discord requires its token; enabled WhatsApp requires verify, access, and phone-number tokens.",
-      "source": { "path": "src/config.ts", "line_start": 190, "line_end": 214 }
+      "source": { "path": "src/config.ts", "line_start": 196, "line_end": 225 }
     },
     {
       "behavior_id": "behavior.config.defaults",
       "feature_id": "legacy.config.runtime",
       "classification": "preserved",
       "summary": "Runtime defaults are port 3978, info logging, 3600000 ms session TTL, 100 sessions, gpt-4o, 30000 ms skill timeout, 120000 ms SDK timeout, rate 30, localhost domain, and false auto-update/trust-proxy.",
-      "source": { "path": "src/config.ts", "line_start": 241, "line_end": 280 }
+      "source": { "path": "src/config.ts", "line_start": 240, "line_end": 286 }
     },
     {
       "behavior_id": "behavior.auth.pat-startup",
@@ -132,50 +132,50 @@
       "behavior_id": "behavior.skill.backend-selection",
       "feature_id": "legacy.skill.execution",
       "classification": "deliberate_break",
-      "summary": "Legacy execution prefers isolated-vm with a 128 MiB isolate and falls back to node:vm with a reduced-isolation warning when the optional module is unavailable.",
-      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 6, "line_end": 59 }
+      "summary": "Legacy execution prefers isolated-vm with a 128 MiB isolate; node:vm is an explicit reduced-isolation development fallback, and production startup fails when isolated-vm is unavailable.",
+      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 6, "line_end": 71 }
     },
     {
       "behavior_id": "behavior.skill.registry",
       "feature_id": "legacy.skill.execution",
       "classification": "deliberate_break",
       "summary": "Registration appends name/code pairs without duplicate rejection; execution rejects disposed executors and unknown names, and duplicate lookup resolves the first registered name.",
-      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 74, "line_end": 109 }
+      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 86, "line_end": 121 }
     },
     {
       "behavior_id": "behavior.skill.domain-policy",
       "feature_id": "legacy.skill.bridge",
       "classification": "manual_port",
       "summary": "An empty domain list allows all URLs; otherwise URL parsing must succeed and the lowercase hostname must equal or be a subdomain of an allowed entry.",
-      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 79, "line_end": 89 }
+      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 91, "line_end": 101 }
     },
     {
       "behavior_id": "behavior.skill.http-bridges",
       "feature_id": "legacy.skill.bridge",
       "classification": "manual_port",
       "summary": "httpGet and httpPost require string URLs, enforce domain policy, apply the skill timeout to fetch, and return response text without rejecting HTTP error status codes; httpPost forwards body and headers.",
-      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 111, "line_end": 143 }
+      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 123, "line_end": 155 }
     },
     {
       "behavior_id": "behavior.skill.log-bridge",
       "feature_id": "legacy.skill.bridge",
       "classification": "manual_port",
       "summary": "log stringifies input, truncates to 2000 characters, and writes a structured skill-tagged info event.",
-      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 144, "line_end": 147 }
+      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 156, "line_end": 159 }
     },
     {
       "behavior_id": "behavior.skill.javascript-eval",
       "feature_id": "legacy.skill.execution",
       "classification": "deliberate_break",
       "summary": "Legacy code is interpolated as a function and invoked with params and bridge APIs in node:vm or isolated-vm; this evaluation behavior is intentionally absent from the final product.",
-      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 150, "line_end": 248 }
+      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 162, "line_end": 260 }
     },
     {
       "behavior_id": "behavior.skill.dispose",
       "feature_id": "legacy.skill.execution",
       "classification": "deliberate_break",
       "summary": "Executor disposal is idempotent, marks the executor unusable, and disposes the isolate when present.",
-      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 250, "line_end": 264 }
+      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 262, "line_end": 276 }
     },
     {
       "behavior_id": "behavior.session.touch",
@@ -518,7 +518,7 @@
       "feature_id": "legacy.updater",
       "classification": "compatibility_shim",
       "summary": "SDK and CLI probes run concurrently; updateAvailable is simple non-unknown string inequality rather than semantic-version ordering, and results/warnings are logged.",
-      "source": { "path": "src/updater/sdkUpdater.ts", "line_start": 73, "line_end": 121 }
+      "source": { "path": "src/updater/sdkUpdater.ts", "line_start": 73, "line_end": 123 }
     },
     {
       "behavior_id": "behavior.updater.nonblocking",
@@ -531,8 +531,8 @@
       "behavior_id": "behavior.updater.self-mutation",
       "feature_id": "legacy.updater",
       "classification": "deliberate_break",
-      "summary": "Legacy AUTO_UPDATE runs npm update for the SDK and a curl-to-shell Copilot installer on non-Windows, logs failures without throwing, and skips CLI update on Windows; these mutations are replaced by signed release handling.",
-      "source": { "path": "src/updater/sdkUpdater.ts", "line_start": 123, "line_end": 168 }
+      "summary": "AUTO_UPDATE=true is rejected during configuration; dependency and CLI updates must change reviewed lockfiles instead of invoking npm or a curl-to-shell installer.",
+      "source": { "path": "src/config.ts", "line_start": 178, "line_end": 194 }
     },
     {
       "behavior_id": "behavior.shutdown.signals",
@@ -552,15 +552,15 @@
       "behavior_id": "behavior.deployment.image-build",
       "feature_id": "legacy.deployment.container",
       "classification": "compatibility_shim",
-      "summary": "The Node 20 bookworm builder installs native build tools, runs npm install with unsafe-perm, compiles TypeScript, prunes dev dependencies, and copies dist, production node_modules, and package metadata to a Node 20 runtime.",
-      "source": { "path": "Dockerfile", "line_start": 1, "line_end": 54 }
+      "summary": "The digest-pinned Node 26 builder copies exact package roots, runs npm ci with scripts disabled, explicitly rebuilds only isolated-vm and koffi, compiles TypeScript with the locked local tool, and prunes development dependencies without scripts.",
+      "source": { "path": "Dockerfile", "line_start": 1, "line_end": 27 }
     },
     {
       "behavior_id": "behavior.deployment.image-runtime",
       "feature_id": "legacy.deployment.container",
       "classification": "compatibility_shim",
-      "summary": "The runtime installs curl/bash/certificates and Copilot CLI, sets no-node-snapshot and CLI path, runs as user node, exposes 3978, health-checks /health every 30 seconds with 10-second timeout and three retries, and starts dist/index.js.",
-      "source": { "path": "Dockerfile", "line_start": 35, "line_end": 68 }
+      "summary": "The runtime reuses the pinned Node 26 digest, copies the built app, production dependencies, and both package roots, uses the SDK-locked Copilot CLI, requires production isolation, runs as user node, health-checks /health, and starts dist/index.js.",
+      "source": { "path": "Dockerfile", "line_start": 29, "line_end": 50 }
     },
     {
       "behavior_id": "behavior.deployment.script-config",
@@ -594,8 +594,8 @@
       "behavior_id": "behavior.deployment.publish",
       "feature_id": "legacy.deployment.publish",
       "classification": "compatibility_shim",
-      "summary": "Publishing runs on main, v* tags, or dispatch with per-ref cancellation; it requires Docker Hub username/token, validates or derives a lowercase docker.io image, emits latest/branch/tag/sha tags, diagnostically builds the builder and final amd64 image, then pushes amd64.",
-      "source": { "path": ".github/workflows/docker-publish.yml", "line_start": 1, "line_end": 107 }
+      "summary": "Publishing also performs a secret-free pull-request build; actions are SHA-pinned, one amd64 image is built and validated by image ID, lockfile, CLI, and isolation checks, then authenticated events push every generated tag only when registry digests agree.",
+      "source": { "path": ".github/workflows/docker-publish.yml", "line_start": 1, "line_end": 150 }
     },
     {
       "behavior_id": "behavior.bundled.role",

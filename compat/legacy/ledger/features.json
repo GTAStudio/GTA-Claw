@@ -1,12 +1,12 @@
 {
   "$schema": "../schemas/feature-ledger.schema.json",
-  "source_revision": "3f2dfebcab1a1395f2445e9261b908cc4093f602",
+  "source_revision": "b2896426f3fcc5bb149402a38e09aac5e836d70b",
   "features": [
     {
       "feature_id": "legacy.config.runtime",
       "domain": "configuration",
       "source": [
-        { "path": "src/config.ts", "line_start": 52, "line_end": 307 },
+        { "path": "src/config.ts", "line_start": 52, "line_end": 313 },
         { "path": ".env.example", "line_start": 1, "line_end": 94 }
       ],
       "status": "current_supported",
@@ -18,7 +18,7 @@
       "feature_id": "legacy.auth.pat",
       "domain": "authentication",
       "source": [
-        { "path": "src/config.ts", "line_start": 141, "line_end": 188 },
+        { "path": "src/config.ts", "line_start": 141, "line_end": 189 },
         { "path": "src/index.ts", "line_start": 63, "line_end": 103 },
         { "path": "src/engine/copilotEngine.ts", "line_start": 28, "line_end": 38 }
       ],
@@ -79,7 +79,7 @@
       "feature_id": "legacy.skill.execution",
       "domain": "skills",
       "source": [
-        { "path": "src/engine/toolExecutor.ts", "line_start": 6, "line_end": 265 },
+        { "path": "src/engine/toolExecutor.ts", "line_start": 6, "line_end": 277 },
         { "path": "package.json", "line_start": 12, "line_end": 22 }
       ],
       "status": "current_degraded",
@@ -94,7 +94,7 @@
       "feature_id": "legacy.skill.bridge",
       "domain": "skills",
       "source": [
-        { "path": "src/engine/toolExecutor.ts", "line_start": 79, "line_end": 248 }
+        { "path": "src/engine/toolExecutor.ts", "line_start": 91, "line_end": 260 }
       ],
       "status": "current_supported",
       "acceptance_fixture": ["fixtures/migration/manual-port-required.json"],
@@ -155,7 +155,7 @@
       "domain": "http",
       "source": [
         { "path": "src/server.ts", "line_start": 154, "line_end": 169 },
-        { "path": "Dockerfile", "line_start": 63, "line_end": 68 }
+        { "path": "Dockerfile", "line_start": 47, "line_end": 48 }
       ],
       "status": "current_supported",
       "acceptance_fixture": ["fixtures/http/examples.json"],
@@ -352,7 +352,7 @@
       "feature_id": "legacy.updater",
       "domain": "updates",
       "source": [
-        { "path": "src/updater/sdkUpdater.ts", "line_start": 9, "line_end": 168 },
+        { "path": "src/updater/sdkUpdater.ts", "line_start": 9, "line_end": 124 },
         { "path": "src/index.ts", "line_start": 259, "line_end": 262 }
       ],
       "status": "current_degraded",
@@ -375,16 +375,18 @@
       "feature_id": "legacy.deployment.container",
       "domain": "deployment",
       "source": [
-        { "path": "Dockerfile", "line_start": 1, "line_end": 68 },
+        { "path": "Dockerfile", "line_start": 1, "line_end": 50 },
         { "path": ".dockerignore", "line_start": 1, "line_end": 10 },
-        { "path": "package.json", "line_start": 1, "line_end": 38 },
+        { "path": "package.json", "line_start": 1, "line_end": 42 },
         { "path": "package-lock.json", "line_start": 1, "line_end": 31 },
         { "path": "tsconfig.json", "line_start": 1, "line_end": 18 }
       ],
       "status": "current_supported",
       "acceptance_fixture": ["inventory/source-coverage.json", "ledger/behaviors.json"],
       "migration_decision": "rust_compat_shim",
-      "known_differences": ["The final image contains a Rust binary instead of Node, npm dependencies, and isolated-vm."]
+      "known_differences": [
+        "The compatibility image remains Node-based but is digest-pinned, lockfile-installed, and fail-closed on production isolation; the final Rust image removes the Node dependency graph."
+      ]
     },
     {
       "feature_id": "legacy.deployment.script",
@@ -402,12 +404,14 @@
       "feature_id": "legacy.deployment.publish",
       "domain": "deployment",
       "source": [
-        { "path": ".github/workflows/docker-publish.yml", "line_start": 1, "line_end": 107 }
+        { "path": ".github/workflows/docker-publish.yml", "line_start": 1, "line_end": 150 }
       ],
       "status": "current_supported",
       "acceptance_fixture": ["config/env-mapping.json", "inventory/source-coverage.json"],
       "migration_decision": "rust_compat_shim",
-      "known_differences": ["CI changes are outside P00b; this entry records the current amd64 Docker Hub contract for later migration."]
+      "known_differences": [
+        "Pull requests build and validate without secrets; authenticated events push the same validated amd64 image digest under every generated tag."
+      ]
     },
     {
       "feature_id": "legacy.bundled.roles",
