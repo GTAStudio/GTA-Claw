@@ -196,6 +196,49 @@ async fn a_buffered_exchange_succeeds_when_all_phases_fit_one_deadline() {
 }
 
 #[tokio::test]
+async fn a_buffered_exchange_treats_duration_max_as_a_far_future_deadline() {
+    let server = TestServer::start(vec![Reply::json(r#"{"ok":true}"#)]).await;
+
+    let response = transport()
+        .send(
+            "test",
+            Operation::Complete,
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions"))
+                .timeout(Duration::MAX),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("an unrepresentable timeout saturates instead of panicking");
+
+    assert_eq!(response.body(), br#"{"ok":true}"#);
+}
+
+#[tokio::test]
+async fn a_pre_cancelled_buffered_exchange_with_duration_max_is_cancelled() {
+    let server = TestServer::start(vec![Reply::json("{}")]).await;
+    let cancel = CancelToken::cancelled_token();
+
+    let error = transport()
+        .send(
+            "test",
+            Operation::Complete,
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions"))
+                .timeout(Duration::MAX),
+            &cancel,
+        )
+        .await
+        .expect_err("cancellation has priority over an extreme timeout");
+
+    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert_eq!(
+        error.detail(),
+        "the request was cancelled before a response arrived"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(server.request_count().await, 0);
+}
+
+#[tokio::test]
 async fn a_chunked_body_is_delivered_incrementally_rather_than_buffered() {
     let server = TestServer::start(vec![Reply::sse(&[
         "data: {\"n\":1}\n\n",
@@ -237,6 +280,57 @@ async fn a_chunked_body_is_delivered_incrementally_rather_than_buffered() {
         String::from_utf8(joined).expect("utf-8"),
         "data: {\"n\":1}\n\ndata: {\"n\":2}\n\ndata: [DONE]\n\n"
     );
+}
+
+#[tokio::test]
+async fn a_streaming_exchange_treats_duration_max_as_a_far_future_deadline() {
+    let server = TestServer::start(vec![Reply::sse(&["data: [DONE]\n\n"])]).await;
+
+    let stream = transport()
+        .send_streaming(
+            "test",
+            Operation::StreamCompletion,
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions"))
+                .timeout(Duration::MAX),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("an unrepresentable timeout saturates instead of panicking");
+
+    let mut chunks = stream.into_chunks();
+    let first = chunks
+        .next()
+        .await
+        .expect("the response contains a chunk")
+        .expect("the chunk decodes");
+    assert_eq!(first, "data: [DONE]\n\n");
+}
+
+#[tokio::test]
+async fn a_pre_cancelled_streaming_exchange_with_duration_max_is_cancelled() {
+    let server = TestServer::start(vec![Reply::sse(&["data: [DONE]\n\n"])]).await;
+    let cancel = CancelToken::cancelled_token();
+
+    let result = transport()
+        .send_streaming(
+            "test",
+            Operation::StreamCompletion,
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions"))
+                .timeout(Duration::MAX),
+            &cancel,
+        )
+        .await;
+    let Err(error) = result else {
+        panic!("cancellation must have priority over an extreme timeout");
+    };
+
+    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert_eq!(
+        error.detail(),
+        "the request was cancelled before a response arrived"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(server.request_count().await, 0);
 }
 
 #[tokio::test]
