@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
-use std::fs;
-use std::io::{self, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signer, SigningKey};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -19,6 +19,7 @@ use crate::contract::{
 use crate::platform::PlatformPaths;
 
 static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const DURABLE_RECEIPT_VERSION: u32 = 1;
 
 /// Confidence assigned to a detected migration source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -427,6 +428,29 @@ enum AppliedState {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DurableReceiptState {
+    Pending,
+    Committed,
+    Aborted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct DurableBackupEntry {
+    target: PathBuf,
+    backup: Option<PathBuf>,
+    sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct DurableReceipt {
+    version: u32,
+    provider_id: String,
+    state: DurableReceiptState,
+    backups: Vec<DurableBackupEntry>,
+}
+
 struct SecretUndo {
     id: String,
     previous: Option<SecretValue>,
@@ -816,6 +840,7 @@ fn apply_plan(
     context: &mut ApplyContext<'_>,
     plan: &MigrationPlan,
 ) -> Result<ApplyReceipt, MigrationError> {
+    recover_pending_backups(context.backup_root, context.target_root)?;
     plan.result.validate()?;
     if plan.result.status != MigrationStatus::Migrated || plan.operations.is_empty() {
         return Err(MigrationError::PlanNotApplicable);
@@ -844,12 +869,17 @@ fn apply_plan(
         secrets: Vec::new(),
     };
     write_backup_manifest(&receipt)?;
+    write_durable_receipt(&receipt, DurableReceiptState::Pending)?;
     let apply_result = apply_operations(context, &plan.operations, &mut receipt)
-        .and_then(|()| verify_source_digests(plan));
+        .and_then(|()| verify_source_digests(plan))
+        .and_then(|()| write_durable_receipt(&receipt, DurableReceiptState::Committed));
     if let Err(error) = apply_result {
-        let rollback_errors = rollback_receipt(context, &receipt)
-            .err()
-            .map_or_else(Vec::new, rollback_failure_messages);
+        let rollback_errors = match rollback_receipt(context, &receipt) {
+            Ok(()) => write_durable_receipt(&receipt, DurableReceiptState::Aborted)
+                .err()
+                .map_or_else(Vec::new, |error| vec![error.to_string()]),
+            Err(error) => rollback_failure_messages(error),
+        };
         return Err(MigrationError::ApplyFailed {
             cause: Box::new(error),
             rollback_errors,
@@ -887,88 +917,225 @@ fn apply_operations(
     operations: &[MigrationOperation],
     receipt: &mut ApplyReceipt,
 ) -> Result<(), MigrationError> {
-    for operation in operations {
-        let result = match operation {
-            MigrationOperation::CopyPath { source, target } => {
-                replace_target_if_needed(target, context.overwrite)?;
-                copy_path(source, target)
-            }
-            MigrationOperation::AppendFile {
+    for (index, operation) in operations.iter().enumerate() {
+        if let MigrationOperation::AppendFile {
+            source,
+            target,
+            heading,
+        } = operation
+        {
+            append_file(source, target, heading)?;
+            record_applied_state(receipt, operation.target());
+            continue;
+        }
+
+        let target = operation.target();
+        let staged = reserve_publish_path(target, "stage")?;
+        remove_path_if_exists(&staged)?;
+        apply_operation_to_target(context, receipt, operation, &staged)?;
+        sync_path_tree(&staged)?;
+        publish_staged_path(context.overwrite, target, &staged, index)?;
+        record_applied_state(receipt, target);
+    }
+    Ok(())
+}
+
+fn apply_operation_to_target(
+    context: &mut ApplyContext<'_>,
+    receipt: &mut ApplyReceipt,
+    operation: &MigrationOperation,
+    target: &Path,
+) -> Result<(), MigrationError> {
+    match operation {
+        MigrationOperation::CopyPath { source, .. } => copy_path(source, target),
+        MigrationOperation::GeneratedCommandSkill { source, name, .. } => {
+            generate_command_skill(source, target, name)
+        }
+        MigrationOperation::TransformJson {
+            source, namespace, ..
+        } => transform_json(
+            source,
+            target,
+            namespace,
+            context.secret_store,
+            &mut receipt.secrets,
+        ),
+        MigrationOperation::TransformText {
+            source, namespace, ..
+        } => transform_text(
+            source,
+            target,
+            namespace,
+            context.secret_store,
+            &mut receipt.secrets,
+        ),
+        MigrationOperation::ImportEnvironment {
+            source, namespace, ..
+        } => import_environment(
+            source,
+            target,
+            namespace,
+            context.secret_store,
+            &mut receipt.secrets,
+        ),
+        MigrationOperation::StoreDocument {
+            source, secret_id, ..
+        } => store_document(
+            source,
+            target,
+            secret_id,
+            context.secret_store,
+            &mut receipt.secrets,
+        ),
+        MigrationOperation::WriteBytes { bytes, .. } => write_bytes(target, bytes),
+        MigrationOperation::AppendFile { .. } => {
+            unreachable!("append operations are handled inline")
+        }
+    }
+}
+
+fn reserve_publish_path(target: &Path, label: &str) -> Result<PathBuf, MigrationError> {
+    create_parent(target)?;
+    for _ in 0..128 {
+        let sequence = BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let file_name = target
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("target");
+        let candidate = target.with_file_name(format!(
+            ".{file_name}.migration-{label}-{}.{}",
+            std::process::id(),
+            sequence
+        ));
+        if !path_is_occupied(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(MigrationError::Io {
+        action: "reserve temporary publication path",
+        path: target.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique migration publication path",
+        ),
+    })
+}
+
+fn publish_staged_path(
+    overwrite: bool,
+    target: &Path,
+    staged: &Path,
+    operation_index: usize,
+) -> Result<(), MigrationError> {
+    let _ = operation_index;
+    if path_is_occupied(target) {
+        if !overwrite {
+            return Err(MigrationError::Conflict(target.to_path_buf()));
+        }
+        #[cfg(test)]
+        failpoint::trigger("after_staging_write");
+        let parking = reserve_publish_path(target, "parking")?;
+        fs::rename(target, &parking).map_err(|source| MigrationError::Io {
+            action: "move existing target aside",
+            path: target.to_path_buf(),
+            source,
+        })?;
+        sync_parent_path(target)?;
+        #[cfg(test)]
+        failpoint::trigger("after_target_moved");
+        fs::rename(staged, target).map_err(|publish_error| {
+            let rollback_attempt = fs::rename(&parking, target).err();
+            let publish_kind = publish_error.kind();
+            let source = match rollback_attempt {
+                Some(restore_error) => io::Error::new(
+                    publish_kind,
+                    format!(
+                        "{publish_error}; additionally failed to restore previous target {}: \
+                         {restore_error}",
+                        parking.display()
+                    ),
+                ),
+                None => publish_error,
+            };
+            MigrationError::Io {
+                action: "publish staged migration target",
+                path: target.to_path_buf(),
                 source,
-                target,
-                heading,
-            } => append_file(source, target, heading),
-            MigrationOperation::GeneratedCommandSkill {
-                source,
-                target,
-                name,
-            } => {
-                replace_target_if_needed(target, context.overwrite)?;
-                generate_command_skill(source, target, name)
             }
-            MigrationOperation::TransformJson {
-                source,
-                target,
-                namespace,
-            } => {
-                replace_target_if_needed(target, context.overwrite)?;
-                transform_json(
-                    source,
-                    target,
-                    namespace,
-                    context.secret_store,
-                    &mut receipt.secrets,
-                )
-            }
-            MigrationOperation::TransformText {
-                source,
-                target,
-                namespace,
-            } => {
-                replace_target_if_needed(target, context.overwrite)?;
-                transform_text(
-                    source,
-                    target,
-                    namespace,
-                    context.secret_store,
-                    &mut receipt.secrets,
-                )
-            }
-            MigrationOperation::ImportEnvironment {
-                source,
-                target,
-                namespace,
-            } => {
-                replace_target_if_needed(target, context.overwrite)?;
-                import_environment(
-                    source,
-                    target,
-                    namespace,
-                    context.secret_store,
-                    &mut receipt.secrets,
-                )
-            }
-            MigrationOperation::StoreDocument {
-                source,
-                target,
-                secret_id,
-            } => {
-                replace_target_if_needed(target, context.overwrite)?;
-                store_document(
-                    source,
-                    target,
-                    secret_id,
-                    context.secret_store,
-                    &mut receipt.secrets,
-                )
-            }
-            MigrationOperation::WriteBytes { target, bytes } => {
-                replace_target_if_needed(target, context.overwrite)?;
-                write_bytes(target, bytes)
-            }
+        })?;
+        sync_parent_path(target)?;
+        #[cfg(test)]
+        failpoint::trigger("after_target_published");
+        remove_path_if_exists(&parking)?;
+        return Ok(());
+    }
+    fs::rename(staged, target).map_err(|source| MigrationError::Io {
+        action: "publish staged migration target",
+        path: target.to_path_buf(),
+        source,
+    })?;
+    sync_parent_path(target)?;
+    #[cfg(test)]
+    {
+        let _ = operation_index;
+        failpoint::trigger("after_target_published");
+    }
+    Ok(())
+}
+
+fn recover_pending_backups(backup_root: &Path, target_root: &Path) -> Result<(), MigrationError> {
+    if !backup_root.exists() {
+        return Ok(());
+    }
+    for entry in sorted_entries(backup_root)? {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
         };
-        record_applied_state(receipt, operation.target());
-        result?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let backup_dir = entry.path();
+        let receipt_path = backup_dir.join("receipt.json");
+        if !receipt_path.exists() {
+            continue;
+        }
+        let mut receipt = read_durable_receipt(&receipt_path)?;
+        if receipt.version != DURABLE_RECEIPT_VERSION {
+            return Err(MigrationError::Io {
+                action: "parse durable migration receipt",
+                path: receipt_path,
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported durable receipt version {}", receipt.version),
+                ),
+            });
+        }
+        if receipt.state != DurableReceiptState::Pending {
+            continue;
+        }
+        restore_pending_receipt(target_root, &receipt.backups)?;
+        receipt.state = DurableReceiptState::Aborted;
+        write_durable_receipt_at(&backup_dir, &receipt)?;
+    }
+    Ok(())
+}
+
+fn restore_pending_receipt(
+    target_root: &Path,
+    backups: &[DurableBackupEntry],
+) -> Result<(), MigrationError> {
+    for entry in backups.iter().rev() {
+        ensure_target_within(target_root, &entry.target)?;
+        let backup = BackupEntry {
+            target: entry.target.clone(),
+            backup: entry.backup.clone(),
+            digest: entry.sha256.clone(),
+            applied: Some(AppliedState::Unknown),
+        };
+        restore_backup(&backup)?;
+        if backup.backup.is_none() {
+            cleanup_empty_parents(&backup.target, target_root);
+        }
     }
     Ok(())
 }
@@ -1152,7 +1319,47 @@ fn write_backup_manifest(receipt: &ApplyReceipt) -> Result<(), MigrationError> {
     let bytes = serde_json::to_vec_pretty(&entries).map_err(|error| {
         MigrationError::Signing(format!("backup manifest serialization: {error}"))
     })?;
-    write_bytes(&receipt.backup_dir.join("manifest.json"), &bytes)
+    write_durable_bytes(&receipt.backup_dir.join("manifest.json"), &bytes)
+}
+
+fn write_durable_receipt(
+    receipt: &ApplyReceipt,
+    state: DurableReceiptState,
+) -> Result<(), MigrationError> {
+    let durable = DurableReceipt {
+        version: DURABLE_RECEIPT_VERSION,
+        provider_id: receipt.provider_id.to_owned(),
+        state,
+        backups: receipt
+            .backups
+            .iter()
+            .map(|entry| DurableBackupEntry {
+                target: entry.target.clone(),
+                backup: entry.backup.clone(),
+                sha256: entry.digest.clone(),
+            })
+            .collect(),
+    };
+    write_durable_receipt_at(&receipt.backup_dir, &durable)
+}
+
+fn write_durable_receipt_at(
+    backup_dir: &Path,
+    receipt: &DurableReceipt,
+) -> Result<(), MigrationError> {
+    let bytes = serde_json::to_vec_pretty(receipt).map_err(|error| {
+        MigrationError::Signing(format!("durable receipt serialization: {error}"))
+    })?;
+    write_durable_bytes(&backup_dir.join("receipt.json"), &bytes)
+}
+
+fn read_durable_receipt(path: &Path) -> Result<DurableReceipt, MigrationError> {
+    let bytes = read_bytes(path)?;
+    serde_json::from_slice(&bytes).map_err(|source| MigrationError::Io {
+        action: "parse durable migration receipt",
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidData, source.to_string()),
+    })
 }
 
 fn restore_backup(entry: &BackupEntry) -> Result<(), MigrationError> {
@@ -1210,16 +1417,6 @@ fn cleanup_empty_parents(target: &Path, root: &Path) {
 /// otherwise silently follow out of the migration root.
 fn path_is_occupied(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
-}
-
-fn replace_target_if_needed(target: &Path, overwrite: bool) -> Result<(), MigrationError> {
-    if path_is_occupied(target) {
-        if !overwrite {
-            return Err(MigrationError::Conflict(target.to_path_buf()));
-        }
-        remove_path_if_exists(target)?;
-    }
-    Ok(())
 }
 
 fn append_file(source: &Path, target: &Path, heading: &str) -> Result<(), MigrationError> {
@@ -1858,7 +2055,10 @@ fn copy_file(source: &Path, target: &Path) -> Result<(), MigrationError> {
             action: "copy",
             path: source.to_path_buf(),
             source: source_error,
-        })
+        })?;
+    sync_file(target)?;
+    sync_parent_path(target)?;
+    Ok(())
 }
 
 fn sorted_entries(path: &Path) -> Result<Vec<fs::DirEntry>, MigrationError> {
@@ -1935,6 +2135,48 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), MigrationError> {
     })
 }
 
+fn write_durable_bytes(path: &Path, bytes: &[u8]) -> Result<(), MigrationError> {
+    create_parent(path)?;
+    let temporary = reserve_publish_path(path, "receipt")?;
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|source| MigrationError::Io {
+                action: "create durable file",
+                path: temporary.clone(),
+                source,
+            })?;
+        file.write_all(bytes).map_err(|source| MigrationError::Io {
+            action: "write durable file",
+            path: temporary.clone(),
+            source,
+        })?;
+        file.flush().map_err(|source| MigrationError::Io {
+            action: "flush durable file",
+            path: temporary.clone(),
+            source,
+        })?;
+        file.sync_all().map_err(|source| MigrationError::Io {
+            action: "sync durable file",
+            path: temporary.clone(),
+            source,
+        })?;
+        drop(file);
+        fs::rename(&temporary, path).map_err(|source| MigrationError::Io {
+            action: "publish durable file",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        sync_parent_path(path)
+    })();
+    if write_result.is_err() {
+        let _ = remove_path_if_exists(&temporary);
+    }
+    write_result
+}
+
 fn create_parent(path: &Path) -> Result<(), MigrationError> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
@@ -1950,6 +2192,55 @@ fn create_dir_all(path: &Path) -> Result<(), MigrationError> {
     })
 }
 
+fn sync_path_tree(path: &Path) -> Result<(), MigrationError> {
+    if path.is_dir() {
+        for entry in sorted_entries(path)? {
+            sync_path_tree(&entry.path())?;
+        }
+        sync_directory(path)?;
+    } else if path.is_file() {
+        sync_file(path)?;
+    }
+    Ok(())
+}
+
+fn sync_file(path: &Path) -> Result<(), MigrationError> {
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| MigrationError::Io {
+            action: "sync file",
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn sync_directory(path: &Path) -> Result<(), MigrationError> {
+    #[cfg(unix)]
+    {
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| MigrationError::Io {
+                action: "sync directory",
+                path: path.to_path_buf(),
+                source,
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn sync_parent_path(path: &Path) -> Result<(), MigrationError> {
+    let parent = path.parent().ok_or_else(|| MigrationError::Io {
+        action: "sync parent directory",
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"),
+    })?;
+    sync_directory(parent)
+}
+
 fn path_to_slashes(path: &Path) -> String {
     path.components()
         .filter_map(|component| match component {
@@ -1958,4 +2249,106 @@ fn path_to_slashes(path: &Path) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+#[cfg(test)]
+mod failpoint {
+    use std::sync::Mutex;
+
+    static ACTIVE: Mutex<Option<&'static str>> = Mutex::new(None);
+
+    pub(super) struct Guard;
+
+    pub(super) fn set(name: &'static str) -> Guard {
+        *ACTIVE.lock().expect("lock failpoint") = Some(name);
+        Guard
+    }
+
+    pub(super) fn trigger(name: &str) {
+        if ACTIVE
+            .lock()
+            .expect("lock failpoint")
+            .is_some_and(|configured| configured == name)
+        {
+            panic!("injected crash at {name}");
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *ACTIVE.lock().expect("lock failpoint") = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod crash_recovery_tests {
+    use super::*;
+
+    fn temporary_root(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "claw-migrate-crash-recovery-{label}-{}-{}",
+            std::process::id(),
+            BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create test root");
+        directory
+    }
+
+    #[test]
+    fn overwrite_publication_recovers_pending_receipt_deterministically_for_all_crash_phases() {
+        for checkpoint in [
+            "after_staging_write",
+            "after_target_moved",
+            "after_target_published",
+        ] {
+            let root = temporary_root(checkpoint);
+            let target_root = root.join("target");
+            let backup_root = root.join("backup-root");
+            let backup_dir = backup_root.join("tx-1");
+            fs::create_dir_all(&backup_dir).expect("create backup directory");
+            let target = target_root.join("workspace").join("AGENTS.md");
+            create_parent(&target).expect("create target parent");
+            fs::write(&target, b"old-bytes").expect("write original target");
+            let backup = backup_dir.join("items").join("0");
+            create_parent(&backup).expect("create backup parent");
+            fs::copy(&target, &backup).expect("copy original to backup");
+            let digest = digest_path(&backup).expect("digest backup");
+            let receipt = ApplyReceipt {
+                provider_id: "test",
+                backup_dir: backup_dir.clone(),
+                backups: vec![BackupEntry {
+                    target: target.clone(),
+                    backup: Some(backup),
+                    digest: Some(digest),
+                    applied: None,
+                }],
+                secrets: Vec::new(),
+            };
+            write_durable_receipt(&receipt, DurableReceiptState::Pending)
+                .expect("write pending receipt");
+
+            let staged = reserve_publish_path(&target, "stage").expect("reserve stage");
+            write_bytes(&staged, b"new-bytes").expect("write staged bytes");
+            let crash = std::panic::catch_unwind(|| {
+                let _guard = failpoint::set(checkpoint);
+                publish_staged_path(true, &target, &staged, 0).expect("publish staged path");
+            });
+            assert!(crash.is_err(), "expected injected crash at {checkpoint}");
+
+            recover_pending_backups(&backup_root, &target_root).expect("recover pending receipt");
+            assert_eq!(
+                fs::read(&target).expect("read recovered target"),
+                b"old-bytes"
+            );
+            recover_pending_backups(&backup_root, &target_root)
+                .expect("second recovery pass stays idempotent");
+            assert_eq!(
+                fs::read(&target).expect("read idempotent recovered target"),
+                b"old-bytes"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
 }

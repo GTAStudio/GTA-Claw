@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -195,22 +195,30 @@ fn migrate_config_file_with_precommit(
     mut precommit: impl FnMut(&Path),
 ) -> Result<ConfigMigrationOutcome, ConfigMigrationError> {
     let path = path.as_ref();
-    let _lock = MigrationLock::acquire(path)?;
-    let source = fs::read(path).map_err(|source| ConfigError::io(path, source))?;
-    let text = std::str::from_utf8(&source).map_err(|error| ConfigError::Syntax {
-        source_name: path.display().to_string(),
-        message: error.to_string(),
-    })?;
-    let mut document = json5::from_str::<Value>(text).map_err(|error| ConfigError::Syntax {
-        source_name: path.display().to_string(),
-        message: error.to_string(),
-    })?;
-    let version = document
-        .get("schema_version")
-        .and_then(Value::as_u64)
-        .and_then(|version| u32::try_from(version).ok())
-        .ok_or(ConfigMigrationError::MissingVersion)?;
+    let (source, _document, version) = read_versioned_document(path)?;
+    let source_name = path.display().to_string();
     if version == CONFIG_SCHEMA_VERSION {
+        let text = std::str::from_utf8(&source).map_err(|error| ConfigError::Syntax {
+            source_name,
+            message: error.to_string(),
+        })?;
+        parse_json5(text, &path.display().to_string())?;
+        return Ok(ConfigMigrationOutcome::Current);
+    }
+    if version != 0 || CONFIG_SCHEMA_VERSION != 1 {
+        return Err(ConfigMigrationError::UnsupportedPath {
+            found: version,
+            current: CONFIG_SCHEMA_VERSION,
+        });
+    }
+
+    let _lock = MigrationLock::acquire(path)?;
+    let (source, mut document, version) = read_versioned_document(path)?;
+    if version == CONFIG_SCHEMA_VERSION {
+        let text = std::str::from_utf8(&source).map_err(|error| ConfigError::Syntax {
+            source_name: path.display().to_string(),
+            message: error.to_string(),
+        })?;
         parse_json5(text, &path.display().to_string())?;
         return Ok(ConfigMigrationOutcome::Current);
     }
@@ -286,6 +294,24 @@ pub fn rollback_config_migration(
     Ok(())
 }
 
+fn read_versioned_document(path: &Path) -> Result<(Vec<u8>, Value, u32), ConfigMigrationError> {
+    let source = fs::read(path).map_err(|source| ConfigError::io(path, source))?;
+    let text = std::str::from_utf8(&source).map_err(|error| ConfigError::Syntax {
+        source_name: path.display().to_string(),
+        message: error.to_string(),
+    })?;
+    let document = json5::from_str::<Value>(text).map_err(|error| ConfigError::Syntax {
+        source_name: path.display().to_string(),
+        message: error.to_string(),
+    })?;
+    let version = document
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or(ConfigMigrationError::MissingVersion)?;
+    Ok((source, document, version))
+}
+
 fn create_backup(path: &Path, bytes: &[u8]) -> Result<PathBuf, ConfigMigrationError> {
     create_backup_io(path, bytes).map_err(|source| ConfigMigrationError::Backup {
         path: path.to_owned(),
@@ -344,30 +370,44 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 struct MigrationLock {
-    path: PathBuf,
+    file: File,
 }
 
 impl MigrationLock {
-    fn acquire(config_path: &Path) -> Result<Self, ConfigMigrationError> {
-        let lock_path = config_path.with_file_name(format!(
+    fn lock_path(config_path: &Path) -> PathBuf {
+        config_path.with_file_name(format!(
             ".{}.schema-migrate.lock",
             config_path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("config")
-        ));
-        let mut lock_file = OpenOptions::new()
+        ))
+    }
+
+    fn acquire(config_path: &Path) -> Result<Self, ConfigMigrationError> {
+        let lock_path = Self::lock_path(config_path);
+        reject_lock_link_or_reparse(&lock_path).map_err(|source| ConfigMigrationError::Lock {
+            path: lock_path.clone(),
+            source,
+        })?;
+        let lock_file = OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(&lock_path)
             .map_err(|source| ConfigMigrationError::Lock {
                 path: lock_path.clone(),
                 source,
             })?;
         lock_file
-            .write_all(std::process::id().to_string().as_bytes())
-            .and_then(|()| lock_file.flush())
-            .and_then(|()| lock_file.sync_all())
+            .try_lock()
+            .map_err(|source| ConfigMigrationError::Lock {
+                path: lock_path.clone(),
+                source: source.into(),
+            })?;
+        lock_file
+            .sync_all()
             .map_err(|source| ConfigMigrationError::Lock {
                 path: lock_path.clone(),
                 source,
@@ -376,13 +416,95 @@ impl MigrationLock {
             path: lock_path.clone(),
             source,
         })?;
-        Ok(Self { path: lock_path })
+        reject_lock_link_or_reparse(&lock_path).map_err(|source| ConfigMigrationError::Lock {
+            path: lock_path.clone(),
+            source,
+        })?;
+        Ok(Self { file: lock_file })
     }
 }
 
 impl Drop for MigrationLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = self.file.unlock();
+    }
+}
+
+fn reject_lock_link_or_reparse(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if is_link_or_reparse(&metadata) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "lock must not be a symlink or reparse point",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(test)]
+impl MigrationLock {
+    fn test_lock_path(config_path: &Path) -> PathBuf {
+        Self::lock_path(config_path)
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::{ConfigMigrationOutcome, MigrationLock, migrate_config_file_with_precommit};
+
+    const VERSION_ZERO: &str = r#"
+{
+  schema_version: 0,
+  core: {
+    auth: { github: { pat: "env:GITHUB_TOKEN", device: { enabled: false } } },
+    role: { source_url: "https://roles.example.test/default.json" },
+    channels: { teams: { enabled: false } },
+    server: {},
+    logging: {},
+    sessions: {},
+    copilot: {},
+    legacy: {},
+    updates: {},
+    admin: {},
+    network: {},
+  },
+}
+"#;
+
+    #[test]
+    fn stale_lock_file_without_live_owner_does_not_block_migration() {
+        let directory = std::env::temp_dir().join(format!(
+            "claw-config-versioning-stale-lock-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create directory");
+        let path = directory.join("config.json5");
+        std::fs::write(&path, VERSION_ZERO).expect("write version zero");
+        let lock = MigrationLock::test_lock_path(&path);
+        std::fs::write(&lock, b"stale owner").expect("write stale lock");
+        let outcome = migrate_config_file_with_precommit(&path, |_| {}).expect("migrate");
+        assert!(matches!(outcome, ConfigMigrationOutcome::Migrated(_)));
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
 

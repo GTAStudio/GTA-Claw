@@ -2,8 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use claw_config::{
-    ConfigSnapshot, SecretRef, WriteWarning, migrate_legacy_environment, write_bytes_atomically,
-    write_file,
+    ConfigSnapshot, SecretRef, WriteWarning, migrate_legacy_environment, write_file,
 };
 
 use crate::CrestodianError;
@@ -348,7 +347,7 @@ fn restore_path(path: &Path, original: Option<&[u8]>) -> Result<(), String> {
         };
     };
     ensure_parent_directory(path).map_err(|error| error.to_string())?;
-    let restored = write_bytes_atomically(path, bytes).map_err(|error| error.to_string())?;
+    let restored = restore_bytes_atomically(path, bytes).map_err(|error| error.to_string())?;
     if !restored.warnings.is_empty() {
         let warning = restored
             .warnings
@@ -366,4 +365,121 @@ fn restore_path(path: &Path, original: Option<&[u8]>) -> Result<(), String> {
         return Err(format!("restore durability warning: {warning}"));
     }
     Ok(())
+}
+
+fn restore_bytes_atomically(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<claw_config::WriteOutcome, claw_config::ConfigError> {
+    #[cfg(test)]
+    {
+        test_failpoint::restore_bytes_atomically(path, bytes)
+    }
+    #[cfg(not(test))]
+    {
+        claw_config::write_bytes_atomically(path, bytes)
+    }
+}
+
+#[cfg(test)]
+mod test_failpoint {
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use claw_config::{ConfigError, WriteOutcome, WriteWarning, write_bytes_atomically};
+
+    static INJECT_DIRECTORY_SYNC_WARNING: Mutex<bool> = Mutex::new(false);
+
+    pub(super) struct Guard;
+
+    pub(super) fn inject_directory_sync_warning() -> Guard {
+        *INJECT_DIRECTORY_SYNC_WARNING
+            .lock()
+            .expect("lock restore failpoint") = true;
+        Guard
+    }
+
+    pub(super) fn restore_bytes_atomically(
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<WriteOutcome, ConfigError> {
+        let mut outcome = write_bytes_atomically(path, bytes)?;
+        let inject_warning = {
+            let mut enabled = INJECT_DIRECTORY_SYNC_WARNING
+                .lock()
+                .expect("lock restore failpoint");
+            let inject = *enabled;
+            if inject {
+                *enabled = false;
+            }
+            inject
+        };
+        if inject_warning {
+            let parent = path
+                .parent()
+                .expect("restored path always has parent")
+                .to_path_buf();
+            outcome.warnings.push(WriteWarning::DirectorySyncFailed {
+                path: parent,
+                message: "injected directory sync warning".to_owned(),
+            });
+        }
+        Ok(outcome)
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *INJECT_DIRECTORY_SYNC_WARNING
+                .lock()
+                .expect("lock restore failpoint") = false;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GuidedSetup, SetupAnswers, test_failpoint};
+    use crate::CrestodianError;
+
+    #[test]
+    fn rollback_surfaces_directory_sync_warning_in_restore_failures() {
+        let root = std::env::temp_dir().join(format!(
+            "claw-crestodian-setup-rollback-warning-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create test root");
+        let config_path = root.join("config.json5");
+        let state_blocker = root.join("state-blocker");
+        let state_path = state_blocker.join("crestodian.json");
+        std::fs::write(&config_path, b"").expect("write original config");
+        std::fs::write(&state_blocker, b"not a directory").expect("write state blocker");
+        let setup = GuidedSetup::new(&config_path, &state_path);
+        let answers = SetupAnswers {
+            github_token_environment: "GITHUB_TOKEN".to_owned(),
+            role_source_url: "https://roles.example.test/default.json".to_owned(),
+            workspace: None,
+            enable_teams: false,
+            teams_app_id: None,
+            teams_password_environment: None,
+        };
+
+        let _guard = test_failpoint::inject_directory_sync_warning();
+        let error = setup.apply(&answers).expect_err("state write must fail");
+        let CrestodianError::Rollback {
+            restore_failures, ..
+        } = error
+        else {
+            panic!("expected rollback with restore failures, got {error:?}");
+        };
+        assert!(
+            restore_failures
+                .iter()
+                .any(|failure| failure.path == config_path
+                    && failure
+                        .message
+                        .contains("restore durability warning: directory sync failed")),
+            "expected restore failure to carry directory sync warning"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
