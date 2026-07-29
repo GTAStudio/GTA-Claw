@@ -1,5 +1,11 @@
 [graph]
 all-features = true
+targets = [
+  { triple = "x86_64-pc-windows-msvc" },
+  { triple = "aarch64-pc-windows-msvc" },
+  { triple = "x86_64-apple-darwin" },
+  { triple = "aarch64-apple-darwin" },
+]
 
 [advisories]
 ignore = []
@@ -55,6 +61,8 @@ skip = [
   { name = "rand_core", version = "=0.6.4" },
   # Winit 0.30 requires smol_str 0.2, while the Slint compiler requires 0.3.
   { name = "smol_str", version = "=0.2.2" },
+  # Slint's proc-macro graph remains on syn 2 while serde_derive has moved to syn 3.
+  { name = "syn", version = "=3.0.3" },
   # calloop 0.13 and fastwebsockets 0.10 require thiserror 1, while newer Slint
   # transitive dependencies require thiserror 2.
   { name = "thiserror", version = "=1.0.69" },

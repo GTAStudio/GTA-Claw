@@ -21,7 +21,7 @@ expected = "Bootstrap verified Rust security tools script hash changed"
 [[case]]
 name = "windows-arm64-deny-missing"
 mutation = "windows-arm64-deny-missing"
-expected = "missing Check Windows ARM64 desktop dependency policy step"
+expected = "missing Check shipped desktop dependency policy step"
 
 [[case]]
 name = "supply-checkout-action-substitution"

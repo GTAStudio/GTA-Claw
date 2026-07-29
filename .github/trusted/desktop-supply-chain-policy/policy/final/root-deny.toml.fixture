@@ -1,5 +1,13 @@
 [graph]
 all-features = true
+targets = [
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "aarch64-unknown-linux-gnu" },
+  { triple = "x86_64-pc-windows-msvc" },
+  { triple = "aarch64-pc-windows-msvc" },
+  { triple = "x86_64-apple-darwin" },
+  { triple = "aarch64-apple-darwin" },
+]
 
 [advisories]
 ignore = []
@@ -12,21 +20,43 @@ confidence-threshold = 0.8
 multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
-# fastwebsockets 0.10 uses rand 0.8 solely for RFC 6455 client masking.
-# ring 0.17 pins windows-sys 0.52 for rustls cryptography internals.
+# fastwebsockets 0.10 remains on rand 0.8 while tungstenite 0.28 uses rand 0.9.
+[[bans.skip]]
+name = "getrandom"
+version = "=0.2.17"
+
+[[bans.skip]]
+name = "rand"
+version = "=0.8.7"
+
+[[bans.skip]]
+name = "rand_chacha"
+version = "=0.3.1"
+
 [[bans.skip]]
 name = "rand_core"
 version = "=0.6.4"
+
+[[bans.skip]]
+name = "rand_core"
+version = "=0.9.5"
+
+# tungstenite 0.28 has not moved from sha1 0.10 to the workspace's sha1 0.11.
+[[bans.skip]]
+name = "sha1"
+version = "=0.10.7"
 
 # Build dependencies straddle syn 2 and syn 3; syn is not linked into the runtime.
 [[bans.skip]]
 name = "syn"
 version = "=3.0.3"
 
+# ring 0.17 pins windows-sys 0.52 for rustls cryptography internals.
 [[bans.skip]]
 name = "windows-sys"
 version = "=0.52.0"
 
+# fastwebsockets remains on thiserror 1 while current workspace crates use 2.
 [[bans.skip]]
 name = "thiserror"
 version = "=1.0.69"

@@ -66,7 +66,43 @@ const LEGACY_TYPESCRIPT_CEILING: usize = 18;
 // moment the container itself leaves the inventory.
 const LEGACY_CONTAINER_RUNTIMES: &[&str] = &["Dockerfile"];
 const NODE_BASE_IMAGE_NAMES: &[&str] = &["node", "nodejs"];
-const ALLOWED_INERT_WORKFLOW_LINES: &[(&str, &str)] = &[
+const NODE_IMAGE: &str =
+    "node:26-bookworm-slim@sha256:2d49d876e96237d76de412761cf05dbfe5aee325cc4406a4d41d5824c5bb8beb";
+const ALLOWED_INSTALL_SCRIPTS: &[&str] = &["isolated-vm@7.0.0", "koffi@3.1.2"];
+const EXACT_NODE_ROOT_REQUIREMENTS: &[(&str, &str)] = &[
+    ("@github/copilot-sdk", "1.0.8"),
+    ("@types/bunyan", "1.8.11"),
+    ("@types/node", "26.1.2"),
+    ("@types/restify", "8.5.12"),
+    ("botbuilder", "4.23.3"),
+    ("isolated-vm", "7.0.0"),
+    ("pino", "10.3.1"),
+    ("restify", "11.1.0"),
+    ("ts-node", "10.9.2"),
+    ("typescript", "7.0.2"),
+    ("undici", "8.9.0"),
+    ("ws", "8.21.1"),
+];
+const DOCKER_WORKFLOW_ACTION_PINS: &[&str] = &[
+    "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+    "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f",
+    "docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9",
+    "docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051",
+];
+const SETUP_PYTHON_ACTION: &str = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065";
+const ALLOWED_LEGACY_WORKFLOW_LINES: &[(&str, &str)] = &[
+    (
+        ".github/workflows/docker-publish.yml",
+        "docker run --rm --entrypoint node \"$IMAGE_TAG\" --input-type=module -e '",
+    ),
+    (
+        ".github/workflows/docker-publish.yml",
+        "import { access } from \"node:fs/promises\";",
+    ),
+    (
+        ".github/workflows/docker-publish.yml",
+        "import { constants } from \"node:fs\";",
+    ),
     (
         ".github/workflows/macos-packaging.yml",
         "if grep -RInE '(^|[[:space:]])(npm|npx|node|bun|pnpm)([[:space:]]|$)' \\",
@@ -407,7 +443,74 @@ fn container_definitions_cannot_reintroduce_a_node_runtime() {
 #[test]
 fn an_inventoried_container_is_exempt_only_while_it_is_inventoried() {
     let fixture = TemporaryTree::new("container-exemption");
-    fixture.write("Dockerfile", b"FROM node:20\nRUN npm ci\n");
+    fixture.write(
+        "Dockerfile",
+        format!(
+            "FROM {NODE_IMAGE} AS builder\n\
+             COPY package.json package-lock.json ./\n\
+             RUN npm ci --ignore-scripts --no-audit --no-fund && \\\n\
+             npm rebuild --foreground-scripts isolated-vm@7.0.0 koffi@3.1.2\n\
+             FROM {NODE_IMAGE}\n\
+             COPY --from=builder /app/package.json /app/package-lock.json ./\n\
+             ENV NODE_ENV=\"production\"\n\
+             ENV COPILOT_CLI_PATH=\"/app/node_modules/.bin/copilot\"\n"
+        )
+        .as_bytes(),
+    );
+    fixture.write(
+        "package.json",
+        br#"{
+  "dependencies": {
+    "@github/copilot-sdk": "1.0.8",
+    "botbuilder": "4.23.3",
+    "pino": "10.3.1",
+    "restify": "11.1.0",
+    "undici": "8.9.0",
+    "ws": "8.21.1"
+  },
+  "optionalDependencies": {"isolated-vm": "7.0.0"},
+  "devDependencies": {
+    "@types/bunyan": "1.8.11",
+    "@types/node": "26.1.2",
+    "@types/restify": "8.5.12",
+    "ts-node": "10.9.2",
+    "typescript": "7.0.2"
+  },
+  "allowScripts": {
+    "isolated-vm@7.0.0": true,
+    "koffi@3.1.2": true,
+    "dtrace-provider": false
+  }
+}"#,
+    );
+    fixture.write(
+        "package-lock.json",
+        br#"{
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "dependencies": {
+        "@github/copilot-sdk": "1.0.8",
+        "botbuilder": "4.23.3",
+        "pino": "10.3.1",
+        "restify": "11.1.0",
+        "undici": "8.9.0",
+        "ws": "8.21.1"
+      },
+      "optionalDependencies": {"isolated-vm": "7.0.0"},
+      "devDependencies": {
+        "@types/bunyan": "1.8.11",
+        "@types/node": "26.1.2",
+        "@types/restify": "8.5.12",
+        "ts-node": "10.9.2",
+        "typescript": "7.0.2"
+      }
+    },
+    "node_modules/@github/copilot": {"version": "1.0.75"},
+    "node_modules/@github/copilot-sdk": {"version": "1.0.8"}
+  }
+}"#,
+    );
 
     assert!(
         LEGACY_CONTAINER_RUNTIMES
@@ -430,6 +533,218 @@ fn an_inventoried_container_is_exempt_only_while_it_is_inventoried() {
             "second/Dockerfile:1: node base image node"
         ]
     );
+}
+
+#[test]
+fn legacy_node_supply_chain_rejects_mutable_or_uncoupled_inputs() {
+    let root = workspace_root();
+    let package = fs::read_to_string(root.join("package.json")).expect("read package manifest");
+    let lock = fs::read_to_string(root.join("package-lock.json")).expect("read package lock");
+    let docker = fs::read_to_string(root.join("Dockerfile")).expect("read Dockerfile");
+    assert!(
+        legacy_node_supply_chain_violations(&package, &lock, &docker).is_empty(),
+        "repository Node supply-chain roots are not compliant"
+    );
+
+    for (label, mutated, expected) in [
+        (
+            "mutable base image",
+            docker.replacen(
+                &format!("{NODE_IMAGE} AS builder"),
+                "node:26-bookworm-slim AS builder",
+                1,
+            ),
+            "base image is not digest-pinned",
+        ),
+        (
+            "optional lock copy",
+            docker.replace(
+                "COPY package.json package-lock.json ./",
+                "COPY package.json package-lock.json* ./",
+            ),
+            "exact package roots",
+        ),
+        (
+            "mutable install",
+            docker.replace("npm ci --ignore-scripts", "npm install"),
+            "npm install is forbidden",
+        ),
+        (
+            "mutable command runner",
+            docker.replace("./node_modules/.bin/tsc", "npx tsc"),
+            "npx network fallback is forbidden",
+        ),
+        (
+            "remote installer",
+            format!("{docker}\nRUN curl -fsSL https://gh.io/copilot-install | bash\n"),
+            "remote Copilot installer",
+        ),
+    ] {
+        let violations = legacy_node_supply_chain_violations(&package, &lock, &mutated);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "{label} failed through the wrong rule: {violations:?}"
+        );
+    }
+
+    let mutable_package = package.replace(
+        "\"@github/copilot-sdk\": \"1.0.8\"",
+        "\"@github/copilot-sdk\": \"^1.0.8\"",
+    );
+    assert!(
+        legacy_node_supply_chain_violations(&mutable_package, &lock, &docker)
+            .iter()
+            .any(|violation| violation.contains("exact versions")),
+        "mutable package constraint unexpectedly passed"
+    );
+}
+
+#[test]
+fn legacy_runtime_updates_and_production_isolation_fail_closed() {
+    let root = workspace_root();
+    let config = fs::read_to_string(root.join("src/config.ts")).expect("read runtime config");
+    let executor =
+        fs::read_to_string(root.join("src/engine/toolExecutor.ts")).expect("read tool executor");
+    let updater =
+        fs::read_to_string(root.join("src/updater/sdkUpdater.ts")).expect("read SDK updater");
+    assert!(
+        legacy_runtime_source_violations(&config, &executor, &updater).is_empty(),
+        "legacy runtime update and isolation policy is not fail-closed"
+    );
+
+    for (label, config, executor, updater, expected) in [
+        (
+            "auto-update bypass",
+            config.replace("if (AUTO_UPDATE) {", "if (false) {"),
+            executor.clone(),
+            updater.clone(),
+            "AUTO_UPDATE=true must fail configuration",
+        ),
+        (
+            "production node:vm fallback",
+            config.clone(),
+            executor.replace(
+                "if (nodeEnvironment === \"production\")",
+                "if (nodeEnvironment === \"disabled-production\")",
+            ),
+            updater.clone(),
+            "production must reject reduced node:vm isolation",
+        ),
+        (
+            "mutable updater",
+            config.clone(),
+            executor.clone(),
+            format!("{updater}\nconst removedInstaller = \"gh.io/copilot-install\";\n"),
+            "mutable runtime update logic is forbidden",
+        ),
+    ] {
+        let violations = legacy_runtime_source_violations(&config, &executor, &updater);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "{label} failed through the wrong rule: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn python_compatibility_policy_is_interpreter_and_hash_locked() {
+    let root = workspace_root();
+    let workflow =
+        fs::read_to_string(root.join(".github/workflows/rust.yml")).expect("read Rust workflow");
+    let requirements = fs::read_to_string(root.join("compat/legacy/scripts/requirements.txt"))
+        .expect("read Python requirements");
+    assert!(
+        python_supply_chain_violations(&workflow, &requirements).is_empty(),
+        "Python compatibility policy is not fully locked"
+    );
+    let (_, remaining_requirements) = requirements
+        .split_once("\njsonschema==")
+        .expect("requirements contain the locked jsonschema entry");
+    let unhashed_requirements = format!("attrs==26.1.0 \\\njsonschema=={remaining_requirements}");
+
+    for (label, workflow, requirements, expected) in [
+        (
+            "mutable setup action",
+            workflow.replace(SETUP_PYTHON_ACTION, "actions/setup-python@v6"),
+            requirements.clone(),
+            "setup-python action is not pinned",
+        ),
+        (
+            "unhashed install",
+            workflow.replace("            --require-hashes \\\n", ""),
+            requirements.clone(),
+            "pip install does not require hashes",
+        ),
+        (
+            "unhashed requirement",
+            workflow.clone(),
+            unhashed_requirements,
+            "requirement entry has no SHA-256 hash",
+        ),
+    ] {
+        let violations = python_supply_chain_violations(&workflow, &requirements);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "{label} failed through the wrong rule: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn docker_publish_builds_validates_and_pushes_one_image() {
+    let workflow =
+        fs::read_to_string(workspace_root().join(".github/workflows/docker-publish.yml"))
+            .expect("read Docker publish workflow");
+    assert!(
+        docker_publish_violations(&workflow).is_empty(),
+        "Docker publish workflow violates the build-once contract"
+    );
+
+    for (label, mutated, expected) in [
+        (
+            "mutable action",
+            workflow.replace(
+                DOCKER_WORKFLOW_ACTION_PINS[1],
+                "docker/setup-buildx-action@v3",
+            ),
+            "Docker workflow action pin changed",
+        ),
+        (
+            "missing pull request build",
+            workflow.replacen("  pull_request:\n", "", 1),
+            "secret-free pull request build is missing",
+        ),
+        (
+            "second image build",
+            workflow.replace(
+                "docker buildx build \\",
+                "docker buildx build \\\n          docker buildx build \\",
+            ),
+            "Docker publish workflow must build exactly once",
+        ),
+        (
+            "broken digest parser",
+            workflow.replace(
+                "for (i = 1; i <= NF; i++) if ($i ~ /^sha256:/) print $i",
+                "print $2",
+            ),
+            "Docker publish digest parser changed",
+        ),
+    ] {
+        let violations = docker_publish_violations(&mutated);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "{label} failed through the wrong rule: {violations:?}"
+        );
+    }
 }
 
 #[test]
@@ -652,6 +967,14 @@ fn scan_containers(root: &Path) -> io::Result<Vec<String>> {
     for path in container_files {
         let relative = normalized_relative(root, &path);
         if LEGACY_CONTAINER_RUNTIMES.contains(&relative.as_str()) {
+            let package = fs::read_to_string(root.join("package.json"))?;
+            let lock = fs::read_to_string(root.join("package-lock.json"))?;
+            let docker = fs::read_to_string(path)?;
+            violations.extend(
+                legacy_node_supply_chain_violations(&package, &lock, &docker)
+                    .into_iter()
+                    .map(|violation| format!("{relative}: {violation}")),
+            );
             continue;
         }
         let document = fs::read_to_string(path)?;
@@ -659,6 +982,250 @@ fn scan_containers(root: &Path) -> io::Result<Vec<String>> {
     }
     violations.sort();
     Ok(violations)
+}
+
+fn legacy_node_supply_chain_violations(
+    package_json: &str,
+    package_lock: &str,
+    dockerfile: &str,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    if package_json.contains("\": \"^") || package_json.contains("\": \"~") {
+        violations.push("package.json direct dependencies must use exact versions".to_owned());
+    }
+    for (name, version) in EXACT_NODE_ROOT_REQUIREMENTS {
+        let exact = format!("\"{name}\": \"{version}\"");
+        if !package_json.contains(&exact) {
+            violations.push(format!(
+                "package.json direct dependencies must use exact versions: {exact}"
+            ));
+        }
+        if !package_lock.contains(&exact) {
+            violations.push(format!(
+                "package-lock.json does not bind direct requirement: {exact}"
+            ));
+        }
+    }
+    for required in [
+        "\"isolated-vm@7.0.0\": true",
+        "\"koffi@3.1.2\": true",
+        "\"dtrace-provider\": false",
+    ] {
+        if !package_json.contains(required) {
+            violations.push(format!("package.json is missing install policy {required}"));
+        }
+    }
+    for required in [
+        "\"lockfileVersion\": 3",
+        "\"@github/copilot-sdk\": \"1.0.8\"",
+        "\"node_modules/@github/copilot\": {",
+        "\"version\": \"1.0.75\"",
+        "\"node_modules/@github/copilot-sdk\": {",
+    ] {
+        if !package_lock.contains(required) {
+            violations.push(format!(
+                "package-lock.json is missing locked input {required}"
+            ));
+        }
+    }
+
+    let from_lines = dockerfile
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.to_ascii_lowercase().starts_with("from "))
+        .collect::<Vec<_>>();
+    if from_lines.len() != 2
+        || from_lines.iter().any(|line| {
+            !line
+                .split_ascii_whitespace()
+                .any(|token| token == NODE_IMAGE)
+        })
+    {
+        violations.push("Dockerfile base image is not digest-pinned exactly".to_owned());
+    }
+    for required in [
+        "COPY package.json package-lock.json ./",
+        "COPY --from=builder /app/package.json /app/package-lock.json ./",
+        "npm ci --ignore-scripts --no-audit --no-fund",
+        "npm rebuild --foreground-scripts isolated-vm@7.0.0 koffi@3.1.2",
+        "ENV NODE_ENV=\"production\"",
+        "ENV COPILOT_CLI_PATH=\"/app/node_modules/.bin/copilot\"",
+    ] {
+        if !dockerfile.contains(required) {
+            violations.push(format!(
+                "Dockerfile does not couple exact package roots: {required}"
+            ));
+        }
+    }
+    for forbidden in [
+        "npm install",
+        "npx ",
+        "package-lock.json*",
+        "gh.io/copilot-install",
+    ] {
+        if dockerfile.contains(forbidden) {
+            let label = if forbidden == "npm install" {
+                "npm install is forbidden"
+            } else if forbidden == "npx " {
+                "npx network fallback is forbidden"
+            } else if forbidden == "gh.io/copilot-install" {
+                "remote Copilot installer is forbidden"
+            } else {
+                "optional package lock copy is forbidden"
+            };
+            violations.push(label.to_owned());
+        }
+    }
+    let rebuild = format!(
+        "npm rebuild --foreground-scripts {}",
+        ALLOWED_INSTALL_SCRIPTS.join(" ")
+    );
+    if !dockerfile.contains(&rebuild) {
+        violations.push("Dockerfile install-script allowlist changed".to_owned());
+    }
+    violations.sort();
+    violations
+}
+
+fn legacy_runtime_source_violations(config: &str, executor: &str, updater: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    for required in [
+        "if (AUTO_UPDATE) {",
+        "AUTO_UPDATE is unsupported: update package.json and package-lock.json through review",
+    ] {
+        if !config.contains(required) {
+            violations.push(format!(
+                "AUTO_UPDATE=true must fail configuration: missing {required}"
+            ));
+        }
+    }
+    for required in [
+        "if (nodeEnvironment === \"production\")",
+        "isolated-vm is required in production; node:vm provides reduced isolation and is development-only",
+    ] {
+        if !executor.contains(required) {
+            violations.push(format!(
+                "production must reject reduced node:vm isolation: missing {required}"
+            ));
+        }
+    }
+    if !updater.contains("export async function checkForUpdates(): Promise<VersionInfo>")
+        || [
+            "performSdkUpdate",
+            "performCliUpdate",
+            "gh.io/copilot-install",
+            "[\"update\", \"@github/copilot-sdk\"]",
+        ]
+        .iter()
+        .any(|forbidden| updater.contains(forbidden))
+    {
+        violations.push("mutable runtime update logic is forbidden".to_owned());
+    }
+    violations.sort();
+    violations
+}
+
+fn python_supply_chain_violations(workflow: &str, requirements: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let setup_python_use = format!("uses: {SETUP_PYTHON_ACTION}");
+    for required in [
+        setup_python_use.as_str(),
+        "python-version: \"3.13.5\"",
+        "python3 -m pip install",
+        "--require-hashes",
+        "--requirement compat/legacy/scripts/requirements.txt",
+        "python3 compat/legacy/scripts/validate.py",
+    ] {
+        if !workflow.contains(required) {
+            let label = if required.starts_with("uses:") {
+                "setup-python action is not pinned"
+            } else if required == "--require-hashes" {
+                "pip install does not require hashes"
+            } else {
+                "Python workflow invocation is not exact"
+            };
+            violations.push(format!("{label}: {required}"));
+        }
+    }
+
+    let mut current_requirement = None;
+    let mut current_has_hash = false;
+    for line in requirements.lines().filter(|line| !line.trim().is_empty()) {
+        if line.starts_with(char::is_whitespace) {
+            if line
+                .trim()
+                .strip_prefix("--hash=sha256:")
+                .is_some_and(|hash| {
+                    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            {
+                current_has_hash = true;
+            }
+            continue;
+        }
+        if let Some(previous) = current_requirement.replace(line) {
+            if !current_has_hash {
+                violations.push(format!("requirement entry has no SHA-256 hash: {previous}"));
+            }
+        }
+        current_has_hash = false;
+        if !line.contains("==") {
+            violations.push(format!("Python requirement is not exact: {line}"));
+        }
+    }
+    if let Some(previous) = current_requirement {
+        if !current_has_hash {
+            violations.push(format!("requirement entry has no SHA-256 hash: {previous}"));
+        }
+    }
+    violations.sort();
+    violations
+}
+
+fn docker_publish_violations(workflow: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    if !workflow.contains("on:\n  pull_request:\n") {
+        violations.push("Docker secret-free pull request build is missing".to_owned());
+    }
+    for pin in DOCKER_WORKFLOW_ACTION_PINS {
+        if !workflow.contains(&format!("uses: {pin}")) {
+            violations.push(format!("Docker workflow action pin changed: {pin}"));
+        }
+    }
+    let docker_action_count = workflow
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("uses: docker/"))
+        .count();
+    if docker_action_count != 3 || workflow.contains("docker/build-push-action@") {
+        violations.push("Docker workflow action set changed".to_owned());
+    }
+    if workflow.matches("docker buildx build \\").count() != 1 {
+        violations.push("Docker publish workflow must build exactly once".to_owned());
+    }
+    for required in [
+        "- name: Validate exact built image",
+        "EXPECTED_IMAGE_ID: ${{ steps.build.outputs.image-id }}",
+        "test \"$(docker image inspect --format '{{.Id}}' \"$IMAGE_TAG\")\" = \"$EXPECTED_IMAGE_ID\"",
+        "await access(\"/app/package-lock.json\", constants.R_OK);",
+        "await access(process.env.COPILOT_CLI_PATH, constants.X_OK);",
+        "selectIsolationMode(false, \"production\")",
+        "- name: Log in to Docker Hub\n        if: github.event_name != 'pull_request'",
+        "- name: Push the validated image digest\n        if: github.event_name != 'pull_request'",
+        "for (i = 1; i <= NF; i++) if ($i ~ /^sha256:/) print $i",
+        "test \"$digest\" = \"$pushed_digest\"",
+    ] {
+        if !workflow.contains(required) {
+            let label = if required.contains("for (i = 1") {
+                "Docker publish digest parser changed"
+            } else {
+                "Docker build/validate/push coupling changed"
+            };
+            violations.push(format!("{label}: {required}"));
+        }
+    }
+    violations.sort();
+    violations
 }
 
 fn collect_container_files(directory: &Path, container_files: &mut Vec<PathBuf>) -> io::Result<()> {
@@ -754,7 +1321,7 @@ fn base_image_reference(line: &str) -> Option<String> {
 fn scan_policy_document(path: &str, document: &str, violations: &mut Vec<String>) {
     for (line_index, line) in document.lines().enumerate() {
         let trimmed = line.trim();
-        if ALLOWED_INERT_WORKFLOW_LINES
+        if ALLOWED_LEGACY_WORKFLOW_LINES
             .iter()
             .any(|(allowed_path, allowed_line)| path == *allowed_path && trimmed == *allowed_line)
         {

@@ -151,12 +151,12 @@ pub fn mutate_negative_case(
             let before = steps.len();
             steps.retain(|step| {
                 yaml_string(yaml_get(step, "name"))
-                    != Some("Check Windows ARM64 desktop dependency policy")
+                    != Some("Check shipped desktop dependency policy")
             });
             assert_eq!(
                 before - steps.len(),
                 1,
-                "remove exactly one ARM64 deny step"
+                "remove exactly one shipped-target deny step"
             );
         }
         "supply-checkout-action-substitution" => {
@@ -461,14 +461,14 @@ pub fn mutate_negative_case(
             let step = step_by_name_mut(
                 workflow,
                 "supply-chain",
-                "Check Windows x64 desktop dependency policy",
+                "Check shipped desktop dependency policy",
             )
-            .expect("Windows x64 deny step");
+            .expect("shipped-target deny step");
             let run = yaml_string(yaml_get(step, "run"))
-                .expect("Windows x64 deny command")
+                .expect("shipped-target deny command")
                 .replace(" --locked", "");
             yaml_mapping_mut(step)
-                .expect("Windows x64 deny mapping")
+                .expect("shipped-target deny mapping")
                 .insert(yaml_key("run"), YamlValue::String(run));
         }
         "deny-advisory-ignore" => {

@@ -180,8 +180,8 @@ PY
   PATH="/usr/bin:/bin" \
   RUSTC="$rustc_bin" \
   /usr/bin/timeout 180 "$deny_bin" \
-  --manifest-path "$manifest" --locked --all-features \
-  check --config "$deny_config" advisories bans licenses sources
+  --manifest-path "$manifest" --config "$deny_config" \
+  --locked --all-features check advisories bans licenses sources
 
 /usr/bin/env -i \
   HOME="$tool_root/home" \

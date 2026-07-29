@@ -10,22 +10,22 @@
     "dev": "node --no-node-snapshot --loader ts-node/esm src/index.ts"
   },
   "dependencies": {
-    "@github/copilot-sdk": "^1.0.8",
-    "botbuilder": "^4.23.3",
-    "pino": "^10.3.1",
-    "restify": "^11.1.0",
-    "undici": "^8.9.0",
-    "ws": "^8.21.1"
+    "@github/copilot-sdk": "1.0.8",
+    "botbuilder": "4.23.3",
+    "pino": "10.3.1",
+    "restify": "11.1.0",
+    "undici": "8.9.0",
+    "ws": "8.21.1"
   },
   "optionalDependencies": {
-    "isolated-vm": "^7.0.0"
+    "isolated-vm": "7.0.0"
   },
   "devDependencies": {
-    "@types/bunyan": "^1.8.11",
-    "@types/node": "^26.1.2",
-    "@types/restify": "^8.5.12",
-    "ts-node": "^10.9.2",
-    "typescript": "^7.0.2"
+    "@types/bunyan": "1.8.11",
+    "@types/node": "26.1.2",
+    "@types/restify": "8.5.12",
+    "ts-node": "10.9.2",
+    "typescript": "7.0.2"
   },
   "overrides": {
     "find-my-way": "8.2.2",

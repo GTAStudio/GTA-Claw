@@ -70,7 +70,7 @@ async function getLatestCliVersion(): Promise<string> {
   }
 }
 
-export async function checkForUpdates(autoUpdate = false): Promise<VersionInfo> {
+export async function checkForUpdates(): Promise<VersionInfo> {
   logger.info("Checking for SDK/CLI updates...");
 
   const [sdkInstalled, sdkLatest, cliInstalled, cliLatest] = await Promise.all([
@@ -120,49 +120,5 @@ export async function checkForUpdates(autoUpdate = false): Promise<VersionInfo> 
     );
   }
 
-  // Auto-update if enabled
-  if (autoUpdate) {
-    if (info.sdk.updateAvailable) {
-      await performSdkUpdate();
-    }
-    if (info.cli.updateAvailable) {
-      await performCliUpdate();
-    }
-  }
-
   return info;
-}
-
-async function performSdkUpdate(): Promise<void> {
-  logger.info("Auto-updating @github/copilot-sdk...");
-  try {
-    const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
-    await execFileAsync(npmCmd, ["update", "@github/copilot-sdk"], {
-      timeout: 120_000,
-    });
-    logger.info("SDK updated successfully");
-  } catch (err) {
-    logger.error({ err }, "SDK auto-update failed");
-  }
-}
-
-async function performCliUpdate(): Promise<void> {
-  logger.info("Auto-updating Copilot CLI...");
-  if (process.platform === "win32") {
-    logger.warn(
-      "CLI auto-update is skipped on Windows hosts; use deploy.sh --update in Linux container",
-    );
-    return;
-  }
-
-  try {
-    await execFileAsync(
-      "sh",
-      ["-c", "curl -fsSL https://gh.io/copilot-install | PREFIX=/usr/local bash"],
-      { timeout: 120_000 },
-    );
-    logger.info("CLI updated successfully");
-  } catch (err) {
-    logger.error({ err }, "CLI auto-update failed");
-  }
 }
