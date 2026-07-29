@@ -298,6 +298,7 @@ name = "claw-config"
 version = "0.1.0"
 dependencies = [
  "json5",
+ "libc",
  "schemars 1.2.2",
  "serde",
  "serde_json",
@@ -469,6 +470,7 @@ name = "claw-migrate"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.11.0",

@@ -282,18 +282,56 @@ impl DestinationLock {
     fn acquire(destination: &Path) -> io::Result<Self> {
         let lock_path = Self::path(destination);
         reject_lock_link_or_reparse(&lock_path)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
+        let file = open_destination_lock_file(&lock_path)?;
         file.lock()?;
         file.sync_all()?;
         sync_parent(&lock_path)?;
         reject_lock_link_or_reparse(&lock_path)?;
+        if !lock_file_matches_path(&file, &lock_path)? {
+            return Err(unsafe_path(
+                "destination lock identity changed during acquisition",
+            ));
+        }
         Ok(Self { file })
     }
+}
+
+#[cfg(unix)]
+fn open_destination_lock_file(lock_path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(lock_path)
+}
+
+#[cfg(not(unix))]
+fn open_destination_lock_file(lock_path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+}
+
+#[cfg(unix)]
+fn lock_file_matches_path(file: &File, lock_path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let handle = file.metadata()?;
+    let on_disk = fs::symlink_metadata(lock_path)?;
+    Ok(on_disk.is_file() && handle.dev() == on_disk.dev() && handle.ino() == on_disk.ino())
+}
+
+#[cfg(not(unix))]
+fn lock_file_matches_path(_file: &File, _lock_path: &Path) -> io::Result<bool> {
+    Ok(true)
 }
 
 impl Drop for DestinationLock {

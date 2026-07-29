@@ -1104,12 +1104,18 @@ fn reserve_publish_path(target: &Path, label: &str) -> Result<PathBuf, Migration
             std::process::id(),
             sequence
         ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        match reserve_path_candidate(&candidate) {
             Ok(file) => {
+                if !reserved_candidate_matches(&file, &candidate)? {
+                    return Err(MigrationError::Io {
+                        action: "reserve temporary publication path",
+                        path: candidate,
+                        source: io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "temporary publication path identity changed during reservation",
+                        ),
+                    });
+                }
                 drop(file);
                 return Ok(candidate);
             }
@@ -1131,6 +1137,44 @@ fn reserve_publish_path(target: &Path, label: &str) -> Result<PathBuf, Migration
             "could not allocate a unique migration publication path",
         ),
     })
+}
+
+#[cfg(unix)]
+fn reserve_path_candidate(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn reserve_path_candidate(path: &Path) -> io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+#[cfg(unix)]
+fn reserved_candidate_matches(file: &File, path: &Path) -> Result<bool, MigrationError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let handle = file.metadata().map_err(|source| MigrationError::Io {
+        action: "inspect reserved publication path",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let on_disk = fs::symlink_metadata(path).map_err(|source| MigrationError::Io {
+        action: "inspect reserved publication path",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(on_disk.is_file() && handle.dev() == on_disk.dev() && handle.ino() == on_disk.ino())
+}
+
+#[cfg(not(unix))]
+fn reserved_candidate_matches(_file: &File, _path: &Path) -> Result<bool, MigrationError> {
+    Ok(true)
 }
 
 fn publish_staged_path(

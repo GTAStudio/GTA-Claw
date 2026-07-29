@@ -526,6 +526,17 @@ fn explicit_claude_source_file_is_authoritative_and_migrates_in_isolation() {
         &root.join("home").join(".claude").join("settings.json"),
         r#"{"env":{"CLAUDE_ENV_SECRET":"ignored-default"}}"#,
     );
+    write(
+        &root.join("home").join(".claude.json"),
+        r#"{"mcpServers":{"ambient":{"command":"ambient-source","env":{"TOKEN":"ambient-user-secret"}}}}"#,
+    );
+    write(
+        &root
+            .join("config")
+            .join("Claude")
+            .join("claude_desktop_config.json"),
+        r#"{"mcpServers":{"desktop":{"command":"ambient-desktop","env":{"TOKEN":"ambient-desktop-secret"}}}}"#,
+    );
     let platform_paths = paths(&root, HostPlatform::Linux);
     let signer = signer();
 
@@ -558,10 +569,74 @@ fn explicit_claude_source_file_is_authoritative_and_migrates_in_isolation() {
             .join("claude-desktop.json"),
     );
     assert!(migrated.contains("\"docs-server\""));
+    assert!(!migrated.contains("ambient-source"));
+    assert!(!migrated.contains("ambient-desktop"));
     assert!(migrated.contains("keyring://gta-claw/"));
     assert!(!migrated.contains("explicit-plaintext"));
     assert_eq!(secrets.values.len(), 1);
     assert!(!secrets.holds("ignored-default"));
+    assert!(!secrets.holds("ambient-user-secret"));
+    assert!(!secrets.holds("ambient-desktop-secret"));
+}
+
+#[test]
+fn explicit_claude_source_directory_ignores_ambient_user_and_desktop_roots() {
+    let root = TestDir::new("claude-explicit-directory");
+    let target = root.join("target");
+    let explicit = root.join("isolated-home").join(".claude");
+    write(
+        &explicit.join("settings.json"),
+        r#"{"env":{"CLAUDE_ENV_SECRET":"isolated-secret"}}"#,
+    );
+    write(
+        &root.join("home").join(".claude.json"),
+        r#"{"mcpServers":{"ambient":{"command":"must-not-migrate","env":{"TOKEN":"ambient-user-secret"}}}}"#,
+    );
+    write(
+        &root
+            .join("config")
+            .join("Claude")
+            .join("claude_desktop_config.json"),
+        r#"{"mcpServers":{"desktop":{"command":"must-not-migrate-desktop","env":{"TOKEN":"ambient-desktop-secret"}}}}"#,
+    );
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+
+    let plan = ClaudeMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&explicit),
+            target_root: &target,
+            overwrite: false,
+            signer: &signer,
+        })
+        .expect("plan explicit Claude source directory");
+    assert_eq!(plan.result.status, MigrationStatus::Migrated);
+
+    let mut secrets = MemorySecretStore::default();
+    let mut apply = ApplyContext {
+        target_root: &target,
+        backup_root: &root.join("backup"),
+        overwrite: false,
+        secret_store: &mut secrets,
+    };
+    ClaudeMigrationProvider
+        .apply(&mut apply, &plan)
+        .expect("apply explicit directory migration");
+
+    let settings = read(
+        &target
+            .join("config")
+            .join("migrations")
+            .join("claude")
+            .join("settings.json"),
+    );
+    assert!(settings.contains("keyring://gta-claw/"));
+    assert!(!settings.contains("must-not-migrate"));
+    assert!(!settings.contains("must-not-migrate-desktop"));
+    assert!(secrets.holds("isolated-secret"));
+    assert!(!secrets.holds("ambient-user-secret"));
+    assert!(!secrets.holds("ambient-desktop-secret"));
 }
 
 #[test]
