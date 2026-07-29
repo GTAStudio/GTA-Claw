@@ -34,9 +34,16 @@ struct Harness {
 }
 
 fn harness(rounds: Vec<Round>, config: RuntimeConfig) -> Harness {
+    harness_with_goals(rounds, config, &MemoryGoals::new())
+}
+
+fn harness_with_goals(
+    rounds: Vec<Round>,
+    config: RuntimeConfig,
+    goals: &Arc<MemoryGoals>,
+) -> Harness {
     let clock = FakeClock::new(1_000);
     let state = MemoryState::new();
-    let goals = MemoryGoals::new();
     let approvals = RecordingApprovals::new();
     let context = SimpleContext::new();
     let provider = ScriptedProvider::new(rounds);
@@ -67,7 +74,7 @@ fn harness(rounds: Vec<Round>, config: RuntimeConfig) -> Harness {
             state: Arc::clone(&state) as Arc<_>,
             tools: Arc::clone(&tools) as Arc<_>,
             approvals: Arc::clone(&approvals) as Arc<_>,
-            goals: Arc::clone(&goals) as Arc<_>,
+            goals: Arc::clone(goals) as Arc<_>,
             context: Arc::clone(&context) as Arc<_>,
         },
         config,
@@ -82,6 +89,55 @@ fn harness(rounds: Vec<Round>, config: RuntimeConfig) -> Harness {
         context,
         provider,
     }
+}
+
+#[tokio::test]
+async fn committed_but_not_durable_goal_tool_failure_aborts_without_model_retry() {
+    let goals = MemoryGoals::new();
+    goals.refuse_saves_with(PortError::CommittedButNotDurable(
+        "record committed; do not retry blindly".to_owned(),
+    ));
+    let harness = harness_with_goals(
+        vec![
+            tool_round(
+                "goal-1",
+                "update_goal",
+                r#"{"action":"set","objective":"ship safely"}"#,
+            ),
+            text_round("would be an unsafe retry"),
+        ],
+        RuntimeConfig::default(),
+        &goals,
+    );
+    let session_id = session("goal-durability-failure");
+
+    let mut handle = harness
+        .runtime
+        .submit(&session_id, "set the goal")
+        .await
+        .expect("turn accepted");
+    while handle.next_event().await.is_some() {}
+    let error = handle
+        .join()
+        .await
+        .expect_err("degraded durability aborts the model loop");
+
+    assert!(matches!(
+        &error,
+        RuntimeError::Goal(claw_runtime::GoalError::Port(
+            PortError::CommittedButNotDurable(_)
+        ))
+    ));
+    assert_eq!(
+        error.failure_class(),
+        RuntimeFailureClass::CommittedButNotDurable
+    );
+    assert!(!error.is_retryable());
+    assert_eq!(
+        harness.provider.requests().len(),
+        1,
+        "the provider is not invited to retry the committed mutation"
+    );
 }
 
 fn states(events: &[RuntimeEventKind]) -> Vec<SessionState> {
@@ -110,6 +166,7 @@ async fn a_text_only_turn_walks_the_contract_to_completed() {
         assert_eq!(event.session_id.as_str(), "lifecycle-text");
         kinds.push(event.kind);
     }
+
     let outcome = handle.join().await.expect("the turn finishes");
 
     assert_eq!(
@@ -139,6 +196,91 @@ async fn a_text_only_turn_walks_the_contract_to_completed() {
 
     harness.runtime.shutdown().await.expect("shutdown is clean");
     assert_eq!(harness.runtime.tracked_tasks(), 0);
+}
+
+#[tokio::test]
+async fn goal_context_has_exactly_one_active_statement_across_replace_and_close() {
+    let harness = harness(
+        vec![
+            text_round("first turn"),
+            text_round("second turn"),
+            text_round("third turn"),
+        ],
+        RuntimeConfig::default(),
+    );
+    let session_id = session("goal-context-lifecycle");
+
+    let first = harness
+        .runtime
+        .goals()
+        .start(&session_id, "first objective")
+        .await
+        .expect("first goal");
+    let mut turn = harness
+        .runtime
+        .submit(&session_id, "one")
+        .await
+        .expect("first turn");
+    while turn.next_event().await.is_some() {}
+    turn.join().await.expect("first turn completes");
+
+    harness
+        .runtime
+        .goals()
+        .start(&session_id, "replacement objective")
+        .await
+        .expect("replacement goal");
+    let mut turn = harness
+        .runtime
+        .submit(&session_id, "two")
+        .await
+        .expect("second turn");
+    while turn.next_event().await.is_some() {}
+    turn.join().await.expect("second turn completes");
+    let items = harness.context.items();
+    let statements: Vec<&ContextItem> = items
+        .iter()
+        .filter(|item| matches!(item, ContextItem::GoalStatement { .. }))
+        .collect();
+    assert_eq!(statements.len(), 1);
+    assert_eq!(
+        statements[0],
+        &ContextItem::GoalStatement {
+            objective: "replacement objective".to_owned()
+        }
+    );
+
+    let active = harness
+        .runtime
+        .goals()
+        .active(&session_id)
+        .await
+        .expect("goal store")
+        .expect("active goal");
+    assert_ne!(active.goal_id, first.goal_id);
+    harness
+        .runtime
+        .goals()
+        .close(
+            &active.goal_id,
+            claw_application::model::goal::GoalStatus::Achieved,
+        )
+        .await
+        .expect("goal closes");
+    let mut turn = harness
+        .runtime
+        .submit(&session_id, "three")
+        .await
+        .expect("third turn");
+    while turn.next_event().await.is_some() {}
+    turn.join().await.expect("third turn completes");
+    assert!(
+        harness
+            .context
+            .items()
+            .iter()
+            .all(|item| !matches!(item, ContextItem::GoalStatement { .. }))
+    );
 }
 
 #[tokio::test]

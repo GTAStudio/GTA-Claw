@@ -33,6 +33,7 @@ struct ScriptedRuntime {
     snapshot: Arc<Mutex<LegacyRuntimeSnapshot>>,
     reply: Arc<Mutex<String>>,
     fail_chat: Arc<AtomicBool>,
+    degrade_chat_durability: Arc<AtomicBool>,
     chats: Arc<Mutex<Vec<(String, String)>>>,
 }
 
@@ -42,6 +43,7 @@ impl ScriptedRuntime {
             snapshot: Arc::new(Mutex::new(snapshot)),
             reply: Arc::new(Mutex::new("Hello.".to_owned())),
             fail_chat: Arc::new(AtomicBool::new(false)),
+            degrade_chat_durability: Arc::new(AtomicBool::new(false)),
             chats: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -71,6 +73,7 @@ impl LegacyRuntimePort for ScriptedRuntime {
             .expect("chat log")
             .push((conversation_id, message));
         let fail = self.fail_chat.load(Ordering::Acquire);
+        let degraded_durability = self.degrade_chat_durability.load(Ordering::Acquire);
         let reply = self.reply.lock().expect("reply lock").clone();
         Box::pin(async move {
             if cancellation.is_cancelled() {
@@ -78,6 +81,11 @@ impl LegacyRuntimePort for ScriptedRuntime {
             }
             if fail {
                 Err(PortError::new(PortErrorKind::Internal, "scripted failure"))
+            } else if degraded_durability {
+                Err(PortError::new(
+                    PortErrorKind::CommittedButNotDurable,
+                    "State may already be committed; durability is unconfirmed. Do not retry.",
+                ))
             } else {
                 Ok(reply)
             }
@@ -443,6 +451,29 @@ async fn legacy_root_device_chat_and_health_match_frozen_shapes() {
     assert_eq!(
         token_mode.json(),
         frozen_response("chat", "unauthenticated-token-mode")
+    );
+}
+
+#[tokio::test]
+async fn legacy_chat_preserves_committed_but_not_durable_outcome() {
+    let fixtures = Fixtures::new(true);
+    fixtures
+        .runtime
+        .degrade_chat_durability
+        .store(true, Ordering::Release);
+    let server = spawn(LegacyApiConfig::default(), fixtures.services()).await;
+
+    let response = json_request(&server, "/chat", None, &json!({"message":"set goal"})).await;
+
+    assert_eq!(response.status, 409);
+    assert_eq!(
+        response.json(),
+        json!({
+            "error":"State may already be committed; durability is unconfirmed. Do not retry.",
+            "type":"committed_but_not_durable",
+            "retryable":false,
+            "stateMayAlreadyBeCommitted":true
+        })
     );
 }
 

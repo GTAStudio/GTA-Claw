@@ -11,6 +11,12 @@ use claw_application::model::goal::GoalStatus;
 use claw_goals::invoke_goal_tool;
 use claw_goals::testing::{TempRoot, block_on, open_durable, session_id};
 
+#[allow(dead_code)]
+#[derive(serde::Deserialize)]
+struct LegacyReader {
+    goal_ids: Vec<String>,
+}
+
 /// Runs the goal writer in a separate OS process and returns what it printed.
 fn write_in_another_process(root: &TempRoot, session: &str, clock: u64, action: &str, value: &str) {
     let output = Command::new(env!("CARGO_BIN_EXE_claw-goal-writer"))
@@ -255,6 +261,75 @@ fn an_index_naming_a_vanished_record_is_pruned_instead_of_failing_every_read() {
     let history = block_on(durable.service.history(&session)).expect("the store answers");
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].objective, "second");
+    let third = block_on(durable.service.start(&session, "third")).expect("set");
+    assert_eq!(
+        third.goal_id.as_str(),
+        "dangling:goal-3",
+        "pruning a lost record must not rewind the durable high-water mark"
+    );
+}
+
+#[test]
+fn a_legacy_index_migrates_its_high_water_before_record_loss_and_restart() {
+    let root = TempRoot::new("restart-high-water-migration");
+    let session = session_id("migrate");
+    {
+        let durable = open_durable(root.path(), 1_000);
+        block_on(durable.service.start(&session, "first")).expect("set");
+        block_on(durable.service.start(&session, "second")).expect("set");
+    }
+
+    let index_path = std::fs::read_dir(root.path().join("sessions"))
+        .expect("sessions directory")
+        .map(|entry| entry.expect("readable").path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .expect("session index");
+    let index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&index_path).expect("index reads"))
+            .expect("index JSON");
+    let legacy = serde_json::json!({
+        "schema": 1,
+        "session_id": "migrate",
+        "goal_ids": index["goal_ids"]["entries"].clone(),
+    });
+    std::fs::write(
+        &index_path,
+        serde_json::to_string_pretty(&legacy).expect("index encodes"),
+    )
+    .expect("legacy fixture writes");
+
+    {
+        let migrated = open_durable(root.path(), 50_000);
+        assert!(migrated.store.recovery().is_clean());
+    }
+    let migrated_text = std::fs::read_to_string(&index_path).expect("migrated index reads");
+    let migrated: serde_json::Value =
+        serde_json::from_str(&migrated_text).expect("migrated index JSON");
+    assert_eq!(migrated["schema"], 2);
+    assert_eq!(migrated["goal_ids"]["high_water"], 2);
+    assert!(
+        serde_json::from_str::<LegacyReader>(&migrated_text).is_err(),
+        "the durable index shape fences readers that would ignore the high-water mark"
+    );
+
+    let second_record = std::fs::read_dir(root.path().join("goals"))
+        .expect("goals directory")
+        .map(|entry| entry.expect("readable").path())
+        .find(|path| {
+            std::fs::read_to_string(path)
+                .expect("record reads")
+                .contains("migrate:goal-2")
+        })
+        .expect("second record");
+    std::fs::remove_file(second_record).expect("record loss injected");
+
+    let reopened = open_durable(root.path(), 100_000);
+    assert_eq!(reopened.store.recovery().pruned_dangling, 1);
+    let third = block_on(reopened.service.start(&session, "third")).expect("set");
+    assert_eq!(third.goal_id.as_str(), "migrate:goal-3");
 }
 
 #[test]

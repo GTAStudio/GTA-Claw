@@ -223,6 +223,8 @@ pub enum RuntimeFailureClass {
     NotFound,
     /// Caller input or a provider stream violated a contract.
     InvalidRequest,
+    /// The mutation committed, but its publication is not proven power-loss durable.
+    CommittedButNotDurable,
     /// The caller or host cancelled the work.
     Cancelled,
     /// An internal runtime invariant failed.
@@ -238,6 +240,7 @@ impl RuntimeFailureClass {
             Self::Unavailable => "unavailable",
             Self::NotFound => "not_found",
             Self::InvalidRequest => "invalid_request",
+            Self::CommittedButNotDurable => "committed_but_not_durable",
             Self::Cancelled => "cancelled",
             Self::Internal => "internal",
         }
@@ -254,6 +257,9 @@ impl RuntimeFailureClass {
             Self::NotFound => "The requested runtime resource no longer exists.",
             Self::InvalidRequest => {
                 "The request could not be processed. Check its input and retry."
+            }
+            Self::CommittedButNotDurable => {
+                "The change committed, but durability could not be confirmed. Do not retry blindly."
             }
             Self::Cancelled => "The operation was cancelled.",
             Self::Internal => "The runtime could not complete the operation.",
@@ -420,6 +426,7 @@ const fn classify_port_error(error: &PortError) -> RuntimeFailureClass {
         PortError::Conflict(_) => RuntimeFailureClass::Busy,
         PortError::NotFound(_) => RuntimeFailureClass::NotFound,
         PortError::Invalid(_) => RuntimeFailureClass::InvalidRequest,
+        PortError::CommittedButNotDurable(_) => RuntimeFailureClass::CommittedButNotDurable,
         PortError::Cancelled => RuntimeFailureClass::Cancelled,
     }
 }
@@ -1726,12 +1733,13 @@ impl TurnExecution {
             .await;
         }
 
-        if let Some(goal) = self.inner.goals.active(&self.session_id).await? {
-            self.ingest(ContextItem::GoalStatement {
+        let goal_context = self.inner.goals.active(&self.session_id).await?.map_or(
+            ContextItem::GoalCleared,
+            |goal| ContextItem::GoalStatement {
                 objective: goal.objective,
-            })
-            .await?;
-        }
+            },
+        );
+        self.ingest(goal_context).await?;
 
         // The turn owns its input and ingests it exactly once, so it is moved rather than copied:
         // an operator paste can be tens of kilobytes and the field is dead afterwards.
@@ -1989,9 +1997,10 @@ impl TurnExecution {
 
     /// Applies one model-authored goal-tool call.
     ///
-    /// Argument and goal-service failures become a failed [`ToolOutcome`] rather than a turn
-    /// failure, so a model that sends bad arguments is told about it and can retry within the same
-    /// turn. Only an event-channel failure can abort the turn, and that is not reachable here.
+    /// Argument and ordinary goal-service failures become a failed [`ToolOutcome`] rather than a
+    /// turn failure, so a model that sends bad arguments is told about it and can retry within the
+    /// same turn. A committed-but-not-durable store outcome aborts the turn because presenting it
+    /// as a failed tool call would invite an unsafe model retry.
     async fn run_goal_tool(&self, call: &ToolCall) -> Result<ToolOutcome, RuntimeError> {
         let action = match parse_goal_action(&call.arguments) {
             Ok(action) => action,
@@ -2000,6 +2009,9 @@ impl TurnExecution {
 
         let record = match self.inner.goals.apply(&self.session_id, &action).await {
             Ok(record) => record,
+            Err(error @ GoalError::Port(PortError::CommittedButNotDurable(_))) => {
+                return Err(RuntimeError::Goal(error));
+            }
             Err(error) => return Ok(Self::failed_goal_call(call, &error)),
         };
 
@@ -2007,6 +2019,14 @@ impl TurnExecution {
             goal: record.clone(),
         })
         .await;
+        self.ingest(if record.status.is_closed() {
+            ContextItem::GoalCleared
+        } else {
+            ContextItem::GoalStatement {
+                objective: record.objective.clone(),
+            }
+        })
+        .await?;
 
         Ok(ToolOutcome {
             call_id: call.call_id.clone(),

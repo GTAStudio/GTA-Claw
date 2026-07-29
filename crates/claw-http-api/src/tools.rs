@@ -87,14 +87,17 @@ pub(crate) async fn invoke(
         )
     })?
     .map_err(|error| {
-        let status = match error.kind {
-            PortErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
-            PortErrorKind::NotFound => StatusCode::NOT_FOUND,
-            PortErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-            PortErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
-            PortErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        let (status, error_type) = match error.kind {
+            PortErrorKind::InvalidRequest => (StatusCode::BAD_REQUEST, "tool_error"),
+            PortErrorKind::NotFound => (StatusCode::NOT_FOUND, "tool_error"),
+            PortErrorKind::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "tool_error"),
+            PortErrorKind::Timeout => (StatusCode::GATEWAY_TIMEOUT, "tool_error"),
+            PortErrorKind::CommittedButNotDurable => {
+                (StatusCode::CONFLICT, "committed_but_not_durable")
+            }
+            PortErrorKind::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "tool_error"),
         };
-        ApiError::openai(status, error.message, "tool_error")
+        ApiError::openai(status, error.message, error_type)
     })?;
     Ok(tool_response(outcome))
 }

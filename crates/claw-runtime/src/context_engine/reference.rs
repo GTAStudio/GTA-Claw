@@ -37,8 +37,11 @@ pub const fn is_pinned(item: &ContextItem) -> bool {
 struct EngineState {
     session: Option<SessionId>,
     budget: u32,
+    /// Goal context is structurally separate from ordinary history, so the
+    /// turn-start clear/update synchronization path is O(1).
+    goal: Option<ContextItem>,
     items: Vec<ContextItem>,
-    /// Running sum of [`item_bytes`] over `items`.
+    /// Running sum of [`item_bytes`] over `goal` and `items`.
     ///
     /// Every state answer carries `used_tokens`, so recomputing the sum per answer made a session
     /// quadratic in the number of items it had ever ingested: 4096 ingests cost 3.43 ms, of which
@@ -47,6 +50,8 @@ struct EngineState {
     /// derived from the *total* byte count, never from per-item rounding.
     bytes: usize,
     compacted: u32,
+    #[cfg(test)]
+    goal_sync_operations: u64,
 }
 
 impl EngineState {
@@ -56,10 +61,29 @@ impl EngineState {
         self.items.push(item);
     }
 
+    fn replace_goal(&mut self, replacement: Option<ContextItem>) {
+        let previous_bytes = self.goal.as_ref().map_or(0, item_bytes);
+        let replacement_bytes = replacement.as_ref().map_or(0, item_bytes);
+        self.bytes = self
+            .bytes
+            .saturating_sub(previous_bytes)
+            .saturating_add(replacement_bytes);
+        self.goal = replacement;
+        #[cfg(test)]
+        {
+            self.goal_sync_operations = self.goal_sync_operations.saturating_add(1);
+        }
+    }
+
     /// Drops every item and resets the running byte total with them.
     fn clear(&mut self) {
+        self.goal = None;
         self.items.clear();
         self.bytes = 0;
+        #[cfg(test)]
+        {
+            self.goal_sync_operations = 0;
+        }
     }
 
     fn used_tokens(&self) -> u32 {
@@ -73,7 +97,12 @@ impl EngineState {
     fn snapshot(&self) -> ContextState {
         let used = self.used_tokens();
         ContextState {
-            item_count: u32::try_from(self.items.len()).unwrap_or(u32::MAX),
+            item_count: u32::try_from(
+                self.items
+                    .len()
+                    .saturating_add(usize::from(self.goal.is_some())),
+            )
+            .unwrap_or(u32::MAX),
             used_tokens: used,
             token_budget: self.budget,
             needs_compaction: used > self.budget,
@@ -101,6 +130,7 @@ const fn item_bytes(item: &ContextItem) -> usize {
         | ContextItem::AssistantMessage { text }
         | ContextItem::SystemNote { text } => text.len(),
         ContextItem::GoalStatement { objective } => objective.len(),
+        ContextItem::GoalCleared => 0,
         ContextItem::ToolResult {
             tool_name, output, ..
         } => tool_name.len() + output.len(),
@@ -117,6 +147,9 @@ fn prompt_message(index: usize, item: &ContextItem) -> PromptMessage {
         ContextItem::SystemNote { text } => PromptMessage::System { text: text.clone() },
         ContextItem::GoalStatement { objective } => PromptMessage::System {
             text: format!("goal: {objective}"),
+        },
+        ContextItem::GoalCleared => PromptMessage::System {
+            text: String::new(),
         },
         ContextItem::ToolResult { output, failed, .. } => PromptMessage::ToolResult {
             call_id: ToolCallId::new(format!("context-item-{index}"))
@@ -142,16 +175,25 @@ impl ReferenceContextEngine {
         Self::default()
     }
 
-    /// Returns every item the engine currently holds, in arrival order.
+    /// Returns the goal first, followed by ordinary items in arrival order.
     #[must_use]
     pub fn items(&self) -> Vec<ContextItem> {
-        self.lock().items.clone()
+        let state = self.lock();
+        let mut items = Vec::with_capacity(state.items.len().saturating_add(1));
+        items.extend(state.goal.iter().cloned());
+        items.extend(state.items.iter().cloned());
+        items
     }
 
     /// Returns the session the engine is open for, if any.
     #[must_use]
     pub fn open_session(&self) -> Option<SessionId> {
         self.lock().session.clone()
+    }
+
+    #[cfg(test)]
+    fn goal_sync_operations(&self) -> u64 {
+        self.lock().goal_sync_operations
     }
 
     fn lock(&self) -> MutexGuard<'_, EngineState> {
@@ -195,7 +237,11 @@ impl ContextEnginePort for ReferenceContextEngine {
     fn ingest(&self, request: ContextIngest) -> PortFuture<'_, Result<ContextState, PortError>> {
         let mut state = self.lock();
         let outcome = state.ensure_open_for(&request.session_id).map(|()| {
-            state.push(request.item);
+            match request.item {
+                item @ ContextItem::GoalStatement { .. } => state.replace_goal(Some(item)),
+                ContextItem::GoalCleared => state.replace_goal(None),
+                item => state.push(item),
+            }
             state.snapshot()
         });
         drop(state);
@@ -211,8 +257,9 @@ impl ContextEnginePort for ReferenceContextEngine {
             .ensure_open_for(&request.session_id)
             .map(|()| AssembledContext {
                 messages: state
-                    .items
+                    .goal
                     .iter()
+                    .chain(state.items.iter())
                     .enumerate()
                     .map(|(index, item)| prompt_message(index, item))
                     .collect(),
@@ -350,6 +397,79 @@ mod tests {
             output: "ok".to_owned(),
             failed: false,
         }));
+    }
+
+    #[tokio::test]
+    async fn goal_updates_replace_and_clear_the_single_pinned_statement() {
+        let engine = ReferenceContextEngine::new();
+        let session_id = session("goal-lifecycle");
+        engine
+            .bootstrap(bootstrap(&session_id, BootstrapReason::NewSession, 128))
+            .await
+            .expect("bootstrap");
+
+        for objective in ["first", "replacement"] {
+            engine
+                .ingest(ingest(
+                    &session_id,
+                    ContextItem::GoalStatement {
+                        objective: objective.to_owned(),
+                    },
+                ))
+                .await
+                .expect("goal update");
+        }
+        assert_eq!(
+            engine
+                .items()
+                .iter()
+                .filter(|item| matches!(item, ContextItem::GoalStatement { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            engine.items(),
+            vec![ContextItem::GoalStatement {
+                objective: "replacement".to_owned()
+            }]
+        );
+
+        engine
+            .ingest(ingest(&session_id, ContextItem::GoalCleared))
+            .await
+            .expect("goal clear");
+        assert!(engine.items().is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_no_goal_sync_is_one_constant_time_operation_per_turn() {
+        let engine = ReferenceContextEngine::new();
+        let session_id = session("goal-sync-cost");
+        engine
+            .bootstrap(bootstrap(&session_id, BootstrapReason::NewSession, 100_000))
+            .await
+            .expect("bootstrap");
+        for index in 0..1_000 {
+            engine
+                .ingest(ingest(
+                    &session_id,
+                    ContextItem::UserInput {
+                        text: format!("history {index}"),
+                    },
+                ))
+                .await
+                .expect("history ingest");
+        }
+
+        for _ in 0..10_000 {
+            engine
+                .ingest(ingest(&session_id, ContextItem::GoalCleared))
+                .await
+                .expect("goal sync");
+        }
+
+        assert_eq!(engine.goal_sync_operations(), 10_000);
+        assert_eq!(engine.items().len(), 1_000);
     }
 
     #[tokio::test]

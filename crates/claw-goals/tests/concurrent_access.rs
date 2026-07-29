@@ -30,6 +30,10 @@ impl FirstLoadBarrierStore {
 }
 
 impl GoalStorePort for FirstLoadBarrierStore {
+    fn next_goal_ordinal(&self, session_id: &SessionId) -> PortFuture<'_, Result<u64, PortError>> {
+        self.inner.next_goal_ordinal(session_id)
+    }
+
     fn load(&self, goal_id: &GoalId) -> PortFuture<'_, Result<Option<GoalRecord>, PortError>> {
         let loaded = self.inner.load(goal_id);
         if self.first_load.swap(false, Ordering::SeqCst) {

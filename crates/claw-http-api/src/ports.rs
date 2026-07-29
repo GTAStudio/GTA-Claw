@@ -447,6 +447,8 @@ pub enum PortErrorKind {
     Unavailable,
     /// Operation exceeded its deadline.
     Timeout,
+    /// The mutation committed, but its durability could not be confirmed.
+    CommittedButNotDurable,
     /// Internal adapter failure.
     Internal,
 }

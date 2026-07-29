@@ -64,8 +64,10 @@
 //! assert!(context.used_tokens <= budget.available());
 //! ```
 
+mod bounded;
 pub mod budget;
 pub mod context;
+pub mod json;
 pub mod retrieval;
 pub mod session;
 pub mod store;
@@ -79,6 +81,7 @@ pub use budget::{
 pub use context::{
     AssembledContext, ContextAssembler, ContextError, ContextTruncation, DroppedMessage,
 };
+pub use json::{JsonDecodeError, from_json_reader};
 pub use retrieval::{
     KeywordRetriever, MAX_KEYWORD_RECORD_TERMS, MAX_QUERY_BYTES, MAX_RECORD_BYTES, MAX_RECORD_TAGS,
     MAX_RETRIEVAL_LIMIT, MAX_TAG_BYTES, MemoryRecord, RecordError, RecordKind, RetrievalCoverage,

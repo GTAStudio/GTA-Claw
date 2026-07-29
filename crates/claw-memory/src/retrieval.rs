@@ -4,8 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
+use crate::bounded::{BoundedString, BoundedVec, reject_unbounded_json_reader};
 use crate::session::SessionId;
 use crate::vector::{
     DEFAULT_INDEX_CAPACITY, Embedding, EmbeddingModel, RecordId, VectorError, VectorIndex,
@@ -65,7 +67,7 @@ impl Display for RecordKind {
 }
 
 /// One durable unit of memory.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct MemoryRecord {
     /// Stable record identity.
     pub id: RecordId,
@@ -79,6 +81,42 @@ pub struct MemoryRecord {
     pub unix_millis: u64,
     /// Operator-assigned labels.
     pub tags: BTreeSet<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "MemoryRecord")]
+struct RawMemoryRecord {
+    id: RecordId,
+    session: SessionId,
+    kind: RecordKind,
+    text: BoundedString<MAX_RECORD_BYTES>,
+    unix_millis: u64,
+    tags: BoundedVec<BoundedString<MAX_TAG_BYTES>, MAX_RECORD_TAGS>,
+}
+
+impl<'de> Deserialize<'de> for MemoryRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        reject_unbounded_json_reader::<D>()?;
+        let raw = RawMemoryRecord::deserialize(deserializer)?;
+        let record = Self {
+            id: raw.id,
+            session: raw.session,
+            kind: raw.kind,
+            text: raw.text.into_inner(),
+            unix_millis: raw.unix_millis,
+            tags: raw
+                .tags
+                .into_inner()
+                .into_iter()
+                .map(BoundedString::into_inner)
+                .collect(),
+        };
+        record.validate().map_err(de::Error::custom)?;
+        Ok(record)
+    }
 }
 
 impl MemoryRecord {

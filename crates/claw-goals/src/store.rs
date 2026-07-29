@@ -29,9 +29,9 @@
 //! Only Unix exposes directory synchronization through [`std`]. On every other target the step is
 //! skipped, and [`FileGoalStore::synced_publications`] does not count the publication, so the
 //! store never claims a guarantee the platform did not give it. A directory sync that is attempted
-//! and fails is *not* an error: by then the new bytes are published and the previous ones are
-//! gone, so there is nothing to roll back and nothing to retry. It is counted in
-//! [`FileGoalStore::unsynced_publications`] instead, which is the only signal that carries it.
+//! and fails returns [`StoreError::CommittedButNotDurable`]: by then the new bytes are published
+//! and the previous ones are gone, so an ordinary error would dangerously invite a blind retry.
+//! [`FileGoalStore::unsynced_publications`] also counts the degraded publication for diagnostics.
 //!
 //! The record is written before the session index, so a crash between the two leaves a goal file
 //! that no index mentions. That is the orphan case [`FileGoalStore::open`] repairs, and it is
@@ -72,6 +72,8 @@ const SESSIONS_DIR: &str = "sessions";
 const RECORD_EXTENSION: &str = "json";
 const TEMP_PREFIX: &str = "pending-";
 const WRITE_LOCK_FILE: &str = ".goal-store.lock";
+const SESSION_INDEX_SCHEMA_VERSION: u32 = 2;
+const LEGACY_SESSION_INDEX_SCHEMA_VERSION: u32 = 1;
 
 /// Maximum attempts made to acquire the cross-process store lock.
 pub const WRITE_LOCK_ATTEMPTS: usize = 64;
@@ -80,11 +82,44 @@ pub const WRITE_LOCK_ATTEMPTS: usize = 64;
 pub const WRITE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 /// The persisted order of one session's goals.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SessionIndex {
     schema: u32,
     session_id: String,
     goal_ids: Vec<String>,
+    goal_id_high_water: u64,
+}
+
+#[derive(Deserialize)]
+struct SessionIndexEnvelope {
+    schema: u32,
+    session_id: String,
+    goal_ids: SessionGoalIds,
+    #[serde(default)]
+    goal_id_high_water: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SessionGoalIds {
+    Legacy(Vec<String>),
+    Durable {
+        entries: Vec<String>,
+        high_water: u64,
+    },
+}
+
+#[derive(Serialize)]
+struct DurableSessionIndex<'a> {
+    schema: u32,
+    session_id: &'a str,
+    goal_ids: DurableGoalIds<'a>,
+}
+
+#[derive(Serialize)]
+struct DurableGoalIds<'a> {
+    entries: &'a [String],
+    high_water: u64,
 }
 
 /// What [`FileGoalStore::open`] had to repair before the store was usable.
@@ -156,6 +191,13 @@ pub enum StoreError {
         /// The underlying failure.
         source: std::io::Error,
     },
+    /// A replacement was published, but its directory entry was not proven power-loss durable.
+    CommittedButNotDurable {
+        /// The committed path.
+        path: PathBuf,
+        /// The parent-directory synchronization failure.
+        source: std::io::Error,
+    },
     /// A stored record could not be decoded.
     Corrupt {
         /// The file that could not be decoded.
@@ -191,6 +233,11 @@ impl Display for StoreError {
                     path.display()
                 )
             }
+            Self::CommittedButNotDurable { path, source } => write!(
+                formatter,
+                "goal store committed {} but could not make the directory entry power-loss durable: {source}; do not retry blindly",
+                path.display()
+            ),
             Self::Corrupt { path, source } => {
                 write!(
                     formatter,
@@ -221,7 +268,7 @@ impl Display for StoreError {
 impl Error for StoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Io { source, .. } => Some(source),
+            Self::Io { source, .. } | Self::CommittedButNotDurable { source, .. } => Some(source),
             Self::Corrupt { source, .. } | Self::Encoding(source) => Some(source),
             Self::Budget(source) => Some(source),
             Self::Conflict { .. } | Self::Busy { .. } => None,
@@ -245,6 +292,9 @@ impl From<StoreError> for PortError {
                 Self::Conflict(format!("goal store busy after {attempts} lock attempts"))
             }
             StoreError::Budget(error) => Self::Invalid(error.to_string()),
+            error @ StoreError::CommittedButNotDurable { .. } => {
+                Self::CommittedButNotDurable(error.to_string())
+            }
             other => Self::Unavailable(other.to_string()),
         }
     }
@@ -297,6 +347,14 @@ fn digest_of(value: &str) -> String {
         hex.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     hex
+}
+
+fn generated_goal_ordinal(session_id: &str, goal_id: &str) -> Option<u64> {
+    goal_id
+        .strip_prefix(session_id)?
+        .strip_prefix(":goal-")?
+        .parse()
+        .ok()
 }
 
 /// Flushes a directory's own entries, reporting whether the flush was actually performed.
@@ -500,11 +558,10 @@ impl FileGoalStore {
 
     /// Compacts progress payloads in closed goals while preserving every goal identity.
     ///
-    /// Goal files and index entries are deliberately retained: the runtime mints
-    /// the next goal identifier from history length, so deleting an old entry
-    /// would permit identifier reuse. The newest `keep_recent_progress` entries
-    /// remain available on each closed goal; older entries are folded into
-    /// `compacted_entries`.
+    /// Goal identities are retained, and the session index separately preserves
+    /// the generated-identifier high-water mark. The newest
+    /// `keep_recent_progress` entries remain available on each closed goal;
+    /// older entries are folded into `compacted_entries`.
     ///
     /// # Errors
     ///
@@ -606,6 +663,15 @@ impl FileGoalStore {
     // therefore optimised only where it is also on a read path (see
     // `digest_of` and `usage_of_index`), never for the sake of a save.
     fn write_atomically(&self, path: &Path, contents: &str) -> Result<(), StoreError> {
+        self.write_atomically_with(path, contents, sync_directory_entries)
+    }
+
+    fn write_atomically_with(
+        &self,
+        path: &Path,
+        contents: &str,
+        sync_directory: impl FnOnce(&Path) -> std::io::Result<bool>,
+    ) -> Result<(), StoreError> {
         let directory = path.parent().unwrap_or(&self.root);
         let ordinal = self.sequence.fetch_add(1, Ordering::SeqCst);
         let temporary = directory.join(format!("{TEMP_PREFIX}{}-{ordinal}", std::process::id()));
@@ -624,17 +690,20 @@ impl FileGoalStore {
         }
 
         // Both the temporary file's creation and its rename are entries in this one directory, so
-        // a single sync after the rename covers the whole publication. A failure here is recorded
-        // rather than returned: the new bytes are already in place and the previous ones are
-        // already gone, so reporting failure would tell the caller to retry a write that in fact
-        // landed, and the revision check would then refuse the retry.
-        match sync_directory_entries(directory) {
+        // a single sync after the rename covers the whole publication. A failure is a distinct
+        // committed outcome: the bytes landed, but callers must not mistake that for ordinary
+        // success or blindly retry a mutation whose revision already advanced.
+        match sync_directory(directory) {
             Ok(true) => {
                 self.synced_publications.fetch_add(1, Ordering::SeqCst);
             }
             Ok(false) => {}
-            Err(_) => {
+            Err(source) => {
                 self.unsynced_publications.fetch_add(1, Ordering::SeqCst);
+                return Err(StoreError::CommittedButNotDurable {
+                    path: path.to_path_buf(),
+                    source,
+                });
             }
         }
         Ok(())
@@ -668,22 +737,71 @@ impl FileGoalStore {
     fn read_index(&self, session_id: &SessionId) -> Result<SessionIndex, StoreError> {
         let path = self.index_path_for(session_id.as_str());
         match fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).map_err(|error| StoreError::Corrupt {
-                path,
-                source: WireError::Malformed(error.to_string()),
-            }),
+            Ok(text) => Self::decode_index(&path, &text),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(SessionIndex {
-                schema: wire::SCHEMA_VERSION,
+                schema: SESSION_INDEX_SCHEMA_VERSION,
                 session_id: session_id.as_str().to_owned(),
                 goal_ids: Vec::new(),
+                goal_id_high_water: 0,
             }),
             Err(error) => Err(io_error(&path, error)),
         }
     }
 
+    fn decode_index(path: &Path, text: &str) -> Result<SessionIndex, StoreError> {
+        let envelope: SessionIndexEnvelope =
+            serde_json::from_str(text).map_err(|error| StoreError::Corrupt {
+                path: path.to_path_buf(),
+                source: WireError::Malformed(error.to_string()),
+            })?;
+        let (goal_ids, goal_id_high_water) = match (envelope.schema, envelope.goal_ids) {
+            (LEGACY_SESSION_INDEX_SCHEMA_VERSION, SessionGoalIds::Legacy(goal_ids)) => {
+                (goal_ids, envelope.goal_id_high_water)
+            }
+            (
+                SESSION_INDEX_SCHEMA_VERSION,
+                SessionGoalIds::Durable {
+                    entries,
+                    high_water,
+                },
+            ) => (entries, high_water),
+            (found, _) if found != SESSION_INDEX_SCHEMA_VERSION => {
+                return Err(StoreError::Corrupt {
+                    path: path.to_path_buf(),
+                    source: WireError::UnsupportedSchema {
+                        expected: SESSION_INDEX_SCHEMA_VERSION,
+                        found,
+                    },
+                });
+            }
+            (_, _) => {
+                return Err(StoreError::Corrupt {
+                    path: path.to_path_buf(),
+                    source: WireError::Malformed(
+                        "session index payload does not match its schema".to_owned(),
+                    ),
+                });
+            }
+        };
+        Ok(SessionIndex {
+            schema: envelope.schema,
+            session_id: envelope.session_id,
+            goal_ids,
+            goal_id_high_water,
+        })
+    }
+
     fn write_index(&self, index: &SessionIndex) -> Result<(), StoreError> {
         let path = self.index_path_for(&index.session_id);
-        let mut text = serde_json::to_string_pretty(index)
+        let durable = DurableSessionIndex {
+            schema: SESSION_INDEX_SCHEMA_VERSION,
+            session_id: &index.session_id,
+            goal_ids: DurableGoalIds {
+                entries: &index.goal_ids,
+                high_water: index.goal_id_high_water,
+            },
+        };
+        let mut text = serde_json::to_string_pretty(&durable)
             .map_err(|error| StoreError::Encoding(WireError::Malformed(error.to_string())))?;
         text.push('\n');
         self.write_atomically(&path, &text)
@@ -800,11 +918,7 @@ impl FileGoalStore {
                 continue;
             }
             let text = fs::read_to_string(&path).map_err(|error| io_error(&path, error))?;
-            let index: SessionIndex =
-                serde_json::from_str(&text).map_err(|error| StoreError::Corrupt {
-                    path: path.clone(),
-                    source: WireError::Malformed(error.to_string()),
-                })?;
+            let index = Self::decode_index(&path, &text)?;
             sessions.insert(index.session_id);
         }
 
@@ -819,6 +933,13 @@ impl FileGoalStore {
                 })?;
             let mut index = self.read_index(&session_id)?;
             let indexed = index.goal_ids.len();
+            let legacy_schema = index.schema != SESSION_INDEX_SCHEMA_VERSION;
+            let previous_high_water = index.goal_id_high_water;
+            index.goal_id_high_water = index
+                .goal_ids
+                .iter()
+                .filter_map(|goal_id| generated_goal_ordinal(&session, goal_id))
+                .fold(index.goal_id_high_water, u64::max);
 
             index
                 .goal_ids
@@ -851,10 +972,19 @@ impl FileGoalStore {
             for record in orphans {
                 index.goal_ids.push(record.goal_id.as_str().to_owned());
             }
+            index.goal_id_high_water = index
+                .goal_ids
+                .iter()
+                .filter_map(|goal_id| generated_goal_ordinal(&session, goal_id))
+                .fold(index.goal_id_high_water, u64::max);
 
             report.pruned_dangling += pruned;
             report.adopted_orphans += adopted;
-            if pruned > 0 || adopted > 0 {
+            if legacy_schema
+                || pruned > 0
+                || adopted > 0
+                || index.goal_id_high_water != previous_high_water
+            {
                 self.write_index(&index)?;
             }
         }
@@ -868,21 +998,27 @@ impl FileGoalStore {
 
         self.with_store_lock(|| {
             let existing = Self::read_record_sized(&path)?;
-            let expected = existing
-                .as_ref()
-                .map_or(1, |(stored, _)| stored.revision.saturating_add(1));
-            if record.revision != expected {
-                return Err(StoreError::Conflict {
-                    expected,
-                    held: record.revision,
-                });
-            }
-
             let mut index = self.read_index(&record.session_id)?;
             let is_new = !index
                 .goal_ids
                 .iter()
                 .any(|goal_id| goal_id == record.goal_id.as_str());
+            let adopts_identical_orphan = is_new
+                && existing
+                    .as_ref()
+                    .is_some_and(|(stored, _)| stored == record);
+
+            if !adopts_identical_orphan {
+                let expected = existing
+                    .as_ref()
+                    .map_or(1, |(stored, _)| stored.revision.saturating_add(1));
+                if record.revision != expected {
+                    return Err(StoreError::Conflict {
+                        expected,
+                        held: record.revision,
+                    });
+                }
+            }
 
             let mut held = self.usage_of_index(&index)?;
             if !is_new {
@@ -894,10 +1030,17 @@ impl FileGoalStore {
                 .admit(held, encoded.len(), is_new)
                 .map_err(StoreError::Budget)?;
 
-            self.write_atomically(&path, &encoded)?;
+            if !adopts_identical_orphan {
+                self.write_atomically(&path, &encoded)?;
+            }
 
             if is_new {
                 index.goal_ids.push(record.goal_id.as_str().to_owned());
+                if let Some(ordinal) =
+                    generated_goal_ordinal(record.session_id.as_str(), record.goal_id.as_str())
+                {
+                    index.goal_id_high_water = index.goal_id_high_water.max(ordinal);
+                }
                 self.write_index(&index)?;
             }
 
@@ -924,9 +1067,28 @@ impl FileGoalStore {
             Ok(records)
         })
     }
+
+    fn next_goal_ordinal_blocking(&self, session_id: &SessionId) -> Result<u64, StoreError> {
+        self.with_store_lock(|| {
+            let index = self.read_index(session_id)?;
+            index.goal_id_high_water.checked_add(1).ok_or_else(|| {
+                StoreError::Encoding(WireError::Invalid {
+                    field: "goal_id_high_water",
+                    reason: "goal identifier space is exhausted".to_owned(),
+                })
+            })
+        })
+    }
 }
 
 impl GoalStorePort for FileGoalStore {
+    fn next_goal_ordinal(&self, session_id: &SessionId) -> PortFuture<'_, Result<u64, PortError>> {
+        let outcome = self
+            .next_goal_ordinal_blocking(session_id)
+            .map_err(PortError::from);
+        Box::pin(async move { outcome })
+    }
+
     fn load(&self, goal_id: &GoalId) -> PortFuture<'_, Result<Option<GoalRecord>, PortError>> {
         let outcome =
             Self::read_record_at(&self.record_path_for(goal_id.as_str())).map_err(PortError::from);
@@ -953,9 +1115,10 @@ impl GoalStorePort for FileGoalStore {
 mod tests {
     use super::{FileGoalStore, StoreError, WRITE_LOCK_ATTEMPTS, digest_of};
     use crate::budget::{BudgetError, GoalBudget};
-    use crate::testing::{TempRoot, block_on, goal_id, record, session_id};
+    use crate::testing::{SteppingClock, TempRoot, block_on, goal_id, record, session_id};
     use claw_application::ports::PortError;
     use claw_application::ports::goal::GoalStorePort;
+    use claw_runtime::{GoalConfig, GoalService};
     use std::fs::OpenOptions;
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -1196,5 +1359,88 @@ mod tests {
 
         assert_eq!(loaded.goal_id, goal_id("s:goal-1"));
         assert_eq!(loaded.objective, "objective");
+    }
+
+    #[test]
+    fn a_directory_sync_failure_reports_committed_but_not_durable() {
+        let root = TempRoot::new("directory-sync-failure");
+        let store = FileGoalStore::open(root.path()).expect("store opens");
+        let path = store.record_path_for("s:goal-1");
+
+        let error = store
+            .write_atomically_with(&path, "committed", |_| {
+                Err(std::io::Error::other("injected directory sync failure"))
+            })
+            .expect_err("durability failure is explicit");
+
+        assert!(matches!(
+            error,
+            StoreError::CommittedButNotDurable { path: ref committed, .. } if committed == &path
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("published file remains visible"),
+            "committed"
+        );
+        assert_eq!(store.unsynced_publications(), 1);
+        let port_error = PortError::from(error);
+        assert_eq!(port_error.label(), "committed_but_not_durable");
+        assert!(!port_error.is_retryable());
+    }
+
+    #[test]
+    fn a_live_retry_adopts_an_identical_record_and_completes_its_index() {
+        let root = TempRoot::new("live-orphan-retry");
+        let store = FileGoalStore::open(root.path()).expect("store opens");
+        let record = record("s", "s:goal-1", "objective", 1);
+        let encoded = crate::wire::encode(&record).expect("record encodes");
+        let path = store.record_path_for(record.goal_id.as_str());
+
+        store
+            .write_atomically(&path, &encoded)
+            .expect("record publication succeeds before the injected index split");
+        assert!(
+            store
+                .list_blocking(&session_id("s"))
+                .expect("index reads")
+                .is_empty()
+        );
+
+        store
+            .save_blocking(&record)
+            .expect("retry adopts rather than reopening or duplicating");
+        let listed = store
+            .list_blocking(&session_id("s"))
+            .expect("completed index reads");
+        assert_eq!(listed, vec![record]);
+        assert_eq!(store.accepted_writes(), 1);
+    }
+
+    #[test]
+    fn a_service_retry_adopts_the_original_orphan_when_the_clock_has_advanced() {
+        let root = TempRoot::new("live-service-orphan-retry");
+        let store = Arc::new(FileGoalStore::open(root.path()).expect("store opens"));
+        let orphan = record("s", "s:goal-1", "objective", 1);
+        let encoded = crate::wire::encode(&orphan).expect("record encodes");
+        store
+            .write_atomically(&store.record_path_for(orphan.goal_id.as_str()), &encoded)
+            .expect("record publication succeeds before the index split");
+        let service = GoalService::new(
+            Arc::clone(&store) as Arc<_>,
+            Arc::new(SteppingClock::new(99_000, 1_000)),
+            GoalConfig::default(),
+        );
+
+        let adopted = block_on(service.start(&session_id("s"), " objective "))
+            .expect("retry adopts and indexes the original record");
+
+        assert_eq!(
+            adopted, orphan,
+            "the retry retains the committed timestamps"
+        );
+        assert_eq!(
+            block_on(service.history(&session_id("s"))).expect("history"),
+            vec![orphan]
+        );
+        assert_eq!(store.accepted_writes(), 1);
     }
 }

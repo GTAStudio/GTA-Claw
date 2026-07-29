@@ -214,6 +214,9 @@ pub fn compact<C: TokenCounter + ?Sized, S: Summarizer>(
     if text.trim().is_empty() {
         return Err(SummaryError::EmptySummary);
     }
+    if counter.count_text(&text) > plan.max_tokens {
+        return Err(SummaryError::OverBudget);
+    }
     let summary = Summary {
         first: plan.first,
         last: plan.last,
@@ -336,7 +339,7 @@ impl Summarizer for ExtractiveSummarizer {
         if request.messages.is_empty() {
             return Err(SummaryError::NothingToSummarize);
         }
-        let character_budget = request.max_tokens.saturating_mul(4).max(16);
+        let character_budget = request.max_tokens.saturating_mul(4).max(1);
         let mut lines: Vec<String> = Vec::new();
         let mut used = 0_usize;
         for message in request.messages {
@@ -353,11 +356,12 @@ impl Summarizer for ExtractiveSummarizer {
             // Always produce something: a compaction that yields nothing would
             // silently erase the run it replaced.
             let first = request.messages.first().ok_or(SummaryError::EmptySummary)?;
-            lines.push(format!(
+            let fallback = format!(
                 "{}: {}",
                 first.role.as_str(),
                 leading_sentence(&first.content, 32)
-            ));
+            );
+            lines.push(fallback.chars().take(character_budget).collect());
         }
         Ok(lines.join("\n"))
     }
@@ -390,6 +394,8 @@ pub enum SummaryError {
     NothingToSummarize,
     /// The summarizer produced no usable text.
     EmptySummary,
+    /// The summarizer exceeded the replacement budget it was given.
+    OverBudget,
     /// The session refused the resulting summary.
     Session(SessionError),
     /// The host summarizer failed.
@@ -404,6 +410,7 @@ impl Display for SummaryError {
             }
             Self::NothingToSummarize => formatter.write_str("no messages were eligible"),
             Self::EmptySummary => formatter.write_str("summarizer produced no text"),
+            Self::OverBudget => formatter.write_str("summarizer exceeded its summary budget"),
             Self::Session(error) => write!(formatter, "session refused the summary: {error}"),
             Self::Backend => formatter.write_str("summarizer backend failed"),
         }
@@ -438,6 +445,14 @@ mod tests {
     impl Summarizer for BlankSummarizer {
         fn summarize(&mut self, _request: &SummaryRequest<'_>) -> Result<String, SummaryError> {
             Ok("   \n  ".to_owned())
+        }
+    }
+
+    struct OversizedSummarizer;
+
+    impl Summarizer for OversizedSummarizer {
+        fn summarize(&mut self, request: &SummaryRequest<'_>) -> Result<String, SummaryError> {
+            Ok("oversized ".repeat(request.max_tokens.saturating_add(1)))
         }
     }
 
@@ -637,6 +652,19 @@ mod tests {
             Err(SummaryError::EmptySummary)
         );
         assert_eq!(session, before);
+
+        assert_eq!(
+            compact(
+                &mut session,
+                tight,
+                &counter(),
+                policy,
+                &mut OversizedSummarizer,
+                1
+            ),
+            Err(SummaryError::OverBudget)
+        );
+        assert_eq!(session, before);
     }
 
     #[test]
@@ -676,7 +704,7 @@ mod tests {
                 max_tokens: 1,
             })
             .expect("summarized");
-        assert_eq!(text, "user: padding padding padding padding");
+        assert_eq!(text, "user");
     }
 
     #[test]

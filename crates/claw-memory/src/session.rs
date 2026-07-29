@@ -10,6 +10,8 @@ use std::fmt::{self, Display, Formatter};
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
+use crate::bounded::{BoundedString, BoundedVec, reject_unbounded_json_reader};
+
 /// Inclusive maximum byte length of a session identifier.
 pub const MAX_SESSION_ID_BYTES: usize = 128;
 
@@ -80,7 +82,8 @@ impl<'de> Deserialize<'de> for SessionId {
     where
         D: Deserializer<'de>,
     {
-        let value = String::deserialize(deserializer)?;
+        reject_unbounded_json_reader::<D>()?;
+        let value = BoundedString::<MAX_SESSION_ID_BYTES>::deserialize(deserializer)?.into_inner();
         Self::new(&value).map_err(de::Error::custom)
     }
 }
@@ -143,7 +146,7 @@ impl Display for MessageId {
 }
 
 /// One immutable conversation entry.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Message {
     /// Monotonic identifier, unique within the session.
     pub id: MessageId,
@@ -155,6 +158,35 @@ pub struct Message {
     pub unix_millis: u64,
     /// Whether the message must survive every truncation.
     pub pinned: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "Message")]
+struct RawMessage {
+    id: MessageId,
+    role: Role,
+    content: BoundedString<MAX_MESSAGE_BYTES>,
+    unix_millis: u64,
+    pinned: bool,
+}
+
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        reject_unbounded_json_reader::<D>()?;
+        let raw = RawMessage::deserialize(deserializer)?;
+        let content = raw.content.into_inner();
+        check_body(&content).map_err(de::Error::custom)?;
+        Ok(Self {
+            id: raw.id,
+            role: raw.role,
+            content,
+            unix_millis: raw.unix_millis,
+            pinned: raw.pinned,
+        })
+    }
 }
 
 impl Message {
@@ -170,7 +202,7 @@ impl Message {
 }
 
 /// A summary standing in for a contiguous run of older messages.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Summary {
     /// First message identifier the summary replaces, inclusive.
     pub first: MessageId,
@@ -180,6 +212,33 @@ pub struct Summary {
     pub text: String,
     /// Wall-clock creation time in Unix milliseconds.
     pub unix_millis: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "Summary")]
+struct RawSummary {
+    first: MessageId,
+    last: MessageId,
+    text: BoundedString<MAX_MESSAGE_BYTES>,
+    unix_millis: u64,
+}
+
+impl<'de> Deserialize<'de> for Summary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        reject_unbounded_json_reader::<D>()?;
+        let raw = RawSummary::deserialize(deserializer)?;
+        let summary = Self {
+            first: raw.first,
+            last: raw.last,
+            text: raw.text.into_inner(),
+            unix_millis: raw.unix_millis,
+        };
+        check_summary(&summary).map_err(de::Error::custom)?;
+        Ok(summary)
+    }
 }
 
 impl Summary {
@@ -276,6 +335,51 @@ impl Session {
         }
     }
 
+    /// Replaces one retained message in place without changing its identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same body errors as [`Self::append`]. Validation runs before mutation.
+    pub fn replace(
+        &mut self,
+        id: MessageId,
+        role: Role,
+        content: impl Into<String>,
+        unix_millis: u64,
+        pinned: bool,
+    ) -> Result<bool, SessionError> {
+        let content = content.into();
+        check_body(&content)?;
+        let Some(message) = self.messages.iter_mut().find(|message| message.id == id) else {
+            return Ok(false);
+        };
+        *message = Message {
+            id,
+            role,
+            content,
+            unix_millis,
+            pinned,
+        };
+        Ok(true)
+    }
+
+    /// Removes one retained message while preserving the monotonic identifier high-water mark.
+    pub fn remove(&mut self, id: MessageId) -> Option<Message> {
+        let index = self.messages.iter().position(|message| message.id == id)?;
+        Some(self.messages.remove(index))
+    }
+
+    /// Returns the identifier the next successful append will assign.
+    ///
+    /// Removed messages do not rewind this value.
+    #[must_use]
+    pub const fn next_message_id(&self) -> Option<MessageId> {
+        match self.next_ordinal.checked_add(1) {
+            Some(_) => Some(MessageId(self.next_ordinal)),
+            None => None,
+        }
+    }
+
     /// Returns every message in ascending identifier order.
     #[must_use]
     pub fn messages(&self) -> &[Message] {
@@ -356,28 +460,6 @@ fn check_summary(summary: &Summary) -> Result<(), SessionError> {
     check_body(&summary.text)
 }
 
-/// Drops the oldest ordinary messages until at most [`MAX_MESSAGES`] remain.
-///
-/// This is the retention rule the rest of the crate already applies: anchors
-/// survive, and what is shed is the oldest non-anchor history — the same run
-/// [`crate::summarize::plan_summarization`] would have picked for compaction
-/// and the same messages [`crate::budget::plan_truncation`] leaves outside
-/// its window. `Vec::retain` visits front to back, so the surplus is taken
-/// from the oldest end.
-fn shed_oldest_history(messages: &mut Vec<Message>) {
-    let mut surplus = messages.len().saturating_sub(MAX_MESSAGES);
-    if surplus == 0 {
-        return;
-    }
-    messages.retain(|message| {
-        if surplus > 0 && !message.is_anchor() {
-            surplus -= 1;
-            return false;
-        }
-        true
-    });
-}
-
 /// The wire shape of a [`Session`], before its bounds are re-applied.
 ///
 /// The field set and the name are exactly the derived ones, so the format a
@@ -387,8 +469,8 @@ fn shed_oldest_history(messages: &mut Vec<Message>) {
 #[serde(rename = "Session")]
 struct RawSession {
     id: SessionId,
-    messages: Vec<Message>,
-    summaries: Vec<Summary>,
+    messages: BoundedVec<Message, MAX_MESSAGES>,
+    summaries: BoundedVec<Summary, MAX_SUMMARIES>,
     next_ordinal: u64,
 }
 
@@ -423,37 +505,28 @@ impl Session {
     /// bound the type advertises — and a store that can be loaded into an
     /// invalid state has no bounds at all.
     ///
-    /// Restoring repairs rather than refuses wherever the crate already has a
-    /// rule for what to shed, so an existing save never stops loading: an
-    /// over-long history sheds its oldest ordinary messages, exactly as
-    /// compaction would have done while the session was live, and surplus
-    /// summaries keep the newest, exactly as truncation admits them. Only
-    /// what no rule can repair is refused: an identifier order that makes
-    /// "oldest" meaningless, a body [`Session::append`] would have rejected,
-    /// or a history of anchors alone past [`MAX_MESSAGES`], which cannot be
-    /// shed without discarding an operator instruction.
+    /// The bounded visitors cap raw string input and reject a message or
+    /// summary sequence at `MAX + 1`; this step validates semantic invariants
+    /// that do not affect allocation: identifier order, body validity, summary
+    /// ranges, and the next ordinal.
     ///
     /// On any session the write path could have produced this is the identity
     /// function.
     fn restore(raw: RawSession) -> Result<Self, RestoreError> {
         let RawSession {
             id,
-            mut messages,
-            mut summaries,
+            messages,
+            summaries,
             next_ordinal,
         } = raw;
+        let messages = messages.into_inner();
+        let summaries = summaries.into_inner();
 
         // Recency is positional throughout this crate, so the ordering
         // invariant has to hold before anything decides what is oldest.
         if !messages.is_sorted_by(|earlier, later| earlier.id < later.id) {
             return Err(RestoreError::NonMonotonicMessages);
         }
-        shed_oldest_history(&mut messages);
-        if messages.len() > MAX_MESSAGES {
-            return Err(RestoreError::Bound(SessionError::TooManyMessages));
-        }
-        summaries.drain(..summaries.len().saturating_sub(MAX_SUMMARIES));
-
         for message in &messages {
             check_body(&message.content).map_err(RestoreError::Bound)?;
         }
@@ -481,6 +554,7 @@ impl<'de> Deserialize<'de> for Session {
     where
         D: Deserializer<'de>,
     {
+        reject_unbounded_json_reader::<D>()?;
         Self::restore(RawSession::deserialize(deserializer)?).map_err(de::Error::custom)
     }
 }
@@ -635,33 +709,42 @@ mod tests {
     }
 
     #[test]
-    fn an_over_long_history_sheds_its_oldest_ordinary_messages_and_still_loads() {
+    fn removal_and_a_refused_append_never_rewind_or_retain_a_message() {
+        let mut session = session();
+        let removed = session
+            .append(Role::System, "goal", 1)
+            .expect("goal appended");
+        assert!(session.remove(removed).is_some());
+        assert_eq!(session.next_message_id(), Some(MessageId::new(1)));
+
+        assert_eq!(
+            session.append(Role::User, "", 2),
+            Err(SessionError::EmptyMessage)
+        );
+        assert!(session.messages().is_empty());
+        assert_eq!(session.next_message_id(), Some(MessageId::new(1)));
+        assert_eq!(
+            session
+                .append(Role::User, "after clear", 3)
+                .expect("append succeeds"),
+            MessageId::new(1)
+        );
+    }
+
+    #[test]
+    fn max_plus_one_messages_are_rejected_by_the_bounded_sequence_visitor() {
         let mut messages = vec![
             message_json(0, Role::System, "rules", false),
             message_json(1, Role::User, "pinned", true),
         ];
-        for id in 2..=(MAX_MESSAGES as u64 + 2) {
+        for id in 2..=MAX_MESSAGES as u64 {
             messages.push(message_json(id, Role::User, "x", false));
         }
-        assert_eq!(messages.len(), MAX_MESSAGES + 3);
+        assert_eq!(messages.len(), MAX_MESSAGES + 1);
 
-        let restored = restore(&document(&messages, &[], MAX_MESSAGES as u64 + 3))
-            .expect("an over-long history loads rather than failing");
-        assert_eq!(restored.len(), MAX_MESSAGES, "the bound is restored");
-        let ids: Vec<u64> = restored
-            .messages()
-            .iter()
-            .map(|message| message.id.get())
-            .collect();
-        assert_eq!(
-            &ids[..3],
-            &[0, 1, 5],
-            "both anchors survive and the three oldest ordinary messages went"
-        );
-        assert_eq!(
-            ids.last().copied(),
-            Some(MAX_MESSAGES as u64 + 2),
-            "the newest message is always retained"
+        assert!(
+            restore(&document(&messages, &[], MAX_MESSAGES as u64 + 1)).is_err(),
+            "MAX+1 is detected before another Message is materialized"
         );
     }
 
@@ -673,22 +756,19 @@ mod tests {
         let error = restore(&document(&messages, &[], MAX_MESSAGES as u64 + 1))
             .expect_err("anchors cannot be shed to meet the bound");
         assert!(
-            error.to_string().contains("maximum number of messages"),
+            error.to_string().contains("at most 100000 elements"),
             "unexpected error: {error}"
         );
     }
 
     #[test]
-    fn surplus_summaries_are_restored_newest_first() {
-        let summaries: Vec<String> = (0..(MAX_SUMMARIES as u64 + 2))
+    fn max_plus_one_summaries_are_rejected_by_the_bounded_sequence_visitor() {
+        let summaries: Vec<String> = (0..=MAX_SUMMARIES as u64)
             .map(|ordinal| summary_json(ordinal, ordinal, "compacted"))
             .collect();
-        let restored = restore(&document(&[], &summaries, 0)).expect("loads");
-        assert_eq!(restored.summaries().len(), MAX_SUMMARIES);
-        assert_eq!(
-            restored.summaries()[0].first,
-            MessageId::new(2),
-            "the two oldest summaries are the ones shed"
+        assert!(
+            restore(&document(&[], &summaries, 0)).is_err(),
+            "MAX+1 is detected before another Summary is materialized"
         );
     }
 
@@ -731,7 +811,7 @@ mod tests {
         let error =
             restore(&document(&oversized, &[], 1)).expect_err("an oversized body is refused");
         assert!(
-            error.to_string().contains("exceeds the maximum size"),
+            error.to_string().contains("maximum is 1048576"),
             "unexpected error: {error}"
         );
 
