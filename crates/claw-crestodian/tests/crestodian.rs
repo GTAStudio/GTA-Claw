@@ -5,8 +5,8 @@ mod common;
 use claw_config::{ConfigSnapshot, load_file, parse_json5, to_json5};
 use claw_crestodian::{
     CRESTODIAN_STATE_SCHEMA_VERSION, ConfigCondition, Crestodian, CrestodianError, CrestodianState,
-    GuidedSetup, RecoveryAction, RecoveryGuidance, SetupAnswers, SetupConstraint, SetupField,
-    StateCondition,
+    GuidedSetup, RecoveryAction, RecoveryGuidance, RestoreFailure, SetupAnswers, SetupConstraint,
+    SetupField, StateCondition, inject_directory_sync_warning_for,
 };
 
 const VALID: &str = r#"
@@ -487,4 +487,51 @@ fn healthy_files_are_never_rewritten() {
 
 fn baseline() -> ConfigSnapshot {
     parse_json5(VALID, "baseline.json5").expect("baseline")
+}
+
+/// Proves that a `DirectorySyncFailed` warning emitted during config rollback
+/// ends up in `CrestodianError::Rollback::restore_failures` when
+/// `Crestodian::recover` cannot write the state file.
+///
+/// The failpoint is path-scoped so concurrent tests operating on different
+/// config paths cannot consume each other's injected warning.
+#[test]
+fn rollback_in_recover_surfaces_directory_sync_warning_in_restore_failures() {
+    let directory = common::TestDirectory::create();
+    let config_path = directory.path().join("config.json5");
+    let state_blocker = directory.path().join("state-parent-is-file");
+    let state_path = state_blocker.join("crestodian.json");
+
+    // Corrupt config triggers a repair; the blocked state path makes the
+    // subsequent state write fail, which forces a rollback of the config write.
+    let corrupt = b"{ definitely-not-valid-json5";
+    std::fs::write(&config_path, corrupt).expect("write corrupt config");
+    std::fs::write(&state_blocker, b"not-a-directory").expect("write state blocker");
+
+    // Arm the one-shot directory-sync warning for the config path.  It fires
+    // on the first `restore_bytes_atomically` call for that specific path.
+    // The guard disarms automatically on drop.
+    let _guard = inject_directory_sync_warning_for(&config_path);
+
+    let error = Crestodian::new(&config_path, &state_path)
+        .recover(&baseline(), CRESTODIAN_STATE_SCHEMA_VERSION.into())
+        .expect_err("state write failure must propagate as rollback");
+
+    let CrestodianError::Rollback {
+        restore_failures, ..
+    } = error
+    else {
+        panic!("expected CrestodianError::Rollback with restore_failures; got {error:?}");
+    };
+
+    assert!(
+        restore_failures.iter().any(|failure: &RestoreFailure| {
+            failure.path == config_path
+                && failure
+                    .message
+                    .contains("restore durability warning: directory sync failed")
+        }),
+        "restore_failures must carry the directory-sync warning for {}: got {restore_failures:?}",
+        config_path.display(),
+    );
 }

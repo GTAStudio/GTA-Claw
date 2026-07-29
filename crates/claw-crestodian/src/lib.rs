@@ -49,3 +49,7 @@ pub use setup::{
     GuidedSetup, SetupAnswers, SetupConstraint, SetupField, SetupQuestion, SetupReport,
 };
 pub use state::{CRESTODIAN_STATE_SCHEMA_VERSION, CrestodianState};
+
+pub use setup::test_failpoint::{
+    Guard as DirectorySyncWarningGuard, inject_directory_sync_warning_for,
+};

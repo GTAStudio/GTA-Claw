@@ -1255,3 +1255,118 @@ fn missing_explicit_source_is_authoritative_for_every_provider() {
         );
     }
 }
+
+/// Proves end-to-end crash-safety at the provider level:
+///
+/// 1. A crash after the staging write but before the target is replaced leaves
+///    a durable `Pending` receipt in the backup directory.
+/// 2. A fresh `apply` call (restart) calls `recover_pending_backups`, rolls
+///    back the partial write, and then re-applies the migration to completion.
+///
+/// No sleeps — the "crash" is deterministic via the path-scoped publish
+/// failpoint.  Using path-scoping means concurrent tests operating on different
+/// target paths are unaffected.
+#[test]
+fn overwrite_apply_crash_followed_by_restart_completes_migration() {
+    let root = TestDir::new("crash-restart");
+    let source = root.join("codex-home");
+    let target = root.join("target");
+    let backup_root = root.join("backup");
+    let config_target = target
+        .join("config")
+        .join("migrations")
+        .join("codex")
+        .join("config.toml");
+
+    write(
+        &source.join("config.toml"),
+        "api_key = \"crash-test-secret\"\n",
+    );
+    write(&config_target, "api_key = \"old-value\"\n");
+
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+
+    // First apply: failpoint fires after staging write, before the target is
+    // replaced.  The panic simulates a process crash.
+    {
+        let plan = CodexMigrationProvider
+            .plan(&PlanContext {
+                paths: &platform_paths,
+                source: Some(&source),
+                target_root: &target,
+                overwrite: true,
+                signer: &signer,
+            })
+            .expect("plan migration for crash test");
+
+        let target_ref = &target;
+        let backup_ref = &backup_root;
+        let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _fp = claw_migrate::test_publish_failpoint::set_for(
+                "after_staging_write",
+                &config_target,
+            );
+            let mut secrets = MemorySecretStore::default();
+            let mut ctx = ApplyContext {
+                target_root: target_ref,
+                backup_root: backup_ref,
+                overwrite: true,
+                secret_store: &mut secrets,
+            };
+            let _ = CodexMigrationProvider.apply(&mut ctx, &plan);
+        }));
+        assert!(crash.is_err(), "first apply must panic at the failpoint");
+    }
+
+    // A durable Pending receipt must exist so that restart can reconstruct the
+    // pre-crash state.
+    let pending_receipts: Vec<_> = fs::read_dir(&backup_root)
+        .expect("read backup root after crash")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect backup entries")
+        .into_iter()
+        .filter_map(|entry| {
+            let receipt = entry.path().join("receipt.json");
+            receipt.exists().then_some(receipt)
+        })
+        .collect();
+    assert_eq!(
+        pending_receipts.len(),
+        1,
+        "exactly one durable receipt must survive the simulated crash"
+    );
+
+    // Restart: a fresh apply with no active failpoint recovers the pending
+    // receipt (rolls back the partial write), then completes the migration.
+    let plan = CodexMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&source),
+            target_root: &target,
+            overwrite: true,
+            signer: &signer,
+        })
+        .expect("plan migration for restart");
+    let mut secrets = MemorySecretStore::default();
+    let mut ctx = ApplyContext {
+        target_root: &target,
+        backup_root: &backup_root,
+        overwrite: true,
+        secret_store: &mut secrets,
+    };
+    CodexMigrationProvider
+        .apply(&mut ctx, &plan)
+        .expect("restart must recover pending receipt then complete migration");
+
+    // The target must now carry the keyring reference, not plaintext.
+    let migrated = fs::read_to_string(&config_target).expect("read migrated config");
+    assert!(
+        migrated.contains("keyring://gta-claw/"),
+        "migrated config must carry a keyring reference; got: {migrated}"
+    );
+    assert!(
+        !migrated.contains("crash-test-secret"),
+        "migrated config must not expose the plaintext secret after restart"
+    );
+}

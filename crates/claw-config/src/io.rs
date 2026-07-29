@@ -284,8 +284,9 @@ impl DestinationLock {
         reject_lock_link_or_reparse(&lock_path)?;
         let file = open_destination_lock_file(&lock_path)?;
         file.lock()?;
-        file.sync_all()?;
-        sync_parent(&lock_path)?;
+        // The OS file lock is advisory; syncing the lock file itself adds latency
+        // with no correctness benefit.  The durable backup written during the
+        // migration is what must be fsync'd, not the lock sentinel.
         reject_lock_link_or_reparse(&lock_path)?;
         if !lock_file_matches_path(&file, &lock_path)? {
             return Err(unsafe_path(

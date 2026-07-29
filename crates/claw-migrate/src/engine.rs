@@ -1024,8 +1024,7 @@ fn apply_operations(
             &mut receipt.secrets,
         )?;
         sync_path_tree(&staged)?;
-        #[cfg(test)]
-        failpoint::trigger("after_staging_write");
+        test_publish_failpoint::trigger("after_staging_write", target);
         publish_staged_path(context.overwrite, target, &staged, index)?;
         record_applied_state(receipt, target)?;
     }
@@ -1183,22 +1182,19 @@ fn publish_staged_path(
     staged: &Path,
     _operation_index: usize,
 ) -> Result<(), MigrationError> {
-    #[cfg(test)]
-    failpoint::trigger("after_staging_write");
+    test_publish_failpoint::trigger("after_staging_write", target);
     if path_is_occupied(target) {
         if !overwrite {
             return Err(MigrationError::Conflict(target.to_path_buf()));
         }
-        #[cfg(test)]
-        failpoint::trigger("after_target_moved");
+        test_publish_failpoint::trigger("after_target_moved", target);
         fs::rename(staged, target).map_err(|source| MigrationError::Io {
             action: "publish staged migration target",
             path: target.to_path_buf(),
             source,
         })?;
         sync_parent_path(target)?;
-        #[cfg(test)]
-        failpoint::trigger("after_target_published");
+        test_publish_failpoint::trigger("after_target_published", target);
         return Ok(());
     }
     fs::rename(staged, target).map_err(|source| MigrationError::Io {
@@ -1207,10 +1203,7 @@ fn publish_staged_path(
         source,
     })?;
     sync_parent_path(target)?;
-    #[cfg(test)]
-    {
-        failpoint::trigger("after_target_published");
-    }
+    test_publish_failpoint::trigger("after_target_published", target);
     Ok(())
 }
 
@@ -1634,8 +1627,7 @@ fn append_file(source: &Path, target: &Path, heading: &str) -> Result<(), Migrat
     let staged = reserve_publish_path(target, "append")?;
     write_bytes(&staged, &existing)?;
     sync_path_tree(&staged)?;
-    #[cfg(test)]
-    failpoint::trigger("after_staging_write");
+    test_publish_failpoint::trigger("after_staging_write", target);
     publish_staged_path(true, target, &staged, 0)
 }
 
@@ -2799,27 +2791,45 @@ fn path_to_slashes(path: &Path) -> String {
         .join("/")
 }
 
-#[cfg(test)]
-mod failpoint {
+/// Test-only utilities for simulating process crashes deterministically.
+/// Exposed without `cfg(test)` so integration tests in `tests/` can reach them.
+#[doc(hidden)]
+#[allow(unreachable_pub)]
+pub mod test_publish_failpoint {
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    static ACTIVE: Mutex<Option<&'static str>> = Mutex::new(None);
+    // Path-scoped so concurrent tests operating on different target paths cannot
+    // trigger each other's injected crash.
+    static ACTIVE: Mutex<Option<(&'static str, PathBuf)>> = Mutex::new(None);
 
-    pub(super) struct Guard;
+    /// Held during the test; clears the active failpoint on drop.
+    pub struct Guard;
 
-    pub(super) fn set(name: &'static str) -> Guard {
-        *ACTIVE.lock().expect("lock failpoint") = Some(name);
+    /// Arms a failpoint at `checkpoint` scoped to `target_path`.
+    ///
+    /// Only a `trigger` call for the same `(checkpoint, target_path)` pair will
+    /// panic; concurrent tests operating on different paths are unaffected.
+    pub fn set_for(checkpoint: &'static str, target_path: impl AsRef<Path>) -> Guard {
+        *ACTIVE.lock().expect("lock failpoint") =
+            Some((checkpoint, target_path.as_ref().to_path_buf()));
         Guard
     }
 
-    pub(super) fn trigger(name: &str) {
-        if ACTIVE
-            .lock()
-            .expect("lock failpoint")
-            .is_some_and(|configured| configured == name)
-        {
-            panic!("injected crash at {name}");
-        }
+    pub(super) fn trigger(checkpoint: &str, target: &Path) {
+        let armed = {
+            let mut guard = ACTIVE.lock().expect("lock failpoint");
+            if guard
+                .as_ref()
+                .is_some_and(|(c, p)| *c == checkpoint && p == target)
+            {
+                *guard = None; // fire once, then disarm
+                true
+            } else {
+                false
+            }
+        };
+        assert!(!armed, "injected crash at {checkpoint}");
     }
 
     impl Drop for Guard {
@@ -2900,7 +2910,7 @@ mod crash_recovery_tests {
             let staged = reserve_publish_path(&target, "stage").expect("reserve stage");
             write_bytes(&staged, b"new-bytes").expect("write staged bytes");
             let crash = std::panic::catch_unwind(|| {
-                let _guard = failpoint::set(checkpoint);
+                let _guard = test_publish_failpoint::set_for(checkpoint, &target);
                 publish_staged_path(true, &target, &staged, 0).expect("publish staged path");
             });
             assert!(crash.is_err(), "expected injected crash at {checkpoint}");

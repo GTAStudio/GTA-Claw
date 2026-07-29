@@ -24,3 +24,5 @@ pub use engine::{
 };
 pub use platform::{HostPlatform, PlatformPaths, SystemPlatformPaths};
 pub use providers::{ClaudeMigrationProvider, CodexMigrationProvider, HermesMigrationProvider};
+
+pub use engine::test_publish_failpoint;

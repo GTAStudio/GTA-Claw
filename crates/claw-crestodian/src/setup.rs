@@ -391,31 +391,38 @@ fn restore_bytes_atomically(
     path: &Path,
     bytes: &[u8],
 ) -> Result<claw_config::WriteOutcome, claw_config::ConfigError> {
-    #[cfg(test)]
-    {
-        test_failpoint::restore_bytes_atomically(path, bytes)
-    }
-    #[cfg(not(test))]
-    {
-        claw_config::write_bytes_atomically(path, bytes)
-    }
+    // Always route through the test_failpoint wrapper so that integration
+    // tests (where the library is compiled without cfg(test)) can inject
+    // warnings via `inject_directory_sync_warning_for()`.  In production the
+    // injection path is never active; the overhead is one path-comparison per
+    // restore call, which only happens on error-recovery paths.
+    test_failpoint::restore_bytes_atomically(path, bytes)
 }
 
-#[cfg(test)]
-mod test_failpoint {
-    use std::path::Path;
+/// Test-only utilities for injecting `DirectorySyncFailed` warnings.
+/// Exposed without `cfg(test)` so integration tests in `tests/` can reach them.
+#[doc(hidden)]
+#[allow(unreachable_pub)]
+pub mod test_failpoint {
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     use claw_config::{ConfigError, WriteOutcome, WriteWarning, write_bytes_atomically};
 
-    static INJECT_DIRECTORY_SYNC_WARNING: Mutex<bool> = Mutex::new(false);
+    // Path-scoped so concurrent tests cannot consume each other's injected warning.
+    static INJECT_FOR_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-    pub(super) struct Guard;
+    /// Held for the duration of a test; clears the injected warning on drop.
+    pub struct Guard;
 
-    pub(super) fn inject_directory_sync_warning() -> Guard {
-        *INJECT_DIRECTORY_SYNC_WARNING
-            .lock()
-            .expect("lock restore failpoint") = true;
+    /// Arms a one-shot `DirectorySyncFailed` warning.
+    ///
+    /// Fires the next time `restore_bytes_atomically` is called for `path`
+    /// specifically.  Path-scoping prevents concurrent tests from consuming
+    /// each other's flag.
+    pub fn inject_directory_sync_warning_for(path: impl AsRef<Path>) -> Guard {
+        *INJECT_FOR_PATH.lock().expect("lock restore failpoint") =
+            Some(path.as_ref().to_path_buf());
         Guard
     }
 
@@ -425,14 +432,12 @@ mod test_failpoint {
     ) -> Result<WriteOutcome, ConfigError> {
         let mut outcome = write_bytes_atomically(path, bytes)?;
         let inject_warning = {
-            let mut enabled = INJECT_DIRECTORY_SYNC_WARNING
-                .lock()
-                .expect("lock restore failpoint");
-            let inject = *enabled;
-            if inject {
-                *enabled = false;
+            let mut inject_for = INJECT_FOR_PATH.lock().expect("lock restore failpoint");
+            let should_fire = inject_for.as_deref() == Some(path);
+            if should_fire {
+                *inject_for = None; // fire once, then disarm
             }
-            inject
+            should_fire
         };
         if inject_warning {
             let parent = path
@@ -446,11 +451,10 @@ mod test_failpoint {
         }
         Ok(outcome)
     }
+
     impl Drop for Guard {
         fn drop(&mut self) {
-            *INJECT_DIRECTORY_SYNC_WARNING
-                .lock()
-                .expect("lock restore failpoint") = false;
+            *INJECT_FOR_PATH.lock().expect("lock restore failpoint") = None;
         }
     }
 }
@@ -483,7 +487,7 @@ mod tests {
             teams_password_environment: None,
         };
 
-        let _guard = test_failpoint::inject_directory_sync_warning();
+        let _guard = test_failpoint::inject_directory_sync_warning_for(&config_path);
         let error = setup.apply(&answers).expect_err("state write must fail");
         let CrestodianError::Rollback {
             restore_failures, ..

@@ -485,6 +485,28 @@ mod lock_tests {
         assert!(matches!(outcome, ConfigMigrationOutcome::Migrated(_)));
         let _ = std::fs::remove_dir_all(&directory);
     }
+
+    /// Configs that are already at the current schema version return immediately
+    /// before any lock is acquired or created.  This is the hot path and must
+    /// not perform any I/O beyond the initial version read.
+    #[test]
+    fn already_current_config_does_not_create_lock_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "claw-config-versioning-no-lock-fast-path-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create directory");
+        let path = directory.join("config.json5");
+        let version_one = VERSION_ZERO.replace("schema_version: 0", "schema_version: 1");
+        std::fs::write(&path, version_one.as_bytes()).expect("write version one");
+        let lock = destination_lock_path_for_tests(&path);
+        assert!(!lock.exists(), "lock must not exist before fast-path call");
+        let outcome = migrate_config_file_with_precommit(&path, |_| {}).expect("fast path migrate");
+        assert!(matches!(outcome, ConfigMigrationOutcome::Current));
+        assert!(!lock.exists(), "fast path must not create a lock file");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 }
 
 #[cfg(unix)]
