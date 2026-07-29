@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { splitMessage } from "../dist/utils/splitMessage.js";
+import {
+  MessageGraphemeTooLongError,
+  splitMessage,
+} from "../dist/utils/splitMessage.js";
 
 function hasUnpairedSurrogate(value) {
   for (let index = 0; index < value.length; index += 1) {
@@ -18,6 +21,7 @@ function hasUnpairedSurrogate(value) {
 
 test("splitMessage preserves newline and word split preferences", () => {
   assert.deepEqual(splitMessage("12345\n67890", 6), ["12345", "67890"]);
+  assert.deepEqual(splitMessage("12345\r\n67890", 8), ["12345", "67890"]);
   assert.deepEqual(splitMessage("hello world", 7), ["hello", "world"]);
 });
 
@@ -34,6 +38,39 @@ test("splitMessage repairs malformed UTF-16 and preserves code-unit limits", () 
   assert.equal(chunks.join(""), "a\uFFFDb\uFFFDc");
   assert.ok(chunks.every((chunk) => chunk.length <= 2));
   assert.ok(chunks.every((chunk) => !hasUnpairedSurrogate(chunk)));
+});
 
-  assert.deepEqual(splitMessage("😀", 1), ["\uFFFD"]);
+test("splitMessage keeps combining and ZWJ graphemes intact", () => {
+  const combining = splitMessage("Ae\u0301B", 2);
+  assert.deepEqual(combining, ["A", "e\u0301", "B"]);
+  assert.equal(combining.join(""), "Ae\u0301B");
+
+  const family = "👨‍👩‍👧‍👦";
+  const zwj = splitMessage(`a${family}b`, 1 + family.length);
+  assert.deepEqual(zwj, [`a${family}`, "b"]);
+  assert.equal(zwj.join(""), `a${family}b`);
+});
+
+test("splitMessage trims separators only at whole grapheme boundaries", () => {
+  const chunks = splitMessage("abc \u0301d", 3);
+  assert.deepEqual(chunks, ["abc", " \u0301d"]);
+  assert.equal(chunks.join(""), "abc \u0301d");
+});
+
+test("splitMessage rejects an indivisible grapheme over the code-unit limit", () => {
+  assert.throws(
+    () => splitMessage("😀", 1),
+    (err) => {
+      assert.ok(err instanceof MessageGraphemeTooLongError);
+      assert.equal(err.grapheme, "😀");
+      assert.equal(err.maxLength, 1);
+      return true;
+    },
+  );
+
+  const family = "👨‍👩‍👧‍👦";
+  assert.throws(
+    () => splitMessage(family, family.length - 1),
+    MessageGraphemeTooLongError,
+  );
 });

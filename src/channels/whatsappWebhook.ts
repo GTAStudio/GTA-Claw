@@ -100,7 +100,8 @@ export function captureWhatsAppRawBody(whatsappPath: string) {
 
 interface PendingWhatsAppReply {
   to: string;
-  chunks: string[];
+  reply: string;
+  chunks?: string[];
   nextChunk: number;
 }
 
@@ -335,11 +336,15 @@ export class WhatsAppWebhookHandler {
       });
       pendingReply = {
         to: from,
-        chunks: reply.trim() ? splitMessage(reply, 3500) : [],
+        reply,
         nextChunk: 0,
       };
       this.pendingReplies.set(messageId, pendingReply);
     }
+
+    pendingReply.chunks ??= pendingReply.reply.trim()
+      ? splitMessage(pendingReply.reply, 3500)
+      : [];
 
     while (pendingReply.nextChunk < pendingReply.chunks.length) {
       await this.sendText(

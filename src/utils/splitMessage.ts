@@ -1,13 +1,40 @@
+const graphemeSegmenter = new Intl.Segmenter(undefined, {
+  granularity: "grapheme",
+});
+const whitespaceGrapheme = /^\s+$/u;
+
+function trimLeadingWhitespaceGraphemes(value: string): string {
+  let trimAt = 0;
+  for (const { index, segment } of graphemeSegmenter.segment(value)) {
+    if (!whitespaceGrapheme.test(segment)) break;
+    trimAt = index + segment.length;
+  }
+  return value.slice(trimAt);
+}
+
+export class MessageGraphemeTooLongError extends RangeError {
+  constructor(
+    readonly grapheme: string,
+    readonly maxLength: number,
+  ) {
+    super(
+      `A message grapheme uses ${grapheme.length} UTF-16 code units, exceeding the ${maxLength}-unit limit`,
+    );
+    this.name = "MessageGraphemeTooLongError";
+  }
+}
+
 export function splitMessage(text: string, maxLength: number): string[] {
   if (!Number.isInteger(maxLength) || maxLength < 1) {
     throw new RangeError("maxLength must be a positive integer");
   }
 
-  let normalized = text.toWellFormed();
-  if (maxLength === 1) {
-    normalized = Array.from(normalized, (character) =>
-      character.length === 1 ? character : "\uFFFD",
-    ).join("");
+  const normalized = text.toWellFormed();
+  const graphemes = Array.from(graphemeSegmenter.segment(normalized));
+  for (const { segment } of graphemes) {
+    if (segment.length > maxLength) {
+      throw new MessageGraphemeTooLongError(segment, maxLength);
+    }
   }
 
   if (normalized.length <= maxLength) return [normalized];
@@ -21,33 +48,35 @@ export function splitMessage(text: string, maxLength: number): string[] {
       break;
     }
 
-    let splitAt = remaining.lastIndexOf("\n", maxLength);
+    let hardSplitAt = 0;
+    let newlineSplitAt = -1;
+    let wordSplitAt = -1;
+    for (const { index, segment } of graphemeSegmenter.segment(remaining)) {
+      if (index > maxLength) break;
+
+      if (segment === "\n" || segment === "\r\n" || segment === "\r") {
+        newlineSplitAt = index;
+      } else if (segment === " ") {
+        wordSplitAt = index;
+      }
+
+      const end = index + segment.length;
+      if (end <= maxLength) {
+        hardSplitAt = end;
+      }
+    }
+
+    let splitAt = newlineSplitAt;
     if (splitAt < maxLength * 0.5) {
-      splitAt = remaining.lastIndexOf(" ", maxLength);
+      splitAt = wordSplitAt;
     }
     if (splitAt < maxLength * 0.3) {
-      splitAt = maxLength;
-    }
-    if (
-      splitAt > 0 &&
-      splitAt < remaining.length &&
-      isHighSurrogate(remaining.charCodeAt(splitAt - 1)) &&
-      isLowSurrogate(remaining.charCodeAt(splitAt))
-    ) {
-      splitAt -= 1;
+      splitAt = hardSplitAt;
     }
 
     chunks.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).trimStart();
+    remaining = trimLeadingWhitespaceGraphemes(remaining.slice(splitAt));
   }
 
   return chunks;
-}
-
-function isHighSurrogate(codeUnit: number): boolean {
-  return codeUnit >= 0xd800 && codeUnit <= 0xdbff;
-}
-
-function isLowSurrogate(codeUnit: number): boolean {
-  return codeUnit >= 0xdc00 && codeUnit <= 0xdfff;
 }

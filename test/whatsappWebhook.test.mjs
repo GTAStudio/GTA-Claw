@@ -219,6 +219,32 @@ test("WhatsApp outbound retry resumes at the failed reply chunk", async () => {
   assert.equal(sentChunks[2], "b");
 });
 
+test("WhatsApp checkpoints a generated reply before grapheme validation", async () => {
+  let handled = 0;
+  let sends = 0;
+  const handler = createHandler({
+    onMessage: async () => {
+      handled += 1;
+      return `a${"\u0301".repeat(3500)}`;
+    },
+    fetchFn: async () => {
+      sends += 1;
+      return new Response(null, { status: 200 });
+    },
+  });
+  const request = signedRequest(webhookBody("wamid.oversized-grapheme"));
+
+  const first = responseRecorder();
+  await handler.incoming(request, first, () => undefined);
+  assert.equal(first.calls[0].status, 500);
+
+  const retried = responseRecorder();
+  await handler.incoming(request, retried, () => undefined);
+  assert.equal(retried.calls[0].status, 500);
+  assert.equal(handled, 1);
+  assert.equal(sends, 0);
+});
+
 test("WhatsApp coalesces concurrent deliveries of the same message id", async () => {
   let handled = 0;
   let sends = 0;

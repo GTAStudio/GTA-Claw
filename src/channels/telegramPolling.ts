@@ -30,6 +30,13 @@ interface TelegramGetUpdatesResponse {
   result: TelegramUpdate[];
 }
 
+interface TelegramDeliveryCheckpoint {
+  chatId: number;
+  answer: string;
+  chunks?: string[];
+  nextChunk: number;
+}
+
 export interface TelegramPollingOptions {
   botToken: string;
   pollIntervalMs: number;
@@ -48,8 +55,14 @@ export class TelegramPollingClient {
   private readonly fetchFn: typeof defaultFetch;
   private running = false;
   private loopPromise: Promise<void> | null = null;
+  private lifecyclePromise: Promise<void> = Promise.resolve();
   private lifecycleController: AbortController | null = null;
   private offset = 0;
+  // Checkpoints survive stop/start on this client; a process restart relies on Telegram redelivery.
+  private readonly deliveryCheckpoints = new Map<
+    number,
+    TelegramDeliveryCheckpoint
+  >();
 
   constructor(options: TelegramPollingOptions) {
     this.baseUrl = `https://api.telegram.org/bot${options.botToken}`;
@@ -58,27 +71,36 @@ export class TelegramPollingClient {
     this.fetchFn = options.fetchFn ?? defaultFetch;
   }
 
-  async start(): Promise<void> {
-    if (this.running) return;
-    this.running = true;
-    this.lifecycleController = new AbortController();
-    this.loopPromise = this.loop(this.lifecycleController.signal);
-    logger.info("Telegram polling client started");
+  start(): Promise<void> {
+    const startPromise = this.lifecyclePromise.then(() => {
+      if (this.running) return;
+
+      this.running = true;
+      this.lifecycleController = new AbortController();
+      this.loopPromise = this.loop(this.lifecycleController.signal);
+      logger.info("Telegram polling client started");
+    });
+    this.lifecyclePromise = startPromise.catch(() => undefined);
+    return startPromise;
   }
 
-  async stop(): Promise<void> {
-    this.running = false;
-    this.lifecycleController?.abort();
-    this.lifecycleController = null;
+  stop(): Promise<void> {
+    const stopPromise = this.lifecyclePromise.then(async () => {
+      this.running = false;
+      this.lifecycleController?.abort();
+      this.lifecycleController = null;
 
-    const loopPromise = this.loopPromise;
-    if (loopPromise) {
-      await loopPromise;
-      if (this.loopPromise === loopPromise) {
-        this.loopPromise = null;
+      const loopPromise = this.loopPromise;
+      if (loopPromise) {
+        await loopPromise;
+        if (this.loopPromise === loopPromise) {
+          this.loopPromise = null;
+        }
       }
-    }
-    logger.info("Telegram polling client stopped");
+      logger.info("Telegram polling client stopped");
+    });
+    this.lifecyclePromise = stopPromise.catch(() => undefined);
+    return stopPromise;
   }
 
   private async loop(signal: AbortSignal): Promise<void> {
@@ -145,6 +167,13 @@ export class TelegramPollingClient {
   }
 
   private async handleUpdate(update: TelegramUpdate): Promise<void> {
+    const existingCheckpoint = this.deliveryCheckpoints.get(update.update_id);
+    if (existingCheckpoint) {
+      await this.deliverCheckpoint(existingCheckpoint);
+      this.deliveryCheckpoints.delete(update.update_id);
+      return;
+    }
+
     const msg = update.message;
     if (!msg?.text?.trim()) {
       return;
@@ -164,17 +193,28 @@ export class TelegramPollingClient {
 
     if (!answer.trim()) return;
 
-    await this.sendMessage(msg.chat.id, answer);
+    const checkpoint: TelegramDeliveryCheckpoint = {
+      chatId: msg.chat.id,
+      answer,
+      nextChunk: 0,
+    };
+    this.deliveryCheckpoints.set(update.update_id, checkpoint);
+    await this.deliverCheckpoint(checkpoint);
+    this.deliveryCheckpoints.delete(update.update_id);
   }
 
-  private async sendMessage(chatId: number, text: string): Promise<void> {
-    const chunks = splitMessage(text, 4000);
-    for (const chunk of chunks) {
+  private async deliverCheckpoint(
+    checkpoint: TelegramDeliveryCheckpoint,
+  ): Promise<void> {
+    checkpoint.chunks ??= splitMessage(checkpoint.answer, 4000);
+
+    while (checkpoint.nextChunk < checkpoint.chunks.length) {
+      const chunk = checkpoint.chunks[checkpoint.nextChunk];
       const resp = await this.fetchFn(`${this.baseUrl}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          chat_id: chatId,
+          chat_id: checkpoint.chatId,
           text: chunk,
           disable_web_page_preview: true,
         }),
@@ -184,6 +224,7 @@ export class TelegramPollingClient {
       if (!resp.ok) {
         throw new Error(`Telegram sendMessage failed: ${resp.status}`);
       }
+      checkpoint.nextChunk += 1;
     }
   }
 }
