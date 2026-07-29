@@ -338,7 +338,8 @@ async fn chat(
     .await
     {
         Ok(Ok(reply)) => json_response(StatusCode::OK, &json!({"reply":reply})),
-        Ok(Err(_)) | Err(_) => legacy_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"),
+        Ok(Err(error)) => legacy_chat_error(&error),
+        Err(_) => legacy_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"),
     }
 }
 
@@ -863,6 +864,21 @@ async fn read_legacy_json(state: &LegacyState, request: Request) -> Result<Value
 
 fn legacy_error(status: StatusCode, message: &str) -> Response {
     json_response(status, &json!({"error":message}))
+}
+
+fn legacy_chat_error(error: &PortError) -> Response {
+    if error.kind == PortErrorKind::CommittedButNotDurable {
+        return json_response(
+            StatusCode::CONFLICT,
+            &json!({
+                "error":error.message,
+                "type":"committed_but_not_durable",
+                "retryable":false,
+                "stateMayAlreadyBeCommitted":true
+            }),
+        );
+    }
+    legacy_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
 }
 
 fn no_store(mut response: Response) -> Response {

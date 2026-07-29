@@ -957,6 +957,9 @@ impl ToolPortBridge {
             PortErrorKind::Unavailable | PortErrorKind::Timeout => {
                 RuntimePortError::Unavailable(error.message)
             }
+            PortErrorKind::CommittedButNotDurable => {
+                RuntimePortError::CommittedButNotDurable(error.message)
+            }
             PortErrorKind::Internal => RuntimePortError::Unavailable(error.message),
         })
     }
@@ -1539,8 +1542,10 @@ fn runtime_http_error(error: &RuntimeError) -> PortError {
         claw_runtime::RuntimeFailureClass::Busy
         | claw_runtime::RuntimeFailureClass::Unavailable
         | claw_runtime::RuntimeFailureClass::Cancelled => PortErrorKind::Unavailable,
-        claw_runtime::RuntimeFailureClass::CommittedButNotDurable
-        | claw_runtime::RuntimeFailureClass::Internal => PortErrorKind::Internal,
+        claw_runtime::RuntimeFailureClass::CommittedButNotDurable => {
+            PortErrorKind::CommittedButNotDurable
+        }
+        claw_runtime::RuntimeFailureClass::Internal => PortErrorKind::Internal,
     };
     PortError::new(kind, format!("{} ({})", error.user_message(), error))
 }
@@ -1570,7 +1575,10 @@ mod tests {
     use claw_application::ports::state::{SessionSnapshot, StatePort};
     use claw_domain::SessionId;
 
-    use super::{MemoryContextEngine, RuntimeStateStore, goal_http_outcome};
+    use super::{
+        MemoryContextEngine, PortError, PortErrorKind, RuntimeError, RuntimeStateStore,
+        ToolPortBridge, goal_http_outcome, runtime_http_error,
+    };
 
     #[tokio::test]
     async fn runtime_state_rejects_stale_revisions() {
@@ -1785,6 +1793,30 @@ mod tests {
                 .error_message
                 .as_deref()
                 .is_some_and(|message| message.contains("do not retry blindly"))
+        );
+
+        let runtime_error = RuntimeError::Goal(claw_runtime::GoalError::Port(
+            claw_application::ports::PortError::CommittedButNotDurable(
+                "record committed; do not retry blindly".to_owned(),
+            ),
+        ));
+        let http_error = runtime_http_error(&runtime_error);
+        assert_eq!(
+            http_error.kind,
+            claw_http_api::PortErrorKind::CommittedButNotDurable
+        );
+        assert!(http_error.message.contains("Do not retry blindly"));
+
+        let runtime_port_error = ToolPortBridge::map_http::<()>(Err(PortError::new(
+            PortErrorKind::CommittedButNotDurable,
+            "state may already be committed",
+        )))
+        .expect_err("degraded durability remains a typed tool error");
+        assert_eq!(
+            runtime_port_error,
+            claw_application::ports::PortError::CommittedButNotDurable(
+                "state may already be committed".to_owned()
+            )
         );
     }
 }

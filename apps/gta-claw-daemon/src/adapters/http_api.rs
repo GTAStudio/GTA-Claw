@@ -1747,6 +1747,13 @@ fn admin_port_failure(error: PortError) -> AdminFailure {
             retryable: Some(true),
             retry_after_ms: None,
         },
+        PortErrorKind::CommittedButNotDurable => AdminFailure {
+            code: "COMMITTED_BUT_NOT_DURABLE".to_owned(),
+            message: error.message,
+            details: None,
+            retryable: Some(false),
+            retry_after_ms: None,
+        },
         PortErrorKind::Internal => AdminFailure {
             code: "INTERNAL".to_owned(),
             message: error.message,

@@ -2538,6 +2538,11 @@ fn provider_api_error(error: PortError) -> ApiError {
         PortErrorKind::Timeout => {
             ApiError::openai(StatusCode::GATEWAY_TIMEOUT, error.message, "api_error")
         }
+        PortErrorKind::CommittedButNotDurable => ApiError::openai(
+            StatusCode::CONFLICT,
+            error.message,
+            "committed_but_not_durable",
+        ),
         PortErrorKind::Internal => ApiError::openai(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal error",
