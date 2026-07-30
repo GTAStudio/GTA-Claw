@@ -539,6 +539,7 @@ channel = "1.96.0"
             $window -match 'New-ArtifactSupplyChain') {
             throw 'Certificate-active Windows phase executes build or supply-chain code.'
         }
+    }
         $cleanupContracts = @(
             @{
                 Name = 'package import failure'
@@ -591,16 +592,22 @@ channel = "1.96.0"
         }
         if ([regex]::Matches($workflow, '-DeleteKey').Count -ne 5 -or
             [regex]::Matches($workflow, 'cleanup-thumbprints=').Count -ne 2 -or
-            [regex]::Matches($workflow, '\$certificates = @\(Import-PfxCertificate').Count -ne 2 -or
-            [regex]::Matches($workflow, 'Protected .* PFX must contain exactly one certificate').Count -ne 2) {
+            [regex]::Matches($workflow, 'Get-PfxData -FilePath \$pfx -Password \$secure').Count -ne 2 -or
+            [regex]::Matches($workflow, '\$null = @\(Import-PfxCertificate').Count -ne 2 -or
+            [regex]::Matches($workflow, 'Protected .* PFX must import exactly one matching private-key signer').Count -ne 2) {
             throw 'Windows signing identity cleanup does not fail closed and delete private keys.'
         }
         foreach ($certificateWindow in @($packageCertificateWindow, $bundleCertificateWindow)) {
-            $derivationIndex = $certificateWindow.IndexOf('$cleanupThumbprints = @(')
+            $derivationIndex = $certificateWindow.IndexOf(
+                '$pfxThumbprints = @($pfxCertificates |'
+            )
+            $cleanupBindingIndex = $certificateWindow.IndexOf(
+                '$cleanupThumbprints = $pfxThumbprints'
+            )
             $retentionIndex = $certificateWindow.IndexOf('cleanup-thumbprints=')
-            $cardinalityIndex = $certificateWindow.IndexOf('$certificates.Count -ne 1')
+            $cardinalityIndex = $certificateWindow.IndexOf('$signingCertificates.Count -ne 1')
             $signerOutputIndex = $certificateWindow.IndexOf('"thumbprint=$($certificate.Thumbprint)"')
-            $postImportTryIndex = $certificateWindow.IndexOf('try {', $derivationIndex)
+            $postImportTryIndex = $certificateWindow.IndexOf('try {', $cleanupBindingIndex)
             $cleanupCatchIndex = $certificateWindow.IndexOf('$postImportError = $_')
             $cleanupCallIndex = $certificateWindow.LastIndexOf('Remove-ImportedCertificates')
             $cleanupLoopIndex = $certificateWindow.IndexOf(
@@ -610,7 +617,8 @@ channel = "1.96.0"
                 'if ($cleanupFailures.Count -gt 0)'
             )
             if ($derivationIndex -lt 0 -or
-                $postImportTryIndex -le $derivationIndex -or
+                $cleanupBindingIndex -le $derivationIndex -or
+                $postImportTryIndex -le $cleanupBindingIndex -or
                 $retentionIndex -le $postImportTryIndex -or
                 $cardinalityIndex -lt 0 -or
                 $retentionIndex -ge $cardinalityIndex -or
@@ -619,10 +627,12 @@ channel = "1.96.0"
                 $cleanupCallIndex -le $cleanupCatchIndex -or
                 $cleanupLoopIndex -lt 0 -or
                 $cleanupAggregateIndex -le $cleanupLoopIndex -or
-                [regex]::Matches($certificateWindow, 'Remove-ImportedCertificates').Count -ne 2 -or
-                $certificateWindow -notmatch '\$cleanupThumbprints = @\(\$certificates \|' -or
+                [regex]::Matches($certificateWindow, 'Remove-ImportedCertificates').Count -ne 3 -or
+                $certificateWindow -notmatch '\$pfxData\.EndEntityCertificates' -or
+                $certificateWindow -notmatch '\$pfxData\.OtherCertificates' -or
                 $certificateWindow -notmatch 'ForEach-Object \{ \$_\.Thumbprint \}' -or
                 $certificateWindow -notmatch 'Sort-Object -Unique' -or
+                $certificateWindow -notmatch 'collides with an existing certificate' -or
                 $certificateWindow -notmatch 'throw \$postImportError') {
                 throw 'Windows import does not retain and exhaustively clean the full certificate set.'
             }
@@ -667,7 +677,6 @@ channel = "1.96.0"
             [regex]::Matches($workflow, [regex]::Escape($bundleSignerReference)).Count -ne 1) {
             throw 'Windows sign steps do not consume their validated single-certificate outputs.'
         }
-    }
     $signSource = [System.IO.File]::ReadAllText((Join-Path $scriptRoot 'sign.ps1'))
     if ($signSource -match '(?im)^\s*(cargo|rustc)\b' -or
         $signSource -match 'Assert-RustToolchain' -or

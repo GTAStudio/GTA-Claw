@@ -438,37 +438,64 @@ jobs:
           }
           $pfx = Join-Path $env:RUNNER_TEMP 'gta-claw-signing.pfx'
           [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX))
-          $certificates = @()
+          $pfxThumbprints = @()
           try {
             $secure = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
-            $certificates = @(Import-PfxCertificate `
+            $pfxData = Get-PfxData -FilePath $pfx -Password $secure
+            $pfxCertificates = @(
+              @($pfxData.EndEntityCertificates) +
+              @($pfxData.OtherCertificates)
+            )
+            $pfxThumbprints = @($pfxCertificates |
+              ForEach-Object { $_.Thumbprint } |
+              Where-Object { $_ -match '^[0-9A-Fa-f]{40}$' } |
+              Sort-Object -Unique)
+            if ($pfxCertificates.Count -eq 0 -or
+                $pfxThumbprints.Count -ne $pfxCertificates.Count) {
+              throw 'Protected package PFX certificate inventory is empty or ambiguous.'
+            }
+            foreach ($thumbprint in $pfxThumbprints) {
+              if (Test-Path -LiteralPath "Cert:\CurrentUser\My\$thumbprint") {
+                throw "Protected package PFX collides with an existing certificate: $thumbprint"
+              }
+            }
+            $null = @(Import-PfxCertificate `
               -FilePath $pfx `
               -CertStoreLocation Cert:\CurrentUser\My `
               -Password $secure `
               -Exportable:$false)
+          } catch {
+            $importError = $_
+            if ($pfxThumbprints.Count -gt 0) {
+              try {
+                Remove-ImportedCertificates `
+                  -Thumbprints $pfxThumbprints `
+                  -Failure 'Partially imported package certificate set remained after cleanup.'
+              } catch {
+                throw "$($importError.Exception.Message) Cleanup also failed: $($_.Exception.Message)"
+              }
+            }
+            throw $importError
           } finally {
             Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
           }
-          $cleanupThumbprints = @($certificates |
-            ForEach-Object { $_.Thumbprint } |
-            Where-Object { $_ -match '^[0-9A-Fa-f]{40}$' } |
-            Sort-Object -Unique)
+          $cleanupThumbprints = $pfxThumbprints
           try {
             if ($cleanupThumbprints.Count -gt 0) {
               "cleanup-thumbprints=$($cleanupThumbprints -join ',')" |
                 Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
             }
-            if ($certificates.Count -ne 1 -or
-                $cleanupThumbprints.Count -ne $certificates.Count) {
-              throw 'Protected package PFX must contain exactly one certificate.'
+            $storeCertificates = @($cleanupThumbprints | ForEach-Object {
+              Get-Item -LiteralPath "Cert:\CurrentUser\My\$_"
+            })
+            $signingCertificates = @($storeCertificates | Where-Object {
+              $_.HasPrivateKey -and $_.Subject -ceq $env:EXPECTED_PUBLISHER
+            })
+            if ($storeCertificates.Count -ne $cleanupThumbprints.Count -or
+                $signingCertificates.Count -ne 1) {
+              throw 'Protected package PFX must import exactly one matching private-key signer.'
             }
-            $certificate = $certificates[0]
-            if (-not $certificate.HasPrivateKey) {
-              throw 'Imported Windows certificate has no private key.'
-            }
-            if ($certificate.Subject -cne $env:EXPECTED_PUBLISHER) {
-              throw 'Imported Windows certificate subject differs from the reviewed publisher.'
-            }
+            $certificate = $signingCertificates[0]
             "thumbprint=$($certificate.Thumbprint)" |
               Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
             "publisher=$($certificate.Subject)" |
@@ -623,35 +650,64 @@ jobs:
           }
           $pfx = Join-Path $env:RUNNER_TEMP 'gta-claw-bundle-signing.pfx'
           [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX))
-          $certificates = @()
+          $pfxThumbprints = @()
           try {
             $secure = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
-            $certificates = @(Import-PfxCertificate `
+            $pfxData = Get-PfxData -FilePath $pfx -Password $secure
+            $pfxCertificates = @(
+              @($pfxData.EndEntityCertificates) +
+              @($pfxData.OtherCertificates)
+            )
+            $pfxThumbprints = @($pfxCertificates |
+              ForEach-Object { $_.Thumbprint } |
+              Where-Object { $_ -match '^[0-9A-Fa-f]{40}$' } |
+              Sort-Object -Unique)
+            if ($pfxCertificates.Count -eq 0 -or
+                $pfxThumbprints.Count -ne $pfxCertificates.Count) {
+              throw 'Protected bundle PFX certificate inventory is empty or ambiguous.'
+            }
+            foreach ($thumbprint in $pfxThumbprints) {
+              if (Test-Path -LiteralPath "Cert:\CurrentUser\My\$thumbprint") {
+                throw "Protected bundle PFX collides with an existing certificate: $thumbprint"
+              }
+            }
+            $null = @(Import-PfxCertificate `
               -FilePath $pfx `
               -CertStoreLocation Cert:\CurrentUser\My `
 ****** `
               -Exportable:$false)
+          } catch {
+            $importError = $_
+            if ($pfxThumbprints.Count -gt 0) {
+              try {
+                Remove-ImportedCertificates `
+                  -Thumbprints $pfxThumbprints `
+                  -Failure 'Partially imported bundle certificate set remained after cleanup.'
+              } catch {
+                throw "$($importError.Exception.Message) Cleanup also failed: $($_.Exception.Message)"
+              }
+            }
+            throw $importError
           } finally {
             Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
           }
-          $cleanupThumbprints = @($certificates |
-            ForEach-Object { $_.Thumbprint } |
-            Where-Object { $_ -match '^[0-9A-Fa-f]{40}$' } |
-            Sort-Object -Unique)
+          $cleanupThumbprints = $pfxThumbprints
           try {
             if ($cleanupThumbprints.Count -gt 0) {
               "cleanup-thumbprints=$($cleanupThumbprints -join ',')" |
                 Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
             }
-            if ($certificates.Count -ne 1 -or
-                $cleanupThumbprints.Count -ne $certificates.Count) {
-              throw 'Protected bundle PFX must contain exactly one certificate.'
+            $storeCertificates = @($cleanupThumbprints | ForEach-Object {
+              Get-Item -LiteralPath "Cert:\CurrentUser\My\$_"
+            })
+            $signingCertificates = @($storeCertificates | Where-Object {
+              $_.HasPrivateKey -and $_.Subject -ceq $env:EXPECTED_PUBLISHER
+            })
+            if ($storeCertificates.Count -ne $cleanupThumbprints.Count -or
+                $signingCertificates.Count -ne 1) {
+              throw 'Protected bundle PFX must import exactly one matching private-key signer.'
             }
-            $certificate = $certificates[0]
-            if (-not $certificate.HasPrivateKey -or
-                $certificate.Subject -cne $env:EXPECTED_PUBLISHER) {
-              throw 'Protected bundle signing identity is invalid.'
-            }
+            $certificate = $signingCertificates[0]
             "thumbprint=$($certificate.Thumbprint)" |
               Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           } catch {
