@@ -6,6 +6,7 @@ use serde_yaml_ng::{Mapping as YamlMapping, Value as YamlValue};
 use toml::Value as TomlValue;
 
 use crate::input::{DEFAULT_FILE_LIMIT, SafeRoot};
+use crate::policy::validate_windows_file_id_phase_a_transition;
 use crate::{PolicyError, PolicyResult, error};
 
 const MAX_REPOSITORY_FILES: usize = 50_000;
@@ -705,6 +706,7 @@ pub fn validate_repository_policy_transition(
     trusted: &SafeRoot,
     candidate: &SafeRoot,
 ) -> PolicyResult<()> {
+    validate_windows_file_id_phase_a_transition(trusted, candidate)?;
     let trusted_files = repository_files(trusted)?;
     let candidate_files = repository_files(candidate)?;
     let trusted_artifacts = legacy_artifacts(&trusted_files);

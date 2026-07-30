@@ -1,0 +1,32 @@
+[package]
+name = "claw-windows-file-id"
+description = "Audited retained-handle FILE_ID_INFO boundary for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[lints.rust]
+missing_docs = "warn"
+# Windows has no safe std API for FILE_ID_INFO. The module-level expectation in
+# lib.rs is the crate's sole audited FFI boundary.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+invalid_html_tags = "warn"
+private_intra_doc_links = "warn"
+unescaped_backticks = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+redundant_pub_crate = "allow"
+too_many_lines = "allow"

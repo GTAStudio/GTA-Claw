@@ -39,6 +39,42 @@ const LEGACY_VALIDATOR: &str = "crates/claw-security/tests/desktop_supply_chain_
 const LEGACY_FIXTURES: &str = "crates/claw-security/tests/fixtures/desktop_supply_chain_policy";
 const SQLITE_FILE_CONTROL_MEMBER: &str = "crates/claw-sqlite-file-control";
 const SQLITE_FILE_CONTROL_PACKAGE: &str = "claw-sqlite-file-control";
+const WINDOWS_FILE_ID_MEMBER: &str = "crates/claw-windows-file-id";
+const WINDOWS_FILE_ID_PACKAGE: &str = "claw-windows-file-id";
+const WINDOWS_FILE_ID_MANIFEST: &str = "crates/claw-windows-file-id/Cargo.toml";
+const WINDOWS_FILE_ID_SOURCE: &str = "crates/claw-windows-file-id/src/lib.rs";
+const WINDOWS_FILE_ID_CONSUMER_MANIFEST: &str = "crates/claw-conformance/Cargo.toml";
+/// Current-main commit against which the Phase-A1 admission was frozen.
+pub const WINDOWS_FILE_ID_ADMISSION_BASE_OID: &str =
+    "5e85d6d080712c82dc0814985df1472bdfab5dd9";
+/// Immutable PR226 source commit for the exact Windows file-ID helper.
+pub const WINDOWS_FILE_ID_SOURCE_OID: &str =
+    "4f91f20348b030cdf6817bc1bb9c527a999a25d2";
+/// Exact manifest blob at [`WINDOWS_FILE_ID_SOURCE_OID`].
+pub const WINDOWS_FILE_ID_MANIFEST_BLOB: &str =
+    "a9fad929ce2befd694bbb5144dd733011ae0e65f";
+/// Exact source blob at [`WINDOWS_FILE_ID_SOURCE_OID`].
+pub const WINDOWS_FILE_ID_SOURCE_BLOB: &str =
+    "375c6e7d4043c7168f512656ccc0902f0a9ea598";
+/// SHA-256 of the exact helper manifest bytes.
+pub const WINDOWS_FILE_ID_MANIFEST_SHA256: &str =
+    "2139338411341e1dae1db88972d05b23ff59ac8b32a10b0ec471b43d0da2af44";
+/// SHA-256 of the exact helper source bytes.
+pub const WINDOWS_FILE_ID_SOURCE_SHA256: &str =
+    "8561dd1f84b565332a48e497c86d8d926b33ee79d026c4336c9cdefb80f3a440";
+
+const WINDOWS_FILE_ID_BASE_ROOT_MANIFEST_SHA256: &str =
+    "38ec72b01870ad69272048d4af6b869ef2bf37347d6cc872cecbc015a4849111";
+const WINDOWS_FILE_ID_BASE_ROOT_LOCK_SHA256: &str =
+    "fa661b63680ba3205c5c59099b5f597d9ffa6950b55b6f7fe76e060b3a58cac5";
+const WINDOWS_FILE_ID_BASE_CONSUMER_MANIFEST_SHA256: &str =
+    "9e29b86db53ce16c13b5421afe05506b7352f39870ebe9d6f01f19f013153d6b";
+const WINDOWS_FILE_ID_ADMITTED_ROOT_MANIFEST_SHA256: &str =
+    "168a3d4e9a3775f45fb4308ac7b9e19b6281b7e91b362d08501dc9d818fdba1e";
+const WINDOWS_FILE_ID_ADMITTED_ROOT_LOCK_SHA256: &str =
+    "3388fcb660864eec04b17f5b4edc79bcb60cb6fc236c1ee437edba9a3e78f477";
+const WINDOWS_FILE_ID_ADMITTED_CONSUMER_MANIFEST_SHA256: &str =
+    "da769bc8b834e8804fa58ff17f4adfa76ee4924ea09cd0c643ac804cedb57e11";
 
 const FINAL_ROOT_DENY: &[u8] = include_bytes!("../policy/final/root-deny.toml.fixture");
 const FINAL_DESKTOP_MANIFEST: &[u8] = include_bytes!("../policy/final/desktop/Cargo.toml.fixture");
@@ -53,6 +89,10 @@ const FINAL_IOS_MANIFEST: &[u8] = include_bytes!("../../../../ios/Cargo.toml");
 const FINAL_IOS_APP_MANIFEST: &[u8] =
     include_bytes!("../../../../ios/apps/gta-claw-ios-shell/Cargo.toml");
 const FINAL_IOS_DENY: &[u8] = include_bytes!("../../../../ios/deny.toml");
+const FINAL_WINDOWS_FILE_ID_MANIFEST: &[u8] =
+    include_bytes!("../policy/final/crates/claw-windows-file-id/Cargo.toml.fixture");
+const FINAL_WINDOWS_FILE_ID_SOURCE: &[u8] =
+    include_bytes!("../policy/final/crates/claw-windows-file-id/src/lib.rs");
 type ExactFile = (&'static str, &'static [u8]);
 const FINAL_ANDROID_PACKAGING_INPUTS: [ExactFile; 5] = [
     (
@@ -604,6 +644,44 @@ fn require_exact_file(root: &SafeRoot, path: &str, expected: &[u8]) -> PolicyRes
     Ok(())
 }
 
+fn require_sha256(
+    root: &SafeRoot,
+    path: &str,
+    limit: u64,
+    expected: &str,
+    label: &str,
+) -> PolicyResult<()> {
+    let actual = sha256(&root.read_bytes(path, limit)?);
+    if actual != expected {
+        return Err(PolicyError::new(format!(
+            "{label} SHA-256 changed: {path} expected {expected}, found {actual}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_mode_0644(root: &SafeRoot, path: &str, limit: u64, label: &str) -> PolicyResult<()> {
+    let file = root.regular_file(path, limit)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = fs::metadata(file)
+            .map_err(|cause| error(&format!("inspect {label} mode {path}"), cause))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode != 0o644 {
+            return Err(PolicyError::new(format!(
+                "{label} mode changed: {path} is {mode:04o}, expected 0644"
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
+}
+
 fn require_exact_lf_file(root: &SafeRoot, path: &str, expected: &[u8]) -> PolicyResult<()> {
     let actual = root.read_bytes(path, DEFAULT_FILE_LIMIT.max(expected.len() as u64))?;
     if expected.contains(&b'\r')
@@ -1114,6 +1192,762 @@ fn validate_sqlite_file_control_lints(manifest: &TomlValue) -> PolicyResult<()> 
     Ok(())
 }
 
+fn validate_windows_file_id_lints(manifest: &TomlValue) -> PolicyResult<()> {
+    let lints = table(manifest, "lints")?;
+    let rust = lints
+        .get("rust")
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| PolicyError::new("claw-windows-file-id Rust lints are missing"))?;
+    let clippy = lints
+        .get("clippy")
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| PolicyError::new("claw-windows-file-id Clippy lints are missing"))?;
+    let rustdoc = lints
+        .get("rustdoc")
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| PolicyError::new("claw-windows-file-id rustdoc lints are missing"))?;
+    if keys(lints) != expected_keys(&["clippy", "rust", "rustdoc"])
+        || rust
+            != &toml::map::Map::from_iter([
+                (
+                    "missing_docs".to_owned(),
+                    TomlValue::String("warn".to_owned()),
+                ),
+                (
+                    "unsafe_code".to_owned(),
+                    TomlValue::String("deny".to_owned()),
+                ),
+                (
+                    "unsafe_op_in_unsafe_fn".to_owned(),
+                    TomlValue::String("deny".to_owned()),
+                ),
+                (
+                    "unreachable_pub".to_owned(),
+                    TomlValue::String("warn".to_owned()),
+                ),
+            ])
+        || clippy != &expected_clippy_lints()
+        || rustdoc != &expected_rustdoc_lints()
+    {
+        return Err(PolicyError::new(
+            "claw-windows-file-id's audited FFI lint exception changed",
+        ));
+    }
+    Ok(())
+}
+
+fn windows_file_id_dependency() -> TomlValue {
+    TomlValue::Table(toml::map::Map::from_iter([
+        (
+            "path".to_owned(),
+            TomlValue::String(WINDOWS_FILE_ID_MEMBER.to_owned()),
+        ),
+        (
+            "version".to_owned(),
+            TomlValue::String("0.1.0".to_owned()),
+        ),
+    ]))
+}
+
+fn windows_file_id_workspace_inheritance() -> TomlValue {
+    TomlValue::Table(toml::map::Map::from_iter([(
+        "workspace".to_owned(),
+        TomlValue::Boolean(true),
+    )]))
+}
+
+fn windows_file_id_windows_sys_dependency() -> TomlValue {
+    TomlValue::Table(toml::map::Map::from_iter([
+        (
+            "features".to_owned(),
+            TomlValue::Array(vec![
+                TomlValue::String("Win32_Foundation".to_owned()),
+                TomlValue::String("Win32_Storage_FileSystem".to_owned()),
+            ]),
+        ),
+        (
+            "version".to_owned(),
+            TomlValue::String("0.61.2".to_owned()),
+        ),
+    ]))
+}
+
+fn validate_windows_file_id_manifest_shape(manifest: &TomlValue) -> PolicyResult<()> {
+    validate_windows_file_id_lints(manifest)?;
+    let targets = table(manifest, "target")?;
+    let windows = targets
+        .get("cfg(windows)")
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| PolicyError::new("claw-windows-file-id Windows target is missing"))?;
+    let dependencies = windows
+        .get("dependencies")
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| PolicyError::new("claw-windows-file-id Windows dependencies are missing"))?;
+    if keys(targets) != expected_keys(&["cfg(windows)"])
+        || keys(windows) != expected_keys(&["dependencies"])
+        || dependencies.len() != 1
+        || dependencies.get("windows-sys") != Some(&windows_file_id_windows_sys_dependency())
+    {
+        return Err(PolicyError::new(
+            "claw-windows-file-id Windows API dependency surface changed",
+        ));
+    }
+    Ok(())
+}
+
+/// Requires the exact reviewed two-file Windows retained-handle identity boundary.
+pub fn validate_windows_file_id_boundary(root: &SafeRoot) -> PolicyResult<()> {
+    let actual = root
+        .list_tree(WINDOWS_FILE_ID_MEMBER, 2, 64 * 1024)?
+        .into_iter()
+        .map(|entry| entry.relative)
+        .collect::<Vec<_>>();
+    let expected = vec![
+        WINDOWS_FILE_ID_MANIFEST.to_owned(),
+        WINDOWS_FILE_ID_SOURCE.to_owned(),
+    ];
+    if actual != expected {
+        return Err(PolicyError::new(format!(
+            "claw-windows-file-id file inventory changed: expected {expected:?}, found {actual:?}"
+        )));
+    }
+    require_exact_file(
+        root,
+        WINDOWS_FILE_ID_MANIFEST,
+        FINAL_WINDOWS_FILE_ID_MANIFEST,
+    )?;
+    require_exact_file(root, WINDOWS_FILE_ID_SOURCE, FINAL_WINDOWS_FILE_ID_SOURCE)?;
+    for (path, expected_hash) in [
+        (
+            WINDOWS_FILE_ID_MANIFEST,
+            WINDOWS_FILE_ID_MANIFEST_SHA256,
+        ),
+        (WINDOWS_FILE_ID_SOURCE, WINDOWS_FILE_ID_SOURCE_SHA256),
+    ] {
+        require_sha256(
+            root,
+            path,
+            DEFAULT_FILE_LIMIT,
+            expected_hash,
+            "claw-windows-file-id",
+        )?;
+        require_mode_0644(root, path, DEFAULT_FILE_LIMIT, "claw-windows-file-id")?;
+    }
+    let manifest = parse_toml(root, WINDOWS_FILE_ID_MANIFEST, DEFAULT_FILE_LIMIT)?;
+    validate_windows_file_id_manifest_shape(&manifest)?;
+
+    let source = root.read_text(WINDOWS_FILE_ID_SOURCE, DEFAULT_FILE_LIMIT)?;
+    if source.matches("#[expect(").count() != 1
+        || source.matches("unsafe_code,").count() != 1
+        || source.matches("unsafe {").count() != 1
+        || source.contains("#![allow(unsafe_code")
+        || source.contains("#![expect(unsafe_code")
+        || source.matches("GetFileInformationByHandleEx(").count() != 1
+        || !source.contains(
+            "GetFileInformationByHandleEx(\n                raw_handle,\n                FileIdInfo,\n                (&raw mut info).cast(),\n                buffer_size,\n            )",
+        )
+        || !source.contains("let mut info = FILE_ID_INFO::default();")
+    {
+        return Err(PolicyError::new(
+            "claw-windows-file-id unsafe FFI scope changed",
+        ));
+    }
+    for required in [
+        "pub struct FileId {",
+        "pub const fn new(",
+        "pub const fn volume_serial_number(",
+        "pub const fn identifier(",
+        "pub fn from_handle(",
+        "pub(super) fn from_handle(",
+    ] {
+        if !source.contains(required) {
+            return Err(PolicyError::new(format!(
+                "claw-windows-file-id public/safe API contract is missing: {required}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+struct WindowsFileIdDependencyEdge {
+    manifest: String,
+    target: Option<String>,
+    kind: &'static str,
+    name: String,
+    declaration: TomlValue,
+}
+
+fn dependency_refers_to_windows_file_id(name: &str, value: &TomlValue) -> bool {
+    name == WINDOWS_FILE_ID_PACKAGE
+        || value
+            .as_table()
+            .and_then(|dependency| dependency.get("package"))
+            .and_then(TomlValue::as_str)
+            == Some(WINDOWS_FILE_ID_PACKAGE)
+}
+
+fn collect_windows_file_id_dependency_table(
+    manifest: &str,
+    target: Option<&str>,
+    kind: &'static str,
+    value: Option<&TomlValue>,
+    edges: &mut Vec<WindowsFileIdDependencyEdge>,
+) -> PolicyResult<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let dependencies = value
+        .as_table()
+        .ok_or_else(|| PolicyError::new(format!("{manifest} {kind} must be a TOML table")))?;
+    for (name, declaration) in dependencies {
+        if dependency_refers_to_windows_file_id(name, declaration) {
+            edges.push(WindowsFileIdDependencyEdge {
+                manifest: manifest.to_owned(),
+                target: target.map(str::to_owned),
+                kind,
+                name: name.to_owned(),
+                declaration: declaration.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn windows_file_id_consumer_edges(
+    root: &SafeRoot,
+) -> PolicyResult<Vec<WindowsFileIdDependencyEdge>> {
+    let mut edges = Vec::new();
+    for entry in root.list_all(MAX_REPOSITORY_FILES, MAX_REPOSITORY_BYTES)? {
+        let path = entry.relative;
+        if path == ROOT_MANIFEST
+            || path == WINDOWS_FILE_ID_MANIFEST
+            || path.rsplit('/').next() != Some("Cargo.toml")
+        {
+            continue;
+        }
+        let manifest = parse_toml(root, &path, DEFAULT_FILE_LIMIT)?;
+        for kind in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            collect_windows_file_id_dependency_table(
+                &path,
+                None,
+                kind,
+                manifest.get(kind),
+                &mut edges,
+            )?;
+        }
+        if let Some(targets) = manifest.get("target") {
+            let targets = targets
+                .as_table()
+                .ok_or_else(|| PolicyError::new(format!("{path} target must be a TOML table")))?;
+            for (target_name, target) in targets {
+                let target = target.as_table().ok_or_else(|| {
+                    PolicyError::new(format!("{path} target {target_name} must be a TOML table"))
+                })?;
+                for kind in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                    collect_windows_file_id_dependency_table(
+                        &path,
+                        Some(target_name),
+                        kind,
+                        target.get(kind),
+                        &mut edges,
+                    )?;
+                }
+            }
+        }
+    }
+    edges.sort_by(|left, right| {
+        left.manifest
+            .cmp(&right.manifest)
+            .then_with(|| left.target.cmp(&right.target))
+            .then_with(|| left.kind.cmp(right.kind))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(edges)
+}
+
+fn windows_file_id_root_dependencies(
+    root: &SafeRoot,
+) -> PolicyResult<Vec<(String, TomlValue)>> {
+    let manifest = parse_toml(root, ROOT_MANIFEST, DEFAULT_FILE_LIMIT)?;
+    let dependencies = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| PolicyError::new("root workspace dependencies are missing"))?;
+    Ok(dependencies
+        .iter()
+        .filter(|(name, declaration)| {
+            dependency_refers_to_windows_file_id(name, declaration)
+        })
+        .map(|(name, declaration)| (name.clone(), declaration.clone()))
+        .collect())
+}
+
+fn validate_windows_file_id_consumer_edges(root: &SafeRoot) -> PolicyResult<()> {
+    let root_dependencies = windows_file_id_root_dependencies(root)?;
+    let expected_root = vec![(
+        WINDOWS_FILE_ID_PACKAGE.to_owned(),
+        windows_file_id_dependency(),
+    )];
+    if root_dependencies != expected_root {
+        return Err(PolicyError::new(format!(
+            "root Windows file-ID workspace dependency changed: {root_dependencies:?}"
+        )));
+    }
+    let consumers = windows_file_id_consumer_edges(root)?;
+    let expected_consumers = vec![WindowsFileIdDependencyEdge {
+        manifest: WINDOWS_FILE_ID_CONSUMER_MANIFEST.to_owned(),
+        target: Some("cfg(windows)".to_owned()),
+        kind: "dependencies",
+        name: WINDOWS_FILE_ID_PACKAGE.to_owned(),
+        declaration: windows_file_id_workspace_inheritance(),
+    }];
+    if consumers != expected_consumers {
+        return Err(PolicyError::new(format!(
+            "Windows file-ID consumer edges must equal the one reviewed conformance edge: \
+             expected {expected_consumers:?}, found {consumers:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn windows_file_id_lock_package() -> TomlValue {
+    TomlValue::Table(toml::map::Map::from_iter([
+        (
+            "name".to_owned(),
+            TomlValue::String(WINDOWS_FILE_ID_PACKAGE.to_owned()),
+        ),
+        (
+            "version".to_owned(),
+            TomlValue::String("0.1.0".to_owned()),
+        ),
+        (
+            "dependencies".to_owned(),
+            TomlValue::Array(vec![TomlValue::String("windows-sys 0.61.2".to_owned())]),
+        ),
+    ]))
+}
+
+fn windows_sys_lock_package() -> TomlValue {
+    TomlValue::Table(toml::map::Map::from_iter([
+        (
+            "name".to_owned(),
+            TomlValue::String("windows-sys".to_owned()),
+        ),
+        (
+            "version".to_owned(),
+            TomlValue::String("0.61.2".to_owned()),
+        ),
+        (
+            "source".to_owned(),
+            TomlValue::String("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+        ),
+        (
+            "checksum".to_owned(),
+            TomlValue::String(
+                "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+                    .to_owned(),
+            ),
+        ),
+        (
+            "dependencies".to_owned(),
+            TomlValue::Array(vec![TomlValue::String("windows-link".to_owned())]),
+        ),
+    ]))
+}
+
+fn windows_link_lock_package() -> TomlValue {
+    TomlValue::Table(toml::map::Map::from_iter([
+        (
+            "name".to_owned(),
+            TomlValue::String("windows-link".to_owned()),
+        ),
+        (
+            "version".to_owned(),
+            TomlValue::String("0.2.1".to_owned()),
+        ),
+        (
+            "source".to_owned(),
+            TomlValue::String("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+        ),
+        (
+            "checksum".to_owned(),
+            TomlValue::String(
+                "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+                    .to_owned(),
+            ),
+        ),
+    ]))
+}
+
+fn unique_lock_package<'a>(
+    packages: &'a [TomlValue],
+    name: &str,
+    version: &str,
+) -> PolicyResult<&'a TomlValue> {
+    let mut matches = packages.iter().filter(|package| {
+        package.get("name").and_then(TomlValue::as_str) == Some(name)
+            && package.get("version").and_then(TomlValue::as_str) == Some(version)
+    });
+    let package = matches
+        .next()
+        .ok_or_else(|| PolicyError::new(format!("{name} {version} lock package is missing")))?;
+    if matches.next().is_some() {
+        return Err(PolicyError::new(format!(
+            "{name} {version} lock package is duplicated"
+        )));
+    }
+    Ok(package)
+}
+
+fn validate_windows_file_id_lock_resolution(root: &SafeRoot) -> PolicyResult<()> {
+    let lock = parse_toml(root, ROOT_LOCK, MAX_LOCK_BYTES)?;
+    let packages = lock
+        .get("package")
+        .and_then(TomlValue::as_array)
+        .ok_or_else(|| PolicyError::new("root lock package array is missing"))?;
+    if unique_lock_package(packages, WINDOWS_FILE_ID_PACKAGE, "0.1.0")?
+        != &windows_file_id_lock_package()
+    {
+        return Err(PolicyError::new(
+            "claw-windows-file-id lock package changed",
+        ));
+    }
+    if unique_lock_package(packages, "windows-sys", "0.61.2")?
+        != &windows_sys_lock_package()
+    {
+        return Err(PolicyError::new(
+            "windows-sys 0.61.2 lock resolution changed",
+        ));
+    }
+    if unique_lock_package(packages, "windows-link", "0.2.1")?
+        != &windows_link_lock_package()
+    {
+        return Err(PolicyError::new(
+            "windows-link 0.2.1 lock resolution changed",
+        ));
+    }
+    let conformance = unique_lock_package(packages, "claw-conformance", "0.1.0")?;
+    let helper_edges = conformance
+        .get("dependencies")
+        .and_then(TomlValue::as_array)
+        .ok_or_else(|| PolicyError::new("claw-conformance lock dependencies are missing"))?
+        .iter()
+        .filter(|dependency| dependency.as_str() == Some(WINDOWS_FILE_ID_PACKAGE))
+        .count();
+    if helper_edges != 1 {
+        return Err(PolicyError::new(
+            "claw-conformance lock must contain exactly one Windows file-ID edge",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_windows_file_id_inactive(root: &SafeRoot) -> PolicyResult<()> {
+    let root_dependencies = windows_file_id_root_dependencies(root)?;
+    let consumers = windows_file_id_consumer_edges(root)?;
+    let lock = parse_toml(root, ROOT_LOCK, MAX_LOCK_BYTES)?;
+    let lock_references = lock
+        .get("package")
+        .and_then(TomlValue::as_array)
+        .ok_or_else(|| PolicyError::new("root lock package array is missing"))?
+        .iter()
+        .any(|package| {
+            package.get("name").and_then(TomlValue::as_str)
+                == Some(WINDOWS_FILE_ID_PACKAGE)
+                || package
+                    .get("dependencies")
+                    .and_then(TomlValue::as_array)
+                    .is_some_and(|dependencies| {
+                        dependencies
+                            .iter()
+                            .any(|dependency| dependency.as_str() == Some(WINDOWS_FILE_ID_PACKAGE))
+                    })
+        });
+    if root.exists(WINDOWS_FILE_ID_MANIFEST)?
+        || root.exists(WINDOWS_FILE_ID_SOURCE)?
+        || !root_dependencies.is_empty()
+        || !consumers.is_empty()
+        || lock_references
+    {
+        return Err(PolicyError::new(
+            "repository contains a partial Windows file-ID admission",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_windows_file_id_admission_base(root: &SafeRoot) -> PolicyResult<()> {
+    for (path, limit, expected) in [
+        (
+            ROOT_MANIFEST,
+            DEFAULT_FILE_LIMIT,
+            WINDOWS_FILE_ID_BASE_ROOT_MANIFEST_SHA256,
+        ),
+        (
+            ROOT_LOCK,
+            MAX_LOCK_BYTES,
+            WINDOWS_FILE_ID_BASE_ROOT_LOCK_SHA256,
+        ),
+        (
+            WINDOWS_FILE_ID_CONSUMER_MANIFEST,
+            DEFAULT_FILE_LIMIT,
+            WINDOWS_FILE_ID_BASE_CONSUMER_MANIFEST_SHA256,
+        ),
+    ] {
+        require_sha256(root, path, limit, expected, "Phase A1 protected base")?;
+    }
+    Ok(())
+}
+
+fn validate_windows_file_id_admitted_hashes(root: &SafeRoot) -> PolicyResult<()> {
+    for (path, limit, expected) in [
+        (
+            ROOT_MANIFEST,
+            DEFAULT_FILE_LIMIT,
+            WINDOWS_FILE_ID_ADMITTED_ROOT_MANIFEST_SHA256,
+        ),
+        (
+            ROOT_LOCK,
+            MAX_LOCK_BYTES,
+            WINDOWS_FILE_ID_ADMITTED_ROOT_LOCK_SHA256,
+        ),
+        (
+            WINDOWS_FILE_ID_CONSUMER_MANIFEST,
+            DEFAULT_FILE_LIMIT,
+            WINDOWS_FILE_ID_ADMITTED_CONSUMER_MANIFEST_SHA256,
+        ),
+    ] {
+        require_sha256(root, path, limit, expected, "Phase A1 admitted surface")?;
+    }
+    Ok(())
+}
+
+fn validate_windows_file_id_manifest_delta(
+    trusted: &SafeRoot,
+    candidate: &SafeRoot,
+) -> PolicyResult<()> {
+    let mut expected = parse_toml(trusted, ROOT_MANIFEST, DEFAULT_FILE_LIMIT)?;
+    let workspace = expected
+        .get_mut("workspace")
+        .and_then(TomlValue::as_table_mut)
+        .ok_or_else(|| PolicyError::new("protected root workspace table is missing"))?;
+    let members = workspace
+        .get_mut("members")
+        .and_then(TomlValue::as_array_mut)
+        .ok_or_else(|| PolicyError::new("protected root workspace members are missing"))?;
+    if members
+        .iter()
+        .any(|member| member.as_str() == Some(WINDOWS_FILE_ID_MEMBER))
+    {
+        return Err(PolicyError::new(
+            "protected base already contains a partial Windows file-ID member",
+        ));
+    }
+    let position = members
+        .binary_search_by(|member| {
+            member
+                .as_str()
+                .unwrap_or_default()
+                .cmp(WINDOWS_FILE_ID_MEMBER)
+        })
+        .unwrap_or_else(|position| position);
+    members.insert(
+        position,
+        TomlValue::String(WINDOWS_FILE_ID_MEMBER.to_owned()),
+    );
+    let dependencies = workspace
+        .get_mut("dependencies")
+        .and_then(TomlValue::as_table_mut)
+        .ok_or_else(|| PolicyError::new("protected root workspace dependencies are missing"))?;
+    if dependencies
+        .insert(
+            WINDOWS_FILE_ID_PACKAGE.to_owned(),
+            windows_file_id_dependency(),
+        )
+        .is_some()
+    {
+        return Err(PolicyError::new(
+            "protected base already contains a partial Windows file-ID dependency",
+        ));
+    }
+    let actual = parse_toml(candidate, ROOT_MANIFEST, DEFAULT_FILE_LIMIT)?;
+    if actual != expected {
+        return Err(PolicyError::new(format!(
+            "Phase A1 root Cargo.toml must equal protected main plus only {WINDOWS_FILE_ID_MEMBER}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_windows_file_id_consumer_delta(
+    trusted: &SafeRoot,
+    candidate: &SafeRoot,
+) -> PolicyResult<()> {
+    let mut expected = parse_toml(
+        trusted,
+        WINDOWS_FILE_ID_CONSUMER_MANIFEST,
+        DEFAULT_FILE_LIMIT,
+    )?;
+    let root = expected
+        .as_table_mut()
+        .ok_or_else(|| PolicyError::new("protected conformance manifest is not a table"))?;
+    let target = TomlValue::Table(toml::map::Map::from_iter([(
+        "cfg(windows)".to_owned(),
+        TomlValue::Table(toml::map::Map::from_iter([(
+            "dependencies".to_owned(),
+            TomlValue::Table(toml::map::Map::from_iter([(
+                WINDOWS_FILE_ID_PACKAGE.to_owned(),
+                windows_file_id_workspace_inheritance(),
+            )])),
+        )])),
+    )]));
+    if root.insert("target".to_owned(), target).is_some() {
+        return Err(PolicyError::new(
+            "protected conformance manifest already contains a target table",
+        ));
+    }
+    let actual = parse_toml(
+        candidate,
+        WINDOWS_FILE_ID_CONSUMER_MANIFEST,
+        DEFAULT_FILE_LIMIT,
+    )?;
+    if actual != expected {
+        return Err(PolicyError::new(
+            "Phase A1 conformance Cargo.toml must equal protected main plus only the reviewed \
+             cfg(windows) claw-windows-file-id dependency",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_windows_file_id_lock_delta(
+    trusted: &SafeRoot,
+    candidate: &SafeRoot,
+) -> PolicyResult<()> {
+    let mut expected = parse_toml(trusted, ROOT_LOCK, MAX_LOCK_BYTES)?;
+    let packages = expected
+        .get_mut("package")
+        .and_then(TomlValue::as_array_mut)
+        .ok_or_else(|| PolicyError::new("protected root lock package array is missing"))?;
+    if packages.iter().any(|package| {
+        package.get("name").and_then(TomlValue::as_str)
+            == Some(WINDOWS_FILE_ID_PACKAGE)
+    }) {
+        return Err(PolicyError::new(
+            "protected base already contains a partial Windows file-ID lock package",
+        ));
+    }
+    {
+        let conformance = packages
+            .iter_mut()
+            .find(|package| {
+                package.get("name").and_then(TomlValue::as_str) == Some("claw-conformance")
+                    && package.get("version").and_then(TomlValue::as_str) == Some("0.1.0")
+            })
+            .and_then(TomlValue::as_table_mut)
+            .ok_or_else(|| PolicyError::new("protected claw-conformance lock package is missing"))?;
+        let dependencies = conformance
+            .get_mut("dependencies")
+            .and_then(TomlValue::as_array_mut)
+            .ok_or_else(|| {
+                PolicyError::new("protected claw-conformance lock dependencies are missing")
+            })?;
+        let position = dependencies
+            .binary_search_by(|dependency| {
+                dependency
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(WINDOWS_FILE_ID_PACKAGE)
+            })
+            .map_or_else(|position| position, |_| usize::MAX);
+        if position == usize::MAX {
+            return Err(PolicyError::new(
+                "protected base already contains a partial conformance Windows file-ID lock edge",
+            ));
+        }
+        dependencies.insert(
+            position,
+            TomlValue::String(WINDOWS_FILE_ID_PACKAGE.to_owned()),
+        );
+    }
+    let position = packages
+        .iter()
+        .position(|package| {
+            package
+                .get("name")
+                .and_then(TomlValue::as_str)
+                .is_some_and(|name| name > WINDOWS_FILE_ID_PACKAGE)
+        })
+        .unwrap_or(packages.len());
+    packages.insert(position, windows_file_id_lock_package());
+    let actual = parse_toml(candidate, ROOT_LOCK, MAX_LOCK_BYTES)?;
+    if actual != expected {
+        return Err(PolicyError::new(
+            "Phase A1 Cargo.lock must equal protected main plus only the helper package and \
+             conformance dependency edge",
+        ));
+    }
+    Ok(())
+}
+
+/// Requires PR226's helper to enter frozen current main with its exact declared consumer edge.
+pub fn validate_windows_file_id_phase_a_transition(
+    trusted: &SafeRoot,
+    candidate: &SafeRoot,
+) -> PolicyResult<()> {
+    let trusted_files = (
+        trusted.exists(WINDOWS_FILE_ID_MANIFEST)?,
+        trusted.exists(WINDOWS_FILE_ID_SOURCE)?,
+    );
+    let candidate_files = (
+        candidate.exists(WINDOWS_FILE_ID_MANIFEST)?,
+        candidate.exists(WINDOWS_FILE_ID_SOURCE)?,
+    );
+    if trusted_files.0 != trusted_files.1 {
+        return Err(PolicyError::new(
+            "protected base contains a partial Windows file-ID helper",
+        ));
+    }
+    if candidate_files.0 != candidate_files.1 {
+        return Err(PolicyError::new(
+            "candidate contains a partial Windows file-ID helper",
+        ));
+    }
+    let trusted_present = trusted_files.0;
+    let candidate_present = candidate_files.0;
+    if trusted_present && !candidate_present {
+        return Err(PolicyError::new(
+            "candidate removed the protected Windows file-ID helper",
+        ));
+    }
+    if !candidate_present {
+        validate_windows_file_id_inactive(candidate)?;
+        return Ok(());
+    }
+    validate_windows_file_id_boundary(candidate)?;
+    validate_windows_file_id_consumer_edges(candidate)?;
+    validate_windows_file_id_lock_resolution(candidate)?;
+    if trusted_present {
+        return Ok(());
+    }
+    validate_windows_file_id_inactive(trusted)?;
+    validate_windows_file_id_admission_base(trusted)?;
+    validate_windows_file_id_admitted_hashes(candidate)?;
+    validate_windows_file_id_manifest_delta(trusted, candidate)?;
+    validate_windows_file_id_consumer_delta(trusted, candidate)?;
+    validate_windows_file_id_lock_delta(trusted, candidate)?;
+    for (path, limit) in [
+        (ROOT_MANIFEST, DEFAULT_FILE_LIMIT),
+        (ROOT_LOCK, MAX_LOCK_BYTES),
+        (WINDOWS_FILE_ID_CONSUMER_MANIFEST, DEFAULT_FILE_LIMIT),
+    ] {
+        require_mode_0644(candidate, path, limit, "Phase A1 admitted surface")?;
+    }
+    Ok(())
+}
+
 fn validate_member_manifest(
     root: &SafeRoot,
     member: &str,
@@ -1202,6 +2036,9 @@ fn validate_member_manifest(
         }
     } else if member == SQLITE_FILE_CONTROL_MEMBER && name == SQLITE_FILE_CONTROL_PACKAGE {
         validate_sqlite_file_control_lints(&manifest)?;
+    } else if member == WINDOWS_FILE_ID_MEMBER && name == WINDOWS_FILE_ID_PACKAGE {
+        validate_windows_file_id_manifest_shape(&manifest)?;
+        validate_windows_file_id_boundary(root)?;
     } else {
         let lints = table(&manifest, "lints")?;
         if keys(lints) != expected_keys(&["workspace"])
@@ -2411,6 +3248,12 @@ pub fn validate_final_static(root: &SafeRoot) -> PolicyResult<RootWorkspace> {
     let workspace = validate_root_workspace(root)?;
     validate_manifest_and_lock_inventory(root, &workspace)?;
     validate_root_lock(root, &workspace)?;
+    if workspace.members.contains_key(WINDOWS_FILE_ID_MEMBER) {
+        validate_windows_file_id_consumer_edges(root)?;
+        validate_windows_file_id_lock_resolution(root)?;
+    } else {
+        validate_windows_file_id_inactive(root)?;
+    }
     Ok(workspace)
 }
 
