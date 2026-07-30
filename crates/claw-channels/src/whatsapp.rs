@@ -1069,6 +1069,7 @@ const fn map_credential_binding(error: CredentialBindingError) -> ChannelError {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
     use std::rc::Rc;
 
     use claw_channel_sdk::{
@@ -1113,6 +1114,24 @@ mod tests {
         ) -> Result<ProviderResponse, WhatsAppSendError> {
             self.sent.borrow_mut().push(request.text().to_owned());
             Ok(ProviderResponse::new(200, Vec::new()))
+        }
+    }
+
+    struct ScriptedStageTransport {
+        results: Rc<RefCell<VecDeque<Result<ProviderResponse, WhatsAppSendError>>>>,
+        attempts: Rc<Cell<usize>>,
+    }
+
+    impl WhatsAppTransport for ScriptedStageTransport {
+        fn send_text(
+            &mut self,
+            _request: &WhatsAppSendRequest<'_>,
+        ) -> Result<ProviderResponse, WhatsAppSendError> {
+            self.attempts.set(self.attempts.get() + 1);
+            self.results
+                .borrow_mut()
+                .pop_front()
+                .expect("scripted send stage")
         }
     }
 
@@ -1251,5 +1270,66 @@ mod tests {
         assert_eq!(replay.processed, 0);
         assert_eq!(processed.get(), processed_before_replay);
         assert_eq!(sent.borrow().len(), sent_before_replay);
+    }
+
+    #[test]
+    fn checkpoint_advances_only_when_the_send_may_have_transmitted() {
+        let results = Rc::new(RefCell::new(VecDeque::from([
+            Err(WhatsAppSendError::CancelledBeforeSend),
+            Err(WhatsAppSendError::AmbiguousAfterSend(
+                ChannelError::Transport(claw_channel_sdk::TransportErrorKind::Timeout),
+            )),
+        ])));
+        let attempts = Rc::new(Cell::new(0));
+        let origin = approved_origin();
+        let access = credential(origin.clone());
+        let mut channel = WhatsAppChannel::new(
+            ACCOUNT,
+            "phone-id",
+            origin,
+            ScriptedStageTransport {
+                results,
+                attempts: Rc::clone(&attempts),
+            },
+            FixedClock(10_000),
+            NonZeroUsize::new(1).expect("non-zero capacity"),
+        )
+        .expect("WhatsApp channel");
+        channel.start(&mut ()).expect("started");
+        channel.pending_replies.push_back(PendingWhatsAppReply {
+            message_id: "message-1".to_owned(),
+            to: "15550001".to_owned(),
+            text: "reply".to_owned(),
+            next_chunk: 0,
+        });
+
+        assert_eq!(
+            channel.process_webhook_queue(&access, |_| panic!("pending reply skips processing")),
+            Err(ChannelError::Transport(
+                claw_channel_sdk::TransportErrorKind::CancelledBeforeSend
+            ))
+        );
+        assert_eq!(channel.pending_replies[0].next_chunk, 0);
+        assert!(channel.completed_messages.is_empty());
+        assert_eq!(attempts.get(), 1);
+
+        assert_eq!(
+            channel.process_webhook_queue(&access, |_| panic!("pending reply skips processing")),
+            Err(ChannelError::Transport(
+                claw_channel_sdk::TransportErrorKind::Timeout
+            ))
+        );
+        assert_eq!(channel.pending_replies[0].next_chunk, 1);
+        assert!(channel.completed_messages.is_empty());
+        assert_eq!(attempts.get(), 2);
+
+        assert_eq!(
+            channel.process_webhook_queue(&access, |_| panic!("pending reply skips processing")),
+            Ok(1)
+        );
+        assert!(channel.pending_replies.is_empty());
+        assert_eq!(channel.completed_messages.len(), 1);
+        assert_eq!(channel.completed_messages[0].message_id, "message-1");
+        assert_eq!(attempts.get(), 2);
     }
 }
