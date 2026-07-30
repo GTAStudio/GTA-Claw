@@ -3,14 +3,14 @@
 use axum::extract::{Extension, Request, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use claw_security::authorization::Scope;
+use claw_security::authorization::Role;
 use serde_json::{Map, Value, json};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::{Principal, authorize_scope};
+use crate::auth::{Principal, authorize_tool_access};
 use crate::error::ApiError;
-use crate::http_support::{CancelOnDrop, json_response, read_json_value, rejected_response};
+use crate::http_support::{CancelOnDrop, json_response, read_json_value};
 use crate::ports::{PortErrorKind, ToolInvocation, ToolInvocationContext, ToolOutcome};
 use crate::state::ApiState;
 
@@ -20,15 +20,6 @@ pub(crate) async fn invoke(
     request: Request,
 ) -> Result<Response, ApiError> {
     let limits = &state.inner.config.limits;
-    if let Err(error) = authorize_scope(
-        principal,
-        Scope::OperatorWrite,
-        state.inner.services.audit.as_ref(),
-    ) {
-        return Ok(
-            rejected_response(request, limits.tools_body_bytes, limits.body_timeout, error).await,
-        );
-    }
     let invocation_context = ToolInvocationContext {
         session_key: optional_body_string_from_request(&request, "x-openclaw-session-key"),
         agent_id: optional_body_string_from_request(&request, "x-openclaw-agent-id"),
@@ -37,7 +28,9 @@ pub(crate) async fn invoke(
         account_id: optional_body_string_from_request(&request, "x-openclaw-account-id"),
         agent_to: optional_body_string_from_request(&request, "x-openclaw-message-to"),
         agent_thread_id: optional_body_string_from_request(&request, "x-openclaw-thread-id"),
-        sender_is_owner: true,
+        sender_is_owner: principal.role == Role::Owner,
+        authenticated_role: principal.role,
+        authenticated_scopes: principal.scopes,
         dry_run: false,
     };
     let value = read_json_value(request, limits.tools_body_bytes, limits.body_timeout).await?;
@@ -56,6 +49,12 @@ pub(crate) async fn invoke(
             )
         })?
         .to_owned();
+    authorize_tool_access(
+        principal,
+        principal.role == Role::Owner,
+        state.inner.services.tools.access(&name),
+        state.inner.services.audit.as_ref(),
+    )?;
     let arguments = body
         .get("args")
         .and_then(Value::as_object)

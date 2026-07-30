@@ -18,6 +18,8 @@
 //! rather than waiting it out.
 
 use std::fmt::{self, Display, Formatter};
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,6 +27,7 @@ use std::time::Duration;
 use claw_application::composition::{
     BoxFuture, ShutdownSignal, SubsystemError, SubsystemId, TaskSpawner,
 };
+use futures_util::FutureExt as _;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -58,6 +61,7 @@ pub struct TrackedSpawner {
     subsystem: SubsystemId,
     spawned: Arc<AtomicU64>,
     terminated: Arc<AtomicU64>,
+    failed: Arc<AtomicU64>,
 }
 
 impl TrackedSpawner {
@@ -87,6 +91,7 @@ impl TrackedSpawner {
             subsystem: runtime_subsystem(),
             spawned: Arc::new(AtomicU64::new(0)),
             terminated: Arc::new(AtomicU64::new(0)),
+            failed: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -107,6 +112,10 @@ impl TrackedSpawner {
     #[must_use]
     pub fn outstanding(&self) -> usize {
         self.tracker.len()
+    }
+
+    fn failed(&self) -> u64 {
+        self.failed.load(Ordering::SeqCst)
     }
 }
 
@@ -131,12 +140,15 @@ impl TaskSpawner for TrackedSpawner {
         }
 
         let terminated = Arc::clone(&self.terminated);
+        let failed = Arc::clone(&self.failed);
         self.spawned.fetch_add(1, Ordering::SeqCst);
 
         self.tracker.spawn(async move {
             let _guard = TerminationGuard(terminated);
             let _ = name;
-            task.await;
+            if AssertUnwindSafe(task).catch_unwind().await.is_err() {
+                failed.fetch_add(1, Ordering::SeqCst);
+            }
         });
 
         Ok(())
@@ -171,6 +183,7 @@ pub struct TaskLedger {
     spawned: u64,
     terminated: u64,
     outstanding: usize,
+    failed: u64,
 }
 
 impl TaskLedger {
@@ -192,10 +205,16 @@ impl TaskLedger {
         self.outstanding
     }
 
+    /// Returns owned tasks that panicked before producing their result.
+    #[must_use]
+    pub const fn failed(self) -> u64 {
+        self.failed
+    }
+
     /// Returns whether every spawned task was joined and none was left behind.
     #[must_use]
     pub const fn is_settled(self) -> bool {
-        self.spawned == self.terminated && self.outstanding == 0
+        self.spawned == self.terminated && self.outstanding == 0 && self.failed == 0
     }
 }
 
@@ -294,12 +313,13 @@ impl RuntimeHost {
         self.ledger()
     }
 
-    /// Reads the three counters that make up one run's task accounting.
+    /// Reads the counters that make up one run's task accounting.
     fn ledger(&self) -> TaskLedger {
         TaskLedger {
             spawned: self.spawner.spawned(),
             terminated: self.spawner.terminated(),
             outstanding: self.tracker.len(),
+            failed: self.spawner.failed(),
         }
     }
 
@@ -354,6 +374,7 @@ pub struct BlockingTaskHost {
     permits: Arc<Semaphore>,
     spawned: Arc<AtomicU64>,
     terminated: Arc<AtomicU64>,
+    failed: Arc<AtomicU64>,
 }
 
 impl BlockingTaskHost {
@@ -368,6 +389,7 @@ impl BlockingTaskHost {
             permits: Arc::new(Semaphore::new(parallelism.max(1))),
             spawned: Arc::new(AtomicU64::new(0)),
             terminated: Arc::new(AtomicU64::new(0)),
+            failed: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -402,15 +424,140 @@ impl BlockingTaskHost {
             return Err(BlockingTaskError::Cancelled);
         }
         let terminated = Arc::clone(&self.terminated);
+        let failed = Arc::clone(&self.failed);
+        let task_failed = Arc::clone(&failed);
         self.spawned.fetch_add(1, Ordering::SeqCst);
         let task = self.tracker.spawn_blocking(move || {
             let _guard = TerminationGuard(terminated);
             let _permit = permit;
-            task()
+            match std::panic::catch_unwind(AssertUnwindSafe(task)) {
+                Ok(output) => Ok(output),
+                Err(_) => {
+                    task_failed.fetch_add(1, Ordering::SeqCst);
+                    Err(())
+                }
+            }
         });
         drop(admission);
-        task.await
+        match task.await {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(())) => Err(BlockingTaskError::Join("blocking task panicked".to_owned())),
+            Err(error) => {
+                failed.fetch_add(1, Ordering::SeqCst);
+                Err(BlockingTaskError::Join(error.to_string()))
+            }
+        }
+    }
+
+    /// Admits cleanup synchronously so a dropping startup guard can transfer
+    /// ownership into the same bounded tracker used by async startup work.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original value when shutdown has already closed admission.
+    pub(crate) fn spawn_cleanup<T, F>(&self, value: T, task: F) -> Result<(), T>
+    where
+        T: Send + 'static,
+        F: FnOnce(T) + Send + 'static,
+    {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(value);
+        }
+        let admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closing.load(Ordering::Acquire)
+            || self.cancellation.is_cancelled()
+            || self.tracker.is_closed()
+        {
+            return Err(value);
+        }
+        let permits = Arc::clone(&self.permits);
+        let terminated = Arc::clone(&self.terminated);
+        let failed = Arc::clone(&self.failed);
+        self.spawned.fetch_add(1, Ordering::SeqCst);
+        self.tracker.spawn(async move {
+            let _guard = TerminationGuard(terminated);
+            let Ok(permit) = permits.acquire_owned().await else {
+                return;
+            };
+            let joined = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                task(value);
+            });
+            if joined.await.is_err() {
+                failed.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        drop(admission);
+        Ok(())
+    }
+
+    /// Runs async post-commit work in the owned tracker so caller cancellation
+    /// cannot detach it.
+    ///
+    /// # Errors
+    ///
+    /// Returns cancellation before admission closes or a join error if the
+    /// tracked result channel closes unexpectedly.
+    pub(crate) async fn run_owned<T, F>(
+        &self,
+        _name: &'static str,
+        task: F,
+    ) -> Result<T, BlockingTaskError>
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+    {
+        self.spawn_owned(task)?
+            .await
             .map_err(|error| BlockingTaskError::Join(error.to_string()))
+    }
+
+    /// Registers async owned work synchronously and returns its result channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns cancellation if shutdown already closed admission.
+    pub(crate) fn spawn_owned<T, F>(
+        &self,
+        task: F,
+    ) -> Result<tokio::sync::oneshot::Receiver<T>, BlockingTaskError>
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+    {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(BlockingTaskError::Cancelled);
+        }
+        let admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closing.load(Ordering::Acquire)
+            || self.cancellation.is_cancelled()
+            || self.tracker.is_closed()
+        {
+            return Err(BlockingTaskError::Cancelled);
+        }
+        let (completed, result) = tokio::sync::oneshot::channel();
+        let terminated = Arc::clone(&self.terminated);
+        let failed = Arc::clone(&self.failed);
+        self.spawned.fetch_add(1, Ordering::SeqCst);
+        self.tracker.spawn(async move {
+            let _guard = TerminationGuard(terminated);
+            match AssertUnwindSafe(task).catch_unwind().await {
+                Ok(output) => {
+                    let _ = completed.send(output);
+                }
+                Err(_) => {
+                    failed.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        drop(admission);
+        Ok(result)
     }
 
     /// Prevents new admissions and asks waiters to stop.
@@ -432,6 +579,7 @@ impl BlockingTaskHost {
             spawned: self.spawned.load(Ordering::SeqCst),
             terminated: self.terminated.load(Ordering::SeqCst),
             outstanding: self.tracker.len(),
+            failed: self.failed.load(Ordering::SeqCst),
         }
     }
 
@@ -447,7 +595,6 @@ impl BlockingTaskHost {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.cancellation.cancel();
         self.tracker.close();
-        self.permits.close();
     }
 }
 
@@ -601,6 +748,128 @@ mod tests {
         let ledger = host.shutdown_within(Duration::from_secs(1)).await;
         assert!(ledger.is_settled());
         assert_eq!(ledger.terminated(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_cleanup_is_tracked_before_abandonment_is_reported() {
+        let host = BlockingTaskHost::new(1);
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let cleanup_entered = Arc::clone(&entered);
+        let cleanup_release = Arc::clone(&release);
+        host.spawn_cleanup((), move |()| {
+            cleanup_entered.wait();
+            cleanup_release.wait();
+        })
+        .expect("cleanup admission remains open");
+        entered.wait();
+
+        let unsettled = host.shutdown_within(Duration::from_millis(25)).await;
+        assert_eq!(unsettled.spawned(), 1);
+        assert_eq!(unsettled.terminated(), 0);
+        assert_eq!(unsettled.outstanding(), 1);
+
+        release.wait();
+        let settled = host.shutdown_within(Duration::from_secs(1)).await;
+        assert!(settled.is_settled());
+        assert_eq!(settled.terminated(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_post_commit_work_survives_waiter_cancellation() {
+        let host = BlockingTaskHost::new(1);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicU64::new(0));
+        let waiter_host = host.clone();
+        let task_entered = Arc::clone(&entered);
+        let task_release = Arc::clone(&release);
+        let task_finished = Arc::clone(&finished);
+        let waiter = tokio::spawn(async move {
+            waiter_host
+                .run_owned("post-commit", async move {
+                    task_entered.notify_one();
+                    task_release.notified().await;
+                    task_finished.fetch_add(1, Ordering::SeqCst);
+                })
+                .await
+        });
+        entered.notified().await;
+        waiter.abort();
+        let _ = waiter.await;
+        release.notify_one();
+
+        let ledger = host.shutdown_within(Duration::from_secs(1)).await;
+
+        assert!(ledger.is_settled());
+        assert_eq!(ledger.spawned(), 1);
+        assert_eq!(ledger.terminated(), 1);
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn panicked_owned_cleanup_never_produces_a_settled_ledger() {
+        let host = BlockingTaskHost::new(1);
+        let result = host
+            .run_owned("panic", async { panic!("forced cleanup panic") })
+            .await;
+
+        assert!(result.is_err());
+        let ledger = host.shutdown_within(Duration::from_secs(1)).await;
+        assert_eq!(ledger.spawned(), 1);
+        assert_eq!(ledger.terminated(), 1);
+        assert_eq!(ledger.failed(), 1);
+        assert!(!ledger.is_settled());
+    }
+
+    #[tokio::test]
+    async fn panicked_runtime_task_never_produces_a_settled_ledger() {
+        let host = RuntimeHost::new();
+        host.spawner()
+            .spawn(
+                "panic",
+                Box::pin(async {
+                    panic!("forced runtime panic");
+                }),
+            )
+            .expect("runtime task is admitted");
+
+        let ledger = host.shutdown_within(Duration::from_secs(1)).await;
+
+        assert_eq!(ledger.spawned(), 1);
+        assert_eq!(ledger.terminated(), 1);
+        assert_eq!(ledger.failed(), 1);
+        assert!(!ledger.is_settled());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_panic_is_recorded_after_its_waiter_is_cancelled() {
+        let host = BlockingTaskHost::new(1);
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let waiter_host = host.clone();
+        let task_entered = Arc::clone(&entered);
+        let task_release = Arc::clone(&release);
+        let waiter = tokio::spawn(async move {
+            waiter_host
+                .run("panic", move || {
+                    task_entered.wait();
+                    task_release.wait();
+                    panic!("forced blocking panic");
+                })
+                .await
+        });
+        entered.wait();
+        waiter.abort();
+        let _ = waiter.await;
+        release.wait();
+
+        let ledger = host.shutdown_within(Duration::from_secs(1)).await;
+
+        assert_eq!(ledger.spawned(), 1);
+        assert_eq!(ledger.terminated(), 1);
+        assert_eq!(ledger.failed(), 1);
+        assert!(!ledger.is_settled());
     }
 
     #[tokio::test]

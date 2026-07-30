@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use claw_application::Application;
 use claw_observability::TelemetryHandle;
 use claw_platform::NativeSystemProbe;
+use futures_util::FutureExt as _;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio_util::sync::CancellationToken;
 
@@ -44,12 +45,9 @@ struct DirectSupervisorOutput<'a, W> {
 }
 
 trait ProductionOutput {
-    fn line<'a>(
-        &'a self,
-        line: impl Into<String> + 'a,
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a>>;
+    fn line(&self, line: impl Into<String>) -> impl Future<Output = io::Result<()>>;
 
-    fn shutdown(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+    fn shutdown(&self) -> impl Future<Output = io::Result<()>>;
 }
 
 impl<W> SupervisorOutput<W>
@@ -99,15 +97,12 @@ impl<W> ProductionOutput for SupervisorOutput<W>
 where
     W: Write + Send + 'static,
 {
-    fn line<'a>(
-        &'a self,
-        line: impl Into<String> + 'a,
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a>> {
-        Box::pin(self.write_line(line))
+    async fn line(&self, line: impl Into<String>) -> io::Result<()> {
+        self.write_line(line).await
     }
 
-    fn shutdown(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
-        Box::pin(self.finish())
+    async fn shutdown(&self) -> io::Result<()> {
+        self.finish().await
     }
 }
 
@@ -115,31 +110,26 @@ impl<W> ProductionOutput for DirectSupervisorOutput<'_, W>
 where
     W: Write,
 {
-    fn line<'a>(
-        &'a self,
-        line: impl Into<String> + 'a,
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a>> {
+    async fn line(&self, line: impl Into<String>) -> io::Result<()> {
         let line = line.into();
-        Box::pin(async move {
-            let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-            writeln!(&mut **writer, "{line}").and_then(|()| writer.flush())
-        })
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        writeln!(&mut **writer, "{line}").and_then(|()| writer.flush())
     }
 
-    fn shutdown(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
-        Box::pin(std::future::ready(Ok(())))
+    async fn shutdown(&self) -> io::Result<()> {
+        Ok(())
     }
 }
 
 async fn cleanup_startup_resources(
     blocking: &BlockingTaskHost,
     telemetry: Option<TelemetryHandle>,
-    started: Instant,
+    deadline: Instant,
 ) -> (TaskLedger, &'static str, Option<String>) {
     let telemetry = shutdown_telemetry_within(
         blocking,
         telemetry,
-        PRODUCTION_STOP_DEADLINE.saturating_sub(started.elapsed()),
+        deadline.saturating_duration_since(Instant::now()),
     )
     .await;
     let (telemetry, telemetry_error) = match telemetry {
@@ -147,7 +137,7 @@ async fn cleanup_startup_resources(
         Err(error) => ("failed", Some(error)),
     };
     let ledger = blocking
-        .shutdown_within(PRODUCTION_STOP_DEADLINE.saturating_sub(started.elapsed()))
+        .shutdown_within(deadline.saturating_duration_since(Instant::now()))
         .await;
     (ledger, telemetry, telemetry_error)
 }
@@ -184,13 +174,13 @@ async fn stop_startup_after_output_failure<F>(
     F: Future<Output = Result<ProductionService, crate::production::ProductionError>>,
 {
     cancellation.cancel();
-    let started = Instant::now();
-    match tokio::time::timeout(PRODUCTION_STOP_DEADLINE, startup).await {
+    let deadline = Instant::now() + PRODUCTION_STOP_DEADLINE;
+    match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), startup).await {
         Ok(Ok(service)) => {
-            let _ = service.stop(Some(fault)).await;
+            let _ = service.stop_with_deadline(Some(fault), deadline).await;
         }
         Ok(Err(_)) | Err(_) => {
-            let _ = cleanup_startup_resources(blocking, telemetry, started).await;
+            let _ = cleanup_startup_resources(blocking, telemetry, deadline).await;
         }
     }
 }
@@ -375,6 +365,125 @@ enum ControlEvent {
 struct ControlChannel<R> {
     lines: Lines<BufReader<R>>,
     open: bool,
+}
+
+enum ReloadSupervision {
+    Complete { accepted: bool },
+    Stop(&'static str),
+    Fault(String),
+}
+
+async fn supervise_reload<R, O>(
+    service: &ProductionService,
+    signals: &mut StopSignals,
+    control: &mut ControlChannel<R>,
+    output: &O,
+) -> ReloadSupervision
+where
+    R: tokio::io::AsyncRead + Unpin,
+    O: ProductionOutput,
+{
+    let cancellation = CancellationToken::new();
+    let reload = service.reload_with_cancellation(cancellation.clone());
+    tokio::pin!(reload);
+    loop {
+        enum Event<T> {
+            Reloaded(T),
+            Signal(SignalEvent),
+            Control(ControlEvent),
+            Fault(crate::production::ProductionError),
+        }
+
+        let event = tokio::select! {
+            biased;
+            signal = signals.recv_event() => Event::Signal(signal),
+            control = control.recv() => Event::Control(control),
+            fault = service.wait_for_failure() => Event::Fault(fault),
+            result = &mut reload => Event::Reloaded(result),
+        };
+        match event {
+            Event::Reloaded(result) => {
+                let accepted = result.is_ok();
+                if let Err(error) = output.line(reload_result_line(service, result)).await {
+                    return ReloadSupervision::Fault(format!("supervisor output failed: {error}"));
+                }
+                return ReloadSupervision::Complete { accepted };
+            }
+            Event::Signal(SignalEvent::Stop(trigger)) => {
+                cancellation.cancel();
+                return ReloadSupervision::Stop(trigger.label());
+            }
+            Event::Control(ControlEvent::Stop) => {
+                cancellation.cancel();
+                return ReloadSupervision::Stop(StopTrigger::Control.label());
+            }
+            Event::Fault(error) => {
+                cancellation.cancel();
+                return ReloadSupervision::Fault(error.to_string());
+            }
+            Event::Signal(SignalEvent::Reload) | Event::Control(ControlEvent::Reload) => {
+                if let Err(error) = output
+                    .line(format!(
+                        "reload rejected generation={} reason=reload already in progress",
+                        service.config_generation()
+                    ))
+                    .await
+                {
+                    cancellation.cancel();
+                    return ReloadSupervision::Fault(format!("supervisor output failed: {error}"));
+                }
+            }
+
+            Event::Control(ControlEvent::Status) => {
+                if let Err(error) = output.line(service.status_line()).await {
+                    cancellation.cancel();
+                    return ReloadSupervision::Fault(format!("supervisor output failed: {error}"));
+                }
+            }
+            Event::Control(ControlEvent::Ignored) => {
+                if let Err(error) = output.line("control ignored").await {
+                    cancellation.cancel();
+                    return ReloadSupervision::Fault(format!("supervisor output failed: {error}"));
+                }
+            }
+        }
+    }
+}
+
+async fn drain_queued_startup_events<R, O>(
+    signals: &mut StopSignals,
+    control: &mut ControlChannel<R>,
+    output: &O,
+    reload_deferred: &mut bool,
+) -> io::Result<Option<&'static str>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    O: ProductionOutput,
+{
+    loop {
+        if let Some(signal) = signals.recv_event().now_or_never() {
+            match signal {
+                SignalEvent::Stop(trigger) => return Ok(Some(trigger.label())),
+                SignalEvent::Reload => {
+                    *reload_deferred = true;
+                    output.line("reload deferred phase=starting").await?;
+                    continue;
+                }
+            }
+        }
+        let Some(event) = control.recv().now_or_never() else {
+            return Ok(None);
+        };
+        match event {
+            ControlEvent::Stop => return Ok(Some(StopTrigger::Control.label())),
+            ControlEvent::Reload => {
+                *reload_deferred = true;
+                output.line("reload deferred phase=starting").await?;
+            }
+            ControlEvent::Status => output.line("status ready=false phase=starting").await?,
+            ControlEvent::Ignored => output.line("control ignored").await?,
+        }
+    }
 }
 
 impl<R> ControlChannel<R>
@@ -576,8 +685,32 @@ pub async fn serve(
 /// Returns a startup error before readiness when signal installation or service
 /// composition fails. After readiness, returns an output error only after the
 /// service has been drained.
-#[allow(clippy::future_not_send)] // Preserves the existing non-Send reader/writer contract.
 pub async fn serve_production(
+    output: impl Write + Send + 'static,
+    control: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    options: &ProductionOptions,
+    loaded: LoadedConfig,
+) -> Result<ProductionStopSummary, Box<dyn std::error::Error>> {
+    let signals = StopSignals::install()?;
+    let blocking = BlockingTaskHost::new(4);
+    let output = SupervisorOutput::new(output);
+    serve_production_inner(
+        &output, control, options, loaded, signals, blocking, None, false,
+    )
+    .await
+}
+
+/// Compatibility entry point for in-process non-`Send` readers and writers.
+///
+/// The daemon binary never calls this path; production process output uses
+/// [`serve_production`] or [`serve_production_preinstalled`], both of which own
+/// bounded output tasks.
+///
+/// # Errors
+///
+/// Returns the same lifecycle errors as [`serve_production`].
+#[allow(clippy::future_not_send)]
+pub async fn serve_production_non_send(
     mut output: impl Write,
     control: impl tokio::io::AsyncRead + Unpin,
     options: &ProductionOptions,
@@ -588,7 +721,10 @@ pub async fn serve_production(
     let output = DirectSupervisorOutput {
         writer: Mutex::new(&mut output),
     };
-    serve_production_inner(&output, control, options, loaded, signals, blocking, None).await
+    serve_production_inner(
+        &output, control, options, loaded, signals, blocking, None, false,
+    )
+    .await
 }
 
 /// Runs production with signal and blocking-task ownership established by the
@@ -608,9 +744,40 @@ pub async fn serve_production_preinstalled(
     blocking: BlockingTaskHost,
     telemetry: Option<TelemetryHandle>,
 ) -> Result<ProductionStopSummary, Box<dyn std::error::Error>> {
+    serve_production_preinstalled_with_reload(
+        output, control, options, loaded, signals, blocking, telemetry, false,
+    )
+    .await
+}
+
+/// Runs production with an operating-system reload already observed during
+/// pre-service configuration or telemetry setup.
+///
+/// # Errors
+///
+/// Returns the same startup, runtime, output, and shutdown errors as
+/// [`serve_production_preinstalled`].
+#[allow(clippy::future_not_send)]
+pub async fn serve_production_preinstalled_with_reload(
+    output: impl Write + Send + 'static,
+    control: impl tokio::io::AsyncRead + Unpin,
+    options: &ProductionOptions,
+    loaded: LoadedConfig,
+    signals: StopSignals,
+    blocking: BlockingTaskHost,
+    telemetry: Option<TelemetryHandle>,
+    reload_deferred: bool,
+) -> Result<ProductionStopSummary, Box<dyn std::error::Error>> {
     let output = SupervisorOutput::new(output);
     serve_production_inner(
-        &output, control, options, loaded, signals, blocking, telemetry,
+        &output,
+        control,
+        options,
+        loaded,
+        signals,
+        blocking,
+        telemetry,
+        reload_deferred,
     )
     .await
 }
@@ -624,6 +791,7 @@ async fn serve_production_inner<O>(
     mut signals: StopSignals,
     blocking: BlockingTaskHost,
     telemetry: Option<TelemetryHandle>,
+    mut reload_deferred: bool,
 ) -> Result<ProductionStopSummary, Box<dyn std::error::Error>>
 where
     O: ProductionOutput,
@@ -640,8 +808,7 @@ where
         telemetry,
     );
     tokio::pin!(startup);
-    let mut reload_deferred = false;
-    let mut service = loop {
+    let service = loop {
         enum StartupEvent<T> {
             Started(T),
             Signal(SignalEvent),
@@ -649,89 +816,117 @@ where
         }
 
         let event = tokio::select! {
-            result = &mut startup => StartupEvent::Started(result),
+            biased;
             signal = signals.recv_event() => StartupEvent::Signal(signal),
             control = control.recv() => StartupEvent::Control(control),
+            result = &mut startup => StartupEvent::Started(result),
         };
         match event {
             StartupEvent::Started(Ok(service)) => break service,
             StartupEvent::Started(Err(error)) => {
-                let (ledger, _, telemetry_error) =
-                    cleanup_startup_resources(&blocking, startup_telemetry.clone(), Instant::now())
-                        .await;
+                let (ledger, _, telemetry_error) = cleanup_startup_resources(
+                    &blocking,
+                    startup_telemetry.clone(),
+                    Instant::now() + PRODUCTION_STOP_DEADLINE,
+                )
+                .await;
                 return Err(startup_error_with_cleanup(error, ledger, telemetry_error));
             }
             StartupEvent::Signal(SignalEvent::Stop(trigger)) => {
                 startup_cancellation.cancel();
-                let stop_started = Instant::now();
-                let summary =
-                    match tokio::time::timeout(PRODUCTION_STOP_DEADLINE, startup.as_mut()).await {
-                        Ok(Ok(service)) => service.stop(None).await,
-                        Ok(Err(error)) if error.stage() == "startup" => {
-                            let (ledger, telemetry, _) = cleanup_startup_resources(
-                                &blocking,
-                                startup_telemetry.clone(),
-                                stop_started,
-                            )
-                            .await;
-                            ProductionStopSummary::before_start(ledger, telemetry)
-                        }
-                        Ok(Err(error)) => {
-                            let (ledger, _, telemetry_error) = cleanup_startup_resources(
-                                &blocking,
-                                startup_telemetry.clone(),
-                                stop_started,
-                            )
-                            .await;
-                            return Err(startup_error_with_cleanup(error, ledger, telemetry_error));
-                        }
-                        Err(_) => {
-                            let (ledger, telemetry, _) = cleanup_startup_resources(
-                                &blocking,
-                                startup_telemetry.clone(),
-                                stop_started,
-                            )
-                            .await;
-                            ProductionStopSummary::before_start(ledger, telemetry)
-                        }
-                    };
+                let deadline = Instant::now() + PRODUCTION_STOP_DEADLINE;
+                let summary = match tokio::time::timeout(
+                    deadline.saturating_duration_since(Instant::now()),
+                    startup.as_mut(),
+                )
+                .await
+                {
+                    Ok(Ok(service)) => service.stop_with_deadline(None, deadline).await,
+                    Ok(Err(error)) if error.stage() == "startup" => {
+                        let (ledger, telemetry, _) = cleanup_startup_resources(
+                            &blocking,
+                            startup_telemetry.clone(),
+                            deadline,
+                        )
+                        .await;
+                        ProductionStopSummary::before_start(
+                            ledger,
+                            telemetry,
+                            Instant::now() >= deadline,
+                        )
+                    }
+                    Ok(Err(error)) => {
+                        let (ledger, _, telemetry_error) = cleanup_startup_resources(
+                            &blocking,
+                            startup_telemetry.clone(),
+                            deadline,
+                        )
+                        .await;
+                        return Err(startup_error_with_cleanup(error, ledger, telemetry_error));
+                    }
+                    Err(_) => {
+                        let (ledger, telemetry, _) = cleanup_startup_resources(
+                            &blocking,
+                            startup_telemetry.clone(),
+                            deadline,
+                        )
+                        .await;
+                        ProductionStopSummary::before_start(
+                            ledger,
+                            telemetry,
+                            Instant::now() >= deadline,
+                        )
+                    }
+                };
                 write_production_stop(output, trigger.label(), &summary).await?;
                 return Ok(summary);
             }
             StartupEvent::Control(ControlEvent::Stop) => {
                 startup_cancellation.cancel();
-                let stop_started = Instant::now();
-                let summary =
-                    match tokio::time::timeout(PRODUCTION_STOP_DEADLINE, startup.as_mut()).await {
-                        Ok(Ok(service)) => service.stop(None).await,
-                        Ok(Err(error)) if error.stage() == "startup" => {
-                            let (ledger, telemetry, _) = cleanup_startup_resources(
-                                &blocking,
-                                startup_telemetry.clone(),
-                                stop_started,
-                            )
-                            .await;
-                            ProductionStopSummary::before_start(ledger, telemetry)
-                        }
-                        Ok(Err(error)) => {
-                            let (ledger, _, telemetry_error) = cleanup_startup_resources(
-                                &blocking,
-                                startup_telemetry.clone(),
-                                stop_started,
-                            )
-                            .await;
-                            return Err(startup_error_with_cleanup(error, ledger, telemetry_error));
-                        }
-                        Err(_) => {
-                            let (ledger, telemetry, _) = cleanup_startup_resources(
-                                &blocking,
-                                startup_telemetry.clone(),
-                                stop_started,
-                            )
-                            .await;
-                            ProductionStopSummary::before_start(ledger, telemetry)
-                        }
-                    };
+                let deadline = Instant::now() + PRODUCTION_STOP_DEADLINE;
+                let summary = match tokio::time::timeout(
+                    deadline.saturating_duration_since(Instant::now()),
+                    startup.as_mut(),
+                )
+                .await
+                {
+                    Ok(Ok(service)) => service.stop_with_deadline(None, deadline).await,
+                    Ok(Err(error)) if error.stage() == "startup" => {
+                        let (ledger, telemetry, _) = cleanup_startup_resources(
+                            &blocking,
+                            startup_telemetry.clone(),
+                            deadline,
+                        )
+                        .await;
+                        ProductionStopSummary::before_start(
+                            ledger,
+                            telemetry,
+                            Instant::now() >= deadline,
+                        )
+                    }
+                    Ok(Err(error)) => {
+                        let (ledger, _, telemetry_error) = cleanup_startup_resources(
+                            &blocking,
+                            startup_telemetry.clone(),
+                            deadline,
+                        )
+                        .await;
+                        return Err(startup_error_with_cleanup(error, ledger, telemetry_error));
+                    }
+                    Err(_) => {
+                        let (ledger, telemetry, _) = cleanup_startup_resources(
+                            &blocking,
+                            startup_telemetry.clone(),
+                            deadline,
+                        )
+                        .await;
+                        ProductionStopSummary::before_start(
+                            ledger,
+                            telemetry,
+                            Instant::now() >= deadline,
+                        )
+                    }
+                };
                 write_production_stop(output, StopTrigger::Control.label(), &summary).await?;
                 return Ok(summary);
             }
@@ -781,13 +976,66 @@ where
             }
         }
     };
-    if reload_deferred && let Err(error) = output.line(reload_line(&service).await).await {
-        let _ = service
-            .stop(Some(format!("supervisor output failed: {error}")))
-            .await;
-        let _ = output.shutdown().await;
-        return Err(Box::new(error));
+    loop {
+        let queued = match drain_queued_startup_events(
+            &mut signals,
+            &mut control,
+            output,
+            &mut reload_deferred,
+        )
+        .await
+        {
+            Ok(queued) => queued,
+            Err(error) => {
+                let deadline = Instant::now() + PRODUCTION_STOP_DEADLINE;
+                let _ = service
+                    .stop_with_deadline(
+                        Some(format!("supervisor output failed: {error}")),
+                        deadline,
+                    )
+                    .await;
+                let _ = output.shutdown().await;
+                return Err(Box::new(error));
+            }
+        };
+        if let Some(reason) = queued {
+            let deadline = Instant::now() + PRODUCTION_STOP_DEADLINE;
+            let summary = service.stop_with_deadline(None, deadline).await;
+            write_production_stop(output, reason, &summary).await?;
+            return Ok(summary);
+        }
+        if !reload_deferred {
+            break;
+        }
+        reload_deferred = false;
+        match supervise_reload(&service, &mut signals, &mut control, output).await {
+            ReloadSupervision::Complete { accepted: true } => {}
+            ReloadSupervision::Complete { accepted: false } => {
+                let deadline = Instant::now() + PRODUCTION_STOP_DEADLINE;
+                let summary = service
+                    .stop_with_deadline(
+                        Some("deferred startup reload was rejected".to_owned()),
+                        deadline,
+                    )
+                    .await;
+                write_production_stop(output, "runtime", &summary).await?;
+                return Ok(summary);
+            }
+            ReloadSupervision::Stop(reason) => {
+                let deadline = Instant::now() + PRODUCTION_STOP_DEADLINE;
+                let summary = service.stop_with_deadline(None, deadline).await;
+                write_production_stop(output, reason, &summary).await?;
+                return Ok(summary);
+            }
+            ReloadSupervision::Fault(fault) => {
+                let deadline = Instant::now() + PRODUCTION_STOP_DEADLINE;
+                let summary = service.stop_with_deadline(Some(fault), deadline).await;
+                write_production_stop(output, "runtime", &summary).await?;
+                return Ok(summary);
+            }
+        }
     }
+    service.begin_serving();
     let addresses = service.addresses();
 
     let startup_write = async {
@@ -814,13 +1062,14 @@ where
         return Err(Box::new(error));
     }
 
-    let (reason, fault) = loop {
+    let (mut reason, mut fault) = 'running: loop {
         enum Event {
             Signal(SignalEvent),
             Control(ControlEvent),
             Fault(crate::production::ProductionError),
         }
         let event = tokio::select! {
+            biased;
             signal = signals.recv_event() => Event::Signal(signal),
             control = control.recv() => Event::Control(control),
             fault = service.wait_for_failure() => Event::Fault(fault),
@@ -836,12 +1085,12 @@ where
                 break ("runtime", Some(error.to_string()));
             }
             Event::Signal(SignalEvent::Reload) | Event::Control(ControlEvent::Reload) => {
-                let line = reload_line(&service).await;
-                if let Err(error) = output.line(line).await {
-                    break (
-                        "runtime",
-                        Some(format!("supervisor output failed: {error}")),
-                    );
+                match supervise_reload(&service, &mut signals, &mut control, output).await {
+                    ReloadSupervision::Complete { .. } => {}
+                    ReloadSupervision::Stop(reason) => break 'running (reason, None),
+                    ReloadSupervision::Fault(fault) => {
+                        break 'running ("runtime", Some(fault));
+                    }
                 }
             }
             Event::Control(ControlEvent::Status) => {
@@ -862,8 +1111,16 @@ where
             }
         }
     };
+    if let Some(SignalEvent::Stop(trigger)) = signals.recv_event().now_or_never() {
+        reason = trigger.label();
+        fault = None;
+    } else if let Some(ControlEvent::Stop) = control.recv().now_or_never() {
+        reason = StopTrigger::Control.label();
+        fault = None;
+    }
 
-    let summary = service.stop(fault).await;
+    let deadline = Instant::now() + PRODUCTION_STOP_DEADLINE;
+    let summary = service.stop_with_deadline(fault, deadline).await;
     write_production_stop(output, reason, &summary).await?;
     Ok(summary)
 }
@@ -884,14 +1141,34 @@ pub async fn report_pre_start_stop(
     ledger: TaskLedger,
     telemetry: &'static str,
 ) -> Result<ProductionStopSummary, Box<dyn std::error::Error>> {
+    report_pre_start_stop_with_deadline(output, trigger, ledger, telemetry, false).await
+}
+
+/// Reports a pre-service stop with explicit absolute-deadline accounting.
+///
+/// # Errors
+///
+/// Returns a bounded supervisor-output error when the summary cannot be
+/// delivered or its writer task cannot be joined.
+#[allow(clippy::future_not_send)]
+pub async fn report_pre_start_stop_with_deadline(
+    output: impl Write + Send + 'static,
+    trigger: StopTrigger,
+    ledger: TaskLedger,
+    telemetry: &'static str,
+    deadline_expired: bool,
+) -> Result<ProductionStopSummary, Box<dyn std::error::Error>> {
     let output = SupervisorOutput::new(output);
-    let summary = ProductionStopSummary::before_start(ledger, telemetry);
+    let summary = ProductionStopSummary::before_start(ledger, telemetry, deadline_expired);
     write_production_stop(&output, trigger.label(), &summary).await?;
     Ok(summary)
 }
 
-async fn reload_line(service: &ProductionService) -> String {
-    match service.reload().await {
+fn reload_result_line(
+    service: &ProductionService,
+    result: Result<crate::adapters::http_api::AppliedReload, crate::production::ProductionError>,
+) -> String {
+    match result {
         Ok(applied) => format!(
             "reloaded generation={} changed={}",
             applied.generation,
@@ -919,7 +1196,7 @@ where
 {
     let written = output
         .line(format!(
-            "stopped reason={} clean={} drained={} completed={} abandoned={} tasks={}/{} telemetry={}",
+            "stopped reason={} clean={} drained={} completed={} abandoned={} tasks={}/{} telemetry={} deadline_expired={}",
             reason,
             summary.is_clean(),
             summary.drained(),
@@ -928,6 +1205,7 @@ where
             summary.terminated(),
             summary.spawned(),
             summary.telemetry(),
+            summary.deadline_expired(),
         ))
         .await;
     let shutdown = output.shutdown().await;
@@ -936,12 +1214,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::io::Write;
+    use std::rc::Rc;
+    use std::sync::Mutex;
     use std::time::Duration;
 
+    use claw_config::{ConfigLayerKind, migrate_legacy_environment};
+
     use super::{
-        DaemonMode, SHUTDOWN_COMMAND, StopSignals, StopTrigger, await_control, await_stop,
-        parse_mode, probe,
+        ControlChannel, DaemonMode, DirectSupervisorOutput, SHUTDOWN_COMMAND, StopSignals,
+        StopTrigger, await_control, await_stop, drain_queued_startup_events, parse_mode, probe,
+        serve_production, serve_production_non_send,
     };
+    use crate::production::{LoadedConfig, ProductionOptions};
 
     #[test]
     fn normal_mode_is_persistent_and_probe_is_explicit() {
@@ -973,6 +1259,86 @@ mod tests {
 
         assert_eq!(lines.len(), 1);
         assert!(lines[0].starts_with("healthy runtime="));
+    }
+
+    fn loaded_config() -> LoadedConfig {
+        LoadedConfig {
+            snapshot: migrate_legacy_environment([
+                ("GITHUB_TOKEN", "test"),
+                ("ENABLE_TEAMS", "false"),
+                ("ENABLE_TELEGRAM", "false"),
+                ("ENABLE_DISCORD", "false"),
+                ("ENABLE_WHATSAPP", "false"),
+                ("AGENT_ROLE_URL", "https://example.test/role"),
+            ])
+            .expect("configuration fixture migrates")
+            .config,
+            path: None,
+            source: "test",
+            diagnostics: Vec::new(),
+            applied_layers: vec![ConfigLayerKind::BuiltIn],
+            recovery_guidance: None,
+        }
+    }
+
+    fn assert_send<T: Send>(_: T) {}
+
+    #[test]
+    fn production_serve_future_remains_conditionally_send() {
+        let options = ProductionOptions::default();
+        assert_send(serve_production(
+            Vec::<u8>::new(),
+            tokio::io::empty(),
+            &options,
+            loaded_config(),
+        ));
+    }
+
+    struct LocalWriter(Rc<RefCell<Vec<u8>>>);
+
+    impl Write for LocalWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn production_serve_still_accepts_non_send_test_writers() {
+        let options = ProductionOptions::default();
+        let future = serve_production_non_send(
+            LocalWriter(Rc::new(RefCell::new(Vec::new()))),
+            tokio::io::empty(),
+            &options,
+            loaded_config(),
+        );
+        drop(future);
+    }
+
+    #[tokio::test]
+    async fn queued_lifecycle_is_drained_again_before_serving() {
+        let mut signals = StopSignals::install().expect("stop-signal handlers install");
+        let mut control = ControlChannel::new(&b"status\nreload\nshutdown\n"[..]);
+        let mut bytes = Vec::new();
+        let output = DirectSupervisorOutput {
+            writer: Mutex::new(&mut bytes),
+        };
+        let mut reload_deferred = false;
+
+        let stop =
+            drain_queued_startup_events(&mut signals, &mut control, &output, &mut reload_deferred)
+                .await
+                .expect("queued lifecycle drains");
+
+        assert_eq!(stop, Some(StopTrigger::Control.label()));
+        assert!(reload_deferred);
+        let text = String::from_utf8(bytes).expect("output is UTF-8");
+        assert!(text.contains("status ready=false phase=starting"));
+        assert!(text.contains("reload deferred phase=starting"));
     }
 
     #[tokio::test]

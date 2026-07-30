@@ -6,7 +6,7 @@ use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
@@ -19,7 +19,9 @@ use claw_config::{
     SecretRef, load_role as load_role_document, migrate_legacy_environment, to_json5,
 };
 use claw_crestodian::{Crestodian, RecoveryGuidance};
-use claw_gateway::{CredentialPolicy, Exposure, GatewayServer, GatewayServerConfig, ServerHandle};
+use claw_gateway::{
+    BoundServer, CredentialPolicy, Exposure, GatewayServer, GatewayServerConfig, ServerHandle,
+};
 use claw_http_api::{
     ApiConfig, ApiServices, BearerAuthenticator, BearerCredential, HttpApi, LegacyAdminCredential,
     LegacyApiConfig, LegacyApiServices, LegacyChannelStatus, LegacyHttpApi, LegacyReloadError,
@@ -67,6 +69,7 @@ use crate::runtime::BlockingTaskHost;
 pub const PRODUCTION_STOP_DEADLINE: Duration = Duration::from_secs(10);
 const DEFAULT_GATEWAY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const DEFAULT_MCP: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+static STATE_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Supported invocation, printed for `--help` and for a rejected command line.
 pub const USAGE: &str = "usage: gta-claw-daemon [--probe | --check-config] [--config PATH] \
                      [--listen ADDRESS] [--legacy-listen ADDRESS] \
@@ -515,6 +518,11 @@ struct LegacyWhatsAppSettings {
     phone_number_id: String,
 }
 
+struct McpCredentials {
+    owner: Option<String>,
+    client: Option<String>,
+}
+
 /// Bound service addresses reported after readiness.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BoundAddresses {
@@ -602,6 +610,132 @@ struct StartupPluginGuard {
     blocking: BlockingTaskHost,
 }
 
+struct StartupServiceGuard {
+    channels: Option<ChannelSupervisor>,
+    updater: Option<UpdateMonitor>,
+    device_flow: Option<Arc<LegacyDeviceFlowAdapter>>,
+    blocking: BlockingTaskHost,
+}
+
+struct StartupAuditGuard {
+    audit: Option<Arc<DurableSecurityAudit>>,
+    blocking: BlockingTaskHost,
+}
+
+impl StartupAuditGuard {
+    const fn new(audit: Arc<DurableSecurityAudit>, blocking: BlockingTaskHost) -> Self {
+        Self {
+            audit: Some(audit),
+            blocking,
+        }
+    }
+
+    fn audit(&self) -> &Arc<DurableSecurityAudit> {
+        self.audit
+            .as_ref()
+            .expect("startup audit guard owns its writer")
+    }
+
+    fn into_inner(mut self) -> Arc<DurableSecurityAudit> {
+        self.audit
+            .take()
+            .expect("startup audit guard owns its writer")
+    }
+}
+
+impl Drop for StartupAuditGuard {
+    fn drop(&mut self) {
+        if let Some(audit) = self.audit.take() {
+            if let Err(audit) = self.blocking.spawn_cleanup(audit, |audit| {
+                if !audit.shutdown(Duration::from_secs(2)) {
+                    audit.record_abandoned();
+                }
+            }) {
+                self.blocking.record_abandoned();
+                std::mem::forget(audit);
+            }
+        }
+    }
+}
+
+impl StartupServiceGuard {
+    fn new(device_flow: Option<Arc<LegacyDeviceFlowAdapter>>, blocking: BlockingTaskHost) -> Self {
+        Self {
+            channels: None,
+            updater: None,
+            device_flow,
+            blocking,
+        }
+    }
+
+    fn into_parts(
+        mut self,
+    ) -> (
+        ChannelSupervisor,
+        UpdateMonitor,
+        Option<Arc<LegacyDeviceFlowAdapter>>,
+    ) {
+        (
+            self.channels
+                .take()
+                .expect("channels installed before success"),
+            self.updater
+                .take()
+                .expect("updater installed before success"),
+            self.device_flow.take(),
+        )
+    }
+}
+
+impl Drop for StartupServiceGuard {
+    fn drop(&mut self) {
+        if let Some(channels) = self.channels.take() {
+            let accounting = self.blocking.clone();
+            if self
+                .blocking
+                .spawn_owned(async move {
+                    let report = channels.shutdown(PRODUCTION_STOP_DEADLINE).await;
+                    if report.abandoned > 0 {
+                        accounting.record_abandoned();
+                    }
+                })
+                .is_err()
+            {
+                self.blocking.record_abandoned();
+            }
+        }
+        if let Some(mut updater) = self.updater.take() {
+            let accounting = self.blocking.clone();
+            if self
+                .blocking
+                .spawn_owned(async move {
+                    if !updater.shutdown(PRODUCTION_STOP_DEADLINE).await {
+                        accounting.record_abandoned();
+                    }
+                })
+                .is_err()
+            {
+                self.blocking.record_abandoned();
+            }
+        }
+        if let Some(device_flow) = self.device_flow.take() {
+            let accounting = self.blocking.clone();
+            if self
+                .blocking
+                .spawn_owned(async move {
+                    let report = device_flow.shutdown(PRODUCTION_STOP_DEADLINE).await;
+                    if report.abandoned > 0 {
+                        accounting.record_abandoned();
+                    }
+                })
+                .is_err()
+            {
+                self.blocking.record_abandoned();
+            }
+        }
+    }
+}
+
 impl StartupPluginGuard {
     const fn new(plugins: SignedPluginRuntime, blocking: BlockingTaskHost) -> Self {
         Self {
@@ -629,9 +763,17 @@ impl std::ops::Deref for StartupPluginGuard {
 
 impl Drop for StartupPluginGuard {
     fn drop(&mut self) {
-        if let Some(mut plugins) = self.plugins.take() {
-            plugins.abandon_host();
-            self.blocking.record_abandoned();
+        if let Some(plugins) = self.plugins.take() {
+            let accounting = self.blocking.clone();
+            if let Err(mut plugins) = self.blocking.spawn_cleanup(plugins, move |plugins| {
+                let report = plugins.shutdown_host();
+                if report.failed > 0 {
+                    accounting.record_abandoned();
+                }
+            }) {
+                plugins.abandon_host();
+                self.blocking.record_abandoned();
+            }
         }
     }
 }
@@ -666,21 +808,38 @@ impl DaemonReload {
             admission = self.runtime.reload_admission() => admission,
             () = cancellation.cancelled() => return Err("reload was cancelled".to_owned()),
         };
+        let reset_required =
+            self.config
+                .requires_session_reset(&source, &source_name, role.as_ref())?;
         let previous_generation = self.config.generation();
-        let applied = self
-            .config
-            .apply_json5_with_role(&source, &source_name, role)?;
+        let runtime = Arc::clone(&self.runtime);
+        let config = Arc::clone(&self.config);
+        let transaction = self
+            .blocking
+            .spawn_owned(async move {
+                let reset_report = if reset_required {
+                    Some(runtime.reload_sessions_admitted(&admission).await)
+                } else {
+                    None
+                };
+                let applied = config.apply_json5_with_role(&source, &source_name, role);
+                drop(admission);
+                (applied, reset_report)
+            })
+            .map_err(|error| format!("reload transaction admission failed: {error}"))?;
+        let (applied, reset_report) = transaction
+            .await
+            .map_err(|error| format!("reload transaction task failed: {error}"))?;
+        let applied = applied?;
         if applied.generation == previous_generation {
             self.diagnostics
                 .record("reload candidate unchanged; participants were not disturbed");
-        } else {
-            let report = self.runtime.reload_sessions_admitted(&admission).await;
+        } else if let Some(report) = reset_report {
             self.diagnostics.record(format!(
                 "runtime reload generation={} destroyed={} cancelled={} forced={}",
                 report.generation, report.destroyed, report.cancelled_turns, report.forced_turns
             ));
         }
-        drop(admission);
         Ok(applied)
     }
 
@@ -843,14 +1002,19 @@ pub struct ProductionService {
     telemetry: Option<TelemetryHandle>,
     requests: RequestAccounting,
     http_shutdown: CancellationToken,
-    http_tasks: JoinSet<(&'static str, io::Result<()>)>,
-    gateway: Option<ServerHandle>,
+    http_tasks: tokio::sync::Mutex<JoinSet<(&'static str, io::Result<()>)>>,
+    gateway: Mutex<Option<GatewayIngress>>,
     device_flow: Option<Arc<LegacyDeviceFlowAdapter>>,
     channels: ChannelSupervisor,
     agent_runtime: Arc<AgentRuntime>,
     updater: UpdateMonitor,
     plugins: Option<SignedPluginRuntime>,
-    terminated_http_tasks: u64,
+    terminated_http_tasks: AtomicU64,
+}
+
+enum GatewayIngress {
+    Bound(BoundServer),
+    Started(ServerHandle),
 }
 
 impl ProductionService {
@@ -866,14 +1030,32 @@ impl ProductionService {
         loaded: LoadedConfig,
         startup_cancellation: CancellationToken,
     ) -> Result<Self, ProductionError> {
-        Self::start_owned(
+        let blocking = BlockingTaskHost::new(4);
+        let result = Self::start_owned(
             options,
             loaded,
             startup_cancellation,
-            BlockingTaskHost::new(4),
+            blocking.clone(),
             None,
         )
-        .await
+        .await;
+        if result.is_err() {
+            let ledger = blocking.shutdown_within(PRODUCTION_STOP_DEADLINE).await;
+            if !ledger.is_settled() {
+                return Err(ProductionError::message(
+                    "startup",
+                    format!(
+                        "startup rollback left {} of {} blocking tasks unjoined",
+                        ledger.spawned().saturating_sub(ledger.terminated()),
+                        ledger.spawned()
+                    ),
+                ));
+            }
+        }
+        if let Ok(service) = &result {
+            service.begin_serving();
+        }
+        result
     }
 
     pub(crate) async fn start_owned(
@@ -986,15 +1168,17 @@ impl ProductionService {
             .run("state-open", {
                 let state_dir = state_dir.clone();
                 let readiness = Arc::clone(&readiness);
+                let audit_blocking = blocking.clone();
                 move || {
                     std::fs::create_dir_all(&state_dir)
                         .map_err(|error| ProductionError::new("state", error))?;
                     let gateway_pairing =
                         GatewayPairingStore::open(state_dir.join("gateway-pairings.json"))
                             .map_err(|error| ProductionError::message("gateway-pairing", error))?;
-                    let audit = DurableSecurityAudit::open(
+                    let audit = DurableSecurityAudit::open_tracked(
                         &state_dir.join("security-audit.jsonl"),
                         readiness,
+                        audit_blocking,
                     )
                     .map_err(|error| ProductionError::new("audit", error))?;
                     Ok::<_, ProductionError>((gateway_pairing, audit))
@@ -1003,6 +1187,7 @@ impl ProductionService {
             .await
             .map_err(|error| ProductionError::new("state", error))??;
         let audit = Arc::new(audit);
+        let audit = StartupAuditGuard::new(audit, blocking.clone());
         diagnostics.record(format!(
             "gateway pairing store opened with {} grants",
             gateway_pairing.len()
@@ -1010,7 +1195,7 @@ impl ProductionService {
         readiness.set("audit", true);
         info!(stage = "audit", path = %state_dir.join("security-audit.jsonl").display(), "durable audit opened");
 
-        let (proxy, mut legacy_settings, resolved_admin_token) = blocking
+        let (proxy, mut legacy_settings, resolved_admin_token, mcp_credentials) = blocking
             .run("startup-secrets", {
                 let snapshot = loaded.snapshot.clone();
                 move || {
@@ -1018,6 +1203,7 @@ impl ProductionService {
                         proxy_policy(&snapshot)?,
                         legacy_settings(&snapshot)?,
                         admin_token(&snapshot)?,
+                        mcp_credentials()?,
                     ))
                 }
             })
@@ -1296,7 +1482,8 @@ impl ProductionService {
         } else {
             None
         };
-        if let Some(flow) = device_flow.as_ref()
+        let mut startup_services = StartupServiceGuard::new(device_flow, blocking.clone());
+        if let Some(flow) = startup_services.device_flow.as_ref()
             && (teams.is_some()
                 || whatsapp.is_some()
                 || legacy_settings.telegram.is_some()
@@ -1332,10 +1519,13 @@ impl ProductionService {
                 Arc::clone(&channel_authentication),
                 proxy.clone(),
                 Arc::clone(&diagnostics),
+                Arc::clone(&readiness),
                 startup_cancellation.clone(),
+                blocking.clone(),
             ) => result.map_err(|error| ProductionError::message("channels", error))?,
             () = startup_cancellation.cancelled() => return Err(startup_cancelled()),
         };
+        startup_services.channels = Some(channel_supervisor);
         readiness.set("channels", true);
         info!(
             stage = "channels",
@@ -1359,6 +1549,7 @@ impl ProductionService {
         let update_monitor =
             UpdateMonitor::start(updates_enabled, &proxy, Arc::clone(&diagnostics))
                 .map_err(|error| ProductionError::message("updates", error))?;
+        startup_services.updater = Some(update_monitor);
         let admin = Arc::new(OperatorAdmin::new(
             Arc::clone(&config),
             Arc::clone(&reload) as Arc<dyn ConfigurationReloader>,
@@ -1386,7 +1577,7 @@ impl ProductionService {
             watch_auth: Arc::clone(&external) as Arc<dyn claw_http_api::WatchAuthPort>,
             watch_results: Arc::clone(&external) as Arc<dyn claw_http_api::WatchResultPort>,
             webhooks: external,
-            audit: Arc::clone(&audit) as Arc<dyn claw_http_api::AuditPort>,
+            audit: Arc::clone(audit.audit()) as Arc<dyn claw_http_api::AuditPort>,
         };
         diagnostics.record("optional watch pairing and task-flow webhook routes are disabled");
 
@@ -1400,8 +1591,18 @@ impl ProductionService {
                 "protected HTTP routes have no bearer credential"
             );
         }
+        if mcp_credentials.owner.is_none() && mcp_credentials.client.is_none() {
+            diagnostics.record(
+                "MCP routes reject every request; set GTA_CLAW_MCP_TOKEN or \
+                 GTA_CLAW_MCP_OWNER_TOKEN to enable scoped access",
+            );
+            warn!(
+                stage = "mcp-auth",
+                "MCP routes have no dedicated bearer credential"
+            );
+        }
         let api = HttpApi::with_serving_state(
-            api_config(admin_token.clone()),
+            api_config(admin_token.clone(), mcp_credentials),
             services,
             Arc::new(serving.clone()),
         );
@@ -1423,7 +1624,8 @@ impl ProductionService {
         let legacy_services = LegacyApiServices {
             runtime: Arc::clone(&agent_runtime) as Arc<dyn LegacyRuntimePort>,
             readiness: Arc::clone(&readiness) as Arc<dyn claw_http_api::ReadinessPort>,
-            device_flow: device_flow
+            device_flow: startup_services
+                .device_flow
                 .as_ref()
                 .map(|flow| Arc::clone(flow) as Arc<dyn claw_http_api::LegacyDeviceFlowPort>),
             teams: teams
@@ -1513,8 +1715,6 @@ impl ProductionService {
             .map_err(|error| ProductionError::new("mcp-bind", error))?;
         let gateway_address = gateway.local_address();
 
-        let gateway = gateway.start();
-        readiness.set("gateway", true);
         let http_shutdown = CancellationToken::new();
         let requests = RequestAccounting::default();
         let mut http_tasks = JoinSet::new();
@@ -1570,7 +1770,6 @@ impl ProductionService {
         readiness.set("legacy-http", true);
         readiness.set("mcp", true);
 
-        serving.begin_serving();
         let addresses = BoundAddresses {
             http: http_address,
             legacy: legacy_address,
@@ -1596,6 +1795,8 @@ impl ProductionService {
             model = provider.default_model(),
             "all required dependencies are live"
         );
+        let (channel_supervisor, update_monitor, device_flow) = startup_services.into_parts();
+        let audit = audit.into_inner();
 
         Ok(Self {
             addresses,
@@ -1610,14 +1811,14 @@ impl ProductionService {
             telemetry,
             requests,
             http_shutdown,
-            http_tasks,
-            gateway: Some(gateway),
+            http_tasks: tokio::sync::Mutex::new(http_tasks),
+            gateway: Mutex::new(Some(GatewayIngress::Bound(gateway))),
             device_flow,
             channels: channel_supervisor,
             agent_runtime,
             updater: update_monitor,
             plugins: Some(plugins.into_inner()),
-            terminated_http_tasks: 0,
+            terminated_http_tasks: AtomicU64::new(0),
         })
     }
 
@@ -1656,6 +1857,18 @@ impl ProductionService {
         self.config.generation()
     }
 
+    /// Opens request admission after every startup transaction has committed.
+    pub(crate) fn begin_serving(&self) {
+        self.agent_runtime.begin_serving();
+        let mut gateway = self.gateway.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(GatewayIngress::Bound(bound)) = gateway.take() {
+            *gateway = Some(GatewayIngress::Started(bound.start()));
+        }
+        drop(gateway);
+        self.readiness.set("gateway", true);
+        self.serving.begin_serving();
+    }
+
     /// Reloads the configured file transactionally.
     ///
     /// # Errors
@@ -1663,14 +1876,29 @@ impl ProductionService {
     /// Returns a `reload`-stage error when no file was configured, the file
     /// cannot be read, or the candidate is rejected and rolled back.
     pub async fn reload(&self) -> Result<AppliedReload, ProductionError> {
-        self.reloader.reload_file(CancellationToken::new()).await
+        self.reload_with_cancellation(CancellationToken::new())
+            .await
+    }
+
+    /// Reloads the configured file under caller-owned cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same reload-stage failures as [`Self::reload`], plus explicit
+    /// cancellation before participant commit.
+    pub(crate) async fn reload_with_cancellation(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<AppliedReload, ProductionError> {
+        self.reloader.reload_file(cancellation).await
     }
 
     /// Waits for an ingress task to exit without a stop request.
-    pub async fn wait_for_failure(&mut self) -> ProductionError {
-        match self.http_tasks.join_next().await {
+    pub async fn wait_for_failure(&self) -> ProductionError {
+        let mut tasks = self.http_tasks.lock().await;
+        match tasks.join_next().await {
             Some(result) => {
-                self.terminated_http_tasks += 1;
+                self.terminated_http_tasks.fetch_add(1, Ordering::AcqRel);
                 ProductionError::message("runtime", joined_http_result(result))
             }
             None => ProductionError::message("runtime", "all HTTP ingress tasks disappeared"),
@@ -1678,10 +1906,20 @@ impl ProductionService {
     }
 
     /// Quiesces ingress and joins every task within the process stop budget.
-    pub async fn stop(mut self, fault: Option<String>) -> ProductionStopSummary {
-        let started = Instant::now();
+    pub async fn stop(self, fault: Option<String>) -> ProductionStopSummary {
+        self.stop_with_deadline(fault, Instant::now() + PRODUCTION_STOP_DEADLINE)
+            .await
+    }
+
+    /// Stops using the caller's already-started absolute process deadline.
+    pub(crate) async fn stop_with_deadline(
+        mut self,
+        fault: Option<String>,
+        deadline: Instant,
+    ) -> ProductionStopSummary {
         let completed_before_drain = self.requests.completed();
         self.serving.begin_draining();
+        self.agent_runtime.begin_draining();
         self.readiness.set("http", false);
         self.readiness.set("legacy-http", false);
         self.readiness.set("mcp", false);
@@ -1692,8 +1930,12 @@ impl ProductionService {
         info!(stage = "shutdown", "readiness disabled; draining ingress");
 
         let mut abandoned = 0_u32;
-        if let Some(gateway) = self.gateway.as_ref()
-            && tokio::time::timeout(remaining(started), gateway.stop_accepting())
+        if let Some(GatewayIngress::Started(gateway)) = self
+            .gateway
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            && tokio::time::timeout(remaining(deadline), gateway.stop_accepting())
                 .await
                 .is_err()
         {
@@ -1706,24 +1948,34 @@ impl ProductionService {
         }
 
         self.http_shutdown.cancel();
+        let http_tasks = self.http_tasks.get_mut();
         let http_drain = async {
-            while let Some(result) = self.http_tasks.join_next().await {
-                self.terminated_http_tasks += 1;
+            while let Some(result) = http_tasks.join_next().await {
+                self.terminated_http_tasks.fetch_add(1, Ordering::AcqRel);
                 if let Err(error) = normalize_http_result(result) {
                     warn!(stage = "shutdown", subsystem = "http", error = %error);
                     abandoned += 1;
                 }
             }
         };
-        if tokio::time::timeout(remaining(started), http_drain)
+        if tokio::time::timeout(remaining(deadline), http_drain)
             .await
             .is_err()
         {
-            let outstanding = self.http_tasks.len();
+            let outstanding = http_tasks.len();
             abandoned = abandoned.saturating_add(u32::try_from(outstanding).unwrap_or(u32::MAX));
-            self.http_tasks.abort_all();
-            while self.http_tasks.join_next().await.is_some() {
-                self.terminated_http_tasks += 1;
+            http_tasks.abort_all();
+            let aborted_drain = async {
+                while http_tasks.join_next().await.is_some() {
+                    self.terminated_http_tasks.fetch_add(1, Ordering::AcqRel);
+                }
+            };
+            if tokio::time::timeout(remaining(deadline), aborted_drain)
+                .await
+                .is_err()
+            {
+                abandoned =
+                    abandoned.saturating_add(u32::try_from(http_tasks.len()).unwrap_or(u32::MAX));
             }
             warn!(
                 stage = "shutdown",
@@ -1739,7 +1991,7 @@ impl ProductionService {
 
         let audit_joined = {
             let audit = Arc::clone(&self.audit);
-            let budget = remaining(started);
+            let budget = remaining(deadline);
             if tokio::time::timeout(
                 budget,
                 self.blocking
@@ -1760,10 +2012,10 @@ impl ProductionService {
             }
         };
 
-        let channel_report = self.channels.shutdown(remaining(started)).await;
+        let channel_report = self.channels.shutdown(remaining(deadline)).await;
         abandoned = abandoned.saturating_add(channel_report.abandoned);
         let updater_spawned = u64::from(self.updater.is_enabled());
-        let updater_joined = self.updater.shutdown(remaining(started)).await;
+        let updater_joined = self.updater.shutdown(remaining(deadline)).await;
         if !updater_joined {
             abandoned = abandoned.saturating_add(1);
             warn!(
@@ -1774,7 +2026,7 @@ impl ProductionService {
         }
 
         let device_report = if let Some(device_flow) = self.device_flow.as_ref() {
-            device_flow.shutdown(remaining(started)).await
+            device_flow.shutdown(remaining(deadline)).await
         } else {
             DeviceTaskReport {
                 spawned: 0,
@@ -1784,7 +2036,7 @@ impl ProductionService {
         };
         abandoned = abandoned.saturating_add(device_report.abandoned);
 
-        match tokio::time::timeout(remaining(started), self.agent_runtime.shutdown()).await {
+        match tokio::time::timeout(remaining(deadline), self.agent_runtime.shutdown()).await {
             Ok(Ok(())) => info!(stage = "shutdown", subsystem = "runtime", "runtime stopped"),
             Ok(Err(error)) => {
                 abandoned = abandoned.saturating_add(1);
@@ -1799,13 +2051,18 @@ impl ProductionService {
                 );
             }
         }
-        self.provider.shutdown().await;
+        if tokio::time::timeout(remaining(deadline), self.provider.shutdown())
+            .await
+            .is_err()
+        {
+            abandoned = abandoned.saturating_add(1);
+        }
 
         let mut plugins_joined = false;
         let mut plugin_invocations_spawned = 0;
         let mut plugin_invocations_terminated = 0;
         if let Some(mut plugins) = self.plugins.take() {
-            let report = plugins.drain_invocations(remaining(started)).await;
+            let report = plugins.drain_invocations(remaining(deadline)).await;
             plugin_invocations_spawned = report.spawned;
             plugin_invocations_terminated = report.terminated;
             if report.cancelled > 0 {
@@ -1831,7 +2088,7 @@ impl ProductionService {
                     .blocking
                     .run("plugin-shutdown", move || plugins.shutdown_host());
                 tokio::pin!(task);
-                match tokio::time::timeout(remaining(started), &mut task).await {
+                match tokio::time::timeout(remaining(deadline), &mut task).await {
                     Ok(Ok(report)) => {
                         plugins_joined = true;
                         if report.failed > 0 {
@@ -1863,9 +2120,15 @@ impl ProductionService {
         }
 
         let mut gateway_joined = false;
-        if let Some(gateway) = self.gateway.take() {
+        let gateway = self
+            .gateway
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let gateway_was_started = matches!(&gateway, Some(GatewayIngress::Started(_)));
+        if let Some(GatewayIngress::Started(gateway)) = gateway {
             let mut task = tokio::spawn(gateway.shutdown());
-            match tokio::time::timeout(remaining(started), &mut task).await {
+            match tokio::time::timeout(remaining(deadline), &mut task).await {
                 Ok(Ok(())) => gateway_joined = true,
                 Ok(Err(error)) => {
                     abandoned = abandoned.saturating_add(1);
@@ -1878,8 +2141,13 @@ impl ProductionService {
                 }
                 Err(_) => {
                     task.abort();
-                    let _ = task.await;
                     abandoned = abandoned.saturating_add(1);
+                    if tokio::time::timeout(remaining(deadline), &mut task)
+                        .await
+                        .is_err()
+                    {
+                        abandoned = abandoned.saturating_add(1);
+                    }
                     warn!(
                         stage = "shutdown",
                         subsystem = "gateway",
@@ -1892,7 +2160,7 @@ impl ProductionService {
         let telemetry = match shutdown_telemetry_within(
             &self.blocking,
             self.telemetry.take(),
-            remaining(started),
+            remaining(deadline),
         )
         .await
         {
@@ -1904,7 +2172,7 @@ impl ProductionService {
                 "failed"
             }
         };
-        let blocking = self.blocking.shutdown_within(remaining(started)).await;
+        let blocking = self.blocking.shutdown_within(remaining(deadline)).await;
         if !blocking.is_settled() {
             abandoned = abandoned.saturating_add(
                 u32::try_from(blocking.outstanding())
@@ -1912,7 +2180,9 @@ impl ProductionService {
                     .max(1),
             );
         }
-        let spawned = 7_u64
+        let gateway_spawned = u64::from(gateway_was_started) * 2;
+        let spawned = 5_u64
+            .saturating_add(gateway_spawned)
             .saturating_add(device_report.spawned)
             .saturating_add(channel_report.spawned)
             .saturating_add(updater_spawned)
@@ -1920,6 +2190,7 @@ impl ProductionService {
             .saturating_add(blocking.spawned());
         let terminated = self
             .terminated_http_tasks
+            .load(Ordering::Acquire)
             .saturating_add(if gateway_joined { 2 } else { 0 })
             .saturating_add(u64::from(plugins_joined))
             .saturating_add(u64::from(audit_joined))
@@ -1928,7 +2199,7 @@ impl ProductionService {
             .saturating_add(u64::from(updater_spawned > 0 && updater_joined))
             .saturating_add(plugin_invocations_terminated)
             .saturating_add(blocking.terminated());
-        let deadline_expired = started.elapsed() >= PRODUCTION_STOP_DEADLINE;
+        let deadline_expired = Instant::now() >= deadline;
         let clean = abandoned == 0 && terminated == spawned && !deadline_expired && fault.is_none();
         ProductionStopSummary {
             clean,
@@ -1979,6 +2250,7 @@ impl ProductionStopSummary {
     pub(crate) fn before_start(
         blocking: crate::runtime::TaskLedger,
         telemetry: &'static str,
+        deadline_expired: bool,
     ) -> Self {
         let telemetry_clean = matches!(telemetry, "clean" | "not-configured");
         let blocking_abandoned = blocking
@@ -1987,15 +2259,16 @@ impl ProductionStopSummary {
             .max(u64::try_from(blocking.outstanding()).unwrap_or(u64::MAX));
         let abandoned = u32::try_from(blocking_abandoned)
             .unwrap_or(u32::MAX)
-            .saturating_add(u32::from(!telemetry_clean));
+            .saturating_add(u32::from(!telemetry_clean))
+            .saturating_add(u32::from(deadline_expired));
         Self {
-            clean: blocking.is_settled() && telemetry_clean,
+            clean: blocking.is_settled() && telemetry_clean && !deadline_expired,
             drained: 0,
             completed: 0,
             abandoned,
             spawned: blocking.spawned(),
             terminated: blocking.terminated(),
-            deadline_expired: false,
+            deadline_expired,
             fault: None,
             telemetry,
         }
@@ -2056,8 +2329,8 @@ impl ProductionStopSummary {
     }
 }
 
-fn remaining(started: Instant) -> Duration {
-    PRODUCTION_STOP_DEADLINE.saturating_sub(started.elapsed())
+fn remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
 }
 
 fn startup_cancelled() -> ProductionError {
@@ -2164,14 +2437,65 @@ fn channel_statuses(settings: &LegacySettings) -> Result<Vec<Value>, ProductionE
     Ok(statuses)
 }
 
-fn api_config(admin_token: Option<String>) -> ApiConfig {
+fn api_config(admin_token: Option<String>, mcp: McpCredentials) -> ApiConfig {
     let credentials = admin_token
         .map(|token| {
             BearerCredential::new(&token, Role::Operator, ScopeSet::from_scopes(Scope::ALL))
         })
         .into_iter()
         .collect();
-    ApiConfig::new(BearerAuthenticator::new(credentials))
+    let mut config = ApiConfig::new(BearerAuthenticator::new(credentials));
+    config.mcp_owner_authenticator = BearerAuthenticator::new(
+        mcp.owner
+            .map(|token| {
+                BearerCredential::new(&token, Role::Operator, ScopeSet::from_scopes(Scope::ALL))
+            })
+            .into_iter()
+            .collect(),
+    );
+    config.mcp_authenticator = BearerAuthenticator::new(
+        mcp.client
+            .map(|token| {
+                BearerCredential::new(
+                    &token,
+                    Role::Operator,
+                    ScopeSet::from_scopes([Scope::OperatorRead]),
+                )
+            })
+            .into_iter()
+            .collect(),
+    );
+    config
+}
+
+fn mcp_credentials() -> Result<McpCredentials, ProductionError> {
+    let owner = scoped_process_token("GTA_CLAW_MCP_OWNER_TOKEN")?;
+    let client = scoped_process_token("GTA_CLAW_MCP_TOKEN")?;
+    if owner.is_some() && owner == client {
+        return Err(ProductionError::message(
+            "mcp-auth",
+            "GTA_CLAW_MCP_OWNER_TOKEN and GTA_CLAW_MCP_TOKEN must be distinct",
+        ));
+    }
+    Ok(McpCredentials { owner, client })
+}
+
+fn scoped_process_token(name: &'static str) -> Result<Option<String>, ProductionError> {
+    match std::env::var(name) {
+        Ok(token)
+            if !token.is_empty()
+                && token.trim() == token
+                && !token.chars().any(char::is_whitespace) =>
+        {
+            Ok(Some(token))
+        }
+        Ok(_) => Err(ProductionError::message(
+            "mcp-auth",
+            format!("{name} must be a non-empty bearer token without whitespace"),
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(ProductionError::new("mcp-auth", error)),
+    }
 }
 
 fn admin_token(snapshot: &ConfigSnapshot) -> Result<Option<String>, ProductionError> {
@@ -2718,6 +3042,7 @@ pub fn check_configuration(
     validate_state_destination(&options.state_dir()?)?;
     let _ = proxy_policy(&loaded.snapshot)?;
     let _ = admin_token(&loaded.snapshot)?;
+    let _ = mcp_credentials()?;
     let _ = updates_enabled(&loaded.snapshot)
         .map_err(|error| ProductionError::message("updates", error))?;
     let legacy_settings = legacy_settings(&loaded.snapshot)?;
@@ -2737,41 +3062,21 @@ pub fn check_configuration(
 }
 
 fn validate_state_destination(path: &Path) -> Result<(), ProductionError> {
-    let mut candidate = path;
+    match std::fs::metadata(path) {
+        Ok(metadata) => return validate_existing_state_destination(path, &metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ProductionError::new("state", error)),
+    }
+    let mut candidate = path.parent().ok_or_else(|| {
+        ProductionError::message(
+            "state",
+            format!("state destination {} has no usable parent", path.display()),
+        )
+    })?;
     loop {
         match std::fs::metadata(candidate) {
             Ok(metadata) => {
-                if !metadata.is_dir() {
-                    return Err(ProductionError::message(
-                        "state",
-                        format!(
-                            "state destination {} is not a directory",
-                            candidate.display()
-                        ),
-                    ));
-                }
-                if metadata.permissions().readonly() {
-                    return Err(ProductionError::message(
-                        "state",
-                        format!("state destination {} is read-only", candidate.display()),
-                    ));
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-
-                    let mode = metadata.permissions().mode();
-                    if mode & 0o222 == 0 || mode & 0o111 == 0 {
-                        return Err(ProductionError::message(
-                            "state",
-                            format!(
-                                "state destination {} is not writable and searchable",
-                                candidate.display()
-                            ),
-                        ));
-                    }
-                }
-                return Ok(());
+                return validate_state_directory(candidate, &metadata);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 candidate = candidate.parent().ok_or_else(|| {
@@ -2786,17 +3091,228 @@ fn validate_state_destination(path: &Path) -> Result<(), ProductionError> {
     }
 }
 
+fn validate_existing_state_destination(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), ProductionError> {
+    validate_state_directory(path, metadata)?;
+    GatewayPairingStore::validate_existing(path.join("gateway-pairings.json"))
+        .map_err(|error| ProductionError::message("state", error))?;
+    let crestodian = path.join("crestodian-state.json");
+    match std::fs::metadata(&crestodian) {
+        Ok(metadata) if metadata.is_file() => {
+            std::fs::File::open(&crestodian)
+                .map_err(|error| ProductionError::new("state", error))?;
+        }
+        Ok(_) => {
+            return Err(ProductionError::message(
+                "state",
+                format!("state destination {} is not a file", crestodian.display()),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ProductionError::new("state", error)),
+    }
+    let audit = path.join("security-audit.jsonl");
+    match std::fs::metadata(&audit) {
+        Ok(metadata) if metadata.is_file() => {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&audit)
+                .map_err(|error| ProductionError::new("state", error))?;
+        }
+        Ok(_) => {
+            return Err(ProductionError::message(
+                "state",
+                format!("state destination {} is not a file", audit.display()),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ProductionError::new("state", error)),
+    }
+    let goals = path.join("goals");
+    match std::fs::metadata(&goals) {
+        Ok(metadata) => validate_goal_store_destination(&goals, &metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ProductionError::new("state", error)),
+    }
+    Ok(())
+}
+
+fn validate_goal_store_destination(
+    root: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), ProductionError> {
+    validate_state_directory(root, metadata)?;
+    for name in ["goals", "sessions"] {
+        let directory = root.join(name);
+        match std::fs::metadata(&directory) {
+            Ok(metadata) => validate_state_directory(&directory, &metadata)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ProductionError::new("state", error)),
+        }
+    }
+    let lock = root.join(".goal-store.lock");
+    match std::fs::metadata(&lock) {
+        Ok(metadata) if metadata.is_file() => {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock)
+                .map_err(|error| ProductionError::new("state", error))?;
+        }
+        Ok(_) => {
+            return Err(ProductionError::message(
+                "state",
+                format!("state destination {} is not a file", lock.display()),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ProductionError::new("state", error)),
+    }
+    Ok(())
+}
+
+fn validate_state_directory(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), ProductionError> {
+    if !metadata.is_dir() {
+        return Err(ProductionError::message(
+            "state",
+            format!("state destination {} is not a directory", path.display()),
+        ));
+    }
+    probe_state_directory(path).map_err(|error| ProductionError::new("state", error))?;
+    probe_state_child(path).map_err(|error| ProductionError::new("state", error))?;
+    Ok(())
+}
+
+fn probe_state_child(path: &Path) -> io::Result<()> {
+    probe_state_child_with_sequence(path, &STATE_PROBE_SEQUENCE)
+}
+
+fn probe_state_child_with_sequence(path: &Path, sequence: &AtomicU64) -> io::Result<()> {
+    for _ in 0..16 {
+        let probe = path.join(format!(
+            ".gta-claw-check-{}-{}",
+            std::process::id(),
+            sequence.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&probe) {
+            Ok(()) => return probe_owned_state_directory(&probe),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique state access probe",
+    ))
+}
+
+fn probe_owned_state_directory(probe: &Path) -> io::Result<()> {
+    struct OwnedProbe {
+        directory: PathBuf,
+        child: PathBuf,
+        child_created: bool,
+        directory_created: bool,
+    }
+
+    impl OwnedProbe {
+        fn cleanup(&mut self) -> io::Result<()> {
+            if self.child_created {
+                std::fs::remove_file(&self.child)?;
+                self.child_created = false;
+            }
+            if self.directory_created {
+                std::fs::remove_dir(&self.directory)?;
+                self.directory_created = false;
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for OwnedProbe {
+        fn drop(&mut self) {
+            if self.child_created {
+                let _ = std::fs::remove_file(&self.child);
+            }
+            if self.directory_created {
+                let _ = std::fs::remove_dir(&self.directory);
+            }
+        }
+    }
+
+    let child = probe.join("write-probe");
+    let mut owned = OwnedProbe {
+        directory: probe.to_owned(),
+        child: child.clone(),
+        child_created: false,
+        directory_created: true,
+    };
+    let result = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&child)
+    {
+        Ok(mut file) => {
+            owned.child_created = true;
+            file.write_all(b"state-access-probe")
+                .and_then(|()| file.sync_data())
+        }
+        Err(error) => Err(error),
+    };
+    let cleanup = owned.cleanup();
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn probe_state_directory(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map(drop)
+}
+
+#[cfg(unix)]
+fn probe_state_directory(path: &Path) -> io::Result<()> {
+    std::fs::File::open(path).map(drop)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn probe_state_directory(path: &Path) -> io::Result<()> {
+    std::fs::read_dir(path).map(drop)
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
     use std::io;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     use claw_config::{ConfigLayerKind, MigrationDiagnostic, migrate_legacy_environment, to_json5};
     use claw_crestodian::RecoveryGuidance;
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    use claw_provider_sdk::CredentialKey;
 
-    use super::{CommandLine, CommandMode, ProductionOptions, resolve_file_config};
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    use super::native_secret;
+    use super::{
+        CommandLine, CommandMode, ProductionOptions, probe_owned_state_directory,
+        probe_state_child_with_sequence, remaining, resolve_file_config,
+        validate_state_destination,
+    };
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -2886,6 +3402,203 @@ mod tests {
 
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{flag}");
         }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn targets_without_native_credential_storage_fail_explicitly() {
+        let key = CredentialKey::new("gta-claw", "portability-test").expect("credential key");
+        let error = native_secret(&key).expect_err("this target has no native credential store");
+
+        assert_eq!(error.stage(), "secrets");
+        assert!(
+            error
+                .to_string()
+                .contains("native credential storage is unavailable on this platform"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn existing_state_destination_validates_concrete_child_types() {
+        let root = std::env::temp_dir().join(format!(
+            "gta-claw-state-destination-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(root.join("security-audit.jsonl"))
+            .expect("conflicting audit directory is created");
+
+        let error = validate_state_destination(&root)
+            .expect_err("an audit directory cannot satisfy the append-only file contract");
+
+        assert_eq!(error.stage(), "state");
+        assert!(error.to_string().contains("security-audit.jsonl"));
+        assert!(error.to_string().contains("is not a file"));
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    #[test]
+    fn effective_state_access_probe_is_reversible() {
+        let root = std::env::temp_dir().join(format!(
+            "gta-claw-effective-state-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let before = std::fs::read_dir(&root)
+            .expect("state directory is readable")
+            .count();
+
+        validate_state_destination(&root).expect("effective create/write/search access succeeds");
+
+        let after = std::fs::read_dir(&root)
+            .expect("state directory remains readable")
+            .count();
+        assert_eq!(after, before, "state probe left a persistent child");
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    #[test]
+    fn state_probe_never_removes_a_foreign_collision() {
+        let root = std::env::temp_dir().join(format!(
+            "gta-claw-colliding-state-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let collision = root.join(format!(".gta-claw-check-{}-0", std::process::id()));
+        std::fs::create_dir(&collision).expect("foreign collision is created");
+        std::fs::write(collision.join("foreign"), "owned elsewhere")
+            .expect("foreign child is written");
+
+        let sequence = AtomicU64::new(0);
+        probe_state_child_with_sequence(&root, &sequence).expect("probe retries a unique name");
+
+        assert_eq!(
+            std::fs::read_to_string(collision.join("foreign"))
+                .expect("foreign collision remains intact"),
+            "owned elsewhere"
+        );
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    #[test]
+    fn child_create_collision_is_never_removed() {
+        let root = std::env::temp_dir().join(format!(
+            "gta-claw-child-collision-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("owned probe directory is created");
+        let child = root.join("write-probe");
+        std::fs::write(&child, "foreign child").expect("foreign child is written");
+
+        let error = probe_owned_state_directory(&root)
+            .expect_err("create_new collision must fail the probe");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&child).expect("foreign child survives"),
+            "foreign child"
+        );
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effective_state_access_probe_rejects_non_creatable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "gta-claw-denied-state-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500))
+            .expect("directory permissions are restricted");
+
+        let result = validate_state_destination(&root);
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("directory permissions are restored");
+        assert!(result.is_err(), "effective create access was not tested");
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    #[test]
+    fn existing_goal_store_destination_validates_every_concrete_path() {
+        for relative in ["goals/goals", "goals/sessions", "goals/.goal-store.lock"] {
+            let root = std::env::temp_dir().join(format!(
+                "gta-claw-goal-destination-{}-{}",
+                std::process::id(),
+                NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(root.join("goals")).expect("goal root is created");
+            if relative.ends_with(".goal-store.lock") {
+                std::fs::create_dir_all(root.join(relative))
+                    .unwrap_or_else(|error| panic!("{relative}: conflicting directory: {error}"));
+            } else {
+                std::fs::write(root.join(relative), "not a directory")
+                    .unwrap_or_else(|error| panic!("{relative}: conflicting file: {error}"));
+            }
+
+            let error = match validate_state_destination(&root) {
+                Ok(()) => panic!("{relative}: conflicting type was accepted"),
+                Err(error) => error,
+            };
+
+            assert!(error.to_string().contains(relative), "{relative}: {error}");
+            std::fs::remove_dir_all(root).expect("temporary root is removed");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_access_probe_accepts_a_valid_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "gta-claw-windows-state-dir-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+
+        validate_state_destination(&root).expect("valid Windows directory handle opens");
+
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    #[test]
+    fn shutdown_budget_is_derived_from_one_absolute_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let initial = remaining(deadline);
+        std::thread::sleep(Duration::from_millis(10));
+        let later = remaining(deadline);
+
+        assert!(later < initial, "shutdown budget was reset between phases");
+        assert_eq!(
+            remaining(Instant::now() - Duration::from_millis(1)),
+            Duration::ZERO
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_start_deadline_expiry_is_never_reported_clean() {
+        let ledger = crate::runtime::BlockingTaskHost::new(1)
+            .shutdown_within(Duration::ZERO)
+            .await;
+        assert!(
+            ledger.is_settled(),
+            "fixture ledger must otherwise be clean"
+        );
+
+        let summary = super::ProductionStopSummary::before_start(ledger, "clean", true);
+
+        assert!(!summary.is_clean());
+        assert!(summary.deadline_expired());
+        assert_eq!(summary.abandoned(), 1);
+        assert_eq!(summary.spawned(), summary.terminated());
     }
 
     #[test]

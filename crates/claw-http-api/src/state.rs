@@ -77,12 +77,31 @@ impl ApiState {
         format!("{prefix}_{nanos:032x}{sequence:016x}")
     }
 
-    pub(crate) fn resolve_response_session(
+    pub(crate) async fn resolve_response_session(
         &self,
         previous_response_id: Option<&str>,
         subject: [u8; 32],
         model: &str,
-    ) -> Result<String, ApiError> {
+    ) -> Result<(String, u64), ApiError> {
+        if self.inner.services.provider.owns_response_continuity() {
+            let resolved = self
+                .inner
+                .services
+                .provider
+                .resolve_response_session(
+                    previous_response_id.map(str::to_owned),
+                    subject,
+                    model.to_owned(),
+                )
+                .await
+                .map_err(|_| response_session_error())?;
+            return Ok((
+                resolved
+                    .session_id
+                    .unwrap_or_else(|| self.id("response_session")),
+                resolved.epoch,
+            ));
+        }
         let now = Instant::now();
         let mut sessions = self
             .inner
@@ -95,16 +114,26 @@ impl ApiState {
             .filter(|entry| entry.subject == subject && entry.model == model)
             .map(|entry| entry.session_id.clone());
         drop(sessions);
-        Ok(resumed.unwrap_or_else(|| self.id("response_session")))
+        Ok((resumed.unwrap_or_else(|| self.id("response_session")), 0))
     }
 
-    pub(crate) fn remember_response_session(
+    pub(crate) async fn remember_response_session(
         &self,
         response_id: String,
         subject: [u8; 32],
         model: String,
         session_id: String,
+        epoch: u64,
     ) -> Result<(), ApiError> {
+        if self.inner.services.provider.owns_response_continuity() {
+            return self
+                .inner
+                .services
+                .provider
+                .remember_response_session(response_id, subject, model, session_id, epoch)
+                .await
+                .map_err(|_| response_session_error());
+        }
         let mut sessions = self
             .inner
             .response_sessions

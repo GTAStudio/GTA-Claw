@@ -163,3 +163,42 @@ fn check_config_rejects_an_unusable_state_destination_without_mutating_it() {
     );
     std::fs::remove_dir_all(root).expect("temporary root is removed");
 }
+
+#[test]
+fn check_config_reuses_pairing_schema_validation_without_rewriting() {
+    let root = std::env::temp_dir().join(format!(
+        "gta-claw-check-pairing-{}-{}",
+        std::process::id(),
+        NEXT_STATE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("temporary root is created");
+    let pairing = root.join("gateway-pairings.json");
+    let invalid = r#"{"schema_version":999,"pairings":[]}"#;
+    std::fs::write(&pairing, invalid).expect("invalid pairing file is written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
+        .env_clear()
+        .args(["--check-config", "--state-dir"])
+        .arg(&root)
+        .env("GITHUB_TOKEN", "test")
+        .env("ENABLE_TEAMS", "false")
+        .env("ENABLE_TELEGRAM", "false")
+        .env("ENABLE_DISCORD", "false")
+        .env("ENABLE_WHATSAPP", "false")
+        .env("COPILOT_MODEL", "gpt-4o")
+        .env("AGENT_ROLE_URL", "https://example.test/role")
+        .output()
+        .expect("configuration check runs");
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        stderr_of(&output).contains("pairing file schema is unsupported"),
+        "{output:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&pairing).expect("pairing remains readable"),
+        invalid,
+        "check-config rewrote the pairing file"
+    );
+    std::fs::remove_dir_all(root).expect("temporary root is removed");
+}

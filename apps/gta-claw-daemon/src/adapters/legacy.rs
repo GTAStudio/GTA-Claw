@@ -128,14 +128,13 @@ impl LegacyDeviceFlowAdapter {
 
     /// Cancels and joins the active poller within `budget`.
     pub async fn shutdown(&self, budget: Duration) -> DeviceTaskReport {
-        let started = Instant::now();
+        let deadline = Instant::now() + budget;
         self.stopping.store(true, Ordering::Release);
-        let active_cancel = self.active_cancel.lock().await.take();
-        if let Some(cancel) = active_cancel {
-            cancel.cancel();
-        }
-        let _ = self.flow.clear().await;
-        let Ok(_single_flight) = tokio::time::timeout(budget, self.single_flight.lock()).await
+        let Ok(mut active_cancel_slot) = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            self.active_cancel.lock(),
+        )
+        .await
         else {
             return DeviceTaskReport {
                 spawned: self.spawned.load(Ordering::SeqCst),
@@ -143,14 +142,56 @@ impl LegacyDeviceFlowAdapter {
                 abandoned: 1,
             };
         };
-        let task = self.task.lock().await.take();
+        let active_cancel = active_cancel_slot.take();
+        drop(active_cancel_slot);
+        if let Some(cancel) = active_cancel {
+            cancel.cancel();
+        }
+        let _ = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            self.flow.clear(),
+        )
+        .await;
+        let Ok(_single_flight) = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            self.single_flight.lock(),
+        )
+        .await
+        else {
+            return DeviceTaskReport {
+                spawned: self.spawned.load(Ordering::SeqCst),
+                terminated: self.terminated.load(Ordering::SeqCst),
+                abandoned: 1,
+            };
+        };
+        let Ok(mut task_slot) = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            self.task.lock(),
+        )
+        .await
+        else {
+            return DeviceTaskReport {
+                spawned: self.spawned.load(Ordering::SeqCst),
+                terminated: self.terminated.load(Ordering::SeqCst),
+                abandoned: 1,
+            };
+        };
+        let task = task_slot.take();
+        drop(task_slot);
         let abandoned = if let Some(mut task) = task
-            && tokio::time::timeout(budget.saturating_sub(started.elapsed()), &mut task)
+            && tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                &mut task,
+            )
                 .await
                 .is_err()
         {
             task.abort();
-            let _ = task.await;
+            let _ = tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                &mut task,
+            )
+            .await;
             1
         } else {
             0

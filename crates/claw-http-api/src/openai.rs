@@ -459,11 +459,13 @@ pub(crate) async fn responses(
     let tools = tools_for_choice(tools, &tool_choice);
     let response_id = state.id("resp");
     let output_item_id = state.id("msg");
-    let session_id = state.resolve_response_session(
-        body.previous_response_id.as_deref(),
-        principal.subject,
-        &body.model,
-    )?;
+    let (session_id, continuity_epoch) = state
+        .resolve_response_session(
+            body.previous_response_id.as_deref(),
+            principal.subject,
+            &body.model,
+        )
+        .await?;
     let generation = GenerationRequest {
         model: body.model.clone(),
         prompt: prompt.message,
@@ -481,14 +483,8 @@ pub(crate) async fn responses(
         stop: None,
         response_format: None,
         request_id: response_id.clone(),
-        session_id: session_id.clone(),
+        session_id: format!("{session_id}#epoch={continuity_epoch}"),
     };
-    state.remember_response_session(
-        response_id.clone(),
-        principal.subject,
-        body.model.clone(),
-        session_id,
-    )?;
     let _compat_fields = (
         body.user,
         body.metadata,
@@ -502,6 +498,9 @@ pub(crate) async fn responses(
             generation,
             response_id,
             output_item_id,
+            principal.subject,
+            session_id.clone(),
+            continuity_epoch,
         ));
     }
     let cancellation = CancellationToken::new();
@@ -556,6 +555,15 @@ pub(crate) async fn responses(
     } else {
         "incomplete"
     };
+    state
+        .remember_response_session(
+            response_id.clone(),
+            principal.subject,
+            generation.model.clone(),
+            session_id,
+            continuity_epoch,
+        )
+        .await?;
     Ok(json_response(
         StatusCode::OK,
         &response_resource(
@@ -766,6 +774,9 @@ fn responses_stream(
     request: GenerationRequest,
     response_id: String,
     item_id: String,
+    subject: [u8; 32],
+    session_id: String,
+    continuity_epoch: u64,
 ) -> Response {
     let capacity = state.inner.config.limits.stream_buffer.max(1);
     let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, Infallible>>(capacity);
@@ -1067,12 +1078,46 @@ fn responses_stream(
             None,
             created,
         );
-        let _ = sse_tx
-            .send(Ok(named_event(
-                "response.completed",
-                json!({"type":"response.completed","response":final_response}),
-            )))
+        let terminal = named_event(
+            "response.completed",
+            json!({"type":"response.completed","response":final_response}),
+        );
+        let terminal_permit = tokio::select! {
+            permit = sse_tx.reserve() => {
+                let Ok(permit) = permit else {
+                    return;
+                };
+                permit
+            }
+            () = cancellation.cancelled() => return,
+        };
+        if state_for_ids
+            .remember_response_session(
+                response_id.clone(),
+                subject,
+                request.model.clone(),
+                session_id.clone(),
+                continuity_epoch,
+            )
+            .await
+            .is_err()
+        {
+            drop(terminal_permit);
+            send_response_failure(
+                &sse_tx,
+                &response_id,
+                &request.model,
+                PortError::new(
+                    PortErrorKind::Unavailable,
+                    "response continuity changed before completion",
+                ),
+                usage,
+                created,
+            )
             .await;
+            return;
+        }
+        terminal_permit.send(Ok(terminal));
         let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
     });
     sse_response(

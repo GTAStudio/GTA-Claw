@@ -14,9 +14,9 @@ use tokio_util::sync::CancellationToken;
 use crate::ports::{
     AdminFailure, AdminPort, AdminSuccess, ApiServices, AuditPort, EmbeddingRequest,
     GenerationEvent, GenerationOutput, GenerationRequest, Model, PortError, PortErrorKind,
-    PortFuture, ProviderPort, ReadinessPort, ReadinessSnapshot, ToolDefinition, ToolInvocation,
-    ToolOutcome, ToolPort, Usage, WatchAuthPort, WatchIdentity, WatchResultPort, WebhookOutcome,
-    WebhookPort,
+    PortFuture, ProviderPort, ReadinessPort, ReadinessSnapshot, ToolAccess, ToolDefinition,
+    ToolInvocation, ToolOutcome, ToolPort, Usage, WatchAuthPort, WatchIdentity, WatchResultPort,
+    WebhookOutcome, WebhookPort,
 };
 
 /// Deterministic adapter implementing every runtime port.
@@ -29,6 +29,7 @@ pub struct DeterministicRuntime {
     delay_ms: AtomicU64,
     stream_cancelled: AtomicBool,
     audits: Mutex<Vec<AuditEvent>>,
+    audit_failed: AtomicBool,
 }
 
 impl Default for DeterministicRuntime {
@@ -50,6 +51,7 @@ impl Default for DeterministicRuntime {
             delay_ms: AtomicU64::new(0),
             stream_cancelled: AtomicBool::new(false),
             audits: Mutex::new(Vec::new()),
+            audit_failed: AtomicBool::new(false),
         }
     }
 }
@@ -146,6 +148,11 @@ impl DeterministicRuntime {
             .lock()
             .map(|events| events.clone())
             .map_err(|_| PortError::new(PortErrorKind::Internal, "audit lock failed"))
+    }
+
+    /// Forces subsequent mandatory audit writes to fail.
+    pub fn fail_audit(&self) {
+        self.audit_failed.store(true, Ordering::Release);
     }
 
     async fn delay(&self, cancellation: &CancellationToken) -> Result<(), PortError> {
@@ -298,13 +305,34 @@ impl ProviderPort for DeterministicRuntime {
 }
 
 impl ToolPort for DeterministicRuntime {
+    fn access(&self, name: &str) -> ToolAccess {
+        match name {
+            "echo" => ToolAccess::Read,
+            "mutate" => ToolAccess::Write,
+            "plugin:privileged" => ToolAccess::Owner,
+            _ => ToolAccess::Owner,
+        }
+    }
+
     fn list(&self) -> PortFuture<'_, Result<Vec<ToolDefinition>, PortError>> {
         Box::pin(async {
-            Ok(vec![ToolDefinition {
-                name: "echo".to_owned(),
-                description: Some("Returns its arguments".to_owned()),
-                input_schema: json!({"type":"object"}),
-            }])
+            Ok(vec![
+                ToolDefinition {
+                    name: "echo".to_owned(),
+                    description: Some("Returns its arguments".to_owned()),
+                    input_schema: json!({"type":"object"}),
+                },
+                ToolDefinition {
+                    name: "mutate".to_owned(),
+                    description: Some("Mutates deterministic state".to_owned()),
+                    input_schema: json!({"type":"object"}),
+                },
+                ToolDefinition {
+                    name: "plugin:privileged".to_owned(),
+                    description: Some("Represents a privileged plugin tool".to_owned()),
+                    input_schema: json!({"type":"object"}),
+                },
+            ])
         })
     }
 
@@ -318,7 +346,10 @@ impl ToolPort for DeterministicRuntime {
             *self.last_tool_invocation.lock().map_err(|_| {
                 PortError::new(PortErrorKind::Internal, "tool invocation lock failed")
             })? = Some(invocation.clone());
-            if invocation.name != "echo" {
+            if !matches!(
+                invocation.name.as_str(),
+                "echo" | "mutate" | "plugin:privileged"
+            ) {
                 return Ok(ToolOutcome {
                     status: 404,
                     ok: false,
@@ -423,6 +454,12 @@ impl WebhookPort for DeterministicRuntime {
 
 impl AuditPort for DeterministicRuntime {
     fn persist(&self, event: &AuditEvent) -> Result<(), PortError> {
+        if self.audit_failed.load(Ordering::Acquire) {
+            return Err(PortError::new(
+                PortErrorKind::Unavailable,
+                "forced audit failure",
+            ));
+        }
         self.audits
             .lock()
             .map_err(|_| PortError::new(PortErrorKind::Internal, "audit lock failed"))?

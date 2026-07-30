@@ -1,6 +1,7 @@
 //! Supervised Telegram and Discord channel transports.
 
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
@@ -21,7 +22,7 @@ use claw_provider_sdk::http::{
     Body, HttpRequest, HttpTransport, Method, ProxyPolicy, TransportConfig,
 };
 use claw_provider_sdk::{BoundSecret, CancelToken, Operation, Origin, SecretString};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt as _, SinkExt, StreamExt};
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -31,9 +32,9 @@ use tokio_util::task::TaskTracker;
 use url::Url;
 
 use super::agent_runtime::AgentRuntime;
-use super::http_api::Diagnostics;
+use super::http_api::{DependencyReadiness, Diagnostics};
+use crate::runtime::BlockingTaskHost;
 
-const CHANNEL_START_TIMEOUT: Duration = Duration::from_secs(20);
 const CHANNEL_STOP_GRACE: Duration = Duration::from_secs(2);
 
 /// Configured Telegram worker.
@@ -106,12 +107,15 @@ pub struct ChannelSupervisor {
     request_cancellations: RequestCancellations,
     spawned: u64,
     terminated: Arc<AtomicU64>,
+    failed: Arc<AtomicU64>,
 }
 
 struct ChannelStartGuard<'a> {
     cancellation: &'a CancellationToken,
+    tracker: &'a TaskTracker,
     aborts: &'a Mutex<Vec<AbortHandle>>,
     request_cancellations: RequestCancellations,
+    blocking: BlockingTaskHost,
     armed: bool,
 }
 
@@ -135,6 +139,15 @@ impl Drop for ChannelStartGuard<'_> {
             .iter()
         {
             abort.abort();
+        }
+        self.tracker.close();
+        let tracker = self.tracker.clone();
+        if self
+            .blocking
+            .spawn_owned(async move { tracker.wait().await })
+            .is_err()
+        {
+            self.blocking.record_abandoned();
         }
     }
 }
@@ -181,17 +194,22 @@ impl ChannelSupervisor {
         authentication: Arc<RwLock<Option<String>>>,
         proxy: ProxyPolicy,
         diagnostics: Arc<Diagnostics>,
+        readiness: Arc<DependencyReadiness>,
         startup_cancellation: CancellationToken,
+        blocking: BlockingTaskHost,
     ) -> Result<Self, String> {
         let cancellation = startup_cancellation.child_token();
         let tracker = TaskTracker::new();
         let terminated = Arc::new(AtomicU64::new(0));
+        let failed = Arc::new(AtomicU64::new(0));
         let aborts = Mutex::new(Vec::new());
         let request_cancellations = Arc::new(Mutex::new(Vec::new()));
         let mut start_guard = ChannelStartGuard {
             cancellation: &cancellation,
+            tracker: &tracker,
             aborts: &aborts,
             request_cancellations: Arc::clone(&request_cancellations),
+            blocking,
             armed: true,
         };
         let mut spawned = 0_u64;
@@ -199,6 +217,7 @@ impl ChannelSupervisor {
         if let Some(settings) = telegram {
             let request_cancel = Arc::new(Mutex::new(None));
             let transport = TelegramHttpTransport::new(proxy.clone(), Arc::clone(&request_cancel))?;
+            transport.validate(&settings.token, &cancellation).await?;
             let account = "default";
             let origin = approved_origin("telegram", account, "api.telegram.org")?;
             let credential = bind_credential(
@@ -226,18 +245,27 @@ impl ChannelSupervisor {
             let task_runtime = Arc::clone(&runtime);
             let task_authentication = Arc::clone(&authentication);
             let task_diagnostics = Arc::clone(&diagnostics);
+            let task_readiness = Arc::clone(&readiness);
             let task_terminated = Arc::clone(&terminated);
+            let task_failed = Arc::clone(&failed);
             let handle = tracker.spawn(async move {
                 let _guard = TerminationGuard(task_terminated);
-                run_telegram(
+                let result = AssertUnwindSafe(run_telegram(
                     channel,
                     credential,
                     task_runtime,
                     task_authentication,
                     task_diagnostics,
-                    task_cancel,
-                )
+                    task_cancel.clone(),
+                ))
+                .catch_unwind()
                 .await;
+                if result.is_err() {
+                    task_failed.fetch_add(1, Ordering::SeqCst);
+                }
+                if !task_cancel.is_cancelled() {
+                    task_readiness.set("channels", false);
+                }
             });
             aborts
                 .lock()
@@ -313,9 +341,23 @@ impl ChannelSupervisor {
                 .map_err(|error| error.to_string())?;
             let socket_cancel = cancellation.clone();
             let socket_terminated = Arc::clone(&terminated);
+            let socket_readiness = Arc::clone(&readiness);
+            let socket_failed = Arc::clone(&failed);
             let socket = tracker.spawn(async move {
                 let _guard = TerminationGuard(socket_terminated);
-                run_discord_socket(commands, event_tx, socket_cancel).await;
+                let result = AssertUnwindSafe(run_discord_socket(
+                    commands,
+                    event_tx,
+                    socket_cancel.clone(),
+                ))
+                .catch_unwind()
+                .await;
+                if result.is_err() {
+                    socket_failed.fetch_add(1, Ordering::SeqCst);
+                }
+                if !socket_cancel.is_cancelled() {
+                    socket_readiness.set("channels", false);
+                }
             });
             aborts
                 .lock()
@@ -329,10 +371,12 @@ impl ChannelSupervisor {
             let task_runtime = Arc::clone(&runtime);
             let task_authentication = Arc::clone(&authentication);
             let task_diagnostics = Arc::clone(&diagnostics);
+            let task_readiness = Arc::clone(&readiness);
             let task_terminated = Arc::clone(&terminated);
+            let task_failed = Arc::clone(&failed);
             let channel_task = tracker.spawn(async move {
                 let _guard = TerminationGuard(task_terminated);
-                run_discord(
+                let result = AssertUnwindSafe(run_discord(
                     channel,
                     gateway_credential,
                     reply_transport,
@@ -342,11 +386,18 @@ impl ChannelSupervisor {
                     task_runtime,
                     task_authentication,
                     task_diagnostics,
-                    task_cancel,
+                    task_cancel.clone(),
                     ready_tx,
                     started,
-                )
+                ))
+                .catch_unwind()
                 .await;
+                if result.is_err() {
+                    task_failed.fetch_add(1, Ordering::SeqCst);
+                }
+                if !task_cancel.is_cancelled() {
+                    task_readiness.set("channels", false);
+                }
             });
             aborts
                 .lock()
@@ -358,19 +409,12 @@ impl ChannelSupervisor {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(request_cancel);
             spawned = spawned.saturating_add(1);
-            match tokio::time::timeout(CHANNEL_START_TIMEOUT, ready_rx).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(error))) => {
-                    cancellation.cancel();
-                    return Err(error);
+            tokio::select! {
+                ready = ready_rx => {
+                    ready.map_err(|_| "Discord readiness task stopped".to_owned())??;
                 }
-                Ok(Err(_)) => {
-                    cancellation.cancel();
-                    return Err("Discord channel stopped before readiness".to_owned());
-                }
-                Err(_) => {
-                    cancellation.cancel();
-                    return Err("Discord channel readiness timed out".to_owned());
+                () = cancellation.cancelled() => {
+                    return Err("Discord readiness was cancelled".to_owned());
                 }
             }
         }
@@ -384,6 +428,7 @@ impl ChannelSupervisor {
             request_cancellations,
             spawned,
             terminated,
+            failed,
         })
     }
 
@@ -416,6 +461,8 @@ impl ChannelSupervisor {
             )
             .await;
         }
+        abandoned = abandoned
+            .saturating_add(u32::try_from(self.failed.load(Ordering::SeqCst)).unwrap_or(u32::MAX));
         ChannelTaskReport {
             spawned: self.spawned,
             terminated: self.terminated.load(Ordering::SeqCst),
@@ -561,6 +608,50 @@ impl TelegramHttpTransport {
             request_cancel,
         })
     }
+
+    async fn validate(
+        &self,
+        token: &SecretString,
+        cancellation: &CancellationToken,
+    ) -> Result<(), String> {
+        let url = Url::parse(&format!(
+            "https://api.telegram.org/bot{}/getMe",
+            token.expose()
+        ))
+        .map_err(|_| "Telegram validation URL is invalid".to_owned())?;
+        let cancel = CancelToken::new();
+        *self
+            .request_cancel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(cancel.clone());
+        let _guard = RequestSlotGuard {
+            slot: &self.request_cancel,
+        };
+        let response = tokio::select! {
+            result = self.transport.send(
+                "telegram",
+                Operation::Transport,
+                HttpRequest::new(Method::Get, url).timeout(Duration::from_secs(10)),
+                &cancel,
+            ) => result.map_err(|error| provider_channel_error(&error).to_string())?,
+            () = cancellation.cancelled() => {
+                cancel.cancel();
+                return Err("Telegram validation was cancelled".to_owned());
+            }
+        };
+        if !(200..300).contains(&response.status()) {
+            return Err(format!(
+                "Telegram credential validation failed with HTTP {}",
+                response.status()
+            ));
+        }
+        let body: serde_json::Value = serde_json::from_slice(response.body())
+            .map_err(|_| "Telegram credential validation returned invalid JSON".to_owned())?;
+        if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err("Telegram credential validation was rejected".to_owned());
+        }
+        Ok(())
+    }
 }
 
 impl TelegramTransport for TelegramHttpTransport {
@@ -628,8 +719,16 @@ enum DiscordCommand {
 
 enum DiscordEvent {
     Opened,
-    Packet(Vec<u8>),
+    Packet(Vec<u8>, oneshot::Sender<()>),
     Closed,
+}
+
+fn discord_packet_requires_admission(packet: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(packet) else {
+        return false;
+    };
+    value.get("op").and_then(serde_json::Value::as_u64) == Some(0)
+        && value.get("t").and_then(serde_json::Value::as_str) != Some("READY")
 }
 
 #[derive(Clone)]
@@ -799,13 +898,23 @@ async fn run_discord_socket(
                 },
                 message = reader.next() => match message {
                     Some(Ok(Message::Text(text))) => {
-                        if events.send(DiscordEvent::Packet(text.as_bytes().to_vec())).await.is_err() {
+                        let (processed, wait_processed) = oneshot::channel();
+                        if events.send(DiscordEvent::Packet(text.as_bytes().to_vec(), processed)).await.is_err() {
                             return;
+                        }
+                        tokio::select! {
+                            _ = wait_processed => {}
+                            () = cancellation.cancelled() => return,
                         }
                     }
                     Some(Ok(Message::Binary(bytes))) => {
-                        if events.send(DiscordEvent::Packet(bytes.to_vec())).await.is_err() {
+                        let (processed, wait_processed) = oneshot::channel();
+                        if events.send(DiscordEvent::Packet(bytes.to_vec(), processed)).await.is_err() {
                             return;
+                        }
+                        tokio::select! {
+                            _ = wait_processed => {}
+                            () = cancellation.cancelled() => return,
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
@@ -863,12 +972,29 @@ async fn run_discord(
                     DiscordEvent::Opened => channel.gateway_opened(
                         &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
                     ).map(|()| None),
-                    DiscordEvent::Packet(packet) => channel.handle_gateway_packet(
-                        &packet,
-                        started.elapsed(),
-                        &gateway_credential,
-                        &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
-                    ).map(Some),
+                    DiscordEvent::Packet(packet, processed) => {
+                        if discord_packet_requires_admission(&packet)
+                            && !runtime.wait_for_channel_admission(&cancellation).await
+                        {
+                            break;
+                        }
+                        let result = channel.handle_gateway_packet(
+                            &packet,
+                            started.elapsed(),
+                            &gateway_credential,
+                            &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
+                        ).map(Some);
+                        if matches!(&result, Ok(Some(DiscordPacketOutcome::Ready))) {
+                            if let Some(ready) = ready.take() {
+                                let _ = ready.send(Ok(()));
+                            }
+                            if !runtime.wait_for_channel_admission(&cancellation).await {
+                                break;
+                            }
+                        }
+                        let _ = processed.send(());
+                        result
+                    }
                     DiscordEvent::Closed => channel.gateway_closed(
                         started.elapsed(),
                         &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
@@ -883,12 +1009,14 @@ async fn run_discord(
                     Ok(_) => {}
                     Err(error) => diagnostics.record(format!("Discord event failed: {error}")),
                 }
-                if let Err(error) = enqueue_discord(
-                    &mut channel,
-                    &inbound_tx,
-                    &diagnostics,
-                ) {
-                    diagnostics.record(format!("Discord dispatch failed: {error}"));
+                if runtime.accepts_channel_work() {
+                    if let Err(error) = enqueue_discord(
+                        &mut channel,
+                        &inbound_tx,
+                        &diagnostics,
+                    ) {
+                        diagnostics.record(format!("Discord dispatch failed: {error}"));
+                    }
                 }
             }
             _ = tick.tick() => {
@@ -904,7 +1032,7 @@ async fn run_discord(
     dispatch_cancellation.cancel();
     drop(inbound_tx);
     if let Err(error) = dispatch_task.join().await {
-        diagnostics.record(format!("Discord dispatch task failed: {error}"));
+        panic!("Discord dispatch task failed: {error}");
     }
     let _ = channel.stop(&mut ChannelDiagnostics(Arc::clone(&diagnostics)));
     if let Some(ready) = ready {
@@ -922,6 +1050,9 @@ async fn run_telegram(
 ) {
     loop {
         if cancellation.is_cancelled() {
+            break;
+        }
+        if !runtime.wait_for_channel_admission(&cancellation).await {
             break;
         }
         if let Err(error) = channel.poll_once(
@@ -1090,6 +1221,9 @@ async fn process_inbound(
     diagnostics: &Arc<Diagnostics>,
     cancellation: CancellationToken,
 ) -> Result<Option<String>, ChannelError> {
+    if !runtime.accepts_channel_work() {
+        return Err(ChannelError::RemoteRejected { status: 503 });
+    }
     let text = message.text.as_deref().unwrap_or_default();
     let instructions = authentication
         .read()
@@ -1184,7 +1318,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use tokio_util::task::TaskTracker;
 
-    use super::ChannelStartGuard;
+    use super::{ChannelStartGuard, discord_packet_requires_admission};
+    use crate::runtime::BlockingTaskHost;
 
     #[tokio::test]
     async fn dropping_channel_start_aborts_accepted_workers() {
@@ -1197,12 +1332,15 @@ mod tests {
         let request_cancellations = Arc::new(Mutex::new(vec![Arc::new(Mutex::new(Some(
             request_cancel.clone(),
         )))]));
+        let blocking = BlockingTaskHost::new(1);
         drop(task);
         {
             let _guard = ChannelStartGuard {
                 cancellation: &cancellation,
+                tracker: &tracker,
                 aborts: &aborts,
                 request_cancellations,
+                blocking: blocking.clone(),
                 armed: true,
             };
         }
@@ -1219,5 +1357,24 @@ mod tests {
             aborts.lock().unwrap_or_else(PoisonError::into_inner).len(),
             1
         );
+        assert!(
+            blocking
+                .shutdown_within(Duration::from_secs(1))
+                .await
+                .is_settled()
+        );
+    }
+
+    #[test]
+    fn discord_only_processes_protocol_readiness_before_channel_admission() {
+        assert!(!discord_packet_requires_admission(
+            br#"{"op":10,"d":{"heartbeat_interval":45000}}"#
+        ));
+        assert!(!discord_packet_requires_admission(
+            br#"{"op":0,"t":"READY","d":{}}"#
+        ));
+        assert!(discord_packet_requires_admission(
+            br#"{"op":0,"t":"MESSAGE_CREATE","d":{}}"#
+        ));
     }
 }

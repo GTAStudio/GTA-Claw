@@ -675,6 +675,10 @@ fn dimensioned_vectors(request: &EmbeddingRequest, fallback: usize) -> Vec<Vec<f
 }
 
 impl ToolPort for ScriptedRuntime {
+    fn access(&self, _name: &str) -> claw_http_api::ToolAccess {
+        claw_http_api::ToolAccess::Read
+    }
+
     fn list(&self) -> PortFuture<'_, Result<Vec<ToolDefinition>, PortError>> {
         Box::pin(async {
             Ok(vec![ToolDefinition {

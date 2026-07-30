@@ -42,6 +42,7 @@ impl UpdateMonitor {
         if !enabled {
             return Ok(Self { task: None });
         }
+
         if !matches!(proxy, ProxyPolicy::FromEnvironment) {
             return Err(
                 "the updater cannot honor the selected shared proxy policy; disable updates or use environment proxy policy"
@@ -76,11 +77,18 @@ impl UpdateMonitor {
         let Some(mut task) = self.task.take() else {
             return true;
         };
-        if tokio::time::timeout(budget, &mut task).await.is_ok() {
-            return true;
+        match tokio::time::timeout(budget, &mut task).await {
+            Ok(Ok(())) => return true,
+            Ok(Err(_)) => return false,
+            Err(_) => {}
         }
         task.abort();
-        let _ = task.await;
+        if tokio::time::timeout(Duration::ZERO, &mut task)
+            .await
+            .is_err()
+        {
+            return false;
+        }
         false
     }
 
@@ -88,5 +96,25 @@ impl UpdateMonitor {
     #[must_use]
     pub const fn is_enabled(&self) -> bool {
         self.task.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::UpdateMonitor;
+
+    #[tokio::test]
+    async fn forced_abort_join_never_exceeds_the_shutdown_budget() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let mut monitor = UpdateMonitor { task: Some(task) };
+        let started = Instant::now();
+
+        assert!(!monitor.shutdown(Duration::from_millis(25)).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "post-abort updater join was unbounded"
+        );
     }
 }

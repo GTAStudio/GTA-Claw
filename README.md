@@ -253,6 +253,8 @@ Selected variables read by shipped Rust binaries:
 | `GTA_CLAW_CONFIG` | `gta-claw-daemon` | Configuration file fallback when `--config` is absent. |
 | `GTA_CLAW_STATE_DIR` | `gta-claw-daemon` | State-directory fallback when `--state-dir` is absent; otherwise `$HOME/.gta-claw`. |
 | `GTA_CLAW_ADMIN_TOKEN` | `gta-claw-daemon` | Overrides the configured admin bearer token. It authenticates the main API's six protected model/tool routes and `POST /api/v1/admin/rpc`, and its presence registers the legacy `/admin/*` routes. It does not authenticate `/mcp` or legacy `/chat`; legacy `/admin/system` and `/admin/exec` also trust a loopback peer. |
+| `GTA_CLAW_MCP_TOKEN` | `gta-claw-daemon` | Dedicated non-owner bearer token for the loopback MCP listener. It lists/invokes only tools explicitly classified read-only and does not authorize the main/admin HTTP surface. |
+| `GTA_CLAW_MCP_OWNER_TOKEN` | `gta-claw-daemon` | Optional dedicated owner bearer token for mutating and plugin MCP tools. It must differ from `GTA_CLAW_MCP_TOKEN`; the daemon never falls back to the broader admin token. |
 | `NO_COLOR` | `gta-claw-tui` | Monochrome rendering, same as `--no-color`. |
 | `TERM` | `gta-claw-tui` | `TERM=dumb` is treated as non-interactive. |
 | `GTA_CLAW_CREDENTIALS_DIR` | `claw-provider-sdk` file secret store | Overrides the credential root. Otherwise `$XDG_DATA_HOME/gta-claw/credentials`, else `$HOME`(or `%USERPROFILE%`)`/.local/share/gta-claw/credentials`. |

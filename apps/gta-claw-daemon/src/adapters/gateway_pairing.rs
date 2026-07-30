@@ -170,6 +170,22 @@ impl GatewayPairingStore {
         }))
     }
 
+    /// Validates an existing pairing document without creating or rewriting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same safe link, type, size, schema, grant, and duplicate
+    /// errors as [`Self::open`]. A missing file is valid.
+    pub(crate) fn validate_existing(path: impl AsRef<Path>) -> Result<(), String> {
+        let path = path.as_ref();
+        reject_link_or_non_file(path)?;
+        match fs::symlink_metadata(path) {
+            Ok(_) => load_pairings(path).map(drop),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(safe_io("inspect", &error)),
+        }
+    }
+
     /// Returns a live authorization handle that retains this store's ownership.
     #[must_use]
     pub fn devices(&self) -> GatewayPairingAuthorization {
@@ -1364,6 +1380,28 @@ mod tests {
             pairings,
         })
         .expect("pairing document encodes")
+    }
+
+    #[test]
+    fn side_effect_free_validation_reuses_pairing_schema_checks() {
+        let root = TestRoot::new("validate-existing");
+        let path = root.join("gateway-pairings.json");
+        fs::write(
+            &path,
+            json!({"schema_version": PAIRING_SCHEMA_VERSION + 1, "pairings":[]}).to_string(),
+        )
+        .expect("invalid pairing document is written");
+        let before = fs::read(&path).expect("pairing bytes are readable");
+
+        let error = GatewayPairingStore::validate_existing(&path)
+            .expect_err("unsupported schema must be rejected");
+
+        assert!(error.contains("schema is unsupported"), "{error}");
+        assert_eq!(
+            fs::read(&path).expect("pairing bytes remain readable"),
+            before,
+            "validation rewrote the pairing file"
+        );
     }
 
     fn operator_pairing(device: char, scopes: Vec<OperatorScope>) -> StoredPairing {

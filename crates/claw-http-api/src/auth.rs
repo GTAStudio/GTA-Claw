@@ -18,6 +18,7 @@ use subtle::ConstantTimeEq;
 use crate::config::HttpLimits;
 use crate::error::ApiError;
 use crate::http_support::rejected_response;
+use crate::ports::ToolAccess;
 use crate::ports::{AuditPort, PortError};
 
 /// Authenticated HTTP principal.
@@ -161,6 +162,53 @@ pub(crate) fn authorize_scope(
             granted_scopes: principal.scopes,
             required_scope,
             approved: true,
+        },
+        unix_millis,
+        &mut adapter,
+    )
+    .map_err(|_| {
+        ApiError::openai(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "internal error",
+            "api_error",
+        )
+    })?;
+    if decision.granted {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(required_scope.as_str()))
+    }
+}
+
+pub(crate) fn authorize_tool_access(
+    principal: Principal,
+    sender_is_owner: bool,
+    access: ToolAccess,
+    audit: &dyn AuditPort,
+) -> Result<(), ApiError> {
+    let required_scope = access.required_scope();
+    let implied = principal.scopes.contains(Scope::OperatorAdmin)
+        || principal.scopes.contains(required_scope)
+        || (required_scope == Scope::OperatorRead
+            && principal.scopes.contains(Scope::OperatorWrite));
+    let granted_scopes = if implied {
+        ScopeSet::from_scopes(principal.scopes.iter().chain([required_scope]))
+    } else {
+        principal.scopes
+    };
+    let mut adapter = AuditAdapter(audit);
+    let unix_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        });
+    let decision = authorize_audited(
+        AuthorizationRequest {
+            authenticated: true,
+            role: principal.role,
+            granted_scopes,
+            required_scope,
+            approved: access != ToolAccess::Owner || sender_is_owner,
         },
         unix_millis,
         &mut adapter,

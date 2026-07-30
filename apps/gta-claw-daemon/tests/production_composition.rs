@@ -21,6 +21,7 @@ struct Running {
     config: PathBuf,
     http: SocketAddr,
     legacy: SocketAddr,
+    mcp: SocketAddr,
 }
 
 struct StartupChildGuard(Child, PathBuf);
@@ -81,6 +82,8 @@ impl Running {
             .env("WHATSAPP_VERIFY_TOKEN", "verify-token")
             .env("WHATSAPP_ACCESS_TOKEN", "access-token")
             .env("WHATSAPP_PHONE_NUMBER_ID", "phone-id")
+            .env("GTA_CLAW_MCP_TOKEN", "mcp-client-token")
+            .env("GTA_CLAW_MCP_OWNER_TOKEN", "mcp-owner-token")
             .env("GTA_CLAW_LOG", "off")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -108,6 +111,7 @@ impl Running {
             config,
             http: "127.0.0.1:0".parse().expect("placeholder address parses"),
             legacy: "127.0.0.1:0".parse().expect("placeholder address parses"),
+            mcp: "127.0.0.1:0".parse().expect("placeholder address parses"),
         };
 
         let ready = running.read_line();
@@ -120,6 +124,9 @@ impl Running {
         running.legacy = field(&service, "legacy")
             .parse()
             .expect("reported legacy address parses");
+        running.mcp = field(&service, "mcp")
+            .parse()
+            .expect("reported MCP address parses");
         running
     }
 
@@ -141,6 +148,15 @@ impl Running {
             stopped.starts_with("stopped reason=control clean=true"),
             "unexpected stop summary: {stopped}"
         );
+        assert_eq!(
+            field(&stopped, "drained"),
+            "4",
+            "MCP must remain part of the four-route drain accounting"
+        );
+        let (joined, spawned) = field(&stopped, "tasks")
+            .split_once('/')
+            .expect("task accounting is a ratio");
+        assert_eq!(joined, spawned, "shutdown left a route task unjoined");
         let status = self.child.wait().expect("daemon exits");
         assert!(status.success(), "daemon exited with {status}");
         let _ = std::fs::remove_dir_all(&self.root);
@@ -256,6 +272,69 @@ fn bound_http_is_ready_and_dispatches_to_the_composed_provider() {
     );
     assert!(models.starts_with("HTTP/1.1 200"), "{models}");
     assert!(models.contains(r#""id":"openclaw""#), "{models}");
+
+    let mcp_initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#;
+    let mcp_unauthenticated = request(daemon.mcp, "POST", "/mcp", None, Some(mcp_initialize));
+    assert!(
+        mcp_unauthenticated.starts_with("HTTP/1.1 401"),
+        "{mcp_unauthenticated}"
+    );
+    let mcp_admin_token = request(
+        daemon.mcp,
+        "POST",
+        "/mcp",
+        Some("operator-token"),
+        Some(mcp_initialize),
+    );
+    assert!(
+        mcp_admin_token.starts_with("HTTP/1.1 401"),
+        "the broader admin credential must not authorize MCP: {mcp_admin_token}"
+    );
+    let mcp_authenticated = request(
+        daemon.mcp,
+        "POST",
+        "/mcp",
+        Some("mcp-client-token"),
+        Some(mcp_initialize),
+    );
+    assert!(
+        mcp_authenticated.starts_with("HTTP/1.1 200"),
+        "{mcp_authenticated}"
+    );
+    assert!(
+        mcp_authenticated.contains(r#""protocolVersion":"2024-11-05""#),
+        "{mcp_authenticated}"
+    );
+    let mcp_client_mutation = request(
+        daemon.mcp,
+        "POST",
+        "/mcp",
+        Some("mcp-client-token"),
+        Some(
+            r#"{"jsonrpc":"2.0","id":"client-goal","method":"tools/call","params":{"name":"update_goal","arguments":{"action":"set","objective":"denied"}}}"#,
+        ),
+    );
+    assert!(
+        mcp_client_mutation.contains("not authorized"),
+        "{mcp_client_mutation}"
+    );
+    let mcp_owner_mutation = request(
+        daemon.mcp,
+        "POST",
+        "/mcp",
+        Some("mcp-owner-token"),
+        Some(
+            r#"{"jsonrpc":"2.0","id":"owner-goal","method":"tools/call","params":{"name":"update_goal","sessionKey":"owner-mcp-session","arguments":{"action":"set","objective":"allowed"}}}"#,
+        ),
+    );
+    assert!(
+        mcp_owner_mutation.starts_with("HTTP/1.1 200"),
+        "{mcp_owner_mutation}"
+    );
+    assert!(
+        mcp_owner_mutation.contains(r#""isError":false"#),
+        "{mcp_owner_mutation}"
+    );
 
     let status = request(
         daemon.http,
@@ -626,7 +705,18 @@ fn reload_commits_a_live_model_and_rolls_back_a_bad_candidate() {
     assert!(status.contains("model=gpt-4.1"), "{status}");
     assert!(status.contains("config_generation=1"), "{status}");
 
-    std::fs::write(&daemon.config, "{ this is not json5").expect("invalid candidate is written");
+    let before_unknown = request(
+        daemon.legacy,
+        "POST",
+        "/chat",
+        None,
+        Some(r#"{"message":"before-unknown-model","conversation_id":"rejected-model"}"#),
+    );
+    assert!(
+        before_unknown.starts_with("HTTP/1.1 200"),
+        "{before_unknown}"
+    );
+    write_config(&daemon.config, "not-a-live-model");
     let rejected = daemon.control("reload");
     assert!(
         rejected.starts_with("reload rejected generation=1 reason=reload:"),
@@ -635,6 +725,21 @@ fn reload_commits_a_live_model_and_rolls_back_a_bad_candidate() {
     let status = daemon.control("status");
     assert!(status.contains("model=gpt-4.1"), "{status}");
     assert!(status.contains("config_generation=1"), "{status}");
+    let after_unknown = request(
+        daemon.legacy,
+        "POST",
+        "/chat",
+        None,
+        Some(r#"{"message":"after-unknown-model","conversation_id":"rejected-model"}"#),
+    );
+    assert!(
+        after_unknown.contains("before-unknown-model"),
+        "{after_unknown}"
+    );
+    assert!(
+        after_unknown.contains("after-unknown-model"),
+        "{after_unknown}"
+    );
 
     daemon.stop();
 }
@@ -651,8 +756,24 @@ fn unchanged_reload_is_a_true_no_op() {
     );
     assert!(before.starts_with("HTTP/1.1 200"), "{before}");
 
-    let reloaded = daemon.control("reload");
-    assert_eq!(reloaded, "reloaded generation=0 changed=none");
+    let source = std::fs::read_to_string(&daemon.config).expect("configuration is readable");
+    let apply = serde_json::json!({
+        "method": "config.apply",
+        "params": {
+            "source": source,
+            "sourceName": "<unchanged-admin-test>"
+        }
+    });
+    let reloaded = request(
+        daemon.http,
+        "POST",
+        "/api/v1/admin/rpc",
+        Some("operator-token"),
+        Some(&apply.to_string()),
+    );
+    assert!(reloaded.starts_with("HTTP/1.1 200"), "{reloaded}");
+    assert!(reloaded.contains(r#""generation":0"#), "{reloaded}");
+    assert!(reloaded.contains(r#""changed":[]"#), "{reloaded}");
     let status = daemon.control("status");
     assert!(status.contains("config_generation=0"), "{status}");
     assert!(status.contains("model=gpt-4o"), "{status}");
@@ -668,6 +789,286 @@ fn unchanged_reload_is_a_true_no_op() {
     assert!(after.contains("retained-after-noop"), "{after}");
 
     daemon.stop();
+}
+
+#[cfg(unix)]
+#[test]
+fn control_reload_is_supervised_while_its_file_read_is_stalled() {
+    use std::time::Instant;
+
+    let mut daemon = Running::start("gpt-4o");
+    std::fs::remove_file(&daemon.config).expect("configuration file is removed");
+    let created = Command::new("mkfifo")
+        .arg(&daemon.config)
+        .status()
+        .expect("mkfifo is available");
+    assert!(created.success());
+    let guard = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&daemon.config)
+        .expect("test holds both FIFO ends");
+    writeln!(daemon.stdin, "reload").expect("reload command is written");
+    writeln!(daemon.stdin, "shutdown").expect("shutdown command is written");
+    daemon.stdin.flush().expect("control commands are flushed");
+    let started = Instant::now();
+    drop(guard);
+
+    let stopped = loop {
+        let line = daemon.read_line();
+        if line.starts_with("stopped ") {
+            break line;
+        }
+    };
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "inline reload prevented the control stop from being observed"
+    );
+    assert!(stopped.starts_with("stopped reason=control"), "{stopped}");
+    let (joined, spawned) = field(&stopped, "tasks")
+        .split_once('/')
+        .expect("task accounting is a ratio");
+    assert_eq!(joined, spawned, "file reload escaped shutdown accounting");
+    assert!(daemon.child.wait().expect("daemon exits").success());
+}
+
+#[test]
+fn control_shutdown_cancels_a_stalled_role_reload() {
+    use std::time::Instant;
+
+    let root = std::env::temp_dir().join(format!(
+        "gta-claw-supervised-role-reload-{}-{}",
+        std::process::id(),
+        NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("temporary root is created");
+    let role_server =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("role fixture binds to loopback");
+    let role_address = role_server.local_addr().expect("role address is available");
+    let (reload_tx, reload_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut initial, _) = role_server.accept().expect("startup requests the role");
+        let mut request = [0_u8; 2048];
+        let _ = initial
+            .read(&mut request)
+            .expect("startup role request is readable");
+        let body = r#"{"content":"initial role"}"#;
+        write!(
+            initial,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("startup role response is written");
+        initial.flush().expect("startup role response is flushed");
+        let (_reload, _) = role_server.accept().expect("reload requests the role");
+        reload_tx.send(()).expect("reload acceptance is reported");
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+    let config = root.join("config.json5");
+    write_device_config(&config, &format!("http://{role_address}/role"));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
+        .args([
+            "--config",
+            config.to_str().expect("temporary path is UTF-8"),
+            "--listen",
+            "127.0.0.1:0",
+            "--legacy-listen",
+            "127.0.0.1:0",
+            "--gateway-listen",
+            "127.0.0.1:0",
+            "--mcp-listen",
+            "127.0.0.1:0",
+            "--state-dir",
+            root.to_str().expect("temporary path is UTF-8"),
+        ])
+        .env_clear()
+        .env("ADMIN_TOKEN", "operator-token")
+        .env("GTA_CLAW_LOG", "off")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("daemon process starts");
+    let mut stdin = child.stdin.take().expect("control channel is piped");
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let mut child = StartupChildGuard(child, root);
+    let mut stdout = BufReader::new(stdout);
+    assert_eq!(read_buffered_line(&mut stdout), "ready protocol=1");
+    assert!(read_buffered_line(&mut stdout).starts_with("healthy runtime="));
+    let _ = read_buffered_line(&mut stdout);
+    writeln!(stdin, "reload").expect("reload is written");
+    stdin.flush().expect("reload is flushed");
+    reload_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reload reaches the stalled role source");
+
+    let started = Instant::now();
+    writeln!(stdin, "shutdown").expect("shutdown is written");
+    stdin.flush().expect("shutdown is flushed");
+    let stopped = read_buffered_line(&mut stdout);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "shutdown was blocked behind role reload"
+    );
+    assert!(stopped.starts_with("stopped reason=control"), "{stopped}");
+    let (joined, spawned) = field(&stopped, "tasks")
+        .split_once('/')
+        .expect("task accounting is a ratio");
+    assert_eq!(joined, spawned, "role reload escaped shutdown accounting");
+
+    release_tx.send(()).expect("role fixture is released");
+    server.join().expect("role fixture exits");
+    assert!(child.0.wait().expect("daemon exits").success());
+}
+
+#[cfg(unix)]
+#[test]
+fn deferred_startup_reload_keeps_work_routes_closed_until_commit() {
+    let root = std::env::temp_dir().join(format!(
+        "gta-claw-deferred-admission-{}-{}",
+        std::process::id(),
+        NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("temporary root is created");
+    let role_server =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("role fixture binds to loopback");
+    let role_address = role_server.local_addr().expect("role address is available");
+    let port_reservation =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("HTTP port reservation binds");
+    let http_address = port_reservation
+        .local_addr()
+        .expect("reserved HTTP address is available");
+    drop(port_reservation);
+    let gateway_reservation =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("Gateway port reservation binds");
+    let gateway_address = gateway_reservation
+        .local_addr()
+        .expect("reserved Gateway address is available");
+    drop(gateway_reservation);
+    let (reload_tx, reload_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        for (index, body) in [
+            r#"{"content":"startup role"}"#,
+            r#"{"content":"reloaded role"}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut stream, _) = role_server.accept().expect("daemon requests the role");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).expect("role request is readable");
+            if index == 1 {
+                reload_tx.send(()).expect("reload acceptance is reported");
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("reload is released");
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("role response is written");
+            stream.flush().expect("role response is flushed");
+        }
+    });
+    let config = root.join("config.json5");
+    let log = root.join("telemetry.fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&log)
+            .status()
+            .expect("mkfifo is available")
+            .success()
+    );
+    write_device_config(&config, &format!("http://{role_address}/role"));
+    let http_argument = http_address.to_string();
+    let gateway_argument = gateway_address.to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
+        .args(["--config"])
+        .arg(&config)
+        .args(["--log-file"])
+        .arg(&log)
+        .args(["--listen", http_argument.as_str()])
+        .args(["--legacy-listen", "127.0.0.1:0"])
+        .args(["--gateway-listen", gateway_argument.as_str()])
+        .args(["--mcp-listen", "127.0.0.1:0"])
+        .args(["--state-dir"])
+        .arg(&root)
+        .env_clear()
+        .env("ADMIN_TOKEN", "operator-token")
+        .env("GTA_CLAW_LOG", "off")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("daemon process starts");
+    let mut stdin = child.stdin.take().expect("control channel is piped");
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let mut child = StartupChildGuard(child, root);
+    let mut stdout = BufReader::new(stdout);
+    thread::sleep(Duration::from_millis(250));
+    assert!(
+        Command::new("kill")
+            .arg("-HUP")
+            .arg(child.0.id().to_string())
+            .status()
+            .expect("kill is available")
+            .success()
+    );
+    let _log_guard = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&log)
+        .expect("opening the reader releases telemetry startup");
+    reload_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("deferred reload reaches its role source");
+
+    let blocked = request(
+        http_address,
+        "GET",
+        "/v1/models",
+        Some("operator-token"),
+        None,
+    );
+    assert!(
+        blocked.starts_with("HTTP/1.1 503"),
+        "work was admitted before deferred reload commit: {blocked}"
+    );
+    let mut gateway =
+        TcpStream::connect(gateway_address).expect("bound Gateway socket accepts TCP backlog");
+    gateway
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("Gateway probe timeout is set");
+    gateway
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("Gateway probe is written");
+    let mut response = [0_u8; 1];
+    assert!(
+        gateway.read(&mut response).is_err(),
+        "Gateway accept loop served traffic before deferred reload commit"
+    );
+
+    release_tx.send(()).expect("deferred reload is released");
+    assert_eq!(
+        read_buffered_line(&mut stdout),
+        "reload deferred phase=starting"
+    );
+    assert_eq!(
+        read_buffered_line(&mut stdout),
+        "reloaded generation=0 changed=none"
+    );
+    assert_eq!(read_buffered_line(&mut stdout), "ready protocol=1");
+    assert!(read_buffered_line(&mut stdout).starts_with("healthy runtime="));
+    let _ = read_buffered_line(&mut stdout);
+    writeln!(stdin, "shutdown").expect("shutdown is written");
+    stdin.flush().expect("shutdown is flushed");
+    assert!(read_buffered_line(&mut stdout).starts_with("stopped reason=control"));
+    assert!(child.0.wait().expect("daemon exits").success());
+    server.join().expect("role fixture exits");
 }
 
 #[cfg(unix)]

@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use claw_http_api::{
-    PortError, PortErrorKind, PortFuture, ToolDefinition, ToolInvocation, ToolOutcome, ToolPort,
+    PortError, PortErrorKind, PortFuture, ToolAccess, ToolDefinition, ToolInvocation, ToolOutcome,
+    ToolPort,
 };
 use claw_plugin_api::capability::{CapabilityGrant, CapabilitySet};
 use claw_plugin_api::policy::OperatorPolicy;
@@ -22,6 +23,7 @@ use claw_plugin_host::{
     ToolSink,
 };
 use claw_skills::{WasmHostError, WasmHostErrorKind, WasmSkillHost, WasmSkillInvocation};
+use claw_security::authorization::{Role, Scope};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -262,6 +264,10 @@ impl Drop for PluginCancelGuard {
 }
 
 impl ToolPort for PluginToolSurface {
+    fn access(&self, _name: &str) -> ToolAccess {
+        ToolAccess::Owner
+    }
+
     fn list(&self) -> PortFuture<'_, Result<Vec<ToolDefinition>, PortError>> {
         Box::pin(async move { Ok(self.definitions()) })
     }
@@ -272,6 +278,18 @@ impl ToolPort for PluginToolSurface {
         cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<ToolOutcome, PortError>> {
         Box::pin(async move {
+            if !invocation.context.sender_is_owner
+                || invocation.context.authenticated_role != Role::Operator
+                || !invocation
+                    .context
+                    .authenticated_scopes
+                    .contains(Scope::OperatorAdmin)
+            {
+                return Err(PortError::new(
+                    PortErrorKind::InvalidRequest,
+                    "plugin tool requires an owner operator credential",
+                ));
+            }
             let (result_rx, plugin_cancel, mut cancel_guard) = {
                 let accepting = self.accepting.lock().map_err(|_| {
                     PortError::new(
@@ -972,6 +990,10 @@ mod tests {
                 agent_to: None,
                 agent_thread_id: None,
                 sender_is_owner: true,
+                authenticated_role: claw_security::authorization::Role::Operator,
+                authenticated_scopes: claw_security::authorization::ScopeSet::from_scopes(
+                    claw_security::authorization::Scope::ALL,
+                ),
                 dry_run: false,
             },
         };

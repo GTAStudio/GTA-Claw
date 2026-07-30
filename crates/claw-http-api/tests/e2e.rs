@@ -162,8 +162,10 @@ fn config() -> ApiConfig {
     ]));
     config.mcp_owner_authenticator =
         BearerAuthenticator::new(vec![credential("mcp-owner", [Scope::OperatorAdmin])]);
-    config.mcp_authenticator =
-        BearerAuthenticator::new(vec![credential("mcp-client", [Scope::OperatorRead])]);
+    config.mcp_authenticator = BearerAuthenticator::new(vec![
+        credential("mcp-client", [Scope::OperatorRead]),
+        credential("mcp-writer", [Scope::OperatorWrite]),
+    ]);
     config.webhooks.insert(
         "zapier".to_owned(),
         WebhookRoute::new("zapier", "webhook-secret"),
@@ -904,7 +906,9 @@ async fn tools_admin_mcp_and_webhooks_enforce_and_map_contracts() {
                 account_id: Some("account-1".to_owned()),
                 agent_to: Some("room-7".to_owned()),
                 agent_thread_id: Some("thread-2".to_owned()),
-                sender_is_owner: true,
+                sender_is_owner: false,
+                authenticated_role: Role::Operator,
+                authenticated_scopes: ScopeSet::from_scopes([Scope::OperatorAdmin]),
                 dry_run: true,
             }
         }
@@ -1037,6 +1041,88 @@ async fn tools_admin_mcp_and_webhooks_enforce_and_map_contracts() {
             "result":{"content":[{"type":"text","text":"{\"hello\":\"world\"}"}],"isError":false}
         })
     );
+    let client_tools = mcp_request(
+        &server,
+        "POST",
+        Some("mcp-client"),
+        &[("Content-Type", "application/json")],
+        &json_body(&json!({
+            "jsonrpc":"2.0","id":"list-client","method":"tools/list"
+        })),
+    )
+    .await;
+    assert_eq!(client_tools.status, 200);
+    assert_eq!(
+        client_tools.json()["result"]["tools"]
+            .as_array()
+            .expect("client tool list is an array")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool has a name"))
+            .collect::<Vec<_>>(),
+        vec!["echo"]
+    );
+    for denied in ["mutate", "plugin:privileged"] {
+        let response = mcp_request(
+            &server,
+            "POST",
+            Some("mcp-client"),
+            &[("Content-Type", "application/json")],
+            &json_body(&json!({
+                "jsonrpc":"2.0","id":denied,"method":"tools/call",
+                "params":{"name":denied,"arguments":{}}
+            })),
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.json()["result"]["isError"], true, "{denied}");
+        assert!(
+            response.json()["result"]["content"][0]["text"]
+                .as_str()
+                .expect("error text")
+                .contains("not authorized"),
+            "{denied}: {}",
+            response.text()
+        );
+    }
+    let writer_plugin = mcp_request(
+        &server,
+        "POST",
+        Some("mcp-writer"),
+        &[("Content-Type", "application/json")],
+        &json_body(&json!({
+            "jsonrpc":"2.0","id":"writer-plugin","method":"tools/call",
+            "params":{"name":"plugin:privileged","arguments":{}}
+        })),
+    )
+    .await;
+    assert_eq!(writer_plugin.status, 200);
+    assert_eq!(writer_plugin.json()["result"]["isError"], true);
+    let owner_plugin = mcp_request(
+        &server,
+        "POST",
+        Some("mcp-owner"),
+        &[("Content-Type", "application/json")],
+        &json_body(&json!({
+            "jsonrpc":"2.0","id":"owner-plugin","method":"tools/call",
+            "params":{"name":"plugin:privileged","arguments":{"allowed":true}}
+        })),
+    )
+    .await;
+    assert_eq!(owner_plugin.status, 200);
+    assert_eq!(owner_plugin.json()["result"]["isError"], false);
+    let owner_invocation = runtime
+        .last_tool_invocation()
+        .expect("read owner invocation")
+        .expect("owner invocation recorded");
+    assert_eq!(owner_invocation.name, "plugin:privileged");
+    assert!(owner_invocation.context.sender_is_owner);
+    assert_eq!(owner_invocation.context.authenticated_role, Role::Operator);
+    assert!(
+        owner_invocation
+            .context
+            .authenticated_scopes
+            .contains(Scope::OperatorAdmin)
+    );
 
     let webhook_denied = request(
         &server,
@@ -1098,6 +1184,50 @@ async fn tools_admin_mcp_and_webhooks_enforce_and_map_contracts() {
 }
 
 #[tokio::test]
+async fn tool_authorization_audit_failure_denies_http_and_mcp() {
+    let runtime = DeterministicRuntime::new();
+    let server = spawn_with(config(), runtime.clone()).await;
+    runtime.fail_audit();
+
+    let http = request(
+        &server,
+        "POST",
+        "/tools/invoke",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(&json!({"name":"mutate","args":{}})),
+    )
+    .await;
+    assert_eq!(http.status, 503);
+    assert!(
+        runtime
+            .last_tool_invocation()
+            .expect("invocation lock")
+            .is_none()
+    );
+
+    let mcp = mcp_request(
+        &server,
+        "POST",
+        Some("mcp-owner"),
+        &[("Content-Type", "application/json")],
+        &json_body(&json!({
+            "jsonrpc":"2.0","id":"audit-failure","method":"tools/call",
+            "params":{"name":"echo","arguments":{}}
+        })),
+    )
+    .await;
+    assert_eq!(mcp.status, 200);
+    assert_eq!(mcp.json()["error"]["code"], -32603);
+    assert!(
+        runtime
+            .last_tool_invocation()
+            .expect("invocation lock")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn tools_invoke_rejects_auth_schema_scope_and_maps_tool_errors() {
     let runtime = DeterministicRuntime::new();
     let server = spawn_with(config(), runtime).await;
@@ -1122,7 +1252,7 @@ async fn tools_invoke_rejects_auth_schema_scope_and_maps_tool_errors() {
         "/tools/invoke",
         Some("read-token"),
         &[("Content-Type", "application/json")],
-        &json_body(&json!({"name":"echo","args":{}})),
+        &json_body(&json!({"name":"mutate","args":{}})),
     )
     .await;
     assert_eq!(scope_denied.status, 403);
@@ -1132,6 +1262,21 @@ async fn tools_invoke_rejects_auth_schema_scope_and_maps_tool_errors() {
             "ok":false,
             "error":{"type":"forbidden","message":"missing scope: operator.write"}
         })
+    );
+
+    let owner_denied = request(
+        &server,
+        "POST",
+        "/tools/invoke",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(&json!({"name":"plugin:privileged","args":{}})),
+    )
+    .await;
+    assert_eq!(owner_denied.status, 403);
+    assert_eq!(
+        owner_denied.json(),
+        json!({"error":{"message":"Missing required scope: operator.admin","type":"forbidden"}})
     );
 
     let invalid = request(

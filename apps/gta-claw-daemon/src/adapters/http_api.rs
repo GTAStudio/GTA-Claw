@@ -2,9 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self as std_mpsc, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread;
@@ -14,8 +14,9 @@ use claw_config::{ConfigDomain, ConfigSnapshot, ReloadManager, schema_json, to_j
 use claw_http_api::{
     AdminFailure, AdminPort, AdminSuccess, AuditPort, EmbeddingRequest, GenerationEvent,
     GenerationOutput, GenerationRequest, Model, PortError, PortErrorKind, PortFuture, ProviderPort,
-    ReadinessPort, ReadinessSnapshot, ToolDefinition as HttpToolDefinition, Usage as HttpUsage,
-    WatchAuthPort, WatchIdentity, WatchResultPort, WebhookOutcome, WebhookPort,
+    ReadinessPort, ReadinessSnapshot, ResponseSessionResolution,
+    ToolDefinition as HttpToolDefinition, Usage as HttpUsage, WatchAuthPort, WatchIdentity,
+    WatchResultPort, WebhookOutcome, WebhookPort,
 };
 use claw_protocol::gateway::ConnectParams;
 use claw_provider_sdk::model::{
@@ -35,6 +36,8 @@ use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use crate::runtime::BlockingTaskHost;
 
 const MAX_HISTORY_MESSAGES: usize = 32;
 const AUDIT_QUEUE_CAPACITY: usize = 64;
@@ -200,7 +203,9 @@ pub struct ProviderAdapter {
     default_model: RwLock<String>,
     role_prompt: RwLock<String>,
     models: RwLock<Vec<ModelDescriptor>>,
+    admission: Mutex<()>,
     history: Mutex<ConversationHistory>,
+    history_epoch: AtomicU64,
     history_config: ProviderHistoryConfig,
     model_tools: Arc<dyn ModelToolCatalog>,
     readiness: Arc<DependencyReadiness>,
@@ -210,6 +215,8 @@ pub struct ProviderAdapter {
 #[derive(Debug, Default)]
 struct ConversationHistory {
     messages: BTreeMap<String, HistoryEntry>,
+    responses: BTreeMap<String, ResponseHistoryEntry>,
+    pending: BTreeMap<String, PendingHistoryEntry>,
 }
 
 #[derive(Debug)]
@@ -218,10 +225,30 @@ struct HistoryEntry {
     seen: Instant,
 }
 
-struct PreparedCompletion {
-    request: CompletionRequest,
+#[derive(Clone, Debug)]
+struct ResponseHistoryEntry {
+    subject: [u8; 32],
+    model: String,
+    session_id: String,
+    seen: Instant,
+    epoch: u64,
+}
+
+#[derive(Debug)]
+struct PendingHistoryEntry {
     session_id: String,
     user: ChatMessage,
+    assistant: AssistantMessage,
+    seen: Instant,
+    epoch: u64,
+}
+
+struct PreparedCompletion {
+    request: CompletionRequest,
+    request_id: String,
+    session_id: String,
+    user: ChatMessage,
+    history_epoch: u64,
 }
 
 impl ProviderAdapter {
@@ -242,7 +269,9 @@ impl ProviderAdapter {
             default_model: RwLock::new(default_model.into()),
             role_prompt: RwLock::new(role_prompt.into()),
             models: RwLock::new(Vec::new()),
+            admission: Mutex::new(()),
             history: Mutex::new(ConversationHistory::default()),
+            history_epoch: AtomicU64::new(0),
             history_config,
             model_tools,
             readiness,
@@ -293,6 +322,25 @@ impl ProviderAdapter {
     /// Returns an error when the model cache lock is poisoned or `model` is not
     /// present in the live startup catalogue.
     pub fn set_default_model(&self, model: &str) -> Result<(), String> {
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| "provider request admission lock failed".to_owned())?;
+        self.set_default_model_admitted(model)
+    }
+
+    fn set_default_model_admitted(&self, model: &str) -> Result<(), String> {
+        self.validate_model(model)?;
+        let mut selected = self
+            .default_model
+            .write()
+            .map_err(|_| "provider model lock failed".to_owned())?;
+        model.clone_into(&mut selected);
+        drop(selected);
+        Ok(())
+    }
+
+    fn validate_model(&self, model: &str) -> Result<(), String> {
         if !self
             .models
             .read()
@@ -304,17 +352,19 @@ impl ProviderAdapter {
                 "model `{model}` is not in the live provider catalogue"
             ));
         }
-        let mut selected = self
-            .default_model
-            .write()
-            .map_err(|_| "provider model lock failed".to_owned())?;
-        model.clone_into(&mut selected);
-        drop(selected);
         Ok(())
     }
 
     /// Replaces the role prompt used by subsequent requests.
     pub fn set_role_prompt(&self, prompt: &str) {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.set_role_prompt_admitted(prompt);
+    }
+
+    fn set_role_prompt_admitted(&self, prompt: &str) {
         let mut role = self
             .role_prompt
             .write()
@@ -364,31 +414,35 @@ impl ProviderAdapter {
         }
     }
 
-    fn history(&self, session_id: &str) -> Vec<ChatMessage> {
+    fn history(&self, session_id: &str) -> (u64, Vec<ChatMessage>) {
         if !session_id.starts_with(RESPONSE_CONTINUITY_PREFIX) {
-            return Vec::new();
+            return (self.history_epoch.load(Ordering::Acquire), Vec::new());
         }
         let now = Instant::now();
         let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+        let epoch = self.history_epoch.load(Ordering::Acquire);
         history
             .messages
             .retain(|_, entry| now.duration_since(entry.seen) < self.history_config.idle_timeout);
-        history
+        let messages = history
             .messages
             .get_mut(session_id)
             .map(|entry| {
                 entry.seen = now;
                 entry.messages.iter().cloned().collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (epoch, messages)
     }
 
-    fn remember(&self, session_id: &str, user: ChatMessage, assistant: AssistantMessage) {
-        if !session_id.starts_with(RESPONSE_CONTINUITY_PREFIX) {
-            return;
-        }
-        let now = Instant::now();
-        let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+    fn remember_locked(
+        &self,
+        history: &mut ConversationHistory,
+        session_id: &str,
+        user: ChatMessage,
+        assistant: AssistantMessage,
+        now: Instant,
+    ) {
         history
             .messages
             .retain(|_, entry| now.duration_since(entry.seen) < self.history_config.idle_timeout);
@@ -401,6 +455,9 @@ impl ProviderAdapter {
                 .map(|(id, _)| id.clone())
         {
             history.messages.remove(&oldest);
+            history
+                .responses
+                .retain(|_, response| response.session_id != oldest);
         }
         let entry = history
             .messages
@@ -415,15 +472,166 @@ impl ProviderAdapter {
         while entry.messages.len() > MAX_HISTORY_MESSAGES {
             entry.messages.pop_front();
         }
-        drop(history);
+    }
+
+    fn stage_history(
+        &self,
+        request_id: String,
+        session_id: String,
+        expected_epoch: u64,
+        user: ChatMessage,
+        assistant: AssistantMessage,
+    ) {
+        if !session_id.starts_with(RESPONSE_CONTINUITY_PREFIX) {
+            return;
+        }
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.history_epoch.load(Ordering::Acquire) != expected_epoch {
+            return;
+        }
+        let now = Instant::now();
+        let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+        history.pending.retain(|_, entry| {
+            entry.epoch == expected_epoch
+                && now.duration_since(entry.seen) < self.history_config.idle_timeout
+        });
+        if history.pending.len() >= self.history_config.max_conversations.max(1)
+            && !history.pending.contains_key(&request_id)
+            && let Some(oldest) = history
+                .pending
+                .iter()
+                .min_by_key(|(_, entry)| entry.seen)
+                .map(|(id, _)| id.clone())
+        {
+            history.pending.remove(&oldest);
+        }
+        history.pending.insert(
+            request_id,
+            PendingHistoryEntry {
+                session_id,
+                user,
+                assistant,
+                seen: now,
+                epoch: expected_epoch,
+            },
+        );
     }
 
     fn clear_history(&self) {
-        self.history
+        let _admission = self
+            .admission
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .messages
-            .clear();
+            .unwrap_or_else(PoisonError::into_inner);
+        self.clear_history_admitted();
+    }
+
+    fn clear_history_admitted(&self) {
+        let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+        self.history_epoch.fetch_add(1, Ordering::AcqRel);
+        history.messages.clear();
+        history.responses.clear();
+        history.pending.clear();
+    }
+
+    fn resolve_response_session(
+        &self,
+        previous_response_id: Option<&str>,
+        subject: [u8; 32],
+        model: &str,
+    ) -> ResponseSessionResolution {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let epoch = self.history_epoch.load(Ordering::Acquire);
+        let now = Instant::now();
+        let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+        history.responses.retain(|_, entry| {
+            entry.epoch == epoch
+                && now.duration_since(entry.seen) < self.history_config.idle_timeout
+        });
+        let session_id = previous_response_id
+            .and_then(|id| history.responses.get(id).cloned())
+            .filter(|entry| entry.subject == subject && entry.model == model)
+            .filter(|entry| history.messages.contains_key(&entry.session_id))
+            .map(|entry| entry.session_id);
+        ResponseSessionResolution { session_id, epoch }
+    }
+
+    fn remember_response_session(
+        &self,
+        response_id: String,
+        subject: [u8; 32],
+        model: String,
+        session_id: String,
+        expected_epoch: u64,
+    ) -> Result<(), PortError> {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.history_epoch.load(Ordering::Acquire) != expected_epoch {
+            return Err(PortError::new(
+                PortErrorKind::Unavailable,
+                "response continuity epoch changed",
+            ));
+        }
+        let now = Instant::now();
+        let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(pending) = history.pending.remove(&response_id) else {
+            return Err(PortError::new(
+                PortErrorKind::Unavailable,
+                "response history was not accepted",
+            ));
+        };
+        if pending.epoch != expected_epoch || pending.session_id != session_id {
+            return Err(PortError::new(
+                PortErrorKind::Unavailable,
+                "response continuity admission changed",
+            ));
+        }
+        self.remember_locked(
+            &mut history,
+            &session_id,
+            pending.user,
+            pending.assistant,
+            now,
+        );
+        if history.responses.len() >= self.history_config.max_conversations.max(1)
+            && !history.responses.contains_key(&response_id)
+            && let Some(oldest) = history
+                .responses
+                .iter()
+                .min_by_key(|(_, entry)| entry.seen)
+                .map(|(id, _)| id.clone())
+        {
+            history.responses.remove(&oldest);
+        }
+        history.responses.insert(
+            response_id,
+            ResponseHistoryEntry {
+                subject,
+                model,
+                session_id,
+                seen: now,
+                epoch: expected_epoch,
+            },
+        );
+        Ok(())
+    }
+
+    fn apply_configuration(&self, model: &str, prompt: &str) -> Result<(), String> {
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| "provider request admission lock failed".to_owned())?;
+        self.set_default_model_admitted(model)?;
+        self.set_role_prompt_admitted(prompt);
+        self.clear_history_admitted();
+        Ok(())
     }
 
     async fn complete(
@@ -469,6 +677,34 @@ impl std::fmt::Debug for ProviderAdapter {
 }
 
 impl ProviderPort for ProviderAdapter {
+    fn owns_response_continuity(&self) -> bool {
+        true
+    }
+
+    fn resolve_response_session(
+        &self,
+        previous_response_id: Option<String>,
+        subject: [u8; 32],
+        model: String,
+    ) -> PortFuture<'_, Result<ResponseSessionResolution, PortError>> {
+        Box::pin(async move {
+            Ok(self.resolve_response_session(previous_response_id.as_deref(), subject, &model))
+        })
+    }
+
+    fn remember_response_session(
+        &self,
+        response_id: String,
+        subject: [u8; 32],
+        model: String,
+        session_id: String,
+        epoch: u64,
+    ) -> PortFuture<'_, Result<(), PortError>> {
+        Box::pin(async move {
+            self.remember_response_session(response_id, subject, model, session_id, epoch)
+        })
+    }
+
     fn models(&self) -> PortFuture<'_, Result<Vec<Model>, PortError>> {
         Box::pin(async move {
             Ok(self
@@ -490,8 +726,10 @@ impl ProviderPort for ProviderAdapter {
                 .complete(prepared.request, cancellation)
                 .await
                 .map_err(|error| map_provider_error(&error))?;
-            self.remember(
-                &prepared.session_id,
+            self.stage_history(
+                prepared.request_id,
+                prepared.session_id,
+                prepared.history_epoch,
                 prepared.user,
                 response.message.clone(),
             );
@@ -591,7 +829,13 @@ impl ProviderPort for ProviderAdapter {
                     "provider stream ended before completion",
                 ));
             }
-            self.remember(&prepared.session_id, prepared.user, accumulator.message());
+            self.stage_history(
+                prepared.request_id,
+                prepared.session_id,
+                prepared.history_epoch,
+                prepared.user,
+                accumulator.message(),
+            );
             Ok(http_usage(accumulator.usage()))
         })
     }
@@ -876,13 +1120,29 @@ impl SwappableProvider {
             .write()
             .map_err(|_| "provider slot is unavailable".to_owned())?;
         if let Some(provider) = state.current.as_ref() {
-            provider.set_default_model(model)?;
-            provider.set_role_prompt(prompt);
+            provider.apply_configuration(model, prompt)?;
         }
         model.clone_into(&mut state.default_model);
         prompt.clone_into(&mut state.role_prompt);
         state.generation = state.generation.saturating_add(1);
         drop(state);
+        Ok(())
+    }
+
+    /// Validates a model against the active provider without changing selection or history.
+    ///
+    /// # Errors
+    ///
+    /// Returns when the provider slot is unavailable or the live catalogue does
+    /// not contain `model`.
+    pub fn validate_configuration(&self, model: &str) -> Result<(), String> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| "provider slot is unavailable".to_owned())?;
+        if let Some(provider) = state.current.as_ref() {
+            provider.validate_model(model)?;
+        }
         Ok(())
     }
 
@@ -941,6 +1201,40 @@ impl std::fmt::Debug for SwappableProvider {
 }
 
 impl ProviderPort for SwappableProvider {
+    fn owns_response_continuity(&self) -> bool {
+        true
+    }
+
+    fn resolve_response_session(
+        &self,
+        previous_response_id: Option<String>,
+        subject: [u8; 32],
+        model: String,
+    ) -> PortFuture<'_, Result<ResponseSessionResolution, PortError>> {
+        let provider = self.active();
+        Box::pin(async move {
+            provider?
+                .resolve_response_session(previous_response_id, subject, model)
+                .await
+        })
+    }
+
+    fn remember_response_session(
+        &self,
+        response_id: String,
+        subject: [u8; 32],
+        model: String,
+        session_id: String,
+        epoch: u64,
+    ) -> PortFuture<'_, Result<(), PortError>> {
+        let provider = self.active();
+        Box::pin(async move {
+            provider?
+                .remember_response_session(response_id, subject, model, session_id, epoch)
+                .await
+        })
+    }
+
     fn models(&self) -> PortFuture<'_, Result<Vec<Model>, PortError>> {
         let provider = self.active();
         Box::pin(async move { provider?.models().await })
@@ -977,6 +1271,12 @@ impl ProviderPort for SwappableProvider {
 
 impl ProviderAdapter {
     fn to_completion(&self, request: GenerationRequest) -> Result<PreparedCompletion, PortError> {
+        let _admission = self.admission.lock().map_err(|_| {
+            PortError::new(
+                PortErrorKind::Internal,
+                "provider request admission lock failed",
+            )
+        })?;
         if request.frequency_penalty.is_some_and(|value| value != 0.0)
             || request.presence_penalty.is_some_and(|value| value != 0.0)
         {
@@ -990,7 +1290,29 @@ impl ProviderAdapter {
             ));
         }
 
-        let session_id = request.session_id.clone();
+        let session_id = if request.session_id.starts_with(RESPONSE_CONTINUITY_PREFIX) {
+            let (session_id, epoch) = request
+                .session_id
+                .rsplit_once("#epoch=")
+                .and_then(|(session_id, epoch)| {
+                    epoch.parse::<u64>().ok().map(|epoch| (session_id, epoch))
+                })
+                .ok_or_else(|| {
+                    PortError::new(
+                        PortErrorKind::Unavailable,
+                        "response continuity admission is missing",
+                    )
+                })?;
+            if epoch != self.history_epoch.load(Ordering::Acquire) {
+                return Err(PortError::new(
+                    PortErrorKind::Unavailable,
+                    "response continuity epoch changed before provider admission",
+                ));
+            }
+            session_id.to_owned()
+        } else {
+            request.session_id.clone()
+        };
         let model = if matches!(
             request.model.trim(),
             "" | "openclaw" | "openclaw/default" | "openclaw/main"
@@ -1011,7 +1333,8 @@ impl ProviderAdapter {
         if let Some(instructions) = request.instructions {
             messages.push(ChatMessage::System(instructions));
         }
-        messages.extend(self.history(&session_id));
+        let (history_epoch, retained_history) = self.history(&session_id);
+        messages.extend(retained_history);
         let mut content = vec![ContentPart::text(request.prompt)];
         for media in request.media {
             if media.kind != claw_http_api::InputMediaKind::Image {
@@ -1118,8 +1441,10 @@ impl ProviderAdapter {
             .map_err(|error| invalid_request(error.to_string()))?;
         Ok(PreparedCompletion {
             request: completion,
+            request_id: request.request_id,
             session_id,
             user,
+            history_epoch,
         })
     }
 }
@@ -1371,6 +1696,12 @@ impl ConfigController {
             .iter()
             .map(|domain| format!("{domain:?}").to_ascii_lowercase())
             .collect::<Vec<_>>();
+        if changed.is_empty() && role.is_none() {
+            return Ok(AppliedReload {
+                generation: state.generation,
+                changed,
+            });
+        }
         if changed.is_empty()
             && selected_model == current_model
             && selected_prompt == current_prompt
@@ -1383,7 +1714,6 @@ impl ConfigController {
         self.provider
             .apply_configuration(&selected_model, &selected_prompt)
             .map_err(|error| format!("reload rolled back: {error}"))?;
-        self.provider.clear_history();
         state.manager = candidate_manager;
         state.generation = state.generation.saturating_add(1);
         let generation = state.generation;
@@ -1400,6 +1730,72 @@ impl ConfigController {
             generation,
             changed,
         })
+    }
+
+    /// Validates one candidate without publishing it and reports whether runtime
+    /// sessions must be cleared before commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same parse, hot-swap, timeout, and role-ownership failures as
+    /// [`Self::apply_json5_with_role`].
+    pub(crate) fn requires_session_reset(
+        &self,
+        source: &str,
+        source_name: &str,
+        role: Option<&RoleReload>,
+    ) -> Result<bool, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "configuration reload lock is poisoned".to_owned())?;
+        let previous = state.manager.snapshot();
+        let previous_timeout = copilot_request_timeout_ms(&previous)?;
+        let mut candidate_manager = ReloadManager::new((*previous).clone());
+        let outcome = candidate_manager
+            .reload_json5(source, source_name)
+            .map_err(|error| error.to_string())?;
+        let candidate_timeout = copilot_request_timeout_ms(&outcome.snapshot)?;
+        let has_unsupported = outcome
+            .changed_domains
+            .iter()
+            .copied()
+            .any(|domain| domain != ConfigDomain::Copilot);
+        if !outcome.restart_required_domains.is_empty()
+            || has_unsupported
+            || previous_timeout != candidate_timeout
+        {
+            return Err(format!(
+                "reload requires a restart or changes an adapter that is not hot-swappable: {:?}",
+                outcome.changed_domains
+            ));
+        }
+        let previous_model = previous.core().copilot().default_model();
+        let candidate_model = outcome.snapshot.core().copilot().default_model();
+        let current_model = self.provider.default_model();
+        if role.is_none() && previous_model != candidate_model && current_model != previous_model {
+            return Err(
+                "reload rolled back: the remote role owns model selection for this run".to_owned(),
+            );
+        }
+        let current_prompt = self.provider.role_prompt();
+        let (selected_model, selected_prompt) = role.map_or_else(
+            || (candidate_model.to_owned(), current_prompt.clone()),
+            |role| {
+                (
+                    role.model
+                        .clone()
+                        .unwrap_or_else(|| candidate_model.to_owned()),
+                    role.prompt.clone(),
+                )
+            },
+        );
+        self.provider
+            .validate_configuration(&selected_model)
+            .map_err(|error| format!("reload rolled back: {error}"))?;
+        Ok(!outcome.changed_domains.is_empty()
+            || selected_model != current_model
+            || selected_prompt != current_prompt)
     }
 }
 
@@ -1437,6 +1833,8 @@ pub struct DurableSecurityAudit {
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     readiness: Arc<DependencyReadiness>,
     failed: Arc<AtomicBool>,
+    accounting: Option<BlockingTaskHost>,
+    abandonment_recorded: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -1457,8 +1855,81 @@ impl DurableSecurityAudit {
     ///
     /// Returns the operating-system error raised while opening the file.
     pub fn open(path: &Path, readiness: Arc<DependencyReadiness>) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let existed = path.try_exists()?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .append(true)
+            .open(path)?;
+        Self::recover_audit_tail(&mut file)?;
+        if !existed {
+            file.sync_all()?;
+            Self::sync_audit_parent(path)?;
+        }
         Self::from_file(file, readiness)
+    }
+
+    /// Opens an audit writer that reports a failed final join to startup accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same filesystem or worker-spawn error as [`Self::open`].
+    pub(crate) fn open_tracked(
+        path: &Path,
+        readiness: Arc<DependencyReadiness>,
+        accounting: BlockingTaskHost,
+    ) -> io::Result<Self> {
+        let mut audit = Self::open(path, readiness)?;
+        audit.accounting = Some(accounting);
+        Ok(audit)
+    }
+
+    fn recover_audit_tail(file: &mut File) -> io::Result<()> {
+        let length = file.metadata()?.len();
+        let mut reader = BufReader::new(file.try_clone()?);
+        let mut valid = 0_u64;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let read = reader.read_until(b'\n', &mut line)?;
+            if read == 0 {
+                break;
+            }
+            if line.ends_with(b"\n") {
+                valid = valid.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            } else {
+                break;
+            }
+        }
+        if valid < length {
+            file.set_len(valid)?;
+            file.sync_data()?;
+        }
+        file.seek(SeekFrom::End(0)).map(drop)
+    }
+
+    #[cfg(windows)]
+    fn sync_audit_parent(path: &Path) -> io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(parent)?
+            .sync_all()
+    }
+
+    #[cfg(unix)]
+    fn sync_audit_parent(path: &Path) -> io::Result<()> {
+        File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn sync_audit_parent(_path: &Path) -> io::Result<()> {
+        Ok(())
     }
 
     fn from_file(file: File, readiness: Arc<DependencyReadiness>) -> io::Result<Self> {
@@ -1473,12 +1944,22 @@ impl DurableSecurityAudit {
             worker: Mutex::new(Some(worker)),
             readiness,
             failed,
+            accounting: None,
+            abandonment_recorded: AtomicBool::new(false),
         })
     }
 
     /// Flushes and joins the dedicated writer within `budget`.
     #[must_use]
     pub fn shutdown(&self, budget: Duration) -> bool {
+        if self
+            .worker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
+        {
+            return !self.failed.load(Ordering::Acquire);
+        }
         let (completed, acknowledged) = std_mpsc::sync_channel(1);
         if self
             .sender
@@ -1505,6 +1986,23 @@ impl DurableSecurityAudit {
         let clean = flushed && joined && !self.failed.load(Ordering::Acquire);
         self.readiness.set("audit", clean);
         clean
+    }
+
+    /// Records a failed bounded writer join at most once in process accounting.
+    pub(crate) fn record_abandoned(&self) {
+        if !self.abandonment_recorded.swap(true, Ordering::AcqRel)
+            && let Some(accounting) = self.accounting.as_ref()
+        {
+            accounting.record_abandoned();
+        }
+    }
+}
+
+impl Drop for DurableSecurityAudit {
+    fn drop(&mut self) {
+        if !self.shutdown(AUDIT_WRITE_DEADLINE) {
+            self.record_abandoned();
+        }
     }
 }
 
@@ -2156,15 +2654,17 @@ impl Provider for SmokeProvider {
 mod tests {
     use super::{
         ConfigController, DependencyReadiness, Diagnostics, DurableSecurityAudit, EmptyModelTools,
-        ProviderHistoryConfig, SmokeProvider, SwappableProvider, admin_port_failure,
-        copilot_request_timeout_ms,
+        ProviderAdapter, ProviderHistoryConfig, SmokeProvider, SwappableProvider,
+        admin_port_failure, copilot_request_timeout_ms,
     };
     use std::fs::File;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     use claw_config::{migrate_legacy_environment, to_json5};
     use claw_http_api::{AuditPort, PortError, PortErrorKind};
+    use claw_provider_sdk::model::{AssistantMessage, ChatMessage, ContentPart};
     use claw_security::audit::{AuditAction, AuditEvent, AuditOutcome, AuditReason, AuditSubject};
     use claw_security::authorization::Role;
 
@@ -2212,6 +2712,36 @@ mod tests {
     }
 
     #[test]
+    fn durable_audit_truncates_an_incomplete_tail_before_writing() {
+        let path =
+            std::env::temp_dir().join(format!("gta-claw-audit-recovery-{}", std::process::id()));
+        let valid = b"{\"action\":\"authorization_evaluated\"}\n";
+        let mut bytes = valid.to_vec();
+        bytes.extend_from_slice(br#"{"action":"partial""#);
+        std::fs::write(&path, bytes).expect("partial audit fixture is written");
+        let readiness = Arc::new(DependencyReadiness::new(["audit"]));
+
+        let audit = DurableSecurityAudit::open(&path, Arc::clone(&readiness))
+            .expect("audit recovers its tail");
+        audit
+            .persist(&AuditEvent {
+                action: AuditAction::AuthorizationEvaluated,
+                subject: AuditSubject::Role(Role::Operator),
+                outcome: AuditOutcome::Allowed,
+                reason: AuditReason::PolicySatisfied,
+                unix_millis: 2,
+            })
+            .expect("post-recovery event persists");
+        assert!(audit.shutdown(Duration::from_secs(1)));
+
+        let recovered = std::fs::read(&path).expect("recovered audit is readable");
+        assert!(recovered.starts_with(valid));
+        assert!(!String::from_utf8_lossy(&recovered).contains("partial"));
+        assert!(recovered.ends_with(b"\n"));
+        std::fs::remove_file(path).expect("audit fixture is removed");
+    }
+
+    #[test]
     fn admin_port_errors_retain_their_http_classification() {
         let cases = [
             (
@@ -2222,6 +2752,11 @@ mod tests {
             (PortErrorKind::NotFound, "NOT_FOUND", Some(false)),
             (PortErrorKind::Unavailable, "UNAVAILABLE", Some(false)),
             (PortErrorKind::Timeout, "AGENT_TIMEOUT", Some(true)),
+            (
+                PortErrorKind::CommittedButNotDurable,
+                "COMMITTED_BUT_NOT_DURABLE",
+                Some(false),
+            ),
             (PortErrorKind::Internal, "INTERNAL", Some(false)),
         ];
         for (kind, code, retryable) in cases {
@@ -2329,6 +2864,245 @@ mod tests {
             copilot_request_timeout_ms(&controller.snapshot().expect("snapshot"))
                 .expect("timeout remains readable"),
             120_000
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_admin_reload_preserves_role_owned_model_and_prompt() {
+        let readiness = Arc::new(DependencyReadiness::new(["provider"]));
+        let provider = Arc::new(SwappableProvider::new(
+            "gpt-4o",
+            "configured role",
+            ProviderHistoryConfig::default(),
+            Arc::new(EmptyModelTools),
+            Arc::clone(&readiness),
+        ));
+        provider
+            .activate(Arc::new(SmokeProvider::new().expect("smoke provider")))
+            .await
+            .expect("provider starts");
+        provider
+            .apply_configuration("gpt-4.1", "remote role")
+            .expect("role selection applies");
+        let controller = ConfigController::new(
+            snapshot("gpt-4o"),
+            Arc::clone(&provider),
+            Arc::new(Diagnostics::new(8)),
+        );
+        let unchanged = to_json5(&snapshot("gpt-4o")).expect("serialize unchanged config");
+
+        let applied = controller
+            .apply_json5(&unchanged, "<admin>")
+            .expect("unchanged admin reload is accepted");
+
+        assert_eq!(applied.generation, 0);
+        assert!(applied.changed.is_empty());
+        assert_eq!(controller.generation(), 0);
+        assert_eq!(provider.default_model(), "gpt-4.1");
+        assert_eq!(provider.role_prompt(), "remote role");
+    }
+
+    #[test]
+    fn stale_provider_response_cannot_repopulate_cleared_history() {
+        let readiness = Arc::new(DependencyReadiness::new(["provider"]));
+        let adapter = ProviderAdapter::new(
+            Arc::new(SmokeProvider::new().expect("smoke provider")),
+            "gpt-4o",
+            "",
+            ProviderHistoryConfig::default(),
+            Arc::new(EmptyModelTools),
+            readiness,
+            Arc::new(AtomicBool::new(true)),
+        );
+        let session = "response_session_epoch";
+        let (request_epoch, history) = adapter.history(session);
+        assert!(history.is_empty());
+
+        adapter.clear_history();
+        adapter.stage_history(
+            "response-stale".to_owned(),
+            session.to_owned(),
+            request_epoch,
+            ChatMessage::User(vec![ContentPart::text("stale request")]),
+            AssistantMessage {
+                content: vec![ContentPart::text("stale response")],
+                reasoning: None,
+                tool_calls: Vec::new(),
+            },
+        );
+
+        assert!(
+            adapter.history(session).1.is_empty(),
+            "a response admitted before the clear crossed the history epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_admission_snapshots_model_prompt_and_epoch_together() {
+        let readiness = Arc::new(DependencyReadiness::new(["provider"]));
+        let adapter = ProviderAdapter::new(
+            Arc::new(SmokeProvider::new().expect("smoke provider")),
+            "gpt-4o",
+            "old prompt",
+            ProviderHistoryConfig::default(),
+            Arc::new(EmptyModelTools),
+            readiness,
+            Arc::new(AtomicBool::new(true)),
+        );
+        adapter
+            .initialize(&claw_provider_sdk::RequestContext::new())
+            .await
+            .expect("provider catalogue initializes");
+        let request = |session: &str| claw_http_api::GenerationRequest {
+            model: "openclaw".to_owned(),
+            prompt: "hello".to_owned(),
+            instructions: None,
+            media: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: claw_http_api::ToolChoice::Auto,
+            max_tokens: None,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            stop: None,
+            response_format: None,
+            request_id: session.to_owned(),
+            session_id: format!(
+                "response_session_{session}#epoch={}",
+                adapter.history_epoch.load(Ordering::Acquire)
+            ),
+        };
+        let before = adapter
+            .to_completion(request("before"))
+            .expect("old request is admitted");
+
+        adapter
+            .apply_configuration("gpt-4.1", "new prompt")
+            .expect("configuration transition is atomic");
+        let after = adapter
+            .to_completion(request("after"))
+            .expect("new request is admitted");
+
+        assert_eq!(before.request.model.as_str(), "gpt-4o");
+        assert_eq!(after.request.model.as_str(), "gpt-4.1");
+        assert_ne!(before.history_epoch, after.history_epoch);
+        assert!(matches!(
+            &before.request.messages[0],
+            ChatMessage::System(prompt) if prompt == "old prompt"
+        ));
+        assert!(matches!(
+            &after.request.messages[0],
+            ChatMessage::System(prompt) if prompt == "new prompt"
+        ));
+    }
+
+    #[test]
+    fn response_ids_share_history_capacity_and_epoch() {
+        let readiness = Arc::new(DependencyReadiness::new(["provider"]));
+        let adapter = ProviderAdapter::new(
+            Arc::new(SmokeProvider::new().expect("smoke provider")),
+            "gpt-4o",
+            "",
+            ProviderHistoryConfig {
+                max_conversations: 1,
+                idle_timeout: Duration::from_mins(30),
+            },
+            Arc::new(EmptyModelTools),
+            readiness,
+            Arc::new(AtomicBool::new(true)),
+        );
+        let subject = [7_u8; 32];
+        let epoch = adapter
+            .resolve_response_session(None, subject, "gpt-4o")
+            .epoch;
+        assert!(
+            adapter
+                .resolve_response_session(Some("resp-failed"), subject, "gpt-4o")
+                .session_id
+                .is_none(),
+            "a failed response ID was recorded without successful completion"
+        );
+        let conversation = |text: &str| {
+            (
+                ChatMessage::User(vec![ContentPart::text(text)]),
+                AssistantMessage {
+                    content: vec![ContentPart::text(format!("{text}-reply"))],
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                },
+            )
+        };
+        let (user, assistant) = conversation("one");
+        adapter.stage_history(
+            "resp-one".to_owned(),
+            "response_session_one".to_owned(),
+            epoch,
+            user,
+            assistant,
+        );
+        assert!(
+            adapter.history("response_session_one").1.is_empty(),
+            "provider completion must remain pending until API validation accepts it"
+        );
+        adapter
+            .remember_response_session(
+                "resp-one".to_owned(),
+                subject,
+                "gpt-4o".to_owned(),
+                "response_session_one".to_owned(),
+                epoch,
+            )
+            .expect("first response commits");
+        let (user, assistant) = conversation("two");
+        adapter.stage_history(
+            "resp-two".to_owned(),
+            "response_session_two".to_owned(),
+            epoch,
+            user,
+            assistant,
+        );
+        adapter
+            .remember_response_session(
+                "resp-two".to_owned(),
+                subject,
+                "gpt-4o".to_owned(),
+                "response_session_two".to_owned(),
+                epoch,
+            )
+            .expect("second response commits");
+        assert!(
+            adapter
+                .resolve_response_session(Some("resp-one"), subject, "gpt-4o")
+                .session_id
+                .is_none(),
+            "response mapping exceeded the configured continuity capacity"
+        );
+        assert_eq!(
+            adapter
+                .resolve_response_session(Some("resp-two"), subject, "gpt-4o")
+                .session_id
+                .as_deref(),
+            Some("response_session_two")
+        );
+
+        adapter.clear_history();
+        let stale = adapter.remember_response_session(
+            "resp-stale".to_owned(),
+            subject,
+            "gpt-4o".to_owned(),
+            "response_session_stale".to_owned(),
+            epoch,
+        );
+        assert!(stale.is_err(), "stale response commit must fail closed");
+        assert!(
+            adapter
+                .resolve_response_session(Some("resp-stale"), subject, "gpt-4o")
+                .session_id
+                .is_none(),
+            "in-flight pre-reload response ID crossed the continuity epoch"
         );
     }
 }

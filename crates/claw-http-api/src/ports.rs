@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use claw_protocol::gateway::ConnectParams;
 use claw_security::audit::AuditEvent;
+use claw_security::authorization::{Role, Scope, ScopeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -206,6 +207,38 @@ pub struct EmbeddingRequest {
 
 /// Calls the provider SDK without depending on a concrete provider crate.
 pub trait ProviderPort: Send + Sync {
+    /// Whether this provider owns response-ID continuity with its prompt history.
+    fn owns_response_continuity(&self) -> bool {
+        false
+    }
+
+    /// Resolves a previous response ID and captures the provider history epoch.
+    fn resolve_response_session(
+        &self,
+        _previous_response_id: Option<String>,
+        _subject: [u8; 32],
+        _model: String,
+    ) -> PortFuture<'_, Result<ResponseSessionResolution, PortError>> {
+        Box::pin(async {
+            Ok(ResponseSessionResolution {
+                session_id: None,
+                epoch: 0,
+            })
+        })
+    }
+
+    /// Records a successful response only if its admitted epoch is still current.
+    fn remember_response_session(
+        &self,
+        _response_id: String,
+        _subject: [u8; 32],
+        _model: String,
+        _session_id: String,
+        _epoch: u64,
+    ) -> PortFuture<'_, Result<(), PortError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Lists configured `OpenClaw` model aliases.
     fn models(&self) -> PortFuture<'_, Result<Vec<Model>, PortError>>;
 
@@ -230,6 +263,15 @@ pub trait ProviderPort: Send + Sync {
         request: EmbeddingRequest,
         cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<Vec<Vec<f32>>, PortError>>;
+}
+
+/// Provider-owned response continuity resolution at one history epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResponseSessionResolution {
+    /// Retained provider session when the previous response is valid.
+    pub session_id: Option<String>,
+    /// History epoch captured atomically with the lookup.
+    pub epoch: u64,
 }
 
 /// Result of an HTTP tool invocation.
@@ -268,8 +310,35 @@ pub struct ToolInvocationContext {
     pub agent_thread_id: Option<String>,
     /// Whether the authenticated caller is the owner.
     pub sender_is_owner: bool,
+    /// Authenticated closed role.
+    pub authenticated_role: Role,
+    /// Authenticated closed scope set.
+    pub authenticated_scopes: ScopeSet,
     /// Whether the caller requested a non-executing policy preview.
     pub dry_run: bool,
+}
+
+/// Authorization requirement attached to one host-published tool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolAccess {
+    /// Read-only operator access.
+    Read,
+    /// Mutating operator access.
+    Write,
+    /// Owner-only plugin or privileged access.
+    Owner,
+}
+
+impl ToolAccess {
+    /// Scope required before owner-specific policy is considered.
+    #[must_use]
+    pub const fn required_scope(self) -> Scope {
+        match self {
+            Self::Read => Scope::OperatorRead,
+            Self::Write => Scope::OperatorWrite,
+            Self::Owner => Scope::OperatorAdmin,
+        }
+    }
 }
 
 /// One fully contextualized tool invocation.
@@ -300,6 +369,11 @@ pub struct ToolDefinition {
 
 /// Invokes gateway-scoped tools and supplies MCP schemas.
 pub trait ToolPort: Send + Sync {
+    /// Returns the host-owned authorization requirement for `name`.
+    fn access(&self, _name: &str) -> ToolAccess {
+        ToolAccess::Owner
+    }
+
     /// Lists currently available tools.
     fn list(&self) -> PortFuture<'_, Result<Vec<ToolDefinition>, PortError>>;
 
@@ -398,6 +472,46 @@ pub trait WebhookPort: Send + Sync {
         action: Value,
         cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<WebhookOutcome, PortError>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{
+        PortError, PortFuture, ToolAccess, ToolDefinition, ToolInvocation, ToolOutcome, ToolPort,
+    };
+
+    struct UnclassifiedTools;
+
+    impl ToolPort for UnclassifiedTools {
+        fn list(&self) -> PortFuture<'_, Result<Vec<ToolDefinition>, PortError>> {
+            Box::pin(async {
+                Ok(vec![ToolDefinition {
+                    name: "unclassified".to_owned(),
+                    description: None,
+                    input_schema: json!({"type":"object"}),
+                }])
+            })
+        }
+
+        fn invoke(
+            &self,
+            _invocation: ToolInvocation,
+            _cancellation: CancellationToken,
+        ) -> PortFuture<'_, Result<ToolOutcome, PortError>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[test]
+    fn unclassified_tools_fail_closed_to_owner_access() {
+        assert_eq!(
+            ToolPort::access(&UnclassifiedTools, "unclassified"),
+            ToolAccess::Owner
+        );
+    }
 }
 
 /// Persists security decisions before protected dispatch.

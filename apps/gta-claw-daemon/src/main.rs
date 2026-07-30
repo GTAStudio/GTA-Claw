@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 
 use claw_observability::TelemetryHandle;
 use gta_claw_daemon::control::{
-    SignalEvent, StopSignals, probe, report_pre_start_stop, serve_production_preinstalled,
+    SignalEvent, StopSignals, probe, report_pre_start_stop_with_deadline,
+    serve_production_preinstalled_with_reload,
 };
 use gta_claw_daemon::production::{
     CommandLine, CommandMode, PRODUCTION_STOP_DEADLINE, USAGE, check_configuration, init_telemetry,
@@ -150,6 +151,7 @@ async fn run(command: CommandLine) -> Result<(), Box<dyn std::error::Error>> {
             // filesystem work. A stop received during any of those stages is
             // queued by Tokio instead of taking the process's default action.
             let mut signals = StopSignals::install()?;
+            let mut reload_deferred = false;
             let blocking = BlockingTaskHost::new(4);
             let config_blocking = blocking.clone();
             let config = command.options.load_config_owned(&config_blocking);
@@ -158,17 +160,21 @@ async fn run(command: CommandLine) -> Result<(), Box<dyn std::error::Error>> {
                 tokio::select! {
                     loaded = &mut config => break loaded?,
                     event = signals.recv_event() => match event {
-                        SignalEvent::Reload => {}
+                        SignalEvent::Reload => reload_deferred = true,
                         SignalEvent::Stop(trigger) => {
+                            let deadline = Instant::now() + PRODUCTION_STOP_DEADLINE;
                             blocking.request_stop();
                             let ledger = blocking
-                                .shutdown_within(PRODUCTION_STOP_DEADLINE)
+                                .shutdown_within(
+                                    deadline.saturating_duration_since(Instant::now()),
+                                )
                                 .await;
-                            let summary = report_pre_start_stop(
+                            let summary = report_pre_start_stop_with_deadline(
                                 io::stdout(),
                                 trigger,
                                 ledger,
                                 "not-configured",
+                                Instant::now() >= deadline,
                             )
                             .await?;
                             if summary.is_clean() {
@@ -194,11 +200,11 @@ async fn run(command: CommandLine) -> Result<(), Box<dyn std::error::Error>> {
                 tokio::select! {
                     telemetry = &mut telemetry => break telemetry??,
                     event = signals.recv_event() => match event {
-                        SignalEvent::Reload => {}
+                        SignalEvent::Reload => reload_deferred = true,
                         SignalEvent::Stop(trigger) => {
-                            let stop_started = Instant::now();
+                            let deadline = Instant::now() + PRODUCTION_STOP_DEADLINE;
                             let telemetry = tokio::time::timeout(
-                                PRODUCTION_STOP_DEADLINE,
+                                deadline.saturating_duration_since(Instant::now()),
                                 &mut telemetry,
                             )
                             .await;
@@ -210,8 +216,7 @@ async fn run(command: CommandLine) -> Result<(), Box<dyn std::error::Error>> {
                                 shutdown_pre_start_telemetry(
                                     &blocking,
                                     telemetry,
-                                    PRODUCTION_STOP_DEADLINE
-                                        .saturating_sub(stop_started.elapsed()),
+                                    deadline.saturating_duration_since(Instant::now()),
                                 )
                                 .await
                             } else {
@@ -220,13 +225,17 @@ async fn run(command: CommandLine) -> Result<(), Box<dyn std::error::Error>> {
                             blocking.request_stop();
                             let ledger = blocking
                                 .shutdown_within(
-                                    PRODUCTION_STOP_DEADLINE
-                                        .saturating_sub(stop_started.elapsed()),
+                                    deadline.saturating_duration_since(Instant::now()),
                                 )
                                 .await;
-                            let summary =
-                                report_pre_start_stop(io::stdout(), trigger, ledger, outcome)
-                                    .await?;
+                            let summary = report_pre_start_stop_with_deadline(
+                                io::stdout(),
+                                trigger,
+                                ledger,
+                                outcome,
+                                Instant::now() >= deadline,
+                            )
+                            .await?;
                             if summary.is_clean() {
                                 return Ok(());
                             }
@@ -243,7 +252,7 @@ async fn run(command: CommandLine) -> Result<(), Box<dyn std::error::Error>> {
             // for the whole run, so any other thread that printed would block
             // until the daemon exited. Each `writeln!` takes the lock for the
             // length of one line instead, and this daemon has one writer.
-            let service = serve_production_preinstalled(
+            let service = serve_production_preinstalled_with_reload(
                 io::stdout(),
                 tokio::io::stdin(),
                 &command.options,
@@ -251,6 +260,7 @@ async fn run(command: CommandLine) -> Result<(), Box<dyn std::error::Error>> {
                 signals,
                 blocking,
                 Some(telemetry),
+                reload_deferred,
             )
             .await;
             let mut failures = Vec::new();

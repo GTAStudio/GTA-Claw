@@ -14,7 +14,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::auth::bearer_token;
+use crate::auth::{Principal, authorize_tool_access, bearer_token};
 use crate::error::{ApiError, json_rpc_error};
 use crate::http_support::{CancelOnDrop, json_response, read_json_value, rejected_response};
 use crate::ports::{ToolInvocation, ToolInvocationContext, ToolOutcome};
@@ -45,8 +45,8 @@ pub(crate) async fn handle(
         )
         .await);
     }
-    let sender_is_owner = match authenticate(&state, request.headers()) {
-        Ok(sender_is_owner) => sender_is_owner,
+    let principal = match authenticate(&state, request.headers()) {
+        Ok(principal) => principal,
         Err(error) => {
             return Ok(rejected_response(
                 request,
@@ -60,7 +60,7 @@ pub(crate) async fn handle(
     match *request.method() {
         Method::GET => Ok(mcp_sse(&state)),
         Method::DELETE => Ok(json_response(StatusCode::OK, &json!({"ok":true}))),
-        Method::POST => post(state, request, sender_is_owner).await,
+        Method::POST => post(state, request, principal).await,
         _ => Err(ApiError::method("GET, POST, DELETE")),
     }
 }
@@ -87,25 +87,38 @@ fn validate_browser_origin(headers: &axum::http::HeaderMap) -> Result<(), ApiErr
     }
 }
 
-fn authenticate(state: &ApiState, headers: &axum::http::HeaderMap) -> Result<bool, ApiError> {
+#[derive(Clone, Copy)]
+struct McpPrincipal {
+    principal: Principal,
+    owner: bool,
+}
+
+fn authenticate(
+    state: &ApiState,
+    headers: &axum::http::HeaderMap,
+) -> Result<McpPrincipal, ApiError> {
     let token = bearer_token(headers).ok_or_else(unauthorized)?;
-    if state
+    if let Some(principal) = state
         .inner
         .config
         .mcp_owner_authenticator
         .authenticate_token(token)
-        .is_some()
     {
-        return Ok(true);
+        return Ok(McpPrincipal {
+            principal,
+            owner: true,
+        });
     }
-    if state
+    if let Some(principal) = state
         .inner
         .config
         .mcp_authenticator
         .authenticate_token(token)
-        .is_some()
     {
-        return Ok(false);
+        return Ok(McpPrincipal {
+            principal,
+            owner: false,
+        });
     }
     Err(unauthorized())
 }
@@ -113,7 +126,7 @@ fn authenticate(state: &ApiState, headers: &axum::http::HeaderMap) -> Result<boo
 async fn post(
     state: ApiState,
     request: Request,
-    sender_is_owner: bool,
+    principal: McpPrincipal,
 ) -> Result<Response, ApiError> {
     let content_type = request
         .headers()
@@ -162,7 +175,7 @@ async fn post(
     };
     let mut responses = Vec::new();
     for message in messages {
-        if let Some(response) = handle_message(&state, message, sender_is_owner).await {
+        if let Some(response) = handle_message(&state, message, principal).await {
             responses.push(response);
         }
     }
@@ -177,7 +190,11 @@ async fn post(
     Ok(json_response(StatusCode::OK, &body))
 }
 
-async fn handle_message(state: &ApiState, message: Value, sender_is_owner: bool) -> Option<Value> {
+async fn handle_message(
+    state: &ApiState,
+    message: Value,
+    principal: McpPrincipal,
+) -> Option<Value> {
     let Some(object) = message.as_object() else {
         return Some(json_rpc_error(Value::Null, -32600, "Invalid Request"));
     };
@@ -220,7 +237,22 @@ async fn handle_message(state: &ApiState, message: Value, sender_is_owner: bool)
         )
         .await
         {
-            Ok(Ok(tools)) => Some(rpc_result(&id, &json!({"tools":tools}))),
+            Ok(Ok(tools)) => {
+                let mut authorized = Vec::new();
+                for tool in tools {
+                    match authorize_tool_access(
+                        principal.principal,
+                        principal.owner,
+                        state.inner.services.tools.access(&tool.name),
+                        state.inner.services.audit.as_ref(),
+                    ) {
+                        Ok(()) => authorized.push(tool),
+                        Err(error) if error.status == StatusCode::FORBIDDEN => {}
+                        Err(_) => return Some(json_rpc_error(id, -32603, "Internal error")),
+                    }
+                }
+                Some(rpc_result(&id, &json!({"tools":authorized})))
+            }
             _ => Some(json_rpc_error(id, -32603, "Internal error")),
         },
         "tools/call" => {
@@ -245,6 +277,35 @@ async fn handle_message(state: &ApiState, message: Value, sender_is_owner: bool)
                     &tool_call_error("Tool not available: unknown"),
                 ));
             }
+            let definitions = match timeout(
+                state.inner.config.limits.operation_timeout,
+                state.inner.services.tools.list(),
+            )
+            .await
+            {
+                Ok(Ok(definitions)) => definitions,
+                _ => return Some(json_rpc_error(id, -32603, "Internal error")),
+            };
+            let Some(definition) = definitions.iter().find(|tool| tool.name == name) else {
+                return Some(rpc_result(
+                    &id,
+                    &tool_call_error("Tool not available: unknown"),
+                ));
+            };
+            if let Err(error) = authorize_tool_access(
+                principal.principal,
+                principal.owner,
+                state.inner.services.tools.access(&definition.name),
+                state.inner.services.audit.as_ref(),
+            ) {
+                if error.status == StatusCode::SERVICE_UNAVAILABLE {
+                    return Some(json_rpc_error(id, -32603, "Internal error"));
+                }
+                return Some(rpc_result(
+                    &id,
+                    &tool_call_error("Tool not authorized for this MCP credential"),
+                ));
+            }
             let cancellation = CancellationToken::new();
             let _cancel_on_drop = CancelOnDrop::new(&cancellation);
             match timeout(
@@ -255,14 +316,19 @@ async fn handle_message(state: &ApiState, message: Value, sender_is_owner: bool)
                         arguments,
                         action: None,
                         context: ToolInvocationContext {
-                            session_key: None,
+                            session_key: params
+                                .and_then(|params| params.get("sessionKey"))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
                             agent_id: None,
                             idempotency_key: None,
                             message_channel: None,
                             account_id: None,
                             agent_to: None,
                             agent_thread_id: None,
-                            sender_is_owner,
+                            sender_is_owner: principal.owner,
+                            authenticated_role: principal.principal.role,
+                            authenticated_scopes: principal.principal.scopes,
                             dry_run: false,
                         },
                     },

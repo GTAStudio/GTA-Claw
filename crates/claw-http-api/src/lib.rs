@@ -57,9 +57,9 @@ pub use ports::{
     AdminFailure, AdminPort, AdminSuccess, ApiServices, AuditPort, ClientTool, EmbeddingRequest,
     GenerationEvent, GenerationOutput, GenerationRequest, InputMedia, InputMediaKind,
     InputMediaSource, Model, PortError, PortErrorKind, PortFuture, ProviderPort, ReadinessPort,
-    ReadinessSnapshot, ToolCall, ToolChoice, ToolDefinition, ToolInvocation, ToolInvocationContext,
-    ToolOutcome, ToolPort, Usage, WatchAuthPort, WatchIdentity, WatchResultPort, WebhookOutcome,
-    WebhookPort,
+    ReadinessSnapshot, ResponseSessionResolution, ToolAccess, ToolCall, ToolChoice, ToolDefinition,
+    ToolInvocation, ToolInvocationContext, ToolOutcome, ToolPort, Usage, WatchAuthPort,
+    WatchIdentity, WatchResultPort, WebhookOutcome, WebhookPort,
 };
 pub use watch::WatchNodeHandle;
 

@@ -1,6 +1,7 @@
 //! Shared provider, memory, goal, and conversation runtime composition.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,8 +29,8 @@ use claw_domain::SessionId;
 use claw_goals::FileGoalStore;
 use claw_http_api::{
     ClientTool, GenerationRequest, LegacyChannelMessage, LegacyChannelMessagePort,
-    LegacyRuntimePort, LegacyRuntimeSnapshot, PortError, PortErrorKind, PortFuture, ToolChoice,
-    ToolDefinition as HttpToolDefinition, ToolInvocation, ToolInvocationContext,
+    LegacyRuntimePort, LegacyRuntimeSnapshot, PortError, PortErrorKind, PortFuture, ToolAccess,
+    ToolChoice, ToolDefinition as HttpToolDefinition, ToolInvocation, ToolInvocationContext,
     ToolOutcome as HttpToolOutcome, ToolPort,
 };
 use claw_memory::{
@@ -41,6 +42,7 @@ use claw_runtime::approval::SilentApprovalPort;
 use claw_runtime::{
     CommandEffect, CommandOutcome, Runtime, RuntimeConfig, RuntimeError, RuntimePorts,
 };
+use claw_security::authorization::{Role as SecurityRole, Scope};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -63,6 +65,47 @@ fn goal_http_definition() -> HttpToolDefinition {
                 "status":{"type":"string"}
             }
         }),
+    }
+}
+
+struct ChannelAdmission(AtomicBool);
+
+impl ChannelAdmission {
+    const fn starting() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    fn begin_serving(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn begin_draining(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+
+    fn ensure_open(&self) -> Result<(), PortError> {
+        if self.0.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(PortError::new(
+                PortErrorKind::Unavailable,
+                "runtime is not accepting channel work",
+            ))
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    async fn wait(&self, cancellation: &CancellationToken) -> bool {
+        while !self.is_open() {
+            tokio::select! {
+                () = cancellation.cancelled() => return false,
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+        true
     }
 }
 
@@ -1011,6 +1054,11 @@ impl RuntimeToolPort for ToolPortBridge {
                             agent_to: None,
                             agent_thread_id: None,
                             sender_is_owner: true,
+                            authenticated_role: claw_security::authorization::Role::Operator,
+                            authenticated_scopes:
+                                claw_security::authorization::ScopeSet::from_scopes(
+                                    claw_security::authorization::Scope::ALL,
+                                ),
                             dry_run: false,
                         },
                     },
@@ -1096,6 +1144,14 @@ fn goal_http_outcome(
 }
 
 impl ToolPort for AgentHttpTools {
+    fn access(&self, name: &str) -> ToolAccess {
+        if name == claw_runtime::GOAL_TOOL_NAME {
+            ToolAccess::Write
+        } else {
+            ToolPort::access(self.plugins.as_ref(), name)
+        }
+    }
+
     fn list(&self) -> PortFuture<'_, Result<Vec<HttpToolDefinition>, PortError>> {
         Box::pin(async move {
             let mut tools = ToolPort::list(self.plugins.as_ref()).await?;
@@ -1113,6 +1169,21 @@ impl ToolPort for AgentHttpTools {
             return ToolPort::invoke(self.plugins.as_ref(), invocation, cancellation);
         }
         Box::pin(async move {
+            if invocation.context.authenticated_role != SecurityRole::Operator
+                || (!invocation
+                    .context
+                    .authenticated_scopes
+                    .contains(Scope::OperatorWrite)
+                    && !invocation
+                        .context
+                        .authenticated_scopes
+                        .contains(Scope::OperatorAdmin))
+            {
+                return Err(PortError::new(
+                    PortErrorKind::InvalidRequest,
+                    "update_goal requires operator write scope",
+                ));
+            }
             let session = invocation.context.session_key.ok_or_else(|| {
                 PortError::new(
                     PortErrorKind::InvalidRequest,
@@ -1140,6 +1211,7 @@ impl ToolPort for AgentHttpTools {
 pub struct AgentRuntime {
     runtime: Arc<Runtime>,
     admission: Arc<tokio::sync::RwLock<()>>,
+    serving: ChannelAdmission,
     provider: Arc<SwappableProvider>,
     state: Arc<RuntimeStateStore>,
     memory: Arc<MemoryContextEngine>,
@@ -1202,6 +1274,7 @@ impl AgentRuntime {
         Ok(Arc::new(Self {
             runtime,
             admission: Arc::new(tokio::sync::RwLock::new(())),
+            serving: ChannelAdmission::starting(),
             provider,
             state,
             memory,
@@ -1250,6 +1323,29 @@ impl AgentRuntime {
         self.provider.is_active()
     }
 
+    pub(crate) fn begin_serving(&self) {
+        self.serving.begin_serving();
+    }
+
+    pub(crate) fn begin_draining(&self) {
+        self.serving.begin_draining();
+    }
+
+    pub(crate) fn accepts_channel_work(&self) -> bool {
+        self.serving.is_open()
+    }
+
+    pub(crate) async fn wait_for_channel_admission(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        self.serving.wait(cancellation).await
+    }
+
+    fn ensure_serving(&self) -> Result<(), PortError> {
+        self.serving.ensure_open()
+    }
+
     /// Executes the channel-owned `/status` and `/reset` commands.
     ///
     /// # Errors
@@ -1260,6 +1356,7 @@ impl AgentRuntime {
         conversation_id: &str,
         command: &str,
     ) -> Result<String, PortError> {
+        self.ensure_serving()?;
         match command {
             "status" => Ok(format!(
                 "model={} authenticated={} sessions={} provider_generation={}",
@@ -1316,6 +1413,7 @@ impl AgentRuntime {
     ///
     /// Returns the runtime's typed shutdown failure after all tasks are joined.
     pub async fn shutdown(&self) -> Result<(), RuntimeError> {
+        self.begin_draining();
         let _admission = self.reload_admission().await;
         self.runtime.shutdown().await
     }
@@ -1347,6 +1445,7 @@ impl AgentRuntime {
         message: &str,
         cancellation: CancellationToken,
     ) -> Result<String, PortError> {
+        self.ensure_serving()?;
         let session_id = SessionId::new(conversation_id)
             .map_err(|error| PortError::new(PortErrorKind::InvalidRequest, error.to_string()))?;
         let admission = tokio::select! {
@@ -1573,6 +1672,7 @@ fn command_outcome_json(outcome: CommandOutcome) -> Value {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use claw_application::model::ids::TurnId;
     use claw_application::model::session::SessionState;
@@ -1584,11 +1684,43 @@ mod tests {
     use claw_application::ports::provider::PromptMessage;
     use claw_application::ports::state::{SessionSnapshot, StatePort};
     use claw_domain::SessionId;
+    use tokio_util::sync::CancellationToken;
 
     use super::{
-        MemoryContextEngine, PortError, PortErrorKind, RuntimeError, RuntimeStateStore,
-        ToolPortBridge, goal_http_outcome, runtime_http_error,
+        ChannelAdmission, MemoryContextEngine, PortError, PortErrorKind, RuntimeError,
+        RuntimeStateStore, ToolPortBridge, goal_http_outcome, runtime_http_error,
     };
+
+    #[test]
+    fn channel_admission_stays_closed_until_serving_and_closes_for_drain() {
+        let admission = ChannelAdmission::starting();
+        assert!(!admission.is_open());
+        assert!(admission.ensure_open().is_err());
+
+        admission.begin_serving();
+        assert!(admission.is_open());
+        assert!(admission.ensure_open().is_ok());
+
+        admission.begin_draining();
+        assert!(!admission.is_open());
+        assert!(admission.ensure_open().is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_channel_admission_waits_without_consuming_until_cancelled() {
+        let admission = ChannelAdmission::starting();
+        let cancellation = CancellationToken::new();
+        let waiting = admission.wait(&cancellation);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), waiting.as_mut())
+                .await
+                .is_err(),
+            "closed channel admission resolved before serving"
+        );
+        cancellation.cancel();
+        assert!(!waiting.await);
+    }
 
     #[tokio::test]
     async fn runtime_state_rejects_stale_revisions() {
