@@ -42,6 +42,7 @@ cat >"$work/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 root="${RPM_TEST_ROOT:?}"
+printf '%s\n' "$*" >>"$root/systemctl-commands"
 case "$1" in
   is-active)
     [[ "$(cat "$root/active")" == "active" ]]
@@ -73,7 +74,16 @@ case "$1" in
     fi
     printf 'inactive\n' >"$root/active"
     ;;
-  start | restart)
+  start)
+    printf 'active\n' >"$root/active"
+    ;;
+  restart)
+    case "$(cat "$root/enabled")" in
+      masked | masked-runtime)
+        echo "masked service must not be restarted" >&2
+        exit 1
+        ;;
+    esac
     printf 'active\n' >"$root/active"
     ;;
   daemon-reload | preset)
@@ -85,6 +95,7 @@ case "$1" in
 esac
 EOF
 chmod +x "$work/bin/rpm" "$work/bin/systemctl"
+: >"$work/systemctl-commands"
 
 old_nevra="$(cat "$work/installed-nevras")"
 old_payload="$(sha256sum "$work/daemon" | awk '{print $1}')"
@@ -162,10 +173,70 @@ PATH="$work/bin:$PATH" \
   GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
   GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
   sh "$work/rendered/preun" 0
-[[ "$(cat "$work/enabled")" == "disabled" ]] ||
+  PATH="$work/bin:$PATH" \
+    RPM_TEST_ROOT="$work" \
+    GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+    GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+    sh "$work/rendered/postun" 0
+  [[ "$(cat "$work/enabled")" == "disabled" ]] ||
   {
     echo "successful RPM erase retained runtime enablement" >&2
     exit 1
   }
 
-echo "RPM pre-mutation rollback and failed-erase self-tests passed"
+test_masked_upgrade() {
+  local enabled_state="$1"
+  local expected_marker="$2"
+  rm -f "$work/state"/gta-claw-daemon.*
+  : >"$work/systemctl-commands"
+  printf 'active\n' >"$work/active"
+  printf '%s\n' "$enabled_state" >"$work/enabled"
+  printf 'gta-claw-0:0.1.0-1.x86_64\n' >"$work/installed-nevras"
+
+  PATH="$work/bin:$PATH" \
+    RPM_TEST_ROOT="$work" \
+    GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+    GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+    sh "$work/rendered/pre" 2
+  test -f "$work/state/gta-claw-daemon.was-active"
+  test -f "$work/state/$expected_marker"
+
+  printf 'gta-claw-0:0.1.0-2.x86_64\n' >"$work/installed-nevras"
+  PATH="$work/bin:$PATH" \
+    RPM_TEST_ROOT="$work" \
+    GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+    GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+    sh "$work/rendered/post" 2
+  [[ "$(cat "$work/active")" == "active" ]]
+  [[ "$(cat "$work/enabled")" == "$enabled_state" ]]
+  if grep -Fq 'restart gta-claw-daemon.service' "$work/systemctl-commands"; then
+    echo "$enabled_state upgrade attempted to restart a masked active unit" >&2
+    exit 1
+  fi
+
+  PATH="$work/bin:$PATH" \
+    RPM_TEST_ROOT="$work" \
+    GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+    GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+    sh "$work/rendered/preun" 1
+  PATH="$work/bin:$PATH" \
+    RPM_TEST_ROOT="$work" \
+    GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+    GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+    sh "$work/rendered/postun" 1
+  PATH="$work/bin:$PATH" \
+    RPM_TEST_ROOT="$work" \
+    GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+    GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+    sh "$work/rendered/posttrans" 2
+
+  [[ "$(cat "$work/installed-nevras")" == "gta-claw-0:0.1.0-2.x86_64" ]]
+  [[ "$(cat "$work/active")" == "active" ]]
+  [[ "$(cat "$work/enabled")" == "$enabled_state" ]]
+  test -z "$(find "$work/state" -maxdepth 1 -name 'gta-claw-daemon.*' -print -quit)"
+}
+
+test_masked_upgrade masked gta-claw-daemon.was-masked
+test_masked_upgrade masked-runtime gta-claw-daemon.was-masked-runtime
+
+echo "RPM pre-mutation, failed-erase, and masked-upgrade self-tests passed"

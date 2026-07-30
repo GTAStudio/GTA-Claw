@@ -29,6 +29,59 @@ grep -F './ios/scripts/check-targets.sh' "$workflow" >/dev/null
 grep -F './ios/scripts/package.sh' "$workflow" >/dev/null
 grep -F 'MOBILE_SMOKE_REQUIRED: "1"' "$workflow" >/dev/null
 grep -F './ios/scripts/simulator-smoke.sh' "$workflow" >/dev/null
+grep -F 'ARCHS=arm64' "$workflow" >/dev/null
+grep -F 'EXCLUDED_ARCHS=x86_64' "$workflow" >/dev/null
+grep -F 'ONLY_ACTIVE_ARCH=YES' "$workflow" >/dev/null
+grep -F 'architectures="$(run_with_timeout 15 xcrun lipo -archs "$app/GTA Claw")"' \
+  "$workspace/scripts/simulator-smoke.sh" >/dev/null
+grep -F 'iOS simulator app must contain only arm64' \
+  "$workspace/scripts/simulator-smoke.sh" >/dev/null
+grep -F '$runtime.supportedDeviceTypes[]?' \
+  "$workspace/scripts/simulator-smoke.sh" >/dev/null
+grep -F 'selected iOS runtime has no supported iPhone device type' \
+  "$workspace/scripts/simulator-smoke.sh" >/dev/null
+
+selection="$(
+  "$workspace/scripts/simulator-smoke.sh" --select-runtime-device <<'JSON'
+{
+  "runtimes": [
+    {
+      "name": "iOS 17.5",
+      "identifier": "com.apple.CoreSimulator.SimRuntime.iOS-17-5",
+      "isAvailable": true,
+      "supportedDeviceTypes": [
+        {
+          "name": "iPhone 16 Pro",
+          "identifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro",
+          "productFamily": "iPhone"
+        }
+      ]
+    },
+    {
+      "name": "iOS 18.5",
+      "identifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-5",
+      "isAvailable": true,
+      "supportedDeviceTypes": [
+        {
+          "name": "Apple TV",
+          "identifier": "com.apple.CoreSimulator.SimDeviceType.Apple-TV",
+          "productFamily": "Apple TV"
+        },
+        {
+          "name": "iPhone 15",
+          "identifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15",
+          "productFamily": "iPhone"
+        }
+      ]
+    }
+  ]
+}
+JSON
+)"
+[[ "$selection" == $'com.apple.CoreSimulator.SimRuntime.iOS-18-5\tcom.apple.CoreSimulator.SimDeviceType.iPhone-15' ]] || {
+  echo "Xcode 16 runtime selection chose a device unsupported by the selected runtime: $selection" >&2
+  exit 1
+}
 
 unexpected_curl="$(
   grep -RIl 'curl ' "$workspace" --include='*.sh' |

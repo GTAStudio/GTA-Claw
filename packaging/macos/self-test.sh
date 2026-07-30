@@ -436,6 +436,16 @@ expect_success archive-first \
 archive="$OUTPUT_ROOT/headless/$host_arch/gta-claw-cli-$VERSION-macos-$host_arch.tar.gz"
 grep -F '"cargoProfile":"release"' "$archive.provenance.json" >/dev/null ||
   die "provenance does not identify the Cargo release profile"
+grep -F 'Relationship: SPDXRef-DOCUMENT DESCRIBES SPDXRef-Artifact' \
+  "$archive.spdx" >/dev/null ||
+  die "SBOM does not use the standard DESCRIBES relationship"
+grep -F 'FileChecksum: SHA1:' "$archive.spdx" >/dev/null ||
+  die "SBOM lacks the mandatory SHA-1 file checksum"
+grep -F 'FileCopyrightText: NOASSERTION' "$archive.spdx" >/dev/null ||
+  die "SBOM lacks the SPDX file copyright tag"
+if grep -F 'DocumentDescribes:' "$archive.spdx" >/dev/null; then
+  die "SBOM contains the nonstandard tag/value DocumentDescribes field"
+fi
 if grep -F '"offline":' "$archive.provenance.json" >/dev/null; then
   die "provenance claims an unverifiable build network mode"
 fi

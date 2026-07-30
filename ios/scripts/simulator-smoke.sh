@@ -1,6 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+select_runtime_and_device() {
+  jq -r '
+    [
+      .runtimes[] |
+      select(.isAvailable != false and (.name | startswith("iOS ")))
+    ] |
+    last |
+    . as $runtime |
+    [
+      ($runtime.identifier // ""),
+      ([
+        $runtime.supportedDeviceTypes[]? |
+        select(.productFamily == "iPhone")
+      ] | last | .identifier // "")
+    ] |
+    @tsv
+  '
+}
+
+if [[ "${1:-}" == "--select-runtime-device" ]]; then
+  command -v jq >/dev/null || {
+    echo "jq is required to select an iOS simulator runtime" >&2
+    exit 1
+  }
+  select_runtime_and_device
+  exit 0
+fi
+
 app="${1:?usage: simulator-smoke.sh <GTA Claw.app>}"
 required="${MOBILE_SMOKE_REQUIRED:-0}"
 bundle_id="com.gtastudio.gtaclaw"
@@ -67,18 +95,21 @@ run_with_timeout() {
   return "$status"
 }
 
+architectures="$(run_with_timeout 15 xcrun lipo -archs "$app/GTA Claw")"
+if [[ "$architectures" != "arm64" ]]; then
+  echo "iOS simulator app must contain only arm64, got: $architectures" >&2
+  exit 1
+fi
+
 runtime_json="$(run_with_timeout 30 xcrun simctl list runtimes available --json)"
-runtime="$(
+runtime_and_device="$(
   printf '%s\n' "$runtime_json" |
-    jq -r '[.runtimes[] | select(.isAvailable != false and (.name | startswith("iOS ")))] | last | .identifier // empty'
+    select_runtime_and_device
 )"
-device_type_json="$(run_with_timeout 30 xcrun simctl list devicetypes --json)"
-device_type="$(
-  printf '%s\n' "$device_type_json" |
-    jq -r '[.devicetypes[] | select(.name | startswith("iPhone "))] | last | .identifier // empty'
-)"
+IFS=$'\t' read -r runtime device_type <<<"$runtime_and_device"
 [[ -n "$runtime" ]] || unavailable "no available iOS simulator runtime is installed"
-[[ -n "$device_type" ]] || unavailable "no iPhone simulator device type is installed"
+[[ -n "$device_type" ]] ||
+  unavailable "selected iOS runtime has no supported iPhone device type"
 
 udid="$(
   run_with_timeout 30 xcrun simctl create \

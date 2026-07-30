@@ -5,6 +5,11 @@ IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
+: "${SPDX_VALIDATOR:?SPDX_VALIDATOR must name the official SPDX parser/validator}"
+[[ -x "$SPDX_VALIDATOR" ]] || {
+  printf 'SPDX validator is not executable: %s\n' "$SPDX_VALIDATOR" >&2
+  exit 1
+}
 finalizer_workflow="$REPO_ROOT/.github/workflows/joint-release-finalize.yml"
 macos_workflow="$REPO_ROOT/.github/workflows/macos-packaging.yml"
 windows_workflow="$REPO_ROOT/.github/workflows/windows-packaging.yml"
@@ -15,7 +20,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for tool in awk cmp diff jq; do
+for tool in awk cmp diff jq shasum unzip zip; do
   command -v "$tool" >/dev/null || {
     echo "joint release self-test requires $tool" >&2
     exit 1
@@ -44,17 +49,25 @@ extract_run_step() {
 }
 
 finalizer="$test_root/finalizer.sh"
-publisher="$test_root/publisher.sh"
+macos_publisher="$test_root/macos-publisher.sh"
+windows_publisher="$test_root/windows-publisher.sh"
+assembler="$test_root/assembler.sh"
 extract_run_step "$finalizer_workflow" "Validate and finalize joint release" "$finalizer"
-extract_run_step "$macos_workflow" "Publish exact bytes to GitHub Release" "$publisher"
+extract_run_step "$macos_workflow" "Publish exact bytes to GitHub Release" "$macos_publisher"
+extract_run_step "$windows_workflow" "Publish exact bytes to GitHub Release" "$windows_publisher"
+extract_run_step "$macos_workflow" "Assemble final signed and notarized release" "$assembler"
 
 grep -F 'needs: protected-release-contract' "$macos_workflow" >/dev/null
 grep -F 'needs: release' "$windows_workflow" >/dev/null
-grep -F 'Windows release completion is already immutable' "$windows_workflow" >/dev/null
-if grep -F 'release delete-asset' "$macos_workflow" "$windows_workflow" >/dev/null; then
-  echo "completed platform manifests must never be deleted or replaced" >&2
-  exit 1
-fi
+grep -F 'Windows release completion is valid and immutable' "$windows_workflow" >/dev/null
+grep -F 'release delete-asset "$tag" SHA256SUMS-macos --yes' \
+  "$macos_workflow" >/dev/null
+grep -F 'release delete-asset "$tag" SHA256SUMS-windows --yes' \
+  "$windows_workflow" >/dev/null
+grep -F 'release delete-asset "$tag" "$name" --yes' \
+  "$macos_workflow" >/dev/null
+grep -F 'release delete-asset "$tag" "$name" --yes' \
+  "$windows_workflow" >/dev/null
 if grep -F -- '--clobber' "$macos_workflow" "$windows_workflow" >/dev/null; then
   echo "release publishers must never discard existing asset bytes" >&2
   exit 1
@@ -79,12 +92,28 @@ mkdir -p "$assets"
 
 json() {
   local draft
+  local digest
+  local asset_state
   draft="$(cat "$state/draft")"
   printf '{"isDraft":%s,"assets":[' "$draft"
   local separator=""
   for path in "$assets"/*; do
     [[ -e "$path" ]] || continue
-    printf '%s{"name":"%s"}' "$separator" "$(basename "$path")"
+    if command -v sha256sum >/dev/null; then
+      digest="$(sha256sum "$path" | awk '{print $1}')"
+    else
+      digest="$(shasum -a 256 "$path" | awk '{print $1}')"
+    fi
+    asset_state=uploaded
+    if [[ -e "$state/failed-assets/$(basename "$path")" ]]; then
+      asset_state=failed
+    fi
+    printf '%s{"name":"%s","state":"%s","size":%s,"digest":"sha256:%s"}' \
+      "$separator" \
+      "$(basename "$path")" \
+      "$asset_state" \
+      "$(wc -c <"$path" | tr -d ' ')" \
+      "$digest"
     separator=,
   done
   printf ']}\n'
@@ -117,6 +146,8 @@ case "$command" in
       for path in "$assets"/*; do
         [[ -e "$path" ]] && basename "$path"
       done
+    elif [[ "$jq_filter" == ".isDraft" ]]; then
+      cat "$state/draft"
     elif [[ "$has_json" -eq 1 ]]; then
       json
     fi
@@ -127,6 +158,7 @@ case "$command" in
     ;;
   delete-asset)
     rm -f -- "$assets/$2"
+    rm -f -- "$state/failed-assets/$2"
     printf 'delete %s\n' "$2" >>"$state/operations"
     ;;
   upload)
@@ -134,6 +166,7 @@ case "$command" in
     for path in "$@"; do
       [[ "$path" == "--clobber" ]] && continue
       cp "$path" "$assets/$(basename "$path")"
+      rm -f -- "$state/failed-assets/$(basename "$path")"
       printf 'upload %s\n' "$(basename "$path")" >>"$state/operations"
     done
     ;;
@@ -157,6 +190,10 @@ case "$command" in
       esac
     done
     [[ -n "$destination" ]]
+    if [[ -n "${FAKE_GH_FAIL_DOWNLOAD_PATTERN:-}" &&
+      "$pattern" == "$FAKE_GH_FAIL_DOWNLOAD_PATTERN" ]]; then
+      exit 42
+    fi
     mkdir -p "$destination"
     for path in "$assets"/*; do
       [[ -e "$path" ]] || continue
@@ -178,7 +215,18 @@ case "$command" in
     ;;
 esac
 EOF
-chmod +x "$fake_bin/gh"
+cat >"$fake_bin/ditto" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+source="${@: -2:1}"
+destination="${@: -1}"
+(
+  cd "$(dirname "$source")"
+  zip -qry "$destination" "$(basename "$source")"
+)
+EOF
+chmod +x "$fake_bin/ditto" "$fake_bin/gh"
 
 sha256_file() {
   if command -v sha256sum >/dev/null; then
@@ -189,11 +237,82 @@ sha256_file() {
 }
 
 fixture="$test_root/fixture"
-mkdir -p "$fixture/macos" "$fixture/windows"
-printf '\000macOS signed app bytes\377\n' \
-  >"$fixture/macos/gta-claw-1.2.3-macos-arm64-signed-notarized.app.zip"
-printf 'macOS notarized dmg bytes\n' >"$fixture/macos/gta-claw-1.2.3-macos.dmg"
-printf 'macOS notarized pkg bytes\n' >"$fixture/macos/gta-claw-1.2.3-macos.pkg"
+mkdir -p "$fixture/windows"
+assembly_temp="$test_root/assembly"
+assembly_state="$assembly_temp/gta-claw-release"
+assembly_app="$assembly_state/release-input/GTA Claw.app"
+assembly_distribution="$assembly_state/distribution"
+mkdir -p "$assembly_app/Contents/MacOS" "$assembly_distribution"
+printf '\000final stapled application bytes\377\n' \
+  >"$assembly_app/Contents/MacOS/gta-claw-desktop"
+chmod +x "$assembly_app/Contents/MacOS/gta-claw-desktop"
+printf 'final notarized and stapled dmg bytes\n' \
+  >"$assembly_distribution/gta-claw-1.2.3-macos.dmg"
+printf 'final notarized and stapled pkg bytes\n' \
+  >"$assembly_distribution/gta-claw-1.2.3-macos.pkg"
+PATH="$fake_bin:$PATH" \
+  RUNNER_TEMP="$assembly_temp" \
+  EXPECTED_PAYLOAD_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  EXPECTED_RELEASE_REF=refs/tags/v1.2.3 \
+  EXPECTED_RELEASE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  EXPECTED_VERSION=1.2.3 \
+  bash "$assembler"
+mv "$assembly_distribution" "$fixture/macos"
+
+app_zip="$fixture/macos/gta-claw-1.2.3-macos-arm64-signed-notarized.app.zip"
+unzip -t "$app_zip" >/dev/null
+unzip -p "$app_zip" 'GTA Claw.app/Contents/MacOS/gta-claw-desktop' |
+  cmp - "$assembly_app/Contents/MacOS/gta-claw-desktop"
+cat >"$test_root/expected-macos-assembly" <<'EOF'
+gta-claw-1.2.3-macos-arm64-signed-notarized.app.zip
+gta-claw-1.2.3-macos-arm64-signed-notarized.app.zip.provenance.json
+gta-claw-1.2.3-macos-arm64-signed-notarized.app.zip.spdx
+gta-claw-1.2.3-macos.dmg
+gta-claw-1.2.3-macos.dmg.provenance.json
+gta-claw-1.2.3-macos.dmg.spdx
+gta-claw-1.2.3-macos.pkg
+gta-claw-1.2.3-macos.pkg.provenance.json
+gta-claw-1.2.3-macos.pkg.spdx
+EOF
+find "$fixture/macos" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; |
+  LC_ALL=C sort >"$test_root/actual-macos-assembly"
+diff -u "$test_root/expected-macos-assembly" "$test_root/actual-macos-assembly"
+for artifact in "$app_zip" \
+  "$fixture/macos/gta-claw-1.2.3-macos.dmg" \
+  "$fixture/macos/gta-claw-1.2.3-macos.pkg"; do
+  name="$(basename "$artifact")"
+  sha1="$(shasum -a 1 "$artifact" | awk '{print $1}')"
+  sha256="$(sha256_file "$artifact")"
+  "$SPDX_VALIDATOR" -i "$artifact.spdx"
+  grep -Fx "FileChecksum: SHA1: $sha1" "$artifact.spdx" >/dev/null
+  grep -Fx "FileChecksum: SHA256: $sha256" "$artifact.spdx" >/dev/null
+  jq -e \
+    --arg digest "$sha256" \
+    --arg name "$name" \
+    '.subject == [{"name": $name, "digest": {"sha256": $digest}}]' \
+    "$artifact.provenance.json" >/dev/null
+done
+
+invalid_spdx="$test_root/invalid.spdx"
+cp "$app_zip.spdx" "$invalid_spdx"
+sed '/^FileChecksum: SHA1:/d' "$invalid_spdx" >"$invalid_spdx.tmp"
+mv "$invalid_spdx.tmp" "$invalid_spdx"
+if "$SPDX_VALIDATOR" -i "$invalid_spdx" >/dev/null 2>&1; then
+  echo "official SPDX validator accepted a file without its required SHA-1 checksum" >&2
+  exit 1
+fi
+
+invalid_spdx="$test_root/invalid-relationship.spdx"
+cp "$app_zip.spdx" "$invalid_spdx"
+sed \
+  's/^Relationship: SPDXRef-DOCUMENT DESCRIBES SPDXRef-Artifact$/DocumentDescribes: SPDXRef-Artifact/' \
+  "$invalid_spdx" >"$invalid_spdx.tmp"
+mv "$invalid_spdx.tmp" "$invalid_spdx"
+if "$SPDX_VALIDATOR" -i "$invalid_spdx" >/dev/null 2>&1; then
+  echo "official SPDX validator accepted nonstandard DocumentDescribes tag/value" >&2
+  exit 1
+fi
+
 printf 'Windows signed archive bytes\n' \
   >"$fixture/windows/gta-claw-1.2.3-windows-x64-portable-release.zip"
 
@@ -209,7 +328,7 @@ done
 reset_release() {
   release="$test_root/release"
   rm -rf -- "$release"
-  mkdir -p "$release/assets"
+  mkdir -p "$release/assets" "$release/failed-assets"
   printf 'true\n' >"$release/draft"
   printf '0\n' >"$release/finalize-count"
   : >"$release/operations"
@@ -270,7 +389,7 @@ PATH="$fake_bin:$PATH" \
   RUNNER_TEMP="$test_root/handoff" \
   GITHUB_REF_NAME=v1.2.3 \
   GH_TOKEN=fake \
-  bash "$publisher"
+  bash "$macos_publisher"
 assert_fixture_bytes macos
 [[ "$windows_hash" == "$(sha256_file \
   "$FAKE_RELEASE/assets/gta-claw-1.2.3-windows-x64-portable-release.zip")" ]]
@@ -282,13 +401,34 @@ PATH="$fake_bin:$PATH" \
   RUNNER_TEMP="$test_root/handoff" \
   GITHUB_REF_NAME=v1.2.3 \
   GH_TOKEN=fake \
-  bash "$publisher"
+  bash "$macos_publisher"
 [[ "$macos_hash" == "$(sha256_file \
   "$FAKE_RELEASE/assets/gta-claw-1.2.3-macos.dmg")" ]] ||
   {
     echo "completed macOS publication was mutated by a rerun" >&2
     exit 1
   }
+
+reset_release
+stage_platform macos
+operations_before="$(cat "$FAKE_RELEASE/operations")"
+distribution="$test_root/macos-download-failure/gta-claw-release/distribution"
+mkdir -p "$distribution"
+cp "$fixture/macos"/* "$distribution/"
+if PATH="$fake_bin:$PATH" \
+  RUNNER_TEMP="$test_root/macos-download-failure" \
+  GITHUB_REF_NAME=v1.2.3 \
+  GH_TOKEN=fake \
+  FAKE_GH_FAIL_DOWNLOAD_PATTERN=SHA256SUMS-macos \
+  bash "$macos_publisher" >/dev/null 2>&1; then
+  echo "macOS publisher accepted an unverifiable completion asset" >&2
+  exit 1
+fi
+[[ "$(cat "$FAKE_RELEASE/operations")" == "$operations_before" ]] || {
+  echo "macOS publisher mutated release state after a completion download failure" >&2
+  exit 1
+}
+assert_fixture_bytes macos
 
 reset_release
 stage_platform windows
@@ -300,9 +440,59 @@ PATH="$fake_bin:$PATH" \
   RUNNER_TEMP="$test_root/partial" \
   GITHUB_REF_NAME=v1.2.3 \
   GH_TOKEN=fake \
-  bash "$publisher"
+  bash "$macos_publisher"
 assert_fixture_bytes macos
 assert_fixture_bytes windows
+if grep -Fq 'delete SHA256SUMS-windows' "$FAKE_RELEASE/operations" ||
+  grep -Fq 'delete gta-claw-1.2.3-windows-x64-portable-release.zip' \
+    "$FAKE_RELEASE/operations"; then
+  echo "macOS retry deleted completed Windows assets" >&2
+  exit 1
+fi
+
+reset_release
+stage_platform windows
+: >"$FAKE_RELEASE/assets/SHA256SUMS-macos"
+printf 'partial macOS bytes\n' \
+  >"$FAKE_RELEASE/assets/gta-claw-1.2.3-macos.dmg"
+distribution="$test_root/empty-completion/gta-claw-release/distribution"
+mkdir -p "$distribution"
+cp "$fixture/macos"/* "$distribution/"
+PATH="$fake_bin:$PATH" \
+  RUNNER_TEMP="$test_root/empty-completion" \
+  GITHUB_REF_NAME=v1.2.3 \
+  GH_TOKEN=fake \
+  bash "$macos_publisher"
+assert_fixture_bytes macos
+assert_fixture_bytes windows
+grep -Fq 'delete SHA256SUMS-macos' "$FAKE_RELEASE/operations" || {
+  echo "macOS retry did not retire an empty completion asset" >&2
+  exit 1
+}
+[[ "$(tail -n 1 "$FAKE_RELEASE/operations")" == "upload SHA256SUMS-macos" ]]
+if grep -Fq 'delete SHA256SUMS-windows' "$FAKE_RELEASE/operations"; then
+  echo "macOS empty-completion retry deleted Windows completion" >&2
+  exit 1
+fi
+
+reset_release
+stage_platform windows
+stage_platform macos
+printf 'unterminated-garbage' >>"$FAKE_RELEASE/assets/SHA256SUMS-macos"
+distribution="$test_root/trailing-garbage/gta-claw-release/distribution"
+mkdir -p "$distribution"
+cp "$fixture/macos"/* "$distribution/"
+PATH="$fake_bin:$PATH" \
+  RUNNER_TEMP="$test_root/trailing-garbage" \
+  GITHUB_REF_NAME=v1.2.3 \
+  GH_TOKEN=fake \
+  bash "$macos_publisher"
+assert_fixture_bytes macos
+assert_fixture_bytes windows
+grep -Fq 'delete SHA256SUMS-macos' "$FAKE_RELEASE/operations" || {
+  echo "macOS retry did not retire completion with unterminated garbage" >&2
+  exit 1
+}
 
 reset_release
 stage_platform windows
@@ -311,14 +501,101 @@ printf 'different existing bytes\n' \
 distribution="$test_root/conflict/gta-claw-release/distribution"
 mkdir -p "$distribution"
 cp "$fixture/macos"/* "$distribution/"
-if PATH="$fake_bin:$PATH" \
+PATH="$fake_bin:$PATH" \
   RUNNER_TEMP="$test_root/conflict" \
   GITHUB_REF_NAME=v1.2.3 \
   GH_TOKEN=fake \
-  bash "$publisher" >/dev/null 2>&1; then
-  echo "macOS publisher replaced conflicting existing bytes" >&2
+  bash "$macos_publisher"
+assert_fixture_bytes macos
+assert_fixture_bytes windows
+grep -Fq 'delete gta-claw-1.2.3-macos.dmg' "$FAKE_RELEASE/operations" || {
+  echo "macOS retry did not retire an incomplete owned asset" >&2
+  exit 1
+}
+if grep -Fq 'delete SHA256SUMS-windows' "$FAKE_RELEASE/operations" ||
+  grep -Fq 'delete gta-claw-1.2.3-windows-x64-portable-release.zip' \
+    "$FAKE_RELEASE/operations"; then
+  echo "macOS conflicting-byte retry deleted foreign Windows assets" >&2
   exit 1
 fi
+
+windows_workspace="$test_root/windows-workspace"
+windows_publication="$windows_workspace/packaging/windows/out/release"
+mkdir -p "$windows_publication"
+cp "$fixture/windows"/* "$windows_publication/"
+
+reset_release
+stage_platform macos
+printf 'different existing Windows bytes\n' \
+  >"$FAKE_RELEASE/assets/gta-claw-1.2.3-windows-x64-portable-release.zip"
+cp "$fixture/windows/SHA256SUMS-windows" \
+  "$FAKE_RELEASE/assets/SHA256SUMS-windows"
+touch "$FAKE_RELEASE/failed-assets/SHA256SUMS-windows"
+printf 'X' |
+  dd of="$FAKE_RELEASE/assets/SHA256SUMS-windows" bs=1 seek=0 conv=notrunc \
+    >/dev/null 2>&1
+(
+  cd "$windows_workspace"
+  PATH="$fake_bin:$PATH" \
+    GITHUB_REF_NAME=v1.2.3 \
+    GH_TOKEN=fake \
+    bash "$windows_publisher"
+)
+assert_fixture_bytes macos
+assert_fixture_bytes windows
+[[ "$(tail -n 1 "$FAKE_RELEASE/operations")" == "upload SHA256SUMS-windows" ]]
+grep -Fq 'delete SHA256SUMS-windows' "$FAKE_RELEASE/operations" || {
+  echo "Windows retry did not retire a same-size corrupt completion asset" >&2
+  exit 1
+}
+grep -Fq 'delete gta-claw-1.2.3-windows-x64-portable-release.zip' \
+  "$FAKE_RELEASE/operations" || {
+  echo "Windows retry did not retire an incomplete owned asset" >&2
+  exit 1
+}
+if grep -Fq 'delete SHA256SUMS-macos' "$FAKE_RELEASE/operations" ||
+  grep -Fq 'delete gta-claw-1.2.3-macos.dmg' "$FAKE_RELEASE/operations"; then
+  echo "Windows retry deleted completed macOS assets" >&2
+  exit 1
+fi
+
+windows_hash="$(sha256_file \
+  "$FAKE_RELEASE/assets/gta-claw-1.2.3-windows-x64-portable-release.zip")"
+printf 'different rerun Windows bytes\n' \
+  >"$windows_publication/gta-claw-1.2.3-windows-x64-portable-release.zip"
+(
+  cd "$windows_workspace"
+  PATH="$fake_bin:$PATH" \
+    GITHUB_REF_NAME=v1.2.3 \
+    GH_TOKEN=fake \
+    bash "$windows_publisher"
+)
+[[ "$windows_hash" == "$(sha256_file \
+  "$FAKE_RELEASE/assets/gta-claw-1.2.3-windows-x64-portable-release.zip")" ]] ||
+  {
+    echo "completed Windows publication was mutated by a rerun" >&2
+    exit 1
+  }
+
+reset_release
+stage_platform windows
+operations_before="$(cat "$FAKE_RELEASE/operations")"
+(
+  cd "$windows_workspace"
+  if PATH="$fake_bin:$PATH" \
+    GITHUB_REF_NAME=v1.2.3 \
+    GH_TOKEN=fake \
+    FAKE_GH_FAIL_DOWNLOAD_PATTERN=SHA256SUMS-windows \
+    bash "$windows_publisher" >/dev/null 2>&1; then
+    echo "Windows publisher accepted an unverifiable completion asset" >&2
+    exit 1
+  fi
+)
+[[ "$(cat "$FAKE_RELEASE/operations")" == "$operations_before" ]] || {
+  echo "Windows publisher mutated release state after a completion download failure" >&2
+  exit 1
+}
+assert_fixture_bytes windows
 
 reset_release
 stage_platform macos

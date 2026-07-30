@@ -20,6 +20,8 @@ if [ -e "$prepared_marker" ]; then
     "$state_root/gta-claw-daemon.was-active" \
     "$state_root/gta-claw-daemon.was-enabled" \
     "$state_root/gta-claw-daemon.was-enabled-runtime" \
+    "$state_root/gta-claw-daemon.was-masked" \
+    "$state_root/gta-claw-daemon.was-masked-runtime" \
     "$prepared_marker" \
     "$configured_marker"
 fi

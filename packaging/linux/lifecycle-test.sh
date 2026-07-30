@@ -40,6 +40,8 @@ cleanup() {
     /run/gta-claw-daemon.was-active \
     /run/gta-claw-daemon.was-enabled \
     /run/gta-claw-daemon.was-enabled-runtime \
+    /run/gta-claw-daemon.was-masked \
+    /run/gta-claw-daemon.was-masked-runtime \
     /run/gta-claw-daemon.upgrade-prepared \
     /run/gta-claw-daemon.upgrade-configured \
     /run/gta-claw-daemon.remove-was-active \

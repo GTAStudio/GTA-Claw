@@ -70,6 +70,11 @@ and prior service state unchanged. `%posttrans` accepts only one replacement
 NEVRA and retires the journal; an incomplete later activation remains fenced
 from old-package erase. Failed final erase restores the captured enablement
 before returning the failure. No hook executes network or dynamic code.
+An administrator-masked active service stays active and masked across an RPM
+replacement; the package validates the live process instead of attempting a
+restart that systemd must reject. Both persistent and runtime masks are
+journaled independently and retired only after old-package erase and the
+post-transaction exact-one-NEVRA check complete.
 
 ## systemd boundary
 
@@ -77,9 +82,11 @@ The service is disabled by default and uses `DynamicUser=yes`; no static
 account is created by package scripts. systemd owns private state, cache, log,
 and runtime directories. `GTA_CLAW_STATE_DIR=/var/lib/gta-claw` wires the
 daemon to the `StateDirectory` systemd creates. The unit removes all
-capabilities, permits `AF_UNIX`, IPv4, and IPv6 while limiting IP traffic to
-localhost, and enables `NoNewPrivileges`, private temporary storage/devices,
-strict system/home/kernel/control-group protections,
+capabilities and permits `AF_UNIX`, IPv4, and IPv6 so outbound provider
+traffic remains available. Listener exposure stays constrained by the
+daemon's typed loopback defaults rather than a systemd egress filter. The
+unit enables `NoNewPrivileges`, private temporary storage/devices, strict
+system/home/kernel/control-group protections,
 namespace/personality/SUID restrictions, syscall filtering, and a 15-second
 SIGTERM stop window with restart-on-failure.
 

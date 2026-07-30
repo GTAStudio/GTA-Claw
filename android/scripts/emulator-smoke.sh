@@ -168,23 +168,37 @@ while :; do
       tr -d '\r' ||
       true
   )"
-  if [[ -n "$current_pid" ]]; then
-    if [[ "$current_pid" != "$stable_pid" ]]; then
+  resumed="$(
+    run_with_timeout 5 "$adb" -s "$serial" shell dumpsys activity activities \
+      2>/dev/null |
+      tr -d '\r' |
+      awk '/mResumedActivity|topResumedActivity/ { print; exit }' ||
+      true
+  )"
+  if [[ -n "$current_pid" && "$resumed" == *"$component"* ]]; then
+    if [[ -z "$stable_pid" ]]; then
       stable_pid="$current_pid"
       stable_since=$SECONDS
+    elif [[ "$current_pid" != "$stable_pid" ]]; then
+      echo "GTA Claw process changed during the resumed Activity stability window" >&2
+      exit 1
     elif ((SECONDS - stable_since >= 10)); then
       break
     fi
+  elif [[ -n "$stable_pid" ]]; then
+    echo "Expected Activity stopped being resumed/top during the stability window: $component" >&2
+    printf 'Observed resumed Activity: %s\n' "$resumed" >&2
+    exit 1
   else
     stable_pid=""
     stable_since=0
   fi
   if ((SECONDS >= deadline)); then
-    echo "GTA Claw did not remain alive for 10 seconds within the readiness window" >&2
+    echo "GTA Claw did not remain resumed/top for 10 seconds within the readiness window" >&2
     run_with_timeout 10 "$adb" -s "$serial" logcat -d -t 200 >&2 || true
     exit 1
   fi
   sleep 1
 done
 
-echo "Android emulator smoke passed for $component (stable pid $stable_pid)"
+echo "Android emulator smoke passed for resumed Activity $component (stable pid $stable_pid)"

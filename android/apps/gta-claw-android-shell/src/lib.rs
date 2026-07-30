@@ -3,13 +3,13 @@
 #[cfg(target_os = "android")]
 use std::error::Error;
 #[cfg(target_os = "android")]
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 #[cfg(any(target_os = "android", test))]
 use gta_claw_android::controller::ActivityLifecycleEvent;
 #[cfg(target_os = "android")]
 use gta_claw_android::controller::{
-    AndroidController, core_protocol_summary, native_runtime_summary,
+    AndroidController, DestroyAcknowledgement, core_protocol_summary, native_runtime_summary,
 };
 #[cfg(target_os = "android")]
 use gta_claw_android::controller::{CommandRejection, ControllerHandle, SnapshotSink};
@@ -245,6 +245,8 @@ fn run_android(app: slint::android::AndroidApp) -> Result<(), Box<dyn Error>> {
 
     let lifecycle_handle = Arc::new(OnceLock::<ControllerHandle>::new());
     let event_handle = Arc::clone(&lifecycle_handle);
+    let destruction = Arc::new(Mutex::new(None::<DestroyAcknowledgement>));
+    let event_destruction = Arc::clone(&destruction);
     slint::android::init_with_event_listener(app, move |event| {
         let lifecycle = match event {
             PollEvent::Main(MainEvent::Start) => Some((ShellLifecycleEvent::Start, "start state")),
@@ -261,10 +263,26 @@ fn run_android(app: slint::android::AndroidApp) -> Result<(), Box<dyn Error>> {
         if let Some((event, action)) = lifecycle
             && let Some(handle) = event_handle.get()
         {
-            report_platform_command(
-                handle.lifecycle_changed(lifecycle_transition(event)),
-                action,
-            );
+            if event == ShellLifecycleEvent::Destroy {
+                match handle.app_destroyed() {
+                    Ok(acknowledgement) => {
+                        let mut pending = event_destruction
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        if pending.is_none() {
+                            *pending = Some(acknowledgement);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("failed to report Android {action}: {error}");
+                    }
+                }
+            } else {
+                report_platform_command(
+                    handle.lifecycle_changed(lifecycle_transition(event)),
+                    action,
+                );
+            }
         }
     })?;
 
@@ -288,8 +306,15 @@ fn run_android(app: slint::android::AndroidApp) -> Result<(), Box<dyn Error>> {
         "discovery readiness",
     );
     install_callbacks(&window, &handle);
-    window.run()?;
-    drop(controller);
+    let run_result = window.run();
+    let acknowledgement = destruction
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .map_or_else(|| handle.app_destroyed(), |acknowledgement| Ok(acknowledgement))?;
+    drop(handle);
+    controller.shutdown(acknowledgement)?;
+    run_result?;
     Ok(())
 }
 

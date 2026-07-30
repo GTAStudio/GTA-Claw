@@ -171,7 +171,10 @@ jobs:
             -configuration Release \
             -sdk iphonesimulator \
             -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath "$RUNNER_TEMP/gta-claw-ios-simulator"
+            -derivedDataPath "$RUNNER_TEMP/gta-claw-ios-simulator" \
+            ARCHS=arm64 \
+            EXCLUDED_ARCHS=x86_64 \
+            ONLY_ACTIVE_ARCH=YES
 
       - name: Run required iOS simulator smoke
         shell: bash

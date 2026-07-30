@@ -274,14 +274,23 @@ async fn failed_connections_can_be_retried_without_restarting_the_tui() {
 async fn shutdown_cancels_a_stalled_connection_attempt() {
     let (url, cancellation, tasks, handshake_received) = raw_stalled_server().await;
     let mut worker = spawn_gateway_worker(GatewayOptions { url, token: None });
-    assert!(matches!(
+    assert_eq!(
         worker.events.recv().await,
-        Some(WorkerEvent::Connection(_))
-    ));
+        Some(WorkerEvent::Connection(
+            "Gateway: connecting (bounded retries)".to_owned()
+        ))
+    );
     tokio::time::timeout(Duration::from_secs(2), handshake_received)
         .await
         .expect("server received the WebSocket handshake")
         .expect("handshake readiness signal sent");
+    assert!(
+        matches!(
+            worker.events.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "worker must still be blocked in the connecting attempt immediately before shutdown"
+    );
     tokio::time::timeout(Duration::from_secs(2), worker.shutdown())
         .await
         .expect("worker shutdown is bounded");

@@ -811,8 +811,6 @@ validate_service_contract() {
     'ProtectControlGroups=yes' \
     'CapabilityBoundingSet=' \
     'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' \
-    'IPAddressAllow=localhost' \
-    'IPAddressDeny=any' \
     'SystemCallFilter=@system-service' \
     'LoadCredential=gta-claw-config:/etc/gta-claw/credentials/daemon.conf'; do
     grep -Fx "$required" "$service" >/dev/null ||
@@ -820,6 +818,9 @@ validate_service_contract() {
   done
   if grep -Eiq 'Environment=.*(token|secret|password|private.?key)=' "$service"; then
     die "service embeds a secret-like environment literal"
+  fi
+  if grep -Eq '^IPAddressDeny=' "$service"; then
+    die "service blocks required outbound provider traffic"
   fi
   if grep -Eq '^ExecStart=.*--(listen|socket|config|state|log)' "$service"; then
     die "service invents a daemon runtime flag"

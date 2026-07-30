@@ -14,7 +14,7 @@ use claw_platform::NativeSystemProbe;
 use claw_protocol::ServerEvent;
 use claw_security::identity::DeviceIdentity;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -37,6 +37,13 @@ const UPDATE_QUEUE_CAPACITY: usize = 8;
 /// Hard ceiling for joining an attempt after cancellation.
 const ATTEMPT_JOIN_TIMEOUT: Duration =
     Duration::from_secs(SHUTDOWN_TIMEOUT.as_secs().saturating_add(2));
+
+/// Hard ceiling for acknowledged terminal lifecycle shutdown.
+const CONTROLLER_SHUTDOWN_TIMEOUT: Duration =
+    Duration::from_secs(SHUTDOWN_TIMEOUT.as_secs().saturating_add(3));
+
+/// Final ceiling for terminating runtime tasks after a failed controller join.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Receives every rendered snapshot. Implementations must not block.
 pub type SnapshotSink = Arc<dyn Fn(ViewSnapshot) + Send + Sync>;
@@ -96,14 +103,37 @@ impl ActivityLifecycleEvent {
 struct LifecycleSender {
     current: Mutex<ActivityLifecycleEvent>,
     events: mpsc::UnboundedSender<ActivityLifecycleEvent>,
+    shutdown_completed: watch::Receiver<bool>,
 }
 
 impl LifecycleSender {
-    fn new(events: mpsc::UnboundedSender<ActivityLifecycleEvent>) -> Self {
+    fn new(
+        events: mpsc::UnboundedSender<ActivityLifecycleEvent>,
+        shutdown_completed: watch::Receiver<bool>,
+    ) -> Self {
         Self {
             current: Mutex::new(ActivityLifecycleEvent::Foreground),
             events,
+            shutdown_completed,
         }
+    }
+}
+
+/// Proof that the controller processed terminal destruction and finished cleanup.
+#[derive(Debug)]
+pub struct DestroyAcknowledgement {
+    completed: watch::Receiver<bool>,
+}
+
+impl DestroyAcknowledgement {
+    async fn wait(mut self) -> Result<(), ControllerShutdownError> {
+        while !*self.completed.borrow_and_update() {
+            self.completed
+                .changed()
+                .await
+                .map_err(|_| ControllerShutdownError::AcknowledgementDropped)?;
+        }
+        Ok(())
     }
 }
 
@@ -147,6 +177,31 @@ impl Display for CommandRejection {
 }
 
 impl Error for CommandRejection {}
+
+/// A terminal Android controller shutdown failure.
+#[derive(Debug)]
+pub enum ControllerShutdownError {
+    /// The control loop did not acknowledge and finish within its hard ceiling.
+    Timeout,
+    /// The control loop ended without acknowledging destruction.
+    AcknowledgementDropped,
+    /// The control loop task panicked or was cancelled.
+    Task(tokio::task::JoinError),
+}
+
+impl Display for ControllerShutdownError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout => formatter.write_str("Android controller shutdown timed out"),
+            Self::AcknowledgementDropped => {
+                formatter.write_str("Android controller dropped destruction acknowledgement")
+            }
+            Self::Task(error) => write!(formatter, "Android controller task failed: {error}"),
+        }
+    }
+}
+
+impl Error for ControllerShutdownError {}
 
 /// A cloneable, non-blocking handle usable from a native shell event loop.
 #[derive(Clone, Debug)]
@@ -245,8 +300,11 @@ impl ControllerHandle {
     /// # Errors
     ///
     /// Returns [`CommandRejection`] when the controller has stopped.
-    pub fn app_destroyed(&self) -> Result<(), CommandRejection> {
-        self.lifecycle_changed(ActivityLifecycleEvent::Destroyed)
+    pub fn app_destroyed(&self) -> Result<DestroyAcknowledgement, CommandRejection> {
+        self.send_lifecycle(ActivityLifecycleEvent::Destroyed)?;
+        Ok(DestroyAcknowledgement {
+            completed: self.lifecycle.shutdown_completed.clone(),
+        })
     }
 
     /// Reports that the Android activity left the foreground.
@@ -329,18 +387,14 @@ impl ControllerHandle {
 
 /// Owns the Tokio runtime and the single Gateway control loop.
 ///
-/// Dropping this closes the command channel, which ends the control loop, which
-/// cancels and joins any live attempt before the runtime itself is torn down.
-///
-/// That sequence is load-bearing on a phone: an attempt abandoned by runtime
-/// teardown instead of by cancellation gets no chance to close its socket, so
-/// the field order below is part of the contract. Rust drops fields in
-/// declaration order, so `handle` — the controller's own command sender — must
-/// stay ahead of `runtime`. Reversing them would tear the runtime down first
-/// and make the documented shutdown unreachable.
+/// The native shell must finish with [`Self::shutdown`], which waits for
+/// destruction acknowledgement and joins the control task before this runtime
+/// is dropped. Field order remains a fallback safety boundary: senders and the
+/// task handle are dropped before runtime teardown.
 #[derive(Debug)]
 pub struct AndroidController {
     handle: ControllerHandle,
+    control: JoinHandle<()>,
     runtime: Runtime,
 }
 
@@ -370,13 +424,21 @@ impl AndroidController {
             .build()?;
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
-        let lifecycle = Arc::new(LifecycleSender::new(lifecycle_tx));
-        runtime.spawn(run_with_platform(commands_rx, lifecycle_rx, sink, platform));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let lifecycle = Arc::new(LifecycleSender::new(lifecycle_tx, shutdown_rx));
+        let control = runtime.spawn(run_with_platform(
+            commands_rx,
+            lifecycle_rx,
+            shutdown_tx,
+            sink,
+            platform,
+        ));
         Ok(Self {
             handle: ControllerHandle {
                 commands: commands_tx,
                 lifecycle,
             },
+            control,
             runtime,
         })
     }
@@ -391,6 +453,41 @@ impl AndroidController {
     #[must_use]
     pub const fn runtime(&self) -> &Runtime {
         &self.runtime
+    }
+
+    /// Waits for acknowledged destruction and joins the control loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerShutdownError`] if acknowledgement is lost, the
+    /// control task fails, or the hard shutdown ceiling expires.
+    pub fn shutdown(
+        self,
+        acknowledgement: DestroyAcknowledgement,
+    ) -> Result<(), ControllerShutdownError> {
+        let Self {
+            handle,
+            mut control,
+            runtime,
+        } = self;
+        drop(handle);
+        let acknowledgement = acknowledgement.wait();
+        tokio::pin!(acknowledgement);
+        let result = runtime.block_on(async {
+            tokio::time::timeout(CONTROLLER_SHUTDOWN_TIMEOUT, async {
+                acknowledgement.as_mut().await?;
+                (&mut control)
+                    .await
+                    .map_err(ControllerShutdownError::Task)
+            })
+            .await
+            .map_err(|_| ControllerShutdownError::Timeout)?
+        });
+        if result.is_err() {
+            control.abort();
+        }
+        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+        result
     }
 }
 
@@ -588,10 +685,12 @@ impl SnapshotPublisher {
 #[cfg(test)]
 async fn run(commands: mpsc::Receiver<ControllerCommand>, sink: SnapshotSink) {
     let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
-    let _lifecycle = LifecycleSender::new(lifecycle_tx);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let _lifecycle = LifecycleSender::new(lifecycle_tx, shutdown_rx);
     run_with_platform(
         commands,
         lifecycle_rx,
+        shutdown_tx,
         sink,
         Arc::new(PortablePlatformFacilities),
     )
@@ -601,6 +700,7 @@ async fn run(commands: mpsc::Receiver<ControllerCommand>, sink: SnapshotSink) {
 async fn run_with_platform(
     mut commands: mpsc::Receiver<ControllerCommand>,
     mut lifecycle: mpsc::UnboundedReceiver<ActivityLifecycleEvent>,
+    shutdown_completed: watch::Sender<bool>,
     sink: SnapshotSink,
     platform: Arc<dyn PlatformFacilities>,
 ) {
@@ -613,6 +713,7 @@ async fn run_with_platform(
     let mut active: Option<ActiveAttempt> = None;
     let mut policy = MobileRunPolicy::new();
     let mut publisher = SnapshotPublisher::new();
+    let mut destroyed = false;
 
     publisher.publish(&model, &sink);
 
@@ -622,6 +723,7 @@ async fn run_with_platform(
             lifecycle_event = lifecycle.recv() => {
                 let Some(event) = lifecycle_event else { break };
                 if event == ActivityLifecycleEvent::Destroyed {
+                    destroyed = true;
                     let directive = policy.disconnect();
                     model.set_environment(AppLifecycle::Background, policy.network);
                     model.request_stop();
@@ -806,6 +908,9 @@ async fn run_with_platform(
     }
 
     stop_attempt(active.take()).await;
+    if destroyed {
+        let _ = shutdown_completed.send(true);
+    }
 }
 
 #[expect(
@@ -1039,19 +1144,19 @@ async fn send_attempt_update(
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use claw_application::SystemProbe;
     use claw_platform::NativeSystemProbe;
     use claw_protocol::RuntimeDescriptor;
     use claw_security::identity::DeviceIdentity;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
 
     use super::{
-        ActivityLifecycleEvent, AttemptDirective, COMMAND_QUEUE_CAPACITY, CommandRejection,
-        ControllerCommand, ControllerHandle, LifecycleSender, MobileRunPolicy, SnapshotSink,
-        core_protocol_summary, native_runtime_summary, run, run_with_platform, runtime_summary,
-        send_attempt_update,
+        ActivityLifecycleEvent, AndroidController, AttemptDirective, COMMAND_QUEUE_CAPACITY,
+        CommandRejection, ControllerCommand, ControllerHandle, LifecycleSender, MobileRunPolicy,
+        SnapshotSink, core_protocol_summary, native_runtime_summary, run, run_with_platform,
+        runtime_summary, send_attempt_update,
     };
     use crate::onboarding::{
         ConnectRequest, DiagnosticCode, RemedyKind, SubmissionRejection, ViewSnapshot,
@@ -1173,9 +1278,10 @@ mod tests {
     fn lifecycle_delivery_bypasses_a_saturated_command_queue() {
         let (commands_tx, _commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = ControllerHandle {
             commands: commands_tx,
-            lifecycle: Arc::new(LifecycleSender::new(lifecycle_tx)),
+            lifecycle: Arc::new(LifecycleSender::new(lifecycle_tx, shutdown_rx)),
         };
 
         for _ in 0..COMMAND_QUEUE_CAPACITY {
@@ -1207,9 +1313,10 @@ mod tests {
     fn lifecycle_updates_coalesce_duplicates_and_destruction_is_terminal() {
         let (commands_tx, _commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = ControllerHandle {
             commands: commands_tx,
-            lifecycle: Arc::new(LifecycleSender::new(lifecycle_tx)),
+            lifecycle: Arc::new(LifecycleSender::new(lifecycle_tx, shutdown_rx)),
         };
 
         handle
@@ -1250,14 +1357,15 @@ mod tests {
         runtime.block_on(async {
             let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
             let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let handle = ControllerHandle {
                 commands: commands_tx,
-                lifecycle: Arc::new(LifecycleSender::new(lifecycle_tx)),
+                lifecycle: Arc::new(LifecycleSender::new(lifecycle_tx, shutdown_rx)),
             };
             for _ in 0..COMMAND_QUEUE_CAPACITY {
                 handle.retry().expect("fill the normal command queue");
             }
-            handle
+            let acknowledgement = handle
                 .app_destroyed()
                 .expect("destroy bypasses the saturated queue");
 
@@ -1265,13 +1373,19 @@ mod tests {
             let control = tokio::spawn(run_with_platform(
                 commands_rx,
                 lifecycle_rx,
+                shutdown_tx,
                 sink,
                 Arc::new(PortablePlatformFacilities),
             ));
-            tokio::time::timeout(Duration::from_secs(1), control)
+            tokio::time::timeout(Duration::from_secs(1), async {
+                acknowledgement
+                    .wait()
+                    .await
+                    .expect("destruction is acknowledged after cleanup");
+                control.await.expect("the controller must not panic");
+            })
                 .await
-                .expect("destroy must end the controller promptly")
-                .expect("the controller must not panic");
+                .expect("destroy acknowledgement and task join must be bounded");
 
             assert_eq!(
                 handle.retry(),
@@ -1279,6 +1393,29 @@ mod tests {
                 "destruction must close the normal command path"
             );
         });
+    }
+
+    #[test]
+    fn owned_controller_shutdown_awaits_acknowledgement_and_task_join() {
+        let controller =
+            AndroidController::start(Arc::new(|_| {})).expect("controller runtime starts");
+        let handle = controller.handle();
+        for _ in 0..COMMAND_QUEUE_CAPACITY {
+            handle.retry().expect("fill the normal command queue");
+        }
+        let acknowledgement = handle
+            .app_destroyed()
+            .expect("destroy bypasses the saturated queue");
+        drop(handle);
+
+        let started = Instant::now();
+        controller
+            .shutdown(acknowledgement)
+            .expect("controller acknowledges destruction and joins");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "controller cleanup should finish well inside its hard ceiling"
+        );
     }
 
     #[test]
@@ -1439,10 +1576,12 @@ mod tests {
         runtime.block_on(async move {
             let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
             let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
-            let _lifecycle = LifecycleSender::new(lifecycle_tx);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let _lifecycle = LifecycleSender::new(lifecycle_tx, shutdown_rx);
             let control = tokio::spawn(run_with_platform(
                 commands_rx,
                 lifecycle_rx,
+                shutdown_tx,
                 sink,
                 Arc::new(FailingPlatform),
             ));
@@ -1535,9 +1674,10 @@ mod tests {
     fn a_handle_outliving_the_loop_refuses_commands_instead_of_queueing_them() {
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = ControllerHandle {
             commands: commands_tx,
-            lifecycle: Arc::new(LifecycleSender::new(lifecycle_tx)),
+            lifecycle: Arc::new(LifecycleSender::new(lifecycle_tx, shutdown_rx)),
         };
         drop(commands_rx);
         drop(lifecycle_rx);

@@ -548,6 +548,7 @@ write_artifact_supply_chain() {
   local package_inventory_cache="${4:-}"
   local artifact_name
   local artifact_hash
+  local artifact_sha1
   local source_revision
   local sbom
   local provenance
@@ -567,6 +568,7 @@ write_artifact_supply_chain() {
   esac
   artifact_name="$(basename "$artifact")"
   artifact_hash="$(sha256_file "$artifact")"
+  artifact_sha1="$(shasum -a 1 "$artifact" | awk '{ print $1 }')"
   source_revision="${GITHUB_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
   [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]] || die "invalid provenance source revision"
   sbom="$artifact.spdx"
@@ -633,14 +635,16 @@ write_artifact_supply_chain() {
     printf 'DocumentNamespace: https://github.com/GTAStudio/GTA-Claw/releases/sbom/%s\n' "$artifact_hash"
     printf 'Creator: Tool: GTA-Claw-macOS-Packaging\n'
     printf 'Created: 2000-01-01T00:00:00Z\n'
-    printf 'DocumentDescribes: SPDXRef-Artifact\n\n'
     printf 'FileName: ./%s\n' "$artifact_name"
     printf 'SPDXID: SPDXRef-Artifact\n'
+    printf 'FileChecksum: SHA1: %s\n' "$artifact_sha1"
     printf 'FileChecksum: SHA256: %s\n' "$artifact_hash"
     printf 'LicenseConcluded: NOASSERTION\n'
-    printf 'CopyrightText: NOASSERTION\n'
+    printf 'LicenseInfoInFile: NOASSERTION\n'
+    printf 'FileCopyrightText: NOASSERTION\n'
 
     write_spdx_package_inventory "$normalized_packages"
+    printf '\nRelationship: SPDXRef-DOCUMENT DESCRIBES SPDXRef-Artifact\n'
   } >"$sbom"
 
   printf '%s\n' \
@@ -653,16 +657,23 @@ test_artifact_supply_chain() {
   local artifact="$1"
   local artifact_name
   local artifact_hash
+  local artifact_sha1
   local sbom="$artifact.spdx"
   local provenance="$artifact.provenance.json"
   artifact_name="$(basename "$artifact")"
   artifact_hash="$(sha256_file "$artifact")"
+  artifact_sha1="$(shasum -a 1 "$artifact" | awk '{ print $1 }')"
   [[ -f "$sbom" && ! -L "$sbom" && -f "$provenance" && ! -L "$provenance" ]] ||
     die "artifact lacks SBOM or provenance companions: $artifact"
   grep -F "FileName: ./$artifact_name" "$sbom" >/dev/null ||
     die "SBOM does not name published artifact: $artifact"
+  grep -F "FileChecksum: SHA1: $artifact_sha1" "$sbom" >/dev/null ||
+    die "SBOM does not contain the mandatory SHA-1 file checksum: $artifact"
   grep -F "FileChecksum: SHA256: $artifact_hash" "$sbom" >/dev/null ||
     die "SBOM does not hash published artifact: $artifact"
+  grep -F "Relationship: SPDXRef-DOCUMENT DESCRIBES SPDXRef-Artifact" \
+    "$sbom" >/dev/null ||
+    die "SBOM does not describe its artifact with a standard relationship: $artifact"
   grep -F "\"name\":\"$artifact_name\",\"digest\":{\"sha256\":\"$artifact_hash\"}" \
     "$provenance" >/dev/null ||
     die "provenance does not attest published artifact: $artifact"
@@ -670,6 +681,12 @@ test_artifact_supply_chain() {
     die "SBOM has no package inventory: $artifact"
   [[ -z "$(awk '$1 == "SPDXID:" { print $2 }' "$sbom" | LC_ALL=C sort | uniq -d)" ]] ||
     die "SBOM contains duplicate SPDX identifiers: $artifact"
+  if [[ -n "${SPDX_VALIDATOR:-}" ]]; then
+    [[ -x "$SPDX_VALIDATOR" ]] ||
+      die "configured official SPDX validator is not executable"
+    "$SPDX_VALIDATOR" -i "$sbom" ||
+      die "official SPDX parser or validator rejected artifact SBOM: $artifact"
+  fi
 }
 
 write_artifact_set_checksums() {
