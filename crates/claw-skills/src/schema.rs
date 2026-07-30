@@ -22,6 +22,8 @@ const MAX_NUMBER_MANTISSA_DIGITS: usize = 1_024;
 const MAX_NUMBER_EXPONENT: u32 = 1_000_000;
 const MAX_NUMBER_EXPONENT_DIGITS: usize = 7;
 const COMPARISON_DIGITS_PER_UNIT: usize = 32;
+const MAX_RAW_JSON_BYTES: usize = 1_048_576;
+const MAX_JSON_STRING_BYTES: usize = 65_536;
 const SUPPORTED_SCHEMA_KEYWORDS: [&str; 18] = [
     "$comment",
     "additionalProperties",
@@ -89,11 +91,18 @@ impl ExactJsonDocument {
     ///
     /// Returns the underlying JSON syntax or value error.
     pub fn parse(json: &str) -> Result<Self, serde_json::Error> {
+        if json.len() > MAX_RAW_JSON_BYTES {
+            return Err(<serde_json::Error as serde::de::Error>::custom(
+                "exact JSON resource limit at $",
+            ));
+        }
         let raw: &RawValue = serde_json::from_str(json)?;
         let limits = RawJsonLimits {
             max_nodes: DEFAULT_MAX_INPUT_NODES.get(),
             max_depth: DEFAULT_MAX_DEPTH.get(),
             max_path_bytes: DEFAULT_MAX_PATH_BYTES.get(),
+            max_document_bytes: MAX_RAW_JSON_BYTES,
+            max_string_bytes: MAX_JSON_STRING_BYTES,
             reject_unbounded_numbers: false,
             track_paths: true,
         };
@@ -118,6 +127,8 @@ impl ExactJsonDocument {
                 max_nodes: limits.max_schema_nodes.get(),
                 max_depth: limits.max_depth.get(),
                 max_path_bytes: limits.max_path_bytes.get(),
+                max_document_bytes: MAX_RAW_JSON_BYTES,
+                max_string_bytes: MAX_JSON_STRING_BYTES,
                 reject_unbounded_numbers: true,
                 track_paths: true,
             },
@@ -189,6 +200,31 @@ pub(crate) enum ExactSchemaDocumentError {
     Schema(SchemaError),
 }
 
+pub(crate) fn preflight_json_document(
+    json: &str,
+    limits: ValidationLimits,
+) -> Result<(), ExactSchemaDocumentError> {
+    if json.len() > MAX_RAW_JSON_BYTES {
+        return Err(ExactSchemaDocumentError::Schema(resource_limit(
+            "$".to_owned(),
+        )));
+    }
+    let raw: &RawValue =
+        serde_json::from_str(json).map_err(ExactSchemaDocumentError::Json)?;
+    preflight_raw_json(
+        raw.get(),
+        RawJsonLimits {
+            max_nodes: limits.max_input_nodes.get(),
+            max_depth: limits.max_depth.get(),
+            max_path_bytes: limits.max_path_bytes.get(),
+            max_document_bytes: MAX_RAW_JSON_BYTES,
+            max_string_bytes: MAX_JSON_STRING_BYTES,
+            reject_unbounded_numbers: true,
+            track_paths: true,
+        },
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExactNode {
     Number(ExactNumber),
@@ -235,13 +271,21 @@ impl ExactNode {
     }
 
     fn from_value_bounded(value: &Value, limits: RawJsonLimits) -> Result<Self, SchemaError> {
+        Self::from_value_with_limits(value, Some(limits)).map_err(resource_limit)
+    }
+
+    fn from_input_value_bounded(
+        value: &Value,
+        limits: RawJsonLimits,
+    ) -> Result<Self, ParameterValidationError> {
         Self::from_value_with_limits(value, Some(limits))
+            .map_err(|path| ParameterValidationError::ResourceLimit { path })
     }
 
     fn from_value_with_limits(
         value: &Value,
         limits: Option<RawJsonLimits>,
-    ) -> Result<Self, SchemaError> {
+    ) -> Result<Self, String> {
         enum Frame<'a> {
             Visit {
                 value: &'a Value,
@@ -276,7 +320,7 @@ impl ExactNode {
                 Frame::Visit { value, depth, path } => {
                     if let Some(limits) = limits {
                         if depth >= limits.max_depth || remaining_nodes == 0 {
-                            return Err(resource_limit(path.unwrap_or_else(|| "$".to_owned())));
+                            return Err(path.unwrap_or_else(|| "$".to_owned()));
                         }
                         remaining_nodes -= 1;
                     }
@@ -284,13 +328,13 @@ impl ExactNode {
                         Value::Number(number) => {
                             let raw = number.to_string();
                             if limits.is_some() && raw.len() > MAX_NUMBER_LEXEME_BYTES {
-                                return Err(resource_limit(path.unwrap_or_else(|| "$".to_owned())));
+                                return Err(path.unwrap_or_else(|| "$".to_owned()));
                             }
                             let exact = ExactNumber::new(raw);
                             if limits.is_some_and(|limits| limits.reject_unbounded_numbers)
                                 && exact.decimal().is_none()
                             {
-                                return Err(resource_limit(path.unwrap_or_else(|| "$".to_owned())));
+                                return Err(path.unwrap_or_else(|| "$".to_owned()));
                             }
                             output.push(Self::Number(exact));
                         }
@@ -311,6 +355,12 @@ impl ExactNode {
                                 path,
                                 output_start: output.len(),
                             });
+                        }
+                        Value::String(value)
+                            if limits
+                                .is_some_and(|limits| value.len() > limits.max_string_bytes) =>
+                        {
+                            return Err(path.unwrap_or_else(|| "$".to_owned()));
                         }
                         Value::Null | Value::Bool(_) | Value::String(_) => {
                             output.push(Self::Other);
@@ -355,6 +405,11 @@ impl ExactNode {
                     output_start,
                 } => {
                     if let Some((name, value)) = values.next() {
+                        if limits
+                            .is_some_and(|limits| name.len() > limits.max_string_bytes)
+                        {
+                            return Err(path.unwrap_or_else(|| "$".to_owned()));
+                        }
                         let child_path = bounded_build_path(path.as_deref(), &[".", name], limits);
                         names.push(name.clone());
                         frames.push(Frame::Object {
@@ -714,6 +769,8 @@ struct RawJsonLimits {
     max_nodes: usize,
     max_depth: usize,
     max_path_bytes: usize,
+    max_document_bytes: usize,
+    max_string_bytes: usize,
     reject_unbounded_numbers: bool,
     track_paths: bool,
 }
@@ -891,6 +948,11 @@ fn invalid_unicode_escape() -> serde_json::Error {
 }
 
 fn preflight_raw_json(json: &str, limits: RawJsonLimits) -> Result<(), ExactSchemaDocumentError> {
+    if json.len() > limits.max_document_bytes {
+        return Err(ExactSchemaDocumentError::Schema(resource_limit(
+            "$".to_owned(),
+        )));
+    }
     let mut cursor = RawJsonCursor::new(json);
     let mut remaining_nodes = limits.max_nodes;
     let mut containers = Vec::new();
@@ -965,6 +1027,9 @@ fn preflight_raw_json(json: &str, limits: RawJsonLimits) -> Result<(), ExactSche
             } => match token {
                 RawToken::ObjectEnd => {}
                 RawToken::String(raw_key, decoded_bytes) => {
+                    if decoded_bytes > limits.max_string_bytes {
+                        return Err(ExactSchemaDocumentError::Schema(resource_limit(path)));
+                    }
                     let minimum_length = path
                         .len()
                         .checked_add(1)
@@ -1074,6 +1139,9 @@ fn start_raw_value(
             expect_value: true,
         }),
         RawToken::Number(length) if length > MAX_NUMBER_LEXEME_BYTES => {
+            return Err(resource_limit(path));
+        }
+        RawToken::String(_, decoded_bytes) if decoded_bytes > limits.max_string_bytes => {
             return Err(resource_limit(path));
         }
         RawToken::String(_, _) | RawToken::Number(_) | RawToken::Scalar => {}
@@ -1258,6 +1326,8 @@ pub fn validate_schema_with_limits(
             max_nodes: limits.max_schema_nodes.get(),
             max_depth: limits.max_depth.get(),
             max_path_bytes: limits.max_path_bytes.get(),
+            max_document_bytes: MAX_RAW_JSON_BYTES,
+            max_string_bytes: MAX_JSON_STRING_BYTES,
             reject_unbounded_numbers: true,
             track_paths: true,
         },
@@ -1676,6 +1746,8 @@ pub fn validate_parameters_with_limits(
             max_nodes: limits.max_schema_nodes.get(),
             max_depth: limits.max_depth.get(),
             max_path_bytes: limits.max_path_bytes.get(),
+            max_document_bytes: MAX_RAW_JSON_BYTES,
+            max_string_bytes: MAX_JSON_STRING_BYTES,
             reject_unbounded_numbers: true,
             track_paths: true,
         },
@@ -1683,15 +1755,18 @@ pub fn validate_parameters_with_limits(
     .map_err(ParameterValidationError::InvalidSchema)?;
     validate_schema_at(schema, &exact_schema, "$", 0, limits)
         .map_err(ParameterValidationError::InvalidSchema)?;
-    let mut remaining_values = limits.max_input_nodes.get();
-    validate_input_node(
+    let exact_parameters = ExactNode::from_input_value_bounded(
         parameters,
-        0,
-        limits,
-        &mut remaining_values,
-        &mut Vec::new(),
+        RawJsonLimits {
+            max_nodes: limits.max_input_nodes.get(),
+            max_depth: limits.max_depth.get(),
+            max_path_bytes: limits.max_path_bytes.get(),
+            max_document_bytes: MAX_RAW_JSON_BYTES,
+            max_string_bytes: MAX_JSON_STRING_BYTES,
+            reject_unbounded_numbers: true,
+            track_paths: true,
+        },
     )?;
-    let exact_parameters = ExactNode::from_value(parameters);
     validate_parameters_after_preflight(
         schema,
         &exact_schema,
@@ -1748,6 +1823,7 @@ fn validate_parameters_inner(
     let mut remaining_values = limits.max_input_nodes.get();
     validate_input_node(
         parameters,
+        exact_parameters,
         0,
         limits,
         &mut remaining_values,
@@ -1848,10 +1924,31 @@ impl ValidationContext {
         };
         Ok(left.cmp(right))
     }
+
+    fn consume_string_work(
+        &mut self,
+        byte_length: usize,
+        multiplier: usize,
+        path: &str,
+    ) -> Result<(), ParameterValidationError> {
+        self.consume_comparisons(
+            string_comparison_units(byte_length).saturating_mul(multiplier),
+            path,
+        )
+    }
+}
+
+fn string_comparison_units(byte_length: usize) -> usize {
+    byte_length.div_ceil(COMPARISON_DIGITS_PER_UNIT).max(1)
+}
+
+fn ordered_map_lookup_steps(entry_count: usize) -> usize {
+    usize::try_from(entry_count.max(1).ilog2()).unwrap_or(usize::MAX) + 1
 }
 
 fn validate_input_node<'a>(
     value: &'a Value,
+    exact: &ExactNode,
     depth: usize,
     limits: ValidationLimits,
     remaining_values: &mut usize,
@@ -1867,20 +1964,58 @@ fn validate_input_node<'a>(
         Value::Array(values) => {
             for (index, value) in values.iter().enumerate() {
                 path.push(InputPathComponent::Index(index));
-                let result = validate_input_node(value, depth + 1, limits, remaining_values, path);
+                let result = validate_input_node(
+                    value,
+                    exact
+                        .index(index)
+                        .expect("exact parameters mirror the parameter value"),
+                    depth + 1,
+                    limits,
+                    remaining_values,
+                    path,
+                );
                 path.pop();
                 result?;
             }
         }
         Value::Object(values) => {
             for (name, value) in values {
+                if name.len() > MAX_JSON_STRING_BYTES {
+                    return Err(ParameterValidationError::ResourceLimit {
+                        path: render_input_path(path, limits.max_path_bytes.get()),
+                    });
+                }
                 path.push(InputPathComponent::Key(name));
-                let result = validate_input_node(value, depth + 1, limits, remaining_values, path);
+                let result = validate_input_node(
+                    value,
+                    exact
+                        .key(name)
+                        .expect("exact parameters mirror the parameter value"),
+                    depth + 1,
+                    limits,
+                    remaining_values,
+                    path,
+                );
                 path.pop();
                 result?;
             }
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        Value::Number(_) => {
+            let number = exact
+                .number()
+                .expect("exact parameters mirror the parameter value");
+            if number.raw().len() > MAX_NUMBER_LEXEME_BYTES || number.decimal().is_none() {
+                return Err(ParameterValidationError::ResourceLimit {
+                    path: render_input_path(path, limits.max_path_bytes.get()),
+                });
+            }
+        }
+        Value::String(value) if value.len() > MAX_JSON_STRING_BYTES => {
+            return Err(ParameterValidationError::ResourceLimit {
+                path: render_input_path(path, limits.max_path_bytes.get()),
+            });
+        }
+        Value::Null | Value::Bool(_) | Value::String(_) => {}
     }
     Ok(())
 }
@@ -2110,7 +2245,11 @@ fn json_equal_bounded(
                 true,
             )
             .map(|ordering| ordering == Ordering::Equal),
-        (Value::String(left), Value::String(right)) => Ok(left == right),
+        (Value::String(left), Value::String(right)) => {
+            let units = string_comparison_units(left.len().max(right.len())).saturating_sub(1);
+            context.consume_comparisons(units, path)?;
+            Ok(left == right)
+        }
         (Value::Array(left), Value::Array(right)) => {
             if left.len() != right.len() {
                 return Ok(false);
@@ -2143,6 +2282,10 @@ fn json_equal_bounded(
                 return Ok(false);
             }
             for (name, left) in left {
+                let lookup_multiplier = 1_usize.saturating_add(
+                    ordered_map_lookup_steps(right.len()).saturating_mul(2),
+                );
+                context.consume_string_work(name.len(), lookup_multiplier, path)?;
                 let Some(right) = right.get(name) else {
                     return Ok(false);
                 };
@@ -2524,6 +2667,7 @@ fn validate_object_value(
 ) -> Result<bool, ParameterValidationError> {
     if let Some(required) = schema.get("required").and_then(Value::as_array) {
         for name in required.iter().filter_map(Value::as_str) {
+            context.consume_string_work(name.len(), 1, path)?;
             if !value.contains_key(name) {
                 let missing_path = context.child_path(path, &[".", name])?;
                 if !context.record(
@@ -2541,6 +2685,10 @@ fn validate_object_value(
             .key("properties")
             .expect("exact schema mirrors the validated schema");
         for (name, property_schema) in properties {
+            let lookup_multiplier = 1_usize
+                .saturating_add(ordered_map_lookup_steps(properties.len()))
+                .saturating_add(ordered_map_lookup_steps(value.len()));
+            context.consume_string_work(name.len(), lookup_multiplier, path)?;
             if let Some(property_value) = value.get(name) {
                 let property_path = context.child_path(path, &[".", name])?;
                 let exact_property_schema = exact_properties
@@ -2565,6 +2713,7 @@ fn validate_object_value(
     }
     if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
         for name in value.keys() {
+            context.consume_string_work(name.len(), 1, path)?;
             if properties.is_none_or(|declared| !declared.contains_key(name)) {
                 let additional_path = context.child_path(path, &[".", name])?;
                 if !context.record(&additional_path, ParameterViolationKind::AdditionalProperty) {

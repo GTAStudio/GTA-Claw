@@ -461,6 +461,39 @@ fn query_parameters_are_inserted_before_a_url_fragment() {
 }
 
 #[test]
+fn an_empty_existing_query_does_not_add_a_leading_ampersand() {
+    let manifest = load_manifest(
+        r#"{
+            "id":"http-empty-query",
+            "description":"Append input to an empty query.",
+            "parameters":{"type":"object","additionalProperties":false},
+            "execution":{
+                "kind":"http",
+                "request":{
+                    "method":"GET",
+                    "url":"https://example.test/search?#results",
+                    "parameters":{"kind":"query_parameter","name":"input"},
+                    "response":"json"
+                }
+            }
+        }"#,
+    )
+    .expect("valid HTTP manifest");
+    let (native, http, mut wasm) = ports();
+
+    SkillRuntime::new(&native, &http, &mut wasm)
+        .execute(&manifest, json!({}))
+        .expect("execute");
+
+    let calls = http.requests.into_inner();
+    assert_eq!(
+        calls[0].url,
+        "https://example.test/search?input=%7B%7D#results"
+    );
+    assert!(!calls[0].url.contains("?&"));
+}
+
+#[test]
 fn every_http_parameter_mode_uses_the_same_canonical_url() {
     let body_manifest = load_manifest(
         r#"{
@@ -535,6 +568,33 @@ fn unknown_manifest_fields_are_rejected_with_source_coordinates() {
     assert!(line > 0);
     assert!(column > 0);
     assert!(message.contains("unknown field `javascript`"));
+}
+
+#[test]
+fn unknown_http_parameter_fields_are_rejected() {
+    let json = r#"{
+        "id":"closed-http-parameters",
+        "description":"Reject hidden parameter behavior.",
+        "parameters":{"type":"object"},
+        "execution":{
+            "kind":"http",
+            "request":{
+                "method":"GET",
+                "url":"https://example.test/search",
+                "parameters":{"kind":"query_parameter","name":"input","extra":true}
+            }
+        }
+    }"#;
+
+    let error = load_manifest(json).expect_err("HTTP parameter encoding is closed");
+    assert!(
+        matches!(
+            error,
+            ManifestError::MalformedJson { ref message, .. }
+                if message.contains("unknown field `extra`")
+        ),
+        "unexpected diagnostic: {error}"
+    );
 }
 
 #[test]

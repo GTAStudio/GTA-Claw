@@ -9,7 +9,7 @@ use serde_json::value::RawValue;
 
 use crate::schema::{
     ExactJsonDocument, ExactSchemaDocumentError, SchemaError, ValidationLimits,
-    validate_schema_with_exact,
+    preflight_json_document, validate_schema_with_exact,
 };
 
 /// A validated modern skill manifest.
@@ -169,7 +169,7 @@ impl Debug for HttpSkillDefinition {
 
 /// Declarative placement of validated parameters.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HttpParameterEncoding {
     /// Serialize parameters as a JSON request body.
     #[default]
@@ -267,6 +267,10 @@ pub enum ManifestError {
 /// [`ManifestError::InvalidWasmTarget`] for an invalid plugin identifier or
 /// export name.
 pub fn load_manifest(json: &str) -> Result<SkillManifest, ManifestError> {
+    preflight_json_document(json, ValidationLimits::default()).map_err(|error| match error {
+        ExactSchemaDocumentError::Json(error) => malformed_json(error, json),
+        ExactSchemaDocumentError::Schema(error) => ManifestError::InvalidParameterSchema(error),
+    })?;
     let raw: RawSkillManifest<'_> =
         serde_json::from_str(json).map_err(|error| ManifestError::MalformedJson {
             line: error.line(),

@@ -451,7 +451,7 @@ impl<'a> SkillRuntime<'a> {
 
 fn append_query_parameter(url: &mut url::Url, name: &str, value: &str) {
     let encoded_pair = format!("{}={}", percent_encode(name), percent_encode(value));
-    let query = url.query().map_or_else(
+    let query = url.query().filter(|existing| !existing.is_empty()).map_or_else(
         || encoded_pair.clone(),
         |existing| format!("{existing}&{encoded_pair}"),
     );

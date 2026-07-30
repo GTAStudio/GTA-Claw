@@ -230,3 +230,58 @@ fn decimal_comparison_work_is_charged_per_array_item() {
         }
     );
 }
+
+#[test]
+fn exact_json_rejects_raw_documents_and_decoded_strings_before_value_construction() {
+    let oversized_document = format!("{}null", " ".repeat(1_048_576));
+    let error = ExactJsonDocument::parse(&oversized_document)
+        .expect_err("raw document bytes are bounded before JSON parsing");
+    assert!(error.to_string().contains("resource limit at $"));
+
+    let oversized_string = format!("\"{}\"", r"\u0061".repeat(65_537));
+    let error = ExactJsonDocument::parse(&oversized_string)
+        .expect_err("decoded string bytes are bounded before string allocation");
+    assert!(error.to_string().contains("resource limit at $"));
+}
+
+#[test]
+fn direct_value_inputs_enforce_string_limits_during_exact_construction() {
+    let schema = json!({"type": "string"});
+    let input = Value::String("a".repeat(65_537));
+
+    assert_eq!(
+        validate_parameters_with_limits(&schema, &input, limits(4, 128)),
+        Err(ParameterValidationError::ResourceLimit {
+            path: "$".to_owned()
+        })
+    );
+}
+
+#[test]
+fn string_equality_work_consumes_the_comparison_budget_by_bytes() {
+    let value = "a".repeat(64);
+    let schema = json!({"enum": [value.clone()]});
+    let mut constrained = limits(4, 128);
+    constrained.max_comparison_nodes = NonZeroUsize::new(1).expect("positive comparison limit");
+
+    assert_eq!(
+        validate_parameters_with_limits(&schema, &json!(value), constrained),
+        Err(ParameterValidationError::ResourceLimit {
+            path: "$".to_owned()
+        })
+    );
+}
+
+#[test]
+fn exact_numbers_beyond_the_numeric_budget_are_resource_limits() {
+    let schema = ExactJsonDocument::parse(r#"{"type":"integer"}"#).expect("valid exact schema");
+    let parameters =
+        ExactJsonDocument::parse("1e1000001").expect("raw exact number remains representable");
+
+    assert_eq!(
+        validate_exact_parameters_with_limits(&schema, &parameters, limits(4, 128)),
+        Err(ParameterValidationError::ResourceLimit {
+            path: "$".to_owned()
+        })
+    );
+}

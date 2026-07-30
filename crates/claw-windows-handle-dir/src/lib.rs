@@ -18,7 +18,7 @@ use windows_sys::Wdk::Storage::FileSystem::{
 };
 use windows_sys::Win32::Foundation::{
     GENERIC_READ, GENERIC_WRITE, HANDLE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
-    STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, STATUS_SUCCESS, UNICODE_STRING,
+    STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, STATUS_PENDING, STATUS_SUCCESS, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -26,8 +26,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-const BUFFER_BYTES: usize = 64 * 1024;
-const BUFFER_BYTES_U32: u32 = 64 * 1024;
+const INITIAL_BUFFER_BYTES: usize = 4 * 1024;
+const MAX_BUFFER_BYTES: usize = 64 * 1024;
 const FILE_NAMES_HEADER_BYTES: usize = 12;
 
 /// A synchronous directory handle created and owned by this helper.
@@ -254,6 +254,9 @@ impl DirectoryHandle {
                 0,
             )
         };
+        if status == STATUS_PENDING {
+            return Err(pending_error("NtCreateFile"));
+        }
         if status != STATUS_SUCCESS {
             return Err(status_error(status));
         }
@@ -269,7 +272,8 @@ impl DirectoryHandle {
 )]
 fn read_names(directory: &DirectoryHandle, max_names: usize) -> io::Result<Vec<OsString>> {
     let mut names = Vec::with_capacity(max_names.min(256));
-    let mut buffer = vec![0_u64; BUFFER_BYTES / size_of::<u64>()];
+    let mut buffer_bytes = INITIAL_BUFFER_BYTES;
+    let mut buffer = vec![0_u64; buffer_bytes / size_of::<u64>()];
     let mut restart_scan = true;
     while names.len() < max_names {
         let mut status_block = IO_STATUS_BLOCK::default();
@@ -284,23 +288,37 @@ fn read_names(directory: &DirectoryHandle, max_names: usize) -> io::Result<Vec<O
                 null(),
                 &raw mut status_block,
                 buffer.as_mut_ptr().cast(),
-                BUFFER_BYTES_U32,
+                u32::try_from(buffer_bytes).expect("bounded directory buffer fits the Windows ABI"),
                 FileNamesInformation,
                 true,
                 null(),
                 restart_scan,
             )
         };
-        restart_scan = false;
-        if enumeration_exhausted(status, status_block.Information) {
+        if status == STATUS_PENDING {
+            return Err(pending_error("NtQueryDirectoryFile"));
+        }
+        if enumeration_exhausted(status) {
             break;
         }
         if status != STATUS_SUCCESS {
             return Err(status_error(status));
         }
+        if status_block.Information == 0 {
+            if buffer_bytes == MAX_BUFFER_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory entry exceeds the bounded enumeration buffer",
+                ));
+            }
+            buffer_bytes = buffer_bytes.saturating_mul(2).min(MAX_BUFFER_BYTES);
+            buffer.resize(buffer_bytes / size_of::<u64>(), 0);
+            continue;
+        }
+        restart_scan = false;
 
         let returned = status_block.Information;
-        if !(FILE_NAMES_HEADER_BYTES..=BUFFER_BYTES).contains(&returned) {
+        if !(FILE_NAMES_HEADER_BYTES..=buffer_bytes).contains(&returned) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "NtQueryDirectoryFile returned an invalid byte count",
@@ -330,10 +348,8 @@ fn read_names(directory: &DirectoryHandle, max_names: usize) -> io::Result<Vec<O
     Ok(names)
 }
 
-const fn enumeration_exhausted(status: i32, information: usize) -> bool {
-    status == STATUS_NO_MORE_FILES
-        || status == STATUS_NO_SUCH_FILE
-        || (status == STATUS_SUCCESS && information == 0)
+const fn enumeration_exhausted(status: i32) -> bool {
+    status == STATUS_NO_MORE_FILES || status == STATUS_NO_SUCH_FILE
 }
 
 #[expect(
@@ -357,16 +373,31 @@ fn status_error(status: i32) -> io::Error {
     io::Error::from_raw_os_error(i32::try_from(code).unwrap_or(i32::MAX))
 }
 
+fn pending_error(operation: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!("{operation} unexpectedly returned STATUS_PENDING for a synchronous handle"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn empty_directory_statuses_are_exhaustion() {
-        assert!(enumeration_exhausted(STATUS_NO_MORE_FILES, 0));
-        assert!(enumeration_exhausted(STATUS_NO_SUCH_FILE, 1));
-        assert!(enumeration_exhausted(STATUS_SUCCESS, 0));
-        assert!(!enumeration_exhausted(STATUS_SUCCESS, 1));
+        assert!(enumeration_exhausted(STATUS_NO_MORE_FILES));
+        assert!(enumeration_exhausted(STATUS_NO_SUCH_FILE));
+        assert!(!enumeration_exhausted(STATUS_SUCCESS));
+    }
+
+    #[test]
+    fn pending_status_is_a_typed_synchronous_contract_failure() {
+        assert_eq!(
+            pending_error("test").kind(),
+            io::ErrorKind::WouldBlock,
+            "STATUS_PENDING must never expose an uninitialized IO_STATUS_BLOCK"
+        );
     }
 
     #[test]
