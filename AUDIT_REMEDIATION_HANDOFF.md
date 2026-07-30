@@ -13,7 +13,8 @@ snapshot was taken.
 
 ### Git baseline
 
-- Remote `main`: `5e85d6d080712c82dc0814985df1472bdfab5dd9`
+- Last product-code baseline before the documentation-only handoff merge:
+  `5e85d6d080712c82dc0814985df1472bdfab5dd9`
 - PR #230 merged as `d2493b07b7c064bd8b72c836852c4ae1617b56f5`.
 - PR #238 merged as `5e85d6d080712c82dc0814985df1472bdfab5dd9`.
 - Closed as unsafe, duplicate, or superseded:
@@ -184,7 +185,8 @@ not merged from their stale heads:
 
 ### Required resume order
 
-1. Fetch `main@5e85d6d...` and read this section first.
+1. Fetch current `origin/main` and read this section first. The last product-code
+   baseline before the handoff documentation is `5e85d6d...`.
 2. Review/validate/land Trusted A1.
 3. Rebase/validate/merge #226.
 4. Fix final Legacy Discord blockers, land Trusted A2, then merge #227.
@@ -244,7 +246,7 @@ final snapshot was authored.
 
 ## 3. Current Git baseline
 
-Remote main:
+Last product-code baseline before the handoff documentation:
 
 ```text
 5e85d6d080712c82dc0814985df1472bdfab5dd9
