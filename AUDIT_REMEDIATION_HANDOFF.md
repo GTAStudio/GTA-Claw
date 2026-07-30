@@ -46,6 +46,8 @@ rebase onto current `main`, independently review, and validate before publicatio
 | Plugin / PR #235 | `handoff/2026-07-30-0833/plugin-pr235` | `7660bce81942919ddf72be07fa60dc1937b5d6aa` | `c7d22a2d13f46eb2b2b7b18d818ab7820f1b9c18` |
 | Discovery/fleet port | `handoff/2026-07-30-0840/discovery-fleet-port-final` | `152bfbc81e10967a3eff3f1627b222f1ba4f3bd2` | `8686c27fa55ba768db473c3d4e7f602b978aa021` |
 | Trusted A1 candidate | `handoff/2026-07-30-0833/trusted-a1-candidate` | `221226f4a4dc77795696994f8930aae39f8a2260` | `5e85d6d080712c82dc0814985df1472bdfab5dd9` |
+| Trusted A1 new-owner candidate | `handoff/2026-07-30-0842/trusted-a1-new-owner-final` | `10b3a2d824dc84d361bad75d31f4f72d014d43c5` | `5e85d6d080712c82dc0814985df1472bdfab5dd9` |
+| Compat-oracle partial port | `handoff/2026-07-30-0842/compat-oracle-partial-final` | `f2f8d28a87205d4c2decde41b0066294dac18862` | `d2493b07b7c064bd8b72c836852c4ae1617b56f5` |
 | Duplicate trusted supply-chain candidate | `handoff/2026-07-30-0833/duplicate-trusted-supply-chain` | `9f3f3a23fbedfccd48981c9bc306b775b9c00c95` | `92c2329b151d4b71b342a54d944254da2f3c61a5` |
 | Dirty PR #234 source | `handoff/2026-07-30-0833/supply-chain-pr234-dirty` | `e70aedb0b2cb4e1e18baf398de4f1b4b78114d4f` | `28fba25d12817f04c8fddee63c6b6fa711941f33` |
 | Duplicate Rust channels | `handoff/2026-07-30-0833/duplicate-rust-channels` | `6c07745e267900683629421f69c231faeed3ab6a` | `c1444f5fb37e5bb625d1b6b40a9c465a1d90c357` |
@@ -59,6 +61,11 @@ authoritative scopes without a fresh source comparison.
 Legacy, Packaging, and Discovery received small writes after the first stop message.
 Their `-final` refs are successor commits whose parents are the earlier snapshots.
 Those raced edits were not reviewed or tested.
+
+The new Trusted A1 and compat-oracle sessions also wrote after the first inventory.
+Their final refs are independent snapshots. In total, 22 handoff refs exist: the 19
+final table entries plus the three predecessor refs for Legacy, Packaging, and
+Discovery.
 
 ### Current open PR inventory
 
@@ -98,10 +105,13 @@ not merged from their stale heads:
 ### Exact unfinished state by active scope
 
 1. **Trusted A1**
-   - The authoritative candidate is the `trusted-a1-candidate` snapshot based directly
-     on current `main`.
-   - Scope is now cleanly limited to `claw-windows-file-id`, root workspace/lock,
-     CODEOWNERS, exact frozen fixtures, repository policy, and trusted-policy tests.
+   - Two A1-only candidates based on the same product main are preserved:
+     `trusted-a1-candidate` and `trusted-a1-new-owner-final`.
+   - The new-owner candidate also changes `crates/claw-conformance/Cargo.toml` to bind
+     the exact consumer edge. Compare both candidates before selecting a base.
+   - Scope is limited to `claw-windows-file-id`, root workspace/lock, CODEOWNERS,
+     exact frozen fixtures, repository policy, trusted-policy tests, and the exact
+     conformance dependency edge.
    - No validation or independent final review was completed after the final split.
    - Do not use the older mixed trusted snapshots as authority.
 
@@ -182,7 +192,9 @@ not merged from their stale heads:
     - Durable memory is partially implemented in its snapshot.
     - Discovery/fleet is partially implemented in its snapshot. A one-line
       `dns_sd.rs` change raced the stop and is unreviewed.
-    - Durable state and compat-oracle sessions stopped before writing files.
+    - Durable state stopped before writing files.
+    - Compat-oracle produced one unreviewed `compat/upstream/validate.ps1` edit, stored
+      in `compat-oracle-partial-final`.
     - PR #238 already completed the #171/#144 client-contract port and is on main.
     - Still create reviewed current-main ports for compat/conformance, trusted policy,
       HTTP API, durable state, durable memory, discovery/fleet, remaining iOS/client
