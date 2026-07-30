@@ -1,0 +1,111 @@
+name: Joint desktop release finalizer
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Annotated semantic release tag
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    name: Validate and finalize joint release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: joint-desktop-release-${{ inputs.tag }}
+      cancel-in-progress: false
+    steps:
+      - name: Validate and finalize joint release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Joint release finalizer requires a semantic vX.Y.Z tag." >&2
+            exit 1
+          }
+
+          release_json="$(gh release view "$tag" --json isDraft,assets)"
+          is_draft="$(jq -r '.isDraft' <<<"$release_json")"
+          assets="$(jq -r '.assets[].name' <<<"$release_json" | LC_ALL=C sort)"
+          missing=()
+          for manifest in SHA256SUMS-macos SHA256SUMS-windows; do
+            if ! grep -Fqx "$manifest" <<<"$assets"; then
+              missing+=("$manifest")
+            fi
+          done
+          if [[ "${#missing[@]}" -ne 0 ]]; then
+            if [[ "$is_draft" != "true" ]]; then
+              echo "Published release is missing completion manifests: ${missing[*]}" >&2
+              exit 1
+            fi
+            echo "Joint release remains draft; waiting for: ${missing[*]}"
+            exit 0
+          fi
+
+          verify="$(mktemp -d "$RUNNER_TEMP/gta-claw-joint-release.XXXXXX")"
+          trap 'rm -rf -- "$verify"' EXIT INT TERM
+          gh release download "$tag" --dir "$verify"
+
+          expected="$verify/.expected-assets"
+          printf '%s\n' SHA256SUMS-macos SHA256SUMS-windows >"$expected"
+          for manifest in SHA256SUMS-macos SHA256SUMS-windows; do
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              if [[ ! "$line" =~ ^([0-9a-f]{64})\ \ ([^/\\]+)$ ]]; then
+                echo "Invalid joint release checksum entry in $manifest: $line" >&2
+                exit 1
+              fi
+              digest="${BASH_REMATCH[1]}"
+              name="${BASH_REMATCH[2]}"
+              path="$verify/$name"
+              if [[ ! -f "$path" || -L "$path" ]]; then
+                echo "Joint release manifest references a missing or unsafe asset: $name" >&2
+                exit 1
+              fi
+              if command -v sha256sum >/dev/null; then
+                actual="$(sha256sum "$path" | awk '{print $1}')"
+              else
+                actual="$(shasum -a 256 "$path" | awk '{print $1}')"
+              fi
+              if [[ "$actual" != "$digest" ]]; then
+                echo "Joint release checksum mismatch: $name" >&2
+                exit 1
+              fi
+              printf '%s\n' "$name" >>"$expected"
+            done <"$verify/$manifest"
+          done
+
+          expected_count="$(wc -l <"$expected" | tr -d ' ')"
+          unique_count="$(LC_ALL=C sort -u "$expected" | wc -l | tr -d ' ')"
+          if [[ "$expected_count" != "$unique_count" ]]; then
+            echo "Joint release manifests contain duplicate asset names." >&2
+            exit 1
+          fi
+          LC_ALL=C sort -u "$expected" -o "$expected"
+          actual="$verify/.actual-assets"
+          printf '%s\n' "$assets" >"$actual"
+          if ! diff -u "$expected" "$actual"; then
+            echo "Joint release asset set differs from both checksum manifests." >&2
+            exit 1
+          fi
+
+          current_json="$(gh release view "$tag" --json isDraft)"
+          if [[ "$(jq -r '.isDraft' <<<"$current_json")" == "false" ]]; then
+            echo "Joint release was already finalized after validating the exact bytes."
+            exit 0
+          fi
+          gh release edit "$tag" --draft=false
+          finalized_json="$(gh release view "$tag" --json isDraft)"
+          if [[ "$(jq -r '.isDraft' <<<"$finalized_json")" != "false" ]]; then
+            echo "Joint release remained draft after finalization." >&2
+            exit 1
+          fi

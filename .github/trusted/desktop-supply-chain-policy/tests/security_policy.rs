@@ -32,7 +32,10 @@ use desktop_supply_chain_policy::policy::{
     write_bootstrap_snapshot, write_final_dependency_fixtures,
 };
 use desktop_supply_chain_policy::process::{CommandSpec, run, run_checked};
-use desktop_supply_chain_policy::repository_policy::validate_repository_policy_transition;
+use desktop_supply_chain_policy::repository_policy::{
+    has_pr227_admission_authority, is_pr233_admission_base, is_rotation_base,
+    validate_pr227_candidate, validate_pr233_final_assets, validate_repository_policy_transition,
+};
 use desktop_supply_chain_policy::validation::{
     BaseState, ValidationRequest, candidate_requires_final, validate_request,
 };
@@ -126,7 +129,7 @@ const P04F_MUTATION_ORACLE: [ExpectedMutation; 48] = [
         "windows-arm64-deny-missing",
         "windows-arm64-deny-missing",
         MutationArtifact::RustWorkflow,
-        "missing Check Windows ARM64 desktop dependency policy step",
+        "missing Check shipped desktop dependency policy step",
     ),
     expected_mutation(
         "supply-checkout-action-substitution",
@@ -449,7 +452,7 @@ const P03B_SQLITE_FILE_CONTROL_MANIFEST_SHA256: &str =
     "12f3b3d87c1b21337285be2e320935539c4c52bdbb9b0c349e1f85fab658ea01";
 const P03B_SQLITE_FILE_CONTROL_MEMBER: &str = "crates/claw-sqlite-file-control";
 const FINAL_ROOT_DENY_SHA256: &str =
-    "75dedb874582f2f6d32890e21cca11186112d13dd51f4140ada96c69989594d0";
+    "f21f987b9d9d72aea4a5edfd3151ad9dd9fbb8eb0e9566c021ad4cbc7abca99a";
 const SUPERSEDED_ROOT_DENY_SHA256: &str =
     "a822bdccf7d6e235f03fdadbc6d43e381f7219d02abad80d8253c10c7e1529db";
 const P03B_SQLITE_FILE_CONTROL_MANIFEST: &str = r#"[package]
@@ -586,14 +589,19 @@ fn bootstrap_tree(label: &str) -> TempTree {
     tree
 }
 
-fn write_from_policy(tree: &TempTree, source: &str, destination: &str) {
+fn write_from_policy_area(tree: &TempTree, area: &str, source: &str, destination: &str) {
     let source = repo_root()
-        .join(".github/trusted/desktop-supply-chain-policy/policy/final")
+        .join(".github/trusted/desktop-supply-chain-policy/policy")
+        .join(area)
         .join(source);
     let destination = tree.join(destination);
     fs::create_dir_all(destination.parent().expect("fixture destination parent"))
         .expect("create fixture destination");
     fs::copy(source, destination).expect("copy final policy overlay");
+}
+
+fn write_from_policy(tree: &TempTree, source: &str, destination: &str) {
+    write_from_policy_area(tree, "final", source, destination);
 }
 
 fn final_tree(label: &str) -> TempTree {
@@ -604,6 +612,113 @@ fn final_tree(label: &str) -> TempTree {
             ".github/workflows/macos-packaging.yml",
             ".github/workflows/macos-packaging.yml",
         ),
+        (
+            ".github/workflows/android-packaging.yml",
+            ".github/workflows/android-packaging.yml",
+        ),
+        (
+            ".github/workflows/ios-packaging.yml",
+            ".github/workflows/ios-packaging.yml",
+        ),
+        (
+            ".github/workflows/windows-packaging.yml",
+            ".github/workflows/windows-packaging.yml",
+        ),
+        (
+            ".github/workflows/joint-release-finalize.yml",
+            ".github/workflows/joint-release-finalize.yml",
+        ),
+        (
+            "android/scripts/emulator-smoke.sh",
+            "android/scripts/emulator-smoke.sh",
+        ),
+        (
+            "android/scripts/validate-apk-native-member.sh",
+            "android/scripts/validate-apk-native-member.sh",
+        ),
+        (
+            "android/scripts/workflow-self-test.sh",
+            "android/scripts/workflow-self-test.sh",
+        ),
+        (
+            "ios/scripts/simulator-smoke.sh",
+            "ios/scripts/simulator-smoke.sh",
+        ),
+        (
+            "ios/scripts/workflow-self-test.sh",
+            "ios/scripts/workflow-self-test.sh",
+        ),
+        (
+            "packaging/macos/joint-release-self-test.sh",
+            "packaging/macos/joint-release-self-test.sh",
+        ),
+        (
+            "packaging/macos/workflow-self-test.sh",
+            "packaging/macos/workflow-self-test.sh",
+        ),
+        (
+            "legacy-policy/.github/workflows/docker-publish.yml",
+            ".github/workflows/docker-publish.yml",
+        ),
+        ("legacy-policy/.env.example", ".env.example"),
+        ("legacy-policy/package.json", "package.json"),
+        ("legacy-policy/package-lock.json", "package-lock.json"),
+        ("legacy-policy/Dockerfile", "Dockerfile"),
+        (
+            "legacy-policy/compat/legacy/scripts/requirements.txt",
+            "compat/legacy/scripts/requirements.txt",
+        ),
+        (
+            "legacy-policy/compat/legacy/config/env-mapping.json",
+            "compat/legacy/config/env-mapping.json",
+        ),
+        (
+            "legacy-policy/crates/claw-config/data/env-mapping.json",
+            "crates/claw-config/data/env-mapping.json",
+        ),
+        (
+            "legacy-policy/crates/claw-config/build_support.rs",
+            "crates/claw-config/build_support.rs",
+        ),
+        (
+            "legacy-policy/crates/claw-config/src/domains.rs",
+            "crates/claw-config/src/domains.rs",
+        ),
+        (
+            "legacy-policy/crates/claw-config/src/migration.rs",
+            "crates/claw-config/src/migration.rs",
+        ),
+        (
+            "legacy-policy/crates/claw-config/src/model.rs",
+            "crates/claw-config/src/model.rs",
+        ),
+        ("legacy-policy/src/config.ts", "src/config.ts"),
+        (
+            "legacy-policy/src/engine/toolExecutor.ts",
+            "src/engine/toolExecutor.ts",
+        ),
+        (
+            "legacy-policy/src/updater/sdkUpdater.ts",
+            "src/updater/sdkUpdater.ts",
+        ),
+        ("test/deviceFlow.test.mjs", "test/deviceFlow.test.mjs"),
+        (
+            "test/discordGateway.test.mjs",
+            "test/discordGateway.test.mjs",
+        ),
+        ("test/splitMessage.test.mjs", "test/splitMessage.test.mjs"),
+        (
+            "test/telegramPolling.test.mjs",
+            "test/telegramPolling.test.mjs",
+        ),
+        (
+            "test/whatsappRawBody.test.mjs",
+            "test/whatsappRawBody.test.mjs",
+        ),
+        (
+            "test/whatsappWebhook.test.mjs",
+            "test/whatsappWebhook.test.mjs",
+        ),
         ("root-deny.toml.fixture", "deny.toml"),
         ("desktop/Cargo.toml.fixture", "desktop/Cargo.toml"),
         ("desktop/Cargo.lock.fixture", "desktop/Cargo.lock"),
@@ -612,10 +727,16 @@ fn final_tree(label: &str) -> TempTree {
             "desktop/apps/gta-claw-desktop/Cargo.toml",
         ),
         (
+            "desktop/apps/gta-claw-desktop/build.rs",
+            "desktop/apps/gta-claw-desktop/build.rs",
+        ),
+        (
             "desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs",
             "desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs",
         ),
         ("desktop/deny.toml.fixture", "desktop/deny.toml"),
+        ("android/deny.toml.fixture", "android/deny.toml"),
+        ("ios/deny.toml.fixture", "ios/deny.toml"),
         (
             ".github/fixtures/cargo-audit/unmaintained/Cargo.lock.fixture",
             ".github/fixtures/cargo-audit/unmaintained/Cargo.lock.fixture",
@@ -639,6 +760,180 @@ fn final_tree(label: &str) -> TempTree {
     ] {
         write_from_policy(&tree, source, destination);
     }
+    for path in [
+        "compat/legacy/contract.json",
+        "compat/legacy/ledger/features.json",
+        "compat/legacy/ledger/behaviors.json",
+        "compat/legacy/fixtures/http/examples.json",
+        "compat/legacy/inventory/bundled-skills.json",
+        "compat/legacy/inventory/source-coverage.json",
+    ] {
+        replace(
+            &tree.join(path),
+            "3f2dfebcab1a1395f2445e9261b908cc4093f602",
+            "b2896426f3fcc5bb149402a38e09aac5e836d70b",
+        );
+    }
+    apply_pr227_rust_contract(&tree);
+    tree
+}
+
+fn apply_pr227_rust_contract(tree: &TempTree) {
+    replace(
+        &tree.join("crates/claw-config/src/domains/imported.rs"),
+        "    pub access_token: Option<SecretInput>,\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub phone_number_id: Option<String>,",
+        "    pub access_token: Option<SecretInput>,\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub app_secret: Option<SecretInput>,\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub phone_number_id: Option<String>,",
+    );
+    let wire = tree.join("crates/claw-config/src/wire.rs");
+    replace(
+        &wire,
+        "    pub(crate) access_token: Option<String>,\n    pub(crate) phone_number_id: Option<String>,",
+        "    pub(crate) access_token: Option<String>,\n    pub(crate) app_secret: Option<String>,\n    pub(crate) phone_number_id: Option<String>,",
+    );
+    replace(
+        &wire,
+        "            access_token: None,\n            phone_number_id: None,",
+        "            access_token: None,\n            app_secret: None,\n            phone_number_id: None,",
+    );
+    replace(
+        &wire,
+        "            access_token: secret(\n                self.core.channels.whatsapp.access_token,\n                \"core.channels.whatsapp.access_token\",\n            )?,\n            phone_number_id:",
+        "            access_token: secret(\n                self.core.channels.whatsapp.access_token,\n                \"core.channels.whatsapp.access_token\",\n            )?,\n            app_secret: secret(\n                self.core.channels.whatsapp.app_secret,\n                \"core.channels.whatsapp.app_secret\",\n            )?,\n            phone_number_id:",
+    );
+    replace(
+        &wire,
+        "                (\n                    \"core.channels.whatsapp.phone_number_id\",\n                    whatsapp.phone_number_id.is_some(),\n                ),\n            ],",
+        "                (\n                    \"core.channels.whatsapp.phone_number_id\",\n                    whatsapp.phone_number_id.is_some(),\n                ),\n                (\n                    \"core.channels.whatsapp.app_secret\",\n                    whatsapp.app_secret.is_some(),\n                ),\n            ],",
+    );
+    replace(
+        &wire,
+        "                        access_token: core\n                            .channels\n                            .whatsapp\n                            .access_token\n                            .as_ref()\n                            .map(secret_string),\n                        phone_number_id:",
+        "                        access_token: core\n                            .channels\n                            .whatsapp\n                            .access_token\n                            .as_ref()\n                            .map(secret_string),\n                        app_secret: core\n                            .channels\n                            .whatsapp\n                            .app_secret\n                            .as_ref()\n                            .map(secret_string),\n                        phone_number_id:",
+    );
+}
+
+fn apply_pr233_admission_scripts(tree: &TempTree) {
+    for path in [
+        "android/scripts/emulator-smoke.sh",
+        "android/scripts/validate-apk-native-member.sh",
+        "ios/scripts/simulator-smoke.sh",
+        "packaging/macos/joint-release-self-test.sh",
+    ] {
+        let added = tree.join(path);
+        if added.exists() {
+            fs::remove_file(added).expect("remove post-PR233-only fixture");
+        }
+    }
+    for path in [
+        "android/scripts/workflow-self-test.sh",
+        "ios/scripts/workflow-self-test.sh",
+        "packaging/macos/workflow-self-test.sh",
+    ] {
+        write_from_policy_area(tree, "pr233-base", path, path);
+    }
+}
+
+fn pr233_admission_tree(label: &str) -> TempTree {
+    let tree = final_tree(label);
+    apply_pr233_admission_scripts(&tree);
+    tree
+}
+
+fn rotation_tree(label: &str) -> TempTree {
+    let tree = copy_repo(label);
+    apply_pr233_admission_scripts(&tree);
+    let joint_release = tree.join(".github/workflows/joint-release-finalize.yml");
+    if joint_release.exists() {
+        fs::remove_file(joint_release).expect("remove post-rotation joint release workflow");
+    }
+    for (source, destination) in [
+        ("package.json", "package.json"),
+        ("package-lock.json", "package-lock.json"),
+        ("Dockerfile", "Dockerfile"),
+        (
+            "compat/legacy/scripts/requirements.txt",
+            "compat/legacy/scripts/requirements.txt",
+        ),
+        ("src/config.ts", "src/config.ts"),
+        ("src/engine/toolExecutor.ts", "src/engine/toolExecutor.ts"),
+        ("src/updater/sdkUpdater.ts", "src/updater/sdkUpdater.ts"),
+        ("deny.toml", "deny.toml"),
+        ("desktop/deny.toml", "desktop/deny.toml"),
+        (
+            "desktop/apps/gta-claw-desktop/build.rs",
+            "desktop/apps/gta-claw-desktop/build.rs",
+        ),
+        (".github/workflows/rust.yml", ".github/workflows/rust.yml"),
+        (
+            ".github/workflows/docker-publish.yml",
+            ".github/workflows/docker-publish.yml",
+        ),
+        (
+            ".github/workflows/android-packaging.yml",
+            ".github/workflows/android-packaging.yml",
+        ),
+        (
+            ".github/workflows/ios-packaging.yml",
+            ".github/workflows/ios-packaging.yml",
+        ),
+        (
+            ".github/workflows/macos-packaging.yml",
+            ".github/workflows/macos-packaging.yml",
+        ),
+        (
+            ".github/workflows/windows-packaging.yml",
+            ".github/workflows/windows-packaging.yml",
+        ),
+    ] {
+        write_from_policy_area(&tree, "rotation-base", source, destination);
+    }
+    for (source, destination) in [
+        (
+            "legacy-policy/compat/legacy/config/env-mapping.json",
+            "compat/legacy/config/env-mapping.json",
+        ),
+        (
+            "legacy-policy/crates/claw-config/data/env-mapping.json",
+            "crates/claw-config/data/env-mapping.json",
+        ),
+        (
+            "legacy-policy/crates/claw-config/src/domains.rs",
+            "crates/claw-config/src/domains.rs",
+        ),
+        (
+            "legacy-policy/crates/claw-config/src/migration.rs",
+            "crates/claw-config/src/migration.rs",
+        ),
+        (
+            "legacy-policy/crates/claw-config/src/model.rs",
+            "crates/claw-config/src/model.rs",
+        ),
+    ] {
+        write_from_policy(&tree, source, destination);
+    }
+    apply_pr227_rust_contract(&tree);
+    for (source, destination) in [
+        ("test/deviceFlow.test.mjs", "test/deviceFlow.test.mjs"),
+        (
+            "test/discordGateway.test.mjs",
+            "test/discordGateway.test.mjs",
+        ),
+        ("test/splitMessage.test.mjs", "test/splitMessage.test.mjs"),
+        (
+            "test/telegramPolling.test.mjs",
+            "test/telegramPolling.test.mjs",
+        ),
+        (
+            "test/whatsappRawBody.test.mjs",
+            "test/whatsappRawBody.test.mjs",
+        ),
+        (
+            "test/whatsappWebhook.test.mjs",
+            "test/whatsappWebhook.test.mjs",
+        ),
+    ] {
+        write_from_policy(&tree, source, destination);
+    }
     tree
 }
 
@@ -646,6 +941,28 @@ fn replace(path: &Path, from: &str, to: &str) {
     let text = fs::read_to_string(path).expect("read mutation input");
     assert!(text.contains(from), "mutation source missing: {from:?}");
     fs::write(path, text.replacen(from, to, 1)).expect("write mutation");
+}
+
+fn assert_supply_chain_rejection(
+    label: &str,
+    path: &str,
+    from: &str,
+    to: &str,
+    expected: &str,
+) {
+    let trusted = final_tree(&format!("{label}-trusted"));
+    let candidate = final_tree(&format!("{label}-candidate"));
+    replace(&candidate.join(path), from, to);
+    let error = validate_repository_policy_transition(
+        &SafeRoot::new(&trusted.path).expect("open supply-chain trusted fixture"),
+        &SafeRoot::new(&candidate.path).expect("open supply-chain candidate fixture"),
+    )
+    .expect_err("legacy supply-chain mutation unexpectedly passed")
+    .to_string();
+    assert!(
+        error.contains(expected),
+        "{label} failed through the wrong rule: {error}"
+    );
 }
 
 fn assert_unique_sorted_root_members(members: &[toml::Value]) {
@@ -2237,6 +2554,10 @@ fn relevant_change_after_three_hundred_entries_is_not_omitted() {
     assert!(has_policy_relevant_change(&manifest));
     assert!(!candidate_requires_final(BaseState::Bootstrap, false));
     assert!(candidate_requires_final(BaseState::Bootstrap, true));
+    assert!(!candidate_requires_final(BaseState::Rotation, false));
+    assert!(!candidate_requires_final(BaseState::Rotation, true));
+    assert!(candidate_requires_final(BaseState::Pr233Admission, false));
+    assert!(candidate_requires_final(BaseState::Pr233Admission, true));
     assert!(candidate_requires_final(BaseState::Final, false));
     assert!(candidate_requires_final(BaseState::Final, true));
 }
@@ -3553,6 +3874,492 @@ fn git_tree_inventory_rejects_symlinks_and_gitlinks() {
 }
 
 #[test]
+fn base_owned_rotation_state_is_exact_and_short_lived() {
+    let rotation = rotation_tree("base-owned-rotation");
+    let root = SafeRoot::new(&rotation.path).expect("open rotation base");
+    assert!(is_rotation_base(&root).expect("classify exact rotation base"));
+    assert!(!candidate_requires_final(BaseState::Rotation, false));
+    assert!(!rotation.join(".github/workflows/joint-release-finalize.yml").exists());
+
+    replace(
+        &rotation.join(".github/workflows/macos-packaging.yml"),
+        "name: macOS packaging",
+        "name: drifted macOS packaging",
+    );
+    assert!(
+        !is_rotation_base(&root).expect("reject drifted rotation base"),
+        "rotation recognition must fail closed on one changed prerequisite byte"
+    );
+    assert!(
+        !is_rotation_base(
+            &SafeRoot::new(&final_tree("post-rotation-final").path)
+                .expect("open final-state fixture")
+        )
+        .expect("classify final state"),
+        "the absorbed final state must not remain classified as Rotation"
+    );
+}
+
+#[test]
+fn pr227_admission_is_base_owned_and_not_final() {
+    let base = copy_repo("pr227-base-owned-admission");
+    let root = SafeRoot::new(&base.path).expect("open PR227 admission base");
+    assert!(
+        has_pr227_admission_authority(&root).expect("classify protected PR227 authority"),
+        "the protected ledger must establish the base-owned PR227 admission"
+    );
+    assert!(!candidate_requires_final(BaseState::Pr227Admission, false));
+    assert!(!candidate_requires_final(BaseState::Pr227Admission, true));
+
+    let ledger = base.join(
+        ".github/trusted/desktop-supply-chain-policy/policy/pr227-asset-map.toml",
+    );
+    let mut bytes = fs::read(&ledger).expect("read PR227 authority ledger");
+    bytes.push(b' ');
+    fs::write(&ledger, bytes).expect("drift PR227 authority ledger");
+    assert!(
+        !has_pr227_admission_authority(&root).expect("reject drifted PR227 authority"),
+        "candidate-owned protected bytes must not recreate PR227 admission authority"
+    );
+}
+
+#[test]
+fn pr227_admission_rejects_unlisted_or_drifted_mjs_tests() {
+    for path in [
+        "test/deviceFlow.test.mjs",
+        "test/discordGateway.test.mjs",
+        "test/splitMessage.test.mjs",
+        "test/telegramPolling.test.mjs",
+        "test/whatsappRawBody.test.mjs",
+        "test/whatsappWebhook.test.mjs",
+    ] {
+        let candidate = rotation_tree(&format!(
+            "pr227-drift-{}",
+            path.replace(['/', '.'], "-")
+        ));
+        let mut bytes = fs::read(candidate.join(path)).expect("read reviewed PR227 test");
+        bytes.push(b' ');
+        fs::write(candidate.join(path), bytes).expect("drift reviewed PR227 test");
+        let error = validate_pr227_candidate(
+            &SafeRoot::new(&candidate.path).expect("open drifted PR227 candidate"),
+        )
+        .expect_err("one-byte PR227 test drift unexpectedly passed")
+        .to_string();
+        assert!(
+            error.contains("exact six-test inventory"),
+            "PR227 test drift failed through the wrong diagnostic: {error}"
+        );
+    }
+
+    let candidate = rotation_tree("pr227-unlisted-seventh-mjs");
+    fs::write(
+        candidate.join("test/config.test.mjs"),
+        b"import test from \"node:test\";\ntest(\"unlisted\", () => {});\n",
+    )
+    .expect("write unlisted seventh MJS test");
+    let error = validate_pr227_candidate(
+        &SafeRoot::new(&candidate.path).expect("open unlisted PR227 candidate"),
+    )
+    .expect_err("unlisted seventh PR227 test unexpectedly passed")
+    .to_string();
+    assert!(
+        error.contains("exact six-test inventory"),
+        "seventh PR227 test failed through the wrong diagnostic: {error}"
+    );
+}
+
+#[test]
+fn pr227_admission_rejects_mapping_or_rust_contract_drift() {
+    for path in [
+        "compat/legacy/config/env-mapping.json",
+        "crates/claw-config/data/env-mapping.json",
+        "crates/claw-config/src/domains.rs",
+        "crates/claw-config/src/domains/imported.rs",
+        "crates/claw-config/src/migration.rs",
+        "crates/claw-config/src/model.rs",
+        "crates/claw-config/src/wire.rs",
+    ] {
+        let candidate = rotation_tree(&format!(
+            "pr227-contract-drift-{}",
+            path.replace(['/', '.'], "-")
+        ));
+        let mut bytes = fs::read(candidate.join(path)).expect("read reviewed PR227 contract input");
+        bytes.push(b' ');
+        fs::write(candidate.join(path), bytes).expect("drift reviewed PR227 contract input");
+        let error = validate_pr227_candidate(
+            &SafeRoot::new(&candidate.path).expect("open drifted PR227 contract candidate"),
+        )
+        .expect_err("one-byte PR227 contract drift unexpectedly passed")
+        .to_string();
+        assert!(
+            error.contains("synchronized protected contract"),
+            "PR227 contract drift failed through the wrong diagnostic: {error}"
+        );
+    }
+}
+
+#[test]
+fn pr233_admission_state_is_exact_and_final_scripts_fail_closed() {
+    let admission = pr233_admission_tree("pr233-admission");
+    let admission_root = SafeRoot::new(&admission.path).expect("open PR233 admission base");
+    assert!(is_pr233_admission_base(&admission_root).expect("classify exact PR233 admission base"));
+    assert!(candidate_requires_final(BaseState::Pr233Admission, false));
+
+    replace(
+        &admission.join("android/scripts/workflow-self-test.sh"),
+        "cargo deny",
+        "cargo deny --offline",
+    );
+    assert!(
+        !is_pr233_admission_base(&admission_root).expect("reject drifted PR233 admission base"),
+        "one changed pre-PR233 script byte must invalidate the admission state"
+    );
+
+    let final_state = final_tree("pr233-final-scripts");
+    let final_root = SafeRoot::new(&final_state.path).expect("open PR233 final fixture");
+    validate_pr233_final_assets(&final_root).expect("accept exact protected PR233 scripts");
+    for path in [
+        "android/scripts/emulator-smoke.sh",
+        "android/scripts/validate-apk-native-member.sh",
+        "android/scripts/workflow-self-test.sh",
+        "ios/scripts/simulator-smoke.sh",
+        "ios/scripts/workflow-self-test.sh",
+        "packaging/macos/joint-release-self-test.sh",
+        "packaging/macos/workflow-self-test.sh",
+    ] {
+        let script = final_state.join(path);
+        let original = fs::read(&script).expect("read protected PR233 script fixture");
+        let mut mutated = original.clone();
+        mutated.extend_from_slice(b"\n# deterministic candidate drift\n");
+        fs::write(&script, mutated).expect("mutate protected PR233 script fixture");
+        assert_eq!(
+            validate_pr233_final_assets(&final_root)
+                .expect_err("mutated PR233 script unexpectedly passed")
+                .to_string(),
+            format!("PR #233 workflow script does not match the protected final bytes: {path}")
+        );
+        fs::write(script, original).expect("restore protected PR233 script fixture");
+    }
+}
+
+#[test]
+fn pr233_final_workflow_graph_rejects_every_changed_byte() {
+    let final_state = final_tree("pr233-final-workflows");
+    let final_root = SafeRoot::new(&final_state.path).expect("open PR233 final workflow fixture");
+    validate_final_workflows(&final_root).expect("accept exact protected PR233 workflow graph");
+    for path in [
+        ".github/workflows/android-packaging.yml",
+        ".github/workflows/ios-packaging.yml",
+        ".github/workflows/joint-release-finalize.yml",
+        ".github/workflows/macos-packaging.yml",
+        ".github/workflows/windows-packaging.yml",
+    ] {
+        let workflow = final_state.join(path);
+        let original = fs::read(&workflow).expect("read protected PR233 workflow fixture");
+        let mut mutated = original.clone();
+        mutated.extend_from_slice(b"\n# deterministic candidate drift\n");
+        fs::write(&workflow, mutated).expect("mutate protected PR233 workflow fixture");
+        assert_eq!(
+            validate_final_workflows(&final_root)
+                .expect_err("mutated PR233 workflow unexpectedly passed")
+                .to_string(),
+            format!("candidate workflow does not match trusted final P04f policy: {path}")
+        );
+        fs::write(workflow, original).expect("restore protected PR233 workflow fixture");
+    }
+}
+
+#[test]
+fn authoritative_legacy_supply_chain_policy_rejects_deterministic_mutations() {
+    for (label, path, from, to, expected) in [
+        (
+            "mutable-node-version",
+            "package.json",
+            "\"@github/copilot-sdk\": \"1.0.8\"",
+            "\"@github/copilot-sdk\": \"^1.0.8\"",
+            "direct dependency specs must be exact numeric versions",
+        ),
+        (
+            "docker-npx-fallback",
+            "Dockerfile",
+            "./node_modules/.bin/tsc --noEmit",
+            "npx tsc --noEmit",
+            "npx network fallback is forbidden",
+        ),
+        (
+            "install-script-allowlist-widening",
+            "package.json",
+            "\"dtrace-provider\": false",
+            "\"dtrace-provider\": true",
+            "install-script allowlist changed",
+        ),
+        (
+            "docker-package-root-decoupling",
+            "Dockerfile",
+            "COPY package.json package-lock.json ./",
+            "COPY package.json ./",
+            "Dockerfile does not couple exact package roots",
+        ),
+        (
+            "auto-update-bypass",
+            "src/config.ts",
+            "if (AUTO_UPDATE) {",
+            "if (false) {",
+            "AUTO_UPDATE=true must fail configuration",
+        ),
+        (
+            "production-isolation-bypass",
+            "src/engine/toolExecutor.ts",
+            "nodeEnvironment !== \"development\"",
+            "nodeEnvironment === \"production\"",
+            "reduced node:vm isolation must require exact development opt-in",
+        ),
+        (
+            "case-insensitive-isolation-opt-in",
+            "src/engine/toolExecutor.ts",
+            "reducedIsolationOptIn !== \"true\"",
+            "reducedIsolationOptIn !== \"TRUE\"",
+            "reduced node:vm isolation must require exact development opt-in",
+        ),
+        (
+            "mutable-runtime-updater",
+            "src/updater/sdkUpdater.ts",
+            "export async function checkForUpdates(): Promise<VersionInfo>",
+            "export async function performSdkUpdate(): Promise<VersionInfo>",
+            "mutable runtime update logic is forbidden",
+        ),
+        (
+            "mutable-setup-python",
+            ".github/workflows/rust.yml",
+            "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
+            "actions/setup-python@v6",
+            "setup-python action or interpreter is not pinned",
+        ),
+        (
+            "mutable-source-revision",
+            "compat/legacy/contract.json",
+            "b2896426f3fcc5bb149402a38e09aac5e836d70b",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source_revision must be the exact reviewed value",
+        ),
+        (
+            "non-hex-source-revision",
+            "compat/legacy/contract.json",
+            "b2896426f3fcc5bb149402a38e09aac5e836d70b",
+            "main",
+            "source_revision must be the exact reviewed value",
+        ),
+        (
+            "mutable-source-fetch",
+            ".github/workflows/rust.yml",
+            "git fetch --no-tags --depth=1 origin \"$source_revision\"",
+            "git fetch origin main",
+            "Python workflow invocation is not exact",
+        ),
+        (
+            "missing-windows-arm64-policy",
+            "desktop/deny.toml",
+            "aarch64-pc-windows-msvc",
+            "x86_64-pc-windows-msvc",
+            "desktop/deny.toml shipped target set changed",
+        ),
+        (
+            "missing-windows-arm64-msrv",
+            ".github/workflows/rust.yml",
+            "--target aarch64-pc-windows-msvc --locked",
+            "--target x86_64-pc-windows-msvc --locked",
+            "desktop Windows ARM64 MSRV coverage changed",
+        ),
+        (
+            "missing-android-emulator-policy",
+            "android/deny.toml",
+            "x86_64-linux-android",
+            "aarch64-linux-android",
+            "android/deny.toml shipped target set changed",
+        ),
+        (
+            "mobile-policy-host-drift",
+            ".github/workflows/android-packaging.yml",
+            "runs-on: ubuntu-24.04",
+            "runs-on: macos-15",
+            "dependency policy must run separately on Ubuntu 24.04",
+        ),
+        (
+            "mobile-host-prerequisite-unpinned",
+            ".github/workflows/android-packaging.yml",
+            "libfontconfig-dev=2.15.0-1.1ubuntu2",
+            "libfontconfig-dev",
+            "Linux host prerequisite pin changed",
+        ),
+        (
+            "mobile-host-deny-target-missing",
+            ".github/workflows/ios-packaging.yml",
+            "--target x86_64-unknown-linux-gnu check",
+            "check",
+            "Linux host dependency-policy target changed",
+        ),
+        (
+            "mobile-target-check-noop",
+            ".github/workflows/ios-packaging.yml",
+            "run: ./ios/scripts/check-targets.sh",
+            "run: 'true'",
+            "shipped-target check command changed",
+        ),
+        (
+            "desktop-host-target-equality",
+            "desktop/apps/gta-claw-desktop/build.rs",
+            "fn cargo_target_os() -> String {",
+            "fn cargo_target_os() -> String {\n    let _ = std::env::var(\"HOST\");",
+            "desktop build script blocks supported cross-architecture targets",
+        ),
+        (
+            "missing-pip-check",
+            ".github/workflows/rust.yml",
+            "python3 -m pip check",
+            "python3 -m pip --version",
+            "Python workflow invocation is not exact",
+        ),
+        (
+            "missing-compat-path-trigger",
+            ".github/workflows/rust.yml",
+            "      - \"compat/**\"\n",
+            "",
+            "paths do not cover compatibility input compat/**",
+        ),
+        (
+            "environment-mapping-drift",
+            "compat/legacy/config/env-mapping.json",
+            "AUTO_UPDATE=true fails",
+            "AUTO_UPDATE=true passes",
+            "workspace and packaged environment mappings must have identical bytes",
+        ),
+        (
+            "rust-migration-auto-update-bypass",
+            "crates/claw-config/src/migration.rs",
+            "if enabled {",
+            "if false {",
+            "reviewed legacy policy input bytes changed",
+        ),
+        (
+            "layered-auto-update-bypass",
+            "crates/claw-config/src/domains.rs",
+            "if name == \"AUTO_UPDATE\" && enabled {",
+            "if false {",
+            "reviewed legacy policy input bytes changed",
+        ),
+        (
+            "missing-isolation-policy-script",
+            "package.json",
+            "\"test:isolation-policy\"",
+            "\"test:weakened-isolation-policy\"",
+            "package.json script set changed",
+        ),
+        (
+            "mutable-npm-start",
+            "package.json",
+            "node --no-node-snapshot dist/index.js",
+            "node dist/index.js",
+            "package.json.scripts.start must be the exact reviewed value",
+        ),
+        (
+            "second-docker-build",
+            ".github/workflows/docker-publish.yml",
+            "docker buildx build \\",
+            "docker buildx build \\\n          docker buildx build \\",
+            "Docker publish workflow must build exactly once",
+        ),
+        (
+            "docker-digest-parser",
+            ".github/workflows/docker-publish.yml",
+            "for (i = 1; i <= NF; i++) if ($i ~ /^sha256:/) print $i",
+            "print $2",
+            "Docker publish digest parser changed",
+        ),
+        (
+            "reviewed-runtime-test-byte",
+            "test/splitMessage.test.mjs",
+            "test(\"splitMessage preserves newline and word split preferences\"",
+            "test(\"splitMessage silently changed\"",
+            "reviewed legacy policy input bytes changed",
+        ),
+    ] {
+        assert_supply_chain_rejection(label, path, from, to, expected);
+    }
+
+    for (label, spec) in [
+        ("node-latest-spec", "latest"),
+        ("node-caret-range", "^1.0.8"),
+        ("node-tilde-range", "~1.0.8"),
+        ("node-comparator-range", ">=1.0.8"),
+        ("node-url-spec", "https://registry.example.invalid/copilot-sdk.tgz"),
+        ("node-git-spec", "git+ssh://git@example.invalid/copilot-sdk.git"),
+        ("node-file-spec", "file:vendor/copilot-sdk"),
+        ("node-workspace-spec", "workspace:*"),
+    ] {
+        assert_supply_chain_rejection(
+            label,
+            "package.json",
+            "\"@github/copilot-sdk\": \"1.0.8\"",
+            &format!("\"@github/copilot-sdk\": \"{spec}\""),
+            "direct dependency specs must be exact numeric versions",
+        );
+    }
+
+    let trusted = final_tree("python-hash-trusted");
+    let candidate = final_tree("python-hash-candidate");
+    replace(
+        &candidate.join("compat/legacy/scripts/requirements.txt"),
+        "attrs==26.1.0 \\\n    --hash=sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309 \\\n    --hash=sha256:d03ceb89cb322a8fd706d4fb91940737b6642aa36998fe130a9bc96c985eff32\n",
+        "attrs==26.1.0\n",
+    );
+    let error = validate_repository_policy_transition(
+        &SafeRoot::new(&trusted.path).expect("open Python hash trusted fixture"),
+        &SafeRoot::new(&candidate.path).expect("open Python hash candidate fixture"),
+    )
+    .expect_err("unhashed Python requirement unexpectedly passed")
+    .to_string();
+    assert!(
+        error.contains("Python requirement entry has no unique SHA-256 binding"),
+        "unhashed requirement failed through the wrong rule: {error}"
+    );
+}
+
+#[test]
+fn cargo_deny_0198_keeps_config_after_check_subcommand() {
+    for (path, required) in [
+        (
+            ".github/trusted/desktop-supply-chain-policy/scripts/bootstrap-tools.sh",
+            "--manifest-path \"$manifest\" --locked --all-features check --config \"$deny_config\"",
+        ),
+        (
+            ".github/trusted/desktop-supply-chain-policy/scripts/run-candidate-gates.sh",
+            "--manifest-path \"$candidate_root/Cargo.toml\" --locked --all-features check --config \"$candidate_root/deny.toml\"",
+        ),
+        (
+            ".github/trusted/desktop-supply-chain-policy/policy/final/.github/workflows/rust.yml",
+            "--manifest-path \"$fixture/Cargo.toml\" check --config \"$fixture/deny.toml\" --locked licenses",
+        ),
+    ] {
+        let normalized = fs::read_to_string(repo_root().join(path))
+            .expect("read pinned cargo-deny invocation")
+            .split_whitespace()
+            .filter(|token| *token != "\\")
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            normalized.contains(required),
+            "cargo-deny 0.19.8 invocation does not retain `check --config` in {path}"
+        );
+    }
+
+    let rejected = "--manifest-path Cargo.toml --config deny.toml --locked check";
+    assert!(
+        !rejected.contains("check --config"),
+        "negative ordering fixture no longer exercises the reviewed CLI contract"
+    );
+}
+
+#[test]
 fn base_owned_repository_ratchet_rejects_addition_and_allows_deletion() {
     let trusted = final_tree("repository-ratchet-base");
     let candidate = final_tree("repository-ratchet-candidate");
@@ -4598,6 +5405,13 @@ fn write_mobile_workspace(tree: &TempTree, platform: &str, lock: &str) {
         &app_manifest,
     );
     write_mobile_file(tree, &format!("{platform}/Cargo.lock"), lock);
+    if matches!(platform, "android" | "ios") {
+        write_from_policy(
+            tree,
+            &format!("{platform}/deny.toml.fixture"),
+            &format!("{platform}/deny.toml"),
+        );
+    }
 }
 
 fn retarget_root_exclude(tree: &TempTree) {
@@ -4896,7 +5710,6 @@ fn workflow_executed_mobile_packaging_inputs_are_exact() {
         "android/scripts/check.sh",
         "android/scripts/fetch-skia.sh",
         "android/scripts/package.sh",
-        "android/scripts/workflow-self-test.sh",
         "ios/project.yml",
         "ios/apps/gta-claw-ios-shell/Info.plist",
         "ios/scripts/build-for-ios.sh",
@@ -4904,7 +5717,6 @@ fn workflow_executed_mobile_packaging_inputs_are_exact() {
         "ios/scripts/check.sh",
         "ios/scripts/fetch-skia.sh",
         "ios/scripts/package.sh",
-        "ios/scripts/workflow-self-test.sh",
     ];
 
     for relative in paths {

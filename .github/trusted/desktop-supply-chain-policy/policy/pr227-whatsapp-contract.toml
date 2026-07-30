@@ -1,0 +1,40 @@
+schema = 1
+source_branch = "aizhihuxiao-implement-legacy-runtime-fixes"
+source_oid = "0d1186274604b368e95b698f19e157f4b2b7d793"
+provisional = true
+reason = "The source worktree added Rust behavior after the recorded OID but has not synchronized either environment map."
+
+[node]
+environment = "WHATSAPP_APP_SECRET"
+trim_empty_to_absent = true
+required_when = "ENABLE_WHATSAPP=true"
+handler_fallback = "options.appSecret ?? process.env[\"WHATSAPP_APP_SECRET\"]?.trim()"
+must_not_log_secret = true
+
+[mapping]
+legacy_env = "WHATSAPP_APP_SECRET"
+scope = "runtime"
+target_json5_key = "channels.whatsapp.app_secret"
+secret = true
+default = "null"
+conversion = "Trim; empty becomes absent. Store as a secret reference."
+validation = "Nonempty when WhatsApp is enabled."
+required_when = "channels.whatsapp.enabled is true"
+
+[rust_migration]
+mapping_id = "WhatsappAppSecret"
+wire_target = "wire.core.channels.whatsapp.app_secret"
+store_as_secret_reference = true
+trim_empty_to_absent = true
+
+[rust_layer]
+environment = "WHATSAPP_APP_SECRET"
+target = "channels.whatsapp.appSecret"
+store_as_secret_reference = true
+trim_empty_to_absent = true
+
+[rust_model]
+wire_field = "app_secret"
+typed_field = "app_secret"
+type = "Option<SecretRef>"
+required_when = "core.channels.whatsapp.enabled"

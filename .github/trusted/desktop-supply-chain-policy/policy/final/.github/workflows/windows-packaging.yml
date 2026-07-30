@@ -1,0 +1,490 @@
+name: Windows release packaging
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/windows-packaging.yml"
+      - ".github/workflows/joint-release-finalize.yml"
+      - "packaging/windows/**"
+      - "apps/**"
+      - "crates/**"
+      - "desktop/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Build protected signed release artifacts
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-packaging-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: "4"
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  WIX_MSI_SHA256: a8a5cc7443353cef3ab900c60cd7a3a5ee601746319d104ac7b12ad0ced2345c
+  WIX_VERSION: 6.0.2
+
+jobs:
+  validate:
+    name: Source and packaging policy
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Run frozen surface and packaging self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\packaging\windows\validate-release-surfaces.ps1
+          .\packaging\windows\self-test.ps1
+
+  package:
+    name: Unsigned non-release ${{ matrix.arch }}
+    needs: validate
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Require architecture toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup target add '${{ matrix.target }}'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $component = 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'
+          if ('${{ matrix.arch }}' -eq 'arm64') {
+            $component = 'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+          }
+          $installation = & $vswhere -latest -products '*' -requires $component -property installationPath
+          if ([string]::IsNullOrWhiteSpace($installation)) {
+            throw "Required MSVC component is unavailable: $component"
+          }
+
+      - name: Provision pinned WiX
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $toolRoot = Join-Path $env:RUNNER_TEMP 'wix'
+          $msi = Join-Path $toolRoot "wix-cli-x64-$env:WIX_VERSION.msi"
+          $admin = Join-Path $toolRoot 'admin'
+          New-Item -ItemType Directory -Force -Path $toolRoot,$admin | Out-Null
+          curl.exe -L --fail --silent --show-error `
+            -o $msi "https://github.com/wixtoolset/wix/releases/download/v$env:WIX_VERSION/wix-cli-x64.msi"
+          if ((Get-FileHash $msi -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:WIX_MSI_SHA256) {
+            throw 'Pinned WiX MSI checksum mismatch.'
+          }
+          $process = Start-Process msiexec.exe -ArgumentList @(
+            '/a', "`"$msi`"", '/qn', "TARGETDIR=`"$admin`""
+          ) -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "WiX administrative extraction failed: $($process.ExitCode)"
+          }
+          $wix = (Get-ChildItem $admin -File -Recurse -Filter wix.exe | Select-Object -First 1).FullName
+          & $wix --version
+          "GTA_CLAW_WIX=$wix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Acquire locked Cargo dependencies
+        shell: pwsh
+        run: |
+          cargo fetch --manifest-path Cargo.toml --locked
+          cargo fetch --manifest-path desktop\Cargo.toml --locked
+
+      - name: Build and inspect published package bytes offline
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}\cargo-target
+          TMP: ${{ runner.temp }}\gta-claw-tmp
+          TEMP: ${{ runner.temp }}\gta-claw-tmp
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path $env:CARGO_TARGET_DIR,$env:TMP | Out-Null
+          .\packaging\windows\package.ps1 -Architecture '${{ matrix.arch }}'
+          .\packaging\windows\validate-artifacts.ps1 `
+            -ArtifactDirectory "packaging\windows\out\${{ matrix.arch }}"
+
+      - name: Upload explicit unsigned non-release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unsigned-non-release-windows-${{ matrix.arch }}
+          path: |
+            packaging/windows/out/${{ matrix.arch }}/*.zip
+            packaging/windows/out/${{ matrix.arch }}/*.msix
+            packaging/windows/out/${{ matrix.arch }}/*.msi
+            packaging/windows/out/${{ matrix.arch }}/*.sha256
+            packaging/windows/out/${{ matrix.arch }}/*.spdx.json
+            packaging/windows/out/${{ matrix.arch }}/*.provenance.json
+            packaging/windows/out/${{ matrix.arch }}/SHA256SUMS
+            packaging/windows/out/${{ matrix.arch }}/artifacts.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  bundle:
+    name: Unsigned non-release MSIXBundle
+    needs: package
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Acquire locked Cargo dependencies
+        shell: pwsh
+        run: |
+          cargo fetch --manifest-path Cargo.toml --locked
+          cargo fetch --manifest-path desktop\Cargo.toml --locked
+
+      - name: Download x64 and arm64 MSIX packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: unsigned-non-release-windows-*
+          path: ${{ runner.temp }}/windows-inputs
+
+      - name: Assemble and inspect published bundle bytes
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}\cargo-target
+          TMP: ${{ runner.temp }}\gta-claw-tmp
+          TEMP: ${{ runner.temp }}\gta-claw-tmp
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path $env:CARGO_TARGET_DIR,$env:TMP | Out-Null
+          $x64 = @(Get-ChildItem $env:RUNNER_TEMP\windows-inputs -File -Recurse -Filter '*windows-x64-unsigned-non-release.msix')
+          $arm64 = @(Get-ChildItem $env:RUNNER_TEMP\windows-inputs -File -Recurse -Filter '*windows-arm64-unsigned-non-release.msix')
+          if ($x64.Count -ne 1 -or $arm64.Count -ne 1) {
+            throw 'Expected exactly one unsigned MSIX for each Windows architecture.'
+          }
+          .\packaging\windows\bundle.ps1 -X64Msix $x64[0].FullName -Arm64Msix $arm64[0].FullName
+          .\packaging\windows\validate-artifacts.ps1 `
+            -ArtifactDirectory packaging\windows\out\bundle
+
+      - name: Upload explicit unsigned non-release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unsigned-non-release-windows-msixbundle
+          path: |
+            packaging/windows/out/bundle/*.msixbundle
+            packaging/windows/out/bundle/*.sha256
+            packaging/windows/out/bundle/*.spdx.json
+            packaging/windows/out/bundle/*.provenance.json
+            packaging/windows/out/bundle/SHA256SUMS
+            packaging/windows/out/bundle/artifacts.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  release:
+    name: Protected signed Windows release
+    if: github.event_name == 'workflow_dispatch' && inputs.release == true
+    needs: validate
+    runs-on: windows-latest
+    environment: windows-release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Enforce immutable semantic release tag
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REF -notmatch '^refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$') {
+            throw 'Signed Windows release requires a semantic vX.Y.Z tag.'
+          }
+          $version = $Matches[1]
+          if ((git cat-file -t $env:GITHUB_REF) -ne 'tag') {
+            throw 'Signed Windows release requires an annotated tag.'
+          }
+          if ((git rev-parse "$env:GITHUB_REF^{commit}") -ne $env:GITHUB_SHA) {
+            throw 'Release tag does not resolve to the immutable workflow commit.'
+          }
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Release commit is not reachable from protected main.'
+          }
+          Import-Module .\packaging\windows\WindowsPackaging.psm1 -Force
+          if ((Get-CanonicalVersion $PWD).Cargo -ne $version) {
+            throw 'Release tag version does not match the Cargo workspace version.'
+          }
+
+      - name: Require both Windows architecture toolchains
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          foreach ($component in @(
+            'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+            'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+          )) {
+            $installation = & $vswhere -latest -products '*' -requires $component -property installationPath
+            if ([string]::IsNullOrWhiteSpace($installation)) {
+              throw "Required MSVC component is unavailable: $component"
+            }
+          }
+
+      - name: Provision pinned WiX and acquire locked Cargo dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $toolRoot = Join-Path $env:RUNNER_TEMP 'wix'
+          $msi = Join-Path $toolRoot "wix-cli-x64-$env:WIX_VERSION.msi"
+          $admin = Join-Path $toolRoot 'admin'
+          New-Item -ItemType Directory -Force -Path $toolRoot,$admin | Out-Null
+          curl.exe -L --fail --silent --show-error `
+            -o $msi "https://github.com/wixtoolset/wix/releases/download/v$env:WIX_VERSION/wix-cli-x64.msi"
+          if ((Get-FileHash $msi -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:WIX_MSI_SHA256) {
+            throw 'Pinned WiX MSI checksum mismatch.'
+          }
+          $process = Start-Process msiexec.exe -ArgumentList @(
+            '/a', "`"$msi`"", '/qn', "TARGETDIR=`"$admin`""
+          ) -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "WiX administrative extraction failed: $($process.ExitCode)"
+          }
+          $wix = (Get-ChildItem $admin -File -Recurse -Filter wix.exe | Select-Object -First 1).FullName
+          & $wix --version
+          "GTA_CLAW_WIX=$wix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          cargo fetch --manifest-path Cargo.toml --locked
+          cargo fetch --manifest-path desktop\Cargo.toml --locked
+
+      - name: Import protected signing identity
+        id: signing
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PFX) -or
+              [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            throw 'Protected Windows signing credentials are unavailable.'
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'gta-claw-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX))
+          try {
+            $secure = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $certificate = Import-PfxCertificate `
+              -FilePath $pfx `
+              -CertStoreLocation Cert:\CurrentUser\My `
+              -Password $secure `
+              -Exportable:$false
+          } finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
+          if ($null -eq $certificate -or -not $certificate.HasPrivateKey) {
+            throw 'Imported Windows certificate has no private key.'
+          }
+          "thumbprint=$($certificate.Thumbprint)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "publisher=$($certificate.Subject)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Build production-identity candidates offline
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}\cargo-target
+          TMP: ${{ runner.temp }}\gta-claw-tmp
+          TEMP: ${{ runner.temp }}\gta-claw-tmp
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path $env:CARGO_TARGET_DIR,$env:TMP | Out-Null
+          .\packaging\windows\package.ps1 `
+            -Architecture x64 `
+            -ReleaseMode `
+            -Publisher '${{ steps.signing.outputs.publisher }}'
+          .\packaging\windows\package.ps1 `
+            -Architecture arm64 `
+            -ReleaseMode `
+            -Publisher '${{ steps.signing.outputs.publisher }}' `
+            -SkipMsi
+
+      - name: Sign packages and assemble signed-inner bundle
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}\cargo-target
+          TMP: ${{ runner.temp }}\gta-claw-tmp
+          TEMP: ${{ runner.temp }}\gta-claw-tmp
+          TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:TIMESTAMP_URL -notmatch '^https://') {
+            throw 'WINDOWS_TIMESTAMP_URL must be a protected HTTPS RFC3161 endpoint.'
+          }
+          $thumbprint = '${{ steps.signing.outputs.thumbprint }}'
+          $publisher = '${{ steps.signing.outputs.publisher }}'
+          $x64Root = 'packaging\windows\out\x64'
+          $armRoot = 'packaging\windows\out\arm64'
+          $x64Msix = @(Get-ChildItem $x64Root -Filter '*release-candidate-unsigned.msix')
+          $armMsix = @(Get-ChildItem $armRoot -Filter '*release-candidate-unsigned.msix')
+          $x64Msi = @(Get-ChildItem $x64Root -Filter '*release-candidate-unsigned.msi')
+          if ($x64Msix.Count -ne 1 -or $armMsix.Count -ne 1 -or $x64Msi.Count -ne 1) {
+            throw 'Release candidate package set is incomplete.'
+          }
+          foreach ($package in @($x64Msix[0], $armMsix[0], $x64Msi[0])) {
+            .\packaging\windows\sign.ps1 `
+              -PackagePath $package.FullName `
+              -CertificateThumbprint $thumbprint `
+              -TimestampUrl $env:TIMESTAMP_URL
+          }
+          $signedX64 = @(Get-ChildItem $x64Root -Filter '*windows-x64-signed.msix')
+          $signedArm = @(Get-ChildItem $armRoot -Filter '*windows-arm64-signed.msix')
+          .\packaging\windows\bundle.ps1 `
+            -X64Msix $signedX64[0].FullName `
+            -Arm64Msix $signedArm[0].FullName `
+            -ReleaseMode `
+            -Publisher $publisher
+          $bundle = @(Get-ChildItem packaging\windows\out\bundle -Filter '*release-candidate-unsigned.msixbundle')
+          .\packaging\windows\sign.ps1 `
+            -PackagePath $bundle[0].FullName `
+            -CertificateThumbprint $thumbprint `
+            -TimestampUrl $env:TIMESTAMP_URL
+
+      - name: Assemble and validate exact release publication bytes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module .\packaging\windows\WindowsPackaging.psm1 -Force
+          Import-Module .\packaging\windows\SupplyChain.psm1 -Force
+          $publication = 'packaging\windows\out\release'
+          New-Item -ItemType Directory -Force -Path $publication | Out-Null
+          $primary = @(
+            Get-ChildItem packaging\windows\out\x64 -File |
+              Where-Object { $_.Name -match 'portable-release\.zip$|-signed\.(msix|msi)$' }
+            Get-ChildItem packaging\windows\out\arm64 -File |
+              Where-Object { $_.Name -match 'portable-release\.zip$|-signed\.msix$' }
+            Get-ChildItem packaging\windows\out\bundle -File |
+              Where-Object { $_.Name -match '-signed\.msixbundle$' }
+          )
+          if ($primary.Count -ne 8) {
+            throw "Expected eight Windows release artifacts, found $($primary.Count)."
+          }
+          foreach ($artifact in $primary) {
+            Copy-Item -LiteralPath $artifact.FullName -Destination $publication
+            Copy-Item -LiteralPath "$($artifact.FullName).spdx.json" -Destination $publication
+            Copy-Item -LiteralPath "$($artifact.FullName).provenance.json" -Destination $publication
+          }
+          Write-ArtifactSetChecksums `
+            -Directory $publication `
+            -ManifestName SHA256SUMS-windows | Out-Null
+          .\packaging\windows\validate-artifacts.ps1 `
+            -ArtifactDirectory $publication `
+            -Publisher '${{ steps.signing.outputs.publisher }}' `
+            -ChecksumName SHA256SUMS-windows
+
+      - name: Upload signed Windows release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gta-claw-windows-release-${{ github.sha }}
+          path: packaging/windows/out/release
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Publish exact bytes to GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --draft --verify-tag --title "GTA Claw $tag" `
+              --notes 'Native Rust release artifacts. Verify platform SHA256SUMS, SBOMs, and provenance before installation.'
+            if ($LASTEXITCODE -ne 0) {
+              gh release view $tag | Out-Null
+            }
+          }
+          $release = gh release view $tag --json isDraft | ConvertFrom-Json
+          if (-not $release.isDraft) {
+            throw 'Refusing to replace assets on an already-published release.'
+          }
+          $existingAssets = @(gh release view $tag --json assets --jq '.assets[].name')
+          if ('SHA256SUMS-windows' -in $existingAssets) {
+            Write-Host 'Windows release completion is already immutable; retaining published bytes.'
+            exit 0
+          }
+          $publication = (Resolve-Path packaging\windows\out\release).Path
+          $existingDirectory = Join-Path $env:RUNNER_TEMP 'gta-claw-existing-windows-release'
+          if (Test-Path -LiteralPath $existingDirectory) {
+            Remove-Item -LiteralPath $existingDirectory -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $existingDirectory | Out-Null
+          $paths = @()
+          foreach ($file in @(Get-ChildItem $publication -File |
+              Where-Object { $_.Name -ne 'SHA256SUMS-windows' })) {
+            if ($file.Name -in $existingAssets) {
+              gh release download $tag --pattern $file.Name --dir $existingDirectory
+              if ($LASTEXITCODE -ne 0) {
+                throw "Failed to download existing Windows release asset: $($file.Name)"
+              }
+              $remote = Join-Path $existingDirectory $file.Name
+              $localHash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash
+              $remoteHash = (Get-FileHash $remote -Algorithm SHA256).Hash
+              if ($localHash -cne $remoteHash) {
+                throw "Refusing to discard different existing release bytes: $($file.Name)"
+              }
+            } else {
+              $paths += $file.FullName
+            }
+          }
+          if ($paths.Count -gt 0) {
+            gh release upload $tag @paths
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Windows release asset upload failed.'
+            }
+          }
+          gh release upload $tag (Join-Path $publication 'SHA256SUMS-windows')
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Windows release checksum upload failed.'
+          }
+
+      - name: Always remove signing identity
+        if: always()
+        shell: pwsh
+        run: |
+          $thumbprint = '${{ steps.signing.outputs.thumbprint }}'
+          if ($thumbprint -match '^[0-9A-Fa-f]{40}$') {
+            Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" -Force -ErrorAction SilentlyContinue
+          }
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'gta-claw-signing.pfx') `
+            -Force -ErrorAction SilentlyContinue
+
+  finalize-release:
+    name: Finalize joint desktop release
+    if: github.event_name == 'workflow_dispatch' && inputs.release == true
+    needs: release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/joint-release-finalize.yml
+    with:
+      tag: ${{ github.ref_name }}

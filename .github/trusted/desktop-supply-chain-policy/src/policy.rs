@@ -48,13 +48,15 @@ const FINAL_DESKTOP_DENY: &[u8] = include_bytes!("../policy/final/desktop/deny.t
 const FINAL_ANDROID_MANIFEST: &[u8] = include_bytes!("../../../../android/Cargo.toml");
 const FINAL_ANDROID_APP_MANIFEST: &[u8] =
     include_bytes!("../../../../android/apps/gta-claw-android-shell/Cargo.toml");
-const FINAL_ANDROID_DENY: &[u8] = include_bytes!("../../../../android/deny.toml");
+const FINAL_ANDROID_DENY: &[u8] = include_bytes!("../policy/final/android/deny.toml.fixture");
 const FINAL_IOS_MANIFEST: &[u8] = include_bytes!("../../../../ios/Cargo.toml");
 const FINAL_IOS_APP_MANIFEST: &[u8] =
     include_bytes!("../../../../ios/apps/gta-claw-ios-shell/Cargo.toml");
-const FINAL_IOS_DENY: &[u8] = include_bytes!("../../../../ios/deny.toml");
+const FINAL_IOS_DENY: &[u8] = include_bytes!("../policy/final/ios/deny.toml.fixture");
 type ExactFile = (&'static str, &'static [u8]);
-const FINAL_ANDROID_PACKAGING_INPUTS: [ExactFile; 5] = [
+// The rotating PR #233 self-tests and smoke scripts are enforced phase-aware in
+// repository_policy so PR #234 can retain the exact pre-PR #233 bytes.
+const FINAL_ANDROID_PACKAGING_INPUTS: [ExactFile; 4] = [
     (
         "android/scripts/check-targets.sh",
         include_bytes!("../../../../android/scripts/check-targets.sh"),
@@ -71,12 +73,8 @@ const FINAL_ANDROID_PACKAGING_INPUTS: [ExactFile; 5] = [
         "android/scripts/package.sh",
         include_bytes!("../../../../android/scripts/package.sh"),
     ),
-    (
-        "android/scripts/workflow-self-test.sh",
-        include_bytes!("../../../../android/scripts/workflow-self-test.sh"),
-    ),
 ];
-const FINAL_IOS_PACKAGING_INPUTS: [ExactFile; 8] = [
+const FINAL_IOS_PACKAGING_INPUTS: [ExactFile; 7] = [
     (
         "ios/project.yml",
         include_bytes!("../../../../ios/project.yml"),
@@ -104,10 +102,6 @@ const FINAL_IOS_PACKAGING_INPUTS: [ExactFile; 8] = [
     (
         "ios/scripts/package.sh",
         include_bytes!("../../../../ios/scripts/package.sh"),
-    ),
-    (
-        "ios/scripts/workflow-self-test.sh",
-        include_bytes!("../../../../ios/scripts/workflow-self-test.sh"),
     ),
 ];
 const FINAL_DESKTOP_LOCK: &[u8] = include_bytes!("../policy/final/desktop/Cargo.lock.fixture");
@@ -2402,7 +2396,40 @@ fn validate_final_fixed_files(root: &SafeRoot) -> PolicyResult<()> {
     ] {
         root.regular_file(source, DEFAULT_FILE_LIMIT)?;
     }
+    validate_desktop_build_script(root)?;
     validate_desktop_lock(root)
+}
+
+fn validate_desktop_build_script(root: &SafeRoot) -> PolicyResult<()> {
+    let source = root
+        .read_text("desktop/apps/gta-claw-desktop/build.rs", DEFAULT_FILE_LIMIT)?
+        .replace("\r\n", "\n");
+    for required in [
+        "fn cargo_target_os() -> String",
+        "std::env::var(\"CARGO_CFG_TARGET_OS\")",
+        "\"windows\" => \"fluent\"",
+        "\"macos\" => \"cupertino\"",
+        "requires a Windows or macOS build host",
+    ] {
+        if !source.contains(required) {
+            return Err(PolicyError::new(format!(
+                "desktop build script is missing target-OS policy: {required}"
+            )));
+        }
+    }
+    for forbidden in [
+        "std::env::var(\"HOST\")",
+        "std::env::var(\"TARGET\")",
+        "if host != target",
+        "matching host and target triples",
+    ] {
+        if source.contains(forbidden) {
+            return Err(PolicyError::new(format!(
+                "desktop build script rejects supported cross-architecture targets: {forbidden}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Performs complete static final-state validation.

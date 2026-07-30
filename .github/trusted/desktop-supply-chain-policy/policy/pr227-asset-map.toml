@@ -1,0 +1,222 @@
+schema = 1
+ready_for_validation = false
+source_branch = "aizhihuxiao-implement-legacy-runtime-fixes"
+source_oid = "0d1186274604b368e95b698f19e157f4b2b7d793"
+source_merge_base = "92c2329b151d4b71b342a54d944254da2f3c61a5"
+source_worktree = "linked worktree aizhihuxiao-psychic-funicular"
+source_status = "dirty: maps, Rust config implementation/tests, deploy/run.sh, deviceFlow, Telegram, and three MJS tests changed during inspection"
+blocker = "PR #227 currently adds a seventh config.test.mjs, its two maps are not byte-identical, and all Rust/map worktree bytes are uncommitted provisional inputs."
+contract_fixture = "policy/pr227-whatsapp-contract.toml"
+contract_fixture_bytes = 1274
+contract_fixture_sha256 = "0f0f659b60564285a9ed4390ac52795558d1f64d2cb27e8835fd2aab473549d1"
+
+[[test]]
+path = "test/deviceFlow.test.mjs"
+source = "0d1186274604b368e95b698f19e157f4b2b7d793:test/deviceFlow.test.mjs"
+source_bytes = 8195
+source_sha256 = "eb7231732b94c9e8d59da1b9d1ce25b7b47451a7adbc6ca635c1a44f3794f48a"
+fixture = "policy/final/test/deviceFlow.test.mjs"
+bytes = 8195
+sha256 = "eb7231732b94c9e8d59da1b9d1ce25b7b47451a7adbc6ca635c1a44f3794f48a"
+derivation = "Exact committed PR #227 blob; later dirty worktree bytes are not admitted."
+enforcement = "src/repository_policy.rs::validate_reviewed_legacy_tests"
+
+[[test]]
+path = "test/discordGateway.test.mjs"
+source = "0d1186274604b368e95b698f19e157f4b2b7d793:test/discordGateway.test.mjs"
+source_bytes = 10004
+source_sha256 = "2ab2345817e5e791c3da53f4b9954f8b8d5edd3518ce1c5a4c0a1c9f45002ca2"
+fixture = "policy/final/test/discordGateway.test.mjs"
+bytes = 10004
+sha256 = "2ab2345817e5e791c3da53f4b9954f8b8d5edd3518ce1c5a4c0a1c9f45002ca2"
+derivation = "Exact committed PR #227 blob."
+enforcement = "src/repository_policy.rs::validate_reviewed_legacy_tests"
+
+[[test]]
+path = "test/splitMessage.test.mjs"
+source = "0d1186274604b368e95b698f19e157f4b2b7d793:test/splitMessage.test.mjs"
+source_bytes = 2701
+source_sha256 = "e2352a91223f040727c00c28937587b5da3ab8af0c556a5753b383529bedf0ea"
+fixture = "policy/final/test/splitMessage.test.mjs"
+bytes = 2701
+sha256 = "e2352a91223f040727c00c28937587b5da3ab8af0c556a5753b383529bedf0ea"
+derivation = "Exact committed PR #227 blob."
+enforcement = "src/repository_policy.rs::validate_reviewed_legacy_tests"
+
+[[test]]
+path = "test/telegramPolling.test.mjs"
+source = "0d1186274604b368e95b698f19e157f4b2b7d793:test/telegramPolling.test.mjs"
+source_bytes = 8663
+source_sha256 = "ef91cfac867fbb7b50200f2af1f56e59f181da7aeea52e8f65a55f055068f5fd"
+fixture = "policy/final/test/telegramPolling.test.mjs"
+bytes = 8663
+sha256 = "ef91cfac867fbb7b50200f2af1f56e59f181da7aeea52e8f65a55f055068f5fd"
+derivation = "Exact committed PR #227 blob; later dirty worktree bytes are not admitted."
+enforcement = "src/repository_policy.rs::validate_reviewed_legacy_tests"
+
+[[test]]
+path = "test/whatsappRawBody.test.mjs"
+source = "0d1186274604b368e95b698f19e157f4b2b7d793:test/whatsappRawBody.test.mjs"
+source_bytes = 4704
+source_sha256 = "4ee4845f4ea88c32b1d72315e744998f2b1fcf59e61fe0124d1a555ece407a11"
+fixture = "policy/final/test/whatsappRawBody.test.mjs"
+bytes = 4704
+sha256 = "4ee4845f4ea88c32b1d72315e744998f2b1fcf59e61fe0124d1a555ece407a11"
+derivation = "Exact committed PR #227 blob."
+enforcement = "src/repository_policy.rs::validate_reviewed_legacy_tests"
+
+[[test]]
+path = "test/whatsappWebhook.test.mjs"
+source = "0d1186274604b368e95b698f19e157f4b2b7d793:test/whatsappWebhook.test.mjs"
+source_bytes = 7924
+source_sha256 = "d3fea6d3371aa7286b23ec3673b7d830ec89aea6625452e06fb84f15f3043ad5"
+fixture = "policy/final/test/whatsappWebhook.test.mjs"
+bytes = 7924
+sha256 = "d3fea6d3371aa7286b23ec3673b7d830ec89aea6625452e06fb84f15f3043ad5"
+derivation = "Exact committed PR #227 blob."
+enforcement = "src/repository_policy.rs::validate_reviewed_legacy_tests"
+
+[[rejected_test]]
+path = "test/config.test.mjs"
+source = "0d1186274604b368e95b698f19e157f4b2b7d793:test/config.test.mjs"
+source_bytes = 2932
+source_sha256 = "aee4491e21dba29bf377955170ca2637a16a350e5bce93b611f5d645dc287f74"
+worktree_bytes = 4843
+worktree_sha256 = "9ff182a7418f98002c8114d104ac1530ec6e5b3c7089431f11e7bde9404c5394"
+reason = "The base-owned closed inventory admits exactly six reviewed MJS tests; this seventh path must be removed or moved to a separately sanctioned surface."
+enforcement = "src/repository_policy.rs::validate_reviewed_legacy_tests"
+
+[[mapping]]
+path = "compat/legacy/config/env-mapping.json"
+source = "0d1186274604b368e95b698f19e157f4b2b7d793:compat/legacy/config/env-mapping.json"
+source_bytes = 15499
+source_sha256 = "ce57cb1738ea7adbb304d1e792ecb6cad29c09a641959b64402649923714290d"
+worktree_bytes = 15893
+worktree_sha256 = "7b8b5f2b2355e5b688c1e051eebd4dbe40603e71d4e06efe2cfd8e36554d5a70"
+fixture = "policy/final/legacy-policy/compat/legacy/config/env-mapping.json"
+bytes = 15944
+sha256 = "66fc62ad2018d3a30d23ec79338590783101b124bce872a2abae947904663753"
+derivation = "PR #234 canonical map plus the exact protected WHATSAPP_APP_SECRET contract row."
+enforcement = "src/repository_policy.rs::pr227_contract_matches and validate_environment_mapping_policy"
+provisional = true
+
+[[mapping]]
+path = "crates/claw-config/data/env-mapping.json"
+source = "0d1186274604b368e95b698f19e157f4b2b7d793:crates/claw-config/data/env-mapping.json"
+source_bytes = 12378
+source_sha256 = "47f9015ba0dabca3267a12cdac1e5291d0e71a62c13cc2e627359a3d22cdc2a1"
+worktree_bytes = 12663
+worktree_sha256 = "ba0e5b4b993f0ab7781f1b3f4164270d05748676be12362640674906cdc332dc"
+fixture = "policy/final/legacy-policy/crates/claw-config/data/env-mapping.json"
+bytes = 15944
+sha256 = "66fc62ad2018d3a30d23ec79338590783101b124bce872a2abae947904663753"
+derivation = "Byte-identical copy of the protected canonical compatibility map."
+enforcement = "src/repository_policy.rs::pr227_contract_matches and validate_environment_mapping_policy"
+provisional = true
+
+[[behavior]]
+path = "src/config.ts"
+source = "0d1186274604b368e95b698f19e157f4b2b7d793:src/config.ts"
+source_bytes = 8903
+source_sha256 = "1eb7df8a619ed7527fa0b1062be0697c9a5d06b9bfacd93cebfbc52eb812915b"
+fixture = "policy/rotation-base/src/config.ts"
+bytes = 8903
+sha256 = "1eb7df8a619ed7527fa0b1062be0697c9a5d06b9bfacd93cebfbc52eb812915b"
+derivation = "Exact committed PR #227 Node configuration behavior."
+enforcement = "src/repository_policy.rs::ROTATION_BASE_INPUTS and validate_runtime_source_policy"
+
+[[behavior]]
+path = "src/channels/whatsappWebhook.ts"
+source = "0d1186274604b368e95b698f19e157f4b2b7d793:src/channels/whatsappWebhook.ts"
+source_bytes = 11048
+source_sha256 = "3c5480b5ca7c03ccceada65687fbe6c2b06faf5df9fa428ca17415297723c316"
+fixture = "policy/pr227-whatsapp-contract.toml"
+bytes = 11048
+sha256 = "3c5480b5ca7c03ccceada65687fbe6c2b06faf5df9fa428ca17415297723c316"
+derivation = "Exact committed PR #227 handler behavior represented by the protected contract."
+enforcement = "PR #227 transition review; exact source pin pending stabilization"
+provisional = true
+
+[[behavior]]
+path = "src/index.ts"
+source = "0d1186274604b368e95b698f19e157f4b2b7d793:src/index.ts"
+source_bytes = 9044
+source_sha256 = "b5afecdcb549bc2fd472d67001abfdc49239800474e42fe7ea3917f628935a17"
+fixture = "policy/pr227-whatsapp-contract.toml"
+bytes = 9044
+sha256 = "b5afecdcb549bc2fd472d67001abfdc49239800474e42fe7ea3917f628935a17"
+derivation = "Exact committed PR #227 app-secret handoff behavior."
+enforcement = "PR #227 transition review; exact source pin pending stabilization"
+provisional = true
+
+[[behavior]]
+path = ".env.example"
+source = "0d1186274604b368e95b698f19e157f4b2b7d793:.env.example"
+source_bytes = 2747
+source_sha256 = "05f5ef0dd91616d65ee606819f8f7072e999896539ee0dcb13c30dc624440ef6"
+fixture = "policy/pr227-whatsapp-contract.toml"
+bytes = 2747
+sha256 = "05f5ef0dd91616d65ee606819f8f7072e999896539ee0dcb13c30dc624440ef6"
+derivation = "Exact committed PR #227 documentation input."
+enforcement = "PR #227 transition review; exact source pin pending stabilization"
+provisional = true
+
+[[behavior]]
+path = "crates/claw-config/src/domains.rs"
+source = "worktree over 0d1186274604b368e95b698f19e157f4b2b7d793:crates/claw-config/src/domains.rs"
+source_bytes = 58043
+source_sha256 = "32a15bb77952807c8a05799e390c1bf6aeb998fe94fecb53c67c50e3f4fe5052"
+fixture = "policy/final/legacy-policy/crates/claw-config/src/domains.rs"
+bytes = 58385
+sha256 = "f8f54faafa5cb291f718e07c9e8a954d3ad09108510d2e4825a7f738491f5ea4"
+derivation = "Exact dirty PR #227 layer insertion composed over the protected PR #234 AUTO_UPDATE layer."
+enforcement = "src/repository_policy.rs::pr227_contract_matches"
+provisional = true
+
+[[behavior]]
+path = "crates/claw-config/src/domains/imported.rs"
+source = "worktree over 0d1186274604b368e95b698f19e157f4b2b7d793:crates/claw-config/src/domains/imported.rs"
+source_bytes = 90045
+source_sha256 = "974f00d9f365167e4d0f7f112e25bc31840c9d5e008af9cd4c8e9a07ea37e478"
+fixture = "policy/pr227-whatsapp-contract.toml"
+bytes = 90045
+sha256 = "974f00d9f365167e4d0f7f112e25bc31840c9d5e008af9cd4c8e9a07ea37e478"
+derivation = "Exact dirty PR #227 imported-domain field insertion."
+enforcement = "src/repository_policy.rs::PR227_PROVISIONAL_CONTRACT_DIGESTS"
+provisional = true
+
+[[behavior]]
+path = "crates/claw-config/src/migration.rs"
+source = "worktree over 0d1186274604b368e95b698f19e157f4b2b7d793:crates/claw-config/src/migration.rs"
+source_bytes = 21701
+source_sha256 = "089d4f2bee525a92f13d86f2cb07f24fb5694f57e661dc727987ea4ed792f3c4"
+fixture = "policy/final/legacy-policy/crates/claw-config/src/migration.rs"
+bytes = 21972
+sha256 = "4214fe33cbc8d59c9b949101b422e4cab29d30e876b8f4c628f5db4cdd79a152"
+derivation = "Exact dirty PR #227 mapping arm composed over the protected PR #234 migration."
+enforcement = "src/repository_policy.rs::pr227_contract_matches"
+provisional = true
+
+[[behavior]]
+path = "crates/claw-config/src/model.rs"
+source = "worktree over 0d1186274604b368e95b698f19e157f4b2b7d793:crates/claw-config/src/model.rs"
+source_bytes = 17445
+source_sha256 = "3627dd61eb7e56d262d6aaa42c8988db9d67f0f7697547a18051887bad755148"
+fixture = "policy/final/legacy-policy/crates/claw-config/src/model.rs"
+bytes = 17612
+sha256 = "e4ad5ab2e97f91a13c2217c90b28a34c3bc9c5b84de08328ba486d3ae0b06ef0"
+derivation = "Exact dirty PR #227 typed field composed over the protected PR #234 model."
+enforcement = "src/repository_policy.rs::pr227_contract_matches"
+provisional = true
+
+[[behavior]]
+path = "crates/claw-config/src/wire.rs"
+source = "worktree over 0d1186274604b368e95b698f19e157f4b2b7d793:crates/claw-config/src/wire.rs"
+source_bytes = 24195
+source_sha256 = "c76b1f84756e5bebdceec65493d7a93528d2820692d3409990bfa6981140386f"
+fixture = "policy/pr227-whatsapp-contract.toml"
+bytes = 24195
+sha256 = "c76b1f84756e5bebdceec65493d7a93528d2820692d3409990bfa6981140386f"
+derivation = "Exact dirty PR #227 wire/default/validation/serialization changes."
+enforcement = "src/repository_policy.rs::PR227_PROVISIONAL_CONTRACT_DIGESTS"
+provisional = true

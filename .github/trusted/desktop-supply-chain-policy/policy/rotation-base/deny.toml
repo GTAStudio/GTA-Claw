@@ -1,0 +1,68 @@
+[graph]
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+allow = ["Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0", "Zlib"]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+# fastwebsockets 0.10 uses rand 0.8 solely for RFC 6455 client masking.
+# ring 0.17 pins windows-sys 0.52 for rustls cryptography internals.
+[[bans.skip]]
+name = "rand_core"
+version = "=0.6.4"
+
+# Build dependencies straddle syn 2 and syn 3; syn is not linked into the runtime.
+[[bans.skip]]
+name = "syn"
+version = "=3.0.3"
+
+[[bans.skip]]
+name = "windows-sys"
+version = "=0.52.0"
+
+[[bans.skip]]
+name = "thiserror"
+version = "=1.0.69"
+
+[[bans.skip]]
+name = "thiserror-impl"
+version = "=1.0.69"
+
+# SQLx 0.9 still uses the previous RustCrypto stack while claw-state uses the
+# latest stable SHA-2 API. SQLx also resolves two intentional hashbrown lines.
+[[bans.skip]]
+name = "block-buffer"
+version = "=0.10.4"
+
+[[bans.skip]]
+name = "cpufeatures"
+version = "=0.2.17"
+
+[[bans.skip]]
+name = "crypto-common"
+version = "=0.1.7"
+
+[[bans.skip]]
+name = "digest"
+version = "=0.10.7"
+
+[[bans.skip]]
+name = "hashbrown"
+version = "=0.16.1"
+
+[[bans.skip]]
+name = "sha2"
+version = "=0.10.9"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

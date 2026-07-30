@@ -1,0 +1,207 @@
+name: iOS packaging
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/ios-packaging.yml"
+      - "ios/**"
+      - "apps/gta-claw-ios/**"
+      - "crates/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+  pull_request:
+    paths:
+      - ".github/workflows/ios-packaging.yml"
+      - "ios/**"
+      - "apps/gta-claw-ios/**"
+      - "crates/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-packaging-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  policy:
+    name: iOS source and dependency policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Install checksum-pinned cargo-deny
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly version="0.20.2"
+          readonly digest="9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+          readonly archive="$RUNNER_TEMP/cargo-deny.tar.gz"
+          readonly destination="$RUNNER_TEMP/cargo-deny"
+          curl --fail --silent --show-error --location --retry 3 \
+            --proto '=https' --tlsv1.2 \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${version}/cargo-deny-${version}-x86_64-unknown-linux-musl.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$digest" "$archive" | sha256sum --check -
+          mkdir -p "$destination"
+          tar --extract --gzip --file "$archive" --directory "$destination" --strip-components=1
+          "$destination/cargo-deny" --version
+          printf '%s\n' "$destination" >> "$GITHUB_PATH"
+
+      - name: Run iOS shell source tests
+        shell: bash
+        run: ./ios/scripts/workflow-self-test.sh
+
+      - name: Install pinned Linux host renderer prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libfontconfig-dev=2.15.0-1.1ubuntu2 \
+            pkgconf=1.8.1-2build1
+
+      - name: Check iOS Linux host graph at MSRV
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal
+          cargo +1.94.0 check --manifest-path ios/Cargo.toml --workspace --all-targets --locked
+
+      - name: Check iOS Linux host dependency policy
+        run: >-
+          cargo deny --manifest-path ios/Cargo.toml --config ios/deny.toml
+          --locked --all-features --target x86_64-unknown-linux-gnu check
+
+      - name: Check iOS dependency policy
+        run: cargo deny --manifest-path ios/Cargo.toml --config ios/deny.toml --locked --all-features check
+
+  package:
+    name: Unsigned iOS archive and target checks
+    needs: policy
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Record Apple tool versions
+        run: |
+          sw_vers
+          xcodebuild -version
+          rustc -Vv
+          cargo -V
+
+      - name: Install Rust iOS targets
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup target add --toolchain 1.94.0 aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: Install checksum-pinned XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly version="2.46.0"
+          readonly digest="4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
+          readonly archive="$RUNNER_TEMP/xcodegen.zip"
+          readonly destination="$RUNNER_TEMP/xcodegen"
+          curl --fail --silent --show-error --location --retry 3 \
+            --proto '=https' --tlsv1.2 \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${version}/xcodegen.zip" \
+            --output "$archive"
+          printf '%s  %s\n' "$digest" "$archive" | shasum -a 256 --check
+          mkdir -p "$destination"
+          ditto -x -k "$archive" "$destination"
+          xcodegen_bin="$(find "$destination" -type f -name xcodegen -perm +111 -print -quit)"
+          test -n "$xcodegen_bin"
+          "$xcodegen_bin" --version
+          printf '%s\n' "$(dirname "$xcodegen_bin")" >> "$GITHUB_PATH"
+
+      - name: Verify both reviewed Skia archives
+        shell: bash
+        env:
+          SKIA_CACHE_DIR: ${{ runner.temp }}/gta-claw-skia
+        run: |
+          set -euo pipefail
+          ./ios/scripts/fetch-skia.sh aarch64-apple-ios "$SKIA_CACHE_DIR"
+          ./ios/scripts/fetch-skia.sh aarch64-apple-ios-sim "$SKIA_CACHE_DIR"
+
+      - name: Check iOS shell on the macOS host
+        shell: bash
+        run: |
+          plutil -lint ios/apps/gta-claw-ios-shell/Info.plist
+          ./ios/scripts/check.sh
+
+      - name: Check device and simulator targets at MSRV
+        shell: bash
+        env:
+          RUSTUP_TOOLCHAIN: 1.94.0
+          SKIA_CACHE_DIR: ${{ runner.temp }}/gta-claw-skia
+        run: ./ios/scripts/check-targets.sh
+
+      - name: Build unsigned iOS archive
+        shell: bash
+        env:
+          SKIA_CACHE_DIR: ${{ runner.temp }}/gta-claw-skia
+        run: ./ios/scripts/package.sh
+
+      - name: Validate unsigned archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="ios/target/ios-package/GTAClaw.xcarchive/Products/Applications/GTA Claw.app"
+          executable="$app/GTA Claw"
+          dsym="ios/target/ios-package/GTAClaw.xcarchive/dSYMs/GTA Claw.app.dSYM/Contents/Resources/DWARF/GTA Claw"
+          test -d "$app"
+          test -x "$executable"
+          test -f "$dsym"
+          file "$executable" | grep -F 'arm64'
+          test "$(find "$app" -type f -name 'GTA Claw' | wc -l | tr -d ' ')" = "1"
+          diff -u \
+            <(xcrun dwarfdump --uuid "$executable" | awk '{print $2}' | sort) \
+            <(xcrun dwarfdump --uuid "$dsym" | awk '{print $2}' | sort)
+
+      - name: Build iOS simulator app
+        shell: bash
+        env:
+          SKIA_CACHE_DIR: ${{ runner.temp }}/gta-claw-skia
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project ios/GTAClaw.xcodeproj \
+            -scheme GTAClaw \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/gta-claw-ios-simulator"
+
+      - name: Run required iOS simulator smoke
+        shell: bash
+        env:
+          MOBILE_SMOKE_REQUIRED: "1"
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/gta-claw-ios-simulator/Build/Products/Release-iphonesimulator/GTA Claw.app"
+          ./ios/scripts/simulator-smoke.sh "$app"
+
+      - name: Upload unsigned archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gta-claw-ios-unsigned-${{ github.sha }}
+          path: ios/target/ios-package/GTAClaw.xcarchive
+          if-no-files-found: error
+          retention-days: 14

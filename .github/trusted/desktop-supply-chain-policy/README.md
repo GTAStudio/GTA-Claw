@@ -41,15 +41,32 @@ paths with trusted Git. It fetches the exact protected base at depth 1 and the e
 immutable head at depth 10,001, never fetches tags or wildcard fork refs, and rejects
 direct pull-request ranges above 10,000 commits.
 
-The validator recognizes two base states:
+The validator recognizes five base states:
 
 - **Bootstrap:** product-policy files rooted at
   `8137bccb6e47097f41f016afe5c4b7b2e3d63002` and both protected trust-root workflows
   exactly match the Bootstrap fingerprint. An unrelated change may pass while those
   exact bytes are retained. Any policy-relevant change must establish complete final
   P04f state in one pull request.
-- **Final:** the base satisfies complete final P04f policy. Every candidate must retain
-  final policy, including candidates whose changed files are otherwise unrelated.
+- **Pr227Admission:** the audited, base-owned protected rotation has landed while the exact
+  Bootstrap product bytes remain. Its only admitted candidate is the reviewed six-file MJS
+  inventory plus the synchronized `WHATSAPP_APP_SECRET` map and Rust behavior. The candidate
+  cannot add or alter the authority ledger because protected bytes must equal the base.
+- **Rotation:** one exact, short-lived base-owned prerequisite state composed from the reviewed
+  PR #227 runtime tests, the pre-PR #233 packaging workflows, and the pre-PR #234 product-policy
+  inputs. Its only admitted candidate is PR #234's full policy plus the combined final workflow
+  graph while the exact pre-PR #233 script bytes remain in place.
+- **Pr233Admission:** PR #234 has landed the complete policy and final workflow graph, but the
+  reviewed PR #233 smoke and workflow self-test scripts have not landed. Every candidate must
+  establish the protected final script bytes, so this state admits PR #233 and blocks unrelated
+  candidates until that transition completes.
+- **Final:** the base satisfies complete final P04f policy, including every protected PR #233
+  workflow and script byte. Every candidate must retain final policy, including candidates whose
+  changed files are otherwise unrelated.
+
+Pr227Admission, Rotation, and Pr233Admission are recognized from protected per-path bytes and
+cannot be recreated or widened by a candidate because the validator and fixtures are compiled
+from the protected base.
 
 An unknown non-final base fails. Final state never falls back to bootstrap state.
 The head must contain the current base commit; stale pull requests fail even before the
@@ -209,14 +226,22 @@ workflows prefetch their target-specific Skia archive through hardened TLS, veri
 digest, and pass only the verified `file://` URL through `SKIA_BINARIES_URL`; the direct
 `skia-safe/no-compile` feature prevents a source-build fallback.
 
+The dependency-policy jobs remain distinct Ubuntu 24.04 Linux-host checks, with exact
+`libfontconfig-dev` and `pkgconf` package versions and an explicit cargo-deny
+`x86_64-unknown-linux-gnu` graph. Separate package jobs exercise the actual shipped target sets.
+The protected deny graphs bind Android arm64 plus x86_64, iOS device plus simulator, and desktop
+Windows/macOS x64 plus ARM64. The desktop build script selects behavior from
+`CARGO_CFG_TARGET_OS`, never requires `HOST == TARGET`, and the Rust workflow proves that a Windows
+x64 host can check `aarch64-pc-windows-msvc` at Rust 1.94 while Linux still fails closed.
+
 Android's artifact uses cargo-apk's local signing behavior and is not a Play Store release. iOS
 distribution signing, provisioning, export, and upload remain outside CI because they require Apple
 credentials. Neither workflow claims device execution.
 
-`rust.yml` is unchanged and is not the place for this: it is byte-frozen, and the authoritative
-policy workflow carries no path filter, so every rule above already runs on every pull request
-regardless of which paths a change touches. A tree containing `android/` can never classify as
-Bootstrap, so it fails closed into Final validation.
+`rust.yml` is a byte-frozen Final snapshot, and the authoritative policy workflow carries no path
+filter, so every rule above runs on every pull request regardless of which paths a change touches.
+A tree containing `android/` can never classify as Bootstrap, so it fails closed into Final
+validation.
 
 The `.github/workflows` directory is a closed inventory. Eight historical workflow files are
 **required** in both Bootstrap and Final states. Two further exact paths,
@@ -258,6 +283,20 @@ exact historical ceiling of 18 `src/**/*.ts` files plus `Dockerfile`, `package.j
 Tracked symbolic links, gitlinks, new package-manager artifacts, and new Node workflow or local
 action debt fail from the base side.
 
+The Rotation-to-Pr233Admission transition also parses the legacy package roots rather than relying on
+source markers. Every direct package and lock-root mirror is an exact reviewed numeric version;
+`latest`, semver ranges, URL, git, file, link, workspace, and path references fail closed. The
+install-script allowlist is exact, Docker uses the same package roots with `npm ci
+--ignore-scripts` followed by only the reviewed native rebuilds, and AUTO_UPDATE is rejected by
+the legacy runtime, Rust migration, and layered configuration path. The workspace and packaged
+environment-mapping JSON files must be byte-identical. Reduced `node:vm` isolation requires the
+exact pair `NODE_ENV=development` and `GTA_CLAW_ALLOW_REDUCED_ISOLATION=true`; default and npm
+start remain fail-closed, and the exact `test:isolation-policy` script exercises the boundary.
+The Python compatibility documents bind one protected lowercase 40-hex source revision. The Rust
+workflow reads that declaration, fetches and verifies only that commit, uses commit-pinned
+setup-python and hash-locked wheels, runs `pip check`, and includes every compatibility input in
+both push and pull-request path triggers.
+
 `crates/claw-repo-policy` is transitionally absent until its accepted product-policy pull request
 lands. Its first appearance must have the exact dependency-free workspace shape, explicit
 ceiling, fixture exceptions, add-fails/delete-passes tests, workflow/action and index tests, and
@@ -276,6 +315,58 @@ and still pass the authoritative job. A future update requires:
 5. Subsequent product-policy pull requests based on the new protected main.
 
 No hash stored in a candidate checkout authorizes an update.
+
+### Supply-chain rotation order
+
+The rotation that admits the dependency hardening has one exact order:
+
+1. Stabilize PR #227 without merging it. It must contain exactly the six protected MJS test
+   paths, byte-identical environment maps, and the protected `WHATSAPP_APP_SECRET` Node/Rust
+   behavior. The currently committed seventh `test/config.test.mjs` and provisional dirty map/Rust
+   bytes are blockers.
+2. **Step A:** rebase this dedicated trust-root-only rotation onto current `main` and merge it with
+   the narrowly restricted, audited ruleset bypass after independent review. The existing
+   authoritative check must reject this step as a protected-tree mutation; the non-authoritative
+   bootstrap check is evidence only. The resulting base reports `Pr227Admission`.
+3. **Step B:** rebase and clean PR #227 onto that base. Merge it normally only when the base-owned
+   authoritative validator reports `base_state=Pr227Admission`, `candidate_final=false`, the exact
+   six-test inventory, and the synchronized contract. The resulting base is `Rotation`.
+4. Rebase PR #234 onto the PR #227 `Rotation` base, remove its attempted trusted-tree edits, retain
+   cargo-deny 0.19.8's `check --config` ordering, and make its product files match the protected
+   policy snapshots. PR #234 must also carry the protected combined Android, iOS, joint-release,
+   macOS, and Windows workflow bytes while retaining the exact pre-PR #233 script state.
+5. Merge PR #234 only after the base-owned authoritative workflow reports
+   `base_state=Rotation` and `candidate_final=false`. The next protected base is
+   `Pr233Admission`; false here records that the final PR #233 scripts are deliberately pending,
+   not that any of the nine policy blockers were skipped.
+6. Rebase PR #233 onto that PR #234 base. Resolve overlapping workflow changes to the already
+   protected combined bytes and require every Android, iOS, and macOS workflow-executed script to
+   match its protected final fixture.
+7. Merge PR #233 only after the base-owned authoritative workflow reports
+   `base_state=Pr233Admission` and `candidate_final=true`. Subsequent bases are Final.
+
+The six PR #227 JavaScript test files are a separately named, byte-pinned test inventory. They do
+not enlarge `LEGACY_RUNTIME_CEILING`; any other JavaScript artifact remains forbidden, and a
+changed test byte requires another reviewed trust-root rotation.
+
+`policy/pr227-asset-map.toml` records the committed PR #227 OID, exact six-test blobs, the rejected
+seventh test, both map forms, and every Node/Rust contract input. Dirty worktree observations are
+explicitly provisional. Until the two maps are byte-identical and the Rust behavior is committed,
+that ledger remains `ready_for_validation=false` and the Pr227Admission transition fails closed.
+
+`policy/rotation-mutation-digests.toml` records every mutation oracle whose canonical artifact
+changed. Its `old_sha256` values remain the active oracle and each `new_sha256` is intentionally
+empty until validation derives that case from the exact canonical mutation bytes and confirms the
+listed diagnostic. Every case names its exact typed mutation, serializer byte derivation, intended
+diagnostic, and later validation command. That command must use actionlint 1.7.7 with SHA-256
+`9f7dedb4e23f89f2922073d1a6720405b7b520d4f5832ebb96f0d55a2958886c`.
+Aggregate observed output must not be copied into the oracle.
+
+`policy/pr233-asset-map.toml` records source branch/path/OID, source and canonical byte counts,
+SHA-256 values, fixture paths, composition rationale, and enforcement locations for every PR #233
+workflow and workflow-executed script. The three dirty macOS inputs are provisional and keep
+`ready_for_validation=false` until PR #233 is stable and rebased; they must be re-reviewed and
+re-pinned from exact bytes rather than treated as immutable truth.
 
 The required-workflow eligibility follow-up based on
 `a3288d7d5eabea9fc2464a4c54b75727cd5ee99b` intentionally changes the authoritative

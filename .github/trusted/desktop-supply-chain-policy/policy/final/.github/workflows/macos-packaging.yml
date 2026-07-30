@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - ".github/workflows/macos-packaging.yml"
+      - ".github/workflows/joint-release-finalize.yml"
       - "packaging/macos/**"
       - "apps/**"
       - "crates/**"
@@ -16,6 +17,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/macos-packaging.yml"
+      - ".github/workflows/joint-release-finalize.yml"
       - "packaging/macos/**"
       - "apps/**"
       - "crates/**"
@@ -85,7 +87,7 @@ jobs:
           set -euo pipefail
           cargo metadata --manifest-path desktop/Cargo.toml --locked --format-version 1 \
             --filter-platform x86_64-unknown-linux-gnu |
-            python -c 'import json, sys; names = {package["name"] for package in json.load(sys.stdin)["packages"]}; forbidden = sorted(name for name in names if name == "slint" or name == "slint-build" or name.startswith("i-slint")); assert not forbidden, f"Linux desktop metadata contains Slint packages: {forbidden}"'
+            python3 -c 'import json, sys; names = {package["name"] for package in json.load(sys.stdin)["packages"]}; forbidden = sorted(name for name in names if name == "slint" or name == "slint-build" or name.startswith("i-slint")); assert not forbidden, f"Linux desktop metadata contains Slint packages: {forbidden}"'
           set +e
           output=$(cargo check --manifest-path desktop/Cargo.toml \
             --package gta-claw-desktop --locked 2>&1)
@@ -93,7 +95,7 @@ jobs:
           set -e
           printf '%s\n' "$output"
           test "$status" -ne 0
-          grep -F "gta-claw-desktop supports only Windows and macOS" <<<"$output"
+          grep -F "requires a Windows or macOS build host" <<<"$output"
 
   native:
     name: Native ${{ matrix.arch }} on ${{ matrix.runner }}
@@ -420,7 +422,7 @@ jobs:
     environment: macos-release
     permissions:
       actions: read
-      contents: read
+      contents: write
     steps:
       - name: Checkout exact trusted release verifier
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -776,26 +778,405 @@ jobs:
             xcrun stapler validate "$artifact"
           done
 
-      - name: Validate protected release outputs without publishing
+      - name: Assemble final signed and notarized release
         shell: bash
+        env:
+          EXPECTED_PAYLOAD_SHA256: ${{ needs.containers.outputs.release-payload-sha256 }}
+          EXPECTED_RELEASE_REF: ${{ needs.release-policy.outputs.release-ref }}
+          EXPECTED_RELEASE_SHA: ${{ needs.release-policy.outputs.release-sha }}
+          EXPECTED_VERSION: ${{ needs.release-policy.outputs.version }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$EXPECTED_PAYLOAD_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_RELEASE_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$EXPECTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+          state="$RUNNER_TEMP/gta-claw-release"
+          app="$state/release-input/GTA Claw.app"
+          distribution="$state/distribution"
+          app_zip="$distribution/gta-claw-$EXPECTED_VERSION-macos-arm64-signed-notarized.app.zip"
+          dmg="$distribution/gta-claw-$EXPECTED_VERSION-macos.dmg"
+          pkg="$distribution/gta-claw-$EXPECTED_VERSION-macos.pkg"
+          [[ -d "$app" && ! -L "$app" ]]
+          for artifact in "$dmg" "$pkg"; do
+            [[ -f "$artifact" && ! -L "$artifact" ]]
+          done
+          for path in "$app_zip" "$app_zip.spdx" "$app_zip.provenance.json" \
+            "$dmg.spdx" "$dmg.provenance.json" \
+            "$pkg.spdx" "$pkg.provenance.json"; do
+            test ! -e "$path"
+            test ! -L "$path"
+          done
+
+          COPYFILE_DISABLE=1 ditto -c -k --keepParent "$app" "$app_zip"
+          test -f "$app_zip" -a ! -L "$app_zip"
+
+          spdx_parser="$state/validate-spdx-tag-value.py"
+          cat >"$spdx_parser" <<'PY'
+          import pathlib
+          import re
+          import sys
+          from urllib.parse import urlparse
+
+          CHECKSUM_LENGTHS = {"SHA1": 40, "SHA256": 64}
+          DOCUMENT_TAGS = {
+              "SPDXVersion",
+              "DataLicense",
+              "SPDXID",
+              "DocumentName",
+              "DocumentNamespace",
+              "Creator",
+              "Created",
+              "DocumentDescribes",
+          }
+          FILE_TAGS = {
+              "FileName",
+              "SPDXID",
+              "FileChecksum",
+              "LicenseConcluded",
+              "FileCopyrightText",
+          }
+          PACKAGE_TAGS = {
+              "PackageName",
+              "SPDXID",
+              "PackageVersion",
+              "PackageDownloadLocation",
+              "FilesAnalyzed",
+              "PackageLicenseConcluded",
+              "PackageLicenseDeclared",
+              "PackageCopyrightText",
+              "ExternalRef",
+          }
+
+          def parse(path):
+              sections = {"document": [], "files": [], "packages": []}
+              current = sections["document"]
+              for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                  if not raw:
+                      continue
+                  match = re.fullmatch(r"([A-Za-z][A-Za-z0-9]*): (.+)", raw)
+                  if not match:
+                      raise ValueError(f"{path}:{number}: malformed tag/value line")
+                  tag, value = match.groups()
+                  if tag == "FileName":
+                      current = []
+                      sections["files"].append(current)
+                  elif tag == "PackageName":
+                      current = []
+                      sections["packages"].append(current)
+                  current.append((tag, value, number))
+              return sections
+
+          def indexed(entries, allowed, label):
+              values = {}
+              for tag, value, number in entries:
+                  if tag not in allowed:
+                      raise ValueError(f"{label}:{number}: unexpected tag {tag}")
+                  values.setdefault(tag, []).append(value)
+              return values
+
+          def one(values, tag, label):
+              found = values.get(tag, [])
+              if len(found) != 1:
+                  raise ValueError(f"{label}: expected exactly one {tag}, found {len(found)}")
+              return found[0]
+
+          def validate(path, expected_name, expected_sha1, expected_sha256, expected_version):
+              sections = parse(path)
+              document = indexed(sections["document"], DOCUMENT_TAGS, "document")
+              if one(document, "SPDXVersion", "document") != "SPDX-2.3":
+                  raise ValueError("document: SPDXVersion must be SPDX-2.3")
+              if one(document, "DataLicense", "document") != "CC0-1.0":
+                  raise ValueError("document: DataLicense must be CC0-1.0")
+              if one(document, "SPDXID", "document") != "SPDXRef-DOCUMENT":
+                  raise ValueError("document: invalid SPDXID")
+              namespace = one(document, "DocumentNamespace", "document")
+              parsed_namespace = urlparse(namespace)
+              if parsed_namespace.scheme != "https" or not parsed_namespace.netloc:
+                  raise ValueError("document: namespace must be an absolute HTTPS URI")
+              if one(document, "DocumentDescribes", "document") != "SPDXRef-Artifact":
+                  raise ValueError("document: must describe SPDXRef-Artifact")
+              one(document, "DocumentName", "document")
+              one(document, "Creator", "document")
+              one(document, "Created", "document")
+
+              if len(sections["files"]) != 1:
+                  raise ValueError("document: expected exactly one file")
+              file_values = indexed(sections["files"][0], FILE_TAGS, "file")
+              if one(file_values, "FileName", "file") != f"./{expected_name}":
+                  raise ValueError("file: unexpected FileName")
+              if one(file_values, "SPDXID", "file") != "SPDXRef-Artifact":
+                  raise ValueError("file: invalid SPDXID")
+              if one(file_values, "LicenseConcluded", "file") != "NOASSERTION":
+                  raise ValueError("file: invalid LicenseConcluded")
+              if one(file_values, "FileCopyrightText", "file") != "NOASSERTION":
+                  raise ValueError("file: invalid FileCopyrightText")
+              checksums = {}
+              for checksum in file_values.get("FileChecksum", []):
+                  match = re.fullmatch(r"(SHA1|SHA256): ([0-9a-f]+)", checksum)
+                  if not match:
+                      raise ValueError("file: malformed FileChecksum")
+                  algorithm, digest = match.groups()
+                  if len(digest) != CHECKSUM_LENGTHS[algorithm] or algorithm in checksums:
+                      raise ValueError("file: invalid or duplicate FileChecksum")
+                  checksums[algorithm] = digest
+              if checksums != {"SHA1": expected_sha1, "SHA256": expected_sha256}:
+                  raise ValueError("file: checksum set differs from final artifact bytes")
+
+              if len(sections["packages"]) != 1:
+                  raise ValueError("document: expected exactly one package")
+              package = indexed(sections["packages"][0], PACKAGE_TAGS, "package")
+              if one(package, "PackageName", "package") != "gta-claw-desktop":
+                  raise ValueError("package: unexpected PackageName")
+              if one(package, "SPDXID", "package") != "SPDXRef-Package-gta-claw-desktop":
+                  raise ValueError("package: invalid SPDXID")
+              if one(package, "PackageVersion", "package") != expected_version:
+                  raise ValueError("package: unexpected PackageVersion")
+              if one(package, "PackageDownloadLocation", "package") != "NOASSERTION":
+                  raise ValueError("package: invalid PackageDownloadLocation")
+              if one(package, "FilesAnalyzed", "package") != "false":
+                  raise ValueError("package: FilesAnalyzed must be false")
+              if one(package, "PackageLicenseConcluded", "package") != "NOASSERTION":
+                  raise ValueError("package: invalid PackageLicenseConcluded")
+              if one(package, "PackageLicenseDeclared", "package") != "MIT":
+                  raise ValueError("package: invalid PackageLicenseDeclared")
+              if one(package, "PackageCopyrightText", "package") != "NOASSERTION":
+                  raise ValueError("package: invalid PackageCopyrightText")
+              if not one(package, "ExternalRef", "package").startswith(
+                  "PACKAGE-MANAGER purl pkg:cargo/gta-claw-desktop@"
+              ):
+                  raise ValueError("package: invalid ExternalRef")
+
+          if len(sys.argv) != 6:
+              raise SystemExit(
+                  "usage: validate-spdx-tag-value.py SPDX NAME SHA1 SHA256 VERSION"
+              )
+          validate(pathlib.Path(sys.argv[1]), *sys.argv[2:])
+          PY
+          chmod 0500 "$spdx_parser"
+
+          write_supply_chain() {
+            local artifact="$1"
+            local name
+            local sha1
+            local sha256
+            name="$(basename "$artifact")"
+            sha1="$(shasum -a 1 "$artifact" | awk '{print $1}')"
+            sha256="$(shasum -a 256 "$artifact" | awk '{print $1}')"
+            cat >"$artifact.spdx" <<EOF
+          SPDXVersion: SPDX-2.3
+          DataLicense: CC0-1.0
+          SPDXID: SPDXRef-DOCUMENT
+          DocumentName: $name SBOM
+          DocumentNamespace: https://github.com/GTAStudio/GTA-Claw/releases/sbom/$sha256
+          Creator: Tool: GTA-Claw-macOS-Protected-Release
+          Created: 2000-01-01T00:00:00Z
+          DocumentDescribes: SPDXRef-Artifact
+
+          FileName: ./$name
+          SPDXID: SPDXRef-Artifact
+          FileChecksum: SHA1: $sha1
+          FileChecksum: SHA256: $sha256
+          LicenseConcluded: NOASSERTION
+          FileCopyrightText: NOASSERTION
+
+          PackageName: gta-claw-desktop
+          SPDXID: SPDXRef-Package-gta-claw-desktop
+          PackageVersion: $EXPECTED_VERSION
+          PackageDownloadLocation: NOASSERTION
+          FilesAnalyzed: false
+          PackageLicenseConcluded: NOASSERTION
+          PackageLicenseDeclared: MIT
+          PackageCopyrightText: NOASSERTION
+          ExternalRef: PACKAGE-MANAGER purl pkg:cargo/gta-claw-desktop@$EXPECTED_VERSION
+          EOF
+            jq -cn \
+              --arg digest "$sha256" \
+              --arg inputDigest "$EXPECTED_PAYLOAD_SHA256" \
+              --arg name "$name" \
+              --arg releaseRef "$EXPECTED_RELEASE_REF" \
+              --arg source "$EXPECTED_RELEASE_SHA" \
+              --arg version "$EXPECTED_VERSION" \
+              '{
+                "_type": "https://in-toto.io/Statement/v1",
+                "subject": [{"name": $name, "digest": {"sha256": $digest}}],
+                "predicateType": "https://slsa.dev/provenance/v1",
+                "predicate": {
+                  "buildDefinition": {
+                    "buildType": "https://github.com/GTAStudio/GTA-Claw/packaging/macos/protected-release/v1",
+                    "externalParameters": {
+                      "componentSet": "desktop",
+                      "cargoProfile": "release",
+                      "releaseRef": $releaseRef,
+                      "releaseVersion": $version,
+                      "rustTargets": ["aarch64-apple-darwin"]
+                    },
+                    "internalParameters": {},
+                    "resolvedDependencies": [{
+                      "uri": "gta-claw-release-input.tar.gz",
+                      "digest": {"sha256": $inputDigest}
+                    }]
+                  },
+                  "runDetails": {
+                    "builder": {
+                      "id": "https://github.com/GTAStudio/GTA-Claw/.github/workflows/macos-packaging.yml"
+                    },
+                    "metadata": {"invocationId": $source}
+                  }
+                }
+              }' >"$artifact.provenance.json"
+            python3 "$spdx_parser" \
+              "$artifact.spdx" "$name" "$sha1" "$sha256" "$EXPECTED_VERSION"
+          }
+
+          for artifact in "$app_zip" "$dmg" "$pkg"; do
+            write_supply_chain "$artifact"
+          done
+
+      - name: Validate protected release outputs
+        shell: bash
+        env:
+          EXPECTED_RELEASE_SHA: ${{ needs.release-policy.outputs.release-sha }}
+          EXPECTED_VERSION: ${{ needs.release-policy.outputs.version }}
         run: |
           set -euo pipefail
           state="$RUNNER_TEMP/gta-claw-release"
           app="$state/release-input/GTA Claw.app"
           distribution="$state/distribution"
+          app_zip="$distribution/gta-claw-$EXPECTED_VERSION-macos-arm64-signed-notarized.app.zip"
+          dmg="$distribution/gta-claw-$EXPECTED_VERSION-macos.dmg"
+          pkg="$distribution/gta-claw-$EXPECTED_VERSION-macos.pkg"
           verifier="$GITHUB_WORKSPACE/trusted-release-policy/.github/trusted/desktop-supply-chain-policy/scripts/verify-macos-app.sh"
           /bin/bash "$verifier" "$app"
           lipo "$app/Contents/MacOS/gta-claw-desktop" -verify_arch arm64
           codesign --verify --deep --strict --verbose=2 "$app"
           spctl --assess --type execute --verbose=4 "$app"
           xcrun stapler validate "$app"
-          codesign --verify --verbose=2 "$distribution"/*.dmg
-          pkgutil --check-signature "$distribution"/*.pkg |
+          codesign --verify --verbose=2 "$dmg"
+          pkgutil --check-signature "$pkg" |
             grep -F 'Developer ID Installer:' >/dev/null
-          xcrun stapler validate "$distribution"/*.dmg
-          xcrun stapler validate "$distribution"/*.pkg
-          (cd "$distribution" && shasum -a 256 * >SHA256SUMS)
-          echo "Protected release contract passed. Artifacts are intentionally not uploaded or published."
+          xcrun stapler validate "$dmg"
+          xcrun stapler validate "$pkg"
+
+          expected="$state/expected-macos-assets"
+          for artifact in "$app_zip" "$dmg" "$pkg"; do
+            name="$(basename "$artifact")"
+            printf '%s\n' "$name" "$name.spdx" "$name.provenance.json"
+          done | LC_ALL=C sort >"$expected"
+          actual="$state/actual-macos-assets"
+          find "$distribution" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; |
+            LC_ALL=C sort >"$actual"
+          if ! diff -u "$expected" "$actual"; then
+            echo "Protected macOS release asset set is incomplete or unexpected." >&2
+            exit 1
+          fi
+          test -z "$(find "$distribution" -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
+
+          zip_listing="$state/final-app-zip.list"
+          zipinfo -1 "$app_zip" >"$zip_listing"
+          if grep -E '(^/|(^|/)\.\.(/|$)|\\)' "$zip_listing"; then
+            echo "Final app ZIP contains an unsafe path." >&2
+            exit 1
+          fi
+          zip_stage="$state/final-app-zip"
+          mkdir -m 0700 "$zip_stage"
+          ditto -x -k "$app_zip" "$zip_stage"
+          [[ -d "$zip_stage/GTA Claw.app" && ! -L "$zip_stage/GTA Claw.app" ]]
+          test -z "$(find "$zip_stage" -type l -print -quit)"
+          /bin/bash "$verifier" "$zip_stage/GTA Claw.app"
+          codesign --verify --deep --strict --verbose=2 "$zip_stage/GTA Claw.app"
+          spctl --assess --type execute --verbose=4 "$zip_stage/GTA Claw.app"
+          xcrun stapler validate "$zip_stage/GTA Claw.app"
+
+          for artifact in "$app_zip" "$dmg" "$pkg"; do
+            name="$(basename "$artifact")"
+            sha1="$(shasum -a 1 "$artifact" | awk '{print $1}')"
+            sha256="$(shasum -a 256 "$artifact" | awk '{print $1}')"
+            python3 "$state/validate-spdx-tag-value.py" \
+              "$artifact.spdx" "$name" "$sha1" "$sha256" "$EXPECTED_VERSION"
+            jq -e \
+              --arg digest "$sha256" \
+              --arg name "$name" \
+              --arg source "$EXPECTED_RELEASE_SHA" \
+              '.subject == [{"name": $name, "digest": {"sha256": $digest}}] and
+               .predicate.runDetails.metadata.invocationId == $source' \
+              "$artifact.provenance.json" >/dev/null
+          done
+
+          manifest="$state/SHA256SUMS-macos"
+          (
+            cd "$distribution"
+            for artifact in ./*; do
+              digest="$(shasum -a 256 "$artifact" | awk '{print $1}')"
+              printf '%s  %s\n' "$digest" "${artifact#./}"
+            done
+          ) >"$manifest"
+          mv "$manifest" "$distribution/SHA256SUMS-macos"
+          printf '%s\n' SHA256SUMS-macos >>"$expected"
+          LC_ALL=C sort -o "$expected" "$expected"
+          find "$distribution" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; |
+            LC_ALL=C sort >"$actual"
+          diff -u "$expected" "$actual"
+          echo "Protected release contract passed."
+
+      - name: Publish exact bytes to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          distribution="$RUNNER_TEMP/gta-claw-release/distribution"
+          tag="$GITHUB_REF_NAME"
+          gh release view "$tag" >/dev/null 2>&1 || {
+            gh release create "$tag" \
+              --draft \
+              --verify-tag \
+              --title "GTA Claw $tag" \
+              --notes 'Native Rust release artifacts. Verify platform SHA256SUMS, SBOMs, and provenance before installation.' ||
+              gh release view "$tag" >/dev/null
+          }
+          release_json="$(gh release view "$tag" --json isDraft)"
+          if [[ "$(jq -r '.isDraft' <<<"$release_json")" != "true" ]]; then
+            echo "Refusing to replace assets on an already-published release." >&2
+            exit 1
+          fi
+          existing="$(gh release view "$tag" --json assets --jq '.assets[].name')"
+          if grep -Fqx SHA256SUMS-macos <<<"$existing"; then
+            echo "macOS release completion is already immutable; retaining published bytes."
+            exit 0
+          fi
+          existing_dir="$(mktemp -d "$RUNNER_TEMP/gta-claw-existing-macos-release.XXXXXX")"
+          paths=()
+          for path in "$distribution"/*; do
+            if [[ ! -f "$path" || -L "$path" ]]; then
+              echo "Refusing non-regular macOS release asset: $path" >&2
+              exit 1
+            fi
+            name="$(basename "$path")"
+            if [[ "$name" == "SHA256SUMS-macos" ]]; then
+              continue
+            fi
+            if grep -Fqx "$name" <<<"$existing"; then
+              gh release download "$tag" --pattern "$name" --dir "$existing_dir"
+              if ! cmp "$path" "$existing_dir/$name"; then
+                echo "Refusing to discard different existing release bytes: $name" >&2
+                exit 1
+              fi
+            else
+              paths+=("$path")
+            fi
+          done
+          [[ "${#paths[@]}" -gt 0 || -n "$existing" ]] || {
+            echo "No macOS release artifacts are available to upload." >&2
+            exit 1
+          }
+          if [[ "${#paths[@]}" -gt 0 ]]; then
+            gh release upload "$tag" "${paths[@]}"
+          fi
+          gh release upload "$tag" "$distribution/SHA256SUMS-macos"
 
       - name: Always remove temporary keychain and credentials
         if: always()
@@ -811,3 +1192,13 @@ jobs:
           fi
           rm -rf -- "$RUNNER_TEMP/gta-claw-release-download"
           rm -rf -- "$state"
+
+  finalize-release:
+    name: Finalize joint desktop release
+    if: github.event_name == 'workflow_dispatch' && inputs.release == true
+    needs: protected-release-contract
+    permissions:
+      contents: write
+    uses: ./.github/workflows/joint-release-finalize.yml
+    with:
+      tag: ${{ github.ref_name }}

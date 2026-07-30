@@ -36,11 +36,19 @@ const RUST_WORKFLOW: &str = ".github/workflows/rust.yml";
 const MACOS_WORKFLOW: &str = ".github/workflows/macos-packaging.yml";
 const ANDROID_WORKFLOW: &str = ".github/workflows/android-packaging.yml";
 const IOS_WORKFLOW: &str = ".github/workflows/ios-packaging.yml";
+const WINDOWS_WORKFLOW: &str = ".github/workflows/windows-packaging.yml";
+const JOINT_RELEASE_WORKFLOW: &str = ".github/workflows/joint-release-finalize.yml";
 const CANONICAL_RUST: &[u8] = include_bytes!("../policy/final/.github/workflows/rust.yml");
 const CANONICAL_MACOS: &[u8] =
     include_bytes!("../policy/final/.github/workflows/macos-packaging.yml");
-const CANONICAL_ANDROID: &[u8] = include_bytes!("../../../workflows/android-packaging.yml");
-const CANONICAL_IOS: &[u8] = include_bytes!("../../../workflows/ios-packaging.yml");
+const CANONICAL_ANDROID: &[u8] =
+    include_bytes!("../policy/final/.github/workflows/android-packaging.yml");
+const CANONICAL_IOS: &[u8] =
+    include_bytes!("../policy/final/.github/workflows/ios-packaging.yml");
+const CANONICAL_WINDOWS: &[u8] =
+    include_bytes!("../policy/final/.github/workflows/windows-packaging.yml");
+const CANONICAL_JOINT_RELEASE: &[u8] =
+    include_bytes!("../policy/final/.github/workflows/joint-release-finalize.yml");
 const MAX_WORKFLOW_BYTES: u64 = 512 * 1024;
 const MAX_WORKFLOW_TREE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ACTIONLINT_BYTES: u64 = 64 * 1024 * 1024;
@@ -83,9 +91,10 @@ const REQUIRED_WORKFLOWS: [&str; 8] = [
 /// Additional exact workflow paths admitted for the newly shipped mobile
 /// platforms. Each may be absent or present; nothing else may be present, and
 /// a present file is validated exactly like a required one.
-const ADMITTED_WORKFLOWS: [&str; 2] = [
+const ADMITTED_WORKFLOWS: [&str; 3] = [
     ".github/workflows/android-packaging.yml",
     ".github/workflows/ios-packaging.yml",
+    ".github/workflows/joint-release-finalize.yml",
 ];
 
 /// Parsed workflow identity used to prevent required-check spoofing.
@@ -522,6 +531,8 @@ pub fn validate_final_workflows(candidate: &SafeRoot) -> PolicyResult<()> {
         (MACOS_WORKFLOW, CANONICAL_MACOS),
         (ANDROID_WORKFLOW, CANONICAL_ANDROID),
         (IOS_WORKFLOW, CANONICAL_IOS),
+        (WINDOWS_WORKFLOW, CANONICAL_WINDOWS),
+        (JOINT_RELEASE_WORKFLOW, CANONICAL_JOINT_RELEASE),
     ] {
         let actual = candidate.read_bytes(path, MAX_WORKFLOW_BYTES)?;
         if actual != expected {

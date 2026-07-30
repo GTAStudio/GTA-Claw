@@ -1,0 +1,167 @@
+schema = 1
+ready_for_validation = false
+source_branch = "aizhihuxiao-fix-packaging-mobile-gates"
+source_oid = "4f0d2e16490b778ebade5ffb4e24d5e27eb0212e"
+source_merge_base = "92c2329b151d4b71b342a54d944254da2f3c61a5"
+source_worktree = "linked worktree aizhihuxiao-stunning-chainsaw"
+source_status = "provisional: macos-packaging.yml and both packaging/macos self-tests are uncommitted"
+blocker = "Re-pin all provisional macOS bytes after PR #233 stops changing and is rebased onto the landed PR #234 base."
+
+[[asset]]
+path = ".github/workflows/android-packaging.yml"
+source = "4f0d2e16490b778ebade5ffb4e24d5e27eb0212e:.github/workflows/android-packaging.yml"
+source_bytes = 6675
+source_sha256 = "e7e03f92ea1bfe0b8b5384e88662f81b6e20b2e2c0f2566655144e748e3a105a"
+fixture = "policy/final/.github/workflows/android-packaging.yml"
+bytes = 7215
+sha256 = "649a75eb431c5a91b6f90f302dad2a0ecf5ea3f20a6deffad489b80d62128c04"
+derivation = "PR #234 pinned Ubuntu/MSRV/host-target policy plus the exact PR #233 SDK, APK-member, emulator-build, AVD, and required-smoke hunks; the superseded unpinned libfontconfig1-dev step is not admitted."
+enforcement = "src/workflows.rs::validate_final_workflows"
+
+[[asset]]
+path = ".github/workflows/ios-packaging.yml"
+source = "4f0d2e16490b778ebade5ffb4e24d5e27eb0212e:.github/workflows/ios-packaging.yml"
+source_bytes = 6575
+source_sha256 = "27ee4afc8c1e720a7a3343eb3703d3f9fc843f46b52e2684a6143e03e332fc8f"
+fixture = "policy/final/.github/workflows/ios-packaging.yml"
+bytes = 7279
+sha256 = "f0a7d9a3daadc0b750a143efc6a39a9e75e93d13f63fcb886b661a0d0268d0b7"
+derivation = "Clean three-way composition of the exact PR #233 simulator hunks over the PR #234 pinned Ubuntu/MSRV/host-target workflow."
+enforcement = "src/workflows.rs::validate_final_workflows"
+
+[[asset]]
+path = ".github/workflows/joint-release-finalize.yml"
+source = "4f0d2e16490b778ebade5ffb4e24d5e27eb0212e:.github/workflows/joint-release-finalize.yml"
+source_bytes = 4243
+source_sha256 = "259adbe4511cf4188ff76a935906f9fa42d76feb370aeffb0f1ee82082008f3d"
+fixture = "policy/final/.github/workflows/joint-release-finalize.yml"
+bytes = 4243
+sha256 = "259adbe4511cf4188ff76a935906f9fa42d76feb370aeffb0f1ee82082008f3d"
+derivation = "Exact committed PR #233 bytes."
+enforcement = "src/workflows.rs::validate_final_workflows"
+
+[[asset]]
+path = ".github/workflows/macos-packaging.yml"
+source = "worktree over 4f0d2e16490b778ebade5ffb4e24d5e27eb0212e:.github/workflows/macos-packaging.yml"
+source_bytes = 53171
+source_sha256 = "a8a3ab6a47fb0745a333791cced6504cded1f3306cb02e6743dae2289d030f92"
+fixture = "policy/final/.github/workflows/macos-packaging.yml"
+bytes = 53162
+sha256 = "96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f"
+derivation = "Clean application of the exact dirty PR #233 worktree delta over the PR #234 composite that retains python3 and the requires-a-Windows-or-macOS diagnostic."
+enforcement = "src/workflows.rs::validate_final_workflows"
+provisional = true
+
+[[asset]]
+path = ".github/workflows/windows-packaging.yml"
+source = "4f0d2e16490b778ebade5ffb4e24d5e27eb0212e:.github/workflows/windows-packaging.yml"
+source_bytes = 21523
+source_sha256 = "6d6d4b6b217aa664863035b8f5fd54e4617407d77da0b1bb0cd1b686745dcf7f"
+fixture = "policy/final/.github/workflows/windows-packaging.yml"
+bytes = 21523
+sha256 = "6d6d4b6b217aa664863035b8f5fd54e4617407d77da0b1bb0cd1b686745dcf7f"
+derivation = "Exact committed PR #233 bytes."
+enforcement = "src/workflows.rs::validate_final_workflows"
+
+[[asset]]
+path = "android/scripts/emulator-smoke.sh"
+source = "4f0d2e16490b778ebade5ffb4e24d5e27eb0212e:android/scripts/emulator-smoke.sh"
+source_bytes = 5143
+source_sha256 = "eb2d3fa1d086d61a973086e81507301a9e41bdda64c5b0e5c4ac3d860720ff59"
+fixture = "policy/final/android/scripts/emulator-smoke.sh"
+bytes = 5143
+sha256 = "eb2d3fa1d086d61a973086e81507301a9e41bdda64c5b0e5c4ac3d860720ff59"
+derivation = "Exact committed PR #233 bytes."
+enforcement = "src/repository_policy.rs::validate_pr233_final_assets"
+
+[[asset]]
+path = "android/scripts/validate-apk-native-member.sh"
+source = "4f0d2e16490b778ebade5ffb4e24d5e27eb0212e:android/scripts/validate-apk-native-member.sh"
+source_bytes = 555
+source_sha256 = "cea15111f95e6094b4eb2fd3050f46dcbe229bf38610f71188be09aa874b3680"
+fixture = "policy/final/android/scripts/validate-apk-native-member.sh"
+bytes = 555
+sha256 = "cea15111f95e6094b4eb2fd3050f46dcbe229bf38610f71188be09aa874b3680"
+derivation = "Exact committed PR #233 bytes."
+enforcement = "src/repository_policy.rs::validate_pr233_final_assets"
+
+[[asset]]
+path = "android/scripts/workflow-self-test.sh"
+source = "4f0d2e16490b778ebade5ffb4e24d5e27eb0212e:android/scripts/workflow-self-test.sh"
+source_bytes = 3008
+source_sha256 = "4e28c8a64f74b9f5648378c233726c27bc29ede5a2145f784979c44091a2e0cb"
+fixture = "policy/final/android/scripts/workflow-self-test.sh"
+bytes = 3008
+sha256 = "4e28c8a64f74b9f5648378c233726c27bc29ede5a2145f784979c44091a2e0cb"
+derivation = "Exact committed PR #233 bytes."
+enforcement = "src/repository_policy.rs::validate_pr233_final_assets"
+
+[[asset]]
+path = "ios/scripts/simulator-smoke.sh"
+source = "4f0d2e16490b778ebade5ffb4e24d5e27eb0212e:ios/scripts/simulator-smoke.sh"
+source_bytes = 3754
+source_sha256 = "cd511bc121cc3a32780e9756a2d6fe71e25cf4111f4a9e53afbcac93553a325b"
+fixture = "policy/final/ios/scripts/simulator-smoke.sh"
+bytes = 3754
+sha256 = "cd511bc121cc3a32780e9756a2d6fe71e25cf4111f4a9e53afbcac93553a325b"
+derivation = "Exact committed PR #233 bytes."
+enforcement = "src/repository_policy.rs::validate_pr233_final_assets"
+
+[[asset]]
+path = "ios/scripts/workflow-self-test.sh"
+source = "4f0d2e16490b778ebade5ffb4e24d5e27eb0212e:ios/scripts/workflow-self-test.sh"
+source_bytes = 1860
+source_sha256 = "2b25dcf75ee561614010778fbf78ff2ddcf91ab24c5d85a3312c98babc774639"
+fixture = "policy/final/ios/scripts/workflow-self-test.sh"
+bytes = 1860
+sha256 = "2b25dcf75ee561614010778fbf78ff2ddcf91ab24c5d85a3312c98babc774639"
+derivation = "Exact committed PR #233 bytes."
+enforcement = "src/repository_policy.rs::validate_pr233_final_assets"
+
+[[asset]]
+path = "packaging/macos/joint-release-self-test.sh"
+source = "worktree over 4f0d2e16490b778ebade5ffb4e24d5e27eb0212e:packaging/macos/joint-release-self-test.sh"
+source_bytes = 12411
+source_sha256 = "7af7048f7e9faa31549d5041cfd0db292ded84119f353693d2b37d3ea8f5a63f"
+fixture = "policy/final/packaging/macos/joint-release-self-test.sh"
+bytes = 12411
+sha256 = "7af7048f7e9faa31549d5041cfd0db292ded84119f353693d2b37d3ea8f5a63f"
+derivation = "Exact dirty PR #233 worktree bytes."
+enforcement = "src/repository_policy.rs::validate_pr233_final_assets"
+provisional = true
+
+[[asset]]
+path = "packaging/macos/workflow-self-test.sh"
+source = "worktree over 4f0d2e16490b778ebade5ffb4e24d5e27eb0212e:packaging/macos/workflow-self-test.sh"
+source_bytes = 4931
+source_sha256 = "503b5e94c89b9c66849150dba5cc52bc1a03d7c234b4561d7dfcf0c6d338a53d"
+fixture = "policy/final/packaging/macos/workflow-self-test.sh"
+bytes = 4931
+sha256 = "503b5e94c89b9c66849150dba5cc52bc1a03d7c234b4561d7dfcf0c6d338a53d"
+derivation = "Exact dirty PR #233 worktree bytes."
+enforcement = "src/repository_policy.rs::validate_pr233_final_assets"
+provisional = true
+
+[[admission_base]]
+path = "android/scripts/workflow-self-test.sh"
+source = "92c2329b151d4b71b342a54d944254da2f3c61a5:android/scripts/workflow-self-test.sh"
+fixture = "policy/pr233-base/android/scripts/workflow-self-test.sh"
+bytes = 2224
+sha256 = "d323a0519d6737f7ac788db7b906fbd8aba20574cd74ea622d6d408b9c1fd654"
+enforcement = "src/repository_policy.rs::is_pr233_admission_base"
+
+[[admission_base]]
+path = "ios/scripts/workflow-self-test.sh"
+source = "92c2329b151d4b71b342a54d944254da2f3c61a5:ios/scripts/workflow-self-test.sh"
+fixture = "policy/pr233-base/ios/scripts/workflow-self-test.sh"
+bytes = 2186
+sha256 = "ac8894f3d723d9d0e80afe681f94954dea283e31a69c13bbfc67a807df98183b"
+enforcement = "src/repository_policy.rs::is_pr233_admission_base"
+
+[[admission_base]]
+path = "packaging/macos/workflow-self-test.sh"
+source = "92c2329b151d4b71b342a54d944254da2f3c61a5:packaging/macos/workflow-self-test.sh"
+fixture = "policy/pr233-base/packaging/macos/workflow-self-test.sh"
+bytes = 3156
+sha256 = "bb97516321da7336db88f79a088af8e5bdfa949dcbe48a18ef750e80419d05a0"
+enforcement = "src/repository_policy.rs::is_pr233_admission_base"

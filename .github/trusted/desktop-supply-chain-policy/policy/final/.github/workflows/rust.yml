@@ -6,37 +6,53 @@ on:
       - main
     paths:
       - ".cargo/**"
+      - ".env.example"
       - ".gitattributes"
       - ".github/fixtures/cargo-audit/**"
       - ".github/fixtures/security-tools/**"
       - ".github/workflows/macos-packaging.yml"
       - ".github/workflows/rust.yml"
       - "apps/**"
+      - "compat/**"
       - "crates/**"
       - "desktop/**"
+      - "src/**"
+      - "test/**"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "Dockerfile"
       - ".deny*.toml"
       - "deny*.toml"
+      - "package-lock.json"
+      - "package.json"
       - "rust-toolchain.toml"
       - "rustfmt.toml"
+      - "tsconfig.json"
   pull_request:
     paths:
       - ".cargo/**"
+      - ".env.example"
       - ".gitattributes"
       - ".github/fixtures/cargo-audit/**"
       - ".github/fixtures/security-tools/**"
       - ".github/workflows/macos-packaging.yml"
       - ".github/workflows/rust.yml"
       - "apps/**"
+      - "compat/**"
       - "crates/**"
       - "desktop/**"
+      - "src/**"
+      - "test/**"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "Dockerfile"
       - ".deny*.toml"
       - "deny*.toml"
+      - "package-lock.json"
+      - "package.json"
       - "rust-toolchain.toml"
       - "rustfmt.toml"
+      - "tsconfig.json"
   workflow_dispatch:
 
 permissions:
@@ -69,6 +85,33 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Set up pinned Python
+        if: runner.os == 'Linux'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.13.5"
+
+      - name: Validate locked Python compatibility policy
+        if: runner.os == 'Linux'
+        run: |
+          source_revision="$(
+            python3 -c 'import json; print(json.load(open("compat/legacy/contract.json", encoding="utf-8"))["source_revision"])'
+          )"
+          if ! [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "compatibility source_revision must be an exact lowercase commit SHA"
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "$source_revision"
+          test "$(git rev-parse FETCH_HEAD)" = "$source_revision"
+          git cat-file -e "${source_revision}^{commit}"
+          python3 -m pip install \
+            --disable-pip-version-check \
+            --only-binary=:all: \
+            --require-hashes \
+            --requirement compat/legacy/scripts/requirements.txt
+          python3 -m pip check
+          python3 compat/legacy/scripts/validate.py
+
       - name: Check workspace
         run: cargo check --workspace --all-targets --locked
 
@@ -92,7 +135,7 @@ jobs:
         shell: bash
         run: |
           cargo metadata --locked --format-version 1 |
-            python -c 'import json, sys; names = {package["name"] for package in json.load(sys.stdin)["packages"]}; forbidden = sorted(name for name in names if name == "slint" or name == "slint-build" or name.startswith("i-slint")); assert not forbidden, f"root metadata contains Slint packages: {forbidden}"'
+            python3 -c 'import json, sys; names = {package["name"] for package in json.load(sys.stdin)["packages"]}; forbidden = sorted(name for name in names if name == "slint" or name == "slint-build" or name.startswith("i-slint")); assert not forbidden, f"root metadata contains Slint packages: {forbidden}"'
 
   msrv:
     name: MSRV (1.94.0)
@@ -159,6 +202,22 @@ jobs:
       - name: Check formatting
         run: cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
 
+      - name: Install MSRV toolchain
+        run: rustup toolchain install 1.94.0 --profile minimal
+
+      - name: Check desktop workspace at MSRV
+        run: cargo +1.94.0 check --manifest-path desktop/Cargo.toml --workspace --all-targets --locked
+
+      - name: Check Windows ARM64 desktop target at MSRV
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup target add --toolchain 1.94.0 aarch64-pc-windows-msvc
+          cargo +1.94.0 check --manifest-path desktop/Cargo.toml `
+            --package gta-claw-desktop --all-targets `
+            --target aarch64-pc-windows-msvc --locked
+
       - name: Check workspace
         run: cargo check --manifest-path desktop/Cargo.toml --workspace --all-targets --locked
 
@@ -194,7 +253,7 @@ jobs:
         run: |
           cargo metadata --manifest-path desktop/Cargo.toml --locked --format-version 1 \
             --filter-platform x86_64-unknown-linux-gnu |
-            python -c 'import json, sys; names = {package["name"] for package in json.load(sys.stdin)["packages"]}; forbidden = sorted(name for name in names if name == "slint" or name == "slint-build" or name.startswith("i-slint")); assert not forbidden, f"Linux desktop metadata contains Slint packages: {forbidden}"'
+            python3 -c 'import json, sys; names = {package["name"] for package in json.load(sys.stdin)["packages"]}; forbidden = sorted(name for name in names if name == "slint" or name == "slint-build" or name.startswith("i-slint")); assert not forbidden, f"Linux desktop metadata contains Slint packages: {forbidden}"'
 
       - name: Assert desktop build rejects Linux
         shell: bash
@@ -209,7 +268,7 @@ jobs:
             echo "Desktop build unexpectedly succeeded on Linux"
             exit 1
           fi
-          grep -F "gta-claw-desktop supports only Windows and macOS" <<<"$output"
+          grep -F "requires a Windows or macOS build host" <<<"$output"
 
   supply-chain:
     name: Supply chain
@@ -477,8 +536,8 @@ jobs:
 
           set +e
           rejected_output="$(
-            "$deny_runner" --manifest-path "$fixture/Cargo.toml" --locked \
-              check --config "$fixture/deny.toml" licenses 2>&1
+            "$deny_runner" --manifest-path "$fixture/Cargo.toml" \
+              check --config "$fixture/deny.toml" --locked licenses 2>&1
           )"
           rejected_status=$?
           set -e
@@ -491,8 +550,8 @@ jobs:
             { allow = ["GPL-3.0-only"], name = "prohibited" },
           ]
           EOF
-          "$deny_runner" --manifest-path "$fixture/Cargo.toml" --locked \
-            check --config "$fixture/deny.toml" licenses
+          "$deny_runner" --manifest-path "$fixture/Cargo.toml" \
+            check --config "$fixture/deny.toml" --locked licenses
           rm "$fixture/deny.exceptions.toml"
 
           mkdir -p "$fixture/late/src"
@@ -511,8 +570,8 @@ jobs:
           EOF
           set +e
           stale_output="$(
-            "$deny_runner" --manifest-path "$fixture/Cargo.toml" --locked \
-              check --config "$fixture/deny.toml" licenses 2>&1
+            "$deny_runner" --manifest-path "$fixture/Cargo.toml" \
+              check --config "$fixture/deny.toml" --locked licenses 2>&1
           )"
           stale_status=$?
           set -e
@@ -523,40 +582,35 @@ jobs:
       - name: Check root dependency policy
         run: >-
           "${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-deny-clean"
-          --manifest-path "${{ github.workspace }}/Cargo.toml" --locked
-          --all-features check --config "${{ github.workspace }}/deny.toml"
+          --manifest-path "${{ github.workspace }}/Cargo.toml"
+          check --config "${{ github.workspace }}/deny.toml"
+          --locked --all-features
 
-      - name: Check Windows x64 desktop dependency policy
+      - name: Check shipped desktop dependency policy
         run: >-
           "${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-deny-clean"
-          --manifest-path "${{ github.workspace }}/desktop/Cargo.toml" --locked
-          --target x86_64-pc-windows-msvc check
-          --config "${{ github.workspace }}/desktop/deny.toml"
-          --warn unmaintained advisories bans licenses sources
+          --manifest-path "${{ github.workspace }}/desktop/Cargo.toml"
+          check --config "${{ github.workspace }}/desktop/deny.toml"
+          --locked --all-features --warn unmaintained
 
-      - name: Check Windows ARM64 desktop dependency policy
-        run: >-
-          "${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-deny-clean"
-          --manifest-path "${{ github.workspace }}/desktop/Cargo.toml" --locked
-          --target aarch64-pc-windows-msvc check
-          --config "${{ github.workspace }}/desktop/deny.toml"
-          --warn unmaintained advisories bans licenses sources
-
-      - name: Check macOS Intel desktop dependency policy
-        run: >-
-          "${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-deny-clean"
-          --manifest-path "${{ github.workspace }}/desktop/Cargo.toml" --locked
-          --target x86_64-apple-darwin check
-          --config "${{ github.workspace }}/desktop/deny.toml"
-          --warn unmaintained advisories bans licenses sources
-
-      - name: Check macOS ARM64 desktop dependency policy
-        run: >-
-          "${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-deny-clean"
-          --manifest-path "${{ github.workspace }}/desktop/Cargo.toml" --locked
-          --target aarch64-apple-darwin check
-          --config "${{ github.workspace }}/desktop/deny.toml"
-          --warn unmaintained advisories bans licenses sources
+      - name: Assert shipped desktop trees exclude Skia
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in \
+            x86_64-pc-windows-msvc \
+            aarch64-pc-windows-msvc \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin; do
+            tree="$(
+              cargo tree --manifest-path desktop/Cargo.toml --locked --all-features \
+                --target "$target" --prefix none --format '{p}'
+            )"
+            if grep -Eq '^(i-slint-renderer-skia|skia-bindings|skia-safe) ' <<<"$tree"; then
+              echo "Desktop target $target unexpectedly activates Skia"
+              exit 1
+            fi
+          done
 
       - name: Test desktop wildcard dependency policy
         shell: bash
@@ -591,8 +645,8 @@ jobs:
             output="$(
               "$deny_runner" \
                 --manifest-path "${{ github.workspace }}/desktop/Cargo.toml" \
-                --locked --target "$target" check \
-                --config "${{ github.workspace }}/desktop/deny.toml" bans 2>&1
+                check --config "${{ github.workspace }}/desktop/deny.toml" \
+                --locked --target "$target" bans 2>&1
             )"
             status=$?
             set -e

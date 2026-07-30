@@ -1,0 +1,551 @@
+# Explicit review ledger for mutation digests affected by the protected rotation.
+# Empty new_sha256 values are intentional: the old oracle remains unmodified until
+# validation derives each digest from that case’s exact canonical mutated bytes.
+# Later validation must use actionlint 1.7.7 with SHA-256
+# 9f7dedb4e23f89f2922073d1a6720405b7b520d4f5832ebb96f0d55a2958886c.
+
+[[case]]
+name = "root-audit-continue-on-error"
+artifact = "RustWorkflow"
+old_sha256 = "b478429aea39df8f52056d4db5bca2c0b2ae5a87b2d42bd1abb9d8b020d05ec6"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "Audit root lockfile must not set continue-on-error"
+mutation_source = "tests/mutations.rs::mutate_negative_case(root-audit-continue-on-error)"
+mutation_operation = "Insert continue-on-error=true on supply-chain/Audit root lockfile."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "desktop-audit-disabled"
+artifact = "RustWorkflow"
+old_sha256 = "548e935e8e767560468a6b30a3f21065f42b62cc4fdfe19b71038dbbe0568a75"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "Audit desktop lockfile must not have an if condition"
+mutation_source = "tests/mutations.rs::mutate_negative_case(desktop-audit-disabled)"
+mutation_operation = "Insert if=github.event_name == 'schedule' on supply-chain/Audit desktop lockfile."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "desktop-audit-redirected"
+artifact = "RustWorkflow"
+old_sha256 = "f6fd74eda4466f80b9d252f8870c8e6099e36676a19da30fd50cdd499c4f7c66"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "Audit desktop lockfile must not set working-directory"
+mutation_source = "tests/mutations.rs::mutate_negative_case(desktop-audit-redirected)"
+mutation_operation = "Insert working-directory=. on Audit desktop lockfile, then append Unrelated desktop step with working-directory=desktop and run=true."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "cargo-audit-install-latest"
+artifact = "RustWorkflow"
+old_sha256 = "c14f6dfe6a2edca9c1e719ebc969e67daf5f35286488a7a935c56d36fe90435f"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "Bootstrap verified Rust security tools script hash changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(cargo-audit-install-latest)"
+mutation_operation = "Replace Bootstrap verified Rust security tools run with cargo install cargo-audit."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "windows-arm64-deny-missing"
+artifact = "RustWorkflow"
+old_sha256 = "1b920e71a1c59add7a4943a35891780963937c193deaff3e60471889438c0607"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "missing Check shipped desktop dependency policy step"
+mutation_source = "tests/mutations.rs::mutate_negative_case(windows-arm64-deny-missing)"
+mutation_operation = "Remove the sole Check shipped desktop dependency policy step from supply-chain."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "supply-checkout-action-substitution"
+artifact = "RustWorkflow"
+old_sha256 = "7abf6fa2af540f0f09e4019ab70914e933eee5c7fc83ca045bf6d6d7ece04385"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "supply-chain checkout action or inputs changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(supply-checkout-action-substitution)"
+mutation_operation = "Replace supply-chain/Checkout uses with example/checkout at forty zeroes."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "job-checks-write"
+artifact = "RustWorkflow"
+old_sha256 = "45aae46cc59c67ae5787da614d5dc29c000438da1d6418f2931ecd6822938fdd"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "job supply-chain permissions exceed read-only allow-list"
+mutation_source = "tests/mutations.rs::mutate_negative_case(job-checks-write)"
+mutation_operation = "Insert supply-chain permissions mapping checks=write."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "job-write-all"
+artifact = "RustWorkflow"
+old_sha256 = "90e127b0ea867fea1f913460f8d4300808c162c1bcdcb66e605f0cb66debdbae"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "job supply-chain permissions must be a read-only mapping"
+mutation_source = "tests/mutations.rs::mutate_negative_case(job-write-all)"
+mutation_operation = "Insert supply-chain permissions=write-all."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "negative-desktop-path"
+artifact = "RustWorkflow"
+old_sha256 = "172feb0b07d2be665b40676afe20f6d77a8c7dcbc6cebd76a9ec8ca9997d087e"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "pull_request paths must exactly match the ordered dependency policy inputs"
+mutation_source = "tests/mutations.rs::mutate_negative_case(negative-desktop-path)"
+mutation_operation = "Append !desktop/** to on.pull_request.paths."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "rust-branches-ignore"
+artifact = "RustWorkflow"
+old_sha256 = "474fdd8578f294d45712632f91ccf74edac9846a67d3e00155aba6ff11cdcb2f"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "rust pull_request trigger keys changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(rust-branches-ignore)"
+mutation_operation = "Insert on.pull_request.branches-ignore=[main] in the Rust workflow."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "rust-types-filter"
+artifact = "RustWorkflow"
+old_sha256 = "889d64c3ff68eb5bfcf959b97f887e5cbcc91f1006e518620501833fa7aed7f8"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "rust pull_request trigger keys changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(rust-types-filter)"
+mutation_operation = "Insert on.pull_request.types=[opened] in the Rust workflow."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "macos-branches-ignore"
+artifact = "MacosWorkflow"
+old_sha256 = "a076ad2b48de28c8a58160dccd3dec04dbbe37d6d139c7306de34587d407c713"
+new_canonical_sha256 = "96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f"
+new_sha256 = ""
+expected_diagnostic = "macOS pull_request trigger changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(macos-branches-ignore)"
+mutation_operation = "Insert on.pull_request.branches-ignore=[main] in the macOS workflow."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "Canonical macOS bytes changed fe812def81183202508464ed0449e4d6c74afe3708ddfa4d9b7202a4c20035d7 -> 96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f by the exact reviewed PR #233 worktree delta. Keep new_sha256 empty until this case's typed serializer bytes produce the intended diagnostic."
+
+[[case]]
+name = "macos-types-filter"
+artifact = "MacosWorkflow"
+old_sha256 = "7d682f522d4951dc7683952bafedfa3c5e02780802319ed79aba2d407999ace8"
+new_canonical_sha256 = "96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f"
+new_sha256 = ""
+expected_diagnostic = "macOS pull_request trigger changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(macos-types-filter)"
+mutation_operation = "Insert on.pull_request.types=[opened] in the macOS workflow."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "Canonical macOS bytes changed fe812def81183202508464ed0449e4d6c74afe3708ddfa4d9b7202a4c20035d7 -> 96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f by the exact reviewed PR #233 worktree delta. Keep new_sha256 empty until this case's typed serializer bytes produce the intended diagnostic."
+
+[[case]]
+name = "supply-job-disabled"
+artifact = "RustWorkflow"
+old_sha256 = "41db5183fcd7dec24da5c3d1cd4d4d1f35a26f8b3baf20f8c3d77b1715b9ea83"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "supply-chain job must not set if"
+mutation_source = "tests/mutations.rs::mutate_negative_case(supply-job-disabled)"
+mutation_operation = "Insert if=github.event_name == 'schedule' on supply-chain."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "supply-job-env-shadow"
+artifact = "RustWorkflow"
+old_sha256 = "0ea6e9edb3dd390f4250842323ddc0c295b003e0db424d6a68c4f75f9ac99ea8"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "supply-chain job must not set env"
+mutation_source = "tests/mutations.rs::mutate_negative_case(supply-job-env-shadow)"
+mutation_operation = "Insert supply-chain env CARGO_AUDIT_BIN=/tmp/fake-audit."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "supply-unknown-shadow-step"
+artifact = "RustWorkflow"
+old_sha256 = "6927b94872622ef6c0dc78447ada6571c99add1cc50bb84052431af5378bc980"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "supply-chain ordered steps changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(supply-unknown-shadow-step)"
+mutation_operation = "Insert at supply-chain step index 2 a Shadow verified audit binary step that writes CARGO_AUDIT_BIN=/tmp/fake-audit to GITHUB_ENV."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "bootstrap-wrapper-env"
+artifact = "RustWorkflow"
+old_sha256 = "b484420d2d10dc5723cac9caf2c89ab2ed629cfa32ead60b080f34e39c06fa03"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "verified tool bootstrap environment changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(bootstrap-wrapper-env)"
+mutation_operation = "Insert RUSTC_WRAPPER=/tmp/fake-wrapper in Bootstrap verified Rust security tools env."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "bootstrap-inherited-shell"
+artifact = "RustWorkflow"
+old_sha256 = "2f709caee6c1ac1f98e573feff60729c164fbc143013b8480640006438d95482"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "verified tool bootstrap shell must clear the startup environment"
+mutation_source = "tests/mutations.rs::mutate_negative_case(bootstrap-inherited-shell)"
+mutation_operation = "Insert shell=bash on Bootstrap verified Rust security tools."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "bootstrap-shadow-path-change"
+artifact = "RustWorkflow"
+old_sha256 = "371a31bf888593d8cb68df66fc900a0f4cb504fb2c114c5ce520856058a3e642"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "verified tool bootstrap environment changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(bootstrap-shadow-path-change)"
+mutation_operation = "Insert PATH=/tmp/shadow in Bootstrap verified Rust security tools env."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "policy-step-runner-env"
+artifact = "RustWorkflow"
+old_sha256 = "1b1f4d9bf0475e77d0e95e110417fe9f890086b94d53bec2185fc6c2d716237c"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "Check root dependency policy step schema changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(policy-step-runner-env)"
+mutation_operation = "Insert five runner/tool shadow variables, each /tmp/poison, in Check root dependency policy env."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "native-matrix-runner-collapse"
+artifact = "MacosWorkflow"
+old_sha256 = "ab667749bcba2009c3b08a731b575c2552c0916f4e8e8bd43ac3e14123d0c2eb"
+new_canonical_sha256 = "96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f"
+new_sha256 = ""
+expected_diagnostic = "native macOS matrix must cover exact ARM64 and Intel runners"
+mutation_source = "tests/mutations.rs::mutate_negative_case(native-matrix-runner-collapse)"
+mutation_operation = "Replace native matrix include row index 1 runner with macos-15."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "Canonical macOS bytes changed fe812def81183202508464ed0449e4d6c74afe3708ddfa4d9b7202a4c20035d7 -> 96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f by the exact reviewed PR #233 worktree delta. Keep new_sha256 empty until this case's typed serializer bytes produce the intended diagnostic."
+
+[[case]]
+name = "source-policy-disabled"
+artifact = "MacosWorkflow"
+old_sha256 = "2ca242c86a81276c49191d289509c50aa0b42733dc9abd81f035fe1c565ea5bd"
+new_canonical_sha256 = "96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f"
+new_sha256 = ""
+expected_diagnostic = "macOS source-policy job must not set if"
+mutation_source = "tests/mutations.rs::mutate_negative_case(source-policy-disabled)"
+mutation_operation = "Insert if=github.event_name == 'schedule' on macOS source-policy job."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "Canonical macOS bytes changed fe812def81183202508464ed0449e4d6c74afe3708ddfa4d9b7202a4c20035d7 -> 96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f by the exact reviewed PR #233 worktree delta. Keep new_sha256 empty until this case's typed serializer bytes produce the intended diagnostic."
+
+[[case]]
+name = "native-arch-assertion-removed"
+artifact = "MacosWorkflow"
+old_sha256 = "078a84959517ad83e434bd103727cf4a81ee9af64b6c84369c6402d1bccb556d"
+new_canonical_sha256 = "96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f"
+new_sha256 = ""
+expected_diagnostic = "native macOS architecture assertion or test command changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(native-arch-assertion-removed)"
+mutation_operation = "Replace Test both Cargo workspaces natively run with cargo test --workspace --all-targets --locked plus LF."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "Canonical macOS bytes changed fe812def81183202508464ed0449e4d6c74afe3708ddfa4d9b7202a4c20035d7 -> 96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f by the exact reviewed PR #233 worktree delta. Keep new_sha256 empty until this case's typed serializer bytes produce the intended diagnostic."
+
+[[case]]
+name = "native-format-replaced"
+artifact = "MacosWorkflow"
+old_sha256 = "a8d14608d022164d7eeecca6db4b66f4083089252d68300fd959464ce01760fc"
+new_canonical_sha256 = "96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f"
+new_sha256 = ""
+expected_diagnostic = "Format both Cargo workspaces script hash changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(native-format-replaced)"
+mutation_operation = "Replace Format both Cargo workspaces run with true."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "Canonical macOS bytes changed fe812def81183202508464ed0449e4d6c74afe3708ddfa4d9b7202a4c20035d7 -> 96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f by the exact reviewed PR #233 worktree delta. Keep new_sha256 empty until this case's typed serializer bytes produce the intended diagnostic."
+
+[[case]]
+name = "native-arch-shell-added"
+artifact = "MacosWorkflow"
+old_sha256 = "33b5c07863d77dcb023d86a41fdadec3df80f8a1955cfea36557d731afc25040"
+new_canonical_sha256 = "96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f"
+new_sha256 = ""
+expected_diagnostic = "Test both Cargo workspaces natively step schema changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(native-arch-shell-added)"
+mutation_operation = "Insert shell=sh on Test both Cargo workspaces natively."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "Canonical macOS bytes changed fe812def81183202508464ed0449e4d6c74afe3708ddfa4d9b7202a4c20035d7 -> 96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f by the exact reviewed PR #233 worktree delta. Keep new_sha256 empty until this case's typed serializer bytes produce the intended diagnostic."
+
+[[case]]
+name = "native-workflow-env-shadow"
+artifact = "MacosWorkflow"
+old_sha256 = "ef42642328b326e7640027fa724938fa1c7e4028182efd4062fbbcf43bea7e9f"
+new_canonical_sha256 = "96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f"
+new_sha256 = ""
+expected_diagnostic = "macOS workflow inherited environment changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(native-workflow-env-shadow)"
+mutation_operation = "Insert workflow-level PATH=/tmp/shadow in the macOS workflow."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "Canonical macOS bytes changed fe812def81183202508464ed0449e4d6c74afe3708ddfa4d9b7202a4c20035d7 -> 96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f by the exact reviewed PR #233 worktree delta. Keep new_sha256 empty until this case's typed serializer bytes produce the intended diagnostic."
+
+[[case]]
+name = "native-matrix-extra-key"
+artifact = "MacosWorkflow"
+old_sha256 = "a6e93baf183716d0b0e299756c9e9319361362418f3c3aed1a6af0880a0288dd"
+new_canonical_sha256 = "96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f"
+new_sha256 = ""
+expected_diagnostic = "native macOS matrix row schema changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(native-matrix-extra-key)"
+mutation_operation = "Insert image=shadow in native matrix include row index 0."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "Canonical macOS bytes changed fe812def81183202508464ed0449e4d6c74afe3708ddfa4d9b7202a4c20035d7 -> 96590dfc9287aac732c51ae360fa677279b86e026aee6bfa8a4d0da16e88ca0f by the exact reviewed PR #233 worktree delta. Keep new_sha256 empty until this case's typed serializer bytes produce the intended diagnostic."
+
+[[case]]
+name = "deny-no-locked"
+artifact = "RustWorkflow"
+old_sha256 = "100ccfcffd6a2259b09ffa081475677e0e71438258987c4abf05a0183bf8e3d9"
+new_canonical_sha256 = "5762fc4f255c9be463a709c84e5190b0a578aedf9fc498b53a53b6bdfc451ec9"
+new_sha256 = ""
+expected_diagnostic = "Check Windows x64 desktop dependency policy command is not exact"
+mutation_source = "tests/mutations.rs::mutate_negative_case(deny-no-locked)"
+mutation_operation = "Remove every literal space--locked from Check shipped desktop dependency policy run."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with serde_yaml_ng::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "deny-advisory-ignore"
+artifact = "DesktopDeny"
+old_sha256 = "6f9e9832a4b82fb713d312da5003f65c5c95324fc10a1ec64f5f59cc28bafcb0"
+new_canonical_sha256 = "209936b5991ece603afbe7e71a5401abc9ba25bd69433090868bfa2d803a4ab6"
+new_sha256 = ""
+expected_diagnostic = "desktop deny advisories.ignore must be empty"
+mutation_source = "tests/mutations.rs::mutate_negative_case(deny-advisory-ignore)"
+mutation_operation = "Replace desktop deny advisories.ignore with [RUSTSEC-2026-0194]."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with toml::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "deny-git-source"
+artifact = "DesktopDeny"
+old_sha256 = "1419ffd6b5eba450fe1971895ee7f8ce390706bd01b57d4e8bfbf57987fd41c7"
+new_canonical_sha256 = "209936b5991ece603afbe7e71a5401abc9ba25bd69433090868bfa2d803a4ab6"
+new_sha256 = ""
+expected_diagnostic = "desktop deny sources.allow-git must be empty"
+mutation_source = "tests/mutations.rs::mutate_negative_case(deny-git-source)"
+mutation_operation = "Insert desktop deny sources.allow-git=[https://github.com/example/unpinned]."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with toml::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "deny-license-widening"
+artifact = "DesktopDeny"
+old_sha256 = "8cdb8b459b89f41ac4a34f8ae604f6ed21f8bb457c257c6076fe806df4f65efe"
+new_canonical_sha256 = "209936b5991ece603afbe7e71a5401abc9ba25bd69433090868bfa2d803a4ab6"
+new_sha256 = ""
+expected_diagnostic = "desktop deny license allow-list changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(deny-license-widening)"
+mutation_operation = "Append GPL-3.0-only to desktop deny licenses.allow."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with toml::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "deny-graph-exclude"
+artifact = "DesktopDeny"
+old_sha256 = "774426b359f177abf4fa535d352bc172233e1c65d715ef29659459f7bb82dc1d"
+new_canonical_sha256 = "209936b5991ece603afbe7e71a5401abc9ba25bd69433090868bfa2d803a4ab6"
+new_sha256 = ""
+expected_diagnostic = "desktop deny graph policy keys changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(deny-graph-exclude)"
+mutation_operation = "Insert desktop deny graph.exclude=[quick-xml]."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with toml::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "root-deny-license-widening"
+artifact = "RootDeny"
+old_sha256 = "bb0765a3cde2b1e2ccad68918c4bc639aceedfbab4a4f53a28c8afcd600f9686"
+new_canonical_sha256 = "f21f987b9d9d72aea4a5edfd3151ad9dd9fbb8eb0e9566c021ad4cbc7abca99a"
+new_sha256 = ""
+expected_diagnostic = "root deny license policy changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(root-deny-license-widening)"
+mutation_operation = "Append GPL-3.0-only to root deny licenses.allow."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with toml::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "root-deny-inline-exception"
+artifact = "RootDeny"
+old_sha256 = "fc996a176592a7222eae3ae544c373e0a926f6d9086fed9d47307666ef745fae"
+new_canonical_sha256 = "f21f987b9d9d72aea4a5edfd3151ad9dd9fbb8eb0e9566c021ad4cbc7abca99a"
+new_sha256 = ""
+expected_diagnostic = "root deny license policy changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(root-deny-inline-exception)"
+mutation_operation = "Insert root deny licenses.exceptions containing name=prohibited and allow=[GPL-3.0-only]."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with toml::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "root-deny-source-widening"
+artifact = "RootDeny"
+old_sha256 = "0bf5edd919b09327fee1b6f45aea8a0a6432d3800990a21fe7ed40fbf4a040b5"
+new_canonical_sha256 = "f21f987b9d9d72aea4a5edfd3151ad9dd9fbb8eb0e9566c021ad4cbc7abca99a"
+new_sha256 = ""
+expected_diagnostic = "root deny source policy changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(root-deny-source-widening)"
+mutation_operation = "Insert root deny sources.allow-git=[https://github.com/example/unpinned]."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with toml::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "root-deny-ban-skip"
+artifact = "RootDeny"
+old_sha256 = "2832f430e8b38e365b58ca1583cfe84f0975f4f3655697a2f26fa9876f88bae7"
+new_canonical_sha256 = "f21f987b9d9d72aea4a5edfd3151ad9dd9fbb8eb0e9566c021ad4cbc7abca99a"
+new_sha256 = ""
+expected_diagnostic = "root deny bans policy changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(root-deny-ban-skip)"
+mutation_operation = "Append table {name=prohibited, version=1.0.0} to root deny bans.skip."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with toml::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "root-deny-string-skip"
+artifact = "RootDeny"
+old_sha256 = "b9452f32eec46f9400af6dd0a8c6160d83580bce1f163a6587cc88ff2de56213"
+new_canonical_sha256 = "f21f987b9d9d72aea4a5edfd3151ad9dd9fbb8eb0e9566c021ad4cbc7abca99a"
+new_sha256 = ""
+expected_diagnostic = "root deny bans policy changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(root-deny-string-skip)"
+mutation_operation = "Append string prohibited to root deny bans.skip."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with toml::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "root-deny-crate-skip"
+artifact = "RootDeny"
+old_sha256 = "226007c6e9d0dcf1e48f5b2a4b083f1b5669dfb91f235e999b97e1f7fc1a00f2"
+new_canonical_sha256 = "f21f987b9d9d72aea4a5edfd3151ad9dd9fbb8eb0e9566c021ad4cbc7abca99a"
+new_sha256 = ""
+expected_diagnostic = "root deny bans policy changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(root-deny-crate-skip)"
+mutation_operation = "Append table {crate=prohibited} to root deny bans.skip."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with toml::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."
+
+[[case]]
+name = "root-deny-versionless-name-skip"
+artifact = "RootDeny"
+old_sha256 = "4c663a6cebb27c4cb285c5587e019ae503b2ec352ba83c95dc94f48cf8fa5b18"
+new_canonical_sha256 = "f21f987b9d9d72aea4a5edfd3151ad9dd9fbb8eb0e9566c021ad4cbc7abca99a"
+new_sha256 = ""
+expected_diagnostic = "root deny bans policy changed"
+mutation_source = "tests/mutations.rs::mutate_negative_case(root-deny-versionless-name-skip)"
+mutation_operation = "Append table {name=prohibited} to root deny bans.skip."
+byte_derivation = "Read the named canonical Final artifact bytes, parse to the typed YAML/TOML value, clone every baseline, apply only mutation_operation through mutate_negative_case, assert exactly the named artifact changed, serialize it with toml::to_string, and SHA-256 the exact serializer UTF-8 bytes."
+validation_command = "ACTIONLINT_BIN=/absolute/path/to/actionlint-1.7.7 cargo test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --test security_policy archived_p04f_mutations_are_actionlint_valid_and_rejected -- --exact"
+ready_for_validation = false
+rationale = "The protected canonical artifact changed; derive this case only from its exact serializer output and confirm the intended diagnostic before replacing old_sha256."

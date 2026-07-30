@@ -8,7 +8,10 @@ use crate::input::SafeRoot;
 use crate::metadata::{MetadataTools, validate_desktop_metadata, validate_root_metadata};
 use crate::ownership::validate_codeowners;
 use crate::policy::{is_bootstrap_state, validate_final_static};
-use crate::repository_policy::validate_repository_policy_transition;
+use crate::repository_policy::{
+    has_pr227_admission_authority, is_pr233_admission_base, is_rotation_base,
+    validate_pr227_candidate, validate_pr233_final_assets, validate_repository_policy_transition,
+};
 use crate::workflows::{
     ActionlintTool, run_actionlint, validate_final_workflows, validate_inventory,
     validate_protected_files,
@@ -37,6 +40,12 @@ pub struct ValidationRequest {
 pub enum BaseState {
     /// Exact short-lived pre-P04f product fingerprint.
     Bootstrap,
+    /// Base-owned trust rotation awaiting the exact PR #227 product transition.
+    Pr227Admission,
+    /// Exact base-owned prerequisite state awaiting product-policy absorption.
+    Rotation,
+    /// Exact PR #234 base awaiting the protected PR #233 script transition.
+    Pr233Admission,
     /// Complete final P04f state with extensible root rules.
     Final,
 }
@@ -61,7 +70,7 @@ pub struct ValidationEvidence {
 /// Returns whether complete final policy must be enforced for the candidate.
 #[must_use]
 pub const fn candidate_requires_final(base_state: BaseState, relevant_change: bool) -> bool {
-    matches!(base_state, BaseState::Final)
+    matches!(base_state, BaseState::Final | BaseState::Pr233Admission)
         || matches!(base_state, BaseState::Bootstrap) && relevant_change
 }
 
@@ -136,9 +145,24 @@ pub fn validate_request(request: &ValidationRequest) -> PolicyResult<ValidationE
     validate_inventory(&candidate)?;
 
     let relevant_change = has_policy_relevant_change(&manifest);
-    let base_state = if is_bootstrap_state(&trusted)? {
+    let bootstrap_state = is_bootstrap_state(&trusted)?;
+    let base_state = if bootstrap_state && has_pr227_admission_authority(&trusted)? {
+        BaseState::Pr227Admission
+    } else if bootstrap_state {
         BaseState::Bootstrap
+    } else if is_rotation_base(&trusted)? {
+        BaseState::Rotation
+    } else if is_pr233_admission_base(&trusted)? {
+        validate_final(
+            &trusted,
+            &request.metadata_tools,
+            &request.actionlint,
+            &request.isolation_root,
+            "trusted-base",
+        )?;
+        BaseState::Pr233Admission
     } else {
+        validate_pr233_final_assets(&trusted)?;
         validate_final(
             &trusted,
             &request.metadata_tools,
@@ -148,11 +172,32 @@ pub fn validate_request(request: &ValidationRequest) -> PolicyResult<ValidationE
         )?;
         BaseState::Final
     };
-    if matches!(base_state, BaseState::Final) {
+    if matches!(
+        base_state,
+        BaseState::Final | BaseState::Pr233Admission | BaseState::Rotation
+    ) {
         validate_repository_policy_transition(&trusted, &candidate)?;
     }
 
-    let candidate_final = if candidate_requires_final(base_state, relevant_change) {
+    let candidate_final = if base_state == BaseState::Pr227Admission {
+        validate_pr227_candidate(&candidate)?;
+        false
+    } else if base_state == BaseState::Rotation {
+        validate_final(
+            &candidate,
+            &request.metadata_tools,
+            &request.actionlint,
+            &request.isolation_root,
+            "candidate",
+        )?;
+        if !is_pr233_admission_base(&candidate)? {
+            return Err(PolicyError::new(
+                "PR #234 candidate must retain the exact pre-PR #233 script state",
+            ));
+        }
+        false
+    } else if candidate_requires_final(base_state, relevant_change) {
+        validate_pr233_final_assets(&candidate)?;
         validate_final(
             &candidate,
             &request.metadata_tools,
