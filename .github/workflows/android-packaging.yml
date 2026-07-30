@@ -63,6 +63,11 @@ jobs:
           "$destination/cargo-deny" --version
           printf '%s\n' "$destination" >> "$GITHUB_PATH"
 
+      - name: Install Android host test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libfontconfig1-dev
+
       - name: Run Android shell source tests
         shell: bash
         run: |
@@ -96,7 +101,10 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "platforms;android-36" \
             "build-tools;36.0.0" \
-            "ndk;30.0.14904198"
+            "ndk;30.0.14904198" \
+            "emulator" \
+            "platform-tools" \
+            "system-images;android-36;google_apis;x86_64"
           printf 'ANDROID_NDK_HOME=%s\n' "$ANDROID_HOME/ndk/30.0.14904198" >> "$GITHUB_ENV"
           printf 'ANDROID_NDK_ROOT=%s\n' "$ANDROID_HOME/ndk/30.0.14904198" >> "$GITHUB_ENV"
 
@@ -133,7 +141,9 @@ jobs:
           set -euo pipefail
           apk="android/target/debug/apk/gta-claw-android.apk"
           test -f "$apk"
-          unzip -l "$apk" | grep -F 'lib/arm64-v8a/libgta_claw_android_shell.so'
+          ./android/scripts/validate-apk-native-member.sh \
+            "$apk" \
+            'lib/arm64-v8a/libgta_claw_android_shell.so'
           badging="$("$ANDROID_HOME/build-tools/36.0.0/aapt2" dump badging "$apk")"
           grep -F "minSdkVersion:'26'" <<<"$badging"
           grep -F "targetSdkVersion:'36'" <<<"$badging"
@@ -148,3 +158,36 @@ jobs:
           path: android/target/debug/apk/gta-claw-android.apk
           if-no-files-found: error
           retention-days: 14
+
+      - name: Build x86_64 emulator APK
+        shell: bash
+        env:
+          SKIA_CACHE_DIR: ${{ runner.temp }}/gta-claw-skia
+        run: ./android/scripts/package.sh x86_64-linux-android
+
+      - name: Create pinned Android emulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -e /dev/kvm ]]; then
+            sudo chmod 666 /dev/kvm
+          fi
+          printf 'no\n' |
+            "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd \
+              --force \
+              --name gta-claw-ci \
+              --package "system-images;android-36;google_apis;x86_64" \
+              --device pixel_6
+
+      - name: Run required Android emulator smoke
+        shell: bash
+        env:
+          MOBILE_SMOKE_REQUIRED: "1"
+          ANDROID_AVD_NAME: gta-claw-ci
+        run: |
+          set -euo pipefail
+          apk="android/target/debug/apk/gta-claw-android.apk"
+          ./android/scripts/validate-apk-native-member.sh \
+            "$apk" \
+            'lib/x86_64/libgta_claw_android_shell.so'
+          ./android/scripts/emulator-smoke.sh "$apk"

@@ -1,0 +1,33 @@
+# shellcheck shell=sh
+set -eu
+
+state_root="${GTA_CLAW_PACKAGE_STATE_ROOT:-/run}"
+systemd_runtime="${GTA_CLAW_SYSTEMD_RUNTIME_DIR:-/run/systemd/system}"
+was_active="$state_root/gta-claw-daemon.was-active"
+was_masked="$state_root/gta-claw-daemon.was-masked"
+was_masked_runtime="$state_root/gta-claw-daemon.was-masked-runtime"
+prepared_marker="$state_root/gta-claw-daemon.upgrade-prepared"
+configured_marker="$state_root/gta-claw-daemon.upgrade-configured"
+
+if [ -d "$systemd_runtime" ]; then
+  systemctl daemon-reload >/dev/null
+  if [ "$1" -eq 1 ]; then
+    systemctl preset gta-claw-daemon.service >/dev/null
+  elif [ "$1" -gt 1 ]; then
+    test -f "$prepared_marker"
+    if [ -e "$was_active" ]; then
+      if [ -e "$was_masked" ] || [ -e "$was_masked_runtime" ]; then
+        systemctl is-active --quiet gta-claw-daemon.service
+      else
+        systemctl restart gta-claw-daemon.service >/dev/null
+        systemctl is-active --quiet gta-claw-daemon.service
+      fi
+    fi
+    touch "$configured_marker"
+  fi
+elif [ "$1" -gt 1 ]; then
+  test -f "$prepared_marker"
+  touch "$configured_marker"
+fi
+
+exit 0

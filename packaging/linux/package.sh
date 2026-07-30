@@ -569,51 +569,17 @@ tar -xf "%{SOURCE0}" -C "%{buildroot}"
 /usr/share/doc/gta-claw
 
 %pre
-set -e
-if [ "\$1" -gt 1 ] && [ -d /run/systemd/system ]; then
-  if systemctl is-active --quiet gta-claw-daemon.service; then
-    touch /run/gta-claw-daemon.was-active
-  else
-    rm -f /run/gta-claw-daemon.was-active
-  fi
-else
-  rm -f /run/gta-claw-daemon.was-active
-fi
-exit 0
-
-%post
-set -e
-if [ -d /run/systemd/system ]; then
-  systemctl daemon-reload >/dev/null
-  if [ "\$1" -eq 1 ]; then
-    systemctl preset gta-claw-daemon.service >/dev/null
-  elif [ "\$1" -gt 1 ] && [ -e /run/gta-claw-daemon.was-active ]; then
-    systemctl restart gta-claw-daemon.service >/dev/null
-  fi
-fi
-exit 0
-
-%preun
-set -e
-if [ -d /run/systemd/system ]; then
-  if [ "\$1" -eq 0 ]; then
-    systemctl disable --now gta-claw-daemon.service >/dev/null
-    if systemctl is-active --quiet gta-claw-daemon.service; then
-      exit 1
-    fi
-  elif [ -e /run/gta-claw-daemon.was-active ]; then
-    systemctl is-active --quiet gta-claw-daemon.service
-    rm -f /run/gta-claw-daemon.was-active
-  fi
-fi
-exit 0
-
-%postun
-set -e
-if [ -d /run/systemd/system ]; then
-  systemctl daemon-reload >/dev/null
-fi
-exit 0
+EOF
+cat "$LINUX_DIR/rpm/pre" >&"$OPEN_OUTPUT_FD"
+printf '\n%%post\n' >&"$OPEN_OUTPUT_FD"
+cat "$LINUX_DIR/rpm/post" >&"$OPEN_OUTPUT_FD"
+printf '\n%%preun\n' >&"$OPEN_OUTPUT_FD"
+cat "$LINUX_DIR/rpm/preun" >&"$OPEN_OUTPUT_FD"
+printf '\n%%postun\n' >&"$OPEN_OUTPUT_FD"
+cat "$LINUX_DIR/rpm/postun" >&"$OPEN_OUTPUT_FD"
+printf '\n%%posttrans\n' >&"$OPEN_OUTPUT_FD"
+cat "$LINUX_DIR/rpm/posttrans" >&"$OPEN_OUTPUT_FD"
+cat >&"$OPEN_OUTPUT_FD" <<EOF
 
 %changelog
 * $changelog_date GTAStudio <noreply@github.com> - $VERSION-$LINUX_PACKAGE_RELEASE

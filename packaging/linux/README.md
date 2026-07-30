@@ -62,28 +62,39 @@ apply the explicit disable preset and stay stopped; active upgrades restart,
 inactive upgrades remain inactive, final removal stops/disables before
 executable unlink, and post-transaction hooks reload systemd. Stop/restart/
 disable errors propagate with native `systemctl` diagnostics. Alternate-root
-Debian transactions never invoke host `systemctl`. The RPM upgrade
-path carries active state through `/run` and uses a critical old-package
-`%preun` postcondition because RPM treats `%post` errors as warnings. No hook
-executes network or dynamic code.
+Debian transactions never invoke host `systemctl`. Before RPM mutates an
+upgrade payload, `%pre` requires exactly one installed old NEVRA and journals
+its active and persistent/runtime enablement state. A rejected preparation
+removes only that new journal, leaving the old NEVRA, every old package byte,
+and prior service state unchanged. `%posttrans` accepts only one replacement
+NEVRA and retires the journal; an incomplete later activation remains fenced
+from old-package erase. Failed final erase restores the captured enablement
+before returning the failure. No hook executes network or dynamic code.
+An administrator-masked active service stays active and masked across an RPM
+replacement; the package validates the live process instead of attempting a
+restart that systemd must reject. Both persistent and runtime masks are
+journaled independently and retired only after old-package erase and the
+post-transaction exact-one-NEVRA check complete.
 
 ## systemd boundary
 
 The service is disabled by default and uses `DynamicUser=yes`; no static
 account is created by package scripts. systemd owns private state, cache, log,
-and runtime directories. The unit removes all capabilities, denies IP
-networking, permits only `AF_UNIX`, and enables `NoNewPrivileges`, private
-temporary storage/devices, strict system/home/kernel/control-group
-protections, namespace/personality/SUID restrictions, syscall filtering, and
-a 15-second SIGTERM stop window with restart-on-failure.
+and runtime directories. `GTA_CLAW_STATE_DIR=/var/lib/gta-claw` wires the
+daemon to the `StateDirectory` systemd creates. The unit removes all
+capabilities and permits `AF_UNIX`, IPv4, and IPv6 so outbound provider
+traffic remains available. Listener exposure stays constrained by the
+daemon's typed loopback defaults rather than a systemd egress filter. The
+unit enables `NoNewPrivileges`, private temporary storage/devices, strict
+system/home/kernel/control-group protections,
+namespace/personality/SUID restrictions, syscall filtering, and a 15-second
+SIGTERM stop window with restart-on-failure.
 
-The current daemon accepts only no arguments or `--probe`. It prints readiness
-and health and then parks; it does not listen, consume systemd sockets, read
-configuration or credentials, persist state, or implement an application
-shutdown protocol. The package therefore invents no flags. The service uses
-only the supported command forms. `gta-claw-daemon.socket.deferred` records a
-future `AF_UNIX` endpoint but deliberately is not a `.socket` unit and is not
-installed in the systemd unit search path.
+The current daemon opens its HTTP, legacy, Gateway, and MCP TCP listeners
+itself and persists runtime state below the configured state directory. The
+packaged defaults remain loopback-only. `gta-claw-daemon.socket.deferred`
+records a future systemd-managed `AF_UNIX` endpoint but deliberately is not a
+`.socket` unit and is not installed in the systemd unit search path.
 
 `gta-claw.env` is for non-secret settings only and currently contains no
 assignments. Secret material belongs in root-owned mode-0600

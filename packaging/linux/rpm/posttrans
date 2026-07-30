@@ -1,0 +1,29 @@
+# shellcheck shell=sh
+set -eu
+
+state_root="${GTA_CLAW_PACKAGE_STATE_ROOT:-/run}"
+old_nevra="$state_root/gta-claw-daemon.old-nevra"
+prepared_marker="$state_root/gta-claw-daemon.upgrade-prepared"
+configured_marker="$state_root/gta-claw-daemon.upgrade-configured"
+
+if [ -e "$prepared_marker" ]; then
+  test -f "$configured_marker"
+  test -f "$old_nevra"
+  installed_nevras="$(rpm -q --qf '%%{NEVRA}\n' gta-claw)"
+  installed_count="$(printf '%s\n' "$installed_nevras" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [ "$installed_count" -ne 1 ]; then
+    echo "Completed RPM upgrade must leave exactly one installed NEVRA; found $installed_count" >&2
+    exit 1
+  fi
+  rm -f \
+    "$old_nevra" \
+    "$state_root/gta-claw-daemon.was-active" \
+    "$state_root/gta-claw-daemon.was-enabled" \
+    "$state_root/gta-claw-daemon.was-enabled-runtime" \
+    "$state_root/gta-claw-daemon.was-masked" \
+    "$state_root/gta-claw-daemon.was-masked-runtime" \
+    "$prepared_marker" \
+    "$configured_marker"
+fi
+
+exit 0

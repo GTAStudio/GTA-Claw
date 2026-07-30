@@ -31,13 +31,28 @@ validate_debian_lifecycle_contract() {
 validate_rpm_lifecycle_contract() {
   local scripts="$1"
   local contract
+  local marker
+
+  for marker in \
+    gta-claw-daemon.old-nevra \
+    gta-claw-daemon.upgrade-prepared \
+    gta-claw-daemon.upgrade-configured \
+    gta-claw-daemon.was-masked \
+    gta-claw-daemon.was-masked-runtime \
+    gta-claw-daemon.remove-was-enabled; do
+    grep -Eq "(^|[^A-Za-z0-9._-])${marker//./\\.}([^A-Za-z0-9._-]|$)" \
+      <<<"$scripts" ||
+      die "RPM lifecycle script contract missing exact marker token: $marker"
+  done
 
   for contract in \
+    "rpm -q --qf '%{NEVRA}\\n' gta-claw" \
     'systemctl daemon-reload' \
     'systemctl preset gta-claw-daemon.service' \
     'systemctl restart gta-claw-daemon.service' \
     'systemctl is-active --quiet gta-claw-daemon.service' \
-    'systemctl disable --now gta-claw-daemon.service'; do
+    'systemctl disable gta-claw-daemon.service' \
+    'systemctl enable gta-claw-daemon.service'; do
     grep -F "$contract" <<<"$scripts" >/dev/null ||
       die "RPM lifecycle script contract missing: $contract"
   done

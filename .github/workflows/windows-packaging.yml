@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/windows-packaging.yml"
+      - ".github/workflows/joint-release-finalize.yml"
       - "packaging/windows/**"
       - "apps/**"
       - "crates/**"
@@ -409,82 +410,163 @@ jobs:
           compression-level: 0
 
       - name: Publish exact bytes to GitHub Release
-        shell: pwsh
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = $env:GITHUB_REF_NAME
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --draft --verify-tag --title "GTA Claw $tag" `
-              --notes 'Native Rust release artifacts. Verify platform SHA256SUMS, SBOMs, and provenance before installation.'
-            if ($LASTEXITCODE -ne 0) {
-              gh release view $tag | Out-Null
-            }
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          gh release view "$tag" >/dev/null 2>&1 || {
+            gh release create "$tag" \
+              --draft \
+              --verify-tag \
+              --title "GTA Claw $tag" \
+              --notes 'Native Rust release artifacts. Verify platform SHA256SUMS, SBOMs, and provenance before installation.' ||
+              gh release view "$tag" >/dev/null
           }
-          $release = gh release view $tag --json isDraft | ConvertFrom-Json
-          if (-not $release.isDraft) {
-            throw 'Refusing to replace assets on an already-published release.'
+          if [[ "$(gh release view "$tag" --json isDraft --jq '.isDraft')" != "true" ]]; then
+            echo "Refusing to replace assets on an already-published release." >&2
+            exit 1
+          fi
+          publication="packaging/windows/out/release"
+          manifest="$publication/SHA256SUMS-windows"
+          completion_state() {
+            local metadata="$1"
+            local asset_digest
+            local asset_size
+            local asset_state
+            local count
+            local download
+            local expected_names
+            local manifest_digest
+            local manifest_path
+            local manifest_size
+            local name
+            local referenced
+            local referenced_file
+            local remote_digest
+            local remote_state
+            local remote_size
+            count="$(
+              jq '[.assets[] | select(.name == "SHA256SUMS-windows")] | length' \
+                <<<"$metadata"
+            )" || return 3
+            [[ "$count" == "0" ]] && return 1
+            [[ "$count" == "1" ]] || return 2
+            remote_state="$(
+              jq -r '.assets[] | select(.name == "SHA256SUMS-windows") | .state' \
+                <<<"$metadata"
+            )" || return 3
+            remote_size="$(
+              jq -r '.assets[] | select(.name == "SHA256SUMS-windows") | .size' \
+                <<<"$metadata"
+            )" || return 3
+            remote_digest="$(
+              jq -r '.assets[] | select(.name == "SHA256SUMS-windows") | .digest' \
+                <<<"$metadata"
+            )" || return 3
+            [[ "$remote_state" == "uploaded" ]] || return 2
+            [[ "$remote_size" =~ ^[1-9][0-9]*$ ]] || return 2
+            [[ "$remote_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 2
+            download="$(
+              mktemp -d "$RUNNER_TEMP/gta-claw-windows-completion.XXXXXX"
+            )" || return 3
+            gh release download "$tag" \
+              --pattern SHA256SUMS-windows \
+              --dir "$download" || return 3
+            manifest_path="$download/SHA256SUMS-windows"
+            [[ -f "$manifest_path" && ! -L "$manifest_path" ]] || return 2
+            manifest_size="$(wc -c <"$manifest_path" | tr -d ' ')" || return 3
+            [[ "$manifest_size" == "$remote_size" ]] || return 2
+            manifest_digest="$(
+              sha256sum "$manifest_path" | awk '{print "sha256:" $1}'
+            )" || return 3
+            [[ "$manifest_digest" == "$remote_digest" ]] || return 2
+
+            expected_names="$(
+              awk '$0 ~ /^[0-9a-f]{64}  [^/\\]+$/ {
+                     print substr($0, 67)
+                   }' "$manifest" |
+                LC_ALL=C sort
+            )" || return 3
+            referenced_file="$download/referenced-names"
+            : >"$referenced_file" || return 3
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              [[ "$line" =~ ^([0-9a-f]{64})\ \ ([^/\\]+)$ ]] || return 2
+              remote_digest="sha256:${BASH_REMATCH[1]}"
+              name="${BASH_REMATCH[2]}"
+              printf '%s\n' "$name" >>"$referenced_file" || return 3
+              count="$(
+                jq --arg name "$name" \
+                  '[.assets[] | select(.name == $name)] | length' <<<"$metadata"
+              )" || return 3
+              [[ "$count" == "1" ]] || return 2
+              asset_state="$(
+                jq -r --arg name "$name" \
+                  '.assets[] | select(.name == $name) | .state' <<<"$metadata"
+              )" || return 3
+              asset_size="$(
+                jq -r --arg name "$name" \
+                  '.assets[] | select(.name == $name) | .size' <<<"$metadata"
+              )" || return 3
+              asset_digest="$(
+                jq -r --arg name "$name" \
+                  '.assets[] | select(.name == $name) | .digest' <<<"$metadata"
+              )" || return 3
+              [[ "$asset_state" == "uploaded" ]] || return 2
+              [[ "$asset_size" =~ ^[1-9][0-9]*$ ]] || return 2
+              [[ "$asset_digest" == "$remote_digest" ]] || return 2
+            done <"$manifest_path"
+            referenced="$(LC_ALL=C sort "$referenced_file")" || return 3
+            [[ -n "$referenced" && "$referenced" == "$expected_names" ]] || return 2
+            return 0
           }
-          $existingAssets = @(gh release view $tag --json assets --jq '.assets[].name')
-          if ('SHA256SUMS-windows' -in $existingAssets) {
-            gh release delete-asset $tag SHA256SUMS-windows --yes
-            if ($LASTEXITCODE -ne 0) {
-              throw 'Failed to remove the previous Windows release completion manifest.'
-            }
+          release_assets="$(gh release view "$tag" --json assets)"
+          if completion_state "$release_assets"; then
+            echo "Windows release completion is valid and immutable; retaining published bytes."
+            exit 0
+          else
+            completion_status=$?
+            if [[ "$completion_status" -eq 2 ]]; then
+              gh release delete-asset "$tag" SHA256SUMS-windows --yes
+            elif [[ "$completion_status" -eq 3 ]]; then
+              echo "Unable to verify existing Windows completion; refusing mutation." >&2
+              exit 1
+            fi
+          fi
+          paths=()
+          while IFS= read -r -d '' path; do
+            if [[ "$(basename "$path")" != "SHA256SUMS-windows" ]]; then
+              paths+=("$path")
+            fi
+          done < <(find "$publication" -mindepth 1 -maxdepth 1 -type f -print0)
+          [[ "${#paths[@]}" -gt 0 ]] || {
+            echo "No Windows release artifacts are available to upload." >&2
+            exit 1
           }
-          $existingAssets = @(gh release view $tag --json assets --jq '.assets[].name')
-          if ('SHA256SUMS-windows' -in $existingAssets) {
-            throw 'Windows release completion manifest remains after deletion.'
-          }
-          $paths = @(Get-ChildItem packaging\windows\out\release -File |
-            Where-Object { $_.Name -ne 'SHA256SUMS-windows' } |
-            Select-Object -ExpandProperty FullName)
-          gh release upload $tag @paths --clobber
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Windows release asset upload failed.'
-          }
-          gh release upload $tag packaging\windows\out\release\SHA256SUMS-windows --clobber
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Windows release checksum upload failed.'
-          }
-          $assets = @(gh release view $tag --json assets --jq '.assets[].name')
-          if ('SHA256SUMS-windows' -in $assets -and 'SHA256SUMS-macos' -in $assets) {
-            $verify = Join-Path $env:RUNNER_TEMP 'gta-claw-joint-release'
-            if (Test-Path -LiteralPath $verify) {
-              Remove-Item -LiteralPath $verify -Recurse -Force
-            }
-            New-Item -ItemType Directory -Path $verify | Out-Null
-            gh release download $tag --dir $verify
-            if ($LASTEXITCODE -ne 0) {
-              throw 'Joint release download failed.'
-            }
-            $expected = @('SHA256SUMS-macos', 'SHA256SUMS-windows')
-            foreach ($manifestName in @('SHA256SUMS-macos', 'SHA256SUMS-windows')) {
-              $manifest = Join-Path $verify $manifestName
-              foreach ($line in [IO.File]::ReadAllLines($manifest)) {
-                if ($line -notmatch '^([0-9a-f]{64})  ([^\\/]+)$') {
-                  throw "Invalid joint release checksum entry: $line"
-                }
-                $name = $Matches[2]
-                $expected += $name
-                $fileHash = Get-FileHash (Join-Path $verify $name) -Algorithm SHA256
-                $actual = $fileHash.Hash.ToLowerInvariant()
-                if ($actual -ne $Matches[1]) {
-                  throw "Joint release checksum mismatch: $name"
-                }
-              }
-            }
-            $actualNames = @(Get-ChildItem $verify -File |
-              Select-Object -ExpandProperty Name |
-              Sort-Object)
-            $expectedNames = @($expected | Sort-Object)
-            if (($actualNames -join "`n") -cne ($expectedNames -join "`n")) {
-              throw 'Joint release asset set differs from both checksum manifests.'
-            }
-            gh release edit $tag --draft=false
-          }
+          release_assets="$(gh release view "$tag" --json assets)"
+          if completion_state "$release_assets"; then
+            echo "Windows release completion became valid and immutable; retaining published bytes."
+            exit 0
+          else
+            completion_status=$?
+            if [[ "$completion_status" -eq 2 ]]; then
+              gh release delete-asset "$tag" SHA256SUMS-windows --yes
+            elif [[ "$completion_status" -eq 3 ]]; then
+              echo "Unable to verify raced Windows completion; refusing mutation." >&2
+              exit 1
+            fi
+          fi
+          existing="$(jq -r '.assets[].name' <<<"$release_assets")"
+          for path in "${paths[@]}"; do
+            name="$(basename "$path")"
+            if grep -Fqx "$name" <<<"$existing"; then
+              gh release delete-asset "$tag" "$name" --yes
+            fi
+          done
+          gh release upload "$tag" "${paths[@]}"
+          gh release upload "$tag" "$manifest"
 
       - name: Always remove signing identity
         if: always()
@@ -496,3 +578,13 @@ jobs:
           }
           Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'gta-claw-signing.pfx') `
             -Force -ErrorAction SilentlyContinue
+
+  finalize-release:
+    name: Finalize joint desktop release
+    if: github.event_name == 'workflow_dispatch' && inputs.release == true
+    needs: release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/joint-release-finalize.yml
+    with:
+      tag: ${{ github.ref_name }}

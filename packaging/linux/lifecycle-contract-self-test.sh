@@ -5,6 +5,7 @@ IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/lifecycle-validation.sh"
+source "$SCRIPT_DIR/lib/common.sh"
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -28,8 +29,30 @@ expect_failure() {
 }
 
 validate_debian_lifecycle_contract "$SCRIPT_DIR/debian"
-rpm_source="$(sed -n '/^%pre$/,/^%changelog$/p' "$SCRIPT_DIR/package.sh")"
+rpm_source="$(
+  cat \
+    "$SCRIPT_DIR/rpm/pre" \
+    "$SCRIPT_DIR/rpm/post" \
+    "$SCRIPT_DIR/rpm/preun" \
+    "$SCRIPT_DIR/rpm/postun" \
+    "$SCRIPT_DIR/rpm/posttrans" |
+    sed 's/%%{NEVRA}/%{NEVRA}/g'
+)"
 validate_rpm_lifecycle_contract "$rpm_source"
+"$SCRIPT_DIR/rpm-lifecycle-self-test.sh"
+
+service="$SCRIPT_DIR/systemd/gta-claw-daemon.service"
+validate_service_contract "$service"
+{
+  cat "$service"
+  printf 'IPAddressDeny=any\n'
+} >"$work/service-blocked-provider-egress"
+expect_failure blocked-provider-egress \
+  validate_service_contract "$work/service-blocked-provider-egress"
+sed 's/^RestrictAddressFamilies=.*/RestrictAddressFamilies=AF_UNIX/' \
+  "$service" >"$work/service-unix-only"
+expect_failure unix-only-service \
+  validate_service_contract "$work/service-unix-only"
 
 cp -R "$SCRIPT_DIR/debian" "$work/missing-disable"
 sed -i.bak \
@@ -50,5 +73,12 @@ expect_failure swallowed-debian-stop \
 expect_failure suppressed-rpm-diagnostics \
   validate_rpm_lifecycle_contract \
   "$rpm_source"$'\n''systemctl status gta-claw-daemon.service >/dev/null 2>&1'
+
+runtime_mask_only="$(
+  sed '/gta-claw-daemon\.was-masked"/d' <<<"$rpm_source"
+)"
+grep -F 'gta-claw-daemon.was-masked-runtime' <<<"$runtime_mask_only" >/dev/null
+expect_failure runtime-mask-cannot-satisfy-persistent-mask \
+  validate_rpm_lifecycle_contract "$runtime_mask_only"
 
 printf 'Lifecycle contract self-tests passed (%d negative cases)\n' "$tests"

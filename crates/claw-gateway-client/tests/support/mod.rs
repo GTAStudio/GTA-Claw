@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use url::Url;
@@ -206,17 +207,19 @@ impl Drop for TestGateway {
     }
 }
 
-pub(crate) async fn raw_stalled_server() -> (Url, CancellationToken, TaskTracker) {
+pub(crate) async fn raw_stalled_server()
+-> (Url, CancellationToken, TaskTracker, oneshot::Receiver<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("address");
     let cancellation = CancellationToken::new();
     let tasks = TaskTracker::new();
     let task_cancellation = cancellation.clone();
+    let (handshake_tx, handshake_rx) = oneshot::channel();
     tasks.spawn(async move {
         if let Ok((stream, _)) = listener.accept().await {
             tokio::select! {
                 () = task_cancellation.cancelled() => {}
-                () = hold_stream(stream) => {}
+                () = hold_stalled_handshake(stream, handshake_tx) => {}
             }
         }
     });
@@ -224,10 +227,25 @@ pub(crate) async fn raw_stalled_server() -> (Url, CancellationToken, TaskTracker
         Url::parse(&format!("ws://{address}")).expect("url"),
         cancellation,
         tasks,
+        handshake_rx,
     )
 }
 
-async fn hold_stream(_stream: TcpStream) {
+async fn hold_stalled_handshake(mut stream: TcpStream, ready: oneshot::Sender<()>) {
+    let mut received = Vec::with_capacity(1024);
+    loop {
+        if received.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        assert!(received.len() < 16 * 1024, "bounded request headers");
+        let mut chunk = [0_u8; 1024];
+        let count = stream.read(&mut chunk).await.expect("read handshake");
+        assert!(count > 0, "handshake EOF");
+        received.extend_from_slice(&chunk[..count]);
+    }
+    ready
+        .send(())
+        .expect("stalled handshake readiness receiver remains open");
     std::future::pending::<()>().await;
 }
 

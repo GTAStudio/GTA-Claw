@@ -26,6 +26,8 @@ run_mount_failure() (
       *) command "$tool" "$@" ;;
     esac
   }
+  # Exercise the shim directly as well as through the sourced mount helper.
+  sudo true
   create_anchored_mounts "$work/repository-source" "$work/target-source"
 )
 
@@ -52,6 +54,8 @@ fi
       *) command "$tool" "$@" ;;
     esac
   }
+  # Exercise the shim directly as well as through the sourced mount helper.
+  sudo true
   cleanup_anchored_mounts
   [[ -z "$ANCHORED_MOUNT_ROOT" && ! -e "$mount_root" ]]
 )
