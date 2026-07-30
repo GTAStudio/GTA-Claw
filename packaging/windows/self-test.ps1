@@ -540,11 +540,36 @@ channel = "1.96.0"
             throw 'Certificate-active Windows phase executes build or supply-chain code.'
         }
         $cleanupContracts = @(
-            @{ Name = 'package import failure'; Text = $packageCertificateWindow; Deletes = 2 },
-            @{ Name = 'package normal cleanup'; Text = $packageCleanupWindow; Deletes = 1 },
-            @{ Name = 'bundle import failure'; Text = $bundleCertificateWindow; Deletes = 1 },
-            @{ Name = 'bundle normal cleanup'; Text = $bundleCleanupWindow; Deletes = 1 },
-            @{ Name = 'final cleanup'; Text = $finalCleanupWindow; Deletes = 1 }
+            @{
+                Name = 'package import failure'
+                Text = $packageCertificateWindow
+                Deletes = 2
+                Verifications = 2
+            },
+            @{
+                Name = 'package normal cleanup'
+                Text = $packageCleanupWindow
+                Deletes = 1
+                Verifications = 1
+            },
+            @{
+                Name = 'bundle import failure'
+                Text = $bundleCertificateWindow
+                Deletes = 1
+                Verifications = 1
+            },
+            @{
+                Name = 'bundle normal cleanup'
+                Text = $bundleCleanupWindow
+                Deletes = 1
+                Verifications = 1
+            },
+            @{
+                Name = 'final cleanup'
+                Text = $finalCleanupWindow
+                Deletes = 1
+                Verifications = 2
+            }
         )
         foreach ($contract in $cleanupContracts) {
             $deleteCount = [regex]::Matches($contract.Text, '-DeleteKey').Count
@@ -553,7 +578,7 @@ channel = "1.96.0"
                 'Test-Path -LiteralPath \$certificatePath'
             ).Count
             if ($deleteCount -ne $contract.Deletes -or
-                $verificationCount -lt $contract.Deletes -or
+                $verificationCount -ne $contract.Verifications -or
                 $contract.Text -match 'Cert:.*SilentlyContinue') {
                 throw "Windows $($contract.Name) does not delete and verify every private key."
             }
