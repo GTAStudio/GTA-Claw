@@ -24,14 +24,13 @@ $ProgressPreference = 'SilentlyContinue'
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptRoot '..\..'))
 Import-Module (Join-Path $scriptRoot 'WindowsPackaging.psm1') -Force
-Import-Module (Join-Path $scriptRoot 'SupplyChain.psm1') -Force
 
 $source = Assert-PlainFile $PackagePath
 $sourceDirectory = Split-Path -Parent $source
 Assert-NoReparsePathComponents -Root $sourceDirectory -Path $source
 $extension = [System.IO.Path]::GetExtension($source).ToLowerInvariant()
-if ($extension -notin @('.msix', '.msixbundle', '.msi')) {
-    throw 'The signing gate accepts only validated MSIX, MSIXBundle, and MSI release candidates.'
+if ($extension -notin @('.zip', '.msix', '.msixbundle', '.msi')) {
+    throw 'The signing gate accepts only validated portable ZIP, MSIX, MSIXBundle, and MSI release candidates.'
 }
 if ([System.IO.Path]::GetFileName($source) -notmatch '-release-candidate-unsigned\.') {
     throw 'Input package must be explicitly labeled release-candidate-unsigned.'
@@ -87,62 +86,104 @@ if (Test-Path -LiteralPath $checksumPath -PathType Leaf) {
 }
 
 $version = Get-CanonicalVersion $repoRoot
-Assert-RustToolchain $repoRoot
 $architecture = 'x64'
 if ([System.IO.Path]::GetFileName($source) -match 'windows-arm64') {
     $architecture = 'arm64'
 }
 $publisher = $certificate.Subject
-$makeAppx = Find-WindowsSdkTool 'makeappx.exe'
 $inspectionRoot = Join-Path $sourceDirectory '.sign-inspection'
 Initialize-MsvcEnvironment x64 | Out-Null
-try {
-if ($extension -eq '.msix') {
-    Test-MsixPackage `
-        -PackagePath $source `
-        -MakeAppxPath $makeAppx `
-        -InspectionRoot (Join-Path $inspectionRoot 'unsigned-msix') `
-        -Version $version.Msix `
-        -Architecture $architecture `
-        -ExpectedPublisher $publisher `
-        -SignatureMode unsigned `
-        -ReleaseStatus release-candidate
-} elseif ($extension -eq '.msixbundle') {
-    Test-MsixBundle `
-        -PackagePath $source `
-        -MakeAppxPath $makeAppx `
-        -InspectionRoot (Join-Path $inspectionRoot 'unsigned-bundle') `
-        -Version $version.Msix `
-        -ExpectedPublisher $publisher `
-        -SignatureMode unsigned `
-        -InnerSignatureMode signed `
-        -InnerReleaseStatus release-candidate
-} else {
-    Test-MsiPackage `
-        -PackagePath $source `
-        -InspectionRoot (Join-Path $inspectionRoot 'unsigned-msi') `
-        -Architecture $architecture `
-        -SignatureMode unsigned `
-        -ReleaseStatus release-candidate
-}
-
-Copy-Item -LiteralPath $source -Destination $OutputPath
 $signTool = Find-WindowsSdkTool 'signtool.exe'
 $storeArguments = @('/sha1', $thumbprint, '/s', 'My')
 if ($CertificateStore -eq 'LocalMachine') {
     $storeArguments += '/sm'
 }
+
+function Add-VerifiedSignature {
+    param([Parameter(Mandatory)][string]$Path)
     Invoke-CheckedCommand -FilePath $signTool -Arguments (@(
         'sign', '/fd', 'SHA256', '/td', 'SHA256', '/tr', $TimestampUrl
-    ) + $storeArguments + @($OutputPath))
-    Invoke-CheckedCommand -FilePath $signTool -Arguments @('verify', '/pa', '/all', $OutputPath)
-    $signature = Get-AuthenticodeSignature -LiteralPath $OutputPath
+    ) + $storeArguments + @($Path))
+    Invoke-CheckedCommand -FilePath $signTool -Arguments @('verify', '/pa', '/all', $Path)
+    $signature = Get-AuthenticodeSignature -LiteralPath $Path
     if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
-        throw "Signature verification failed with status '$($signature.Status)'."
+        throw "Signature verification failed with status '$($signature.Status)': $Path"
     }
     if ($null -eq $signature.TimeStamperCertificate) {
-        throw 'Release signature has no verified timestamp certificate.'
+        throw "Release signature has no verified timestamp certificate: $Path"
     }
+}
+
+try {
+    if ($extension -eq '.zip') {
+        $componentSet = $(if ([System.IO.Path]::GetFileName($source) -match 'headless') {
+            'headless'
+        } else {
+            'desktop'
+        })
+        $payloadRoot = Join-Path $inspectionRoot 'unsigned-zip'
+        Test-ZipPackage `
+            -PackagePath $source `
+            -InspectionRoot $payloadRoot `
+            -Architecture $architecture `
+            -ComponentSet $componentSet `
+            -ReleaseStatus release `
+            -SignatureMode unsigned
+        $expectedExecutables = @('gta-claw-desktop.exe')
+        if ($componentSet -eq 'headless') {
+            $expectedExecutables = @('gta-claw-cli.exe', 'gta-claw-daemon.exe')
+        }
+        foreach ($name in $expectedExecutables) {
+            Add-VerifiedSignature (Join-Path $payloadRoot $name)
+        }
+        Remove-Item -LiteralPath (Join-Path $payloadRoot 'SHA256SUMS.txt') -Force
+        New-HashManifest $payloadRoot | Out-Null
+        Test-HashManifest $payloadRoot
+        New-DeterministicZip -Root $payloadRoot -Destination $OutputPath | Out-Null
+        Test-ZipPackage `
+            -PackagePath $OutputPath `
+            -InspectionRoot (Join-Path $inspectionRoot 'signed-zip') `
+            -Architecture $architecture `
+            -ComponentSet $componentSet `
+            -ReleaseStatus release `
+            -SignatureMode signed
+    } else {
+        $makeAppx = $null
+        if ($extension -in @('.msix', '.msixbundle')) {
+            $makeAppx = Find-WindowsSdkTool 'makeappx.exe'
+        }
+        if ($extension -eq '.msix') {
+            Test-MsixPackage `
+                -PackagePath $source `
+                -MakeAppxPath $makeAppx `
+                -InspectionRoot (Join-Path $inspectionRoot 'unsigned-msix') `
+                -Version $version.Msix `
+                -Architecture $architecture `
+                -ExpectedPublisher $publisher `
+                -SignatureMode unsigned `
+                -ReleaseStatus release-candidate
+        } elseif ($extension -eq '.msixbundle') {
+            Test-MsixBundle `
+                -PackagePath $source `
+                -MakeAppxPath $makeAppx `
+                -InspectionRoot (Join-Path $inspectionRoot 'unsigned-bundle') `
+                -Version $version.Msix `
+                -ExpectedPublisher $publisher `
+                -SignatureMode unsigned `
+                -InnerSignatureMode signed `
+                -InnerReleaseStatus release-candidate
+        } else {
+            Test-MsiPackage `
+                -PackagePath $source `
+                -InspectionRoot (Join-Path $inspectionRoot 'unsigned-msi') `
+                -Architecture $architecture `
+                -SignatureMode unsigned `
+                -ReleaseStatus release-candidate
+        }
+        Copy-Item -LiteralPath $source -Destination $OutputPath
+        Add-VerifiedSignature $OutputPath
+    }
+
     if ($extension -eq '.msix') {
         Test-MsixPackage `
             -PackagePath $OutputPath `
@@ -163,7 +204,7 @@ if ($CertificateStore -eq 'LocalMachine') {
             -SignatureMode signed `
             -InnerSignatureMode signed `
             -InnerReleaseStatus release-candidate
-    } else {
+    } elseif ($extension -eq '.msi') {
         Test-MsiPackage `
             -PackagePath $OutputPath `
             -InspectionRoot (Join-Path $inspectionRoot 'signed-msi') `
@@ -172,22 +213,7 @@ if ($CertificateStore -eq 'LocalMachine') {
             -ReleaseStatus release-candidate
     }
     Write-ArtifactHash $OutputPath | Out-Null
-    $componentSet = 'desktop'
-    if ($extension -eq '.msi') {
-        $componentSet = 'combined'
-    }
-    $targets = @((Get-Architecture $architecture).RustTarget)
-    if ($extension -eq '.msixbundle') {
-        $targets = @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')
-    }
-    New-ArtifactSupplyChain `
-        -RepoRoot $repoRoot `
-        -ArtifactPath $OutputPath `
-        -ComponentSet $componentSet `
-        -RustTarget $targets `
-        -ProvenanceTargets $targets | Out-Null
-    Write-ArtifactSetChecksums $sourceDirectory | Out-Null
-    Test-ArtifactSetChecksums $sourceDirectory
+    Test-ArtifactHash $OutputPath
 } catch {
     foreach ($path in $outputFiles) {
         if (Test-Path -LiteralPath $path) {

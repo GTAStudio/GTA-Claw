@@ -75,9 +75,16 @@ case "$1" in
     printf 'inactive\n' >"$root/active"
     ;;
   start)
+    if [[ "${RPM_TEST_FAIL_START:-0}" == "1" ]]; then
+      exit 1
+    fi
     printf 'active\n' >"$root/active"
     ;;
   restart)
+    if [[ "${RPM_TEST_FAIL_RESTART:-0}" == "1" ]]; then
+      printf 'inactive\n' >"$root/active"
+      exit 1
+    fi
     case "$(cat "$root/enabled")" in
       masked | masked-runtime)
         echo "masked service must not be restarted" >&2
@@ -127,6 +134,80 @@ fi
 test ! -e "$work/state/gta-claw-daemon.old-nevra"
 test ! -e "$work/state/gta-claw-daemon.upgrade-prepared"
 
+printf 'active\n' >"$work/active"
+printf 'enabled\n' >"$work/enabled"
+if PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  RPM_TEST_FAIL_STOP=1 \
+  sh "$work/rendered/pre" 2; then
+  echo "injected RPM upgrade stop failure unexpectedly succeeded" >&2
+  exit 1
+fi
+[[ "$(cat "$work/installed-nevras")" == "$old_nevra" ]]
+[[ "$(sha256sum "$work/daemon" | awk '{print $1}')" == "$old_payload" ]]
+[[ "$(cat "$work/active")" == "active" ]]
+[[ "$(cat "$work/enabled")" == "enabled" ]]
+test ! -e "$work/state/gta-claw-daemon.old-nevra"
+test ! -e "$work/state/gta-claw-daemon.upgrade-prepared"
+
+rm -f "$work/state"/gta-claw-daemon.*
+printf 'active\n' >"$work/active"
+printf 'enabled\n' >"$work/enabled"
+if PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  GTA_CLAW_PACKAGE_TEST_FAIL_UPGRADE_PREPARE=1 \
+  RPM_TEST_FAIL_START=1 \
+  sh "$work/rendered/pre" 2; then
+  echo "RPM upgrade with a failed service restoration unexpectedly succeeded" >&2
+  exit 1
+fi
+[[ "$(cat "$work/installed-nevras")" == "$old_nevra" ]]
+[[ "$(sha256sum "$work/daemon" | awk '{print $1}')" == "$old_payload" ]]
+[[ "$(cat "$work/active")" == "inactive" ]]
+test -f "$work/state/gta-claw-daemon.was-active"
+test -z "$(
+  find \
+    "$work/state" \
+    -maxdepth 1 \
+    -name 'gta-claw-daemon.*' \
+    ! -name 'gta-claw-daemon.was-active' \
+    -print \
+    -quit
+)"
+PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  sh "$work/rendered/pre" 2
+printf 'gta-claw-0:0.1.0-2.x86_64\n' >"$work/installed-nevras"
+PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  sh "$work/rendered/post" 2
+PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  sh "$work/rendered/preun" 1
+PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  sh "$work/rendered/postun" 1
+PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  sh "$work/rendered/posttrans" 2
+[[ "$(cat "$work/active")" == "active" ]]
+test -z "$(find "$work/state" -maxdepth 1 -name 'gta-claw-daemon.*' -print -quit)"
+printf '%s\n' "$old_nevra" >"$work/installed-nevras"
+
 PATH="$work/bin:$PATH" \
   RPM_TEST_ROOT="$work" \
   GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
@@ -167,7 +248,85 @@ PATH="$work/bin:$PATH" \
     exit 1
   }
 
+rm -f "$work/state"/gta-claw-daemon.*
 printf 'active\n' >"$work/active"
+printf 'enabled\n' >"$work/enabled"
+printf 'gta-claw-0:0.1.0-1.x86_64\n' >"$work/installed-nevras"
+PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  sh "$work/rendered/pre" 2
+printf 'gta-claw-0:0.1.0-2.x86_64\n' >"$work/installed-nevras"
+if PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  RPM_TEST_FAIL_RESTART=1 \
+  sh "$work/rendered/post" 2; then
+  echo "injected post-commit RPM activation failure unexpectedly succeeded" >&2
+  exit 1
+fi
+PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  sh "$work/rendered/preun" 1
+PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  sh "$work/rendered/postun" 1
+if PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  sh "$work/rendered/posttrans" 2; then
+  echo "post-commit RPM activation failure was reported as success" >&2
+  exit 1
+fi
+[[ "$(cat "$work/installed-nevras")" == "gta-claw-0:0.1.0-2.x86_64" ]]
+[[ "$(cat "$work/active")" == "inactive" ]]
+test -f "$work/state/gta-claw-daemon.was-active"
+test -z "$(
+  find \
+    "$work/state" \
+    -maxdepth 1 \
+    -name 'gta-claw-daemon.*' \
+    ! -name 'gta-claw-daemon.was-active' \
+    -print \
+    -quit
+)"
+PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  sh "$work/rendered/pre" 2
+PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  sh "$work/rendered/post" 2
+PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  sh "$work/rendered/preun" 1
+PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  sh "$work/rendered/postun" 1
+PATH="$work/bin:$PATH" \
+  RPM_TEST_ROOT="$work" \
+  GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
+  GTA_CLAW_SYSTEMD_RUNTIME_DIR="$work/systemd" \
+  sh "$work/rendered/posttrans" 2
+[[ "$(cat "$work/active")" == "active" ]]
+test -z "$(find "$work/state" -maxdepth 1 -name 'gta-claw-daemon.*' -print -quit)"
+
+printf 'active\n' >"$work/active"
+printf 'enabled-runtime\n' >"$work/enabled"
 PATH="$work/bin:$PATH" \
   RPM_TEST_ROOT="$work" \
   GTA_CLAW_PACKAGE_STATE_ROOT="$work/state" \
@@ -239,4 +398,4 @@ test_masked_upgrade() {
 test_masked_upgrade masked gta-claw-daemon.was-masked
 test_masked_upgrade masked-runtime gta-claw-daemon.was-masked-runtime
 
-echo "RPM pre-mutation, failed-erase, and masked-upgrade self-tests passed"
+echo "RPM pre/post-commit, failed-erase, and masked-upgrade self-tests passed"

@@ -47,13 +47,13 @@ try {
     } elseif ($releaseSet) {
         $expectedArtifactNames = @(
             "gta-claw-$($version.Cargo)-windows-x64-signed.msi",
-            "gta-claw-desktop-$($version.Cargo)-windows-arm64-portable-release.zip",
             "gta-claw-desktop-$($version.Cargo)-windows-arm64-signed.msix",
-            "gta-claw-desktop-$($version.Cargo)-windows-x64-portable-release.zip",
+            "gta-claw-desktop-$($version.Cargo)-windows-arm64-portable-signed.zip",
             "gta-claw-desktop-$($version.Cargo)-windows-x64-signed.msix",
+            "gta-claw-desktop-$($version.Cargo)-windows-x64-portable-signed.zip",
             "gta-claw-desktop-$($version.Cargo)-windows-x64_arm64-signed.msixbundle",
-            "gta-claw-headless-$($version.Cargo)-windows-arm64-portable-release.zip",
-            "gta-claw-headless-$($version.Cargo)-windows-x64-portable-release.zip"
+            "gta-claw-headless-$($version.Cargo)-windows-arm64-portable-signed.zip",
+            "gta-claw-headless-$($version.Cargo)-windows-x64-portable-signed.zip"
         ) | Sort-Object
     } else {
         $packageArchitecture = 'x64'
@@ -94,15 +94,21 @@ try {
                 $componentSet = 'headless'
             }
             $releaseStatus = 'non-release'
-            if ($name -match 'portable-release') {
+            if ($name -match 'portable-(release-candidate-unsigned|signed)') {
                 $releaseStatus = 'release'
             }
+            $zipSignatureMode = $(if ($name -match 'portable-signed\.zip$') {
+                'signed'
+            } else {
+                'unsigned'
+            })
             Test-ZipPackage `
                 -PackagePath $artifact.FullName `
                 -InspectionRoot (Join-Path $inspection $artifact.BaseName) `
                 -Architecture $architecture `
                 -ComponentSet $componentSet `
-                -ReleaseStatus $releaseStatus
+                -ReleaseStatus $releaseStatus `
+                -SignatureMode $zipSignatureMode
         } elseif ($artifact.Extension -eq '.msix') {
             $releaseStatus = 'release-candidate'
             if ($name -match 'unsigned-non-release') {
@@ -144,6 +150,9 @@ try {
     }
     if (Test-Path -LiteralPath (Join-Path $root 'artifacts.json') -PathType Leaf) {
         $allowedFiles['artifacts.json'] = $true
+    }
+    if (Test-Path -LiteralPath (Join-Path $root 'release-identity-windows.json') -PathType Leaf) {
+        $allowedFiles['release-identity-windows.json'] = $true
     }
     foreach ($file in Get-ChildItem -LiteralPath $root -File) {
         if (-not $allowedFiles.ContainsKey($file.Name)) {

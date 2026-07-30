@@ -18,6 +18,16 @@ ensure_output_directory "$work"
 common="$SCRIPT_DIR/lib/common.sh"
 tests=0
 
+insert_service_directive() {
+  local source="$1"
+  local directive="$2"
+  local destination="$3"
+  awk -v directive="$directive" '
+    $0 == "[Install]" { print directive }
+    { print }
+  ' "$source" >"$destination"
+}
+
 expect_failure() {
   local name="$1"
   shift
@@ -234,10 +244,29 @@ cp "$SCRIPT_DIR/systemd/gta-claw-daemon.service" "$work/service-good"
 grep -v '^NoNewPrivileges=yes$' "$work/service-good" >"$work/service-weakened"
 grep -v '^Environment=GTA_CLAW_STATE_DIR=/var/lib/gta-claw$' \
   "$work/service-good" >"$work/service-no-state-wiring"
-{
-  cat "$work/service-good"
-  printf 'IPAddressDeny=any\n'
-} >"$work/service-blocked-egress"
+sed \
+  's#^ConditionFileIsExecutable=#ConditionPathIsExecutable=#' \
+  "$work/service-good" >"$work/service-invalid-executable-condition"
+insert_service_directive \
+  "$work/service-good" \
+  'IPAddressDeny=any' \
+  "$work/service-blocked-egress"
+insert_service_directive \
+  "$work/service-good" \
+  'PrivateNetwork=yes' \
+  "$work/service-private-network"
+insert_service_directive \
+  "$work/service-good" \
+  'RestrictAddressFamilies=AF_UNIX' \
+  "$work/service-duplicate-address-families"
+insert_service_directive \
+  "$work/service-good" \
+  'RestrictAddressFamilies=' \
+  "$work/service-reset-address-families"
+insert_service_directive \
+  "$work/service-good" \
+  'IPAddressAllow=localhost' \
+  "$work/service-ip-filter"
 sed 's/^RestrictAddressFamilies=.*/RestrictAddressFamilies=AF_UNIX/' \
   "$work/service-good" >"$work/service-no-tcp"
 expect_success hardened-service \
@@ -246,8 +275,18 @@ expect_failure weakened-service \
   bash -c "source '$common'; validate_service_contract '$work/service-weakened'"
 expect_failure missing-state-directory-wiring \
   bash -c "source '$common'; validate_service_contract '$work/service-no-state-wiring'"
+expect_failure invalid-executable-condition \
+  bash -c "source '$common'; validate_service_contract '$work/service-invalid-executable-condition'"
 expect_failure blocked-provider-egress \
   bash -c "source '$common'; validate_service_contract '$work/service-blocked-egress'"
+expect_failure private-network-provider-isolation \
+  bash -c "source '$common'; validate_service_contract '$work/service-private-network'"
+expect_failure duplicate-address-family-override \
+  bash -c "source '$common'; validate_service_contract '$work/service-duplicate-address-families'"
+expect_failure reset-address-family-override \
+  bash -c "source '$common'; validate_service_contract '$work/service-reset-address-families'"
+expect_failure ip-filter-override \
+  bash -c "source '$common'; validate_service_contract '$work/service-ip-filter'"
 expect_failure blocked-tcp-families \
   bash -c "source '$common'; validate_service_contract '$work/service-no-tcp'"
 {
@@ -269,5 +308,7 @@ expect_failure missing-package-input \
   env OUTPUT_ROOT="$work/missing-input-output" \
   "$SCRIPT_DIR/package.sh" "$([[ "$(uname -m)" == "x86_64" ]] && echo x86_64 || echo arm64)" \
   "$work/missing-binaries"
+expect_success lifecycle-contract "$SCRIPT_DIR/lifecycle-contract-self-test.sh"
+expect_success rpm-lifecycle "$SCRIPT_DIR/rpm-lifecycle-self-test.sh"
 
 printf 'Linux packaging security self-tests passed (%d cases)\n' "$tests"

@@ -568,16 +568,16 @@ tar -xf "%{SOURCE0}" -C "%{buildroot}"
 /usr/lib/systemd/system-preset/80-gta-claw.preset
 /usr/share/doc/gta-claw
 
-%pre
+%pre -p /bin/sh
 EOF
 cat "$LINUX_DIR/rpm/pre" >&"$OPEN_OUTPUT_FD"
-printf '\n%%post\n' >&"$OPEN_OUTPUT_FD"
+printf '\n%%post -p /bin/sh\n' >&"$OPEN_OUTPUT_FD"
 cat "$LINUX_DIR/rpm/post" >&"$OPEN_OUTPUT_FD"
-printf '\n%%preun\n' >&"$OPEN_OUTPUT_FD"
+printf '\n%%preun -p /bin/sh\n' >&"$OPEN_OUTPUT_FD"
 cat "$LINUX_DIR/rpm/preun" >&"$OPEN_OUTPUT_FD"
-printf '\n%%postun\n' >&"$OPEN_OUTPUT_FD"
+printf '\n%%postun -p /bin/sh\n' >&"$OPEN_OUTPUT_FD"
 cat "$LINUX_DIR/rpm/postun" >&"$OPEN_OUTPUT_FD"
-printf '\n%%posttrans\n' >&"$OPEN_OUTPUT_FD"
+printf '\n%%posttrans -p /bin/sh\n' >&"$OPEN_OUTPUT_FD"
 cat "$LINUX_DIR/rpm/posttrans" >&"$OPEN_OUTPUT_FD"
 cat >&"$OPEN_OUTPUT_FD" <<EOF
 
@@ -745,7 +745,10 @@ write_json "$oci_config_source" -n \
       User: "65532:65532",
       Entrypoint: ["/usr/libexec/gta-claw/gta-claw-daemon"],
       WorkingDir: "/",
-      Env: ["RUST_BACKTRACE=0"],
+      Env: [
+        "RUST_BACKTRACE=0",
+        "GTA_CLAW_STATE_DIR=/var/lib/gta-claw"
+      ],
       Volumes: {
         "/var/lib/gta-claw": {},
         "/var/cache/gta-claw": {},

@@ -28,7 +28,9 @@ For `x86_64` (`x86_64-unknown-linux-gnu`, Debian `amd64`, RPM `x86_64`, OCI
   documentation/metadata, account files, and exact glibc/libm/libgcc runtime objects
   from the pinned build sysroot. Their Debian versions, hashes, SPDX
   expressions, and copyright files are embedded in the SBOM and provenance.
-  The second layer assigns the writable directories to uid/gid 65532.
+  The second layer assigns the writable directories to uid/gid 65532, while
+  `GTA_CLAW_STATE_DIR=/var/lib/gta-claw` avoids any dependency on the
+  non-existent account home.
 - `provenance-ARCH.json` and `SHA256SUMS` for the final artifacts.
 
 Builds run in the digest-pinned Rust 1.97.1 Bookworm image using the immutable
@@ -64,12 +66,16 @@ executable unlink, and post-transaction hooks reload systemd. Stop/restart/
 disable errors propagate with native `systemctl` diagnostics. Alternate-root
 Debian transactions never invoke host `systemctl`. Before RPM mutates an
 upgrade payload, `%pre` requires exactly one installed old NEVRA and journals
-its active and persistent/runtime enablement state. A rejected preparation
-removes only that new journal, leaving the old NEVRA, every old package byte,
-and prior service state unchanged. `%posttrans` accepts only one replacement
-NEVRA and retires the journal; an incomplete later activation remains fenced
-from old-package erase. Failed final erase restores the captured enablement
-before returning the failure. No hook executes network or dynamic code.
+its active and persistent/runtime enablement state. A rejected pre-commit
+preparation removes only that new journal, leaving the old NEVRA, every old
+package byte, and prior service state unchanged. RPM has no rollback after its
+payload and database commit: a later activation failure remains nonzero and
+diagnostic, but old-package erase proceeds so the host retains exactly one new
+NEVRA rather than a hybrid. `%posttrans` verifies that state, retires the
+transaction journal, and retains only prior-active recovery intent so the fixed
+package can be retried with `--replacepkgs`. Failed final
+erase restores the captured enablement before returning the failure. No hook
+executes network or dynamic code.
 An administrator-masked active service stays active and masked across an RPM
 replacement; the package validates the live process instead of attempting a
 restart that systemd must reject. Both persistent and runtime masks are
@@ -152,6 +158,7 @@ OUTPUT_ROOT="$PWD/target/linux-x86-run1" \
     x86_64 "$build_manifest" "$build_key_sha"
 ./packaging/linux/self-test.sh
 ./packaging/linux/lifecycle-contract-self-test.sh
+./packaging/linux/rpm-lifecycle-self-test.sh
 ./packaging/linux/container-mount-self-test.sh
 ```
 

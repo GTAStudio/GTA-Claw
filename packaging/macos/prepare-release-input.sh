@@ -28,8 +28,22 @@ for destination in "$release_root" "$stage" "$archive"; do
 done
 safe_reset_dir "$release_root"
 ensure_output_directory "$stage"
+ensure_output_directory "$stage/headless"
 assert_output_path "$stage/$APP_NAME.app"
 ditto "$app" "$stage/$APP_NAME.app"
+headless_root="$OUTPUT_ROOT/headless/arm64"
+for component in gta-claw-cli gta-claw-daemon; do
+  headless="$headless_root/$component-$VERSION-macos-arm64.tar.gz"
+  for source in \
+    "$headless" \
+    "$headless.sha256" \
+    "$headless.spdx" \
+    "$headless.provenance.json"; do
+    [[ -f "$source" && ! -L "$source" ]] ||
+      die "release input is missing reviewed headless artifact: $source"
+    copy_regular_input "$source" "$stage/headless/$(basename "$source")" 0644
+  done
+done
 reject_symlinks "$stage"
 
 metadata="$stage/release-metadata.plist"

@@ -7,18 +7,27 @@ if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
     configure)
       systemctl --system daemon-reload >/dev/null
       if [ -n "${2:-}" ]; then
-        deb-systemd-invoke try-restart gta-claw-daemon.service >/dev/null
+        if [ -e /run/gta-claw-daemon.deb-upgrade-was-active ]; then
+          systemctl --system restart gta-claw-daemon.service >/dev/null
+        else
+          deb-systemd-invoke try-restart gta-claw-daemon.service >/dev/null
+        fi
       else
         systemctl --system preset gta-claw-daemon.service >/dev/null
       fi
+      rm -f /run/gta-claw-daemon.deb-upgrade-was-active
       rm -f /run/gta-claw-daemon.deb-was-active
       rm -f /run/gta-claw-daemon.deb-was-enabled
+      rm -f /run/gta-claw-daemon.deb-was-enabled-runtime
       ;;
     abort-remove)
       systemctl --system daemon-reload >/dev/null
       if [ -e /run/gta-claw-daemon.deb-was-enabled ] &&
         ! systemctl --system is-enabled --quiet gta-claw-daemon.service; then
         systemctl --system enable gta-claw-daemon.service >/dev/null
+      elif [ -e /run/gta-claw-daemon.deb-was-enabled-runtime ] &&
+        [ "$(systemctl --system is-enabled gta-claw-daemon.service 2>/dev/null)" != "enabled-runtime" ]; then
+        systemctl --system enable --runtime gta-claw-daemon.service >/dev/null
       fi
       if [ -e /run/gta-claw-daemon.deb-was-active ] &&
         ! systemctl --system is-active --quiet gta-claw-daemon.service; then
@@ -26,12 +35,16 @@ if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
       fi
       rm -f /run/gta-claw-daemon.deb-was-active
       rm -f /run/gta-claw-daemon.deb-was-enabled
+      rm -f /run/gta-claw-daemon.deb-was-enabled-runtime
       ;;
     abort-upgrade | abort-deconfigure)
       systemctl --system daemon-reload >/dev/null
-      if [ -n "${2:-}" ]; then
+      if [ -e /run/gta-claw-daemon.deb-upgrade-was-active ]; then
+        systemctl --system restart gta-claw-daemon.service >/dev/null
+      elif [ -n "${2:-}" ]; then
         deb-systemd-invoke try-restart gta-claw-daemon.service >/dev/null
       fi
+      rm -f /run/gta-claw-daemon.deb-upgrade-was-active
       ;;
   esac
 fi

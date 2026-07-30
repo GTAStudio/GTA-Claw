@@ -176,6 +176,10 @@ validate_published_oci() {
     .config.User == "65532:65532" and
     .config.Entrypoint == ["/usr/libexec/gta-claw/gta-claw-daemon"] and
     .config.WorkingDir == "/" and
+    .config.Env == [
+      "RUST_BACKTRACE=0",
+      "GTA_CLAW_STATE_DIR=/var/lib/gta-claw"
+    ] and
     .config.Labels["org.opencontainers.image.licenses"] ==
       "MIT AND LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)"
   ' "$config" >/dev/null || die "published OCI config contract is invalid"

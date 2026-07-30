@@ -89,6 +89,10 @@ channel = "1.96.0"
     Remove-Item -LiteralPath $missingHashArtifact -Force
     Write-ArtifactSetChecksums $artifactSet | Out-Null
     Test-ArtifactSetChecksums $artifactSet
+    if ((Get-Content (Join-Path $artifactSet 'SHA256SUMS') -Raw) -notmatch
+        '(?m)^[0-9a-f]{64}  artifact\.bin\.sha256$') {
+        throw 'Artifact-set checksum manifest omits the per-artifact .sha256 companion.'
+    }
     $passed++
     Write-Utf8File -Path (Join-Path $artifactSet 'unexpected.bin') -Content 'not listed'
     Assert-Throws {
@@ -98,6 +102,7 @@ channel = "1.96.0"
     $supplyArtifact = Join-Path $testRoot 'supply.bin'
     Write-Utf8File -Path $supplyArtifact -Content 'attested bytes'
     $supplyHash = (Get-FileHash $supplyArtifact -Algorithm SHA256).Hash.ToLowerInvariant()
+    $supplySha1 = (Get-FileHash $supplyArtifact -Algorithm SHA1).Hash.ToLowerInvariant()
     $supplyName = [System.IO.Path]::GetFileName($supplyArtifact)
     $sbom = [ordered]@{
         spdxVersion = 'SPDX-2.3'
@@ -106,7 +111,10 @@ channel = "1.96.0"
         files = @([ordered]@{
             fileName = "./$supplyName"
             SPDXID = 'SPDXRef-Artifact'
-            checksums = @([ordered]@{ algorithm = 'SHA256'; checksumValue = $supplyHash })
+            checksums = @(
+                [ordered]@{ algorithm = 'SHA1'; checksumValue = $supplySha1 },
+                [ordered]@{ algorithm = 'SHA256'; checksumValue = $supplyHash }
+            )
         })
     }
     $provenance = [ordered]@{
@@ -120,8 +128,12 @@ channel = "1.96.0"
     Write-Utf8File -Path "$supplyArtifact.spdx.json" -Content (($sbom | ConvertTo-Json -Depth 8) + "`n")
     Write-Utf8File -Path "$supplyArtifact.provenance.json" -Content (($provenance | ConvertTo-Json -Depth 8) + "`n")
     Test-ArtifactSupplyChain $supplyArtifact
+    if (@($sbom.files[0].checksums | Where-Object algorithm -eq 'SHA1').Count -ne 1 -or
+        @($sbom.files[0].checksums | Where-Object algorithm -eq 'SHA256').Count -ne 1) {
+        throw 'SPDX file checksums must contain exactly SHA1 and SHA256.'
+    }
     $passed++
-    $sbom.files[0].checksums[0].algorithm = 'SHA1'
+    $sbom.files[0].checksums[0].checksumValue = '0' * 40
     Write-Utf8File -Path "$supplyArtifact.spdx.json" -Content (($sbom | ConvertTo-Json -Depth 8) + "`n")
     Assert-Throws {
         Test-ArtifactSupplyChain $supplyArtifact
@@ -478,6 +490,108 @@ channel = "1.96.0"
     }
     $passed++
 
+    $buildIndex = $workflow.IndexOf('name: Build and freeze reviewed production-identity candidates offline')
+    $packageImportIndex = $workflow.IndexOf('name: Import protected package signing identity')
+    $packageRemoveIndex = $workflow.IndexOf('name: Remove package signing identity before bundle assembly')
+    $bundleIndex = $workflow.IndexOf('name: Assemble signed-inner bundle without signing identity')
+    $bundleImportIndex = $workflow.IndexOf('name: Import protected bundle signing identity')
+    $bundleRemoveIndex = $workflow.IndexOf('name: Remove bundle signing identity before supply-chain assembly')
+    $assemblyIndex = $workflow.IndexOf('name: Assemble and validate exact release publication bytes')
+    $uploadIndex = $workflow.IndexOf('name: Upload signed Windows release')
+    $finalCleanupIndex = $workflow.IndexOf('name: Always remove signing identity')
+    $finalizeIndex = $workflow.IndexOf('finalize-release:')
+    if ($buildIndex -lt 0 -or
+        -not ($buildIndex -lt $packageImportIndex -and
+              $packageImportIndex -lt $packageRemoveIndex -and
+              $packageRemoveIndex -lt $bundleIndex -and
+              $bundleIndex -lt $bundleImportIndex -and
+              $bundleImportIndex -lt $bundleRemoveIndex -and
+              $bundleRemoveIndex -lt $assemblyIndex -and
+              $assemblyIndex -lt $uploadIndex -and
+              $uploadIndex -lt $finalCleanupIndex -and
+              $finalCleanupIndex -lt $finalizeIndex)) {
+        throw 'Protected Windows build/sign/bundle/supply-chain phase order is unsafe.'
+    }
+    $packageCertificateWindow = $workflow.Substring(
+        $packageImportIndex,
+        $packageRemoveIndex - $packageImportIndex
+    )
+    $bundleCertificateWindow = $workflow.Substring(
+        $bundleImportIndex,
+        $bundleRemoveIndex - $bundleImportIndex
+    )
+    $packageCleanupWindow = $workflow.Substring(
+        $packageRemoveIndex,
+        $bundleIndex - $packageRemoveIndex
+    )
+    $bundleCleanupWindow = $workflow.Substring(
+        $bundleRemoveIndex,
+        $assemblyIndex - $bundleRemoveIndex
+    )
+    $finalCleanupWindow = $workflow.Substring(
+        $finalCleanupIndex,
+        $finalizeIndex - $finalCleanupIndex
+    )
+    foreach ($window in @($packageCertificateWindow, $bundleCertificateWindow)) {
+        if ($window -match '(?im)^\s*(cargo|rustc)\b' -or
+            $window -match 'package\.ps1' -or
+            $window -match 'bundle\.ps1' -or
+            $window -match 'New-ArtifactSupplyChain') {
+            throw 'Certificate-active Windows phase executes build or supply-chain code.'
+        }
+        $cleanupContracts = @(
+            @{ Name = 'package import failure'; Text = $packageCertificateWindow; Deletes = 2 },
+            @{ Name = 'package normal cleanup'; Text = $packageCleanupWindow; Deletes = 1 },
+            @{ Name = 'bundle import failure'; Text = $bundleCertificateWindow; Deletes = 1 },
+            @{ Name = 'bundle normal cleanup'; Text = $bundleCleanupWindow; Deletes = 1 },
+            @{ Name = 'final cleanup'; Text = $finalCleanupWindow; Deletes = 1 }
+        )
+        foreach ($contract in $cleanupContracts) {
+            $deleteCount = [regex]::Matches($contract.Text, '-DeleteKey').Count
+            $verificationCount = [regex]::Matches(
+                $contract.Text,
+                'Test-Path -LiteralPath \$certificatePath'
+            ).Count
+            if ($deleteCount -ne $contract.Deletes -or
+                $verificationCount -lt $contract.Deletes -or
+                $contract.Text -match 'Cert:.*SilentlyContinue') {
+                throw "Windows $($contract.Name) does not delete and verify every private key."
+            }
+        }
+        foreach ($cleanupWindow in @($packageCleanupWindow, $bundleCleanupWindow, $finalCleanupWindow)) {
+            if ($cleanupWindow -notmatch 'if: always\(\)') {
+                throw 'Windows normal/final signing cleanup is not unconditional.'
+            }
+        }
+        if ([regex]::Matches($workflow, '-DeleteKey').Count -ne 6) {
+            throw 'Windows signing identity cleanup does not fail closed and delete private keys.'
+        }
+    }
+    $signSource = [System.IO.File]::ReadAllText((Join-Path $scriptRoot 'sign.ps1'))
+    if ($signSource -match '(?im)^\s*(cargo|rustc)\b' -or
+        $signSource -match 'Assert-RustToolchain' -or
+        $signSource -match 'New-ArtifactSupplyChain' -or
+        $signSource -match 'package\.ps1' -or
+        $signSource -match 'bundle\.ps1') {
+        throw 'sign.ps1 is not constrained to reviewed package signing and validation.'
+    }
+    $assemblyWindow = $workflow.Substring($assemblyIndex, $uploadIndex - $assemblyIndex)
+    if ($workflow -notmatch 'SIGNING_INPUT_MANIFEST' -or
+        $workflow -notmatch 'BUNDLE_SIGNING_SHA256' -or
+        $workflow -notmatch 'release_commit must equal the immutable workflow commit' -or
+        $workflow -notmatch 'Remote annotated release tag changed before signing' -or
+        $workflow -notmatch 'Remote annotated release tag changed before bundle signing' -or
+        $workflow -notmatch 'Expected eight signed Windows release artifacts' -or
+        $assemblyWindow -notmatch 'portable-signed') {
+        throw 'Protected Windows reviewed-byte or signed-only release contract is incomplete.'
+    }
+    if ($signSource -notmatch "'\.zip'" -or
+        $signSource -notmatch 'Add-VerifiedSignature' -or
+        $signSource -notmatch 'New-DeterministicZip') {
+        throw 'Portable executable signing is not confined to the reviewed sign-only helper.'
+    }
+    $passed++
+
     $fakeCargoRoot = Join-Path $testRoot 'fake-cargo'
     [System.IO.Directory]::CreateDirectory($fakeCargoRoot) | Out-Null
     $fakeCargo = Join-Path $fakeCargoRoot 'cargo.cmd'
@@ -521,8 +635,8 @@ echo gta-claw-cli v0.1.0
     & (Join-Path $scriptRoot 'validate-release-surfaces.ps1')
     $passed++
 
-    if ($passed -ne 64) {
-        throw "Expected 64 self-tests, completed $passed."
+    if ($passed -ne 65) {
+        throw "Expected 65 self-tests, completed $passed."
     }
     Write-Host "Windows packaging self-tests passed: $passed."
 } finally {

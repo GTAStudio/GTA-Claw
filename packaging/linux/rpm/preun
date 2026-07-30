@@ -4,7 +4,6 @@ set -eu
 state_root="${GTA_CLAW_PACKAGE_STATE_ROOT:-/run}"
 systemd_runtime="${GTA_CLAW_SYSTEMD_RUNTIME_DIR:-/run/systemd/system}"
 old_nevra="$state_root/gta-claw-daemon.old-nevra"
-was_active="$state_root/gta-claw-daemon.was-active"
 prepared_marker="$state_root/gta-claw-daemon.upgrade-prepared"
 configured_marker="$state_root/gta-claw-daemon.upgrade-configured"
 remove_was_active="$state_root/gta-claw-daemon.remove-was-active"
@@ -40,13 +39,6 @@ restore_erase_failure() {
 }
 
 if [ "$1" -gt 0 ]; then
-  if [ -e "$prepared_marker" ] && [ ! -e "$configured_marker" ]; then
-    echo "Refusing to erase the old RPM after an incomplete replacement" >&2
-    exit 1
-  fi
-  if [ -e "$was_active" ] && [ -d "$systemd_runtime" ]; then
-    systemctl is-active --quiet gta-claw-daemon.service
-  fi
   exit 0
 fi
 

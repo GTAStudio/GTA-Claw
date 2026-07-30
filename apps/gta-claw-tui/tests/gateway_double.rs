@@ -11,7 +11,9 @@ mod support;
 use std::time::Duration;
 
 use claw_protocol::gateway::{AUTHENTICATED_MAX_FRAME_BYTES, Codec};
-use gta_claw_tui::gateway::{GatewayOptions, UiCommand, WorkerEvent, spawn_gateway_worker};
+use gta_claw_tui::gateway::{
+    GatewayOptions, UiCommand, WorkerEvent, WorkerShutdown, spawn_gateway_worker,
+};
 use gta_claw_tui::model::{RunState, SessionSummary, TranscriptEntry};
 use serde_json::json;
 use support::{
@@ -272,7 +274,8 @@ async fn failed_connections_can_be_retried_without_restarting_the_tui() {
 
 #[tokio::test]
 async fn shutdown_cancels_a_stalled_connection_attempt() {
-    let (url, cancellation, tasks, handshake_received) = raw_stalled_server().await;
+    let (url, cancellation, tasks, handshake_received, client_eof) =
+        raw_stalled_server().await;
     let mut worker = spawn_gateway_worker(GatewayOptions { url, token: None });
     assert_eq!(
         worker.events.recv().await,
@@ -291,9 +294,18 @@ async fn shutdown_cancels_a_stalled_connection_attempt() {
         ),
         "worker must still be blocked in the connecting attempt immediately before shutdown"
     );
-    tokio::time::timeout(Duration::from_secs(2), worker.shutdown())
+    let shutdown = tokio::time::timeout(Duration::from_secs(2), worker.shutdown())
         .await
         .expect("worker shutdown is bounded");
+    assert_eq!(
+        shutdown,
+        WorkerShutdown::Cooperative,
+        "stalled connect must cancel cooperatively without task abandonment"
+    );
+    tokio::time::timeout(Duration::from_secs(2), client_eof)
+        .await
+        .expect("server observes client EOF before fixture cancellation")
+        .expect("client EOF signal sent");
 
     cancellation.cancel();
     tasks.close();

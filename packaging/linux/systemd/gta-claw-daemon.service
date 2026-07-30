@@ -2,7 +2,7 @@
 Description=GTA Claw headless daemon prototype
 Documentation=file:/usr/share/doc/gta-claw/README.md
 After=local-fs.target
-ConditionPathIsExecutable=/usr/libexec/gta-claw/gta-claw-daemon
+ConditionFileIsExecutable=/usr/libexec/gta-claw/gta-claw-daemon
 
 [Service]
 Type=simple

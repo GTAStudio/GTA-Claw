@@ -804,6 +804,8 @@ validate_service_contract() {
     'PrivateDevices=yes' \
     'ProtectSystem=strict' \
     'ProtectHome=yes' \
+    'ConditionFileIsExecutable=/usr/libexec/gta-claw/gta-claw-daemon' \
+    'ExecStartPre=/usr/libexec/gta-claw/gta-claw-daemon --probe' \
     'StateDirectory=gta-claw' \
     'StateDirectoryMode=0700' \
     'Environment=GTA_CLAW_STATE_DIR=/var/lib/gta-claw' \
@@ -819,8 +821,19 @@ validate_service_contract() {
   if grep -Eiq 'Environment=.*(token|secret|password|private.?key)=' "$service"; then
     die "service embeds a secret-like environment literal"
   fi
-  if grep -Eq '^IPAddressDeny=' "$service"; then
-    die "service blocks required outbound provider traffic"
+  [[ "$(
+    grep -Ec '^[[:space:]]*RestrictAddressFamilies[[:space:]]*=' "$service"
+  )" -eq 1 ]] ||
+    die "service must declare RestrictAddressFamilies exactly once"
+  if grep -Eq \
+    '^[[:space:]]*(IPAddressAllow|IPAddressDeny)[[:space:]]*=' \
+    "$service"; then
+    die "service IP filters override required outbound provider traffic"
+  fi
+  if grep -Eiq \
+    '^[[:space:]]*PrivateNetwork[[:space:]]*=[[:space:]]*(1|yes|true|on)[[:space:]]*$' \
+    "$service"; then
+    die "service private network namespace blocks provider traffic"
   fi
   if grep -Eq '^ExecStart=.*--(listen|socket|config|state|log)' "$service"; then
     die "service invents a daemon runtime flag"

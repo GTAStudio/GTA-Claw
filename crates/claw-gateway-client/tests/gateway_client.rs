@@ -1914,7 +1914,8 @@ async fn unique_request_identifier_budget_is_bounded_without_eviction() {
 
 #[tokio::test]
 async fn cancellation_is_safe_during_connect_auth_and_reconnect() {
-    let (url, raw_cancel, raw_tasks, handshake_received) = raw_stalled_server().await;
+    let (url, raw_cancel, raw_tasks, handshake_received, client_eof) =
+        raw_stalled_server().await;
     let mut stalled_config = config(url);
     stalled_config.timeouts.connect = Duration::from_secs(30);
     let (client, _) = GatewayClient::start(stalled_config).expect("start");
@@ -1927,6 +1928,10 @@ async fn cancellation_is_safe_during_connect_auth_and_reconnect() {
         "client must still be blocked in Connecting immediately before shutdown"
     );
     client.shutdown().await.expect("cancel connect");
+    tokio::time::timeout(Duration::from_secs(2), client_eof)
+        .await
+        .expect("server observes client EOF after connect cancellation")
+        .expect("client EOF signal sent");
     raw_cancel.cancel();
     raw_tasks.close();
     raw_tasks.wait().await;

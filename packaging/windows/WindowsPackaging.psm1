@@ -1435,7 +1435,8 @@ function Test-ZipPackage {
         [Parameter(Mandatory)][string]$InspectionRoot,
         [Parameter(Mandatory)][ValidateSet('x64', 'arm64')][string]$Architecture,
         [Parameter(Mandatory)][ValidateSet('desktop', 'headless')][string]$ComponentSet,
-        [Parameter(Mandatory)][ValidateSet('non-release', 'release')][string]$ReleaseStatus
+        [Parameter(Mandatory)][ValidateSet('non-release', 'release')][string]$ReleaseStatus,
+        [Parameter(Mandatory)][ValidateSet('unsigned', 'signed')][string]$SignatureMode
     )
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     Assert-PlainFile $PackagePath | Out-Null
@@ -1466,6 +1467,7 @@ function Test-ZipPackage {
                 'slint', 'i-slint', 'node_modules', 'package.json', 'javascript'
             )
         }
+        Test-PackageSignature -Path $binary -Mode $SignatureMode
     }
 }
 

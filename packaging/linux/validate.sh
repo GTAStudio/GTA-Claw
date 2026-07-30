@@ -100,6 +100,7 @@ rpm -qp --requires "$rpm_artifact" | grep -Fx "glibc >= $BUILD_GLIBC_REQUIREMENT
   die "RPM glibc dependency does not match ELF-derived requirement"
 rpm_scripts="$(rpm -qp --scripts "$rpm_artifact")"
 validate_rpm_lifecycle_contract "$rpm_scripts"
+validate_rpm_scriptlet_metadata "$rpm_artifact"
 rpm_payload_listing="$(rpm -qplv "$rpm_artifact")"
 if awk 'substr($1, 1, 1) !~ /^[-d]$/ { bad = 1 } END { exit !bad }' \
   <<<"$rpm_payload_listing"; then

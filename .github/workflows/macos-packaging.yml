@@ -46,7 +46,7 @@ permissions:
 
 concurrency:
   group: macos-packaging-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -313,6 +313,7 @@ jobs:
     outputs:
       release-sha: ${{ steps.policy.outputs.release-sha }}
       release-ref: ${{ steps.policy.outputs.release-ref }}
+      tag-object: ${{ steps.policy.outputs.tag-object }}
       version: ${{ steps.policy.outputs.version }}
     steps:
       - name: Checkout candidate commit without secrets
@@ -434,6 +435,7 @@ jobs:
           {
             printf 'release-sha=%s\n' "$GITHUB_SHA"
             printf 'release-ref=%s\n' "$GITHUB_REF"
+            printf 'tag-object=%s\n' "$tag_object"
             printf 'version=%s\n' "$version"
           } >>"$GITHUB_OUTPUT"
 
@@ -446,6 +448,9 @@ jobs:
       - release-policy
     runs-on: macos-15
     environment: macos-release
+    concurrency:
+      group: macos-desktop-release-${{ github.ref_name }}
+      cancel-in-progress: false
     permissions:
       actions: read
       contents: write
@@ -460,6 +465,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             .github/trusted/desktop-supply-chain-policy/scripts/verify-macos-app.sh
+            packaging/macos/gta-claw.entitlements
             packaging/macos/spdx-tools-requirements.txt
           sparse-checkout-cone-mode: false
           submodules: false
@@ -554,9 +560,33 @@ jobs:
             find "$root" -mindepth 1 -maxdepth 1 -exec basename {} \; |
               LC_ALL=C sort
           )"
-          expected_top="$(printf '%s\n' 'GTA Claw.app' SHA256SUMS release-metadata.plist | LC_ALL=C sort)"
+          expected_top="$(
+            printf '%s\n' 'GTA Claw.app' SHA256SUMS headless release-metadata.plist |
+              LC_ALL=C sort
+          )"
           test "$actual_top" = "$expected_top"
           (cd "$root" && shasum -a 256 -c SHA256SUMS)
+          expected_headless="$(
+            for component in gta-claw-cli gta-claw-daemon; do
+              name="$component-$EXPECTED_VERSION-macos-arm64.tar.gz"
+              printf '%s\n' "$name" "$name.sha256" "$name.spdx" "$name.provenance.json"
+            done |
+              LC_ALL=C sort
+          )"
+          actual_headless="$(
+            find "$root/headless" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; |
+              LC_ALL=C sort
+          )"
+          test "$actual_headless" = "$expected_headless"
+          test -z "$(find "$root/headless" -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
+          for component in gta-claw-cli gta-claw-daemon; do
+            artifact="$root/headless/$component-$EXPECTED_VERSION-macos-arm64.tar.gz"
+            digest="$(shasum -a 256 "$artifact" | awk '{print $1}')"
+            test "$(cat "$artifact.sha256")" = "$digest  $(basename "$artifact")"
+            "$SPDX_VALIDATOR" -i "$artifact.spdx"
+            grep -F "\"name\":\"$(basename "$artifact")\",\"digest\":{\"sha256\":\"$digest\"}" \
+              "$artifact.provenance.json" >/dev/null
+          done
 
           metadata="$root/release-metadata.plist"
           plutil -lint "$metadata" >/dev/null
@@ -644,14 +674,8 @@ jobs:
           security find-identity -p codesigning -v "$keychain" |
             grep -F "\"$DEVELOPER_ID_APPLICATION\"" >/dev/null
 
-          entitlements="$state/release.entitlements"
-          cat >"$entitlements" <<'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict/>
-          </plist>
-          EOF
+          entitlements="$GITHUB_WORKSPACE/trusted-release-policy/packaging/macos/gta-claw.entitlements"
+          [[ -f "$entitlements" && ! -L "$entitlements" ]]
           plutil -lint "$entitlements" >/dev/null
           app="$state/release-input/GTA Claw.app"
           verifier="$GITHUB_WORKSPACE/trusted-release-policy/.github/trusted/desktop-supply-chain-policy/scripts/verify-macos-app.sh"
@@ -839,12 +863,14 @@ jobs:
           EXPECTED_PAYLOAD_SHA256: ${{ needs.containers.outputs.release-payload-sha256 }}
           EXPECTED_RELEASE_REF: ${{ needs.release-policy.outputs.release-ref }}
           EXPECTED_RELEASE_SHA: ${{ needs.release-policy.outputs.release-sha }}
+          EXPECTED_TAG_OBJECT: ${{ needs.release-policy.outputs.tag-object }}
           EXPECTED_VERSION: ${{ needs.release-policy.outputs.version }}
         run: |
           set -euo pipefail
           umask 077
           [[ "$EXPECTED_PAYLOAD_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$EXPECTED_RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_TAG_OBJECT" =~ ^[0-9a-f]{40}$ ]]
           [[ "$EXPECTED_RELEASE_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           [[ "$EXPECTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 
@@ -947,11 +973,32 @@ jobs:
           for artifact in "$app_zip" "$dmg" "$pkg"; do
             write_supply_chain "$artifact"
           done
+          for component in gta-claw-cli gta-claw-daemon; do
+            name="$component-$EXPECTED_VERSION-macos-arm64.tar.gz"
+            for companion in "$name" "$name.sha256" "$name.spdx" "$name.provenance.json"; do
+              source="$state/release-input/headless/$companion"
+              destination="$distribution/$companion"
+              [[ -f "$source" && ! -L "$source" && ! -e "$destination" ]]
+              cp "$source" "$destination"
+            done
+          done
+          jq -cn \
+            --arg commit "$EXPECTED_RELEASE_SHA" \
+            --arg tagObject "$EXPECTED_TAG_OBJECT" \
+            --arg version "$EXPECTED_VERSION" \
+            '{
+              schema: 1,
+              platform: "macos",
+              version: $version,
+              releaseCommit: $commit,
+              annotatedTagObject: $tagObject
+            }' >"$distribution/release-identity-macos.json"
 
       - name: Validate protected release outputs
         shell: bash
         env:
           EXPECTED_RELEASE_SHA: ${{ needs.release-policy.outputs.release-sha }}
+          EXPECTED_TAG_OBJECT: ${{ needs.release-policy.outputs.tag-object }}
           EXPECTED_VERSION: ${{ needs.release-policy.outputs.version }}
         run: |
           set -euo pipefail
@@ -974,10 +1021,18 @@ jobs:
           xcrun stapler validate "$pkg"
 
           expected="$state/expected-macos-assets"
-          for artifact in "$app_zip" "$dmg" "$pkg"; do
-            name="$(basename "$artifact")"
-            printf '%s\n' "$name" "$name.spdx" "$name.provenance.json"
-          done | LC_ALL=C sort >"$expected"
+          {
+            for artifact in "$app_zip" "$dmg" "$pkg"; do
+              name="$(basename "$artifact")"
+              printf '%s\n' "$name" "$name.spdx" "$name.provenance.json"
+            done
+            for component in gta-claw-cli gta-claw-daemon; do
+              name="$component-$EXPECTED_VERSION-macos-arm64.tar.gz"
+              printf '%s\n' "$name" "$name.sha256" "$name.spdx" "$name.provenance.json"
+            done
+            printf '%s\n' release-identity-macos.json
+          } |
+            LC_ALL=C sort >"$expected"
           actual="$state/actual-macos-assets"
           find "$distribution" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; |
             LC_ALL=C sort >"$actual"
@@ -1018,6 +1073,24 @@ jobs:
                .predicate.runDetails.metadata.invocationId == $source' \
               "$artifact.provenance.json" >/dev/null
           done
+          for component in gta-claw-cli gta-claw-daemon; do
+            artifact="$distribution/$component-$EXPECTED_VERSION-macos-arm64.tar.gz"
+            digest="$(shasum -a 256 "$artifact" | awk '{print $1}')"
+            test "$(cat "$artifact.sha256")" = "$digest  $(basename "$artifact")"
+            "$SPDX_VALIDATOR" -i "$artifact.spdx"
+            grep -F "\"name\":\"$(basename "$artifact")\",\"digest\":{\"sha256\":\"$digest\"}" \
+              "$artifact.provenance.json" >/dev/null
+          done
+          jq -e \
+            --arg commit "$EXPECTED_RELEASE_SHA" \
+            --arg tagObject "$EXPECTED_TAG_OBJECT" \
+            --arg version "$EXPECTED_VERSION" \
+            '.schema == 1 and
+             .platform == "macos" and
+             .version == $version and
+             .releaseCommit == $commit and
+             .annotatedTagObject == $tagObject' \
+            "$distribution/release-identity-macos.json" >/dev/null
 
           manifest="$state/SHA256SUMS-macos"
           (
@@ -1220,9 +1293,13 @@ jobs:
   finalize-release:
     name: Finalize joint desktop release
     if: github.event_name == 'workflow_dispatch' && inputs.release == true
-    needs: protected-release-contract
+    needs:
+      - protected-release-contract
+      - release-policy
     permissions:
       contents: write
     uses: ./.github/workflows/joint-release-finalize.yml
     with:
       tag: ${{ github.ref_name }}
+      release_commit: ${{ needs.release-policy.outputs.release-sha }}
+      tag_object: ${{ needs.release-policy.outputs.tag-object }}

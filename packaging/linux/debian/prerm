@@ -2,20 +2,57 @@
 
 set -e
 
-if [ -z "${DPKG_ROOT:-}" ] && [ "$1" = "remove" ] &&
-  [ -d /run/systemd/system ]; then
+if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+  case "$1" in
+    upgrade | deconfigure)
+      if systemctl --system is-active --quiet gta-claw-daemon.service; then
+        touch /run/gta-claw-daemon.deb-upgrade-was-active
+      else
+        rm -f /run/gta-claw-daemon.deb-upgrade-was-active
+      fi
+      exit 0
+      ;;
+    remove)
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
   if systemctl --system is-active --quiet gta-claw-daemon.service; then
     touch /run/gta-claw-daemon.deb-was-active
   else
     rm -f /run/gta-claw-daemon.deb-was-active
   fi
-  if systemctl --system is-enabled --quiet gta-claw-daemon.service; then
-    touch /run/gta-claw-daemon.deb-was-enabled
-  else
-    rm -f /run/gta-claw-daemon.deb-was-enabled
+  rm -f \
+    /run/gta-claw-daemon.deb-was-enabled \
+    /run/gta-claw-daemon.deb-was-enabled-runtime
+  enabled_state=""
+  if enabled_state="$(systemctl --system is-enabled gta-claw-daemon.service 2>/dev/null)"; then
+    :
   fi
+  case "$enabled_state" in
+    enabled)
+      touch /run/gta-claw-daemon.deb-was-enabled
+      ;;
+    enabled-runtime)
+      touch /run/gta-claw-daemon.deb-was-enabled-runtime
+      ;;
+    disabled | indirect | static | generated | transient | not-found | masked | masked-runtime | '')
+      ;;
+    *)
+      echo "Unexpected service enablement before Debian removal: $enabled_state" >&2
+      exit 1
+      ;;
+  esac
   deb-systemd-invoke stop gta-claw-daemon.service >/dev/null
-  systemctl --system disable gta-claw-daemon.service >/dev/null
+  case "$enabled_state" in
+    enabled)
+      systemctl --system disable gta-claw-daemon.service >/dev/null
+      ;;
+    enabled-runtime)
+      systemctl --system disable --runtime gta-claw-daemon.service >/dev/null
+      ;;
+  esac
 fi
 
 exit 0

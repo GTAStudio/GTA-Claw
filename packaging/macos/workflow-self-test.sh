@@ -69,6 +69,12 @@ grep -F 'name: Assemble final signed and notarized release' \
   <<<"$protected_release" >/dev/null
 grep -F 'macos-arm64-signed-notarized.app.zip' \
   <<<"$protected_release" >/dev/null
+grep -F 'gta-claw-cli-$EXPECTED_VERSION-macos-arm64.tar.gz' \
+  <<<"$protected_release" >/dev/null
+grep -F 'gta-claw-daemon-$EXPECTED_VERSION-macos-arm64.tar.gz' \
+  <<<"$protected_release" >/dev/null
+grep -F '"$name.sha256" "$name.spdx" "$name.provenance.json"' \
+  <<<"$protected_release" >/dev/null
 grep -F 'COPYFILE_DISABLE=1 ditto -c -k --keepParent "$app" "$app_zip"' \
   <<<"$protected_release" >/dev/null
 grep -F 'write_supply_chain "$artifact"' <<<"$protected_release" >/dev/null
@@ -107,9 +113,19 @@ if grep -F -- '--clobber' <<<"$protected_release" >/dev/null; then
   echo "protected release publishing must not replace existing asset bytes" >&2
   exit 1
 fi
-grep -F 'needs: protected-release-contract' <<<"$protected_release" >/dev/null
+grep -F -- '- protected-release-contract' <<<"$protected_release" >/dev/null
 grep -F 'uses: ./.github/workflows/joint-release-finalize.yml' \
   <<<"$protected_release" >/dev/null
+grep -F 'Joint release manifests differ from the fixed versioned artifact profile.' \
+  "$REPO_ROOT/.github/workflows/joint-release-finalize.yml" >/dev/null
+grep -F 'verify_remote_tag' \
+  "$REPO_ROOT/.github/workflows/joint-release-finalize.yml" >/dev/null
+grep -F 'release_commit: ${{ needs.release-policy.outputs.release-sha }}' \
+  "$workflow" >/dev/null
+grep -F 'gta-claw-cli-$version-macos-arm64.tar.gz' \
+  "$REPO_ROOT/.github/workflows/joint-release-finalize.yml" >/dev/null
+grep -F 'gta-claw-$version-windows-x64-signed.msi' \
+  "$REPO_ROOT/.github/workflows/joint-release-finalize.yml" >/dev/null
 
 test "$(grep -c 'uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' <<<"$protected_release")" -eq 1
 # shellcheck disable=SC2016
@@ -121,6 +137,8 @@ grep -F 'persist-credentials: false' <<<"$protected_release" >/dev/null
 grep -F '.github/trusted/desktop-supply-chain-policy/scripts/verify-macos-app.sh' \
   <<<"$protected_release" >/dev/null
 grep -F 'packaging/macos/spdx-tools-requirements.txt' \
+  <<<"$protected_release" >/dev/null
+grep -F 'packaging/macos/gta-claw.entitlements' \
   <<<"$protected_release" >/dev/null
 test "$(
   grep -c 'uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065' \

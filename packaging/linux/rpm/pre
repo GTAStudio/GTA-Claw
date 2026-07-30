@@ -12,21 +12,38 @@ was_masked_runtime="$state_root/gta-claw-daemon.was-masked-runtime"
 prepared_marker="$state_root/gta-claw-daemon.upgrade-prepared"
 configured_marker="$state_root/gta-claw-daemon.upgrade-configured"
 prepared=0
+recovering_activation=0
 
 restore_pre_failure() {
   status=$?
+  restore_failed=0
   trap - 0 1 2 15
   if [ "$prepared" -eq 0 ]; then
+    if [ -d "$systemd_runtime" ] &&
+      [ -e "$was_active" ] &&
+      [ ! -e "$was_masked" ] &&
+      [ ! -e "$was_masked_runtime" ] &&
+      ! systemctl is-active --quiet gta-claw-daemon.service; then
+      if ! systemctl start gta-claw-daemon.service >/dev/null; then
+        echo "Failed to restore active service after RPM upgrade preparation failure" >&2
+        restore_failed=1
+      fi
+    fi
     rm -f \
       "$old_nevra.tmp" \
       "$old_nevra" \
-      "$was_active" \
       "$was_enabled" \
       "$was_enabled_runtime" \
       "$was_masked" \
       "$was_masked_runtime" \
       "$prepared_marker" \
       "$configured_marker"
+    if [ "$restore_failed" -eq 0 ]; then
+      rm -f "$was_active"
+    fi
+  fi
+  if [ "$restore_failed" -ne 0 ]; then
+    exit 1
   fi
   exit "$status"
 }
@@ -35,6 +52,24 @@ if [ "$1" -gt 1 ]; then
   if [ ! -d "$state_root" ] || [ -L "$state_root" ]; then
     echo "RPM lifecycle state root is not a physical directory: $state_root" >&2
     exit 1
+  fi
+  if [ -f "$was_active" ] &&
+    [ ! -L "$was_active" ] &&
+    [ ! -e "$old_nevra" ] &&
+    [ ! -L "$old_nevra" ] &&
+    [ ! -e "$was_enabled" ] &&
+    [ ! -L "$was_enabled" ] &&
+    [ ! -e "$was_enabled_runtime" ] &&
+    [ ! -L "$was_enabled_runtime" ] &&
+    [ ! -e "$was_masked" ] &&
+    [ ! -L "$was_masked" ] &&
+    [ ! -e "$was_masked_runtime" ] &&
+    [ ! -L "$was_masked_runtime" ] &&
+    [ ! -e "$prepared_marker" ] &&
+    [ ! -L "$prepared_marker" ] &&
+    [ ! -e "$configured_marker" ] &&
+    [ ! -L "$configured_marker" ]; then
+    recovering_activation=1
   fi
   for marker in \
     "$old_nevra" \
@@ -45,6 +80,9 @@ if [ "$1" -gt 1 ]; then
     "$was_masked_runtime" \
     "$prepared_marker" \
     "$configured_marker"; do
+    if [ "$recovering_activation" -eq 1 ] && [ "$marker" = "$was_active" ]; then
+      continue
+    fi
     if [ -e "$marker" ] || [ -L "$marker" ]; then
       echo "Refusing upgrade with an incomplete RPM lifecycle marker: $marker" >&2
       exit 1
@@ -81,6 +119,15 @@ if [ "$1" -gt 1 ]; then
         exit 1
         ;;
     esac
+    if [ -e "$was_active" ] &&
+      [ ! -e "$was_masked" ] &&
+      [ ! -e "$was_masked_runtime" ]; then
+      systemctl stop gta-claw-daemon.service >/dev/null
+      if systemctl is-active --quiet gta-claw-daemon.service; then
+        echo "RPM upgrade preparation did not stop gta-claw-daemon.service" >&2
+        exit 1
+      fi
+    fi
   fi
   touch "$prepared_marker"
 

@@ -9,6 +9,14 @@ if [ -d "$systemd_runtime" ]; then
 fi
 if [ "$1" -eq 0 ]; then
   rm -f \
+    "$state_root/gta-claw-daemon.old-nevra" \
+    "$state_root/gta-claw-daemon.was-active" \
+    "$state_root/gta-claw-daemon.was-enabled" \
+    "$state_root/gta-claw-daemon.was-enabled-runtime" \
+    "$state_root/gta-claw-daemon.was-masked" \
+    "$state_root/gta-claw-daemon.was-masked-runtime" \
+    "$state_root/gta-claw-daemon.upgrade-prepared" \
+    "$state_root/gta-claw-daemon.upgrade-configured" \
     "$state_root/gta-claw-daemon.remove-was-active" \
     "$state_root/gta-claw-daemon.remove-was-enabled" \
     "$state_root/gta-claw-daemon.remove-was-enabled-runtime" \

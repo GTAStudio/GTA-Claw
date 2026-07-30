@@ -172,19 +172,32 @@ pub struct GatewayWorker {
     task: JoinHandle<()>,
 }
 
+/// How the background Gateway worker finished its shutdown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerShutdown {
+    /// Shutdown propagated through the client and the worker task joined.
+    Cooperative,
+    /// The worker exceeded its grace period and had to be aborted.
+    ForcedAbort,
+    /// The worker task panicked or was cancelled before the grace period ended.
+    TaskFailed,
+}
+
 impl GatewayWorker {
     /// Cancels Gateway work and waits for a bounded graceful shutdown.
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(mut self) -> WorkerShutdown {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
         drop(self.commands);
-        if tokio::time::timeout(WORKER_SHUTDOWN_GRACE, &mut self.task)
-            .await
-            .is_err()
-        {
-            self.task.abort();
-            let _ = self.task.await;
+        match tokio::time::timeout(WORKER_SHUTDOWN_GRACE, &mut self.task).await {
+            Ok(Ok(())) => WorkerShutdown::Cooperative,
+            Ok(Err(_)) => WorkerShutdown::TaskFailed,
+            Err(_) => {
+                self.task.abort();
+                let _ = self.task.await;
+                WorkerShutdown::ForcedAbort
+            }
         }
     }
 }

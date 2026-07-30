@@ -5,8 +5,10 @@ set -e
 if [ "$1" = "remove" ] && [ -z "${DPKG_ROOT:-}" ] &&
   [ -d /run/systemd/system ]; then
   systemctl --system daemon-reload >/dev/null
+  rm -f /run/gta-claw-daemon.deb-upgrade-was-active
   rm -f /run/gta-claw-daemon.deb-was-active
   rm -f /run/gta-claw-daemon.deb-was-enabled
+  rm -f /run/gta-claw-daemon.deb-was-enabled-runtime
 fi
 
 if [ "$1" = "purge" ] && [ -x /usr/bin/deb-systemd-helper ]; then

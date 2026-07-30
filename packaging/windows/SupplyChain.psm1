@@ -82,6 +82,7 @@ function New-ArtifactSupplyChain {
     $artifact = Assert-PlainFile $ArtifactPath
     $artifactName = [System.IO.Path]::GetFileName($artifact)
     $artifactHash = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+    $artifactSha1 = (Get-FileHash -LiteralPath $artifact -Algorithm SHA1).Hash.ToLowerInvariant()
     $revision = Get-SourceRevision $RepoRoot
     $packages = Get-CargoPackages -RepoRoot $RepoRoot -ComponentSet $ComponentSet -RustTarget $RustTarget
 
@@ -127,6 +128,10 @@ function New-ArtifactSupplyChain {
                 fileName = "./$artifactName"
                 SPDXID = 'SPDXRef-Artifact'
                 checksums = @(
+                    [ordered]@{
+                        algorithm = 'SHA1'
+                        checksumValue = $artifactSha1
+                    },
                     [ordered]@{
                         algorithm = 'SHA256'
                         checksumValue = $artifactHash
@@ -206,6 +211,7 @@ function Test-ArtifactSupplyChain {
 
     $artifact = Assert-PlainFile $ArtifactPath
     $artifactHash = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+    $artifactSha1 = (Get-FileHash -LiteralPath $artifact -Algorithm SHA1).Hash.ToLowerInvariant()
     $artifactName = [System.IO.Path]::GetFileName($artifact)
     $sbomPath = Assert-PlainFile "$artifact.spdx.json"
     $provenancePath = Assert-PlainFile "$artifact.provenance.json"
@@ -217,9 +223,13 @@ function Test-ArtifactSupplyChain {
         @($sbom.files).Count -ne 1 -or
         $sbom.files[0].fileName -ne "./$artifactName" -or
         $sbom.files[0].SPDXID -ne 'SPDXRef-Artifact' -or
-        @($sbom.files[0].checksums).Count -ne 1 -or
-        $sbom.files[0].checksums[0].algorithm -ne 'SHA256' -or
-        $sbom.files[0].checksums[0].checksumValue -ne $artifactHash -or
+        @($sbom.files[0].checksums).Count -ne 2 -or
+        @($sbom.files[0].checksums | Where-Object {
+            $_.algorithm -eq 'SHA1' -and $_.checksumValue -eq $artifactSha1
+        }).Count -ne 1 -or
+        @($sbom.files[0].checksums | Where-Object {
+            $_.algorithm -eq 'SHA256' -and $_.checksumValue -eq $artifactHash
+        }).Count -ne 1 -or
         @($sbom.packages).Count -eq 0) {
         throw "SPDX SBOM does not attest the published artifact bytes: $artifact"
     }
@@ -245,7 +255,7 @@ function Write-ArtifactSetChecksums {
     }
     $manifest = Join-Path $Directory $ManifestName
     $lines = Get-ChildItem -LiteralPath $Directory -File |
-        Where-Object { $_.FullName -ne $manifest -and $_.Name -ne 'artifacts.json' -and $_.Extension -ne '.sha256' } |
+        Where-Object { $_.FullName -ne $manifest -and $_.Name -ne 'artifacts.json' } |
         Sort-Object Name |
         ForEach-Object {
             "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
@@ -286,8 +296,7 @@ function Test-ArtifactSetChecksums {
     $expected = @(Get-ChildItem -LiteralPath $Directory -File |
         Where-Object {
             $_.Name -ne $ManifestName -and
-            $_.Name -ne 'artifacts.json' -and
-            $_.Extension -ne '.sha256'
+            $_.Name -ne 'artifacts.json'
         })
     if ($seen.Count -ne $expected.Count) {
         throw "Published SHA256SUMS coverage differs from the artifact directory."

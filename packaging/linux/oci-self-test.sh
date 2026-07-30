@@ -7,9 +7,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 require_linux
-for tool in gzip jq python3 sha256sum tar wc; do
+for tool in chroot grep gzip jq python3 sha256sum stat tar timeout wc; do
   require_tool "$tool"
 done
+
 [[ "$#" -eq 4 ]] ||
   die "usage: oci-self-test.sh OCI_ARCHIVE ARCH BUILD_MANIFEST EXPECTED_BUILD_KEY_SHA256"
 source_archive="$1"
@@ -214,6 +215,58 @@ prepare_rootfs_case() {
   printf '%s|%s\n' "$layout" "$rootfs"
 }
 
+root_case="$(prepare_rootfs_case entrypoint-smoke)"
+layout="${root_case%%|*}"
+rootfs="${root_case##*|}"
+manifest="$(manifest_blob "$layout")"
+writable_digest="$(jq -er '.layers[1].digest' "$manifest")"
+tar -xf "$layout/blobs/sha256/${writable_digest#sha256:}" -C "$rootfs"
+config_digest="$(jq -er '.config.digest' "$manifest")"
+config="$layout/blobs/sha256/${config_digest#sha256:}"
+entrypoint="$(
+  jq -er \
+    '.config.Entrypoint | if length == 1 then .[0] else error("entrypoint") end' \
+    "$config"
+)"
+state_directory="$(
+  jq -er '
+    .config.Env[] | select(startswith("GTA_CLAW_STATE_DIR=")) |
+    sub("^GTA_CLAW_STATE_DIR="; "")
+  ' "$config"
+)"
+[[ "$entrypoint" == "/usr/libexec/gta-claw/gta-claw-daemon" ]]
+[[ "$state_directory" == "/var/lib/gta-claw" ]]
+daemon="$rootfs$entrypoint"
+[[ -x "$daemon" ]]
+[[ "$(stat -c '%u:%g' "$rootfs$state_directory")" == "65532:65532" ]]
+HOME=/nonexistent \
+GTA_CLAW_STATE_DIR="$state_directory" \
+  timeout 10 \
+    chroot --userspec=65532:65532 "$rootfs" "$entrypoint" --check-config \
+    >"$OUTPUT_ROOT/entrypoint-check.stdout"
+HOME=/nonexistent \
+GTA_CLAW_STATE_DIR="$state_directory" \
+  timeout 10 \
+    chroot --userspec=65532:65532 "$rootfs" "$entrypoint" --probe \
+    >"$OUTPUT_ROOT/entrypoint-probe.stdout"
+printf 'shutdown\n' |
+  HOME=/nonexistent \
+  GTA_CLAW_STATE_DIR="$state_directory" \
+    timeout 15 \
+      chroot \
+        --userspec=65532:65532 \
+        "$rootfs" \
+        "$entrypoint" \
+        --smoke \
+        --listen 127.0.0.1:0 \
+        --legacy-listen 127.0.0.1:0 \
+        --gateway-listen 127.0.0.1:0 \
+        --mcp-listen 127.0.0.1:0 \
+        >"$OUTPUT_ROOT/entrypoint-serve.stdout"
+grep -F 'ready protocol=1' "$OUTPUT_ROOT/entrypoint-serve.stdout" >/dev/null
+grep -F 'stopped ' "$OUTPUT_ROOT/entrypoint-serve.stdout" >/dev/null
+tests=$((tests + 1))
+
 layout="$(prepare_case index-descriptor)"
 replace_json "$layout/index.json" '.manifests[0].size += 1'
 expect_invalid index-descriptor "$(pack_case index-descriptor "$layout")"
@@ -240,6 +293,30 @@ cat "$OUTPUT_ROOT/discard/config-blob" >&"$OPEN_OUTPUT_FD"
 printf 'x' >&"$OPEN_OUTPUT_FD"
 finish_output_file
 expect_invalid config-blob "$(pack_case config-blob "$layout")"
+
+layout="$(prepare_case missing-state-environment)"
+manifest="$(manifest_blob "$layout")"
+config_digest="$(jq -er '.config.digest' "$manifest")"
+config="$layout/blobs/sha256/${config_digest#sha256:}"
+replace_json \
+  "$config" \
+  '.config.Env |= map(select(startswith("GTA_CLAW_STATE_DIR=") | not))'
+reseal_all "$layout"
+expect_invalid \
+  missing-state-environment \
+  "$(pack_case missing-state-environment "$layout")"
+
+layout="$(prepare_case overridden-state-environment)"
+manifest="$(manifest_blob "$layout")"
+config_digest="$(jq -er '.config.digest' "$manifest")"
+config="$layout/blobs/sha256/${config_digest#sha256:}"
+replace_json \
+  "$config" \
+  '.config.Env += ["GTA_CLAW_STATE_DIR=/tmp/gta-claw"]'
+reseal_all "$layout"
+expect_invalid \
+  overridden-state-environment \
+  "$(pack_case overridden-state-environment "$layout")"
 
 layout="$(prepare_case manifest-blob)"
 manifest="$(manifest_blob "$layout")"

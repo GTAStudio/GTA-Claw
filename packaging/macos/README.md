@@ -20,6 +20,10 @@ Release outputs are:
 - an SPDX 2.3 SBOM and SLSA/in-toto provenance statement for every artifact;
 - one complete `SHA256SUMS` manifest over the exact publication bytes.
 
+Each CLI and daemon archive also carries its individual `.sha256` checksum.
+The protected release handoff binds those archives and their checksum, SPDX,
+and provenance companions before any signing secret is available.
+
 The GUI app has bundle identifier `com.gtastudio.gta-claw`, minimum system
 version 14.0, a source-generated icon, the committed empty entitlement set, and
 the hardened runtime.

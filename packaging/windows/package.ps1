@@ -181,8 +181,8 @@ if ($ReleaseMode) {
     Write-Utf8File -Path (Join-Path $desktopPortable 'RELEASE-STATUS.txt') -Content @"
 RELEASE PORTABLE ARTIFACT
 
-Portable ZIP archives do not carry Authenticode package signatures. Verify
-SHA256SUMS, SPDX SBOM, and provenance before distribution.
+Every executable member must carry a verified, timestamped Authenticode
+signature before distribution. Also verify SHA256SUMS, SPDX, and provenance.
 "@
 } else {
     Write-Utf8File -Path (Join-Path $desktopPortable 'RELEASE-STATUS.txt') -Content $releaseStatusText
@@ -198,8 +198,8 @@ if ($ReleaseMode) {
     Write-Utf8File -Path (Join-Path $headlessPortable 'RELEASE-STATUS.txt') -Content @"
 RELEASE PORTABLE ARTIFACT
 
-Portable ZIP archives do not carry Authenticode package signatures. Verify
-SHA256SUMS, SPDX SBOM, and provenance before distribution.
+Every executable member must carry a verified, timestamped Authenticode
+signature before distribution. Also verify SHA256SUMS, SPDX, and provenance.
 "@
 } else {
     Write-Utf8File -Path (Join-Path $headlessPortable 'RELEASE-STATUS.txt') -Content $releaseStatusText
@@ -210,7 +210,7 @@ Assert-PayloadSafety -Root $headlessPortable -ExpectedExecutables @('gta-claw-cl
 
 $zipQualifier = 'portable-unsigned-non-release'
 if ($ReleaseMode) {
-    $zipQualifier = 'portable-release'
+    $zipQualifier = 'portable-release-candidate-unsigned'
 }
 $desktopZip = Join-Path $archRoot "gta-claw-desktop-$($version.Cargo)-windows-$($arch.Name)-$zipQualifier.zip"
 $headlessZip = Join-Path $archRoot "gta-claw-headless-$($version.Cargo)-windows-$($arch.Name)-$zipQualifier.zip"
@@ -228,13 +228,15 @@ Test-ZipPackage `
     -InspectionRoot (Join-Path $zipInspection 'desktop') `
     -Architecture $Architecture `
     -ComponentSet desktop `
-    -ReleaseStatus $portableStatus
+    -ReleaseStatus $portableStatus `
+    -SignatureMode unsigned
 Test-ZipPackage `
     -PackagePath $headlessZip `
     -InspectionRoot (Join-Path $zipInspection 'headless') `
     -Architecture $Architecture `
     -ComponentSet headless `
-    -ReleaseStatus $portableStatus
+    -ReleaseStatus $portableStatus `
+    -SignatureMode unsigned
 
 Copy-PlainFile -Source $executables.Desktop -Destination (Join-Path $msixLayout 'gta-claw-desktop.exe')
 Copy-PlainFile -Source $license -Destination (Join-Path $msixLayout 'LICENSE.txt')

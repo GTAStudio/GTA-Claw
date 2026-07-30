@@ -57,8 +57,14 @@ extract_run_step "$macos_workflow" "Publish exact bytes to GitHub Release" "$mac
 extract_run_step "$windows_workflow" "Publish exact bytes to GitHub Release" "$windows_publisher"
 extract_run_step "$macos_workflow" "Assemble final signed and notarized release" "$assembler"
 
-grep -F 'needs: protected-release-contract' "$macos_workflow" >/dev/null
+grep -F -- '- protected-release-contract' "$macos_workflow" >/dev/null
 grep -F 'needs: release' "$windows_workflow" >/dev/null
+grep -F 'group: macos-desktop-release-' "$macos_workflow" >/dev/null
+grep -F 'group: windows-desktop-release-' "$windows_workflow" >/dev/null
+grep -F 'group: joint-desktop-finalizer-' "$finalizer_workflow" >/dev/null
+for workflow in "$macos_workflow" "$windows_workflow" "$finalizer_workflow"; do
+  grep -F 'cancel-in-progress: false' "$workflow" >/dev/null
+done
 grep -F 'Windows release completion is valid and immutable' "$windows_workflow" >/dev/null
 grep -F 'release delete-asset "$tag" SHA256SUMS-macos --yes' \
   "$macos_workflow" >/dev/null
@@ -78,7 +84,8 @@ test "$(
     END { print count + 0 }
   ' "$macos_workflow" "$windows_workflow"
 )" -eq 2
-grep -F 'cancel-in-progress: false' "$finalizer_workflow" >/dev/null
+grep -F 'Joint release assets changed after validation; refusing publication.' \
+  "$finalizer_workflow" >/dev/null
 
 fake_bin="$test_root/bin"
 mkdir -p "$fake_bin"
@@ -119,6 +126,21 @@ json() {
   printf ']}\n'
 }
 
+if [[ "${1:-}" == "api" ]]; then
+  case "${2:-}" in
+    */git/ref/tags/v1.2.3)
+      printf '{"object":{"type":"tag","sha":"cccccccccccccccccccccccccccccccccccccccc"}}\n'
+      ;;
+    */git/tags/cccccccccccccccccccccccccccccccccccccccc)
+      printf '{"object":{"type":"commit","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}\n'
+      ;;
+    *)
+      echo "unsupported fake gh api path: ${2:-}" >&2
+      exit 2
+      ;;
+  esac
+  exit 0
+fi
 [[ "${1:-}" == "release" ]] || exit 2
 command="${2:-}"
 shift 2
@@ -241,8 +263,9 @@ mkdir -p "$fixture/windows"
 assembly_temp="$test_root/assembly"
 assembly_state="$assembly_temp/gta-claw-release"
 assembly_app="$assembly_state/release-input/GTA Claw.app"
+assembly_headless="$assembly_state/release-input/headless"
 assembly_distribution="$assembly_state/distribution"
-mkdir -p "$assembly_app/Contents/MacOS" "$assembly_distribution"
+mkdir -p "$assembly_app/Contents/MacOS" "$assembly_headless" "$assembly_distribution"
 printf '\000final stapled application bytes\377\n' \
   >"$assembly_app/Contents/MacOS/gta-claw-desktop"
 chmod +x "$assembly_app/Contents/MacOS/gta-claw-desktop"
@@ -250,11 +273,50 @@ printf 'final notarized and stapled dmg bytes\n' \
   >"$assembly_distribution/gta-claw-1.2.3-macos.dmg"
 printf 'final notarized and stapled pkg bytes\n' \
   >"$assembly_distribution/gta-claw-1.2.3-macos.pkg"
+for component in gta-claw-cli gta-claw-daemon; do
+  artifact="$assembly_headless/$component-1.2.3-macos-arm64.tar.gz"
+  printf '%s reviewed headless archive bytes\n' "$component" >"$artifact"
+  sha1="$(shasum -a 1 "$artifact" | awk '{print $1}')"
+  sha256="$(sha256_file "$artifact")"
+  printf '%s  %s\n' "$sha256" "$(basename "$artifact")" >"$artifact.sha256"
+  cat >"$artifact.spdx" <<EOF
+SPDXVersion: SPDX-2.3
+DataLicense: CC0-1.0
+SPDXID: SPDXRef-DOCUMENT
+DocumentName: $(basename "$artifact") SBOM
+DocumentNamespace: https://github.com/GTAStudio/GTA-Claw/releases/sbom/$sha256
+Creator: Tool: GTA-Claw-macOS-Packaging
+Created: 2000-01-01T00:00:00Z
+FileName: ./$(basename "$artifact")
+SPDXID: SPDXRef-Artifact
+FileChecksum: SHA1: $sha1
+FileChecksum: SHA256: $sha256
+LicenseConcluded: NOASSERTION
+LicenseInfoInFile: NOASSERTION
+FileCopyrightText: NOASSERTION
+
+PackageName: $component
+SPDXID: SPDXRef-Package-$component
+PackageVersion: 1.2.3
+PackageDownloadLocation: NOASSERTION
+FilesAnalyzed: false
+PackageLicenseConcluded: NOASSERTION
+PackageLicenseDeclared: MIT
+PackageCopyrightText: NOASSERTION
+
+Relationship: SPDXRef-DOCUMENT DESCRIBES SPDXRef-Artifact
+EOF
+  "$SPDX_VALIDATOR" -i "$artifact.spdx"
+  printf '%s\n' \
+    "{\"_type\":\"https://in-toto.io/Statement/v1\",\"subject\":[{\"name\":\"$(basename "$artifact")\",\"digest\":{\"sha256\":\"$sha256\"}}],\"predicateType\":\"https://slsa.dev/provenance/v1\"}" \
+    >"$artifact.provenance.json"
+done
 PATH="$fake_bin:$PATH" \
   RUNNER_TEMP="$assembly_temp" \
   EXPECTED_PAYLOAD_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   EXPECTED_RELEASE_REF=refs/tags/v1.2.3 \
   EXPECTED_RELEASE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  EXPECTED_TAG_OBJECT=cccccccccccccccccccccccccccccccccccccccc \
   EXPECTED_VERSION=1.2.3 \
   bash "$assembler"
 mv "$assembly_distribution" "$fixture/macos"
@@ -273,6 +335,15 @@ gta-claw-1.2.3-macos.dmg.spdx
 gta-claw-1.2.3-macos.pkg
 gta-claw-1.2.3-macos.pkg.provenance.json
 gta-claw-1.2.3-macos.pkg.spdx
+gta-claw-cli-1.2.3-macos-arm64.tar.gz
+gta-claw-cli-1.2.3-macos-arm64.tar.gz.provenance.json
+gta-claw-cli-1.2.3-macos-arm64.tar.gz.sha256
+gta-claw-cli-1.2.3-macos-arm64.tar.gz.spdx
+gta-claw-daemon-1.2.3-macos-arm64.tar.gz
+gta-claw-daemon-1.2.3-macos-arm64.tar.gz.provenance.json
+gta-claw-daemon-1.2.3-macos-arm64.tar.gz.sha256
+gta-claw-daemon-1.2.3-macos-arm64.tar.gz.spdx
+release-identity-macos.json
 EOF
 find "$fixture/macos" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; |
   LC_ALL=C sort >"$test_root/actual-macos-assembly"
@@ -313,8 +384,27 @@ if "$SPDX_VALIDATOR" -i "$invalid_spdx" >/dev/null 2>&1; then
   exit 1
 fi
 
-printf 'Windows signed archive bytes\n' \
-  >"$fixture/windows/gta-claw-1.2.3-windows-x64-portable-release.zip"
+for name in \
+  gta-claw-1.2.3-windows-x64-signed.msi \
+  gta-claw-desktop-1.2.3-windows-x64-signed.msix \
+  gta-claw-desktop-1.2.3-windows-x64-portable-signed.zip \
+  gta-claw-desktop-1.2.3-windows-arm64-signed.msix \
+  gta-claw-desktop-1.2.3-windows-arm64-portable-signed.zip \
+  gta-claw-desktop-1.2.3-windows-x64_arm64-signed.msixbundle \
+  gta-claw-headless-1.2.3-windows-x64-portable-signed.zip \
+  gta-claw-headless-1.2.3-windows-arm64-portable-signed.zip; do
+  artifact="$fixture/windows/$name"
+  printf '%s signed package bytes\n' "$name" >"$artifact"
+  digest="$(sha256_file "$artifact")"
+  printf '%s  %s\n' "$digest" "$name" >"$artifact.sha256"
+  printf '{"spdxVersion":"SPDX-2.3","name":"%s"}\n' "$name" \
+    >"$artifact.spdx.json"
+  printf '{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"%s","digest":{"sha256":"%s"}}]}\n' \
+    "$name" "$digest" >"$artifact.provenance.json"
+done
+cat >"$fixture/windows/release-identity-windows.json" <<'JSON'
+{"schema":1,"platform":"windows","version":"1.2.3","releaseCommit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","annotatedTagObject":"cccccccccccccccccccccccccccccccccccccccc"}
+JSON
 
 for platform in macos windows; do
   manifest="$fixture/$platform/SHA256SUMS-$platform"
@@ -345,6 +435,8 @@ assert_fixture_bytes() {
 run_finalizer() {
   PATH="$fake_bin:$PATH" \
     RELEASE_TAG=v1.2.3 \
+    RELEASE_COMMIT=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    RELEASE_TAG_OBJECT=cccccccccccccccccccccccccccccccccccccccc \
     RUNNER_TEMP="$test_root" \
     GH_TOKEN=fake \
     bash "$finalizer"
@@ -381,7 +473,7 @@ test_ordering windows macos
 reset_release
 stage_platform windows
 windows_hash="$(sha256_file \
-  "$FAKE_RELEASE/assets/gta-claw-1.2.3-windows-x64-portable-release.zip")"
+  "$FAKE_RELEASE/assets/gta-claw-1.2.3-windows-x64-signed.msi")"
 distribution="$test_root/handoff/gta-claw-release/distribution"
 mkdir -p "$distribution"
 cp "$fixture/macos"/* "$distribution/"
@@ -392,7 +484,7 @@ PATH="$fake_bin:$PATH" \
   bash "$macos_publisher"
 assert_fixture_bytes macos
 [[ "$windows_hash" == "$(sha256_file \
-  "$FAKE_RELEASE/assets/gta-claw-1.2.3-windows-x64-portable-release.zip")" ]]
+  "$FAKE_RELEASE/assets/gta-claw-1.2.3-windows-x64-signed.msi")" ]]
 [[ "$(tail -n 1 "$FAKE_RELEASE/operations")" == "upload SHA256SUMS-macos" ]]
 macos_hash="$(sha256_file \
   "$FAKE_RELEASE/assets/gta-claw-1.2.3-macos.dmg")"
@@ -444,7 +536,7 @@ PATH="$fake_bin:$PATH" \
 assert_fixture_bytes macos
 assert_fixture_bytes windows
 if grep -Fq 'delete SHA256SUMS-windows' "$FAKE_RELEASE/operations" ||
-  grep -Fq 'delete gta-claw-1.2.3-windows-x64-portable-release.zip' \
+  grep -Fq 'delete gta-claw-1.2.3-windows-x64-signed.msi' \
     "$FAKE_RELEASE/operations"; then
   echo "macOS retry deleted completed Windows assets" >&2
   exit 1
@@ -513,7 +605,7 @@ grep -Fq 'delete gta-claw-1.2.3-macos.dmg' "$FAKE_RELEASE/operations" || {
   exit 1
 }
 if grep -Fq 'delete SHA256SUMS-windows' "$FAKE_RELEASE/operations" ||
-  grep -Fq 'delete gta-claw-1.2.3-windows-x64-portable-release.zip' \
+  grep -Fq 'delete gta-claw-1.2.3-windows-x64-signed.msi' \
     "$FAKE_RELEASE/operations"; then
   echo "macOS conflicting-byte retry deleted foreign Windows assets" >&2
   exit 1
@@ -527,7 +619,7 @@ cp "$fixture/windows"/* "$windows_publication/"
 reset_release
 stage_platform macos
 printf 'different existing Windows bytes\n' \
-  >"$FAKE_RELEASE/assets/gta-claw-1.2.3-windows-x64-portable-release.zip"
+  >"$FAKE_RELEASE/assets/gta-claw-1.2.3-windows-x64-signed.msi"
 cp "$fixture/windows/SHA256SUMS-windows" \
   "$FAKE_RELEASE/assets/SHA256SUMS-windows"
 touch "$FAKE_RELEASE/failed-assets/SHA256SUMS-windows"
@@ -548,7 +640,7 @@ grep -Fq 'delete SHA256SUMS-windows' "$FAKE_RELEASE/operations" || {
   echo "Windows retry did not retire a same-size corrupt completion asset" >&2
   exit 1
 }
-grep -Fq 'delete gta-claw-1.2.3-windows-x64-portable-release.zip' \
+grep -Fq 'delete gta-claw-1.2.3-windows-x64-signed.msi' \
   "$FAKE_RELEASE/operations" || {
   echo "Windows retry did not retire an incomplete owned asset" >&2
   exit 1
@@ -560,9 +652,9 @@ if grep -Fq 'delete SHA256SUMS-macos' "$FAKE_RELEASE/operations" ||
 fi
 
 windows_hash="$(sha256_file \
-  "$FAKE_RELEASE/assets/gta-claw-1.2.3-windows-x64-portable-release.zip")"
+  "$FAKE_RELEASE/assets/gta-claw-1.2.3-windows-x64-signed.msi")"
 printf 'different rerun Windows bytes\n' \
-  >"$windows_publication/gta-claw-1.2.3-windows-x64-portable-release.zip"
+  >"$windows_publication/gta-claw-1.2.3-windows-x64-signed.msi"
 (
   cd "$windows_workspace"
   PATH="$fake_bin:$PATH" \
@@ -571,7 +663,7 @@ printf 'different rerun Windows bytes\n' \
     bash "$windows_publisher"
 )
 [[ "$windows_hash" == "$(sha256_file \
-  "$FAKE_RELEASE/assets/gta-claw-1.2.3-windows-x64-portable-release.zip")" ]] ||
+  "$FAKE_RELEASE/assets/gta-claw-1.2.3-windows-x64-signed.msi")" ]] ||
   {
     echo "completed Windows publication was mutated by a rerun" >&2
     exit 1
@@ -596,6 +688,43 @@ operations_before="$(cat "$FAKE_RELEASE/operations")"
   exit 1
 }
 assert_fixture_bytes windows
+
+reset_release
+stage_platform macos
+stage_platform windows
+name="gta-claw-1.2.3-windows-x64-signed.msi"
+printf '%064d  %s\n' 0 "$name" >"$FAKE_RELEASE/assets/$name.sha256"
+: >"$FAKE_RELEASE/assets/SHA256SUMS-windows"
+for path in "$FAKE_RELEASE/assets"/*windows*; do
+  [[ "$(basename "$path")" == "SHA256SUMS-windows" ]] && continue
+  printf '%s  %s\n' "$(sha256_file "$path")" "$(basename "$path")" \
+    >>"$FAKE_RELEASE/assets/SHA256SUMS-windows"
+done
+if run_finalizer >/dev/null 2>&1; then
+  echo "joint finalizer accepted an internally inconsistent per-artifact checksum" >&2
+  exit 1
+fi
+[[ "$(cat "$FAKE_RELEASE/draft")" == "true" ]]
+
+reset_release
+stage_platform macos
+stage_platform windows
+for name in \
+  gta-claw-desktop-1.2.3-windows-arm64-signed.msix \
+  gta-claw-desktop-1.2.3-windows-arm64-signed.msix.sha256 \
+  gta-claw-desktop-1.2.3-windows-arm64-signed.msix.spdx.json \
+  gta-claw-desktop-1.2.3-windows-arm64-signed.msix.provenance.json; do
+  rm "$FAKE_RELEASE/assets/$name"
+  grep -Fv "  $name" "$FAKE_RELEASE/assets/SHA256SUMS-windows" \
+    >"$FAKE_RELEASE/assets/SHA256SUMS-windows.tmp"
+  mv "$FAKE_RELEASE/assets/SHA256SUMS-windows.tmp" \
+    "$FAKE_RELEASE/assets/SHA256SUMS-windows"
+done
+if run_finalizer >/dev/null 2>&1; then
+  echo "joint finalizer accepted self-consistent reduced platform manifests" >&2
+  exit 1
+fi
+[[ "$(cat "$FAKE_RELEASE/draft")" == "true" ]]
 
 reset_release
 stage_platform macos

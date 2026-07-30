@@ -6,6 +6,7 @@ on:
       - ".github/workflows/windows-packaging.yml"
       - ".github/workflows/joint-release-finalize.yml"
       - "packaging/windows/**"
+      - "packaging/macos/spdx-tools-requirements.txt"
       - "apps/**"
       - "crates/**"
       - "desktop/**"
@@ -19,13 +20,17 @@ on:
         required: true
         type: boolean
         default: false
+      release_commit:
+        description: Full immutable commit SHA selected by the annotated release tag
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
   group: windows-packaging-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_BUILD_JOBS: "4"
@@ -204,8 +209,14 @@ jobs:
     needs: validate
     runs-on: windows-latest
     environment: windows-release
+    concurrency:
+      group: windows-desktop-release-${{ github.ref_name }}
+      cancel-in-progress: false
     permissions:
       contents: write
+    outputs:
+      release-sha: ${{ steps.policy.outputs.release-sha }}
+      tag-object: ${{ steps.policy.outputs.tag-object }}
     steps:
       - name: Checkout immutable candidate
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -214,6 +225,7 @@ jobs:
           persist-credentials: false
 
       - name: Enforce immutable semantic release tag
+        id: policy
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -236,6 +248,39 @@ jobs:
           if ((Get-CanonicalVersion $PWD).Cargo -ne $version) {
             throw 'Release tag version does not match the Cargo workspace version.'
           }
+          "release-sha=$env:GITHUB_SHA" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag-object=$(git rev-parse $env:GITHUB_REF)" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Set up pinned Python for official SPDX validation
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.13"
+          check-latest: false
+
+      - name: Install checksum-pinned official SPDX validator
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'gta-claw-spdx-tools'
+          python -m venv $root
+          $python = Join-Path $root 'Scripts\python.exe'
+          & $python -m pip install `
+            --disable-pip-version-check `
+            --only-binary=:all: `
+            --require-hashes `
+            --requirement packaging\macos\spdx-tools-requirements.txt
+          $validator = Join-Path $root 'Scripts\pyspdxtools.exe'
+          if (-not (Test-Path -LiteralPath $validator -PathType Leaf)) {
+            throw 'Official SPDX validator installation is incomplete.'
+          }
+          $spdxVersion = & $python -c 'import importlib.metadata; print(importlib.metadata.version("spdx-tools"))'
+          if ($spdxVersion -ne '0.8.3') {
+            throw "Unexpected SPDX validator version: $spdxVersion"
+          }
+          "SPDX_VALIDATOR=$validator" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Require both Windows architecture toolchains
         shell: pwsh
@@ -278,10 +323,88 @@ jobs:
           cargo fetch --manifest-path Cargo.toml --locked
           cargo fetch --manifest-path desktop\Cargo.toml --locked
 
-      - name: Import protected signing identity
-        id: signing
+      - name: Build and freeze reviewed production-identity candidates offline
         shell: pwsh
         env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}\cargo-target
+          EXPECTED_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+          TMP: ${{ runner.temp }}\gta-claw-tmp
+          TEMP: ${{ runner.temp }}\gta-claw-tmp
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:EXPECTED_PUBLISHER -notmatch '^CN=[^<>&"]+$') {
+            throw 'WINDOWS_SIGNING_PUBLISHER must be a protected certificate subject.'
+          }
+          New-Item -ItemType Directory -Force -Path $env:CARGO_TARGET_DIR,$env:TMP | Out-Null
+          .\packaging\windows\package.ps1 `
+            -Architecture x64 `
+            -ReleaseMode `
+            -Publisher $env:EXPECTED_PUBLISHER
+          .\packaging\windows\package.ps1 `
+            -Architecture arm64 `
+            -ReleaseMode `
+            -Publisher $env:EXPECTED_PUBLISHER `
+            -SkipMsi
+          $candidates = @(
+            Get-ChildItem packaging\windows\out\x64 -File |
+              Where-Object { $_.Name -match '-release-candidate-unsigned\.(zip|msix|msi)$' }
+            Get-ChildItem packaging\windows\out\arm64 -File |
+              Where-Object { $_.Name -match '-release-candidate-unsigned\.(zip|msix)$' }
+          )
+          if ($candidates.Count -ne 7) {
+            throw "Reviewed signing input set must contain exactly seven packages and portable archives, found $($candidates.Count)."
+          }
+          $ledger = @($candidates | Sort-Object Name | ForEach-Object {
+            [ordered]@{
+              name = $_.Name
+              path = $_.FullName
+              sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          })
+          $ledgerPath = Join-Path $env:RUNNER_TEMP 'windows-signing-inputs.json'
+          [IO.File]::WriteAllText(
+            $ledgerPath,
+            (($ledger | ConvertTo-Json -Depth 4 -Compress) + "`n"),
+            [Text.UTF8Encoding]::new($false)
+          )
+          "SIGNING_INPUT_MANIFEST=$ledgerPath" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Revalidate immutable tag and reviewed bytes before signing
+        shell: pwsh
+        env:
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_COMMIT -notmatch '^[0-9a-f]{40}$' -or
+              $env:RELEASE_COMMIT -ne $env:GITHUB_SHA) {
+            throw 'release_commit must equal the immutable workflow commit.'
+          }
+          $tagObject = git rev-parse $env:GITHUB_REF
+          $remoteTag = @(git ls-remote --exit-code origin $env:GITHUB_REF)
+          if ($LASTEXITCODE -ne 0 -or $remoteTag.Count -ne 1 -or
+              (($remoteTag[0] -split '\s+')[0]) -ne $tagObject) {
+            throw 'Remote annotated release tag changed before signing.'
+          }
+          $ledger = @(Get-Content $env:SIGNING_INPUT_MANIFEST -Raw | ConvertFrom-Json)
+          if ($ledger.Count -ne 7) {
+            throw 'Reviewed signing input ledger is incomplete.'
+          }
+          foreach ($entry in $ledger) {
+            if (-not (Test-Path -LiteralPath $entry.path -PathType Leaf)) {
+              throw "Reviewed signing input disappeared: $($entry.name)"
+            }
+            $actual = (Get-FileHash $entry.path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -cne $entry.sha256) {
+              throw "Reviewed signing input changed: $($entry.name)"
+            }
+          }
+
+      - name: Import protected package signing identity
+        id: package-signing
+        shell: pwsh
+        env:
+          EXPECTED_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
           WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
@@ -302,74 +425,195 @@ jobs:
           } finally {
             Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
           }
+          if ($null -ne $certificate -and
+              $certificate.Thumbprint -match '^[0-9A-Fa-f]{40}$') {
+            "thumbprint=$($certificate.Thumbprint)" |
+              Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
           if ($null -eq $certificate -or -not $certificate.HasPrivateKey) {
+            if ($null -ne $certificate -and
+                $certificate.Thumbprint -match '^[0-9A-Fa-f]{40}$') {
+              $certificatePath = "Cert:\CurrentUser\My\$($certificate.Thumbprint)"
+              Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
+              if (Test-Path -LiteralPath $certificatePath) {
+                throw 'Invalid package signing certificate or private key remained after cleanup.'
+              }
+            }
             throw 'Imported Windows certificate has no private key.'
           }
-          "thumbprint=$($certificate.Thumbprint)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if ($certificate.Subject -cne $env:EXPECTED_PUBLISHER) {
+            $certificatePath = "Cert:\CurrentUser\My\$($certificate.Thumbprint)"
+            Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
+            if (Test-Path -LiteralPath $certificatePath) {
+              throw 'Wrong-subject package signing certificate or private key remained after cleanup.'
+            }
+            throw 'Imported Windows certificate subject differs from the reviewed publisher.'
+          }
           "publisher=$($certificate.Subject)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Build production-identity candidates offline
+      - name: Sign only the reviewed package and portable candidates
         shell: pwsh
         env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}\cargo-target
-          TMP: ${{ runner.temp }}\gta-claw-tmp
-          TEMP: ${{ runner.temp }}\gta-claw-tmp
-        run: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force -Path $env:CARGO_TARGET_DIR,$env:TMP | Out-Null
-          .\packaging\windows\package.ps1 `
-            -Architecture x64 `
-            -ReleaseMode `
-            -Publisher '${{ steps.signing.outputs.publisher }}'
-          .\packaging\windows\package.ps1 `
-            -Architecture arm64 `
-            -ReleaseMode `
-            -Publisher '${{ steps.signing.outputs.publisher }}' `
-            -SkipMsi
-
-      - name: Sign packages and assemble signed-inner bundle
-        shell: pwsh
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}\cargo-target
-          TMP: ${{ runner.temp }}\gta-claw-tmp
-          TEMP: ${{ runner.temp }}\gta-claw-tmp
           TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
         run: |
           $ErrorActionPreference = 'Stop'
           if ($env:TIMESTAMP_URL -notmatch '^https://') {
             throw 'WINDOWS_TIMESTAMP_URL must be a protected HTTPS RFC3161 endpoint.'
           }
-          $thumbprint = '${{ steps.signing.outputs.thumbprint }}'
-          $publisher = '${{ steps.signing.outputs.publisher }}'
-          $x64Root = 'packaging\windows\out\x64'
-          $armRoot = 'packaging\windows\out\arm64'
-          $x64Msix = @(Get-ChildItem $x64Root -Filter '*release-candidate-unsigned.msix')
-          $armMsix = @(Get-ChildItem $armRoot -Filter '*release-candidate-unsigned.msix')
-          $x64Msi = @(Get-ChildItem $x64Root -Filter '*release-candidate-unsigned.msi')
-          if ($x64Msix.Count -ne 1 -or $armMsix.Count -ne 1 -or $x64Msi.Count -ne 1) {
-            throw 'Release candidate package set is incomplete.'
-          }
-          foreach ($package in @($x64Msix[0], $armMsix[0], $x64Msi[0])) {
+          $ledger = @(Get-Content $env:SIGNING_INPUT_MANIFEST -Raw | ConvertFrom-Json)
+          foreach ($entry in $ledger) {
+            $actual = (Get-FileHash $entry.path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -cne $entry.sha256) {
+              throw "Signing input changed after review: $($entry.name)"
+            }
             .\packaging\windows\sign.ps1 `
-              -PackagePath $package.FullName `
-              -CertificateThumbprint $thumbprint `
+              -PackagePath $entry.path `
+              -CertificateThumbprint '${{ steps.package-signing.outputs.thumbprint }}' `
               -TimestampUrl $env:TIMESTAMP_URL
           }
+
+      - name: Remove package signing identity before bundle assembly
+        if: always()
+        shell: pwsh
+        run: |
+          $thumbprint = '${{ steps.package-signing.outputs.thumbprint }}'
+          if ($thumbprint -match '^[0-9A-Fa-f]{40}$') {
+            $certificatePath = "Cert:\CurrentUser\My\$thumbprint"
+            Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
+            if (Test-Path -LiteralPath $certificatePath) {
+              throw 'Package signing certificate or private key remained after cleanup.'
+            }
+          }
+
+      - name: Assemble signed-inner bundle without signing identity
+        shell: pwsh
+        env:
+          EXPECTED_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $x64Root = 'packaging\windows\out\x64'
+          $armRoot = 'packaging\windows\out\arm64'
           $signedX64 = @(Get-ChildItem $x64Root -Filter '*windows-x64-signed.msix')
           $signedArm = @(Get-ChildItem $armRoot -Filter '*windows-arm64-signed.msix')
+          if ($signedX64.Count -ne 1 -or $signedArm.Count -ne 1) {
+            throw 'Signed inner MSIX set is incomplete.'
+          }
           .\packaging\windows\bundle.ps1 `
             -X64Msix $signedX64[0].FullName `
             -Arm64Msix $signedArm[0].FullName `
             -ReleaseMode `
-            -Publisher $publisher
+            -Publisher $env:EXPECTED_PUBLISHER
           $bundle = @(Get-ChildItem packaging\windows\out\bundle -Filter '*release-candidate-unsigned.msixbundle')
+          if ($bundle.Count -ne 1) {
+            throw 'Reviewed unsigned bundle candidate set is incomplete.'
+          }
+          "BUNDLE_SIGNING_INPUT=$($bundle[0].FullName)" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "BUNDLE_SIGNING_SHA256=$((Get-FileHash $bundle[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant())" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Revalidate immutable tag and bundle bytes before bundle signing
+        shell: pwsh
+        env:
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_COMMIT -ne $env:GITHUB_SHA) {
+            throw 'release_commit changed before bundle signing.'
+          }
+          $tagObject = git rev-parse $env:GITHUB_REF
+          $remoteTag = @(git ls-remote --exit-code origin $env:GITHUB_REF)
+          if ($LASTEXITCODE -ne 0 -or $remoteTag.Count -ne 1 -or
+              (($remoteTag[0] -split '\s+')[0]) -ne $tagObject) {
+            throw 'Remote annotated release tag changed before bundle signing.'
+          }
+          if (-not (Test-Path -LiteralPath $env:BUNDLE_SIGNING_INPUT -PathType Leaf)) {
+            throw 'Reviewed unsigned bundle candidate disappeared.'
+          }
+          $actual = (Get-FileHash $env:BUNDLE_SIGNING_INPUT -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -cne $env:BUNDLE_SIGNING_SHA256) {
+            throw 'Reviewed unsigned bundle candidate changed before identity import.'
+          }
+
+      - name: Import protected bundle signing identity
+        id: bundle-signing
+        shell: pwsh
+        env:
+          EXPECTED_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PFX) -or
+              [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            throw 'Protected Windows bundle signing credentials are unavailable.'
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'gta-claw-bundle-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX))
+          try {
+            $secure = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $certificate = Import-PfxCertificate `
+              -FilePath $pfx `
+              -CertStoreLocation Cert:\CurrentUser\My `
+****** `
+              -Exportable:$false
+          } finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
+          if ($null -ne $certificate -and
+              $certificate.Thumbprint -match '^[0-9A-Fa-f]{40}$') {
+            "thumbprint=$($certificate.Thumbprint)" |
+              Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+          if ($null -eq $certificate -or -not $certificate.HasPrivateKey -or
+              $certificate.Subject -cne $env:EXPECTED_PUBLISHER) {
+            if ($null -ne $certificate -and
+                $certificate.Thumbprint -match '^[0-9A-Fa-f]{40}$') {
+              $certificatePath = "Cert:\CurrentUser\My\$($certificate.Thumbprint)"
+              Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
+              if (Test-Path -LiteralPath $certificatePath) {
+                throw 'Invalid bundle signing certificate or private key remained after cleanup.'
+              }
+            }
+            throw 'Protected bundle signing identity is invalid.'
+          }
+
+      - name: Sign only the reviewed bundle candidate
+        shell: pwsh
+        env:
+          TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath $env:BUNDLE_SIGNING_INPUT -PathType Leaf)) {
+            throw 'Reviewed unsigned bundle candidate disappeared.'
+          }
+          $actual = (Get-FileHash $env:BUNDLE_SIGNING_INPUT -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -cne $env:BUNDLE_SIGNING_SHA256) {
+            throw 'Reviewed unsigned bundle candidate changed before signing.'
+          }
           .\packaging\windows\sign.ps1 `
-            -PackagePath $bundle[0].FullName `
-            -CertificateThumbprint $thumbprint `
+            -PackagePath $env:BUNDLE_SIGNING_INPUT `
+            -CertificateThumbprint '${{ steps.bundle-signing.outputs.thumbprint }}' `
             -TimestampUrl $env:TIMESTAMP_URL
+
+      - name: Remove bundle signing identity before supply-chain assembly
+        if: always()
+        shell: pwsh
+        run: |
+          $thumbprint = '${{ steps.bundle-signing.outputs.thumbprint }}'
+          if ($thumbprint -match '^[0-9A-Fa-f]{40}$') {
+            $certificatePath = "Cert:\CurrentUser\My\$thumbprint"
+            Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
+            if (Test-Path -LiteralPath $certificatePath) {
+              throw 'Bundle signing certificate or private key remained after cleanup.'
+            }
+          }
 
       - name: Assemble and validate exact release publication bytes
         shell: pwsh
+        env:
+          EXPECTED_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+          EXPECTED_TAG_OBJECT: ${{ steps.policy.outputs.tag-object }}
         run: |
           $ErrorActionPreference = 'Stop'
           Import-Module .\packaging\windows\WindowsPackaging.psm1 -Force
@@ -378,26 +622,69 @@ jobs:
           New-Item -ItemType Directory -Force -Path $publication | Out-Null
           $primary = @(
             Get-ChildItem packaging\windows\out\x64 -File |
-              Where-Object { $_.Name -match 'portable-release\.zip$|-signed\.(msix|msi)$' }
+              Where-Object { $_.Name -match '-signed\.(zip|msix|msi)$' }
             Get-ChildItem packaging\windows\out\arm64 -File |
-              Where-Object { $_.Name -match 'portable-release\.zip$|-signed\.msix$' }
+              Where-Object { $_.Name -match '-signed\.(zip|msix)$' }
             Get-ChildItem packaging\windows\out\bundle -File |
               Where-Object { $_.Name -match '-signed\.msixbundle$' }
           )
           if ($primary.Count -ne 8) {
-            throw "Expected eight Windows release artifacts, found $($primary.Count)."
+            throw "Expected eight signed Windows release artifacts, found $($primary.Count)."
+          }
+          $portable = @($primary | Where-Object { $_.Name -match 'portable-signed\.zip$' })
+          if ($portable.Count -ne 4) {
+            throw "Expected four signed portable Windows archives, found $($portable.Count)."
           }
           foreach ($artifact in $primary) {
+            $componentSet = $(if ($artifact.Extension -eq '.msi') {
+              'combined'
+            } elseif ($artifact.Name -match 'headless') {
+              'headless'
+            } else {
+              'desktop'
+            })
+            $targets = @($(if ($artifact.Name -match 'arm64') {
+              'aarch64-pc-windows-msvc'
+            } else {
+              'x86_64-pc-windows-msvc'
+            }))
+            if ($artifact.Extension -eq '.msixbundle') {
+              $targets = @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')
+            }
+            New-ArtifactSupplyChain `
+              -RepoRoot $PWD `
+              -ArtifactPath $artifact.FullName `
+              -ComponentSet $componentSet `
+              -RustTarget $targets `
+              -ProvenanceTargets $targets | Out-Null
+            & $env:SPDX_VALIDATOR -i "$($artifact.FullName).spdx.json"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Official SPDX validator rejected '$($artifact.Name).spdx.json'."
+            }
             Copy-Item -LiteralPath $artifact.FullName -Destination $publication
+            Copy-Item -LiteralPath "$($artifact.FullName).sha256" -Destination $publication
             Copy-Item -LiteralPath "$($artifact.FullName).spdx.json" -Destination $publication
             Copy-Item -LiteralPath "$($artifact.FullName).provenance.json" -Destination $publication
           }
+          [ordered]@{
+            schema = 1
+            platform = 'windows'
+            version = $env:GITHUB_REF_NAME.Substring(1)
+            releaseCommit = $env:GITHUB_SHA
+            annotatedTagObject = $env:EXPECTED_TAG_OBJECT
+          } |
+            ConvertTo-Json -Compress |
+            ForEach-Object { [IO.File]::WriteAllText(
+              (Join-Path $publication 'release-identity-windows.json'),
+              "$_`n",
+              [Text.UTF8Encoding]::new($false)
+            ) }
           Write-ArtifactSetChecksums `
             -Directory $publication `
             -ManifestName SHA256SUMS-windows | Out-Null
           .\packaging\windows\validate-artifacts.ps1 `
             -ArtifactDirectory $publication `
-            -Publisher '${{ steps.signing.outputs.publisher }}' `
+            -Publisher $env:EXPECTED_PUBLISHER `
             -ChecksumName SHA256SUMS-windows
 
       - name: Upload signed Windows release
@@ -572,12 +859,24 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $thumbprint = '${{ steps.signing.outputs.thumbprint }}'
-          if ($thumbprint -match '^[0-9A-Fa-f]{40}$') {
-            Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" -Force -ErrorAction SilentlyContinue
+          foreach ($thumbprint in @(
+            '${{ steps.package-signing.outputs.thumbprint }}',
+            '${{ steps.bundle-signing.outputs.thumbprint }}'
+          )) {
+            if ($thumbprint -match '^[0-9A-Fa-f]{40}$') {
+              $certificatePath = "Cert:\CurrentUser\My\$thumbprint"
+              if (Test-Path -LiteralPath $certificatePath) {
+                Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
+              }
+              if (Test-Path -LiteralPath $certificatePath) {
+                throw 'Windows signing certificate or private key remained after final cleanup.'
+              }
+            }
           }
-          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'gta-claw-signing.pfx') `
-            -Force -ErrorAction SilentlyContinue
+          foreach ($pfxName in @('gta-claw-signing.pfx', 'gta-claw-bundle-signing.pfx')) {
+            Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP $pfxName) `
+              -Force -ErrorAction SilentlyContinue
+          }
 
   finalize-release:
     name: Finalize joint desktop release
@@ -588,3 +887,5 @@ jobs:
     uses: ./.github/workflows/joint-release-finalize.yml
     with:
       tag: ${{ github.ref_name }}
+      release_commit: ${{ needs.release.outputs.release-sha }}
+      tag_object: ${{ needs.release.outputs.tag-object }}

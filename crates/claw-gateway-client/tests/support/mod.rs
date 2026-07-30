@@ -208,18 +208,25 @@ impl Drop for TestGateway {
 }
 
 pub(crate) async fn raw_stalled_server()
--> (Url, CancellationToken, TaskTracker, oneshot::Receiver<()>) {
+-> (
+    Url,
+    CancellationToken,
+    TaskTracker,
+    oneshot::Receiver<()>,
+    oneshot::Receiver<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("address");
     let cancellation = CancellationToken::new();
     let tasks = TaskTracker::new();
     let task_cancellation = cancellation.clone();
     let (handshake_tx, handshake_rx) = oneshot::channel();
+    let (eof_tx, eof_rx) = oneshot::channel();
     tasks.spawn(async move {
         if let Ok((stream, _)) = listener.accept().await {
             tokio::select! {
                 () = task_cancellation.cancelled() => {}
-                () = hold_stalled_handshake(stream, handshake_tx) => {}
+                () = hold_stalled_handshake(stream, handshake_tx, eof_tx) => {}
             }
         }
     });
@@ -228,10 +235,15 @@ pub(crate) async fn raw_stalled_server()
         cancellation,
         tasks,
         handshake_rx,
+        eof_rx,
     )
 }
 
-async fn hold_stalled_handshake(mut stream: TcpStream, ready: oneshot::Sender<()>) {
+async fn hold_stalled_handshake(
+    mut stream: TcpStream,
+    ready: oneshot::Sender<()>,
+    eof: oneshot::Sender<()>,
+) {
     let mut received = Vec::with_capacity(1024);
     loop {
         if received.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -246,7 +258,15 @@ async fn hold_stalled_handshake(mut stream: TcpStream, ready: oneshot::Sender<()
     ready
         .send(())
         .expect("stalled handshake readiness receiver remains open");
-    std::future::pending::<()>().await;
+    let mut trailing = [0_u8; 1024];
+    loop {
+        let count = stream.read(&mut trailing).await.expect("read after handshake");
+        if count == 0 {
+            eof.send(())
+                .expect("stalled handshake EOF receiver remains open");
+            return;
+        }
+    }
 }
 
 pub(crate) async fn send_json(socket: &mut TestSocket, value: Value) {

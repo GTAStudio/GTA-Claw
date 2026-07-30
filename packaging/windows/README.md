@@ -17,6 +17,13 @@ the only version source. For each architecture it emits:
 - complete `SHA256SUMS` manifests over every artifact and supply-chain
   companion (`SHA256SUMS-windows` in a GitHub Release).
 
+Protected release portable ZIPs contain only individually Authenticode-signed,
+timestamped executables plus their license, status, and internal checksum
+manifest. The fixed release profile contains signed x64 and arm64 desktop and
+headless ZIPs, the signed x64 MSI, signed x64 and arm64 MSIX packages, and the
+signed x64+arm64 MSIXBundle, with a `.sha256`, SPDX, and provenance companion
+for each.
+
 `bundle.ps1` validates the x64 and arm64 MSIX bytes before creating an
 x64+arm64 MSIXBundle. Unsigned outputs include `unsigned-non-release` in their
 names and contain an explicit non-release marker. Release mode requires the
@@ -85,15 +92,20 @@ deployment.
 
 ## Signing
 
-`sign.ps1` accepts only `release-candidate-unsigned` MSIX, MSIXBundle, or MSI
-packages. It requires a non-expired code-signing certificate with an accessible
-private key, an HTTPS RFC3161 timestamp endpoint, and (for MSIX) an exact
-publisher-subject match. It signs a copy, verifies Authenticode and the
-timestamp, reopens the signed package bytes, and regenerates SBOM, provenance,
-and checksums for the changed bytes. Missing credentials are fatal; unsigned
-packages can never pass signed validation.
+`sign.ps1` accepts only `release-candidate-unsigned` portable ZIP, MSIX,
+MSIXBundle, or MSI inputs. It requires a non-expired code-signing certificate
+with an accessible private key, an HTTPS RFC3161 timestamp endpoint, and (for
+MSIX) an exact publisher-subject match. For ZIPs it validates and extracts the
+reviewed archive, signs and timestamps every allowlisted executable, rebuilds
+the internal checksum manifest and deterministic container, then reopens and
+verifies every executable member. Missing credentials are fatal; unsigned
+executables or packages can never pass signed validation.
 
 The workflow exercises unsigned x64 and arm64 packaging on every relevant
-change. An explicit protected `windows-release` dispatch imports a temporary
-certificate, signs x64 MSI plus both MSIX packages and the MSIXBundle, validates
-the final publication directory, uploads it, and removes the certificate.
+change. An explicit protected `windows-release` dispatch builds and hashes all
+production-identity candidates before importing a certificate. Certificate
+windows execute signing only: package signing is followed by immediate identity
+removal, bundle assembly runs without a private key, and a second short-lived
+identity signs only the reviewed bundle. After both identities are removed, the
+workflow generates and officially validates SPDX plus provenance for the final
+signed bytes, validates the exact publication directory, and uploads it.

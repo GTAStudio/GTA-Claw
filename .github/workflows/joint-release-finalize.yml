@@ -7,6 +7,14 @@ on:
         description: Annotated semantic release tag
         required: true
         type: string
+      release_commit:
+        description: Immutable commit selected by the annotated release tag
+        required: true
+        type: string
+      tag_object:
+        description: Immutable annotated tag object SHA
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -17,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
-      group: joint-desktop-release-${{ inputs.tag }}
+      group: joint-desktop-finalizer-${{ inputs.tag }}
       cancel-in-progress: false
     steps:
       - name: Validate and finalize joint release
@@ -25,7 +33,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
           RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG_OBJECT: ${{ inputs.tag_object }}
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
@@ -33,10 +43,30 @@ jobs:
             echo "Joint release finalizer requires a semantic vX.Y.Z tag." >&2
             exit 1
           }
+          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_TAG_OBJECT" =~ ^[0-9a-f]{40}$ ]]
+          version="${tag#v}"
+          verify_remote_tag() {
+            local ref_json
+            local tag_json
+            ref_json="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag")"
+            [[ "$(jq -r '.object.type' <<<"$ref_json")" == "tag" ]]
+            [[ "$(jq -r '.object.sha' <<<"$ref_json")" == "$RELEASE_TAG_OBJECT" ]]
+            tag_json="$(
+              gh api "repos/$GITHUB_REPOSITORY/git/tags/$RELEASE_TAG_OBJECT"
+            )"
+            [[ "$(jq -r '.object.type' <<<"$tag_json")" == "commit" ]]
+            [[ "$(jq -r '.object.sha' <<<"$tag_json")" == "$RELEASE_COMMIT" ]]
+          }
+          verify_remote_tag
 
           release_json="$(gh release view "$tag" --json isDraft,assets)"
           is_draft="$(jq -r '.isDraft' <<<"$release_json")"
           assets="$(jq -r '.assets[].name' <<<"$release_json" | LC_ALL=C sort)"
+          validated_asset_metadata="$(
+            jq -c '[.assets[] | {name, state, size, digest}] | sort_by(.name)' \
+              <<<"$release_json"
+          )"
           missing=()
           for manifest in SHA256SUMS-macos SHA256SUMS-windows; do
             if ! grep -Fqx "$manifest" <<<"$assets"; then
@@ -58,6 +88,37 @@ jobs:
 
           expected="$verify/.expected-assets"
           printf '%s\n' SHA256SUMS-macos SHA256SUMS-windows >"$expected"
+          fixed="$verify/.fixed-assets"
+          {
+            printf '%s\n' SHA256SUMS-macos SHA256SUMS-windows
+            for name in \
+              "gta-claw-$version-macos-arm64-signed-notarized.app.zip" \
+              "gta-claw-$version-macos.dmg" \
+              "gta-claw-$version-macos.pkg"; do
+              printf '%s\n' "$name" "$name.spdx" "$name.provenance.json"
+            done
+            for component in gta-claw-cli gta-claw-daemon; do
+              name="$component-$version-macos-arm64.tar.gz"
+              printf '%s\n' "$name" "$name.sha256" "$name.spdx" "$name.provenance.json"
+            done
+            printf '%s\n' release-identity-macos.json
+            for name in \
+              "gta-claw-$version-windows-x64-signed.msi" \
+              "gta-claw-desktop-$version-windows-x64-signed.msix" \
+              "gta-claw-desktop-$version-windows-x64-portable-signed.zip" \
+              "gta-claw-desktop-$version-windows-arm64-signed.msix" \
+              "gta-claw-desktop-$version-windows-arm64-portable-signed.zip" \
+              "gta-claw-desktop-$version-windows-x64_arm64-signed.msixbundle" \
+              "gta-claw-headless-$version-windows-x64-portable-signed.zip" \
+              "gta-claw-headless-$version-windows-arm64-portable-signed.zip"; do
+              printf '%s\n' \
+                "$name" \
+                "$name.sha256" \
+                "$name.spdx.json" \
+                "$name.provenance.json"
+            done
+            printf '%s\n' release-identity-windows.json
+          } | LC_ALL=C sort >"$fixed"
           for manifest in SHA256SUMS-macos SHA256SUMS-windows; do
             while IFS= read -r line || [[ -n "$line" ]]; do
               if [[ ! "$line" =~ ^([0-9a-f]{64})\ \ ([^/\\]+)$ ]]; then
@@ -91,14 +152,89 @@ jobs:
             exit 1
           fi
           LC_ALL=C sort -u "$expected" -o "$expected"
+          if ! diff -u "$fixed" "$expected"; then
+            echo "Joint release manifests differ from the fixed versioned artifact profile." >&2
+            exit 1
+          fi
           actual="$verify/.actual-assets"
           printf '%s\n' "$assets" >"$actual"
-          if ! diff -u "$expected" "$actual"; then
-            echo "Joint release asset set differs from both checksum manifests." >&2
+          if ! diff -u "$fixed" "$actual"; then
+            echo "Joint release asset set differs from the fixed versioned artifact profile." >&2
             exit 1
           fi
 
-          current_json="$(gh release view "$tag" --json isDraft)"
+          for component in gta-claw-cli gta-claw-daemon; do
+            name="$component-$version-macos-arm64.tar.gz"
+            line="$(cat "$verify/$name.sha256")"
+            [[ "$line" =~ ^([0-9A-Fa-f]{64})\ \ ([^/\\]+)$ ]] || {
+              echo "Invalid macOS per-artifact checksum companion: $name.sha256" >&2
+              exit 1
+            }
+            declared_digest="${BASH_REMATCH[1],,}"
+            declared_name="${BASH_REMATCH[2]}"
+            [[ "$declared_name" == "$name" ]] || {
+              echo "macOS checksum companion names the wrong artifact: $name.sha256" >&2
+              exit 1
+            }
+            actual_digest="$(sha256sum "$verify/$name" | awk '{print $1}')"
+            [[ "$declared_digest" == "$actual_digest" ]] || {
+              echo "macOS per-artifact checksum mismatch: $name" >&2
+              exit 1
+            }
+          done
+          for name in \
+            "gta-claw-$version-windows-x64-signed.msi" \
+            "gta-claw-desktop-$version-windows-x64-signed.msix" \
+            "gta-claw-desktop-$version-windows-x64-portable-signed.zip" \
+            "gta-claw-desktop-$version-windows-arm64-signed.msix" \
+            "gta-claw-desktop-$version-windows-arm64-portable-signed.zip" \
+            "gta-claw-desktop-$version-windows-x64_arm64-signed.msixbundle" \
+            "gta-claw-headless-$version-windows-x64-portable-signed.zip" \
+            "gta-claw-headless-$version-windows-arm64-portable-signed.zip"; do
+            line="$(cat "$verify/$name.sha256")"
+            [[ "$line" =~ ^([0-9A-Fa-f]{64})\ \ ([^/\\]+)$ ]] || {
+              echo "Invalid Windows per-artifact checksum companion: $name.sha256" >&2
+              exit 1
+            }
+            declared_digest="${BASH_REMATCH[1],,}"
+            declared_name="${BASH_REMATCH[2]}"
+            [[ "$declared_name" == "$name" ]] || {
+              echo "Windows checksum companion names the wrong artifact: $name.sha256" >&2
+              exit 1
+            }
+            actual_digest="$(sha256sum "$verify/$name" | awk '{print $1}')"
+            [[ "$declared_digest" == "$actual_digest" ]] || {
+              echo "Windows per-artifact checksum mismatch: $name" >&2
+              exit 1
+            }
+          done
+          for platform in macos windows; do
+            jq -e \
+              --arg commit "$RELEASE_COMMIT" \
+              --arg platform "$platform" \
+              --arg tagObject "$RELEASE_TAG_OBJECT" \
+              --arg version "$version" \
+              '.schema == 1 and
+               .platform == $platform and
+               .version == $version and
+               .releaseCommit == $commit and
+               .annotatedTagObject == $tagObject' \
+              "$verify/release-identity-$platform.json" >/dev/null || {
+                echo "Release identity attestation mismatch: $platform" >&2
+                exit 1
+              }
+          done
+
+          current_json="$(gh release view "$tag" --json isDraft,assets)"
+          current_asset_metadata="$(
+            jq -c '[.assets[] | {name, state, size, digest}] | sort_by(.name)' \
+              <<<"$current_json"
+          )"
+          if [[ "$current_asset_metadata" != "$validated_asset_metadata" ]]; then
+            echo "Joint release assets changed after validation; refusing publication." >&2
+            exit 1
+          fi
+          verify_remote_tag
           if [[ "$(jq -r '.isDraft' <<<"$current_json")" == "false" ]]; then
             echo "Joint release was already finalized after validating the exact bytes."
             exit 0

@@ -43,6 +43,9 @@ docker run --rm \
   --cap-add CHOWN \
   --cap-add DAC_OVERRIDE \
   --cap-add FOWNER \
+  --cap-add SETGID \
+  --cap-add SETUID \
+  --cap-add SYS_CHROOT \
   --security-opt no-new-privileges \
   --env "SAFEIO_RETURN_UID=$(id -u)" \
   --env "SAFEIO_RETURN_GID=$(id -g)" \
