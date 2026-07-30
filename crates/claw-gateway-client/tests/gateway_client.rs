@@ -18,7 +18,7 @@ use claw_gateway_client::{
 };
 use claw_protocol::gateway::{
     AUTHENTICATED_MAX_FRAME_BYTES, ClientId, ClientMode, Codec, CodecError, GatewayMethodName,
-    ProtocolVersion, RequestId, TransportPhase, resolve_core_method,
+    Name, ProtocolVersion, RequestId, TransportPhase, resolve_core_method,
 };
 use claw_security::authorization::{Role, Scope, ScopeSet};
 use claw_security::identity::DeviceIdentity;
@@ -60,10 +60,22 @@ fn config(url: Url) -> GatewayClientConfig {
     config
 }
 
-fn exact_config(url: Url) -> GatewayClientConfig {
-    let mut config = config(url);
-    config.authorization_expectation = AuthorizationExpectation::ExactRequested;
-    config
+#[test]
+fn default_config_requires_exact_authorization_and_retains_empty_scopes() {
+    let config = GatewayClientConfig::new(
+        Url::parse("ws://127.0.0.1:1").expect("placeholder"),
+        identity(),
+    );
+
+    assert_eq!(
+        AuthorizationExpectation::default(),
+        AuthorizationExpectation::ExactRequested
+    );
+    assert_eq!(
+        config.authorization_expectation,
+        AuthorizationExpectation::ExactRequested
+    );
+    assert_eq!(config.scopes, ScopeSet::EMPTY);
 }
 
 fn request_id(value: &str) -> RequestId {
@@ -454,49 +466,42 @@ async fn authenticates_correlates_concurrent_requests_handles_fragments_and_shut
 }
 
 #[tokio::test]
-async fn accepts_closed_effective_scopes_reported_by_server_hello() {
+async fn requested_role_opt_in_accepts_broader_compatible_grant() {
     let gateway = TestGateway::spawn(handler(|mut socket, _| async move {
         send_challenge(&mut socket).await;
         let (request, params) = receive_connect(&mut socket).await;
         support::verify_connect_proof(&params);
-        send_json(
+        assert_eq!(params.role.as_ref().map(Name::as_str), Some("operator"));
+        assert_eq!(
+            params
+                .scopes
+                .as_ref()
+                .expect("requested scopes")
+                .iter()
+                .map(Name::as_str)
+                .collect::<Vec<_>>(),
+            ["operator.read"]
+        );
+        send_hello_with_authorization(
             &mut socket,
-            json!({
-                "type": "res",
-                "id": request.id().as_str(),
-                "ok": true,
-                "payload": {
-                    "type": "hello-ok",
-                    "protocol": 4,
-                    "server": {"version": "test-gateway", "connId": "effective-scopes"},
-                    "features": {"methods": ["health"], "events": ["tick"]},
-                    "snapshot": {
-                        "presence": [],
-                        "health": {},
-                        "stateVersion": {"presence": 0, "health": 0},
-                        "uptimeMs": 1
-                    },
-                    "auth": {
-                        "role": "operator",
-                        "scopes": ["operator.admin", "operator.read"]
-                    },
-                    "policy": {
-                        "maxPayload": AUTHENTICATED_MAX_FRAME_BYTES,
-                        "maxBufferedBytes": AUTHENTICATED_MAX_FRAME_BYTES,
-                        "tickIntervalMs": 1000
-                    }
-                }
-            }),
+            request.id(),
+            "broader-compatible-grant",
+            "operator",
+            &["operator.admin", "operator.read"],
+            AUTHENTICATED_MAX_FRAME_BYTES,
         )
         .await;
         wait_for_close(&mut socket).await;
     }))
     .await;
-    let (client, _) = GatewayClient::start(config(gateway.url.clone())).expect("start");
+    let mut client_config = config(gateway.url.clone());
+    client_config.authorization_expectation = AuthorizationExpectation::RequestedRole;
+    let (client, _) = GatewayClient::start(client_config).expect("start");
     let info = client
         .wait_ready()
         .await
-        .expect("effective scopes accepted");
+        .expect("explicit compatibility grant accepted");
+    assert_eq!(info.role, "operator");
     assert_eq!(
         info.scopes.as_ref(),
         ["operator.admin".to_owned(), "operator.read".to_owned()]
@@ -506,7 +511,46 @@ async fn accepts_closed_effective_scopes_reported_by_server_hello() {
 }
 
 #[tokio::test]
-async fn exact_requested_authorization_is_enforced_before_ready_or_rpc() {
+async fn default_exact_authorization_accepts_node_with_empty_scopes() {
+    let gateway = TestGateway::spawn(handler(|mut socket, _| async move {
+        send_challenge(&mut socket).await;
+        let (request, params) = receive_connect(&mut socket).await;
+        support::verify_connect_proof(&params);
+        assert_eq!(params.role.as_ref().map(Name::as_str), Some("node"));
+        assert_eq!(params.scopes.as_ref().expect("requested scopes").len(), 0);
+        send_hello_with_authorization(
+            &mut socket,
+            request.id(),
+            "exact-empty-node",
+            "node",
+            &[],
+            AUTHENTICATED_MAX_FRAME_BYTES,
+        )
+        .await;
+        wait_for_close(&mut socket).await;
+    }))
+    .await;
+    let mut client_config = config(gateway.url.clone());
+    client_config.role = Role::Node;
+    client_config.scopes = ScopeSet::EMPTY;
+    client_config.client = ClientMetadata {
+        id: ClientId::NodeHost,
+        mode: ClientMode::Node,
+        ..ClientMetadata::default()
+    };
+    let (client, _) = GatewayClient::start(client_config).expect("start exact Node client");
+    let info = client
+        .wait_ready()
+        .await
+        .expect("exact empty Node grant accepted");
+    assert_eq!(info.role, "node");
+    assert_eq!(info.scopes.as_ref(), Vec::<String>::new());
+    client.shutdown().await.expect("shutdown");
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn default_exact_authorization_is_enforced_before_ready_or_rpc() {
     for (label, scopes, accepted) in [
         ("exact-read", &["operator.read"][..], true),
         ("empty", &[][..], false),
@@ -526,6 +570,17 @@ async fn exact_requested_authorization_is_enforced_before_ready_or_rpc() {
                 send_challenge(&mut socket).await;
                 let (request, params) = receive_connect(&mut socket).await;
                 support::verify_connect_proof(&params);
+                assert_eq!(params.role.as_ref().map(Name::as_str), Some("operator"));
+                assert_eq!(
+                    params
+                        .scopes
+                        .as_ref()
+                        .expect("requested scopes")
+                        .iter()
+                        .map(Name::as_str)
+                        .collect::<Vec<_>>(),
+                    ["operator.read"]
+                );
                 send_hello_with_authorization(
                     &mut socket,
                     request.id(),
@@ -549,7 +604,7 @@ async fn exact_requested_authorization_is_enforced_before_ready_or_rpc() {
         }))
         .await;
         let (client, _) =
-            GatewayClient::start(exact_config(gateway.url.clone())).expect("start exact client");
+            GatewayClient::start(config(gateway.url.clone())).expect("start exact client");
         let mut states = client.subscribe_state();
         let ready_observer = tokio::spawn(async move {
             loop {
@@ -582,7 +637,12 @@ async fn exact_requested_authorization_is_enforced_before_ready_or_rpc() {
             );
         } else {
             assert!(
-                matches!(ready, Err(GatewayClientError::Protocol(_))),
+                matches!(
+                    ready,
+                    Err(GatewayClientError::Protocol(
+                        ProtocolFailure::WebSocketProtocol("hello authentication mismatch")
+                    ))
+                ),
                 "{label} unexpectedly reached Ready: {ready:?}"
             );
             assert!(
@@ -2006,7 +2066,7 @@ async fn stale_epoch_is_rejected_after_reconnect_before_enqueue_without_writing_
         }
     }))
     .await;
-    let mut client_config = exact_config(gateway.url.clone());
+    let mut client_config = config(gateway.url.clone());
     client_config.reconnect = ReconnectPolicy::Bounded {
         max_attempts: 3,
         initial_delay: Duration::from_millis(1),
@@ -2140,7 +2200,7 @@ async fn pending_a_response_cannot_complete_as_b_success_or_replay() {
         }
     }))
     .await;
-    let mut client_config = exact_config(gateway.url.clone());
+    let mut client_config = config(gateway.url.clone());
     client_config.reconnect = ReconnectPolicy::Bounded {
         max_attempts: 3,
         initial_delay: Duration::from_millis(1),
@@ -2255,7 +2315,7 @@ async fn invalid_authorization_on_b_never_publishes_ready_or_accepts_rpc() {
         }
     }))
     .await;
-    let mut client_config = exact_config(gateway.url.clone());
+    let mut client_config = config(gateway.url.clone());
     client_config.reconnect = ReconnectPolicy::Bounded {
         max_attempts: 3,
         initial_delay: Duration::from_millis(1),
@@ -2364,7 +2424,7 @@ async fn reconnect_storm_allocates_distinct_epochs_and_only_fresh_binds_write() 
         }
     }))
     .await;
-    let mut client_config = exact_config(gateway.url.clone());
+    let mut client_config = config(gateway.url.clone());
     client_config.reconnect = ReconnectPolicy::Bounded {
         max_attempts: 8,
         initial_delay: Duration::from_millis(1),
