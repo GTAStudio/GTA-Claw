@@ -8,7 +8,7 @@ use claw_plugin_api::capability::EventKind;
 use claw_plugin_host::services::HostEvent;
 use claw_plugin_host::{
     EventOutcome, GuestFailure, HostCallControl, HostError, LifecycleState, PluginHost,
-    TerminationCause,
+    PluginStatus, TerminationCause,
 };
 use support::{
     PROBE_ID, PROBE_VERSION, install_probe, install_probe_named, install_variant,
@@ -271,7 +271,8 @@ fn reload_preserves_a_typed_recoverable_slot_when_deactivation_fails() {
 
     let error = host.reload(&id).expect_err("deactivation must fail");
     assert!(matches!(error, HostError::Guest(_)));
-    assert_eq!(host.state(&id), Some(LifecycleState::Quarantined));
+    assert_eq!(host.state(&id), Some(LifecycleState::Inactive));
+    assert_eq!(host.status(&id), Some(PluginStatus::Quarantined));
     assert_eq!(
         host.component_digest(&id),
         Some(original_digest.as_str()),

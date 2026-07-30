@@ -843,7 +843,11 @@ impl host_tools::Host for PluginState {
                 reason,
             ));
         }
+        let already_registered = self.registered_tools().contains(&tool.name);
         if tool.summary.len() > MAX_TOOL_SUMMARY_BYTES {
+            if already_registered {
+                withdraw_tool_registration(self, &tool.name);
+            }
             drop(permit);
             return self.deny(CapabilityDenial::quota_exceeded(
                 Capability::Tools,
@@ -852,6 +856,9 @@ impl host_tools::Host for PluginState {
             ));
         }
         if tool.input_schema.len() > usize::try_from(grant.max_schema_bytes).unwrap_or(usize::MAX) {
+            if already_registered {
+                withdraw_tool_registration(self, &tool.name);
+            }
             drop(permit);
             return self.deny(CapabilityDenial::quota_exceeded(
                 Capability::Tools,
@@ -863,6 +870,9 @@ impl host_tools::Host for PluginState {
             ));
         }
         if serde_json::from_str::<serde_json::Value>(&tool.input_schema).is_err() {
+            if already_registered {
+                withdraw_tool_registration(self, &tool.name);
+            }
             drop(permit);
             return self.deny(CapabilityDenial::invalid_argument(
                 Capability::Tools,
@@ -873,7 +883,6 @@ impl host_tools::Host for PluginState {
         // The quota counts distinct names this instance currently holds, so
         // replacing an existing registration is always allowed and only a new
         // name can push the plugin over its ceiling.
-        let already_registered = self.registered_tools().contains(&tool.name);
         if !already_registered {
             let held = self.registered_tools().len() as u64;
             if held >= u64::from(grant.max_tools) {
@@ -890,14 +899,14 @@ impl host_tools::Host for PluginState {
         }
         let plugin_id = self.plugin_id().to_owned();
         let name = tool.name.clone();
-        let registration = self.services().tools.register(ToolRegistration {
+        let registration = self.services().tools.try_register(ToolRegistration {
             plugin_id,
             name: tool.name,
             summary: tool.summary,
             input_schema: tool.input_schema,
         });
         if let Err(error) = registration {
-            self.note_tool_unregistered(&name);
+            withdraw_tool_registration(self, &name);
             drop(permit);
             return self.deny(CapabilityDenial::invalid_argument(
                 Capability::Tools,
@@ -928,6 +937,12 @@ impl host_tools::Host for PluginState {
         drop(permit);
         Ok(Ok(removed))
     }
+}
+
+fn withdraw_tool_registration(state: &mut PluginState, name: &str) {
+    let plugin_id = state.plugin_id().to_owned();
+    state.services().tools.unregister(&plugin_id, name);
+    state.note_tool_unregistered(name);
 }
 
 impl host_events::Host for PluginState {

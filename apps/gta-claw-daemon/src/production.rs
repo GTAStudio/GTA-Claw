@@ -27,14 +27,13 @@ use claw_http_api::{
     LegacyWhatsAppServices, PortError, PortErrorKind, PortFuture, ServingStateHandle,
 };
 use claw_observability::{LogFormat, TelemetryConfig, TelemetryHandle, TelemetryOutput};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use claw_provider_sdk::SecretStore as _;
 use claw_provider_sdk::clock::{PseudoRandomJitter, SystemClock as ProviderClock};
 use claw_provider_sdk::http::{
     HttpRequest, HttpTransport, Method, ProxyPolicy, TlsPolicy, TransportConfig,
 };
-use claw_provider_sdk::{
-    CancelToken, CredentialKey, Operation, Provider, SecretStore as ProviderSecretStore,
-    SecretString,
-};
+use claw_provider_sdk::{CancelToken, CredentialKey, Operation, Provider, SecretString};
 use claw_providers::github_copilot::{DeviceFlowConfig, GitHubCopilotConfig};
 use claw_providers::{DeviceFlow, GitHubCopilot, ProviderRuntime};
 use claw_security::authorization::{Role, Scope, ScopeSet};

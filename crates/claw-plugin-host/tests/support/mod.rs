@@ -376,6 +376,29 @@ pub fn probe_component_registering_tools(count: u32) -> Vec<u8> {
     wat::parse_str(&text).expect("the tool-quota fixture must assemble")
 }
 
+/// Assembles a probe whose `y` tool replaces the stock registration with invalid JSON.
+#[must_use]
+pub fn probe_component_registering_invalid_replacement() -> Vec<u8> {
+    let source = probe_wat_lf();
+    let anchor = "      ;; l: host-events.emit";
+    assert!(source.contains(anchor), "the emit anchor must exist");
+    let body = concat!(
+        "      ;; y: replace `probe` with an invalid schema\n",
+        "      (if (i32.eq (local.get $selector) (i32.const 121))\n",
+        "        (then\n",
+        "          (i32.store8 (i32.const 640) (i32.const 123))\n",
+        "          (call $h-tools\n",
+        "            (i32.const 1052) (i32.const 5)\n",
+        "            (i32.const 1108) (i32.const 10)\n",
+        "            (i32.const 640) (i32.const 1)\n",
+        "            (i32.const 288))\n",
+        "          (return (call $answer (i32.const 288) (i32.const 4)))))\n",
+    );
+    let text = source.replacen(anchor, &format!("{body}{anchor}"), 1);
+    assert_ne!(text, source, "the invalid replacement must be inserted");
+    wat::parse_str(&text).expect("the invalid-replacement fixture must assemble")
+}
+
 /// Assembles a probe that registers one tool and then spins during activation.
 #[must_use]
 pub fn probe_component_registering_tool_then_spinning_on_activate() -> Vec<u8> {
@@ -398,6 +421,74 @@ pub fn probe_component_registering_tool_then_spinning_on_activate() -> Vec<u8> {
     let text = source.replacen(original, replacement, 1);
     assert_ne!(text, source, "the activation loop must be inserted");
     wat::parse_str(&text).expect("the activation-loop fixture must assemble")
+}
+
+/// Assembles a probe that registers during activation and logs from deactivate.
+#[must_use]
+pub fn probe_component_registering_tool_on_activate_and_logging_on_deactivate() -> Vec<u8> {
+    let source = probe_wat_lf();
+    let activate = concat!(
+        "    (func (export \"activate\") (result i32)\n",
+        "      (i32.store8 (i32.const 192) (i32.const 0))\n",
+        "      (i32.const 192))\n",
+    );
+    let replacement = concat!(
+        "    (func (export \"activate\") (result i32)\n",
+        "      (call $h-tools\n",
+        "        (i32.const 1052) (i32.const 5)\n",
+        "        (i32.const 1108) (i32.const 10)\n",
+        "        (i32.const 1120) (i32.const 2)\n",
+        "        (i32.const 288))\n",
+        "      (i32.store8 (i32.const 192) (i32.const 0))\n",
+        "      (i32.const 192))\n",
+    );
+    let text = source.replacen(activate, replacement, 1);
+    let deactivate = "    (func (export \"deactivate\") (result i32)\n";
+    let text = text.replacen(
+        deactivate,
+        &format!(
+            "{deactivate}      (call $h-log (i32.const 2) (i32.const 1048) (i32.const 2) (i32.const 288))\n"
+        ),
+        1,
+    );
+    assert_ne!(text, source, "the lifecycle hooks must be inserted");
+    wat::parse_str(&text).expect("the activation-rollback fixture must assemble")
+}
+
+/// Assembles a probe that registers during activation and never finishes deactivation.
+#[must_use]
+pub fn probe_component_registering_tool_on_activate_then_spinning_on_deactivate() -> Vec<u8> {
+    let source = probe_wat_lf();
+    let activate = concat!(
+        "    (func (export \"activate\") (result i32)\n",
+        "      (i32.store8 (i32.const 192) (i32.const 0))\n",
+        "      (i32.const 192))\n",
+    );
+    let active = concat!(
+        "    (func (export \"activate\") (result i32)\n",
+        "      (call $h-tools\n",
+        "        (i32.const 1052) (i32.const 5)\n",
+        "        (i32.const 1108) (i32.const 10)\n",
+        "        (i32.const 1120) (i32.const 2)\n",
+        "        (i32.const 288))\n",
+        "      (i32.store8 (i32.const 192) (i32.const 0))\n",
+        "      (i32.const 192))\n",
+    );
+    let deactivate = concat!(
+        "    (func (export \"deactivate\") (result i32)\n",
+        "      (i32.store8 (i32.const 192) (i32.const 0))\n",
+        "      (i32.const 192))\n",
+    );
+    let spinning = concat!(
+        "    (func (export \"deactivate\") (result i32)\n",
+        "      (loop $deactivate-spin (br $deactivate-spin))\n",
+        "      (i32.const 192))\n",
+    );
+    let text = source
+        .replacen(activate, active, 1)
+        .replacen(deactivate, spinning, 1);
+    assert_ne!(text, source, "the lifecycle hooks must be inserted");
+    wat::parse_str(&text).expect("the bounded-rollback fixture must assemble")
 }
 
 /// A manifest describing `component` with no capabilities and default limits.

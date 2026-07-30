@@ -214,7 +214,11 @@ impl Drop for PluginInvocationGuard {
 }
 
 impl ToolSink for PluginToolSurface {
-    fn register(&self, registration: ToolRegistration) -> Result<(), ToolRegistrationError> {
+    fn register(&self, registration: ToolRegistration) {
+        let _ = self.try_register(registration);
+    }
+
+    fn try_register(&self, registration: ToolRegistration) -> Result<(), ToolRegistrationError> {
         let public_name = Self::public_name(&registration.plugin_id, &registration.name);
         let candidate = serde_json::from_str::<Value>(&registration.input_schema)
             .ok()
@@ -437,6 +441,7 @@ pub struct SignedPluginRuntime {
     summary: PluginActivationSummary,
     shutdown: AtomicBool,
     startup_pending: bool,
+    startup_rollback_budget: Duration,
 }
 
 impl SignedPluginRuntime {
@@ -496,14 +501,14 @@ impl SignedPluginRuntime {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .shutdown_with_control(&shutdown_control);
-            let rollback = plugin_shutdown_summary(&rollback);
+            let rollback = plugin_shutdown_details(&rollback);
             diagnostics.record(format!(
                 "plugin activation rollback: attempted={} failed={} timed_out={}",
-                rollback.attempted, rollback.failed, rollback.timed_out
+                rollback.summary.attempted, rollback.summary.failed, rollback.timed_out
             ));
             return Err(format!(
                 "plugin activation stopped before completion: {reason}; rollback attempted={} failed={} timed_out={}",
-                rollback.attempted, rollback.failed, rollback.timed_out
+                rollback.summary.attempted, rollback.summary.failed, rollback.timed_out
             ));
         }
         Ok(Self {
@@ -512,6 +517,7 @@ impl SignedPluginRuntime {
             summary,
             shutdown: AtomicBool::new(false),
             startup_pending: true,
+            startup_rollback_budget: PLUGIN_STARTUP_ROLLBACK_DEADLINE,
         })
     }
 
@@ -551,24 +557,16 @@ impl SignedPluginRuntime {
     #[must_use]
     pub fn shutdown_host(&self) -> PluginShutdownSummary {
         if self.shutdown.swap(true, Ordering::AcqRel) {
-            return PluginShutdownSummary {
-                attempted: 0,
-                failed: 0,
-                timed_out: 0,
-            };
+            return PluginShutdownSummary::default();
         }
         let Some(host) = self.host.as_ref() else {
-            return PluginShutdownSummary {
-                attempted: 0,
-                failed: 0,
-                timed_out: 0,
-            };
+            return PluginShutdownSummary::default();
         };
         let report = host
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .shutdown();
-        plugin_shutdown_summary(&report)
+        plugin_shutdown_details(&report).summary
     }
 
     /// Drops the host without running deactivation hooks.
@@ -618,36 +616,42 @@ impl Drop for SignedPluginRuntime {
             host,
             &self.tools.diagnostics,
             "plugin startup rollback",
-            PLUGIN_STARTUP_ROLLBACK_DEADLINE,
+            self.startup_rollback_budget,
         );
     }
 }
 
 /// Plugin shutdown accounting.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PluginShutdownSummary {
     /// Plugins deactivated or forgotten.
     pub attempted: usize,
     /// Plugin deactivation failures.
     pub failed: usize,
-    /// Plugin deactivations interrupted at the rollback deadline.
-    pub timed_out: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PluginShutdownDetails {
+    summary: PluginShutdownSummary,
+    timed_out: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PluginRollbackOutcome {
-    Completed(PluginShutdownSummary),
+    Completed(PluginShutdownDetails),
     Abandoned,
 }
 
-fn plugin_shutdown_summary(report: &claw_plugin_host::DisposalReport) -> PluginShutdownSummary {
-    PluginShutdownSummary {
-        attempted: report.outcomes().len(),
-        failed: report
-            .outcomes()
-            .iter()
-            .filter(|outcome| outcome.result.is_err())
-            .count(),
+fn plugin_shutdown_details(report: &claw_plugin_host::DisposalReport) -> PluginShutdownDetails {
+    PluginShutdownDetails {
+        summary: PluginShutdownSummary {
+            attempted: report.outcomes().len(),
+            failed: report
+                .outcomes()
+                .iter()
+                .filter(|outcome| outcome.result.is_err())
+                .count(),
+        },
         timed_out: report
             .outcomes()
             .iter()
@@ -680,7 +684,7 @@ fn run_bounded_rollback(
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .shutdown_with_control(&control);
-            let _ = sender.send(plugin_shutdown_summary(&report));
+            let _ = sender.send(plugin_shutdown_details(&report));
         })
     {
         let message = format!("{context} abandoned: rollback worker could not start: {error}");
@@ -698,7 +702,7 @@ fn run_bounded_rollback(
 }
 
 fn report_bounded_rollback(
-    receiver: &Receiver<PluginShutdownSummary>,
+    receiver: &Receiver<PluginShutdownDetails>,
     budget: Duration,
     diagnostics: &Diagnostics,
     context: &str,
@@ -708,24 +712,24 @@ fn report_bounded_rollback(
             if summary.timed_out > 0 {
                 diagnostics.record(format!(
                     "{context} completed with deadline interruption: attempted={} failed={} timed_out={}",
-                    summary.attempted, summary.failed, summary.timed_out
+                    summary.summary.attempted, summary.summary.failed, summary.timed_out
                 ));
                 tracing::warn!(
                     rollback_context = context,
-                    attempted = summary.attempted,
-                    failed = summary.failed,
+                    attempted = summary.summary.attempted,
+                    failed = summary.summary.failed,
                     timed_out = summary.timed_out,
                     "plugin rollback reached its deactivation deadline"
                 );
             } else {
                 diagnostics.record(format!(
                     "{context} completed: attempted={} failed={}",
-                    summary.attempted, summary.failed
+                    summary.summary.attempted, summary.summary.failed
                 ));
                 tracing::info!(
                     rollback_context = context,
-                    attempted = summary.attempted,
-                    failed = summary.failed,
+                    attempted = summary.summary.attempted,
+                    failed = summary.summary.failed,
                     "plugin rollback completed"
                 );
             }
@@ -1030,15 +1034,16 @@ fn host_error_kind(error: &HostError) -> WasmHostErrorKind {
 #[cfg(test)]
 mod tests {
     use super::{
-        PluginInvocationGuard, PluginRollbackOutcome, PluginShutdownSummary, PluginToolSurface,
-        PluginWasmSkillHost, delivery_class, host_error_kind, plugin_policy,
+        PluginActivationSummary, PluginInvocationGuard, PluginRollbackOutcome,
+        PluginShutdownDetails, PluginShutdownSummary, PluginToolSurface, PluginWasmSkillHost,
+        SignedPluginRuntime, delivery_class, host_error_kind, plugin_policy,
         report_bounded_rollback, run_bounded_rollback,
     };
     use claw_http_api::{ToolInvocation, ToolInvocationContext, ToolPort};
     use claw_plugin_host::{HostError, PluginHost, ToolRegistration, ToolSink};
     use claw_skills::{WasmHostErrorKind, WasmSkillHost, WasmSkillInvocation};
     use serde_json::json;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1107,7 +1112,7 @@ mod tests {
             crate::adapters::http_api::Diagnostics::new(8),
         ));
         tools
-            .register(ToolRegistration {
+            .try_register(ToolRegistration {
                 plugin_id: "example".to_owned(),
                 name: "lookup".to_owned(),
                 summary: "Looks something up".to_owned(),
@@ -1134,7 +1139,7 @@ mod tests {
         let tools =
             PluginToolSurface::new(Arc::new(crate::adapters::http_api::Diagnostics::new(8)));
         tools
-            .register(ToolRegistration {
+            .try_register(ToolRegistration {
                 plugin_id: "example".to_owned(),
                 name: "lookup".to_owned(),
                 summary: "Original".to_owned(),
@@ -1148,7 +1153,7 @@ mod tests {
         );
 
         let error = tools
-            .register(ToolRegistration {
+            .try_register(ToolRegistration {
                 plugin_id: "example".to_owned(),
                 name: "lookup".to_owned(),
                 summary: "Rejected replacement".to_owned(),
@@ -1160,6 +1165,17 @@ mod tests {
             crate::adapters::http_api::ModelToolCatalog::definitions(&*tools).is_empty(),
             "a rejected replacement must not leave the old public schema"
         );
+    }
+
+    #[test]
+    fn shutdown_summary_keeps_its_legacy_two_field_literal() {
+        let summary = PluginShutdownSummary {
+            attempted: 2,
+            failed: 1,
+        };
+
+        assert_eq!(summary.attempted, 2);
+        assert_eq!(summary.failed, 1);
     }
 
     #[test]
@@ -1181,9 +1197,11 @@ mod tests {
     fn rollback_monitor_reports_controlled_deadline_interruption() {
         let diagnostics = crate::adapters::http_api::Diagnostics::new(8);
         let (sender, receiver) = mpsc::sync_channel(1);
-        let summary = PluginShutdownSummary {
-            attempted: 2,
-            failed: 1,
+        let summary = PluginShutdownDetails {
+            summary: PluginShutdownSummary {
+                attempted: 2,
+                failed: 1,
+            },
             timed_out: 1,
         };
         sender.send(summary).expect("send rollback summary");
@@ -1225,6 +1243,35 @@ mod tests {
     }
 
     #[test]
+    fn startup_pending_runtime_drop_reports_real_rollback_abandonment() {
+        let diagnostics = Arc::new(crate::adapters::http_api::Diagnostics::new(8));
+        let tools = PluginToolSurface::new(Arc::clone(&diagnostics));
+        let host = Arc::new(Mutex::new(
+            PluginHost::builder().build().expect("closed host"),
+        ));
+        tools.attach(&host);
+        let guard = host.lock().expect("hold host lock");
+        let runtime = SignedPluginRuntime {
+            host: Some(Arc::clone(&host)),
+            tools: Arc::clone(&tools),
+            summary: PluginActivationSummary::default(),
+            shutdown: AtomicBool::new(false),
+            startup_pending: true,
+            startup_rollback_budget: Duration::ZERO,
+        };
+
+        drop(runtime);
+
+        assert_eq!(
+            diagnostics.entries(),
+            vec!["plugin startup rollback timed out; cleanup worker was explicitly abandoned"]
+        );
+        assert!(!*tools.accepting.lock().expect("acceptance lock"));
+        assert!(tools.host.lock().expect("host attachment lock").is_none());
+        drop(guard);
+    }
+
+    #[test]
     fn startup_rollback_cancels_active_invocations_before_host_cleanup() {
         let tools =
             PluginToolSurface::new(Arc::new(crate::adapters::http_api::Diagnostics::new(8)));
@@ -1250,7 +1297,7 @@ mod tests {
         ));
         tools.attach(&host);
         tools
-            .register(ToolRegistration {
+            .try_register(ToolRegistration {
                 plugin_id: "missing".to_owned(),
                 name: "lookup".to_owned(),
                 summary: "Looks something up".to_owned(),

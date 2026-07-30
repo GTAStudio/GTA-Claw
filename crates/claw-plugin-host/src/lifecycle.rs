@@ -5,7 +5,10 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use claw_plugin_api::abi::{ABI_VERSION, Version, check_compatibility};
 use claw_plugin_api::cancellation::CancellationToken;
@@ -97,6 +100,8 @@ const DEACTIVATE: Transition = Transition {
     guest_error: GuestErrorState::Quarantine,
 };
 
+const ACTIVATION_ROLLBACK_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// The file every plugin directory must contain.
 pub const MANIFEST_FILE_NAME: &str = "plugin.json";
 
@@ -127,9 +132,6 @@ pub enum LifecycleState {
     Active,
     /// `deactivate` returned successfully.
     Inactive,
-    /// `deactivate` returned an ABI error. Capabilities and tools are revoked;
-    /// only explicit unload or reload may act on the retained instance.
-    Quarantined,
     /// A guest call was terminated by the sandbox. The instance is gone and
     /// only `unload` or `reload` are allowed.
     Faulted(TerminationCause),
@@ -143,8 +145,33 @@ impl LifecycleState {
             Self::Loaded => "loaded",
             Self::Active => "active",
             Self::Inactive => "inactive",
-            Self::Quarantined => "quarantined",
             Self::Faulted(_) => "faulted",
+        }
+    }
+}
+
+/// Detailed status of a retained plugin slot.
+///
+/// [`PluginHost::state`] preserves the original lifecycle API. This additive
+/// status distinguishes an ordinary inactive instance from one retained after
+/// a failed deactivation without adding a variant to [`LifecycleState`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PluginStatus {
+    /// Ordinary public lifecycle state.
+    Lifecycle(LifecycleState),
+    /// Deactivation returned an ABI error. The instance is closed and only
+    /// explicit unload or reload may act on it.
+    Quarantined,
+}
+
+impl PluginStatus {
+    /// Stable, machine-readable name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lifecycle(state) => state.as_str(),
+            Self::Quarantined => "quarantined",
         }
     }
 }
@@ -519,8 +546,86 @@ struct Loaded {
     withheld: Vec<Withheld>,
     narrowed: Vec<Capability>,
     instance: Option<Instance>,
+    quarantined: bool,
     last_denials: Vec<CapabilityDenial>,
     last_usage: ResourceUsage,
+}
+
+impl Loaded {
+    const fn status(&self) -> PluginStatus {
+        if self.quarantined {
+            PluginStatus::Quarantined
+        } else {
+            PluginStatus::Lifecycle(self.state)
+        }
+    }
+}
+
+struct AdmissionRequest {
+    engine: wasmtime::Engine,
+    trust: TrustPolicy,
+    verifier: Arc<dyn SignatureVerifier>,
+    directory: PathBuf,
+    manifest: PluginManifest,
+    capabilities: CapabilitySet,
+}
+
+struct AdmittedComponent {
+    decision: TrustDecision,
+    manifest: PluginManifest,
+    capabilities: CapabilitySet,
+    digest: String,
+    component: Component,
+    read_roots: Vec<PathBuf>,
+    write_roots: Vec<PathBuf>,
+}
+
+impl AdmissionRequest {
+    fn run(self) -> Result<AdmittedComponent, HostError> {
+        let decision = self.trust.authorize(&self.directory, &self.manifest)?;
+        let metadata = std::fs::metadata(decision.component_path())
+            .map_err(|error| HostError::io(decision.component_path(), &error))?;
+        if metadata.len() > self.manifest.limits.max_component_bytes {
+            return Err(HostError::ComponentTooLarge {
+                actual: metadata.len(),
+                limit: self.manifest.limits.max_component_bytes,
+            });
+        }
+        if metadata.len() != self.manifest.component.size_bytes {
+            return Err(HostError::DigestMismatch {
+                expected: format!("{} bytes", self.manifest.component.size_bytes),
+                actual: format!("{} bytes", metadata.len()),
+            });
+        }
+
+        let bytes = std::fs::read(decision.component_path())
+            .map_err(|error| HostError::io(decision.component_path(), &error))?;
+        let digest = component_sha256(&bytes);
+        if digest != self.manifest.component.sha256 {
+            return Err(HostError::DigestMismatch {
+                expected: self.manifest.component.sha256.clone(),
+                actual: digest,
+            });
+        }
+        self.verifier.verify(&VerificationRequest {
+            manifest: &self.manifest,
+            component_sha256: &digest,
+        })?;
+        let (read_roots, write_roots) = canonical_roots(&self.capabilities)?;
+        let component = Component::new(&self.engine, &bytes)
+            .map_err(|error| HostError::Instantiate(format!("{error:#}")))?;
+        reject_foreign_imports(&self.engine, &component)?;
+
+        Ok(AdmittedComponent {
+            decision,
+            manifest: self.manifest,
+            capabilities: self.capabilities,
+            digest,
+            component,
+            read_roots,
+            write_roots,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -674,6 +779,7 @@ impl PluginHostBuilder {
             services: self.services,
             policy: self.policy,
             gate,
+            controlled_work_active: Arc::new(AtomicBool::new(false)),
             plugins: BTreeMap::new(),
             activation_order: Vec::new(),
         })
@@ -689,6 +795,7 @@ pub struct PluginHost {
     services: HostServices,
     policy: ViolationPolicy,
     gate: HostCallGate,
+    controlled_work_active: Arc<AtomicBool>,
     plugins: BTreeMap<String, Loaded>,
     activation_order: Vec<String>,
 }
@@ -778,6 +885,12 @@ impl PluginHost {
     #[must_use]
     pub fn state(&self, id: &str) -> Option<LifecycleState> {
         self.plugins.get(id).map(|plugin| plugin.state)
+    }
+
+    /// Detailed retained-slot status, including failed-deactivation quarantine.
+    #[must_use]
+    pub fn status(&self, id: &str) -> Option<PluginStatus> {
+        self.plugins.get(id).map(Loaded::status)
     }
 
     /// The manifest a plugin was loaded from.
@@ -1090,9 +1203,19 @@ impl PluginHost {
                 candidates_seen = candidates_seen.saturating_add(1);
 
                 let directory = candidate.path;
-                let record = candidate
-                    .metadata_error
-                    .map_or_else(|| read_manifest(&directory).map(Box::new), Err);
+                let record = match candidate.metadata_error {
+                    Some(error) => Err(error),
+                    None => {
+                        let manifest_directory = directory.clone();
+                        let host_control = control.host_call_control();
+                        run_controlled_work(
+                            &self.controlled_work_active,
+                            &host_control,
+                            "plugin manifest read",
+                            move || read_manifest(&manifest_directory).map(Box::new),
+                        )
+                    }
+                };
 
                 if let Err(stop) = control.check() {
                     outcomes.push(controlled_terminal(stop));
@@ -1175,7 +1298,7 @@ impl PluginHost {
         }
 
         if let Err(stop) = control.check() {
-            self.discard_plugin(&id);
+            self.rollback_activated_candidate(&id);
             return Err(stop);
         }
 
@@ -1277,47 +1400,32 @@ impl PluginHost {
         let withheld = effective.withheld().to_vec();
         let narrowed = effective.narrowed().to_vec();
 
-        let decision: TrustDecision = self.trust.authorize(directory, &manifest)?;
+        let admission = AdmissionRequest {
+            engine: self.engine.engine().clone(),
+            trust: self.trust.clone(),
+            verifier: Arc::clone(&self.verifier),
+            directory: directory.to_path_buf(),
+            manifest,
+            capabilities,
+        };
+        let AdmittedComponent {
+            decision,
+            manifest,
+            capabilities,
+            digest,
+            component,
+            read_roots,
+            write_roots,
+        } = match control {
+            Some(control) => run_controlled_work(
+                &self.controlled_work_active,
+                control,
+                "plugin admission",
+                move || admission.run(),
+            )?,
+            None => admission.run()?,
+        };
         let signing_key_id = decision.signing_key_id().map(str::to_owned);
-
-        ensure_host_control(control, "plugin load")?;
-        let metadata = std::fs::metadata(decision.component_path())
-            .map_err(|error| HostError::io(decision.component_path(), &error))?;
-        if metadata.len() > manifest.limits.max_component_bytes {
-            return Err(HostError::ComponentTooLarge {
-                actual: metadata.len(),
-                limit: manifest.limits.max_component_bytes,
-            });
-        }
-        if metadata.len() != manifest.component.size_bytes {
-            return Err(HostError::DigestMismatch {
-                expected: format!("{} bytes", manifest.component.size_bytes),
-                actual: format!("{} bytes", metadata.len()),
-            });
-        }
-
-        ensure_host_control(control, "plugin load")?;
-        let bytes = std::fs::read(decision.component_path())
-            .map_err(|error| HostError::io(decision.component_path(), &error))?;
-        let digest = component_sha256(&bytes);
-        if digest != manifest.component.sha256 {
-            return Err(HostError::DigestMismatch {
-                expected: manifest.component.sha256,
-                actual: digest,
-            });
-        }
-        self.verifier.verify(&VerificationRequest {
-            manifest: &manifest,
-            component_sha256: &digest,
-        })?;
-
-        let (read_roots, write_roots) = canonical_roots(&capabilities)?;
-
-        ensure_host_control(control, "plugin compilation")?;
-        let component = Component::new(self.engine.engine(), &bytes)
-            .map_err(|error| HostError::Instantiate(format!("{error:#}")))?;
-        ensure_host_control(control, "plugin compilation")?;
-        reject_foreign_imports(self.engine.engine(), &component)?;
 
         let state = PluginState::new(PluginStateConfig {
             plugin_id: manifest.id.clone(),
@@ -1398,6 +1506,7 @@ impl PluginHost {
                 narrowed,
                 state: LifecycleState::Loaded,
                 instance: Some(Instance { store, bindings }),
+                quarantined: false,
                 last_denials: Vec::new(),
                 last_usage: ResourceUsage::default(),
             },
@@ -1495,6 +1604,13 @@ impl PluginHost {
                     cause,
                 });
             }
+            if plugin.quarantined {
+                return Err(HostError::WrongState {
+                    id: id.to_owned(),
+                    actual: PluginStatus::Quarantined.as_str(),
+                    expected: transition.operation,
+                });
+            }
             if !transition.allowed.contains(&plugin.state) {
                 return Err(HostError::WrongState {
                     id: id.to_owned(),
@@ -1505,7 +1621,7 @@ impl PluginHost {
             plugin.manifest.limits
         };
 
-        let (outcome, previous_phase) = {
+        let previous_phase = {
             let plugin = self
                 .plugins
                 .get_mut(id)
@@ -1520,14 +1636,35 @@ impl PluginHost {
                 })?;
             let previous_phase = instance.store.data().phase();
             instance.store.data_mut().set_phase(transition.during);
-            arm_call(&mut instance.store, &limits, control);
+            previous_phase
+        };
+        if matches!(transition.purge, Purge::Always) {
+            self.purge_tools(id);
+        }
+        let outcome = {
+            let plugin = self
+                .plugins
+                .get_mut(id)
+                .ok_or_else(|| HostError::UnknownPlugin(id.to_owned()))?;
+            let instance = plugin
+                .instance
+                .as_mut()
+                .ok_or_else(|| HostError::WrongState {
+                    id: id.to_owned(),
+                    actual: "unloaded",
+                    expected: transition.operation,
+                })?;
+            let control_bounded_deadline = arm_call(&mut instance.store, &limits, control);
             let raw = call(&instance.bindings, &mut instance.store);
-            let raw = observe_interruption(&mut instance.store, raw);
+            let completed_activation =
+                transition.next == LifecycleState::Active && matches!(&raw, Ok(Ok(())));
+            let raw = if completed_activation {
+                observe_activation_completion(&mut instance.store, raw, control_bounded_deadline)
+            } else {
+                observe_interruption(&mut instance.store, raw)
+            };
             disarm_call(&mut instance.store);
-            (
-                raw.map_err(|error| classify(&error, instance.store.data())),
-                previous_phase,
-            )
+            raw.map_err(|error| classify(&error, instance.store.data()))
         };
 
         // The phase is set before anything else can observe the instance. A
@@ -1551,7 +1688,7 @@ impl PluginHost {
                 instance.store.data_mut().set_phase(phase);
             }
         }
-        if matches!(transition.purge, Purge::Always) || !succeeded {
+        if !succeeded && matches!(transition.purge, Purge::OnFailure) {
             self.purge_tools(id);
         }
 
@@ -1559,6 +1696,7 @@ impl PluginHost {
             Ok(Ok(())) => {
                 if let Some(plugin) = self.plugins.get_mut(id) {
                     plugin.state = transition.next;
+                    plugin.quarantined = false;
                 }
                 self.activation_order.retain(|active| active != id);
                 if transition.next == LifecycleState::Active {
@@ -1570,7 +1708,8 @@ impl PluginHost {
                 if transition.guest_error == GuestErrorState::Quarantine {
                     self.activation_order.retain(|active| active != id);
                     if let Some(plugin) = self.plugins.get_mut(id) {
-                        plugin.state = LifecycleState::Quarantined;
+                        plugin.state = LifecycleState::Inactive;
+                        plugin.quarantined = true;
                     }
                 }
                 Err(guest_error(&error, &limits))
@@ -1784,10 +1923,10 @@ impl PluginHost {
                 cause,
             });
         }
-        if plugin.state != LifecycleState::Active {
+        if plugin.status() != PluginStatus::Lifecycle(LifecycleState::Active) {
             return Err(HostError::WrongState {
                 id: id.to_owned(),
-                actual: plugin.state.as_str(),
+                actual: plugin.status().as_str(),
                 expected: operation,
             });
         }
@@ -1810,6 +1949,7 @@ impl PluginHost {
                 plugin.last_usage = ResourceUsage::of(instance.store.data());
             }
             plugin.state = LifecycleState::Faulted(cause);
+            plugin.quarantined = false;
         }
     }
 
@@ -1833,6 +1973,14 @@ impl PluginHost {
         self.purge_tools(id);
         self.plugins.remove(id);
         self.activation_order.retain(|active| active != id);
+    }
+
+    fn rollback_activated_candidate(&mut self, id: &str) {
+        if self.state(id) == Some(LifecycleState::Active) {
+            let control = HostCallControl::new(Instant::now() + ACTIVATION_ROLLBACK_TIMEOUT, None);
+            let _ = self.deactivate_with_control(id, Some(&control));
+        }
+        self.discard_plugin(id);
     }
 
     /// Drops a plugin's instance and forgets it.
@@ -1877,7 +2025,7 @@ impl PluginHost {
     ///
     /// Returns [`HostError`] when the plugin is unknown or fails to reload.
     /// When deactivation returns an ABI error, the old instance remains in the
-    /// explicit [`LifecycleState::Quarantined`] state. A caller may inspect or
+    /// explicit [`PluginStatus::Quarantined`] status. A caller may inspect or
     /// unload it, or retry `reload`; the retry discards that closed instance and
     /// loads the on-disk plugin from scratch.
     /// Every load error listed on [`PluginHost::load`] is possible here,
@@ -2058,7 +2206,7 @@ fn arm_call(
     store: &mut Store<PluginState>,
     limits: &ResourceLimits,
     control: Option<&HostCallControl>,
-) {
+) -> bool {
     // Every store this host runs came from `PluginEngine::new_store`, whose
     // engine always has fuel metering enabled, so this cannot fail. Even if it
     // somehow did, the two lines below still bound the call in wall-clock time:
@@ -2072,6 +2220,8 @@ fn arm_call(
     // and `load` runs it before any instance exists, so this addition cannot
     // overflow even for a manifest written by a hostile author.
     let plugin_deadline = Instant::now() + limits.timeout();
+    let control_bounded_deadline =
+        control.is_some_and(|control| control.deadline() <= plugin_deadline);
     let deadline = control.map_or(plugin_deadline, |control| {
         plugin_deadline.min(control.deadline())
     });
@@ -2079,6 +2229,7 @@ fn arm_call(
     store.data_mut().arm_call(deadline, cancellation);
     let first_check = store.data().next_interrupt_check_ms(CANCELLATION_POLL_MS);
     store.set_epoch_deadline(epoch_ticks_for(first_check));
+    control_bounded_deadline
 }
 
 fn disarm_call(store: &mut Store<PluginState>) {
@@ -2097,6 +2248,85 @@ fn observe_interruption<T>(
         )));
     }
     outcome
+}
+
+fn observe_activation_completion<T>(
+    store: &mut Store<PluginState>,
+    outcome: wasmtime::Result<T>,
+    control_bounded_deadline: bool,
+) -> wasmtime::Result<T> {
+    if outcome.is_ok()
+        && let Some(cause) = store.data_mut().poll_interruption()
+        && !matches!(cause, TerminationCause::Cancelled)
+        && !(cause == TerminationCause::Timeout && control_bounded_deadline)
+    {
+        return Err(wasmtime::Error::msg(format!(
+            "plugin invocation interrupted ({cause})"
+        )));
+    }
+    outcome
+}
+
+struct ControlledWorkGuard(Arc<AtomicBool>);
+
+impl Drop for ControlledWorkGuard {
+    fn drop(&mut self) {
+        self.0.store(false, AtomicOrdering::Release);
+    }
+}
+
+fn run_controlled_work<T>(
+    active: &Arc<AtomicBool>,
+    control: &HostCallControl,
+    operation: &'static str,
+    work: impl FnOnce() -> Result<T, HostError> + Send + 'static,
+) -> Result<T, HostError>
+where
+    T: Send + 'static,
+{
+    ensure_host_control(Some(control), operation)?;
+    active
+        .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+        .map_err(|_| {
+            HostError::Instantiate(format!(
+                "{operation} refused while a previous controlled admission worker is still running"
+            ))
+        })?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker_active = Arc::clone(active);
+    if let Err(error) = thread::Builder::new()
+        .name("gta-claw-plugin-admission".to_owned())
+        .spawn(move || {
+            let guard = ControlledWorkGuard(worker_active);
+            let result = work();
+            drop(guard);
+            let _ = sender.send(result);
+        })
+    {
+        active.store(false, AtomicOrdering::Release);
+        return Err(HostError::Instantiate(format!(
+            "{operation} worker could not start: {error}"
+        )));
+    }
+
+    loop {
+        ensure_host_control(Some(control), operation)?;
+        let wait = control
+            .remaining()
+            .min(Duration::from_millis(CANCELLATION_POLL_MS));
+        match receiver.recv_timeout(wait) {
+            Ok(result) => {
+                ensure_host_control(Some(control), operation)?;
+                return result;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(HostError::Instantiate(format!(
+                    "{operation} worker stopped without returning a result"
+                )));
+            }
+        }
+    }
 }
 
 fn ensure_host_control(
@@ -2230,6 +2460,20 @@ mod tests {
             LifecycleState::Faulted(TerminationCause::Timeout).as_str(),
             "faulted"
         );
+    }
+
+    #[test]
+    fn lifecycle_state_keeps_its_original_exhaustive_surface() {
+        const fn classify(state: LifecycleState) -> &'static str {
+            match state {
+                LifecycleState::Loaded => "loaded",
+                LifecycleState::Active => "active",
+                LifecycleState::Inactive => "inactive",
+                LifecycleState::Faulted(_) => "faulted",
+            }
+        }
+
+        assert_eq!(classify(LifecycleState::Inactive), "inactive");
     }
 
     #[test]

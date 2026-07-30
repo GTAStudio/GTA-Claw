@@ -359,7 +359,13 @@ pub trait RandomSource: Send + Sync {
 
 /// Sink for tool registrations.
 pub trait ToolSink: Send + Sync {
-    /// Atomically registers or replaces a tool.
+    /// Registers or replaces a tool.
+    ///
+    /// This is the original infallible embedding contract. Implementations that
+    /// enforce publication policy should also override [`ToolSink::try_register`].
+    fn register(&self, registration: ToolRegistration);
+
+    /// Atomically registers or replaces a tool under embedding policy.
     ///
     /// A rejection must leave no public entry for this plugin-local name,
     /// including an older registration being replaced.
@@ -368,7 +374,10 @@ pub trait ToolSink: Send + Sync {
     ///
     /// Returns [`ToolRegistrationError`] when the embedding surface rejects the
     /// registration under its own publication policy.
-    fn register(&self, registration: ToolRegistration) -> Result<(), ToolRegistrationError>;
+    fn try_register(&self, registration: ToolRegistration) -> Result<(), ToolRegistrationError> {
+        self.register(registration);
+        Ok(())
+    }
 
     /// Removes a tool, reporting whether one was registered.
     fn unregister(&self, plugin_id: &str, name: &str) -> bool;
@@ -689,14 +698,12 @@ impl LogSink for RecordingSink {
 }
 
 impl ToolSink for RecordingSink {
-    fn register(&self, registration: ToolRegistration) -> Result<(), ToolRegistrationError> {
+    fn register(&self, registration: ToolRegistration) {
         let mut guard = self.tools.lock().unwrap_or_else(PoisonError::into_inner);
         guard.retain(|existing| {
             existing.plugin_id != registration.plugin_id || existing.name != registration.name
         });
         guard.push(registration);
-        drop(guard);
-        Ok(())
     }
 
     fn unregister(&self, plugin_id: &str, name: &str) -> bool {
@@ -721,9 +728,7 @@ impl EventSink for RecordingSink {
 pub struct DiscardTools;
 
 impl ToolSink for DiscardTools {
-    fn register(&self, _registration: ToolRegistration) -> Result<(), ToolRegistrationError> {
-        Ok(())
-    }
+    fn register(&self, _registration: ToolRegistration) {}
 
     fn unregister(&self, _plugin_id: &str, _name: &str) -> bool {
         false

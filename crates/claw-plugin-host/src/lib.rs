@@ -64,7 +64,7 @@ pub use lifecycle::{
     ActivationOutcome, ActivationReport, ActivationStage, ControlledActivationOutcome,
     ControlledActivationReport, Discovered, DiscoveryRecord, DiscoveryStage, DisposalOutcome,
     DisposalReport, EventOutcome, LifecycleState, MANIFEST_FILE_NAME, MAX_ACTIVATION_CANDIDATES,
-    PluginHost, PluginHostBuilder, PluginToolInvocation, ResourceUsage,
+    PluginHost, PluginHostBuilder, PluginStatus, PluginToolInvocation, ResourceUsage,
 };
 pub use limiter::{HostCallGate, HostCallPermit, HostCallPermits};
 pub use services::{

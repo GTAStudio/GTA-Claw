@@ -6,16 +6,20 @@
 
 mod support;
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use claw_plugin_api::capability::{CapabilityGrant, EventKind, EventsGrant, ToolsGrant};
 use claw_plugin_host::services::{HostServices, RecordingSink};
 use claw_plugin_host::{
-    HostError, LifecycleState, PluginHost, TerminationCause, ToolRegistration,
-    ToolRegistrationError, ToolSink,
+    HostCallControl, HostError, LifecycleState, PluginHost, PluginStatus, TerminationCause,
+    ToolRegistration, ToolRegistrationError, ToolSink,
 };
 use support::{
     PROBE_ID, install_variant, probe_ceiling, probe_component_failing_deactivate,
+    probe_component_registering_invalid_replacement, probe_component_spinning_on_deactivate,
     unsigned_core_policy,
 };
 
@@ -29,7 +33,11 @@ struct RejectFirstSchema {
 }
 
 impl ToolSink for RejectFirstSchema {
-    fn register(&self, registration: ToolRegistration) -> Result<(), ToolRegistrationError> {
+    fn register(&self, registration: ToolRegistration) {
+        let _ = self.try_register(registration);
+    }
+
+    fn try_register(&self, registration: ToolRegistration) -> Result<(), ToolRegistrationError> {
         let mut accepted = self.accepted.lock().unwrap_or_else(PoisonError::into_inner);
         accepted.retain(|tool| {
             tool.plugin_id != registration.plugin_id || tool.name != registration.name
@@ -49,6 +57,80 @@ impl ToolSink for RejectFirstSchema {
         let before = accepted.len();
         accepted.retain(|tool| tool.plugin_id != plugin_id || tool.name != name);
         accepted.len() != before
+    }
+}
+
+#[derive(Clone, Default)]
+struct RejectSecondReplacement {
+    accepted: Arc<Mutex<Vec<ToolRegistration>>>,
+    probe_attempts: Arc<Mutex<usize>>,
+}
+
+impl ToolSink for RejectSecondReplacement {
+    fn register(&self, registration: ToolRegistration) {
+        let _ = self.try_register(registration);
+    }
+
+    fn try_register(&self, registration: ToolRegistration) -> Result<(), ToolRegistrationError> {
+        let mut accepted = self.accepted.lock().unwrap_or_else(PoisonError::into_inner);
+        if registration.name == "probe" {
+            let mut attempts = self
+                .probe_attempts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *attempts += 1;
+            if *attempts == 2 {
+                return Err(ToolRegistrationError::rejected(
+                    "replacement schema rejected",
+                ));
+            }
+        }
+        accepted.retain(|tool| {
+            tool.plugin_id != registration.plugin_id || tool.name != registration.name
+        });
+        accepted.push(registration);
+        Ok(())
+    }
+
+    fn unregister(&self, plugin_id: &str, name: &str) -> bool {
+        let mut accepted = self.accepted.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = accepted.len();
+        accepted.retain(|tool| tool.plugin_id != plugin_id || tool.name != name);
+        accepted.len() != before
+    }
+}
+
+struct LegacyToolSink;
+
+impl ToolSink for LegacyToolSink {
+    fn register(&self, _registration: ToolRegistration) {}
+
+    fn unregister(&self, _plugin_id: &str, _name: &str) -> bool {
+        false
+    }
+}
+
+#[derive(Clone)]
+struct BlockingUnregisterSink {
+    recorder: RecordingSink,
+    entered: mpsc::SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl ToolSink for BlockingUnregisterSink {
+    fn register(&self, registration: ToolRegistration) {
+        self.recorder.register(registration);
+    }
+
+    fn unregister(&self, plugin_id: &str, name: &str) -> bool {
+        let removed = self.recorder.unregister(plugin_id, name);
+        self.entered.send(()).expect("signal unregister");
+        let (released, wake) = &*self.release;
+        let mut released = released.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*released {
+            released = wake.wait(released).unwrap_or_else(PoisonError::into_inner);
+        }
+        removed
     }
 }
 
@@ -170,6 +252,92 @@ fn a_sink_rejection_does_not_consume_tool_quota() {
 }
 
 #[test]
+fn rejected_re_registration_withdraws_schema_and_releases_quota() {
+    let root = support::tempdir();
+    let component = support::probe_component_registering_tools(1);
+    let grants = tools_grant(1);
+    let dir = install_variant(root.path(), "probe", &component, grants.clone());
+    let sink = RejectSecondReplacement::default();
+    let mut host = PluginHost::builder()
+        .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(probe_ceiling(grants))
+        .services(HostServices::deny_all().with_tools(Arc::new(sink.clone())))
+        .build()
+        .expect("host");
+    let id = host.load(&dir).expect("load");
+    host.activate(&id).expect("activate");
+
+    assert_eq!(host.invoke_tool(&id, "k", "{}").expect("register"), ALLOWED);
+    assert_eq!(host.registered_tools(&id), Some(vec!["probe".to_owned()]));
+    assert_eq!(
+        host.invoke_tool(&id, "k", "{}")
+            .expect("rejected replacement is a guest error code"),
+        DENIED
+    );
+    assert_eq!(
+        host.registered_tools(&id),
+        Some(Vec::new()),
+        "rejected replacement must release the host quota ledger"
+    );
+    assert!(
+        sink.accepted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty(),
+        "rejected replacement must withdraw the stale public schema"
+    );
+
+    assert_eq!(
+        host.invoke_tool(&id, "z", "{}")
+            .expect("a different name fits after quota release"),
+        ALLOWED
+    );
+    assert_eq!(host.registered_tools(&id), Some(vec!["ta".to_owned()]));
+}
+
+#[test]
+fn host_validation_rejection_withdraws_an_existing_registration() {
+    let root = support::tempdir();
+    let component = probe_component_registering_invalid_replacement();
+    let grants = tools_grant(1);
+    let dir = install_variant(root.path(), "probe", &component, grants.clone());
+    let recorder = RecordingSink::new();
+    let mut host = PluginHost::builder()
+        .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(probe_ceiling(grants))
+        .services(HostServices::deny_all().with_tools(Arc::new(recorder.clone())))
+        .build()
+        .expect("host");
+    let id = host.load(&dir).expect("load");
+    host.activate(&id).expect("activate");
+
+    assert_eq!(host.invoke_tool(&id, "k", "{}").expect("register"), ALLOWED);
+    assert_eq!(host.registered_tools(&id), Some(vec!["probe".to_owned()]));
+    assert_eq!(
+        host.invoke_tool(&id, "y", "{}")
+            .expect("invalid replacement is a guest error code"),
+        DENIED
+    );
+    assert_eq!(host.registered_tools(&id), Some(Vec::new()));
+    assert!(
+        recorder.tools().is_empty(),
+        "host preflight rejection must withdraw the stale public schema"
+    );
+}
+
+#[test]
+fn legacy_tool_sink_implementations_keep_the_infallible_contract() {
+    let sink = LegacyToolSink;
+    sink.try_register(ToolRegistration {
+        plugin_id: "legacy".to_owned(),
+        name: "tool".to_owned(),
+        summary: String::new(),
+        input_schema: "{}".to_owned(),
+    })
+    .expect("the additive policy hook delegates to the legacy method");
+}
+
+#[test]
 fn deactivating_withdraws_every_tool_the_plugin_advertised() {
     let root = support::tempdir();
     let grants = tools_grant(4);
@@ -203,6 +371,62 @@ fn deactivating_withdraws_every_tool_the_plugin_advertised() {
 }
 
 #[test]
+fn tools_are_unpublished_before_a_blocked_deactivate_guest_runs() {
+    let root = support::tempdir();
+    let grants = tools_grant(1);
+    let component = probe_component_spinning_on_deactivate();
+    let dir = install_variant(root.path(), "probe", &component, grants.clone());
+    let recorder = RecordingSink::new();
+    let (entered, entered_rx) = mpsc::sync_channel(1);
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let sink = BlockingUnregisterSink {
+        recorder: recorder.clone(),
+        entered,
+        release: Arc::clone(&release),
+    };
+    let mut host = PluginHost::builder()
+        .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(probe_ceiling(grants))
+        .services(HostServices::deny_all().with_tools(Arc::new(sink)))
+        .build()
+        .expect("host");
+    let id = host.load(&dir).expect("load");
+    host.activate(&id).expect("activate");
+    assert_eq!(host.invoke_tool(&id, "k", "{}").expect("register"), ALLOWED);
+    assert_eq!(recorder.tools().len(), 1);
+
+    let (finished, finished_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let control = HostCallControl::new(Instant::now() + Duration::from_millis(500), None);
+        let report = host.shutdown_with_control(&control);
+        finished.send(report).expect("send shutdown report");
+    });
+
+    entered_rx
+        .recv_timeout(Duration::from_millis(100))
+        .expect("unregistration must happen before the guest starts spinning");
+    assert!(
+        recorder.tools().is_empty(),
+        "the public tool must already be withdrawn"
+    );
+    assert!(
+        matches!(finished_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "shutdown must still be blocked before the guest is released"
+    );
+    let (released, wake) = &*release;
+    *released.lock().unwrap_or_else(PoisonError::into_inner) = true;
+    wake.notify_all();
+
+    let report = finished_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("bounded guest deactivation finishes");
+    assert!(matches!(
+        report.outcomes()[0].result,
+        Err(HostError::Terminated { .. })
+    ));
+}
+
+#[test]
 fn a_deactivation_error_quarantines_and_withdraws_every_tool() {
     let root = support::tempdir();
     let grants = tools_grant(1);
@@ -220,7 +444,8 @@ fn a_deactivation_error_quarantines_and_withdraws_every_tool() {
     assert_eq!(host.invoke_tool(&id, "k", "{}").expect("register"), ALLOWED);
 
     assert!(matches!(host.deactivate(&id), Err(HostError::Guest(_))));
-    assert_eq!(host.state(&id), Some(LifecycleState::Quarantined));
+    assert_eq!(host.state(&id), Some(LifecycleState::Inactive));
+    assert_eq!(host.status(&id), Some(PluginStatus::Quarantined));
     assert_eq!(host.registered_tools(&id), Some(Vec::new()));
     assert!(
         recorder.tools().is_empty(),
