@@ -3,7 +3,7 @@ schema_version = 1
 [[decisions]]
 id = 1
 path = "Cargo.lock"
-base_oid = "5e85d6d080712c82dc0814985df1472bdfab5dd9"
+base_oid = "ade539bf7fbc2f4726a9ccec4bd7d2dfc462f233"
 base_live_sha256 = "fa661b63680ba3205c5c59099b5f597d9ffa6950b55b6f7fe76e060b3a58cac5"
 candidate_live_sha256 = "3388fcb660864eec04b17f5b4edc79bcb60cb6fc236c1ee437edba9a3e78f477"
 snapshot_payload_sha256 = "89aeb3905b6918651f3d91e95554f550b4aa2dd9cc87d6e3cd1bd0a4ce015aeb"
@@ -13,7 +13,7 @@ rationale = "Phase A1 preserves the reviewed pre-P04f root lock payload while ad
 [[decisions]]
 id = 2
 path = "Cargo.toml"
-base_oid = "5e85d6d080712c82dc0814985df1472bdfab5dd9"
+base_oid = "ade539bf7fbc2f4726a9ccec4bd7d2dfc462f233"
 base_live_sha256 = "38ec72b01870ad69272048d4af6b869ef2bf37347d6cc872cecbc015a4849111"
 candidate_live_sha256 = "168a3d4e9a3775f45fb4308ac7b9e19b6281b7e91b362d08501dc9d818fdba1e"
 snapshot_payload_sha256 = "901dab0edd19a930deaef8030779c60fc859a44512e8f98646dabaaaf24590ad"

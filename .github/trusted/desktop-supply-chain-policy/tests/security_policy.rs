@@ -3014,7 +3014,7 @@ fn write_windows_file_id_boundary(tree: &TempTree) {
 fn windows_file_id_boundary_is_exact_and_narrow() {
     assert_eq!(
         WINDOWS_FILE_ID_ADMISSION_BASE_OID,
-        "5e85d6d080712c82dc0814985df1472bdfab5dd9"
+        "ade539bf7fbc2f4726a9ccec4bd7d2dfc462f233"
     );
     assert_eq!(
         WINDOWS_FILE_ID_SOURCE_OID,

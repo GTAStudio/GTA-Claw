@@ -261,7 +261,7 @@ action debt fail from the base side.
 ### Atomic Phase-A1 PR226 helper admission
 
 Phase A1 is frozen against current main
-`5e85d6d080712c82dc0814985df1472bdfab5dd9`. PR226 source
+`ade539bf7fbc2f4726a9ccec4bd7d2dfc462f233`. PR226 source
 `4f91f20348b030cdf6817bc1bb9c527a999a25d2` contributes only the mode-`100644`
 `crates/claw-windows-file-id/Cargo.toml` and `src/lib.rs` blobs
 `a9fad929ce2befd694bbb5144dd733011ae0e65f` and

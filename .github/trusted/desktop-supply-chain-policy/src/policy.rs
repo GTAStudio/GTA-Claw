@@ -45,7 +45,7 @@ const WINDOWS_FILE_ID_MANIFEST: &str = "crates/claw-windows-file-id/Cargo.toml";
 const WINDOWS_FILE_ID_SOURCE: &str = "crates/claw-windows-file-id/src/lib.rs";
 const WINDOWS_FILE_ID_CONSUMER_MANIFEST: &str = "crates/claw-conformance/Cargo.toml";
 /// Current-main commit against which the Phase-A1 admission was frozen.
-pub const WINDOWS_FILE_ID_ADMISSION_BASE_OID: &str = "5e85d6d080712c82dc0814985df1472bdfab5dd9";
+pub const WINDOWS_FILE_ID_ADMISSION_BASE_OID: &str = "ade539bf7fbc2f4726a9ccec4bd7d2dfc462f233";
 /// Immutable PR226 source commit for the exact Windows file-ID helper.
 pub const WINDOWS_FILE_ID_SOURCE_OID: &str = "4f91f20348b030cdf6817bc1bb9c527a999a25d2";
 /// Exact manifest blob at [`WINDOWS_FILE_ID_SOURCE_OID`].
