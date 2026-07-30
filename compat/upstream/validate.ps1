@@ -15,6 +15,18 @@
     digests for review. This is the ONLY supported way to change ledger digests.
     It never touches inventory digests, the schema digest or baseline.json.
 
+.PARAMETER WriteStatusTotals
+    Declares the lifecycle totals in the form
+    "unimplemented=<n>,partial=<n>,implemented=<n>". This switch is accepted only
+    with -WriteLedgerDigests. The declaration must already match the ledger rows,
+    and both reviewed files are written only after every validation rule passes.
+
+.PARAMETER ReplayEvidenceSweep
+    Re-runs the shipped reachability rule over every tracked .rs file, rewrites
+    compat/upstream/evidence-reachability-sweep.tsv, and prints the new digest and
+    the differential from the previous record. This writer is mutually exclusive
+    with the ledger transition writer.
+
 .PARAMETER RepositoryRoot
     Repository working tree used to resolve acceptance-evidence paths. Defaults to
     the parent of compat/. The validator self-test passes the real tree explicitly
@@ -25,14 +37,44 @@
 
 .EXAMPLE
     powershell -NoProfile -File compat/upstream/validate.ps1 -WriteLedgerDigests
+
+.EXAMPLE
+    powershell -NoProfile -File compat/upstream/validate.ps1 `
+        -WriteLedgerDigests -WriteStatusTotals "unimplemented=3,partial=10,implemented=34"
+
+.EXAMPLE
+    powershell -NoProfile -File compat/upstream/validate.ps1 -ReplayEvidenceSweep
 #>
 [CmdletBinding()]
 param(
     [switch]$WriteLedgerDigests,
+    [string]$WriteStatusTotals,
+    [switch]$ReplayEvidenceSweep,
     [string]$RepositoryRoot
 )
 
 $ErrorActionPreference = "Stop"
+$WriteStatusTotalsRequested = -not [string]::IsNullOrWhiteSpace($WriteStatusTotals)
+if ($WriteStatusTotalsRequested -and -not $WriteLedgerDigests) {
+    throw "-WriteStatusTotals requires -WriteLedgerDigests so ledger digests and manifest totals move in one reviewed command"
+}
+if ($ReplayEvidenceSweep -and ($WriteLedgerDigests -or $WriteStatusTotalsRequested)) {
+    throw ("validator writer modes are mutually exclusive and are rejected before any artifact write; " +
+        "select either -ReplayEvidenceSweep or the ledger transition writer")
+}
+$WriterModeRequested = $WriteLedgerDigests -or $WriteStatusTotalsRequested -or $ReplayEvidenceSweep
+if ($WriterModeRequested) {
+    foreach ($name in @("CI", "GITHUB_ACTIONS", "TF_BUILD", "BUILDKITE")) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if (-not [string]::IsNullOrWhiteSpace($value) -and
+            -not [string]::Equals($value, "false", [StringComparison]::OrdinalIgnoreCase) -and
+            -not [string]::Equals($value, "no", [StringComparison]::OrdinalIgnoreCase) -and
+            -not [string]::Equals($value, "0", [StringComparison]::Ordinal)) {
+            throw "validator writer modes are forbidden in CI; '$name' is set"
+        }
+    }
+}
+
 $Root = $PSScriptRoot
 $ExpectedSha = "b43e832fcc8000ed7287c7accc54e381db607f85"
 $ExpectedSchemaDigest = "5fd454c7a1012e78410178bc44c02dc3201f46eed94d62c5dc811f441e8de396"
@@ -46,8 +88,8 @@ $ExpectedOracleCorpusCases = 120
 $ExpectedOracleCorpusTrue = 46
 # The shared reachability corpus is frozen on exactly the same terms. Its
 # expectations were produced by running cargo and rustc against each fixture, so
-# neither resolver is normative for reachability and neither may edit a case to
-# match itself. -WriteLedgerDigests cannot reach these constants.
+# cargo and rustc arbitrate reachability and neither resolver may edit a case to
+# match itself. No writer mode can reach these constants.
 $ExpectedReachabilityCorpusDigest = "70aec3e02f3885970ec37d61421fdc34ea932e591842d6a1669adf0e1f4880dd"
 $ExpectedReachabilityCorpusCases = 32
 $ExpectedReachabilityCorpusAccepting = 15
@@ -63,8 +105,25 @@ $ExpectedReachabilityCorpusAccepting = 15
 # Frozen exactly like the schema and corpus digests: -WriteLedgerDigests cannot
 # reach this constant, so re-blessing a hollowed-out self-test takes a reviewed
 # edit to this line.
-$ExpectedSelfTestDigest = "0da69d4ad9266c7a5cb4516dbf7fd95a4f0c7f0f82f6844bea44116a06956d96"
+$ExpectedSelfTestDigest = "0000000000000000000000000000000000000000000000000000000000000000"
+# README.md is the normative specification for these rules. Pinning its
+# LF-normalised text makes a prose change a reviewed trust-root edit instead of a
+# silent change to the instructions future rule owners follow.
+$ExpectedReadmeDigest = "0000000000000000000000000000000000000000000000000000000000000000"
 $LedgerDigestFileName = "ledger-digests.sha256"
+$EvidenceSweepFileName = "evidence-reachability-sweep.tsv"
+$EvidenceSweepExpectedFiles = 0
+$EvidenceSweepExpectedAccepted = 0
+$EvidenceSweepExpectedRejected = 0
+$EvidenceSweepPreamble = @(
+    "# GTA-Claw acceptance-evidence reachability sweep.",
+    "# Every tracked .rs file, judged by the reachability rule shipped in validate.ps1.",
+    "# This is a cross-check record only: it grants no evidence permission.",
+    "# Regenerate ONLY through the reviewed command, never by hand:",
+    "#   powershell -NoProfile -File compat/upstream/validate.ps1 -ReplayEvidenceSweep"
+)
+$EvidenceSweepGeneratedByLine = "# generated-by: validate.ps1 -ReplayEvidenceSweep"
+$ExpectedEvidenceSweepDigest = "0000000000000000000000000000000000000000000000000000000000000000"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
     "# Only the three mutable ledgers are covered here; inventory digests, the feature",
@@ -125,6 +184,7 @@ $ExpectedJsonPaths = @(
 
 $ExpectedNonJsonPaths = @(
     "README.md",
+    "evidence-reachability-sweep.tsv",
     "ledger-digests.sha256",
     "validate-self-test.ps1",
     "validate.ps1"
@@ -1030,10 +1090,11 @@ function Assert-EvidencePathShape {
 # ---------------------------------------------------------------------------
 # Enabled-test oracle.
 #
-# This is a FOLLOWER port of declares_enabled_test in
-# crates/claw-conformance/src/claims.rs, which is the NORMATIVE implementation.
-# When the Rust function changes, this must be re-ported in the same cycle; this
-# script has no independent authority to decide what counts as a real test.
+# This is the PowerShell implementation of the shared enabled-test rule.
+# declares_enabled_test / rust_tokens / declares_in_items in
+# crates/claw-conformance/src/claims.rs map to Test-DeclaresEnabledRustTest /
+# Get-RustTokens / Test-RustDeclaresInItems here. Neither implementation may
+# change the rule alone.
 # Agreement is not asserted by hand: enabled-test-oracle.json is a shared,
 # frozen fixture corpus that both implementations must classify identically, and
 # Assert-EnabledTestOracle below replays every case on every run.
@@ -1153,19 +1214,16 @@ function Get-RustTokens {
     # collide with a punctuation marker even though identifiers may now contain
     # non-ASCII characters.
     #
-    # "lit" and "oth" are load bearing, not cosmetic. The normative tokenizer
+    # "lit" and "oth" are load bearing, not cosmetic. The Rust tokenizer
     # emits a token for every unrecognised byte, so a stray byte in front of an
     # attribute makes the following item part of the item that stray byte opened
     # and the test stops being visible. Dropping those bytes silently, as an
-    # earlier port did, accepted sources the normative rule rejects.
+    # earlier port did, accepted sources the Rust implementation rejects.
     #
-    # -WithStrings is a LOCAL extension with no counterpart in the normative Rust
-    # tokenizer. It emits "s:<value>" in place of "lit" for quoted strings and
-    # "=" in place of "oth" for an equals sign, so the locally owned Cargo
-    # reachability rule below can read a #[path = "..."] attribute value. It is
-    # otherwise the same stream. The oracle never passes it, so the token stream
-    # the oracle sees stays byte-identical to the Rust original; the differential
-    # is run against the default path to keep that honest.
+    # -WithStrings exposes the Rust tokenizer's StringLiteral and Equals variants
+    # as "s:<value>" and "=" so the shared reachability rule can read a
+    # #[path = "..."] attribute. The enabled-test consumer uses the opaque
+    # "lit"/"oth" form because it does not need those values.
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Source)
     $length = $bytes.Length
     $tokens = New-Object System.Collections.Generic.List[string]
@@ -1253,9 +1311,9 @@ function Get-RustTokens {
             continue
         }
         # Identifier start: ASCII letter, underscore, or any non-ASCII byte.
-        # Walking non-ASCII a byte at a time is equivalent to the normative
-        # char::len_utf8 step, because every continuation byte of a multi-byte
-        # character is itself >= 0x80 and so is consumed by the same loop.
+        # Walking non-ASCII a byte at a time is equivalent to the Rust
+        # implementation's char::len_utf8 step, because every continuation byte
+        # of a multi-byte character is itself >= 0x80 and is consumed here too.
         if (($byte -ge 65 -and $byte -le 90) -or ($byte -ge 97 -and $byte -le 122) -or $byte -eq 95 -or $byte -ge 128) {
             $start = $index
             $index += 1
@@ -1296,7 +1354,7 @@ function Get-RustMatchingDelimiter {
     # A typed stack, not a depth counter. Mismatched delimiters return -1 so the
     # caller fails closed. An earlier port counted only the opening delimiter's
     # own kind and ignored the others, which accepted "{ ( }" as balanced; the
-    # normative rule rejects it, and macro scanning makes that reachable.
+    # Rust implementation rejects it, and macro scanning makes that reachable.
     if ($Open -lt 0) {
         return -1
     }
@@ -1679,12 +1737,9 @@ function Test-DeclaresEnabledRustTest {
 
 function Assert-EnabledTestOracle {
     param([object]$Corpus)
-    # Replays the shared fixture corpus on every run. This is the drift detector
-    # between the two independently owned trust roots: crates/claw-conformance
-    # owns the normative rule, this script owns a port of it, and both must
-    # classify all of these cases identically. A re-port that silently changes
-    # behaviour fails here, on the auditor's machine as well as in CI, instead of
-    # quietly accepting or rejecting a parity claim the other side disagrees with.
+    # Replays the shared fixture corpus on every run. The Rust and PowerShell
+    # implementations are independently owned; the frozen corpus is the common
+    # contract and both implementations must classify every case identically.
     Assert-ExactPropertySet $Corpus @(
         "schema_version", "purpose", "normative_implementation",
         "follower_implementation", "expected_is_authoritative_from", "cases"
@@ -1698,7 +1753,7 @@ function Assert-EnabledTestOracle {
         -not (Test-OrdinalStringEqual ([string]$Corpus.normative_implementation.function) "declares_enabled_test") -or
         -not (Test-OrdinalStringEqual ([string]$Corpus.follower_implementation.path) "compat/upstream/validate.ps1") -or
         -not (Test-OrdinalStringEqual ([string]$Corpus.follower_implementation.function) "Test-DeclaresEnabledRustTest")) {
-        Fail "enabled-test-oracle must record claw-conformance declares_enabled_test as normative and validate.ps1 Test-DeclaresEnabledRustTest as the follower"
+        Fail "enabled-test-oracle frozen provenance must name claw-conformance declares_enabled_test and validate.ps1 Test-DeclaresEnabledRustTest"
     }
     $cases = @($Corpus.cases)
     # The case count and the true/false split are pinned so that a case cannot be
@@ -1727,7 +1782,7 @@ function Assert-EnabledTestOracle {
         $actual = Test-DeclaresEnabledRustTest ([string]$case.source) ([string]$case.test)
         if ($actual -ne $case.expected) {
             Fail (("enabled-test oracle drift on case '{0}': the shared corpus records {1} but this port returned {2}. " +
-                "crates/claw-conformance declares_enabled_test is normative; re-port Test-DeclaresEnabledRustTest before changing this corpus.") -f
+                "the frozen expected result is authoritative; reconcile both implementations before changing this corpus.") -f
                 $name, $case.expected, $actual)
         }
     }
@@ -1757,6 +1812,46 @@ function Assert-ReachabilityCorpusPath {
     }
 }
 
+# Every accepted canonical case, including future additions, must be registered
+# here. The registry and corpus are exact sets: adding a case appends its name;
+# removing or renaming one requires an explicit deletion from this never-remove
+# list rather than hiding inside the count and digest updates every honest
+# addition already requires.
+$CanonicalReachabilityCaseNames = @(
+    "ambiguity-directory-side",
+    "ambiguity-file-side",
+    "compiled-file-outside-any-package",
+    "cross-package-also-own-package-accept",
+    "cross-package-only-reject",
+    "inline-path-mod-rs-accept",
+    "inline-path-mod-rs-decoy",
+    "inline-path-non-mod-rs-accept",
+    "inline-path-non-mod-rs-module-dir-decoy",
+    "inline-path-plain-child-accept",
+    "nested-inline-path-accept",
+    "nested-inline-path-file-dir-decoy",
+    "peer1-explicit-bin-test-false-reject",
+    "peer2-top-level-path-sibling",
+    "peer2-top-level-path-sibling-decoy",
+    "peer3-path-mod-rs-child",
+    "peer3-path-mod-rs-child-decoy",
+    "peer4-inline-path-propagates",
+    "peer4-inline-path-propagates-decoy",
+    "peer5-raw-string-path",
+    "peer6-ambiguity-directory-side",
+    "peer6-ambiguity-file-side",
+    "peer7-excluded-workspace-root",
+    "peer7-standalone-own-workspace-table-accept",
+    "peer7-unbuildable-orphan-package-reject",
+    "peer8-default-bench-reject",
+    "peer8-default-example-reject",
+    "peer8-enabled-integration-test-accept",
+    "peer8-harness-false-target-reject",
+    "peer8-src-bin-target-accept",
+    "unambiguous-file-accept",
+    "unambiguous-mod-rs-accept"
+)
+
 function Assert-ReachabilityCorpus {
     param([object]$Corpus)
     # Structural and digest pin only. This function deliberately does NOT
@@ -1784,9 +1879,6 @@ function Assert-ReachabilityCorpus {
         Fail "reachability-corpus must name claw-conformance and validate.ps1 as the two compared resolvers"
     }
     $cases = @($Corpus.cases)
-    if ($cases.Count -ne $ExpectedReachabilityCorpusCases) {
-        Fail ("reachability-corpus must contain exactly {0} cases; found {1}" -f $ExpectedReachabilityCorpusCases, $cases.Count)
-    }
     $names = @{}
     $accepting = 0
     foreach ($case in $cases) {
@@ -1841,6 +1933,38 @@ function Assert-ReachabilityCorpus {
             Fail "reachability-corpus case '$name' cites '$cite', which the case does not define"
         }
     }
+    $canonicalNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($canonicalName in $CanonicalReachabilityCaseNames) {
+        if (-not $canonicalNames.Add([string]$canonicalName)) {
+            Fail "canonical reachability case registry repeats '$canonicalName'"
+        }
+    }
+    $missingCanonical = @()
+    foreach ($canonicalName in $CanonicalReachabilityCaseNames) {
+        if (-not $names.ContainsKey($canonicalName)) {
+            $missingCanonical += $canonicalName
+        }
+    }
+    if ($missingCanonical.Count -gt 0) {
+        [Array]::Sort($missingCanonical, [StringComparer]::Ordinal)
+        Fail ("reachability-corpus must not drop canonical cases; missing=[{0}]" -f ($missingCanonical -join ", "))
+    }
+    $unregistered = @()
+    foreach ($name in $names.Keys) {
+        if (-not $canonicalNames.Contains([string]$name)) {
+            $unregistered += [string]$name
+        }
+    }
+    if ($unregistered.Count -gt 0) {
+        [Array]::Sort($unregistered, [StringComparer]::Ordinal)
+        Fail ("new reachability-corpus cases must be appended to `$CanonicalReachabilityCaseNames; unregistered=[{0}]" -f
+            ($unregistered -join ", "))
+    }
+    if ($cases.Count -ne $ExpectedReachabilityCorpusCases -or
+        $CanonicalReachabilityCaseNames.Count -ne $ExpectedReachabilityCorpusCases) {
+        Fail ("reachability-corpus and canonical registry must both contain exactly {0} cases; found corpus={1}, registry={2}" -f
+            $ExpectedReachabilityCorpusCases, $cases.Count, $CanonicalReachabilityCaseNames.Count)
+    }
     if ($accepting -ne $ExpectedReachabilityCorpusAccepting) {
         Fail ("reachability-corpus must record exactly {0} accepting cases; found {1}" -f $ExpectedReachabilityCorpusAccepting, $accepting)
     }
@@ -1865,8 +1989,18 @@ function Assert-RustTestSymbol {
 # ---------------------------------------------------------------------------
 # Cargo target reachability.
 #
-# LOCALLY OWNED rule. This is NOT part of the ported enabled-test oracle and has
-# no counterpart in crates/claw-conformance yet; see README.md.
+# Shared with crates/claw-conformance. Rust orchestrates target discovery through
+# CargoTestTargets::load and membership through
+# CargoTestTargets::contains_compiled_source; this script combines
+# Test-CratePackageIsBuilt, Get-CrateTargetRootFiles and
+# Get-CrateCompiledFileSet inside Assert-EvidenceFileIsCompiled. Rust's
+# rust_module_references_from_tokens / reachable_rust_sources map to
+# Get-RustModuleReferences / Get-CrateCompiledFileSet here.
+#
+# One current fail-closed extension is PowerShell-only:
+# non-empty required-features target declarations are refused here, while the
+# Rust loader still trusts cargo metadata's target.test flag. The shared corpus
+# has no required-features case, so it does not arbitrate that gap; see README.md.
 #
 # A structurally perfect, enabled #[test] in a .rs file that no Cargo target
 # compiles never runs. An author could add crates/foo/src/orphan.rs, never
@@ -2107,26 +2241,110 @@ function Test-CratePackageIsBuilt {
     return [ordered]@{ built = $true; workspace = $null; reason = "standalone" }
 }
 
+function Add-TomlArrayFragment {
+    param(
+        [string]$Text,
+        [System.Collections.IDictionary]$State
+    )
+    # Minimal TOML array scanner for required-features. It is deliberately not a
+    # feature resolver: it answers only whether the declared array is empty, while
+    # respecting comments, quoted strings and arrays split across lines.
+    for ($index = 0; $index -lt $Text.Length; $index += 1) {
+        $character = $Text[$index]
+        if ($State["in_basic"]) {
+            if ($State["escaped"]) {
+                $State["escaped"] = $false
+            } elseif ($character -eq [char]92) {
+                $State["escaped"] = $true
+            } elseif ($character -eq [char]34) {
+                $State["in_basic"] = $false
+            }
+            continue
+        }
+        if ($State["in_literal"]) {
+            if ($character -eq [char]39) {
+                $State["in_literal"] = $false
+            }
+            continue
+        }
+        if ($character -eq [char]35) {
+            break
+        }
+        if ($character -eq [char]34) {
+            if ($State["depth"] -gt 0) { $State["has_entry"] = $true }
+            $State["in_basic"] = $true
+            continue
+        }
+        if ($character -eq [char]39) {
+            if ($State["depth"] -gt 0) { $State["has_entry"] = $true }
+            $State["in_literal"] = $true
+            continue
+        }
+        if ($character -eq [char]91) {
+            if ($State["started"] -and $State["depth"] -gt 0) {
+                $State["has_entry"] = $true
+            }
+            $State["started"] = $true
+            $State["depth"] += 1
+            continue
+        }
+        if ($character -eq [char]93) {
+            if (-not $State["started"] -or $State["depth"] -le 0) {
+                $State["invalid"] = $true
+                $State["complete"] = $true
+                break
+            }
+            $State["depth"] -= 1
+            if ($State["depth"] -eq 0) {
+                $State["complete"] = $true
+                break
+            }
+            continue
+        }
+        if ($State["depth"] -gt 0 -and
+            $character -ne [char]44 -and
+            -not [char]::IsWhiteSpace($character)) {
+            $State["has_entry"] = $true
+        }
+    }
+}
+
 function Get-CargoManifestTargetSections {
     param([string]$ManifestText)
     # Every [lib] / [[bin]] / [[test]] / [[bench]] / [[example]] block, with the
-    # only three keys that decide whether `cargo test` runs #[test] items in the
+    # four keys that decide whether `cargo test` runs #[test] items in the
     # named file. Keys are read per block: a bare `path = "..."` also appears
     # under [dependencies.<name>], and honouring that would let an author bless
     # an orphan file by adding one line to a manifest instead of wiring the file
     # into the crate.
     $sections = New-Object System.Collections.Generic.List[object]
     $current = $null
+    $requiredFeaturesState = $null
     $packageFlags = @{}
     $inPackage = $false
     foreach ($line in ($ManifestText -split "`n")) {
         $trimmed = $line.Trim()
+        if ($null -ne $requiredFeaturesState) {
+            Add-TomlArrayFragment $trimmed $requiredFeaturesState
+            if ($requiredFeaturesState["complete"]) {
+                $current.requiredFeatures =
+                    $requiredFeaturesState["has_entry"] -or $requiredFeaturesState["invalid"]
+                $requiredFeaturesState = $null
+            }
+            continue
+        }
         $header = [regex]::Match($trimmed, '\A\[\[?([A-Za-z0-9_.-]+)\]?\]\z')
         if ($header.Success) {
             $kind = $header.Groups[1].Value
             $inPackage = (Test-OrdinalStringEqual $kind "package")
             if (Test-OrdinalContains @("lib", "bin", "test", "bench", "example") $kind) {
-                $current = [ordered]@{ kind = $kind; path = $null; test = $null; harness = $null }
+                $current = [ordered]@{
+                    kind = $kind
+                    path = $null
+                    test = $null
+                    harness = $null
+                    requiredFeatures = $null
+                }
                 [void]$sections.Add($current)
             } else {
                 $current = $null
@@ -2143,6 +2361,27 @@ function Get-CargoManifestTargetSections {
         if ($declared.Success) { $current.path = $declared.Groups[1].Value; continue }
         $flag = [regex]::Match($trimmed, '\A(test|harness)\s*=\s*(true|false)\z')
         if ($flag.Success) { $current[$flag.Groups[1].Value] = (Test-OrdinalStringEqual $flag.Groups[2].Value "true") }
+        $required = [regex]::Match($trimmed, '\Arequired-features\s*=\s*(.*)\z')
+        if ($required.Success) {
+            # Incomplete or malformed syntax remains fail-closed ($true).
+            $current.requiredFeatures = $true
+            $requiredFeaturesState = [ordered]@{
+                started = $false
+                depth = 0
+                in_basic = $false
+                in_literal = $false
+                escaped = $false
+                has_entry = $false
+                invalid = $false
+                complete = $false
+            }
+            Add-TomlArrayFragment $required.Groups[1].Value $requiredFeaturesState
+            if ($requiredFeaturesState["complete"]) {
+                $current.requiredFeatures =
+                    $requiredFeaturesState["has_entry"] -or $requiredFeaturesState["invalid"]
+                $requiredFeaturesState = $null
+            }
+        }
     }
     return [ordered]@{ sections = $sections.ToArray(); package = $packageFlags }
 }
@@ -2157,6 +2396,12 @@ function Test-CargoSectionRunsTests {
     # main(), which makes every #[test] item in it inert, so it can never be
     # acceptance evidence whatever `test` says.
     if ($Section.harness -eq $false) { return $false }
+    # A non-empty required-features declaration makes a plain cargo test skip the
+    # target entirely. Presence is read, never resolved, because reproducing
+    # Cargo's feature graph here would create a new way to bless a target Cargo
+    # did not build. This outranks an explicit test = true. An empty array is not
+    # a gate and remains accepted.
+    if ($Section.requiredFeatures -eq $true) { return $false }
     if ($null -ne $Section.test) { return [bool]$Section.test }
     return (Test-OrdinalContains @("lib", "bin", "test") ([string]$Section.kind))
 }
@@ -2383,6 +2628,174 @@ function Assert-EvidenceFileIsCompiled {
     }
 }
 
+function Get-RepositoryRustFiles {
+    # The sweep universe is git's tracked list, not a filesystem walk that
+    # reimplements ignore rules and can silently admit untracked sources.
+    $root = [string]$script:RepositoryRootFull
+    $tracked = @(& git -C $root -c core.quotepath=off ls-files -- "*.rs" 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        Fail "-ReplayEvidenceSweep could not list tracked Rust files with git"
+    }
+    $results = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in $tracked) {
+        $relative = [string]$entry
+        if ([string]::IsNullOrEmpty($relative)) { continue }
+        if ($relative.StartsWith("compat/legacy/", [StringComparison]::Ordinal)) { continue }
+        $results.Add($relative)
+    }
+    $results.Sort([System.StringComparer]::Ordinal)
+    return @($results)
+}
+
+function Get-EvidenceFileReachability {
+    param([string]$RelativePath)
+    $resolved = Resolve-RepositoryFilePath $RelativePath
+    if ($null -eq $resolved) {
+        return [pscustomobject]@{
+            verdict = "missing"
+            reason = "the path is absent, non-ordinal, not a regular file, or traverses a reparse point"
+        }
+    }
+    try {
+        Assert-EvidenceFileIsCompiled $RelativePath "sweep"
+        return [pscustomobject]@{
+            verdict = "accept"
+            reason = "the shipped reachability rule accepts the existing repository file"
+        }
+    } catch {
+        return [pscustomobject]@{
+            verdict = "reject"
+            reason = [string]$_.Exception.Message
+        }
+    }
+}
+
+function Get-EvidenceSweepRecord {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Fail "$EvidenceSweepFileName is missing"
+    }
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ge 3 -and
+        $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        Fail "$EvidenceSweepFileName must be BOM-less UTF-8"
+    }
+    try {
+        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $rawText = $strictUtf8.GetString($bytes)
+    } catch {
+        Fail "$EvidenceSweepFileName must be valid BOM-less UTF-8"
+    }
+    if ([regex]::IsMatch($rawText, "`r(?!`n)")) {
+        Fail "$EvidenceSweepFileName contains a bare CR; use uniform LF or uniform CRLF"
+    }
+    $hasCrlf = $rawText.Contains("`r`n")
+    if ($hasCrlf -and $rawText.Replace("`r`n", "").Contains("`n")) {
+        Fail "$EvidenceSweepFileName mixes LF and CRLF"
+    }
+    $text = $rawText.Replace("`r`n", "`n")
+    if (-not $text.EndsWith("`n", [StringComparison]::Ordinal) -or
+        $text.EndsWith("`n`n", [StringComparison]::Ordinal)) {
+        Fail "$EvidenceSweepFileName must end with exactly one newline"
+    }
+    $lines = @($text.Substring(0, $text.Length - 1) -split "`n")
+    $fixedHeaderLines = $EvidenceSweepPreamble.Count + 4
+    if ($lines.Count -lt $fixedHeaderLines) {
+        Fail "$EvidenceSweepFileName is truncated before its complete canonical header"
+    }
+    for ($index = 0; $index -lt $EvidenceSweepPreamble.Count; $index += 1) {
+        $expected = [string]$EvidenceSweepPreamble[$index]
+        if (-not (Test-OrdinalStringEqual ([string]$lines[$index]) $expected)) {
+            Fail ("$EvidenceSweepFileName canonical header line {0} must be exactly '{1}', got '{2}'" -f
+                ($index + 1), $expected, [string]$lines[$index])
+        }
+    }
+    $generatedIndex = $EvidenceSweepPreamble.Count
+    if (-not (Test-OrdinalStringEqual ([string]$lines[$generatedIndex]) $EvidenceSweepGeneratedByLine)) {
+        Fail ("$EvidenceSweepFileName generated-by line must be exactly '{0}', got '{1}'" -f
+            $EvidenceSweepGeneratedByLine, [string]$lines[$generatedIndex])
+    }
+    $baseCommitIndex = $generatedIndex + 1
+    $baseCommitMatch = [regex]::Match(
+        [string]$lines[$baseCommitIndex],
+        '\A# base-commit: ([0-9a-f]{40})\z'
+    )
+    if (-not $baseCommitMatch.Success) {
+        Fail ("$EvidenceSweepFileName canonical header line {0} must be " +
+            "'# base-commit: <40 lowercase hex characters>'" -f ($baseCommitIndex + 1))
+    }
+    $sweptAtIndex = $baseCommitIndex + 1
+    $sweptAtMatch = [regex]::Match(
+        [string]$lines[$sweptAtIndex],
+        '\A# swept-at: ([0-9]{4}-[0-9]{2}-[0-9]{2})\z'
+    )
+    if (-not $sweptAtMatch.Success) {
+        Fail ("$EvidenceSweepFileName canonical header line {0} must be " +
+            "'# swept-at: <ISO yyyy-MM-dd date>'" -f ($sweptAtIndex + 1))
+    }
+    $parsedDate = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact(
+            $sweptAtMatch.Groups[1].Value,
+            "yyyy-MM-dd",
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::None,
+            [ref]$parsedDate
+        )) {
+        Fail "$EvidenceSweepFileName swept-at value is not a real ISO yyyy-MM-dd date"
+    }
+    $totalsIndex = $sweptAtIndex + 1
+    $totalsMatch = [regex]::Match(
+        [string]$lines[$totalsIndex],
+        '\A# totals: files=([0-9]+) accept=([0-9]+) reject=([0-9]+)\z'
+    )
+    if (-not $totalsMatch.Success) {
+        Fail ("$EvidenceSweepFileName canonical header line {0} must be " +
+            "'# totals: files=<n> accept=<n> reject=<n>'" -f ($totalsIndex + 1))
+    }
+    $rows = New-Object System.Collections.Generic.List[object]
+    $previous = $null
+    $accepted = 0
+    $rejected = 0
+    for ($index = $fixedHeaderLines; $index -lt $lines.Count; $index += 1) {
+        $line = [string]$lines[$index]
+        $tab = $line.IndexOf("`t", [StringComparison]::Ordinal)
+        if ($tab -lt 0 -or
+            $line.IndexOf("`t", $tab + 1, [StringComparison]::Ordinal) -ge 0) {
+            Fail ("$EvidenceSweepFileName row {0} must contain exactly two fields separated by one TAB: '{1}'" -f
+                ($index + 1), $line)
+        }
+        $verdict = $line.Substring(0, $tab)
+        $path = $line.Substring($tab + 1)
+        if (-not (Test-OrdinalStringEqual $verdict "accept") -and
+            -not (Test-OrdinalStringEqual $verdict "reject")) {
+            Fail "$EvidenceSweepFileName row $($index + 1) verdict must be exactly 'accept' or 'reject'"
+        }
+        if (-not $path.EndsWith(".rs", [StringComparison]::Ordinal)) {
+            Fail "$EvidenceSweepFileName row path '$path' is not a .rs file"
+        }
+        Assert-EvidencePathShape $path "$EvidenceSweepFileName row"
+        if ($null -ne $previous -and [string]::CompareOrdinal($path, $previous) -le 0) {
+            Fail "$EvidenceSweepFileName rows must be strictly ascending by path; '$path' follows '$previous'"
+        }
+        $previous = $path
+        if ($verdict -eq "accept") { $accepted += 1 } else { $rejected += 1 }
+        $rows.Add([pscustomobject]@{ verdict = $verdict; path = $path })
+    }
+    $expectedTotals = "files={0} accept={1} reject={2}" -f $rows.Count, $accepted, $rejected
+    $declaredTotals = [string]$lines[$totalsIndex].Substring("# totals: ".Length)
+    if (-not (Test-OrdinalStringEqual $declaredTotals $expectedTotals)) {
+        Fail ("$EvidenceSweepFileName totals line disagrees with its rows; header says '{0}', rows are '{1}'" -f
+            $declaredTotals, $expectedTotals)
+    }
+    return [ordered]@{
+        rows = $rows.ToArray()
+        accepted = $accepted
+        rejected = $rejected
+        base_commit = $baseCommitMatch.Groups[1].Value
+        swept_at = $sweptAtMatch.Groups[1].Value
+    }
+}
+
 function Assert-EvidenceArtifact {
     param(
         [object]$Artifact,
@@ -2559,6 +2972,167 @@ function Write-LedgerDigestFile {
     )
     $encoding = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($AbsolutePath, (Format-LedgerDigestFile $DigestsByPath), $encoding)
+}
+
+function ConvertTo-DeclaredStatusTotals {
+    param([string]$Declaration)
+    $declared = [ordered]@{}
+    foreach ($part in ([string]$Declaration -split ",")) {
+        $trimmed = $part.Trim()
+        if ($trimmed.Length -eq 0) {
+            Fail "-WriteStatusTotals contains an empty declaration"
+        }
+        $match = [regex]::Match($trimmed, '\A(?<key>[a-z]+)=(?<value>0|[1-9][0-9]*)\z')
+        if (-not $match.Success) {
+            Fail ("-WriteStatusTotals must be " +
+                "'unimplemented=<n>,partial=<n>,implemented=<n>'; got '$trimmed'")
+        }
+        $key = $match.Groups["key"].Value
+        if ($declared.Contains($key)) {
+            Fail "-WriteStatusTotals declares '$key' more than once"
+        }
+        $parsed = 0
+        if (-not [int]::TryParse(
+                $match.Groups["value"].Value,
+                [System.Globalization.NumberStyles]::None,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [ref]$parsed
+            )) {
+            Fail "-WriteStatusTotals value for '$key' is outside the supported integer range"
+        }
+        $declared[$key] = $parsed
+    }
+    foreach ($status in $AllowedFeatureStatuses) {
+        if (-not $declared.Contains($status)) {
+            Fail "-WriteStatusTotals must declare every status; '$status' is missing"
+        }
+    }
+    foreach ($key in @($declared.Keys)) {
+        if ($AllowedFeatureStatuses -notcontains $key) {
+            Fail "-WriteStatusTotals declares unknown status '$key'"
+        }
+    }
+    return $declared
+}
+
+function Get-UpdatedManifestStatusTotalsBytes {
+    param(
+        [string]$AbsolutePath,
+        [System.Collections.IDictionary]$Totals
+    )
+    # Decode and re-encode explicitly so the writer preserves the input BOM state
+    # as well as every byte outside the three integer tokens. ReadAllText hides a
+    # UTF-8 BOM, which makes string round-trip comparisons unsuitable here.
+    $source = [System.IO.File]::ReadAllBytes($AbsolutePath)
+    $hasBom = $source.Length -ge 3 -and
+        $source[0] -eq 0xEF -and $source[1] -eq 0xBB -and $source[2] -eq 0xBF
+    $offset = $(if ($hasBom) { 3 } else { 0 })
+    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    try {
+        $raw = $strictUtf8.GetString($source, $offset, $source.Length - $offset)
+    } catch {
+        Fail "manifest.json must be valid UTF-8"
+    }
+    $marker = '"status_totals"'
+    $markerIndex = $raw.IndexOf($marker, [System.StringComparison]::Ordinal)
+    if ($markerIndex -lt 0 -or
+        $raw.IndexOf($marker, $markerIndex + $marker.Length, [System.StringComparison]::Ordinal) -ge 0) {
+        Fail "manifest.json must contain exactly one status_totals object"
+    }
+    $open = $raw.IndexOf("{", $markerIndex, [System.StringComparison]::Ordinal)
+    $close = $raw.IndexOf("}", [Math]::Max($open, 0), [System.StringComparison]::Ordinal)
+    if ($open -lt 0 -or $close -lt 0) {
+        Fail "manifest.json status_totals object is not well formed"
+    }
+    $block = $raw.Substring($open, $close - $open + 1)
+    foreach ($status in $AllowedFeatureStatuses) {
+        $pattern = '("' + [regex]::Escape($status) + '"\s*:\s*)\d+'
+        if ([regex]::Matches($block, $pattern).Count -ne 1) {
+            Fail "manifest.json status_totals must name '$status' exactly once"
+        }
+        $block = [regex]::Replace($block, $pattern, ('${1}' + [string]$Totals[$status]))
+    }
+    $updated = $raw.Substring(0, $open) + $block + $raw.Substring($close + 1)
+    [byte[]]$encoded = $strictUtf8.GetBytes($updated)
+    if (-not $hasBom) {
+        return ,$encoded
+    }
+    [byte[]]$withBom = New-Object byte[] ($encoded.Length + 3)
+    $withBom[0] = 0xEF
+    $withBom[1] = 0xBB
+    $withBom[2] = 0xBF
+    [Array]::Copy($encoded, 0, $withBom, 3, $encoded.Length)
+    return ,$withBom
+}
+
+function Write-BytesAtomically {
+    param(
+        [string]$AbsolutePath,
+        [byte[]]$Bytes
+    )
+    $directory = [System.IO.Path]::GetDirectoryName($AbsolutePath)
+    $temporaryPath = Join-Path $directory (
+        "." + [System.IO.Path]::GetFileName($AbsolutePath) + "." +
+        [System.IO.Path]::GetRandomFileName() + ".tmp"
+    )
+    try {
+        [System.IO.File]::WriteAllBytes($temporaryPath, $Bytes)
+        if ([System.IO.File]::Exists($AbsolutePath)) {
+            [System.IO.File]::Replace($temporaryPath, $AbsolutePath, $null)
+        } else {
+            [System.IO.File]::Move($temporaryPath, $AbsolutePath)
+        }
+    } finally {
+        if ([System.IO.File]::Exists($temporaryPath)) {
+            [System.IO.File]::Delete($temporaryPath)
+        }
+    }
+}
+
+function Write-ReviewedStatusTransition {
+    param(
+        [string]$ManifestPath,
+        [byte[]]$ManifestBytes,
+        [string]$DigestPath,
+        [byte[]]$DigestBytes
+    )
+    # Stage both byte sequences before touching either reviewed file. If the
+    # second atomic replacement fails, restore the first from its exact original
+    # bytes so the composite operation leaves no half-transition or temp residue.
+    $manifestExisted = [System.IO.File]::Exists($ManifestPath)
+    $digestExisted = [System.IO.File]::Exists($DigestPath)
+    $originalManifest = if ($manifestExisted) {
+        [System.IO.File]::ReadAllBytes($ManifestPath)
+    } else {
+        $null
+    }
+    $originalDigest = if ($digestExisted) {
+        [System.IO.File]::ReadAllBytes($DigestPath)
+    } else {
+        $null
+    }
+    try {
+        Write-BytesAtomically $DigestPath $DigestBytes
+        Write-BytesAtomically $ManifestPath $ManifestBytes
+    } catch {
+        $transitionFailure = $_
+        try {
+            if ($manifestExisted) {
+                Write-BytesAtomically $ManifestPath $originalManifest
+            } elseif ([System.IO.File]::Exists($ManifestPath)) {
+                [System.IO.File]::Delete($ManifestPath)
+            }
+            if ($digestExisted) {
+                Write-BytesAtomically $DigestPath $originalDigest
+            } elseif ([System.IO.File]::Exists($DigestPath)) {
+                [System.IO.File]::Delete($DigestPath)
+            }
+        } catch {
+            Fail ("composite status transition failed and rollback also failed: transition='{0}'; rollback='{1}'" -f
+                $transitionFailure.Exception.Message, $_.Exception.Message)
+        }
+        throw $transitionFailure
+    }
 }
 
 function Assert-ExactCounts {
@@ -2901,6 +3475,10 @@ function Assert-ManifestDeclarations {
 }
 
 $script:RepositoryRootFull = Resolve-RepositoryRoot $RepositoryRoot
+$declaredStatusTotals = $null
+if ($WriteStatusTotalsRequested) {
+    $declaredStatusTotals = ConvertTo-DeclaredStatusTotals $WriteStatusTotals
+}
 
 # Runs before any contract file is read, in both verify and write mode, so a host
 # whose globalisation or JSON behaviour differs from a conforming host fails
@@ -2923,6 +3501,12 @@ if ($WriteLedgerDigests -and
     -not (Test-Path -LiteralPath (Join-Path $Root $LedgerDigestFileName) -PathType Leaf)) {
     $expectedFilePaths = @(
         $expectedFilePaths | Where-Object { -not (Test-OrdinalStringEqual $_ $LedgerDigestFileName) }
+    )
+}
+if ($ReplayEvidenceSweep -and
+    -not (Test-Path -LiteralPath (Join-Path $Root $EvidenceSweepFileName) -PathType Leaf)) {
+    $expectedFilePaths = @(
+        $expectedFilePaths | Where-Object { -not (Test-OrdinalStringEqual $_ $EvidenceSweepFileName) }
     )
 }
 $missingFiles = @($expectedFilePaths | Where-Object { -not (Test-OrdinalContains $actualFilePaths $_) })
@@ -2955,14 +3539,22 @@ if (-not (Test-OrdinalStringEqual $selfTestDigest $ExpectedSelfTestDigest)) {
         $ExpectedSelfTestDigest, $selfTestDigest)
 }
 
+$readmePath = Join-Path $Root "README.md"
+$readmeText = [System.IO.File]::ReadAllText($readmePath) -replace "`r`n", "`n"
+$readmeDigest = Get-Sha256Text $readmeText
+if (-not (Test-OrdinalStringEqual $readmeDigest $ExpectedReadmeDigest)) {
+    Fail ("README.md digest mismatch; expected {0}, found {1}. README.md is the normative specification " +
+        "and must be re-pinned in the same reviewed commit." -f $ExpectedReadmeDigest, $readmeDigest)
+}
+
 $documents = @{}
 foreach ($relativePath in $ExpectedJsonPaths) {
     $documents[$relativePath] = Read-Json (Join-Path $Root $relativePath)
 }
 
-# Prove the enabled-test oracle still agrees with the normative Rust rule BEFORE
-# any evidence is judged with it. A drifted oracle must never get the chance to
-# accept or reject a parity claim.
+# Prove both enabled-test implementations still agree with the frozen oracle
+# before any evidence is judged. A drifted implementation must never get the
+# chance to accept or reject a parity claim.
 Assert-EnabledTestOracle $documents["enabled-test-oracle.json"]
 Assert-ReachabilityCorpus $documents["reachability-corpus.json"]
 
@@ -3036,6 +3628,7 @@ if (-not (Test-OrdinalStringEqual ([string]$schema.'$schema') "https://json-sche
         $ExpectedSchemaDigest, (Get-ObjectDigest $schema))
 }
 
+$manifestPath = Join-Path $Root "manifest.json"
 $manifest = $documents["manifest.json"]
 Assert-ManifestDeclarations $manifest
 
@@ -3062,9 +3655,13 @@ foreach ($spec in $LedgerSpecs) {
     $computedLedgerDigests[[string]$spec.path] = Get-FeatureDigest $features
 }
 
-if ($WriteLedgerDigests) {
+if ($WriteLedgerDigests -and -not $WriteStatusTotalsRequested) {
+    # Preserve the existing standalone anti-forgery workflow: the reviewed
+    # mutable ledger fields are re-blessed before their semantic checks run.
+    # Composite status transitions defer both reviewed writes until all checks
+    # pass, so a rejected declaration leaves neither file changed.
     Write-LedgerDigestFile $ledgerDigestPath $computedLedgerDigests
-} else {
+} elseif (-not $WriteStatusTotalsRequested) {
     $storedLedgerDigests = Read-LedgerDigestFile $ledgerDigestPath
     foreach ($spec in $LedgerSpecs) {
         if (-not (Test-OrdinalStringEqual `
@@ -3101,9 +3698,10 @@ foreach ($spec in $LedgerSpecs) {
 if ($LedgerSpecs.Count -ne 3 -or $featureCount -ne 47) {
     Fail "fixed ledger totals must be 3 ledgers and 47 features"
 }
-# Runs in write mode too, so -WriteLedgerDigests cannot re-bless a ledger whose
-# frozen text was edited: the regeneration command can only ever move the file
-# digest for a status or evidence change. It fails before it writes.
+# Runs in write mode too, so a command cannot complete after frozen ledger text
+# was edited. Standalone -WriteLedgerDigests intentionally writes its reviewed
+# digest file first; the composite status transition defers both writes until
+# this and every later semantic check have passed.
 foreach ($spec in $LedgerSpecs) {
     if (-not (Test-OrdinalStringEqual `
                 ([string]$computedFrozenDigests[[string]$spec.path]) `
@@ -3113,7 +3711,17 @@ foreach ($spec in $LedgerSpecs) {
             "implementation_pointers and known_differences may change")
     }
 }
-Assert-ExactCounts $manifest.evidence_policy.status_totals $statusTotals "manifest.evidence_policy.status_totals"
+if ($WriteStatusTotalsRequested) {
+    foreach ($status in $AllowedFeatureStatuses) {
+        if ($statusTotals[$status] -ne $declaredStatusTotals[$status]) {
+            Fail ("-WriteStatusTotals declaration disagrees with validated ledger rows: " +
+                "{0} declared {1}, computed {2}" -f
+                $status, $declaredStatusTotals[$status], $statusTotals[$status])
+        }
+    }
+} else {
+    Assert-ExactCounts $manifest.evidence_policy.status_totals $statusTotals "manifest.evidence_policy.status_totals"
+}
 $missingEvidenceCount = $statusTotals["unimplemented"]
 
 $globalRecordIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -3218,16 +3826,212 @@ foreach ($key in $ExpectedCanonicalCounts.Keys) {
     }
 }
 
+# This record is a cross-check of the shipped reachability rule, never an input
+# to an evidence decision. Ordinary validation re-evaluates every dated row;
+# replay explicitly rebuilds the record from git's tracked Rust universe.
+$evidenceSweepPath = Join-Path $Root $EvidenceSweepFileName
+$sweepRecord = $null
+$sweepRowsRechecked = 0
+if ($ReplayEvidenceSweep) {
+    # A malformed previous record must remain repairable by the one reviewed
+    # writer mode rather than requiring a hand-authored replacement.
+    if (Test-Path -LiteralPath $evidenceSweepPath -PathType Leaf) {
+        try {
+            $sweepRecord = Get-EvidenceSweepRecord $evidenceSweepPath
+        } catch {
+            Write-Host ("  previous $EvidenceSweepFileName does not parse and is being replaced: " +
+                $_.Exception.Message)
+            $sweepRecord = $null
+        }
+    }
+} else {
+    $sweepText = [System.IO.File]::ReadAllText($evidenceSweepPath).Replace("`r`n", "`n")
+    $sweepDigest = Get-Sha256Text $sweepText
+    if (-not (Test-OrdinalStringEqual $sweepDigest $ExpectedEvidenceSweepDigest)) {
+        Fail (("{0} digest mismatch; expected {1}, found {2}. Regenerate only with " +
+            "validate.ps1 -ReplayEvidenceSweep, then review and pin the new digest.") -f
+            $EvidenceSweepFileName, $ExpectedEvidenceSweepDigest, $sweepDigest)
+    }
+    $sweepRecord = Get-EvidenceSweepRecord $evidenceSweepPath
+    if (-not (Test-OrdinalStringEqual ([string]$sweepRecord.base_commit) $ExpectedEvidenceSweepBaseCommit) -or
+        -not (Test-OrdinalStringEqual ([string]$sweepRecord.swept_at) $ExpectedEvidenceSweepSweptAt)) {
+        Fail ("$EvidenceSweepFileName metadata must remain pinned to base {0} at {1}" -f
+            $ExpectedEvidenceSweepBaseCommit, $ExpectedEvidenceSweepSweptAt)
+    }
+    $semanticMismatches = New-Object System.Collections.Generic.List[string]
+    foreach ($row in $sweepRecord.rows) {
+        $live = Get-EvidenceFileReachability ([string]$row.path)
+        if (Test-OrdinalStringEqual ([string]$live.verdict) "missing") {
+            $semanticMismatches.Add(("{0} semantic mismatch for '{1}': record says '{2}', but {3}." -f
+                    $EvidenceSweepFileName, [string]$row.path, [string]$row.verdict, [string]$live.reason))
+        } elseif (-not (Test-OrdinalStringEqual ([string]$row.verdict) ([string]$live.verdict))) {
+            $semanticMismatches.Add((("{0} semantic mismatch for '{1}': record says '{2}', " +
+                        "shipped reachability rule says '{3}'. Reason: {4}") -f
+                    $EvidenceSweepFileName,
+                    [string]$row.path,
+                    [string]$row.verdict,
+                    [string]$live.verdict,
+                    [string]$live.reason))
+        }
+        $sweepRowsRechecked += 1
+    }
+    if ($semanticMismatches.Count -gt 0) {
+        Fail ($semanticMismatches.ToArray() -join [Environment]::NewLine)
+    }
+    if ($sweepRecord.rows.Count -ne $EvidenceSweepExpectedFiles -or
+        $sweepRecord.accepted -ne $EvidenceSweepExpectedAccepted -or
+        $sweepRecord.rejected -ne $EvidenceSweepExpectedRejected) {
+        Fail (("{0} semantic verdicts agree, but the reviewed record must contain exactly " +
+                "{1} files / {2} accept / {3} reject; found {4} / {5} / {6}") -f
+            $EvidenceSweepFileName,
+            $EvidenceSweepExpectedFiles,
+            $EvidenceSweepExpectedAccepted,
+            $EvidenceSweepExpectedRejected,
+            $sweepRecord.rows.Count,
+            $sweepRecord.accepted,
+            $sweepRecord.rejected)
+    }
+}
+
+if ($ReplayEvidenceSweep) {
+    $sweepBaseCommit = $null
+    try {
+        $sweepBaseCommit = (& git -C $script:RepositoryRootFull rev-parse HEAD 2>$null | Out-String).Trim()
+    } catch {
+        $sweepBaseCommit = $null
+    }
+    if (-not [regex]::IsMatch([string]$sweepBaseCommit, '\A[0-9a-f]{40}\z')) {
+        Fail ("-ReplayEvidenceSweep could not read the current commit from git; " +
+            "run it inside the repository worktree")
+    }
+    # The rows come from the working tree, so base-commit is truthful only while
+    # every tracked or untracked Rust path matches HEAD.
+    $dirtyRustPaths = @(
+        & git -C $script:RepositoryRootFull status --porcelain -- "*.rs" 2>$null |
+            ForEach-Object { ([string]$_).Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($dirtyRustPaths.Count -gt 0) {
+        Fail ((("-ReplayEvidenceSweep will not date a record it cannot honestly date: {0} Rust " +
+                    "path(s) differ from HEAD, so base-commit {1} would be false. Differing: {2}") -f
+                $dirtyRustPaths.Count, $sweepBaseCommit, ($dirtyRustPaths -join "; ")))
+    }
+    $sweepDate = [datetime]::UtcNow.ToString(
+        "yyyy-MM-dd",
+        [System.Globalization.CultureInfo]::InvariantCulture
+    )
+    $sweptFiles = Get-RepositoryRustFiles
+    $sweptRows = New-Object System.Collections.Generic.List[object]
+    foreach ($file in $sweptFiles) {
+        $live = Get-EvidenceFileReachability $file
+        if (Test-OrdinalStringEqual ([string]$live.verdict) "missing") {
+            Fail "-ReplayEvidenceSweep listed tracked Rust path '$file', but $($live.reason)"
+        }
+        $sweptRows.Add([pscustomobject]@{ verdict = [string]$live.verdict; path = $file })
+    }
+    $previousByPath = @{}
+    if ($null -ne $sweepRecord) {
+        foreach ($row in $sweepRecord.rows) { $previousByPath[$row.path] = $row.verdict }
+    }
+    $currentByPath = @{}
+    foreach ($row in $sweptRows) { $currentByPath[$row.path] = $row.verdict }
+    $changed = @($sweptRows | Where-Object {
+            $previousByPath.ContainsKey($_.path) -and $previousByPath[$_.path] -ne $_.verdict
+        })
+    $added = @($sweptRows | Where-Object { -not $previousByPath.ContainsKey($_.path) })
+    $removed = New-Object System.Collections.Generic.List[string]
+    foreach ($path in $previousByPath.Keys) {
+        if (-not $currentByPath.ContainsKey($path)) { $removed.Add([string]$path) }
+    }
+    $removed.Sort([System.StringComparer]::Ordinal)
+    $acceptedCount = @($sweptRows | Where-Object { $_.verdict -eq "accept" }).Count
+    $rejectedCount = @($sweptRows | Where-Object { $_.verdict -eq "reject" }).Count
+    $sweepLines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $EvidenceSweepPreamble) { $sweepLines.Add([string]$line) }
+    $sweepLines.Add($EvidenceSweepGeneratedByLine)
+    $sweepLines.Add("# base-commit: $sweepBaseCommit")
+    $sweepLines.Add("# swept-at: $sweepDate")
+    $sweepLines.Add(("# totals: files={0} accept={1} reject={2}" -f
+            $sweptRows.Count, $acceptedCount, $rejectedCount))
+    foreach ($row in $sweptRows) {
+        $sweepLines.Add(("{0}`t{1}" -f $row.verdict, $row.path))
+    }
+    $sweepEncoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText(
+        $evidenceSweepPath,
+        (($sweepLines -join "`n") + "`n"),
+        $sweepEncoding
+    )
+    $sweepRecord = Get-EvidenceSweepRecord $evidenceSweepPath
+    Write-Host ("Recorded {0} swept files in {1} ({2} accept / {3} reject); " +
+        "review every line before committing." -f
+        $sweptRows.Count, $EvidenceSweepFileName, $acceptedCount, $rejectedCount)
+    Write-Host "  pin these reviewed values in validate.ps1:"
+    Write-Host ("    base commit: {0}" -f $sweepBaseCommit)
+    Write-Host ("    swept at:    {0}" -f $sweepDate)
+    Write-Host ("    digest:      {0}" -f
+        (Get-Sha256Text ([System.IO.File]::ReadAllText($evidenceSweepPath).Replace("`r`n", "`n")))
+    )
+    Write-Host ("  verdict changes since the previous record: {0}" -f $changed.Count)
+    foreach ($row in $changed) {
+        Write-Host ("    CHANGED {0}: {1} -> {2}" -f
+            $row.path, $previousByPath[$row.path], $row.verdict)
+    }
+    Write-Host ("  files added since the previous record: {0}" -f $added.Count)
+    foreach ($row in $added) {
+        Write-Host ("    ADDED   {0} ({1})" -f $row.path, $row.verdict)
+    }
+    Write-Host ("  files removed since the previous record: {0}" -f $removed.Count)
+    foreach ($path in $removed) { Write-Host ("    REMOVED {0}" -f $path) }
+    Write-Host "  refusals in the refreshed record:"
+    foreach ($row in $sweptRows) {
+        if ($row.verdict -eq "reject") {
+            Write-Host ("    REJECT  {0}" -f $row.path)
+        }
+    }
+}
+
+if ($WriteStatusTotalsRequested) {
+    # All contract and sweep checks have passed. Build both replacements before
+    # touching disk, then publish them as one rollback-protected transition.
+    $updatedManifestBytes = Get-UpdatedManifestStatusTotalsBytes $manifestPath $statusTotals
+    $digestEncoding = New-Object System.Text.UTF8Encoding($false)
+    [byte[]]$updatedDigestBytes = $digestEncoding.GetBytes(
+        (Format-LedgerDigestFile $computedLedgerDigests)
+    )
+    Write-ReviewedStatusTransition `
+        $manifestPath $updatedManifestBytes $ledgerDigestPath $updatedDigestBytes
+}
+
 if ($WriteLedgerDigests) {
     Write-Host "Recorded ledger digests in $LedgerDigestFileName; review every line before committing:"
     foreach ($spec in $LedgerSpecs) {
         Write-Host ("  {0}  {1}" -f [string]$computedLedgerDigests[[string]$spec.path], [string]$spec.path)
     }
 }
+if ($WriteStatusTotalsRequested) {
+    Write-Host "Recorded manifest.evidence_policy.status_totals; review the transition:"
+    foreach ($status in $AllowedFeatureStatuses) {
+        Write-Host ("  {0,-15} {1}" -f $status, $statusTotals[$status])
+    }
+    foreach ($spec in $LedgerSpecs) {
+        foreach ($feature in @($documents[$spec.path].features)) {
+            if (-not (Test-OrdinalStringEqual ([string]$feature.status) "unimplemented")) {
+                Write-Host ("  {0,-15} {1}" -f
+                    [string]$feature.status, [string]$feature.feature_id)
+            }
+        }
+    }
+}
+
+$writeModes = @()
+if ($WriteLedgerDigests) { $writeModes += "write-ledger-digests" }
+if ($WriteStatusTotalsRequested) { $writeModes += "write-status-totals" }
+if ($ReplayEvidenceSweep) { $writeModes += "replay-evidence-sweep" }
 
 [ordered]@{
     status = "ok"
-    mode = if ($WriteLedgerDigests) { "write-ledger-digests" } else { "verify" }
+    mode = if ($writeModes.Count -eq 0) { "verify" } else { $writeModes -join "+" }
     baseline_sha = $ExpectedSha
     repository_root = $script:RepositoryRootFull
     artifact_json_files = $actualJsonPaths.Count
@@ -3236,6 +4040,9 @@ if ($WriteLedgerDigests) {
     feature_status_totals = $statusTotals
     missing_acceptance_evidence = $missingEvidenceCount
     ledger_digests = $computedLedgerDigests
+    evidence_sweep_files = $(if ($null -eq $sweepRecord) { 0 } else { $sweepRecord.rows.Count })
+    evidence_sweep_rows_rechecked = $sweepRowsRechecked
+    evidence_sweep_rows_absent = 0
     inventory_files = $InventorySpecs.Count
     inventory_rows = $inventoryRowCount
     canonical_counts = $derivedCanonicalCounts
