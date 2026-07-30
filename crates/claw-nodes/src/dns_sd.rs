@@ -5,7 +5,7 @@
 //! platform declarations and an Apple-granted multicast entitlement. Those mobile
 //! capabilities cannot be established by this pure-Rust crate, so mobile targets
 //! retain signed-record parsing and verification without exposing network discovery.
-//! Desktop runtimes consume an [`MdnsCapability`] minted only after an active IPv4
+//! Desktop runtimes consume an `MdnsCapability` minted only after an active IPv4
 //! multicast query/response observation; daemon allocation alone never implies availability.
 
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
