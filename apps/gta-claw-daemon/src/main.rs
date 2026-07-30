@@ -23,12 +23,16 @@
 //! patience and sent `SIGKILL`.
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use gta_claw_daemon::control::{probe, serve_production};
-use gta_claw_daemon::production::{
-    CommandLine, CommandMode, USAGE, check_configuration, init_telemetry,
+use claw_observability::TelemetryHandle;
+use gta_claw_daemon::control::{
+    SignalEvent, StopSignals, probe, report_pre_start_stop, serve_production_preinstalled,
 };
+use gta_claw_daemon::production::{
+    CommandLine, CommandMode, PRODUCTION_STOP_DEADLINE, USAGE, check_configuration, init_telemetry,
+};
+use gta_claw_daemon::runtime::BlockingTaskHost;
 
 /// How long the process waits at exit for blocking work that cannot be
 /// cancelled.
@@ -40,6 +44,31 @@ use gta_claw_daemon::production::{
 /// the stop summary already printed — the exact failure the drain exists to
 /// avoid. This bounds that wait instead.
 const BLOCKING_TEARDOWN_GRACE: Duration = Duration::from_millis(250);
+
+async fn shutdown_pre_start_telemetry(
+    blocking: &BlockingTaskHost,
+    telemetry: Option<TelemetryHandle>,
+    budget: Duration,
+) -> &'static str {
+    let Some(telemetry) = telemetry else {
+        return "not-configured";
+    };
+    let shutdown = blocking.run("telemetry-shutdown", move || {
+        let shutdown = telemetry.shutdown().map_err(|error| error.to_string());
+        let writer = telemetry
+            .take_writer_failure()
+            .map_err(|error| error.to_string())?;
+        shutdown?;
+        if let Some(error) = writer {
+            return Err(error.to_string());
+        }
+        Ok::<(), String>(())
+    });
+    match tokio::time::timeout(budget, shutdown).await {
+        Ok(Ok(Ok(()))) => "clean",
+        Ok(Ok(Err(_)) | Err(_)) | Err(_) => "failed",
+    }
+}
 
 fn main() -> std::process::ExitCode {
     // Parsed before the runtime exists. Answering `--help` must not depend on
@@ -88,6 +117,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+#[allow(clippy::future_not_send)] // The process owns this future on `Runtime::block_on`.
 async fn run(command: CommandLine) -> Result<(), Box<dyn std::error::Error>> {
     match command.mode {
         // Answered in `main` before the runtime is built.
@@ -96,21 +126,133 @@ async fn run(command: CommandLine) -> Result<(), Box<dyn std::error::Error>> {
             probe(io::stdout().lock())?;
         }
         CommandMode::CheckConfig => {
-            let loaded = command.options.load_config()?;
-            check_configuration(&command.options, &loaded)?;
+            let blocking = BlockingTaskHost::new(2);
+            let loaded = command.options.load_config_owned(&blocking).await?;
+            let options = command.options.clone();
+            let checked = loaded.clone();
+            blocking
+                .run("config-check", move || {
+                    check_configuration(&options, &checked)
+                })
+                .await??;
+            let ledger = blocking.shutdown_within(PRODUCTION_STOP_DEADLINE).await;
+            if !ledger.is_settled() {
+                return Err(Box::new(io::Error::other(format!(
+                    "configuration check left blocking work behind: {} of {} tasks joined",
+                    ledger.terminated(),
+                    ledger.spawned(),
+                ))));
+            }
             println!("configuration valid source={}", loaded.source);
         }
         CommandMode::Serve => {
-            let loaded = command.options.load_config()?;
-            let telemetry = init_telemetry(&loaded.snapshot, command.options.log_file.as_deref())?;
+            // Installed before configuration, credential, telemetry, or state
+            // filesystem work. A stop received during any of those stages is
+            // queued by Tokio instead of taking the process's default action.
+            let mut signals = StopSignals::install()?;
+            let blocking = BlockingTaskHost::new(4);
+            let config_blocking = blocking.clone();
+            let config = command.options.load_config_owned(&config_blocking);
+            tokio::pin!(config);
+            let loaded = loop {
+                tokio::select! {
+                    loaded = &mut config => break loaded?,
+                    event = signals.recv_event() => match event {
+                        SignalEvent::Reload => {}
+                        SignalEvent::Stop(trigger) => {
+                            blocking.request_stop();
+                            let ledger = blocking
+                                .shutdown_within(PRODUCTION_STOP_DEADLINE)
+                                .await;
+                            let summary = report_pre_start_stop(
+                                io::stdout(),
+                                trigger,
+                                ledger,
+                                "not-configured",
+                            )
+                            .await?;
+                            if summary.is_clean() {
+                                return Ok(());
+                            }
+                            return Err(Box::new(io::Error::other(format!(
+                                "startup cancellation left work behind: {} of {} tasks joined",
+                                summary.terminated(),
+                                summary.spawned(),
+                            ))));
+                        }
+                    },
+                }
+            };
+            let snapshot = loaded.snapshot.clone();
+            let log_file = command.options.log_file.clone();
+            let telemetry_blocking = blocking.clone();
+            let telemetry = telemetry_blocking.run("telemetry-init", move || {
+                init_telemetry(&snapshot, log_file.as_deref())
+            });
+            tokio::pin!(telemetry);
+            let telemetry = loop {
+                tokio::select! {
+                    telemetry = &mut telemetry => break telemetry??,
+                    event = signals.recv_event() => match event {
+                        SignalEvent::Reload => {}
+                        SignalEvent::Stop(trigger) => {
+                            let stop_started = Instant::now();
+                            let telemetry = tokio::time::timeout(
+                                PRODUCTION_STOP_DEADLINE,
+                                &mut telemetry,
+                            )
+                            .await;
+                            let (telemetry, outcome) = match telemetry {
+                                Ok(Ok(Ok(telemetry))) => (Some(telemetry), "pending"),
+                                Ok(Ok(Err(_)) | Err(_)) | Err(_) => (None, "failed"),
+                            };
+                            let outcome = if telemetry.is_some() {
+                                shutdown_pre_start_telemetry(
+                                    &blocking,
+                                    telemetry,
+                                    PRODUCTION_STOP_DEADLINE
+                                        .saturating_sub(stop_started.elapsed()),
+                                )
+                                .await
+                            } else {
+                                outcome
+                            };
+                            blocking.request_stop();
+                            let ledger = blocking
+                                .shutdown_within(
+                                    PRODUCTION_STOP_DEADLINE
+                                        .saturating_sub(stop_started.elapsed()),
+                                )
+                                .await;
+                            let summary =
+                                report_pre_start_stop(io::stdout(), trigger, ledger, outcome)
+                                    .await?;
+                            if summary.is_clean() {
+                                return Ok(());
+                            }
+                            return Err(Box::new(io::Error::other(format!(
+                                "startup cancellation left work behind: {} of {} tasks joined",
+                                summary.terminated(),
+                                summary.spawned(),
+                            ))));
+                        }
+                    },
+                }
+            };
             // `stdout()`, not `stdout().lock()`: a lock taken here would be held
             // for the whole run, so any other thread that printed would block
             // until the daemon exited. Each `writeln!` takes the lock for the
             // length of one line instead, and this daemon has one writer.
-            let service =
-                serve_production(io::stdout(), tokio::io::stdin(), &command.options, loaded).await;
-            let telemetry_shutdown = telemetry.shutdown();
-            let late_telemetry = telemetry.take_writer_failure();
+            let service = serve_production_preinstalled(
+                io::stdout(),
+                tokio::io::stdin(),
+                &command.options,
+                loaded,
+                signals,
+                blocking,
+                Some(telemetry),
+            )
+            .await;
             let mut failures = Vec::new();
 
             match service {
@@ -137,14 +279,6 @@ async fn run(command: CommandLine) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Ok(_) => {}
                 Err(error) => failures.push(format!("service failed: {error}")),
-            }
-            if let Err(error) = telemetry_shutdown {
-                failures.push(format!("telemetry shutdown failed: {error}"));
-            }
-            match late_telemetry {
-                Ok(Some(error)) => failures.push(format!("late telemetry writer failure: {error}")),
-                Ok(None) => {}
-                Err(error) => failures.push(format!("telemetry health check failed: {error}")),
             }
             failures.sort_unstable();
             failures.dedup();

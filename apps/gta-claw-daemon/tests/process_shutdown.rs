@@ -5,11 +5,15 @@
 //! the ready contract, receive a stop signal from outside the process, drain,
 //! and join every task before exiting.
 
+#[cfg(unix)]
+use std::io::Read;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+use claw_config::{migrate_legacy_environment, to_json5};
 
 /// How long a drained daemon is given to leave the process table.
 ///
@@ -40,6 +44,7 @@ struct StopLine {
     abandoned: u32,
     joined: u32,
     spawned: u32,
+    telemetry: String,
 }
 
 impl StopLine {
@@ -85,6 +90,7 @@ impl StopLine {
             abandoned: number(&take("abandoned")),
             joined: number(joined),
             spawned: number(spawned),
+            telemetry: take("telemetry"),
         }
     }
 }
@@ -201,6 +207,7 @@ fn the_control_channel_shuts_a_real_process_down_with_every_task_joined() {
         summary.joined, summary.spawned,
         "a spawned task was not joined"
     );
+    assert_eq!(summary.telemetry, "clean");
 }
 
 #[test]
@@ -314,6 +321,196 @@ fn a_supervisor_termination_shuts_a_real_process_down_cleanly() {
         summary.joined, summary.spawned,
         "a spawned task was not joined on a supervisor termination"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn stop_handling_is_live_before_configuration_io_can_finish() {
+    let root = std::env::temp_dir().join(format!(
+        "gta-claw-early-signal-{}-{}",
+        std::process::id(),
+        NEXT_STATE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("temporary root is created");
+    let config = root.join("config.fifo");
+    let created = Command::new("mkfifo")
+        .arg(&config)
+        .status()
+        .expect("mkfifo is available");
+    assert!(created.success());
+    let mut fifo = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&config)
+        .expect("test holds both FIFO ends");
+    let child = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
+        .args(["--smoke", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&root)
+        .env_clear()
+        .env("GTA_CLAW_LOG", "off")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("daemon process starts");
+    let mut child = ChildGuard(child, root);
+    let stdout = child.0.stdout.take().expect("daemon stdout is piped");
+    let mut stdout = BufReader::new(stdout);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let signalled = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.0.id().to_string())
+        .status()
+        .expect("kill is available");
+    assert!(signalled.success());
+    let snapshot = migrate_legacy_environment([
+        ("GITHUB_TOKEN", "test"),
+        ("ENABLE_TEAMS", "false"),
+        ("ENABLE_TELEGRAM", "false"),
+        ("ENABLE_DISCORD", "false"),
+        ("ENABLE_WHATSAPP", "false"),
+        ("COPILOT_MODEL", "gpt-4o"),
+        ("AGENT_ROLE_URL", "https://example.test/role"),
+    ])
+    .expect("configuration fixture migrates")
+    .config;
+    fifo.write_all(
+        to_json5(&snapshot)
+            .expect("configuration fixture serializes")
+            .as_bytes(),
+    )
+    .expect("configuration FIFO is released");
+    fifo.flush().expect("configuration FIFO flushes");
+    drop(fifo);
+
+    let mut line = String::new();
+    stdout
+        .read_line(&mut line)
+        .expect("early stop summary is readable");
+    let summary = StopLine::parse(line.trim_end());
+    assert_eq!(summary.reason, "terminate");
+    assert_ne!(
+        (summary.joined, summary.spawned),
+        (0, 0),
+        "configuration work vanished from startup accounting"
+    );
+    assert_eq!(summary.joined, summary.spawned);
+    assert!(child.0.wait().expect("daemon exits").success());
+}
+
+#[cfg(unix)]
+#[test]
+fn telemetry_startup_io_is_cancelled_joined_and_reported() {
+    let root = std::env::temp_dir().join(format!(
+        "gta-claw-telemetry-signal-{}-{}",
+        std::process::id(),
+        NEXT_STATE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("temporary root is created");
+    let config = root.join("config.fifo");
+    let log = root.join("telemetry.fifo");
+    for fifo in [&config, &log] {
+        let created = Command::new("mkfifo")
+            .arg(fifo)
+            .status()
+            .expect("mkfifo is available");
+        assert!(created.success());
+    }
+    let snapshot = migrate_legacy_environment([
+        ("GITHUB_TOKEN", "test"),
+        ("ENABLE_TEAMS", "false"),
+        ("ENABLE_TELEGRAM", "false"),
+        ("ENABLE_DISCORD", "false"),
+        ("ENABLE_WHATSAPP", "false"),
+        ("COPILOT_MODEL", "gpt-4o"),
+        ("AGENT_ROLE_URL", "https://example.test/role"),
+    ])
+    .expect("configuration fixture migrates")
+    .config;
+    let source = to_json5(&snapshot).expect("configuration fixture serializes");
+    let child = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
+        .args(["--smoke", "--config"])
+        .arg(&config)
+        .args(["--log-file"])
+        .arg(&log)
+        .args(["--state-dir"])
+        .arg(&root)
+        .env_clear()
+        .env("GITHUB_TOKEN", "test")
+        .env("ENABLE_TEAMS", "false")
+        .env("ENABLE_TELEGRAM", "false")
+        .env("ENABLE_DISCORD", "false")
+        .env("ENABLE_WHATSAPP", "false")
+        .env("COPILOT_MODEL", "gpt-4o")
+        .env("AGENT_ROLE_URL", "https://example.test/role")
+        .env("GTA_CLAW_LOG", "off")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("daemon process starts");
+    let mut child = ChildGuard(child, root);
+    let stdout = child.0.stdout.take().expect("daemon stdout is piped");
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut config_writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&config)
+        .expect("configuration writer meets the installed reader");
+    config_writer
+        .write_all(source.as_bytes())
+        .expect("configuration fixture is written");
+    drop(config_writer);
+    std::thread::sleep(Duration::from_millis(250));
+
+    let signalled = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.0.id().to_string())
+        .status()
+        .expect("kill is available");
+    assert!(signalled.success());
+    let _log_guard = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&log)
+        .expect("opening the reader releases telemetry startup");
+
+    let stopped = loop {
+        let line = line_rx.recv_timeout(EXIT_BUDGET).unwrap_or_else(|error| {
+            let status = child.0.wait().expect("daemon status is available");
+            let mut stderr = String::new();
+            child
+                .0
+                .stderr
+                .take()
+                .expect("daemon stderr is piped")
+                .read_to_string(&mut stderr)
+                .expect("daemon stderr is readable");
+            panic!("daemon stopped without a summary: {error}; status={status}; stderr={stderr:?}");
+        });
+        if line.starts_with("stopped ") {
+            break line;
+        }
+    };
+    let summary = StopLine::parse(&stopped);
+    assert_eq!(summary.reason, "terminate");
+    assert!(summary.clean, "{summary:?}");
+    assert_eq!(summary.telemetry, "clean");
+    assert_ne!((summary.joined, summary.spawned), (0, 0));
+    assert_eq!(summary.joined, summary.spawned);
+    assert!(child.0.wait().expect("daemon exits").success());
 }
 
 /// A terminated daemon must exit for its own reasons, not be killed.
@@ -467,10 +664,49 @@ fn repeating_the_stop_signal_neither_deadlocks_the_drain_nor_skips_the_cleanup()
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_full_supervisor_pipe_cannot_hold_the_process_open() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::Instant;
+
+    let (mut child, _unread_stdout) = started();
+    let statuses = "status\n".repeat(2_000);
+    if let Some(stdin) = child.0.stdin.as_mut() {
+        let _ = stdin.write_all(statuses.as_bytes());
+        let _ = stdin.flush();
+    }
+    std::thread::sleep(Duration::from_millis(750));
+    let pid = child.0.id().to_string();
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(&pid)
+        .stderr(Stdio::null())
+        .status();
+
+    let deadline = Instant::now() + EXIT_BUDGET;
+    let status = loop {
+        if let Some(status) = child.0.try_wait().expect("daemon status is available") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a full stdout pipe held the daemon open past {EXIT_BUDGET:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    assert_eq!(
+        status.signal(),
+        None,
+        "the bounded output path left SIGTERM at its default disposition"
+    );
+}
+
 #[test]
 fn the_stop_line_parser_reads_every_field_independently() {
     let parsed = StopLine::parse(
-        "stopped reason=control clean=true drained=12 completed=3 abandoned=1 tasks=7/9",
+        "stopped reason=control clean=true drained=12 completed=3 abandoned=1 tasks=7/9 telemetry=clean",
     );
 
     assert_eq!(
@@ -483,6 +719,7 @@ fn the_stop_line_parser_reads_every_field_independently() {
             abandoned: 1,
             joined: 7,
             spawned: 9,
+            telemetry: "clean".to_owned(),
         }
     );
 }
