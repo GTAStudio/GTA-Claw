@@ -733,34 +733,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sustained_request_traffic_reaps_completed_dispatch_tasks() {
-        const REQUEST_COUNT: usize = 1_024;
+    async fn sustained_cancellation_traffic_reaps_completed_dispatch_tasks() {
+        const CANCELLATION_COUNT: usize = 1_024;
 
         let task_count_peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = CancellationToken::new();
+        release.cancel();
+        let backend = TestBackend {
+            cancellation: Some(CancellationControl {
+                started: Arc::clone(&started),
+                release,
+            }),
+        };
         let (mut client, input) = duplex(256 * 1024);
-        let bridge = AcpBridge::new(Arc::new(TestBackend::default()), AgentCapabilities::new())
+        let bridge = AcpBridge::new(Arc::new(backend), AgentCapabilities::new())
             .with_task_count_peak(Arc::clone(&task_count_peak));
         let server = tokio::spawn(bridge.serve(input, tokio::io::sink()));
 
-        for id in 0..REQUEST_COUNT {
-            let request = serde_json::to_vec(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "initialize",
-                "params": InitializeRequest::new(ProtocolVersion::V1),
-            }))
-            .expect("serialize initialize");
-            client.write_all(&request).await.expect("write initialize");
-            client.write_all(b"\n").await.expect("frame initialize");
-        }
-        client.flush().await.expect("flush initialize traffic");
+        write_cancellations(&mut client, CANCELLATION_COUNT).await;
         drop(client);
 
         timeout(Duration::from_secs(3), server)
             .await
-            .expect("sustained request traffic must shut down")
+            .expect("sustained cancellation traffic must shut down")
             .expect("bridge task must not panic")
-            .expect("sustained requests must drain cleanly");
+            .expect("sustained cancellations must drain cleanly");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            CANCELLATION_COUNT,
+            "every cancellation must reach the backend"
+        );
         assert!(
             task_count_peak.load(Ordering::SeqCst) <= MAX_TRACKED_DISPATCH_TASKS,
             "completed JoinSet entries must be reaped before admitting unbounded input"
