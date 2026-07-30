@@ -23,6 +23,8 @@ interface DiscordMessageCreate {
 
 const NON_RESUMABLE_CLOSE_CODES = new Set([1000, 1001, 4007, 4009]);
 const FATAL_CLOSE_CODES = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
+const MIN_HEARTBEAT_INTERVAL_MS = 1_000;
+const MAX_HEARTBEAT_INTERVAL_MS = 300_000;
 
 export interface DiscordGatewayOptions {
   botToken: string;
@@ -189,8 +191,10 @@ export class DiscordGatewayClient {
 
     switch (packet.op) {
       case 10: {
-        const data = packet.d as { heartbeat_interval: number };
-        this.startHeartbeat(ws, data.heartbeat_interval);
+        const data = packet.d as { heartbeat_interval?: unknown } | null;
+        if (!this.startHeartbeat(ws, data?.heartbeat_interval)) {
+          return false;
+        }
         if (this.sessionId && this.seq !== null) {
           this.resume();
         } else {
@@ -233,19 +237,25 @@ export class DiscordGatewayClient {
     return packet.op === 10;
   }
 
-  private startHeartbeat(ws: WebSocket, intervalMs: number): void {
+  private startHeartbeat(ws: WebSocket, intervalMs: unknown): boolean {
     this.clearHeartbeat();
-    if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+    if (
+      typeof intervalMs !== "number" ||
+      !Number.isSafeInteger(intervalMs) ||
+      intervalMs < MIN_HEARTBEAT_INTERVAL_MS ||
+      intervalMs > MAX_HEARTBEAT_INTERVAL_MS
+    ) {
       logger.error(
         { intervalMs },
         "Discord gateway supplied an invalid heartbeat interval",
       );
       this.terminateSocket(ws);
-      return;
+      return false;
     }
 
     this.heartbeatIntervalMs = intervalMs;
     this.scheduleHeartbeat(ws);
+    return true;
   }
 
   private scheduleHeartbeat(ws: WebSocket): void {
@@ -360,11 +370,32 @@ export class DiscordGatewayClient {
   private handleDispatch(eventType: string | null, data: unknown): void {
     if (eventType === "READY") {
       const ready = data as {
-        session_id: string;
-        resume_gateway_url?: string;
-      };
+        session_id?: unknown;
+        resume_gateway_url?: unknown;
+      } | null;
+      if (
+        !ready ||
+        typeof ready.session_id !== "string" ||
+        ready.session_id.length === 0 ||
+        ready.session_id.length > 256
+      ) {
+        this.clearSession();
+        logger.warn("Discarding malformed Discord READY payload");
+        return;
+      }
+
+      const resumeGatewayUrl =
+        ready.resume_gateway_url == null
+          ? null
+          : this.validateResumeGatewayUrl(ready.resume_gateway_url);
+      if (ready.resume_gateway_url != null && !resumeGatewayUrl) {
+        this.clearSession();
+        logger.warn("Discarding Discord READY with an unsafe resume gateway URL");
+        return;
+      }
+
       this.sessionId = ready.session_id;
-      this.resumeGatewayUrl = ready.resume_gateway_url ?? null;
+      this.resumeGatewayUrl = resumeGatewayUrl;
       logger.info({ sessionId: this.sessionId }, "Discord READY received");
       return;
     }
@@ -430,23 +461,56 @@ export class DiscordGatewayClient {
       return { url: this.gatewayUrl, isResume: false };
     }
 
-    try {
-      const url = new URL(this.resumeGatewayUrl);
-      if (!url.searchParams.has("v")) {
-        url.searchParams.set("v", "10");
-      }
-      if (!url.searchParams.has("encoding")) {
-        url.searchParams.set("encoding", "json");
-      }
-      return { url: url.toString(), isResume: true };
-    } catch (err) {
-      logger.error(
-        { err, resumeGatewayUrl: this.resumeGatewayUrl },
-        "Invalid Discord resume gateway URL",
-      );
+    const resumeGatewayUrl = this.validateResumeGatewayUrl(this.resumeGatewayUrl);
+    if (!resumeGatewayUrl) {
       this.resumeGatewayUrl = null;
       return { url: this.gatewayUrl, isResume: false };
     }
+
+    return { url: resumeGatewayUrl, isResume: true };
+  }
+
+  private validateResumeGatewayUrl(value: unknown): string | null {
+    if (typeof value !== "string") {
+      return null;
+    }
+
+    for (let index = 0; index < value.length; index += 1) {
+      const codeUnit = value.charCodeAt(index);
+      if (codeUnit <= 0x20 || codeUnit === 0x7f) {
+        return null;
+      }
+    }
+    if (value.includes("#") || !value.startsWith("wss://")) {
+      return null;
+    }
+
+    const authority = value.slice("wss://".length).split(/[/?]/, 1)[0];
+    if (!authority || authority.includes("@")) {
+      return null;
+    }
+
+    const separator = authority.lastIndexOf(":");
+    const hostname =
+      separator === -1 ? authority : authority.slice(0, separator);
+    let port = 443;
+    if (separator !== -1) {
+      const portText = authority.slice(separator + 1);
+      if (!/^\+?\d+$/.test(portText)) {
+        return null;
+      }
+      port = Number(portText);
+    }
+    const normalizedHostname = hostname.toLowerCase();
+    if (
+      port !== 443 ||
+      (normalizedHostname !== "discord.gg" &&
+        !normalizedHostname.endsWith(".discord.gg"))
+    ) {
+      return null;
+    }
+
+    return value.includes("?") ? value : `${value}?v=10&encoding=json`;
   }
 
   private closeSocket(ws: WebSocket): void {

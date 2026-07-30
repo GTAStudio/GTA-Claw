@@ -112,6 +112,83 @@ test("Discord resets heartbeat scheduling for an adjacent opcode 1", async (t) =
   await client.stop();
 });
 
+test("Discord answers opcode 1 immediately and refreshes the ACK watchdog", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { client, sockets } = createClient();
+  client.start();
+  const socket = sockets[0];
+  packet(socket, {
+    op: 10,
+    t: null,
+    d: { heartbeat_interval: 1_000 },
+  });
+
+  t.mock.timers.tick(1_000);
+  assert.equal(socket.sent.filter(({ op }) => op === 1).length, 1);
+  t.mock.timers.tick(999);
+  packet(socket, { op: 1, t: null, d: null });
+  packet(socket, { op: 1, t: null, d: null });
+  assert.equal(socket.sent.filter(({ op }) => op === 1).length, 3);
+
+  t.mock.timers.tick(1);
+  assert.equal(socket.terminateCalls, 0);
+  t.mock.timers.tick(998);
+  assert.equal(socket.terminateCalls, 0);
+  t.mock.timers.tick(1);
+  assert.equal(socket.terminateCalls, 1);
+
+  await client.stop();
+});
+
+test("Discord rejects heartbeat intervals outside safe bounds", async () => {
+  for (const interval of [
+    -1,
+    0,
+    1,
+    999,
+    300_001,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    1_000.5,
+    "1000",
+  ]) {
+    const { client, sockets } = createClient();
+    client.start();
+    const socket = sockets[0];
+
+    packet(socket, {
+      op: 10,
+      t: null,
+      d: { heartbeat_interval: interval },
+    });
+
+    assert.equal(socket.terminateCalls, 1, String(interval));
+    assert.equal(socket.sent.length, 0, String(interval));
+    assert.equal(client.heartbeatTimer, null, String(interval));
+    assert.equal(client.heartbeatAckTimer, null, String(interval));
+    await client.stop();
+  }
+});
+
+test("Discord accepts heartbeat intervals at both safety boundaries", async () => {
+  for (const interval of [1_000, 300_000]) {
+    const { client, sockets } = createClient();
+    client.start();
+    const socket = sockets[0];
+
+    packet(socket, {
+      op: 10,
+      t: null,
+      d: { heartbeat_interval: interval },
+    });
+
+    assert.equal(socket.terminateCalls, 0, String(interval));
+    assert.equal(socket.sent[0].op, 2, String(interval));
+    assert.notEqual(client.heartbeatTimer, null, String(interval));
+    await client.stop();
+  }
+});
+
 test("Discord retains sequence when Hello and ACK omit s", async () => {
   const { client, sockets } = createClient();
   client.start();
@@ -127,7 +204,7 @@ test("Discord retains sequence when Hello and ACK omit s", async () => {
     s: 42,
     d: {
       session_id: "session-1",
-      resume_gateway_url: "wss://resume.example",
+      resume_gateway_url: "wss://resume.discord.gg",
     },
   });
   packet(first, { op: 11, t: null, d: null });
@@ -168,7 +245,7 @@ test("Discord resumes with the saved session, sequence, and resume gateway URL",
     s: 42,
     d: {
       session_id: "session-1",
-      resume_gateway_url: "wss://resume.example",
+      resume_gateway_url: "wss://resume.discord.gg",
     },
   });
 
@@ -177,7 +254,7 @@ test("Discord resumes with the saved session, sequence, and resume gateway URL",
   client.reconnectTimer = null;
   client.connect();
   const resumed = sockets[1];
-  assert.equal(urls[1], "wss://resume.example/?v=10&encoding=json");
+  assert.equal(urls[1], "wss://resume.discord.gg?v=10&encoding=json");
   packet(resumed, {
     op: 10,
     t: null,
@@ -221,7 +298,7 @@ test("Discord identifies after a non-resumable session close", async () => {
     s: 42,
     d: {
       session_id: "session-1",
-      resume_gateway_url: "wss://resume.example",
+      resume_gateway_url: "wss://resume.discord.gg",
     },
   });
 
@@ -292,7 +369,7 @@ test("Discord final stop sends 1000 and clears resumable state", async () => {
     s: 42,
     d: {
       session_id: "session-1",
-      resume_gateway_url: "wss://resume.example",
+      resume_gateway_url: "wss://resume.discord.gg",
     },
   });
 
@@ -321,7 +398,7 @@ test("Discord clean remote closes discard the resumable session", async () => {
       s: 42,
       d: {
         session_id: "session-1",
-        resume_gateway_url: "wss://resume.example",
+        resume_gateway_url: "wss://resume.discord.gg",
       },
     });
 
@@ -356,7 +433,7 @@ test("Discord gateway-requested no-code close remains resumable", async () => {
     s: 42,
     d: {
       session_id: "session-1",
-      resume_gateway_url: "wss://resume.example",
+      resume_gateway_url: "wss://resume.discord.gg",
     },
   });
 
@@ -374,6 +451,140 @@ test("Discord gateway-requested no-code close remains resumable", async () => {
   assert.equal(resumed.sent[0].op, 6);
 
   await client.stop();
+});
+
+test("Discord accepts the PR230 resume gateway URL forms", async () => {
+  const safeUrls = [
+    [
+      "wss://gateway-us-east1-b.discord.gg",
+      "wss://gateway-us-east1-b.discord.gg?v=10&encoding=json",
+    ],
+    ["wss://discord.gg", "wss://discord.gg?v=10&encoding=json"],
+    [
+      "wss://GATEWAY.DISCORD.GG:443/gateway?encoding=json&v=10",
+      "wss://GATEWAY.DISCORD.GG:443/gateway?encoding=json&v=10",
+    ],
+    [
+      "wss://gateway.discord.gg/?compression=zlib-stream",
+      "wss://gateway.discord.gg/?compression=zlib-stream",
+    ],
+  ];
+
+  for (const [resumeGatewayUrl, expectedUrl] of safeUrls) {
+    const { client, sockets, urls } = createClient();
+    client.start();
+    const first = sockets[0];
+    packet(first, {
+      op: 10,
+      t: null,
+      d: { heartbeat_interval: 60_000 },
+    });
+    packet(first, {
+      op: 0,
+      t: "READY",
+      s: 42,
+      d: {
+        session_id: "session-1",
+        resume_gateway_url: resumeGatewayUrl,
+      },
+    });
+    assert.equal(client.sessionId, "session-1", resumeGatewayUrl);
+    assert.equal(client.resumeGatewayUrl, expectedUrl, resumeGatewayUrl);
+
+    first.remoteClose(1006);
+    clearTimeout(client.reconnectTimer);
+    client.reconnectTimer = null;
+    client.connect();
+    assert.equal(urls[1], expectedUrl, resumeGatewayUrl);
+
+    const resumed = sockets[1];
+    packet(resumed, {
+      op: 10,
+      t: null,
+      d: { heartbeat_interval: 60_000 },
+    });
+    assert.equal(resumed.sent[0].op, 6, resumeGatewayUrl);
+    await client.stop();
+  }
+});
+
+test("Discord atomically rejects READY with an unsafe resume gateway URL", async () => {
+  const unsafeUrls = [
+    "https://resume.discord.gg",
+    "wss://user:password@resume.discord.gg",
+    "wss://@resume.discord.gg",
+    "WSS://resume.discord.gg",
+    "wss://resume.discord.gg#fragment",
+    "wss://resume.discord.gg:8443",
+    "wss://discord.gg.attacker.example",
+    "wss://attacker.example",
+    " wss://resume.discord.gg",
+    "not a URL",
+    42,
+  ];
+
+  for (const resumeGatewayUrl of unsafeUrls) {
+    const { client, sockets, urls } = createClient();
+    client.start();
+    const first = sockets[0];
+    packet(first, {
+      op: 10,
+      t: null,
+      d: { heartbeat_interval: 60_000 },
+    });
+    packet(first, {
+      op: 0,
+      t: "READY",
+      s: 42,
+      d: {
+        session_id: "session-1",
+        resume_gateway_url: resumeGatewayUrl,
+      },
+    });
+    assert.equal(client.sessionId, null, String(resumeGatewayUrl));
+    assert.equal(client.seq, null, String(resumeGatewayUrl));
+    assert.equal(client.resumeGatewayUrl, null, String(resumeGatewayUrl));
+
+    first.remoteClose(1006);
+    clearTimeout(client.reconnectTimer);
+    client.reconnectTimer = null;
+    client.connect();
+    assert.equal(
+      urls[1],
+      "wss://gateway.example/?v=10&encoding=json",
+      resumeGatewayUrl,
+    );
+    assert.equal(urls.includes(resumeGatewayUrl), false, String(resumeGatewayUrl));
+
+    const bootstrap = sockets[1];
+    packet(bootstrap, {
+      op: 10,
+      t: null,
+      d: { heartbeat_interval: 60_000 },
+    });
+    assert.equal(bootstrap.sent[0].op, 2, String(resumeGatewayUrl));
+    await client.stop();
+  }
+});
+
+test("Discord READY may omit or null the resume gateway URL", async () => {
+  for (const ready of [
+    { session_id: "session-1" },
+    { session_id: "session-1", resume_gateway_url: null },
+  ]) {
+    const { client, sockets } = createClient();
+    client.start();
+    packet(sockets[0], {
+      op: 10,
+      t: null,
+      d: { heartbeat_interval: 60_000 },
+    });
+    packet(sockets[0], { op: 0, t: "READY", s: 42, d: ready });
+
+    assert.equal(client.sessionId, "session-1");
+    assert.equal(client.resumeGatewayUrl, null);
+    await client.stop();
+  }
 });
 
 test("Discord falls back after the resume gateway factory fails", async () => {
@@ -406,7 +617,7 @@ test("Discord falls back after the resume gateway factory fails", async () => {
     s: 42,
     d: {
       session_id: "session-1",
-      resume_gateway_url: "wss://resume.example",
+      resume_gateway_url: "wss://resume.discord.gg",
     },
   });
 
@@ -420,7 +631,7 @@ test("Discord falls back after the resume gateway factory fails", async () => {
 
   assert.deepEqual(urls, [
     "wss://gateway.example/?v=10&encoding=json",
-    "wss://resume.example/?v=10&encoding=json",
+    "wss://resume.discord.gg?v=10&encoding=json",
     "wss://gateway.example/?v=10&encoding=json",
   ]);
   packet(sockets[1], {
@@ -450,7 +661,7 @@ test("Discord falls back after a pre-Hello resume gateway close", async () => {
     s: 42,
     d: {
       session_id: "session-1",
-      resume_gateway_url: "wss://resume.example",
+      resume_gateway_url: "wss://resume.discord.gg",
     },
   });
 
@@ -465,7 +676,7 @@ test("Discord falls back after a pre-Hello resume gateway close", async () => {
 
   assert.deepEqual(urls, [
     "wss://gateway.example/?v=10&encoding=json",
-    "wss://resume.example/?v=10&encoding=json",
+    "wss://resume.discord.gg?v=10&encoding=json",
     "wss://gateway.example/?v=10&encoding=json",
   ]);
   packet(sockets[2], {
