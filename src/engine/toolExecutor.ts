@@ -21,6 +21,19 @@ interface RegisteredSkill {
   code: string;
 }
 
+export function selectIsolationMode(
+  isolatedVmAvailable: boolean,
+  nodeEnvironment = process.env["NODE_ENV"],
+): "isolated-vm" | "node-vm" {
+  if (isolatedVmAvailable) return "isolated-vm";
+  if (nodeEnvironment === "production") {
+    throw new Error(
+      "isolated-vm is required in production; node:vm provides reduced isolation and is development-only",
+    );
+  }
+  return "node-vm";
+}
+
 export class ToolExecutor {
   private isolate: any = null;
   private registeredSkills: RegisteredSkill[] = [];
@@ -33,14 +46,13 @@ export class ToolExecutor {
     this.timeoutMs = timeoutMs;
     this.allowedDomains = allowedDomains;
 
-    if (ivm) {
-      this.mode = "isolated-vm";
+    this.mode = selectIsolationMode(Boolean(ivm));
+    if (this.mode === "isolated-vm") {
       this.isolate = this.createIsolate();
       logger.info("ToolExecutor using isolated-vm backend");
     } else {
-      this.mode = "node-vm";
       logger.warn(
-        "isolated-vm not available; falling back to node:vm sandbox (reduced isolation)",
+        "isolated-vm not available; using the development-only node:vm backend with reduced isolation",
       );
     }
   }

@@ -126,7 +126,7 @@ const P04F_MUTATION_ORACLE: [ExpectedMutation; 48] = [
         "windows-arm64-deny-missing",
         "windows-arm64-deny-missing",
         MutationArtifact::RustWorkflow,
-        "missing Check Windows ARM64 desktop dependency policy step",
+        "missing Check shipped desktop dependency policy step",
     ),
     expected_mutation(
         "supply-checkout-action-substitution",
@@ -389,46 +389,46 @@ const P04F_MUTATION_ORACLE: [ExpectedMutation; 48] = [
 ];
 
 const P04F_MUTATED_ARTIFACT_SHA256: [&str; 48] = [
-    "b478429aea39df8f52056d4db5bca2c0b2ae5a87b2d42bd1abb9d8b020d05ec6",
-    "548e935e8e767560468a6b30a3f21065f42b62cc4fdfe19b71038dbbe0568a75",
-    "f6fd74eda4466f80b9d252f8870c8e6099e36676a19da30fd50cdd499c4f7c66",
-    "c14f6dfe6a2edca9c1e719ebc969e67daf5f35286488a7a935c56d36fe90435f",
-    "1b920e71a1c59add7a4943a35891780963937c193deaff3e60471889438c0607",
-    "7abf6fa2af540f0f09e4019ab70914e933eee5c7fc83ca045bf6d6d7ece04385",
-    "45aae46cc59c67ae5787da614d5dc29c000438da1d6418f2931ecd6822938fdd",
-    "90e127b0ea867fea1f913460f8d4300808c162c1bcdcb66e605f0cb66debdbae",
-    "172feb0b07d2be665b40676afe20f6d77a8c7dcbc6cebd76a9ec8ca9997d087e",
-    "474fdd8578f294d45712632f91ccf74edac9846a67d3e00155aba6ff11cdcb2f",
-    "889d64c3ff68eb5bfcf959b97f887e5cbcc91f1006e518620501833fa7aed7f8",
-    "a076ad2b48de28c8a58160dccd3dec04dbbe37d6d139c7306de34587d407c713",
-    "7d682f522d4951dc7683952bafedfa3c5e02780802319ed79aba2d407999ace8",
-    "41db5183fcd7dec24da5c3d1cd4d4d1f35a26f8b3baf20f8c3d77b1715b9ea83",
-    "0ea6e9edb3dd390f4250842323ddc0c295b003e0db424d6a68c4f75f9ac99ea8",
-    "6927b94872622ef6c0dc78447ada6571c99add1cc50bb84052431af5378bc980",
-    "b484420d2d10dc5723cac9caf2c89ab2ed629cfa32ead60b080f34e39c06fa03",
-    "2f709caee6c1ac1f98e573feff60729c164fbc143013b8480640006438d95482",
-    "371a31bf888593d8cb68df66fc900a0f4cb504fb2c114c5ce520856058a3e642",
-    "1b1f4d9bf0475e77d0e95e110417fe9f890086b94d53bec2185fc6c2d716237c",
-    "ab667749bcba2009c3b08a731b575c2552c0916f4e8e8bd43ac3e14123d0c2eb",
-    "2ca242c86a81276c49191d289509c50aa0b42733dc9abd81f035fe1c565ea5bd",
-    "078a84959517ad83e434bd103727cf4a81ee9af64b6c84369c6402d1bccb556d",
-    "a8d14608d022164d7eeecca6db4b66f4083089252d68300fd959464ce01760fc",
-    "33b5c07863d77dcb023d86a41fdadec3df80f8a1955cfea36557d731afc25040",
-    "ef42642328b326e7640027fa724938fa1c7e4028182efd4062fbbcf43bea7e9f",
-    "a6e93baf183716d0b0e299756c9e9319361362418f3c3aed1a6af0880a0288dd",
-    "100ccfcffd6a2259b09ffa081475677e0e71438258987c4abf05a0183bf8e3d9",
-    "6f9e9832a4b82fb713d312da5003f65c5c95324fc10a1ec64f5f59cc28bafcb0",
+    "e165a62c7e442a2de2974ba308c1367ef5f4da2adfc6d75a5267ae5d2669eafd",
+    "1afb8a910e41ba654050f18f961b6ec8c0903a2db41febe023a1d6e00603e34a",
+    "5d86dcfe1392844c76c5f825b958317c51c1d48ef148e97d16a99bc730319524",
+    "e18651394689800927548c11f71410e75381b5c9dc5459c023ec9e08e19b1721",
+    "3e7def85fde844b0bece19dc8e318580ba9c85142d7741e8d3055423924567ef",
+    "689f399e0ba185a7e4386539dd1b120f7b569c58daff036ffa5fb1ad13930939",
+    "f34b8875251991b39e841d2a0f646fbaa1f593ec503bbd8f7bdc429d57fbab1f",
+    "f80f486109c2f05bb23e2668dcc32d4759ad11d2a21f62573eee5bdbab84c5a8",
+    "1f264a57d12ab0d1296f13ef96c9a13b3e6b01d26c274c09e38a151a7abd3abc",
+    "e4a7db67e4bfe32d97cc9f887a3124e92521d5fa163268804f069bf8f6db3433",
+    "02b6f799ab5a0a6beaf0f88d6a9a5823bce3148f091a4c09a012ebcd0fcfc9bf",
+    "743aad437cb327e7b858e92d6ffb467f2d2e16168461656fdb25141d153ede16",
+    "bfd22d265f52dd2da5c2b7b170b215bfe0b62a9d3f963209d97a2487f7251b16",
+    "e14f3936cf571d33ad2d26b25a7d9ee868f645c6e6cc45465bfaa28c6d6ca8be",
+    "236ee873d73eb6b9a06ec1a341d67f5f45eb4cb954b4c9729ab12eecef3e88f1",
+    "462480c71ca5d9035b2adfdbf21cfd783ec4987fb175ebbddf21714961ea77a7",
+    "b576a0586e54a56ecf8abaebee915dce2dbecee603e2fabcbdd3a862a92a88ea",
+    "1d836f805903c787a2e137466db018686df37e0867a2e4043ddc8e16097aeb39",
+    "b0f00b83bfaf59c0ac914204978c5f53f653850ab35625205c3bcbcb9e9a57f7",
+    "eb8f47a1114d459937d9ff2200ba042beda017bee656422e6a57bc1b52251817",
+    "9fc12e9ac4157e3fa3af7ad72e9d1594c30a86db1d8def8c5834cf3d107ef538",
+    "747fa858979cf38536a0ed2133f22abb8fdc09bdc7face8f6c11368ac09b791e",
+    "0082f57f13afc5a094616fbac069a2363b18cfbaa4fb78defb9bf3b9268d479d",
+    "60c6ffcb498516a6168be4ab0de49bccd3be3855274ef81bdb84989ded1454ad",
+    "dfc7d62ac1476460dbb993e2fd60c8d2441d6368ded9bb25a83e7595003b2d2d",
+    "3ea1754e98be173a1bb94ae261a51ad2ef10074b7c321f2c30d9672a576184d0",
+    "2e000ef8edc44a1373729ab6c734cfded5cb5bfb5406b09c6fcc18993df3b59e",
+    "c937122ccb344fdc62cecd5cfc90dcfcd6cdd4474e816dc43a0ddda772643b54",
+    "3d1cd2c83ab5558c92a60e9f35c9a8c9c9f67eb1abb358a3025ac1fa98e94508",
     "d25d49c53c9c183dd0686e25d714c17a8658992615b1c51b5154af2d5795eec7",
-    "1419ffd6b5eba450fe1971895ee7f8ce390706bd01b57d4e8bfbf57987fd41c7",
-    "8cdb8b459b89f41ac4a34f8ae604f6ed21f8bb457c257c6076fe806df4f65efe",
-    "774426b359f177abf4fa535d352bc172233e1c65d715ef29659459f7bb82dc1d",
-    "bb0765a3cde2b1e2ccad68918c4bc639aceedfbab4a4f53a28c8afcd600f9686",
-    "fc996a176592a7222eae3ae544c373e0a926f6d9086fed9d47307666ef745fae",
-    "0bf5edd919b09327fee1b6f45aea8a0a6432d3800990a21fe7ed40fbf4a040b5",
-    "2832f430e8b38e365b58ca1583cfe84f0975f4f3655697a2f26fa9876f88bae7",
-    "b9452f32eec46f9400af6dd0a8c6160d83580bce1f163a6587cc88ff2de56213",
-    "226007c6e9d0dcf1e48f5b2a4b083f1b5669dfb91f235e999b97e1f7fc1a00f2",
-    "4c663a6cebb27c4cb285c5587e019ae503b2ec352ba83c95dc94f48cf8fa5b18",
+    "d0eab2bc9c10e67a1874f32aa61d26d7bdde4f9f15fd993e566665843e621123",
+    "55e1c34db91ae76f02ff1f5b1762b5c05f8c11f9edf3a55615bd38705532cf5c",
+    "35daa92ae9f29dcf694f5f8a0061db944d4a96e94c91e10c73fb4d01fdfb3634",
+    "687b848a295a6b2187ceb524a99f73381ba68ace40a400259bcf815db16d370a",
+    "5d74f38397e010d050e7c4f58fc495aa513ea8e946b452d07978d385dd3a08f5",
+    "b9db2ac10465380fae798c263b2f6ed320e934d2c815e946b35e7f1d9507fd29",
+    "8281e83179df576afd81ff26b5832755cd1867ca65c33ec029bde0b86183d93c",
+    "957792ad1be480f378e563d8d702a67b56f7086006d62c67650132c1f8f1a4dc",
+    "b4ffd2e630bb22dc1eb6abcff715c45930d1111770c98a5d8a7b2a3b99fc6c6a",
+    "27a58179e39c81387d9676e1c8de33c1e31ab59a4d5f82e6999496594c3a1a45",
     "55c8a09e4ce78280a7ee54ce4aae940c09bbb89ed7077ae5e714aa93b53c3784",
     "3c1b7333023393552ac7abc7c3e20a4cc673a93eac26dc152b80d1a5ce79cf32",
     "e9ed05dc4017ec1354c22307e17436c4562dc198d11460562c53e7a4e32d1cb9",
@@ -449,7 +449,7 @@ const P03B_SQLITE_FILE_CONTROL_MANIFEST_SHA256: &str =
     "12f3b3d87c1b21337285be2e320935539c4c52bdbb9b0c349e1f85fab658ea01";
 const P03B_SQLITE_FILE_CONTROL_MEMBER: &str = "crates/claw-sqlite-file-control";
 const FINAL_ROOT_DENY_SHA256: &str =
-    "75dedb874582f2f6d32890e21cca11186112d13dd51f4140ada96c69989594d0";
+    "f21f987b9d9d72aea4a5edfd3151ad9dd9fbb8eb0e9566c021ad4cbc7abca99a";
 const SUPERSEDED_ROOT_DENY_SHA256: &str =
     "a822bdccf7d6e235f03fdadbc6d43e381f7219d02abad80d8253c10c7e1529db";
 const P03B_SQLITE_FILE_CONTROL_MANIFEST: &str = r#"[package]
@@ -835,6 +835,33 @@ fn removing_allowlisted_legacy_entry_keeps_ratchet_green() {
 
 #[test]
 fn workflow_commands_are_checked_without_rejecting_inert_search_patterns() {}
+
+#[test]
+fn legacy_node_supply_chain_rejects_mutable_or_uncoupled_inputs() {
+    let _ = "remote Copilot installer is forbidden";
+    let _ = "Dockerfile install-script allowlist changed";
+    let _ = "npx network fallback is forbidden";
+}
+
+#[test]
+fn legacy_runtime_updates_and_production_isolation_fail_closed() {
+    let _ = "AUTO_UPDATE=true must fail configuration";
+    let _ = "production must reject reduced node:vm isolation";
+    let _ = "mutable runtime update logic is forbidden";
+}
+
+#[test]
+fn python_compatibility_policy_is_interpreter_and_hash_locked() {
+    let _ = "setup-python action is not pinned";
+    let _ = "pip install does not require hashes";
+    let _ = "requirement entry has no SHA-256 hash";
+}
+
+#[test]
+fn docker_publish_builds_validates_and_pushes_one_image() {
+    let _ = "Docker publish workflow must build exactly once";
+    let _ = "Docker publish digest parser changed";
+}
 
 #[test]
 fn tracked_symlink_and_gitlink_modes_are_rejected() {
@@ -3221,6 +3248,43 @@ fn executable_security_fixtures_require_raw_lf_bytes() {
 }
 
 #[test]
+fn cargo_deny_global_options_precede_the_check_subcommand() {
+    for path in [
+        ".github/workflows/rust.yml",
+        ".github/workflows/android-packaging.yml",
+        ".github/workflows/ios-packaging.yml",
+        ".github/trusted/desktop-supply-chain-policy/policy/final/.github/workflows/rust.yml",
+        ".github/trusted/desktop-supply-chain-policy/scripts/bootstrap-tools.sh",
+        ".github/trusted/desktop-supply-chain-policy/scripts/run-candidate-gates.sh",
+    ] {
+        let text = fs::read_to_string(repo_root().join(path)).expect("read cargo-deny policy");
+        let command_tokens = text
+            .split_whitespace()
+            .filter(|token| *token != "\\")
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !command_tokens.contains("check --config"),
+            "cargo-deny global --config option follows the check subcommand in {path}"
+        );
+        assert!(
+            command_tokens.contains("--locked"),
+            "cargo-deny policy does not enforce the lockfile in {path}"
+        );
+    }
+
+    let invalid = "cargo deny --locked check \\\n      --config deny.toml bans"
+        .split_whitespace()
+        .filter(|token| *token != "\\")
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        invalid.contains("check --config"),
+        "negative cargo-deny ordering fixture no longer exercises the rule"
+    );
+}
+
+#[test]
 fn protected_macos_release_version_uses_locked_offline_metadata() {
     let mut policy_runs = Vec::new();
     for path in [
@@ -3900,6 +3964,24 @@ fn candidate_cargo_config_and_build_marker_never_execute() {
     assert!(
         validate_final_static(&root).is_err(),
         "final policy must still reject repository Cargo config"
+    );
+}
+
+#[test]
+fn desktop_build_script_must_keep_the_native_target_guard() {
+    let tree = final_tree("desktop-build-target-guard");
+    replace(
+        &tree.join("desktop/apps/gta-claw-desktop/build.rs"),
+        "if host != target",
+        "if false",
+    );
+    let root = SafeRoot::new(&tree.path).expect("open target-guard fixture");
+    let error = validate_final_static(&root)
+        .expect_err("desktop build script without target guard unexpectedly passed")
+        .to_string();
+    assert!(
+        error.contains("desktop build script is missing target guard"),
+        "target guard failed through the wrong rule: {error}"
     );
 }
 

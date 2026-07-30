@@ -257,7 +257,7 @@ async function main(): Promise<void> {
   }
 
   // 7. Non-blocking SDK/CLI update check
-  checkForUpdates(config.AUTO_UPDATE).catch((err) => {
+  checkForUpdates().catch((err) => {
     logger.warn({ err }, "SDK/CLI update check failed (non-blocking)");
   });
 

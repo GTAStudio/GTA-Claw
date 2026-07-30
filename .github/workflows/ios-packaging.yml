@@ -67,13 +67,13 @@ jobs:
         shell: bash
         run: ./ios/scripts/workflow-self-test.sh
 
-      - name: Check iOS workspace at MSRV
+      - name: Check iOS host workspace at MSRV
         run: |
           rustup toolchain install 1.94.0 --profile minimal
           cargo +1.94.0 check --manifest-path ios/Cargo.toml --workspace --all-targets --locked
 
       - name: Check iOS dependency policy
-        run: cargo deny --manifest-path ios/Cargo.toml --config ios/deny.toml check
+        run: cargo deny --manifest-path ios/Cargo.toml --config ios/deny.toml --locked --all-features check
 
   package:
     name: Unsigned iOS archive and target checks
@@ -94,7 +94,10 @@ jobs:
           cargo -V
 
       - name: Install Rust iOS targets
-        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup target add --toolchain 1.94.0 aarch64-apple-ios aarch64-apple-ios-sim
 
       - name: Install checksum-pinned XcodeGen
         shell: bash
@@ -131,9 +134,10 @@ jobs:
           plutil -lint ios/apps/gta-claw-ios-shell/Info.plist
           ./ios/scripts/check.sh
 
-      - name: Check device and simulator targets
+      - name: Check device and simulator targets at MSRV
         shell: bash
         env:
+          RUSTUP_TOOLCHAIN: 1.94.0
           SKIA_CACHE_DIR: ${{ runner.temp }}/gta-claw-skia
         run: ./ios/scripts/check-targets.sh
 

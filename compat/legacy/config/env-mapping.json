@@ -1,6 +1,6 @@
 {
   "$schema": "../schemas/config-mapping.schema.json",
-  "source_revision": "3f2dfebcab1a1395f2445e9261b908cc4093f602",
+  "source_revision": "b2896426f3fcc5bb149402a38e09aac5e836d70b",
   "proposed_format": "JSON5",
   "mappings": [
     {
@@ -321,9 +321,9 @@
       "secret": false,
       "default": false,
       "conversion": "Accept only exact lowercase true or false.",
-      "validation": "Boolean.",
+      "validation": "Boolean; true is rejected because dependency updates are review-only.",
       "required_when": "",
-      "known_legacy_quirk": "The Rust migration preserves update checks but replaces npm and curl self-mutation with a signed release workflow."
+      "known_legacy_quirk": "The compatibility runtime preserves read-only update checks; AUTO_UPDATE=true fails instead of invoking npm or curl."
     },
     {
       "legacy_env": "ADMIN_TOKEN",

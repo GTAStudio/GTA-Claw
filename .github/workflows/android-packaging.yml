@@ -70,13 +70,13 @@ jobs:
           ./android/scripts/workflow-self-test.sh
           ./android/scripts/check.sh
 
-      - name: Check Android workspace at MSRV
+      - name: Check Android host workspace at MSRV
         run: |
           rustup toolchain install 1.94.0 --profile minimal
           cargo +1.94.0 check --manifest-path android/Cargo.toml --workspace --all-targets --locked
 
       - name: Check Android dependency policy
-        run: cargo deny --manifest-path android/Cargo.toml --config android/deny.toml check
+        run: cargo deny --manifest-path android/Cargo.toml --config android/deny.toml --locked --all-features check
 
   package:
     name: Android arm64 APK and target checks
@@ -101,7 +101,10 @@ jobs:
           printf 'ANDROID_NDK_ROOT=%s\n' "$ANDROID_HOME/ndk/30.0.14904198" >> "$GITHUB_ENV"
 
       - name: Install Rust Android targets
-        run: rustup target add aarch64-linux-android x86_64-linux-android
+        run: |
+          rustup target add aarch64-linux-android x86_64-linux-android
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup target add --toolchain 1.94.0 aarch64-linux-android x86_64-linux-android
 
       - name: Install pinned cargo-apk
         run: cargo install cargo-apk --version 0.10.0 --locked
@@ -115,9 +118,10 @@ jobs:
           ./android/scripts/fetch-skia.sh aarch64-linux-android "$SKIA_CACHE_DIR"
           ./android/scripts/fetch-skia.sh x86_64-linux-android "$SKIA_CACHE_DIR"
 
-      - name: Check all declared Android targets
+      - name: Check all declared Android targets at MSRV
         shell: bash
         env:
+          RUSTUP_TOOLCHAIN: 1.94.0
           SKIA_CACHE_DIR: ${{ runner.temp }}/gta-claw-skia
         run: ./android/scripts/check-targets.sh
 

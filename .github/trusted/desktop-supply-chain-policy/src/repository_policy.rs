@@ -62,7 +62,19 @@ const FORBIDDEN_EXTENSIONS: [&str; 9] =
 const FORBIDDEN_WORKFLOW_COMMANDS: [&str; 8] = [
     "node", "npm", "npx", "pnpm", "yarn", "bun", "deno", "corepack",
 ];
-const ALLOWED_INERT_WORKFLOW_LINES: [(&str, &str); 3] = [
+const ALLOWED_LEGACY_WORKFLOW_LINES: [(&str, &str); 6] = [
+    (
+        ".github/workflows/docker-publish.yml",
+        "docker run --rm --entrypoint node \"$IMAGE_TAG\" --input-type=module -e '",
+    ),
+    (
+        ".github/workflows/docker-publish.yml",
+        "import { access } from \"node:fs/promises\";",
+    ),
+    (
+        ".github/workflows/docker-publish.yml",
+        "import { constants } from \"node:fs\";",
+    ),
     (
         ".github/workflows/macos-packaging.yml",
         "if grep -RInE '(^|[[:space:]])(npm|npx|node|bun|pnpm)([[:space:]]|$)' \\",
@@ -230,7 +242,7 @@ fn scan_policy_document(
 ) -> PolicyResult<()> {
     for line in document.lines() {
         let trimmed = line.trim();
-        if ALLOWED_INERT_WORKFLOW_LINES
+        if ALLOWED_LEGACY_WORKFLOW_LINES
             .iter()
             .any(|(allowed_path, allowed_line)| path == *allowed_path && trimmed == *allowed_line)
         {
@@ -494,6 +506,21 @@ fn validate_policy_source(root: &SafeRoot) -> PolicyResult<()> {
         "#[test]\nfn removing_allowlisted_legacy_entry_keeps_ratchet_green()",
         "fs::remove_file(fixture.path().join(\"src/index.ts\"))",
         "#[test]\nfn workflow_commands_are_checked_without_rejecting_inert_search_patterns()",
+        "#[test]\nfn legacy_node_supply_chain_rejects_mutable_or_uncoupled_inputs()",
+        "\"remote Copilot installer is forbidden\"",
+        "\"Dockerfile install-script allowlist changed\"",
+        "\"npx network fallback is forbidden\"",
+        "#[test]\nfn legacy_runtime_updates_and_production_isolation_fail_closed()",
+        "\"AUTO_UPDATE=true must fail configuration\"",
+        "\"production must reject reduced node:vm isolation\"",
+        "\"mutable runtime update logic is forbidden\"",
+        "#[test]\nfn python_compatibility_policy_is_interpreter_and_hash_locked()",
+        "\"setup-python action is not pinned\"",
+        "\"pip install does not require hashes\"",
+        "\"requirement entry has no SHA-256 hash\"",
+        "#[test]\nfn docker_publish_builds_validates_and_pushes_one_image()",
+        "\"Docker publish workflow must build exactly once\"",
+        "\"Docker publish digest parser changed\"",
         "#[test]\nfn tracked_symlink_and_gitlink_modes_are_rejected()",
         "120000 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "160000 cccccccccccccccccccccccccccccccccccccccc",

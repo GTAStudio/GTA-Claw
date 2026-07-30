@@ -85,7 +85,7 @@ jobs:
           set -euo pipefail
           cargo metadata --manifest-path desktop/Cargo.toml --locked --format-version 1 \
             --filter-platform x86_64-unknown-linux-gnu |
-            python -c 'import json, sys; names = {package["name"] for package in json.load(sys.stdin)["packages"]}; forbidden = sorted(name for name in names if name == "slint" or name == "slint-build" or name.startswith("i-slint")); assert not forbidden, f"Linux desktop metadata contains Slint packages: {forbidden}"'
+            python3 -c 'import json, sys; names = {package["name"] for package in json.load(sys.stdin)["packages"]}; forbidden = sorted(name for name in names if name == "slint" or name == "slint-build" or name.startswith("i-slint")); assert not forbidden, f"Linux desktop metadata contains Slint packages: {forbidden}"'
           set +e
           output=$(cargo check --manifest-path desktop/Cargo.toml \
             --package gta-claw-desktop --locked 2>&1)

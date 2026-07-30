@@ -176,6 +176,7 @@ export function loadConfig(): AppConfig {
     process.env["WHATSAPP_WEBHOOK_PATH"]?.trim() || "/whatsapp/webhook";
 
   const DEVICE_FLOW_ENABLED = parseBooleanEnv("DEVICE_FLOW_ENABLED", Boolean(GITHUB_CLIENT_ID));
+  const AUTO_UPDATE = parseBooleanEnv("AUTO_UPDATE", false);
 
   if (DEVICE_FLOW_ENABLED && !GITHUB_CLIENT_ID) {
     throw new Error("DEVICE_FLOW_ENABLED=true requires GITHUB_CLIENT_ID");
@@ -184,6 +185,11 @@ export function loadConfig(): AppConfig {
   if (!GITHUB_TOKEN && !DEVICE_FLOW_ENABLED) {
     throw new Error(
       "Either GITHUB_TOKEN or DEVICE_FLOW_ENABLED=true (with GITHUB_CLIENT_ID) is required",
+    );
+  }
+  if (AUTO_UPDATE) {
+    throw new Error(
+      "AUTO_UPDATE is unsupported: update package.json and package-lock.json through review",
     );
   }
 
@@ -274,7 +280,7 @@ export function loadConfig(): AppConfig {
     RATE_LIMIT_PER_MIN: parseIntegerEnv("RATE_LIMIT_PER_MIN", 30, { min: 1 }),
     ALLOWED_SKILL_DOMAINS: parseDomainList("ALLOWED_SKILL_DOMAINS"),
     DOMAIN: process.env["DOMAIN"] ?? "localhost",
-    AUTO_UPDATE: parseBooleanEnv("AUTO_UPDATE", false),
+    AUTO_UPDATE,
     ADMIN_TOKEN: process.env["ADMIN_TOKEN"],
     TRUST_PROXY: parseBooleanEnv("TRUST_PROXY", false),
   };

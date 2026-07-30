@@ -2402,7 +2402,30 @@ fn validate_final_fixed_files(root: &SafeRoot) -> PolicyResult<()> {
     ] {
         root.regular_file(source, DEFAULT_FILE_LIMIT)?;
     }
+    validate_desktop_build_script(root)?;
     validate_desktop_lock(root)
+}
+
+fn validate_desktop_build_script(root: &SafeRoot) -> PolicyResult<()> {
+    let source = root
+        .read_text("desktop/apps/gta-claw-desktop/build.rs", DEFAULT_FILE_LIMIT)?
+        .replace("\r\n", "\n");
+    for required in [
+        "let host = std::env::var(\"HOST\")",
+        "let target = std::env::var(\"TARGET\")",
+        "if host != target",
+        "requires native builds with matching host and target triples",
+        "let target_os = std::env::var(\"CARGO_CFG_TARGET_OS\")",
+        "\"windows\" => \"fluent\"",
+        "\"macos\" => \"cupertino\"",
+    ] {
+        if !source.contains(required) {
+            return Err(PolicyError::new(format!(
+                "desktop build script is missing target guard: {required}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Performs complete static final-state validation.

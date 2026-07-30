@@ -83,8 +83,9 @@ run_deny() {
 }
 
 run_deny deny-root \
-  --manifest-path "$candidate_root/Cargo.toml" --locked --all-features \
-  check --config "$candidate_root/deny.toml" advisories bans licenses sources
+  --manifest-path "$candidate_root/Cargo.toml" \
+  --config "$candidate_root/deny.toml" --locked --all-features \
+  check advisories bans licenses sources
 
 for target in \
   x86_64-pc-windows-msvc \
@@ -92,8 +93,8 @@ for target in \
   x86_64-apple-darwin \
   aarch64-apple-darwin; do
   run_deny "deny-desktop-$target" \
-    --manifest-path "$candidate_root/desktop/Cargo.toml" --locked \
-    --target "$target" \
-    check --config "$candidate_root/desktop/deny.toml" \
+    --manifest-path "$candidate_root/desktop/Cargo.toml" \
+    --config "$candidate_root/desktop/deny.toml" \
+    --locked --target "$target" check \
     --warn unmaintained advisories bans licenses sources
 done

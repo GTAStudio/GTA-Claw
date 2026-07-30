@@ -2,7 +2,7 @@
   "$schema": "./schemas/legacy-contract.schema.json",
   "contract_id": "gta-claw-legacy-p00b",
   "contract_version": "1.0.0",
-  "source_revision": "3f2dfebcab1a1395f2445e9261b908cc4093f602",
+  "source_revision": "b2896426f3fcc5bb149402a38e09aac5e836d70b",
   "scope": {
     "owned_tree": "compat/legacy",
     "runtime_mutation": false,

@@ -1,6 +1,6 @@
 {
   "$schema": "../schemas/skill-inventory.schema.json",
-  "source_revision": "3f2dfebcab1a1395f2445e9261b908cc4093f602",
+  "source_revision": "b2896426f3fcc5bb149402a38e09aac5e836d70b",
   "skills": [
     {
       "name": "github_commits",
