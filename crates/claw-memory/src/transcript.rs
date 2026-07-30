@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bounded::{BoundedString, BoundedVec};
 use crate::persistence::{
-    PersistenceError, ScopeLocks, WriteOutcome, WriteWarning, atomic_write_json,
+    PersistenceError, ScopeLocks, WriteOutcome, WriteWarning, atomic_write_json, generated_ordinal,
     initialize_state_root, quarantine_corrupt_state, read_json, scope_key, scoped_state_path,
 };
 use crate::safety::{UnsafeContentReason, normalize_for_matching, scan_persistent_content};
@@ -20,6 +20,7 @@ use crate::vector::RecordId;
 
 const TRANSCRIPT_FILE_VERSION: u32 = 1;
 const TRANSCRIPT_COLLECTION: &str = "transcripts";
+const TRANSCRIPT_ID_PREFIX: &str = "transcript:";
 const MAX_TRANSCRIPT_MESSAGES: usize = 100_000;
 const MAX_TRANSCRIPT_CONTENT_CHARS: usize = 1_000_000;
 const MAX_TRANSCRIPT_CONTENT_BYTES: usize = MAX_TRANSCRIPT_CONTENT_CHARS * 4;
@@ -147,6 +148,13 @@ pub enum TranscriptError {
         /// Configured retained-message limit.
         limit: usize,
     },
+    /// Appending would exceed the structural retained-content capacity.
+    RetainedContentCapacityExceeded {
+        /// Character usage the append would produce.
+        used: usize,
+        /// Structural retained-character limit.
+        limit: usize,
+    },
     /// Search text was empty after trimming.
     EmptyQuery,
     /// Search text exceeded its character bound.
@@ -176,6 +184,10 @@ impl Display for TranscriptError {
                 formatter,
                 "transcript capacity exceeded ({retained}/{limit} messages); existing history was preserved"
             ),
+            Self::RetainedContentCapacityExceeded { used, limit } => write!(
+                formatter,
+                "transcript retained-content capacity exceeded ({used}/{limit} characters); existing history was preserved"
+            ),
             Self::EmptyQuery => formatter.write_str("transcript query must not be empty"),
             Self::QueryTooLong => {
                 formatter.write_str("transcript query must be at most 500 characters")
@@ -204,6 +216,7 @@ impl Error for TranscriptError {
             Self::InvalidLimits
             | Self::ContentTooLong
             | Self::CapacityExceeded { .. }
+            | Self::RetainedContentCapacityExceeded { .. }
             | Self::EmptyQuery
             | Self::QueryTooLong
             | Self::QueryTooComplex
@@ -287,6 +300,7 @@ impl DurableTranscriptStore {
             }
             let unsafe_reason = scan_persistent_content(content).reason();
             let (content, truncated) = limit_content(content, self.content_char_limit);
+            document.reserve_retained_chars(retained_payload_chars(&content, truncated))?;
             let mut message = TranscriptMessage {
                 id: document.allocate_id()?,
                 role,
@@ -514,6 +528,13 @@ fn visible_message(message: &TranscriptMessage) -> VisibleTranscriptMessage {
     }
 }
 
+fn retained_payload_chars(content: &str, truncated: bool) -> usize {
+    content.chars().count().saturating_sub(
+        usize::from(truncated && content.ends_with(TRUNCATION_MARKER))
+            .saturating_mul(TRUNCATION_MARKER.chars().count()),
+    )
+}
+
 struct RankedMessage<'a> {
     message: &'a TranscriptMessage,
     score: u32,
@@ -661,6 +682,7 @@ struct TranscriptMessageWrite<'a> {
 struct TranscriptDocument {
     next_id: u64,
     messages: Vec<TranscriptMessage>,
+    retained_chars: usize,
 }
 
 impl TranscriptDocument {
@@ -668,6 +690,7 @@ impl TranscriptDocument {
         Self {
             next_id: 0,
             messages: Vec::new(),
+            retained_chars: 0,
         }
     }
 
@@ -690,12 +713,29 @@ impl TranscriptDocument {
         }
         let mut identifiers = BTreeSet::new();
         let mut retained_chars = 0_usize;
+        let mut previous_ordinal = None;
         let messages = wire
             .messages
             .into_inner()
             .into_iter()
             .enumerate()
             .map(|(index, message)| {
+                let ordinal =
+                    generated_ordinal(&message.id, TRANSCRIPT_ID_PREFIX).ok_or_else(|| {
+                        PersistenceError::corrupt(
+                            path,
+                            format!("messages[{index}] has an invalid generated identifier"),
+                        )
+                    })?;
+                if ordinal == u64::MAX
+                    || previous_ordinal.is_some_and(|previous| ordinal <= previous)
+                {
+                    return Err(PersistenceError::corrupt(
+                        path,
+                        format!("messages[{index}] has a non-monotonic identifier"),
+                    ));
+                }
+                previous_ordinal = Some(ordinal);
                 if !identifiers.insert(message.id.clone()) {
                     return Err(PersistenceError::corrupt(
                         path,
@@ -713,10 +753,7 @@ impl TranscriptDocument {
                         format!("messages[{index}] exceeds the structural content capacity"),
                     ));
                 }
-                let payload_chars = content.chars().count().saturating_sub(
-                    usize::from(message.truncated && content.ends_with(TRUNCATION_MARKER))
-                        .saturating_mul(TRUNCATION_MARKER.chars().count()),
-                );
+                let payload_chars = retained_payload_chars(&content, message.truncated);
                 retained_chars = retained_chars.checked_add(payload_chars).ok_or_else(|| {
                     PersistenceError::corrupt(path, "transcript character count overflowed")
                 })?;
@@ -738,8 +775,11 @@ impl TranscriptDocument {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            next_id: wire.next_id,
+            next_id: wire
+                .next_id
+                .max(previous_ordinal.map_or(0, |ordinal| ordinal + 1)),
             messages,
+            retained_chars,
         })
     }
 
@@ -769,6 +809,21 @@ impl TranscriptDocument {
                 return Ok(id);
             }
         }
+    }
+
+    fn reserve_retained_chars(&mut self, additional: usize) -> Result<(), TranscriptError> {
+        let used = self
+            .retained_chars
+            .checked_add(additional)
+            .unwrap_or(usize::MAX);
+        if used > MAX_RETAINED_CONTENT_CHARS {
+            return Err(TranscriptError::RetainedContentCapacityExceeded {
+                used,
+                limit: MAX_RETAINED_CONTENT_CHARS,
+            });
+        }
+        self.retained_chars = used;
+        Ok(())
     }
 }
 
@@ -867,5 +922,45 @@ mod tests {
             "a".repeat(SCOPE_KEY_BYTES + 1)
         );
         assert!(serde_json::from_str::<TranscriptDocumentWire>(&document).is_err());
+    }
+
+    #[test]
+    fn config_transitions_cannot_publish_over_capacity_state() {
+        let mut document = TranscriptDocument {
+            next_id: 0,
+            messages: Vec::new(),
+            retained_chars: MAX_RETAINED_CONTENT_CHARS,
+        };
+        assert!(matches!(
+            document.reserve_retained_chars(1),
+            Err(TranscriptError::RetainedContentCapacityExceeded {
+                used,
+                limit: MAX_RETAINED_CONTENT_CHARS,
+            }) if used > MAX_RETAINED_CONTENT_CHARS
+        ));
+        assert_eq!(document.retained_chars, MAX_RETAINED_CONTENT_CHARS);
+    }
+
+    #[test]
+    fn a_stale_counter_is_repaired_past_retained_identifiers() {
+        let scope = "a".repeat(SCOPE_KEY_BYTES);
+        let document = format!(
+            r#"{{"version":1,"scope":"{scope}","next_id":0,"messages":[{{"id":"transcript:0000000000000005","role":"user","content":"message","unix_millis":1,"truncated":false}}]}}"#
+        );
+        let wire: TranscriptDocumentWire = serde_json::from_str(&document).expect("valid wire");
+        let restored = TranscriptDocument::from_wire(wire, Path::new("transcript.json"), &scope)
+            .expect("restore document");
+        assert_eq!(restored.next_id, 6);
+    }
+
+    #[test]
+    fn non_monotonic_generated_identifiers_are_rejected() {
+        let scope = "a".repeat(SCOPE_KEY_BYTES);
+        let document = format!(
+            r#"{{"version":1,"scope":"{scope}","next_id":3,"messages":[{{"id":"transcript:0000000000000002","role":"user","content":"first","unix_millis":1,"truncated":false}},{{"id":"transcript:0000000000000001","role":"assistant","content":"second","unix_millis":2,"truncated":false}}]}}"#
+        );
+        let wire: TranscriptDocumentWire =
+            serde_json::from_str(&document).expect("valid wire shape");
+        assert!(TranscriptDocument::from_wire(wire, Path::new("transcript.json"), &scope).is_err());
     }
 }

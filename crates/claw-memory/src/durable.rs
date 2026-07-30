@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bounded::{BoundedString, BoundedVec};
 use crate::persistence::{
-    PersistenceError, ScopeLocks, WriteOutcome, WriteWarning, atomic_write_json,
+    PersistenceError, ScopeLocks, WriteOutcome, WriteWarning, atomic_write_json, generated_ordinal,
     initialize_state_root, quarantine_corrupt_state, read_json, scope_key, scoped_state_path,
 };
 use crate::safety::{UnsafeContentReason, scan_persistent_content};
@@ -18,6 +18,7 @@ use crate::vector::RecordId;
 
 const MEMORY_FILE_VERSION: u32 = 1;
 const MEMORY_COLLECTION: &str = "memory";
+const MEMORY_ID_PREFIX: &str = "memory:";
 const ENTRY_SEPARATOR: &str = "\n---\n";
 const MAX_MEMORY_CHARS: usize = 100_000;
 const MAX_MEMORY_BYTES: usize = MAX_MEMORY_CHARS * 4;
@@ -713,8 +714,9 @@ impl MemoryDocument {
             ));
         }
         let mut identifiers = BTreeSet::new();
-        let memory = parse_entries(wire.memory.into_inner(), path, "memory", &mut identifiers)?;
-        let user_profile = parse_entries(
+        let (memory, memory_high_water) =
+            parse_entries(wire.memory.into_inner(), path, "memory", &mut identifiers)?;
+        let (user_profile, profile_high_water) = parse_entries(
             wire.user_profile.into_inner(),
             path,
             "user_profile",
@@ -728,8 +730,13 @@ impl MemoryDocument {
                 "memory state exceeds its structural character capacity",
             ));
         }
+        let retained_high_water = memory_high_water
+            .into_iter()
+            .chain(profile_high_water)
+            .max()
+            .map_or(0, |ordinal| ordinal + 1);
         Ok(Self {
-            next_id: wire.next_id,
+            next_id: wire.next_id.max(retained_high_water),
             memory,
             user_profile,
         })
@@ -800,12 +807,26 @@ fn parse_entries(
     path: &Path,
     target: &str,
     identifiers: &mut BTreeSet<RecordId>,
-) -> Result<Vec<DurableMemoryEntry>, PersistenceError> {
+) -> Result<(Vec<DurableMemoryEntry>, Option<u64>), PersistenceError> {
     let mut contents = BTreeSet::new();
-    entries
+    let mut previous_ordinal = None;
+    let entries = entries
         .into_iter()
         .enumerate()
         .map(|(index, entry)| {
+            let ordinal = generated_ordinal(&entry.id, MEMORY_ID_PREFIX).ok_or_else(|| {
+                PersistenceError::corrupt(
+                    path,
+                    format!("{target}[{index}] has an invalid generated identifier"),
+                )
+            })?;
+            if ordinal == u64::MAX || previous_ordinal.is_some_and(|previous| ordinal <= previous) {
+                return Err(PersistenceError::corrupt(
+                    path,
+                    format!("{target}[{index}] has a non-monotonic identifier"),
+                ));
+            }
+            previous_ordinal = Some(ordinal);
             if !identifiers.insert(entry.id.clone()) {
                 return Err(PersistenceError::corrupt(
                     path,
@@ -832,7 +853,8 @@ fn parse_entries(
                 updated_unix_millis: entry.updated_unix_millis,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((entries, previous_ordinal))
 }
 
 #[cfg(test)]
@@ -856,5 +878,27 @@ mod tests {
         assert_eq!(value["version"], 1);
         assert_eq!(value["memory"], serde_json::json!([]));
         assert_eq!(value["user_profile"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_stale_counter_is_repaired_past_retained_identifiers() {
+        let scope = "a".repeat(SCOPE_KEY_BYTES);
+        let document = format!(
+            r#"{{"version":1,"scope":"{scope}","next_id":0,"memory":[{{"id":"memory:0000000000000005","content":"fact","created_unix_millis":1,"updated_unix_millis":1}}],"user_profile":[]}}"#
+        );
+        let wire: MemoryDocumentWire = serde_json::from_str(&document).expect("valid wire");
+        let restored = MemoryDocument::from_wire(wire, Path::new("memory.json"), &scope)
+            .expect("restore document");
+        assert_eq!(restored.next_id, 6);
+    }
+
+    #[test]
+    fn non_monotonic_generated_identifiers_are_rejected() {
+        let scope = "a".repeat(SCOPE_KEY_BYTES);
+        let document = format!(
+            r#"{{"version":1,"scope":"{scope}","next_id":3,"memory":[{{"id":"memory:0000000000000002","content":"first","created_unix_millis":1,"updated_unix_millis":1}},{{"id":"memory:0000000000000001","content":"second","created_unix_millis":2,"updated_unix_millis":2}}],"user_profile":[]}}"#
+        );
+        let wire: MemoryDocumentWire = serde_json::from_str(&document).expect("valid wire shape");
+        assert!(MemoryDocument::from_wire(wire, Path::new("memory.json"), &scope).is_err());
     }
 }

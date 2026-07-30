@@ -365,6 +365,18 @@ pub(crate) fn scope_key(scope: &crate::session::SessionId) -> String {
     encoded
 }
 
+pub(crate) fn generated_ordinal(id: &crate::vector::RecordId, prefix: &str) -> Option<u64> {
+    let encoded = id.as_str().strip_prefix(prefix)?;
+    if encoded.len() != 16
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return None;
+    }
+    u64::from_str_radix(encoded, 16).ok()
+}
+
 pub(crate) fn read_json<T: DeserializeOwned>(
     path: &Path,
     max_bytes: usize,
@@ -376,7 +388,8 @@ pub(crate) fn read_json<T: DeserializeOwned>(
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(PersistenceError::io("inspect", &path, source)),
     };
-    if is_link_or_reparse(&metadata) || has_multiple_links(&metadata) || !metadata.is_file() {
+    if is_link_or_reparse(&metadata) || !metadata.is_file() || has_multiple_links(&path, &metadata)?
+    {
         return Err(PersistenceError::corrupt(
             &path,
             "state path is not a regular file",
@@ -445,7 +458,18 @@ pub(crate) fn atomic_write_json<T: Serialize>(
     writer.bytes.push(b'\n');
 
     let existing = match fs::symlink_metadata(&destination) {
-        Ok(metadata) => Some(metadata),
+        Ok(metadata) => {
+            if is_link_or_reparse(&metadata)
+                || !metadata.is_file()
+                || has_multiple_links(&destination, &metadata)?
+            {
+                return Err(PersistenceError::corrupt(
+                    &destination,
+                    "destination is not a single-link regular file",
+                ));
+            }
+            Some(metadata)
+        }
         Err(source) if source.kind() == io::ErrorKind::NotFound => None,
         Err(source) => {
             return Err(PersistenceError::io(
@@ -600,7 +624,9 @@ fn prepare_destination(path: &Path) -> Result<PathBuf, PersistenceError> {
     let destination = canonical_parent.join(file_name);
     match fs::symlink_metadata(&destination) {
         Ok(metadata) => {
-            if is_link_or_reparse(&metadata) || has_multiple_links(&metadata) || !metadata.is_file()
+            if is_link_or_reparse(&metadata)
+                || !metadata.is_file()
+                || has_multiple_links(&destination, &metadata)?
             {
                 return Err(PersistenceError::io(
                     "prepare",
@@ -766,7 +792,8 @@ fn reject_unsafe_ancestors(path: &Path) -> Result<(), PersistenceError> {
 fn validate_existing_file(path: &Path) -> Result<(), PersistenceError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| PersistenceError::io("inspect", path, source))?;
-    if is_link_or_reparse(&metadata) || has_multiple_links(&metadata) || !metadata.is_file() {
+    if is_link_or_reparse(&metadata) || !metadata.is_file() || has_multiple_links(path, &metadata)?
+    {
         return Err(PersistenceError::corrupt(
             path,
             "state path is not a regular file",
@@ -782,7 +809,13 @@ fn validate_open_file(path: &Path, file: &File) -> Result<(), PersistenceError> 
     let file_metadata = file
         .metadata()
         .map_err(|source| PersistenceError::io("inspect open file", path, source))?;
-    if !file_metadata.is_file() || !same_file(&path_metadata, &file_metadata) {
+    if is_link_or_reparse(&path_metadata)
+        || !path_metadata.is_file()
+        || has_multiple_links(path, &path_metadata)?
+        || !file_metadata.is_file()
+        || opened_file_has_multiple_links(path, file, &file_metadata)?
+        || !opened_file_matches(path, &path_metadata, file, &file_metadata)?
+    {
         return Err(PersistenceError::io(
             "verify",
             path,
@@ -801,10 +834,21 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
-fn has_multiple_links(metadata: &fs::Metadata) -> bool {
+fn has_multiple_links(_path: &Path, metadata: &fs::Metadata) -> Result<bool, PersistenceError> {
     use std::os::unix::fs::MetadataExt;
 
-    metadata.nlink() > 1
+    Ok(metadata.nlink() > 1)
+}
+
+#[cfg(unix)]
+fn opened_file_has_multiple_links(
+    _path: &Path,
+    _file: &File,
+    metadata: &fs::Metadata,
+) -> Result<bool, PersistenceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(metadata.nlink() > 1)
 }
 
 #[cfg(windows)]
@@ -816,8 +860,23 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(windows)]
-fn has_multiple_links(_metadata: &fs::Metadata) -> bool {
-    false
+fn has_multiple_links(path: &Path, _metadata: &fs::Metadata) -> Result<bool, PersistenceError> {
+    let file = File::open(path)
+        .map_err(|source| PersistenceError::io("open for link check", path, source))?;
+    let information = winapi_util::file::information(&file)
+        .map_err(|source| PersistenceError::io("inspect link count for", path, source))?;
+    Ok(information.number_of_links() > 1)
+}
+
+#[cfg(windows)]
+fn opened_file_has_multiple_links(
+    path: &Path,
+    file: &File,
+    _metadata: &fs::Metadata,
+) -> Result<bool, PersistenceError> {
+    let information = winapi_util::file::information(file)
+        .map_err(|source| PersistenceError::io("inspect open-file link count for", path, source))?;
+    Ok(information.number_of_links() > 1)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -826,27 +885,58 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn has_multiple_links(_metadata: &fs::Metadata) -> bool {
-    false
-}
-
-#[cfg(unix)]
-fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    left.creation_time() == right.creation_time() && left.file_size() == right.file_size()
+fn has_multiple_links(_path: &Path, _metadata: &fs::Metadata) -> Result<bool, PersistenceError> {
+    Ok(false)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn same_file(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
-    true
+fn opened_file_has_multiple_links(
+    _path: &Path,
+    _file: &File,
+    _metadata: &fs::Metadata,
+) -> Result<bool, PersistenceError> {
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn opened_file_matches(
+    _path: &Path,
+    path_metadata: &fs::Metadata,
+    _file: &File,
+    file_metadata: &fs::Metadata,
+) -> Result<bool, PersistenceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(path_metadata.dev() == file_metadata.dev() && path_metadata.ino() == file_metadata.ino())
+}
+
+#[cfg(windows)]
+fn opened_file_matches(
+    path: &Path,
+    _path_metadata: &fs::Metadata,
+    file: &File,
+    _file_metadata: &fs::Metadata,
+) -> Result<bool, PersistenceError> {
+    let path_file = File::open(path)
+        .map_err(|source| PersistenceError::io("reopen for identity check", path, source))?;
+    let path_information = winapi_util::file::information(&path_file)
+        .map_err(|source| PersistenceError::io("inspect path identity for", path, source))?;
+    let file_information = winapi_util::file::information(file)
+        .map_err(|source| PersistenceError::io("inspect open-file identity for", path, source))?;
+    Ok(
+        path_information.volume_serial_number() == file_information.volume_serial_number()
+            && path_information.file_index() == file_information.file_index(),
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn opened_file_matches(
+    _path: &Path,
+    _path_metadata: &fs::Metadata,
+    _file: &File,
+    _file_metadata: &fs::Metadata,
+) -> Result<bool, PersistenceError> {
+    Ok(true)
 }
 
 struct TemporaryArtifact {
@@ -1019,7 +1109,7 @@ fn replace_destination(
     destination: &Path,
     exists: bool,
 ) -> io::Result<Option<WriteWarning>> {
-    replace_destination_with_cleanup(temporary, destination, exists, fs::remove_file)
+    replace_destination_with_cleanup(temporary, destination, exists, |path| fs::remove_file(path))
 }
 
 #[cfg(windows)]
@@ -1110,21 +1200,22 @@ fn remove_file_if_exists(path: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn artifact_exists(path: &Path) -> Result<bool, PersistenceError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata)
-            if !is_link_or_reparse(&metadata)
-                && !has_multiple_links(&metadata)
-                && metadata.is_file() =>
-        {
+        Ok(metadata) => {
+            if is_link_or_reparse(&metadata)
+                || !metadata.is_file()
+                || has_multiple_links(path, &metadata)?
+            {
+                return Err(PersistenceError::io(
+                    "inspect recovery artifact",
+                    path,
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "recovery artifact must be a single-link regular file",
+                    ),
+                ));
+            }
             Ok(true)
         }
-        Ok(_) => Err(PersistenceError::io(
-            "inspect recovery artifact",
-            path,
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "recovery artifact must be a regular file",
-            ),
-        )),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(source) => Err(PersistenceError::io(
             "inspect recovery artifact",

@@ -792,7 +792,7 @@ fn ambient_alias_is_canonicalized_and_descendant_links_are_rejected() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn linked_state_is_rejected_without_quarantining_external_bytes() {
     let root = TempDir::new("hard-link");
     let scope = scope("linked");
