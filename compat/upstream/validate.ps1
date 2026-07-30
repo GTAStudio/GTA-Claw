@@ -105,16 +105,16 @@ $ExpectedReachabilityCorpusAccepting = 15
 # Frozen exactly like the schema and corpus digests: -WriteLedgerDigests cannot
 # reach this constant, so re-blessing a hollowed-out self-test takes a reviewed
 # edit to this line.
-$ExpectedSelfTestDigest = "20b26f2e52009b44d90d2c83a9d392248b3495d5e4b7a1dd3d673073a4d76add"
+$ExpectedSelfTestDigest = "e51b2ff5ce4d80aa3bbc83662972786575be7f9ce3f6e0c095d72cab7e3bc130"
 # README.md is the normative specification for these rules. Pinning its
 # LF-normalised text makes a prose change a reviewed trust-root edit instead of a
 # silent change to the instructions future rule owners follow.
 $ExpectedReadmeDigest = "f9f5926890bb080fecea8ee616cdb7eaca9dd8cd00dcfead9e5865a4c2990dcc"
 $LedgerDigestFileName = "ledger-digests.sha256"
 $EvidenceSweepFileName = "evidence-reachability-sweep.tsv"
-$EvidenceSweepExpectedFiles = 0
-$EvidenceSweepExpectedAccepted = 0
-$EvidenceSweepExpectedRejected = 0
+$EvidenceSweepExpectedFiles = 582
+$EvidenceSweepExpectedAccepted = 575
+$EvidenceSweepExpectedRejected = 7
 $EvidenceSweepPreamble = @(
     "# GTA-Claw acceptance-evidence reachability sweep.",
     "# Every tracked .rs file, judged by the reachability rule shipped in validate.ps1.",
@@ -123,7 +123,9 @@ $EvidenceSweepPreamble = @(
     "#   powershell -NoProfile -File compat/upstream/validate.ps1 -ReplayEvidenceSweep"
 )
 $EvidenceSweepGeneratedByLine = "# generated-by: validate.ps1 -ReplayEvidenceSweep"
-$ExpectedEvidenceSweepDigest = "0000000000000000000000000000000000000000000000000000000000000000"
+$ExpectedEvidenceSweepDigest = "82939e8b56e2f3351abc1c43870b6604cbd043c6b744d9faee69dba50333ee37"
+$ExpectedEvidenceSweepBaseCommit = "d2493b07b7c064bd8b72c836852c4ae1617b56f5"
+$ExpectedEvidenceSweepSweptAt = "2026-07-30"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
     "# Only the three mutable ledgers are covered here; inventory digests, the feature",
@@ -3963,8 +3965,8 @@ if ($ReplayEvidenceSweep) {
         $sweepEncoding
     )
     $sweepRecord = Get-EvidenceSweepRecord $evidenceSweepPath
-    Write-Host ("Recorded {0} swept files in {1} ({2} accept / {3} reject); " +
-        "review every line before committing." -f
+    Write-Host (("Recorded {0} swept files in {1} ({2} accept / {3} reject); " +
+        "review every line before committing.") -f
         $sweptRows.Count, $EvidenceSweepFileName, $acceptedCount, $rejectedCount)
     Write-Host "  pin these reviewed values in validate.ps1:"
     Write-Host ("    base commit: {0}" -f $sweepBaseCommit)

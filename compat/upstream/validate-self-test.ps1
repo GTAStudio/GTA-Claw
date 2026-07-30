@@ -576,9 +576,9 @@ function Set-SelfTestSweepRecord {
     $sweptAt = "2026-01-01"
     $lines = @(
         "# GTA-Claw acceptance-evidence reachability sweep.",
-        "# Every .rs file in the working tree, judged by the reachability rule shipped in",
-        "# validate.ps1. A cross-check record only: nothing here decides whether a feature",
-        "# row is accepted. Regenerate ONLY through the reviewed command, never by hand:",
+        "# Every tracked .rs file, judged by the reachability rule shipped in validate.ps1.",
+        "# This is a cross-check record only: it grants no evidence permission.",
+        "# Regenerate ONLY through the reviewed command, never by hand:",
         "#   powershell -NoProfile -File compat/upstream/validate.ps1 -ReplayEvidenceSweep",
         "# generated-by: validate.ps1 -ReplayEvidenceSweep",
         "# base-commit: $baseCommit",
