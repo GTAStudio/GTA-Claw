@@ -258,11 +258,36 @@ exact historical ceiling of 18 `src/**/*.ts` files plus `Dockerfile`, `package.j
 Tracked symbolic links, gitlinks, new package-manager artifacts, and new Node workflow or local
 action debt fail from the base side.
 
+The six exact `test/*.test.mjs` paths introduced by prerequisite PR #227 are a separate,
+closed admission set. They do not enter `LEGACY_RUNTIME_CEILING`, do not change
+`LEGACY_TYPESCRIPT_CEILING = 18`, and do not authorize a seventh test or any other JavaScript
+artifact.
+
 `crates/claw-repo-policy` is transitionally absent until its accepted product-policy pull request
 lands. Its first appearance must have the exact dependency-free workspace shape, explicit
 ceiling, fixture exceptions, add-fails/delete-passes tests, workflow/action and index tests, and
 both CI execution paths. Once it exists in a protected base, removing or weakening that shape is
 forbidden. Activation also requires zero remaining Node workflow/action violations.
+
+### Sanctioned product hardening transition
+
+The protected validator owns a one-way atomic transition for the dependency and supply-chain
+hardening. The legacy protected base may remain unchanged. A candidate that changes any declared
+transition input must satisfy the complete hardened policy against the actual repository files;
+marker tests, candidate hashes, and candidate policy declarations grant no authority. Once a
+protected base satisfies the hardened policy, every candidate must continue to satisfy it.
+
+The complete post-transition check parses the package roots and workflows and reads the runtime,
+native build, compatibility, and policy sources. It enforces exact npm root versions and lock
+coupling; the Docker install-script allowlist and SDK-locked CLI; fail-closed AUTO_UPDATE and
+development-only reduced isolation; canonical env-mapping equality; Rust 1.94 and cargo-deny
+0.19.8 invocation; target-OS desktop gating; separate Linux mobile-host and shipped-target
+coverage; exact compatibility source fetching and hashed Python requirements; and Docker
+action-pin, digest, and build-once policy.
+
+This transition lands only in the dedicated trust-root pull request after PR #227 and PR #233.
+PR #234 must then rebase onto that protected base, remove every candidate-owned trusted-tree
+change, update all transition inputs atomically, and carry no protected trust bytes.
 
 ## Trust-root updates
 

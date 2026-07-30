@@ -6,6 +6,7 @@ use serde_yaml_ng::{Mapping as YamlMapping, Value as YamlValue};
 use toml::Value as TomlValue;
 
 use crate::input::{DEFAULT_FILE_LIMIT, SafeRoot};
+use crate::product_policy::validate_product_policy_transition;
 use crate::{PolicyError, PolicyResult, error};
 
 const MAX_REPOSITORY_FILES: usize = 50_000;
@@ -43,6 +44,16 @@ pub const LEGACY_RUNTIME_CEILING: [&str; 22] = [
     "src/utils/proxy.ts",
     "src/utils/splitMessage.ts",
     "tsconfig.json",
+];
+
+/// Exact sanctioned Node test additions from prerequisite PR #227.
+pub const SANCTIONED_LEGACY_TESTS: [&str; 6] = [
+    "test/deviceFlow.test.mjs",
+    "test/discordGateway.test.mjs",
+    "test/splitMessage.test.mjs",
+    "test/telegramPolling.test.mjs",
+    "test/whatsappRawBody.test.mjs",
+    "test/whatsappWebhook.test.mjs",
 ];
 
 const FORBIDDEN_FILE_NAMES: [&str; 9] = [
@@ -114,7 +125,9 @@ fn legacy_artifacts(files: &[String]) -> BTreeSet<String> {
     files
         .iter()
         .filter(|path| {
-            LEGACY_RUNTIME_CEILING.contains(&path.as_str()) || is_forbidden_artifact(path)
+            LEGACY_RUNTIME_CEILING.contains(&path.as_str())
+                || SANCTIONED_LEGACY_TESTS.contains(&path.as_str())
+                || is_forbidden_artifact(path)
         })
         .cloned()
         .collect()
@@ -123,6 +136,7 @@ fn legacy_artifacts(files: &[String]) -> BTreeSet<String> {
 fn require_artifacts_within_ceiling(artifacts: &BTreeSet<String>, label: &str) -> PolicyResult<()> {
     let ceiling = LEGACY_RUNTIME_CEILING
         .into_iter()
+        .chain(SANCTIONED_LEGACY_TESTS)
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
     let outside = artifacts.difference(&ceiling).cloned().collect::<Vec<_>>();
@@ -473,7 +487,6 @@ fn validate_policy_source(root: &SafeRoot) -> PolicyResult<()> {
             "LEGACY_RUNTIME_INVENTORY",
             LEGACY_RUNTIME_CEILING.as_slice(),
         ),
-        ("ALLOWED_COMPAT_FIXTURES", &[]),
         (
             "ALLOWED_ADVERSARIAL_SHELL_FIXTURES",
             &[ALLOWED_SHELL_FIXTURE],
@@ -485,6 +498,13 @@ fn validate_policy_source(root: &SafeRoot) -> PolicyResult<()> {
                 "repository policy {name} changed from the base-owned contract"
             )));
         }
+    }
+    let allowed_compat = rust_string_array(&source, "ALLOWED_COMPAT_FIXTURES")?;
+    let sanctioned_tests = SANCTIONED_LEGACY_TESTS.to_vec();
+    if !allowed_compat.is_empty() && allowed_compat != sanctioned_tests {
+        return Err(PolicyError::new(
+            "repository policy ALLOWED_COMPAT_FIXTURES must be empty before the atomic transition or exactly the six sanctioned PR #227 tests",
+        ));
     }
     for required in [
         "#[test]\nfn repository_legacy_javascript_surface_does_not_grow()",
@@ -736,5 +756,5 @@ pub fn validate_repository_policy_transition(
     } else {
         require_violation_subset(&trusted_workflow_violations, &candidate_workflow_violations)?;
     }
-    Ok(())
+    validate_product_policy_transition(trusted, candidate)
 }

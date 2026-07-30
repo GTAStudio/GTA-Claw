@@ -69,9 +69,10 @@ pub fn linux_actionlint(path: PathBuf) -> ActionlintTool {
 }
 
 /// Workflow files that must be present in every validated checkout.
-const REQUIRED_WORKFLOWS: [&str; 8] = [
+const REQUIRED_WORKFLOWS: [&str; 9] = [
     ".github/workflows/bootstrap-desktop-supply-chain-policy.yml",
     ".github/workflows/docker-publish.yml",
+    ".github/workflows/joint-release-finalize.yml",
     ".github/workflows/linux-packaging.yml",
     ".github/workflows/macos-packaging.yml",
     ".github/workflows/rust.yml",

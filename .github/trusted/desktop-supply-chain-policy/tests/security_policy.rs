@@ -32,7 +32,9 @@ use desktop_supply_chain_policy::policy::{
     write_bootstrap_snapshot, write_final_dependency_fixtures,
 };
 use desktop_supply_chain_policy::process::{CommandSpec, run, run_checked};
-use desktop_supply_chain_policy::repository_policy::validate_repository_policy_transition;
+use desktop_supply_chain_policy::repository_policy::{
+    SANCTIONED_LEGACY_TESTS, validate_repository_policy_transition,
+};
 use desktop_supply_chain_policy::validation::{
     BaseState, ValidationRequest, candidate_requires_final, validate_request,
 };
@@ -3591,6 +3593,40 @@ fn base_owned_repository_ratchet_rejects_addition_and_allows_deletion() {
     assert!(
         error.contains("reintroduced or added legacy Node artifacts"),
         "reintroduced artifact failed through the wrong rule: {error}"
+    );
+}
+
+#[test]
+fn prerequisite_node_tests_are_admitted_without_raising_the_typescript_ceiling() {
+    let trusted = final_tree("repository-pr227-tests-base");
+    let candidate = final_tree("repository-pr227-tests-candidate");
+    deactivate_repository_policy(&trusted);
+    deactivate_repository_policy(&candidate);
+    for path in SANCTIONED_LEGACY_TESTS {
+        for tree in [&trusted, &candidate] {
+            let destination = tree.join(path);
+            fs::create_dir_all(destination.parent().expect("sanctioned test parent"))
+                .expect("create sanctioned test directory");
+            fs::write(destination, "export {};\n").expect("write sanctioned test");
+        }
+    }
+    validate_repository_policy_transition(
+        &SafeRoot::new(&trusted.path).expect("open PR #227 base"),
+        &SafeRoot::new(&candidate.path).expect("open PR #227 candidate"),
+    )
+    .expect("the exact six sanctioned tests must not raise the TypeScript ceiling");
+
+    fs::write(candidate.join("test/seventh.test.mjs"), "export {};\n")
+        .expect("write unsanctioned seventh test");
+    let error = validate_repository_policy_transition(
+        &SafeRoot::new(&trusted.path).expect("reopen PR #227 base"),
+        &SafeRoot::new(&candidate.path).expect("reopen PR #227 candidate"),
+    )
+    .expect_err("an unsanctioned seventh Node test unexpectedly passed")
+    .to_string();
+    assert!(
+        error.contains("outside the exact ceiling"),
+        "the seventh Node test reached the wrong diagnostic: {error}"
     );
 }
 
