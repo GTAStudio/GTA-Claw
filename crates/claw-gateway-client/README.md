@@ -19,8 +19,9 @@ strict codec decision, and `claw-security` for device identity and signing.
 - Every authenticated lifecycle receives a monotonic process-local
   `ConnectionEpoch` unrelated to the untrusted server `connId`. Each lifecycle
   owns its bounded command sender and correlation map.
-- `AuthorizationExpectation::ExactRequested` rejects a hello before Ready unless
-  its effective role and scope set exactly match the configured request.
+- By default, `AuthorizationExpectation::ExactRequested` rejects a hello before
+  Ready unless its effective role and scope set exactly match the configured
+  request.
 - Event gaps, duplicates, regressions, and bounded queue saturation enter a typed
   resync-required terminal state.
 - Every command/event queue, cumulative outbound/event byte budget, serialization
@@ -47,9 +48,11 @@ or disconnected lifecycle returns `GatewayClientError::ConnectionChanged`; the
 request is never routed to the replacement connection or replayed.
 
 The convenient `request` methods atomically capture the current lifecycle and
-remain connection-bound. Set `authorization_expectation` to
-`AuthorizationExpectation::ExactRequested` when the effective hello
-authorization is part of the caller's security contract.
+remain connection-bound. Configurations require exact effective hello
+authorization by default. Set `authorization_expectation` to
+`AuthorizationExpectation::RequestedRole` only to opt into generic Gateway
+compatibility that accepts any closed effective scope set for the requested
+role.
 
 The local suite includes authenticated integration and regression cases,
 deterministic injected clock/jitter/barrier coverage, and a static
