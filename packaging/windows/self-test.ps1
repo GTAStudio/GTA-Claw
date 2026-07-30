@@ -544,7 +544,7 @@ channel = "1.96.0"
                 Name = 'package import failure'
                 Text = $packageCertificateWindow
                 Deletes = 1
-                Verifications = 1
+                Verifications = 2
             },
             @{
                 Name = 'package normal cleanup'
@@ -556,7 +556,7 @@ channel = "1.96.0"
                 Name = 'bundle import failure'
                 Text = $bundleCertificateWindow
                 Deletes = 1
-                Verifications = 1
+                Verifications = 2
             },
             @{
                 Name = 'bundle normal cleanup'
@@ -579,6 +579,7 @@ channel = "1.96.0"
             ).Count
             if ($deleteCount -ne $contract.Deletes -or
                 $verificationCount -ne $contract.Verifications -or
+                $contract.Text -notmatch '\$cleanupFailures' -or
                 $contract.Text -match 'Cert:.*SilentlyContinue') {
                 throw "Windows $($contract.Name) does not delete and verify every private key."
             }
@@ -590,8 +591,27 @@ channel = "1.96.0"
         }
         if ([regex]::Matches($workflow, '-DeleteKey').Count -ne 5 -or
             [regex]::Matches($workflow, 'cleanup-thumbprints=').Count -ne 2 -or
+            [regex]::Matches($workflow, '\$certificates = @\(Import-PfxCertificate').Count -ne 2 -or
             [regex]::Matches($workflow, 'Protected .* PFX must contain exactly one certificate').Count -ne 2) {
             throw 'Windows signing identity cleanup does not fail closed and delete private keys.'
+        }
+        foreach ($certificateWindow in @($packageCertificateWindow, $bundleCertificateWindow)) {
+            $retentionIndex = $certificateWindow.IndexOf('cleanup-thumbprints=')
+            $cardinalityIndex = $certificateWindow.IndexOf('$certificates.Count -ne 1')
+            if ($retentionIndex -lt 0 -or
+                $cardinalityIndex -lt 0 -or
+                $retentionIndex -ge $cardinalityIndex -or
+                [regex]::Matches($certificateWindow, 'Remove-ImportedCertificates').Count -lt 3) {
+                throw 'Windows import does not retain and exhaustively clean the full certificate set.'
+            }
+        }
+        $packageSignerReference =
+            '-CertificateThumbprint ''${{ steps.package-signing.outputs.thumbprint }}'''
+        $bundleSignerReference =
+            '-CertificateThumbprint ''${{ steps.bundle-signing.outputs.thumbprint }}'''
+        if (-not $packageCertificateWindow.Contains($packageSignerReference) -or
+            -not $bundleCertificateWindow.Contains($bundleSignerReference)) {
+            throw 'Windows sign steps do not consume their validated single-certificate outputs.'
         }
     }
     $signSource = [System.IO.File]::ReadAllText((Join-Path $scriptRoot 'sign.ps1'))

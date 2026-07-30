@@ -418,12 +418,22 @@ jobs:
               [Parameter(Mandatory)][string[]]$Thumbprints,
               [Parameter(Mandatory)][string]$Failure
             )
+            $cleanupFailures = @()
             foreach ($thumbprint in @($Thumbprints | Sort-Object -Unique)) {
               $certificatePath = "Cert:\CurrentUser\My\$thumbprint"
-              Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
               if (Test-Path -LiteralPath $certificatePath) {
-                throw $Failure
+                try {
+                  Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
+                } catch {
+                  $cleanupFailures += "$thumbprint`: $($_.Exception.Message)"
+                }
               }
+              if (Test-Path -LiteralPath $certificatePath) {
+                $cleanupFailures += "$thumbprint`: certificate path remains"
+              }
+            }
+            if ($cleanupFailures.Count -gt 0) {
+              throw "$Failure $($cleanupFailures -join '; ')"
             }
           }
           $pfx = Join-Path $env:RUNNER_TEMP 'gta-claw-signing.pfx'
@@ -443,36 +453,39 @@ jobs:
             ForEach-Object { $_.Thumbprint } |
             Where-Object { $_ -match '^[0-9A-Fa-f]{40}$' } |
             Sort-Object -Unique)
-          if ($cleanupThumbprints.Count -gt 0) {
-            "cleanup-thumbprints=$($cleanupThumbprints -join ',')" |
-              Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          }
-          if ($certificates.Count -ne 1 -or
-              $cleanupThumbprints.Count -ne $certificates.Count) {
+          try {
             if ($cleanupThumbprints.Count -gt 0) {
-              Remove-ImportedCertificates `
-                -Thumbprints $cleanupThumbprints `
-                -Failure 'Imported package certificate set remained after cleanup.'
+              "cleanup-thumbprints=$($cleanupThumbprints -join ',')" |
+                Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
             }
-            throw 'Protected package PFX must contain exactly one certificate.'
+            if ($certificates.Count -ne 1 -or
+                $cleanupThumbprints.Count -ne $certificates.Count) {
+              throw 'Protected package PFX must contain exactly one certificate.'
+            }
+            $certificate = $certificates[0]
+            if (-not $certificate.HasPrivateKey) {
+              throw 'Imported Windows certificate has no private key.'
+            }
+            if ($certificate.Subject -cne $env:EXPECTED_PUBLISHER) {
+              throw 'Imported Windows certificate subject differs from the reviewed publisher.'
+            }
+            "thumbprint=$($certificate.Thumbprint)" |
+              Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "publisher=$($certificate.Subject)" |
+              Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } catch {
+            $postImportError = $_
+            if ($cleanupThumbprints.Count -gt 0) {
+              try {
+                Remove-ImportedCertificates `
+                  -Thumbprints $cleanupThumbprints `
+                  -Failure 'Package certificate set remained after post-import failure.'
+              } catch {
+                throw "$($postImportError.Exception.Message) Cleanup also failed: $($_.Exception.Message)"
+              }
+            }
+            throw $postImportError
           }
-          $certificate = $certificates[0]
-          if (-not $certificate.HasPrivateKey) {
-            Remove-ImportedCertificates `
-              -Thumbprints $cleanupThumbprints `
-              -Failure 'Invalid package signing certificate or private key remained after cleanup.'
-            throw 'Imported Windows certificate has no private key.'
-          }
-          if ($certificate.Subject -cne $env:EXPECTED_PUBLISHER) {
-            Remove-ImportedCertificates `
-              -Thumbprints $cleanupThumbprints `
-              -Failure 'Wrong-subject package signing certificate or private key remained after cleanup.'
-            throw 'Imported Windows certificate subject differs from the reviewed publisher.'
-          }
-          "thumbprint=$($certificate.Thumbprint)" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "publisher=$($certificate.Subject)" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Sign only the reviewed package and portable candidates
         shell: pwsh
@@ -504,14 +517,22 @@ jobs:
               Where-Object { $_ -match '^[0-9A-Fa-f]{40}$' } |
               Sort-Object -Unique
           )
+          $cleanupFailures = @()
           foreach ($thumbprint in $thumbprints) {
             $certificatePath = "Cert:\CurrentUser\My\$thumbprint"
             if (Test-Path -LiteralPath $certificatePath) {
-              Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
+              try {
+                Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
+              } catch {
+                $cleanupFailures += "$thumbprint`: $($_.Exception.Message)"
+              }
             }
             if (Test-Path -LiteralPath $certificatePath) {
-              throw 'Package signing certificate or private key remained after cleanup.'
+              $cleanupFailures += "$thumbprint`: certificate path remains"
             }
+          }
+          if ($cleanupFailures.Count -gt 0) {
+            throw "Package signing certificate or private key cleanup failed: $($cleanupFailures -join '; ')"
           }
 
       - name: Assemble signed-inner bundle without signing identity
@@ -582,12 +603,22 @@ jobs:
               [Parameter(Mandatory)][string[]]$Thumbprints,
               [Parameter(Mandatory)][string]$Failure
             )
+            $cleanupFailures = @()
             foreach ($thumbprint in @($Thumbprints | Sort-Object -Unique)) {
               $certificatePath = "Cert:\CurrentUser\My\$thumbprint"
-              Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
               if (Test-Path -LiteralPath $certificatePath) {
-                throw $Failure
+                try {
+                  Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
+                } catch {
+                  $cleanupFailures += "$thumbprint`: $($_.Exception.Message)"
+                }
               }
+              if (Test-Path -LiteralPath $certificatePath) {
+                $cleanupFailures += "$thumbprint`: certificate path remains"
+              }
+            }
+            if ($cleanupFailures.Count -gt 0) {
+              throw "$Failure $($cleanupFailures -join '; ')"
             }
           }
           $pfx = Join-Path $env:RUNNER_TEMP 'gta-claw-bundle-signing.pfx'
@@ -607,29 +638,35 @@ jobs:
             ForEach-Object { $_.Thumbprint } |
             Where-Object { $_ -match '^[0-9A-Fa-f]{40}$' } |
             Sort-Object -Unique)
-          if ($cleanupThumbprints.Count -gt 0) {
-            "cleanup-thumbprints=$($cleanupThumbprints -join ',')" |
-              Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          }
-          if ($certificates.Count -ne 1 -or
-              $cleanupThumbprints.Count -ne $certificates.Count) {
+          try {
             if ($cleanupThumbprints.Count -gt 0) {
-              Remove-ImportedCertificates `
-                -Thumbprints $cleanupThumbprints `
-                -Failure 'Imported bundle certificate set remained after cleanup.'
+              "cleanup-thumbprints=$($cleanupThumbprints -join ',')" |
+                Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
             }
-            throw 'Protected bundle PFX must contain exactly one certificate.'
+            if ($certificates.Count -ne 1 -or
+                $cleanupThumbprints.Count -ne $certificates.Count) {
+              throw 'Protected bundle PFX must contain exactly one certificate.'
+            }
+            $certificate = $certificates[0]
+            if (-not $certificate.HasPrivateKey -or
+                $certificate.Subject -cne $env:EXPECTED_PUBLISHER) {
+              throw 'Protected bundle signing identity is invalid.'
+            }
+            "thumbprint=$($certificate.Thumbprint)" |
+              Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } catch {
+            $postImportError = $_
+            if ($cleanupThumbprints.Count -gt 0) {
+              try {
+                Remove-ImportedCertificates `
+                  -Thumbprints $cleanupThumbprints `
+                  -Failure 'Bundle certificate set remained after post-import failure.'
+              } catch {
+                throw "$($postImportError.Exception.Message) Cleanup also failed: $($_.Exception.Message)"
+              }
+            }
+            throw $postImportError
           }
-          $certificate = $certificates[0]
-          if (-not $certificate.HasPrivateKey -or
-              $certificate.Subject -cne $env:EXPECTED_PUBLISHER) {
-            Remove-ImportedCertificates `
-              -Thumbprints $cleanupThumbprints `
-              -Failure 'Invalid bundle signing certificate or private key remained after cleanup.'
-            throw 'Protected bundle signing identity is invalid.'
-          }
-          "thumbprint=$($certificate.Thumbprint)" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Sign only the reviewed bundle candidate
         shell: pwsh
@@ -658,14 +695,22 @@ jobs:
               Where-Object { $_ -match '^[0-9A-Fa-f]{40}$' } |
               Sort-Object -Unique
           )
+          $cleanupFailures = @()
           foreach ($thumbprint in $thumbprints) {
             $certificatePath = "Cert:\CurrentUser\My\$thumbprint"
             if (Test-Path -LiteralPath $certificatePath) {
-              Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
+              try {
+                Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
+              } catch {
+                $cleanupFailures += "$thumbprint`: $($_.Exception.Message)"
+              }
             }
             if (Test-Path -LiteralPath $certificatePath) {
-              throw 'Bundle signing certificate or private key remained after cleanup.'
+              $cleanupFailures += "$thumbprint`: certificate path remains"
             }
+          }
+          if ($cleanupFailures.Count -gt 0) {
+            throw "Bundle signing certificate or private key cleanup failed: $($cleanupFailures -join '; ')"
           }
 
       - name: Assemble and validate exact release publication bytes
@@ -927,16 +972,24 @@ jobs:
               Where-Object { $_ -match '^[0-9A-Fa-f]{40}$' } |
               Sort-Object -Unique
           )
+          $cleanupFailures = @()
           foreach ($thumbprint in $thumbprints) {
             if ($thumbprint -match '^[0-9A-Fa-f]{40}$') {
               $certificatePath = "Cert:\CurrentUser\My\$thumbprint"
               if (Test-Path -LiteralPath $certificatePath) {
-                Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
+                try {
+                  Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
+                } catch {
+                  $cleanupFailures += "$thumbprint`: $($_.Exception.Message)"
+                }
               }
               if (Test-Path -LiteralPath $certificatePath) {
-                throw 'Windows signing certificate or private key remained after final cleanup.'
+                $cleanupFailures += "$thumbprint`: certificate path remains"
               }
             }
+          }
+          if ($cleanupFailures.Count -gt 0) {
+            throw "Windows signing certificate or private key final cleanup failed: $($cleanupFailures -join '; ')"
           }
           foreach ($pfxName in @('gta-claw-signing.pfx', 'gta-claw-bundle-signing.pfx')) {
             Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP $pfxName) `
