@@ -258,6 +258,86 @@ fn a_symlinked_file_pointing_outside_the_root_is_refused() {
 }
 
 #[test]
+fn a_dangling_leaf_symlink_cannot_redirect_a_write() {
+    let (tree, sandbox) = workspace();
+    let target = tree.join("outside/not-created.txt");
+    let link = tree.join("workspace/dangling.txt");
+    if !try_symlink_file(&target, &link) {
+        return;
+    }
+    assert!(
+        fs::symlink_metadata(&link).is_ok(),
+        "the dangling link must exist for this to exercise the leaf"
+    );
+    let path = sandbox.relative("dangling.txt").expect("legal name");
+    for mode in [WriteMode::CreateNew, WriteMode::Overwrite] {
+        assert_eq!(
+            sandbox.write_file(&path, b"escaped", mode),
+            Err(SandboxError::SymlinkForbidden),
+            "{mode:?} must reject a dangling leaf link"
+        );
+        assert!(
+            fs::symlink_metadata(&target).is_err(),
+            "the refused write created the dangling link target"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_leaf_is_rejected_before_a_blocking_write_open() {
+    use std::process::Command;
+
+    let (tree, sandbox) = workspace();
+    let fifo = tree.join("workspace/pipe");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo")
+            .success(),
+        "create FIFO fixture"
+    );
+    let path = sandbox.relative("pipe").expect("legal name");
+    assert_eq!(
+        sandbox.write_file(&path, b"must not block", WriteMode::Overwrite),
+        Err(SandboxError::NotAFile)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_regular_read_leaf_replaced_by_a_fifo_is_rejected_after_open() {
+    use std::process::Command;
+
+    let (tree, sandbox) = workspace();
+    let leaf = tree.join("workspace/raced");
+    fs::write(&leaf, b"regular").expect("create regular fixture");
+    let path = sandbox.relative("raced").expect("legal name");
+    let resolved = sandbox
+        .resolve_file(&path)
+        .expect("resolve the initial regular file");
+
+    fs::remove_file(&leaf).expect("remove the resolved regular file");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&leaf)
+            .status()
+            .expect("run mkfifo")
+            .success(),
+        "replace the resolved leaf with a FIFO"
+    );
+
+    assert!(
+        matches!(
+            sandbox.open_no_follow(&resolved),
+            Err(SandboxError::NotAFile)
+        ),
+        "the nonblocking open must classify the raced handle before any read"
+    );
+}
+
+#[test]
 fn a_symlinked_directory_in_the_middle_of_a_path_is_refused() {
     let (tree, sandbox) = workspace();
     let created = try_symlink_dir(&tree.join("outside"), &tree.join("workspace/bridge"));

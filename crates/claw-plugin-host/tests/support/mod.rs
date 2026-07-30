@@ -302,6 +302,47 @@ pub fn probe_component_calling_during_deactivate() -> Vec<u8> {
     wat::parse_str(&text).expect("the deactivate fixture must assemble")
 }
 
+/// Assembles a probe whose `deactivate` export returns an ABI error.
+#[must_use]
+pub fn probe_component_failing_deactivate() -> Vec<u8> {
+    let source = probe_wat_lf();
+    let original = concat!(
+        "    (func (export \"deactivate\") (result i32)\n",
+        "      (i32.store8 (i32.const 192) (i32.const 0))\n",
+        "      (i32.const 192))\n",
+    );
+    let replacement = concat!(
+        "    (func (export \"deactivate\") (result i32)\n",
+        "      (i32.store8 (i32.const 192) (i32.const 1))\n",
+        "      (i32.store8 (i32.const 196) (i32.const 0))\n",
+        "      (i32.store (i32.const 200) (i32.const 1136))\n",
+        "      (i32.store (i32.const 204) (i32.const 13))\n",
+        "      (i32.const 192))\n",
+    );
+    let text = source.replacen(original, replacement, 1);
+    assert_ne!(text, source, "the deactivation error must be inserted");
+    wat::parse_str(&text).expect("the deactivation-error fixture must assemble")
+}
+
+/// Assembles a probe whose `deactivate` export never returns on its own.
+#[must_use]
+pub fn probe_component_spinning_on_deactivate() -> Vec<u8> {
+    let source = probe_wat_lf();
+    let original = concat!(
+        "    (func (export \"deactivate\") (result i32)\n",
+        "      (i32.store8 (i32.const 192) (i32.const 0))\n",
+        "      (i32.const 192))\n",
+    );
+    let replacement = concat!(
+        "    (func (export \"deactivate\") (result i32)\n",
+        "      (loop $deactivate-spin (br $deactivate-spin))\n",
+        "      (i32.const 192))\n",
+    );
+    let text = source.replacen(original, replacement, 1);
+    assert_ne!(text, source, "the deactivation loop must be inserted");
+    wat::parse_str(&text).expect("the spinning-deactivation fixture must assemble")
+}
+
 /// Assembles a probe component that registers `count` distinct tools.
 ///
 /// Names are `ta`, `tb`, ... so a quota of *n* can be tested by asking for more

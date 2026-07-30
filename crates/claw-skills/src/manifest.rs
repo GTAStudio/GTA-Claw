@@ -5,17 +5,19 @@ use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::value::RawValue;
 
-use crate::schema::{SchemaError, validate_schema};
+use crate::schema::{
+    ExactJsonDocument, ExactSchemaDocumentError, SchemaError, ValidationLimits,
+    validate_schema_with_exact,
+};
 
 /// A validated modern skill manifest.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SkillManifest {
     id: String,
     description: String,
-    parameters: Value,
+    parameters: ExactJsonDocument,
     execution: SkillExecution,
 }
 
@@ -32,9 +34,9 @@ impl SkillManifest {
         &self.description
     }
 
-    /// Returns the parameter JSON Schema.
+    /// Returns the exact parameter JSON Schema enforced by the runtime.
     #[must_use]
-    pub const fn parameters(&self) -> &Value {
+    pub const fn parameters(&self) -> &ExactJsonDocument {
         &self.parameters
     }
 
@@ -51,7 +53,9 @@ impl SkillManifest {
         if self.description.trim().is_empty() {
             return Err(ManifestError::EmptyDescription);
         }
-        validate_schema(&self.parameters).map_err(ManifestError::InvalidParameterSchema)?;
+        let (parameters, exact_parameters) = self.parameters.parts();
+        validate_schema_with_exact(parameters, exact_parameters, ValidationLimits::default())
+            .map_err(ManifestError::InvalidParameterSchema)?;
         self.execution.validate()
     }
 }
@@ -117,13 +121,12 @@ pub struct HttpSkillDefinition {
 
 impl HttpSkillDefinition {
     fn validate(&self) -> Result<(), ManifestError> {
-        let remainder = self
-            .url
-            .strip_prefix("https://")
-            .or_else(|| self.url.strip_prefix("http://"))
-            .ok_or(ManifestError::InvalidHttpUrl)?;
-        let authority = remainder.split('/').next().unwrap_or_default();
-        if authority.is_empty() || authority.contains('@') || self.url.chars().any(char::is_control)
+        let parsed = url::Url::parse(&self.url).map_err(|_| ManifestError::InvalidHttpUrl)?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || self.url.chars().any(char::is_control)
         {
             return Err(ManifestError::InvalidHttpUrl);
         }
@@ -264,14 +267,39 @@ pub enum ManifestError {
 /// [`ManifestError::InvalidWasmTarget`] for an invalid plugin identifier or
 /// export name.
 pub fn load_manifest(json: &str) -> Result<SkillManifest, ManifestError> {
-    let manifest: SkillManifest =
+    let raw: RawSkillManifest<'_> =
         serde_json::from_str(json).map_err(|error| ManifestError::MalformedJson {
             line: error.line(),
             column: error.column(),
             message: error.to_string(),
         })?;
+    let parameters = ExactJsonDocument::parse_schema(raw.parameters, ValidationLimits::default())
+        .map_err(|error| match error {
+        ExactSchemaDocumentError::Json(error) => ManifestError::MalformedJson {
+            line: error.line(),
+            column: error.column(),
+            message: error.to_string(),
+        },
+        ExactSchemaDocumentError::Schema(error) => ManifestError::InvalidParameterSchema(error),
+    })?;
+    let manifest = SkillManifest {
+        id: raw.id,
+        description: raw.description,
+        parameters,
+        execution: raw.execution,
+    };
     manifest.validate()?;
     Ok(manifest)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSkillManifest<'a> {
+    id: String,
+    description: String,
+    #[serde(borrow)]
+    parameters: &'a RawValue,
+    execution: SkillExecution,
 }
 
 impl Display for ManifestError {

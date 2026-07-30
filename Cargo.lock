@@ -618,6 +618,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]
@@ -625,10 +626,18 @@ name = "claw-tools"
 version = "0.1.0"
 dependencies = [
  "claw-security",
+ "claw-windows-handle-dir",
  "libc",
  "rustix",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "claw-windows-handle-dir"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

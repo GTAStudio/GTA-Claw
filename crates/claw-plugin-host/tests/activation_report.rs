@@ -49,12 +49,16 @@ impl CancellingTools {
 }
 
 impl ToolSink for CancellingTools {
-    fn register(&self, registration: ToolRegistration) {
+    fn register(
+        &self,
+        registration: ToolRegistration,
+    ) -> Result<(), claw_plugin_host::ToolRegistrationError> {
         self.registrations.fetch_add(1, Ordering::AcqRel);
-        self.recorder.register(registration);
+        self.recorder.register(registration)?;
         if let Some(cancellation) = &self.cancellation {
             cancellation.cancel();
         }
+        Ok(())
     }
 
     fn unregister(&self, plugin_id: &str, name: &str) -> bool {

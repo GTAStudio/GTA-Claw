@@ -11,7 +11,9 @@ use serde_json::Value;
 use crate::manifest::{
     HttpMethod, HttpParameterEncoding, HttpResponseMode, SkillExecution, SkillManifest,
 };
-use crate::schema::{ParameterValidationError, validate_parameters};
+use crate::schema::{
+    ExactJsonDocument, ParameterValidationError, validate_parameters_with_exact_schema,
+};
 
 const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
 
@@ -343,6 +345,20 @@ impl<'a> SkillRuntime<'a> {
         manifest: &SkillManifest,
         parameters: Value,
     ) -> Result<Value, SkillExecutionError> {
+        self.execute_inner(manifest, parameters.into(), None)
+    }
+
+    /// Validates and executes parameters parsed with their exact JSON number
+    /// lexemes retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns every error documented by [`SkillRuntime::execute`].
+    pub fn execute_exact(
+        &mut self,
+        manifest: &SkillManifest,
+        parameters: ExactJsonDocument,
+    ) -> Result<Value, SkillExecutionError> {
         self.execute_inner(manifest, parameters, None)
     }
 
@@ -363,13 +379,13 @@ impl<'a> SkillRuntime<'a> {
         parameters: Value,
         cancellation: &CancellationToken,
     ) -> Result<Value, SkillExecutionError> {
-        self.execute_inner(manifest, parameters, Some(cancellation))
+        self.execute_inner(manifest, parameters.into(), Some(cancellation))
     }
 
     fn execute_inner(
         &mut self,
         manifest: &SkillManifest,
-        parameters: Value,
+        parameters: ExactJsonDocument,
         cancellation: Option<&CancellationToken>,
     ) -> Result<Value, SkillExecutionError> {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -378,26 +394,33 @@ impl<'a> SkillRuntime<'a> {
         manifest
             .validate()
             .map_err(SkillExecutionError::InvalidManifest)?;
-        validate_parameters(manifest.parameters(), &parameters)
+        let (schema, exact_schema) = manifest.parameters().parts();
+        validate_parameters_with_exact_schema(schema, exact_schema, &parameters)
             .map_err(SkillExecutionError::InvalidParameters)?;
         match manifest.execution() {
-            SkillExecution::Native { handler } => self.native.execute(handler, parameters),
+            SkillExecution::Native { handler } => self.native.execute(
+                handler,
+                parameters
+                    .into_value()
+                    .ok_or(SkillExecutionError::ParameterEncoding)?,
+            ),
             SkillExecution::Http { request } => {
                 let mut headers = request.headers.clone();
-                let encoded = serde_json::to_vec(&parameters)
+                let mut url = url::Url::parse(&request.url)
+                    .expect("the HTTP URL was validated immediately before request construction");
+                let encoded = parameters
+                    .to_json_vec()
                     .map_err(|_| SkillExecutionError::ParameterEncoding)?;
                 let (url, body) = match &request.parameters {
                     HttpParameterEncoding::JsonBody => {
                         headers.insert("content-type".to_owned(), "application/json".to_owned());
-                        (request.url.clone(), encoded)
+                        (url.into(), encoded)
                     }
                     HttpParameterEncoding::QueryParameter { name } => {
                         let encoded = String::from_utf8(encoded)
                             .map_err(|_| SkillExecutionError::ParameterEncoding)?;
-                        (
-                            append_query_parameter(&request.url, name, &encoded),
-                            Vec::new(),
-                        )
+                        append_query_parameter(&mut url, name, &encoded);
+                        (url.into(), Vec::new())
                     }
                 };
                 let response = self
@@ -416,7 +439,9 @@ impl<'a> SkillRuntime<'a> {
                 .invoke(WasmSkillInvocation {
                     plugin_id,
                     tool: export,
-                    parameters,
+                    parameters: parameters
+                        .into_value()
+                        .ok_or(SkillExecutionError::ParameterEncoding)?,
                     cancellation,
                 })
                 .map_err(SkillExecutionError::WasmHost),
@@ -424,13 +449,13 @@ impl<'a> SkillRuntime<'a> {
     }
 }
 
-fn append_query_parameter(url: &str, name: &str, value: &str) -> String {
-    let separator = if url.contains('?') { '&' } else { '?' };
-    format!(
-        "{url}{separator}{}={}",
-        percent_encode(name),
-        percent_encode(value)
-    )
+fn append_query_parameter(url: &mut url::Url, name: &str, value: &str) {
+    let encoded_pair = format!("{}={}", percent_encode(name), percent_encode(value));
+    let query = url.query().map_or_else(
+        || encoded_pair.clone(),
+        |existing| format!("{existing}&{encoded_pair}"),
+    );
+    url.set_query(Some(&query));
 }
 
 fn percent_encode(value: &str) -> String {
