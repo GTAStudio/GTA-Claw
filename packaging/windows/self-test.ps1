@@ -596,13 +596,64 @@ channel = "1.96.0"
             throw 'Windows signing identity cleanup does not fail closed and delete private keys.'
         }
         foreach ($certificateWindow in @($packageCertificateWindow, $bundleCertificateWindow)) {
+            $derivationIndex = $certificateWindow.IndexOf('$cleanupThumbprints = @(')
             $retentionIndex = $certificateWindow.IndexOf('cleanup-thumbprints=')
             $cardinalityIndex = $certificateWindow.IndexOf('$certificates.Count -ne 1')
-            if ($retentionIndex -lt 0 -or
+            $signerOutputIndex = $certificateWindow.IndexOf('"thumbprint=$($certificate.Thumbprint)"')
+            $postImportTryIndex = $certificateWindow.IndexOf('try {', $derivationIndex)
+            $cleanupCatchIndex = $certificateWindow.IndexOf('$postImportError = $_')
+            $cleanupCallIndex = $certificateWindow.LastIndexOf('Remove-ImportedCertificates')
+            $cleanupLoopIndex = $certificateWindow.IndexOf(
+                'foreach ($thumbprint in @($Thumbprints | Sort-Object -Unique))'
+            )
+            $cleanupAggregateIndex = $certificateWindow.IndexOf(
+                'if ($cleanupFailures.Count -gt 0)'
+            )
+            if ($derivationIndex -lt 0 -or
+                $postImportTryIndex -le $derivationIndex -or
+                $retentionIndex -le $postImportTryIndex -or
                 $cardinalityIndex -lt 0 -or
                 $retentionIndex -ge $cardinalityIndex -or
-                [regex]::Matches($certificateWindow, 'Remove-ImportedCertificates').Count -lt 3) {
+                $signerOutputIndex -le $cardinalityIndex -or
+                $cleanupCatchIndex -le $signerOutputIndex -or
+                $cleanupCallIndex -le $cleanupCatchIndex -or
+                $cleanupLoopIndex -lt 0 -or
+                $cleanupAggregateIndex -le $cleanupLoopIndex -or
+                [regex]::Matches($certificateWindow, 'Remove-ImportedCertificates').Count -ne 2 -or
+                $certificateWindow -notmatch '\$cleanupThumbprints = @\(\$certificates \|' -or
+                $certificateWindow -notmatch 'ForEach-Object \{ \$_\.Thumbprint \}' -or
+                $certificateWindow -notmatch 'Sort-Object -Unique' -or
+                $certificateWindow -notmatch 'throw \$postImportError') {
                 throw 'Windows import does not retain and exhaustively clean the full certificate set.'
+            }
+            $packageCleanupReference =
+                '${{ steps.package-signing.outputs.cleanup-thumbprints }}'
+            $bundleCleanupReference =
+                '${{ steps.bundle-signing.outputs.cleanup-thumbprints }}'
+            if (-not $packageCleanupWindow.Contains($packageCleanupReference) -or
+                -not $bundleCleanupWindow.Contains($bundleCleanupReference) -or
+                -not $finalCleanupWindow.Contains($packageCleanupReference) -or
+                -not $finalCleanupWindow.Contains($bundleCleanupReference)) {
+                throw 'Windows cleanup phases do not consume every retained certificate set.'
+            }
+            foreach ($cleanupWindow in @(
+                $packageCleanupWindow,
+                $bundleCleanupWindow,
+                $finalCleanupWindow
+            )) {
+                $cleanupLoopIndex = $cleanupWindow.IndexOf('foreach ($thumbprint in $thumbprints)')
+                $cleanupAggregateIndex = $cleanupWindow.IndexOf('if ($cleanupFailures.Count -gt 0)')
+                if ($cleanupLoopIndex -lt 0 -or
+                    $cleanupAggregateIndex -le $cleanupLoopIndex) {
+                    throw 'Windows cleanup can fail before attempting every retained certificate.'
+                }
+                $cleanupLoopBody = $cleanupWindow.Substring(
+                    $cleanupLoopIndex,
+                    $cleanupAggregateIndex - $cleanupLoopIndex
+                )
+                if ($cleanupLoopBody -match '(?m)^\s*throw\b') {
+                    throw 'Windows cleanup throws before processing the complete retained set.'
+                }
             }
         }
         $packageSignerReference =
@@ -610,7 +661,10 @@ channel = "1.96.0"
         $bundleSignerReference =
             '-CertificateThumbprint ''${{ steps.bundle-signing.outputs.thumbprint }}'''
         if (-not $packageCertificateWindow.Contains($packageSignerReference) -or
-            -not $bundleCertificateWindow.Contains($bundleSignerReference)) {
+            -not $bundleCertificateWindow.Contains($bundleSignerReference) -or
+            [regex]::Matches($workflow, '-CertificateThumbprint').Count -ne 2 -or
+            [regex]::Matches($workflow, [regex]::Escape($packageSignerReference)).Count -ne 1 -or
+            [regex]::Matches($workflow, [regex]::Escape($bundleSignerReference)).Count -ne 1) {
             throw 'Windows sign steps do not consume their validated single-certificate outputs.'
         }
     }
