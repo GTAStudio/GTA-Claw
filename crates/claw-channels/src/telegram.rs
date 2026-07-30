@@ -633,6 +633,9 @@ fn classify_response(
     match response.status() {
         200..=299 => Ok(()),
         401 | 403 => Err(ChannelError::Authentication),
+        408 => Err(ChannelError::Transport(
+            claw_channel_sdk::TransportErrorKind::Timeout,
+        )),
         429 => {
             response.require_bounded()?;
             let body_retry_after = serde_json::from_slice::<TelegramErrorEnvelope>(response.body())

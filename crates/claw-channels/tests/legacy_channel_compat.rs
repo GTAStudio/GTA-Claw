@@ -273,6 +273,48 @@ fn telegram_uses_json_retry_after_when_a_429_has_no_header() {
     );
 }
 
+#[test]
+fn telegram_running_poll_retries_http_408_as_timeout() {
+    let poll_offsets = Rc::new(RefCell::new(Vec::new()));
+    let transport = TelegramFixture {
+        polls: VecDeque::from([
+            Ok(ProviderResponse::new(408, Vec::new())),
+            Ok(ProviderResponse::new(
+                200,
+                br#"{"ok":true,"result":[]}"#.as_slice(),
+            )),
+        ]),
+        poll_offsets: Rc::clone(&poll_offsets),
+        sent: Rc::new(RefCell::new(Vec::new())),
+        debug: Rc::new(RefCell::new(Vec::new())),
+    };
+    let mut channel = TelegramChannel::new(
+        ACCOUNT,
+        approved_origin("telegram", "api.telegram.org"),
+        transport,
+        FixedClock(999),
+        NonZeroUsize::new(1).expect("non-zero capacity"),
+        Duration::from_millis(250),
+    )
+    .expect("Telegram adapter");
+    let credential = token_credential("telegram", "api.telegram.org", "telegram-secret");
+    channel.start(&mut ()).expect("started");
+
+    assert_eq!(
+        channel.poll_once(&credential, &mut ()),
+        Err(ChannelError::Transport(TransportErrorKind::Timeout))
+    );
+    assert_eq!(channel.state(), ConnectionState::Connected);
+    assert_eq!(
+        channel
+            .poll_once(&credential, &mut ())
+            .expect("next poll recovers")
+            .updates,
+        0
+    );
+    assert_eq!(*poll_offsets.borrow(), [None, None]);
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GatewayRecord {
     opcode: u8,
@@ -293,6 +335,10 @@ struct DiscordFixture {
 }
 
 impl DiscordTransport for DiscordFixture {
+    fn gateway_url_allowed(&self, _gateway_url: &str) -> bool {
+        true
+    }
+
     fn open_gateway(&mut self, gateway_url: &str) -> Result<(), ChannelError> {
         self.open_urls.borrow_mut().push(gateway_url.to_owned());
         self.opens.set(self.opens.get() + 1);

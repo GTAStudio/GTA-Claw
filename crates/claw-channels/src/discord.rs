@@ -318,6 +318,13 @@ impl Debug for DiscordCreateMessageRequest<'_> {
 
 /// Daemon-owned Discord WebSocket and REST transport.
 pub trait DiscordTransport {
+    /// Returns whether the reviewed WebSocket transport may open this URL.
+    ///
+    /// Implementations that cannot route WebSocket connections through a configured proxy
+    /// must return `false` when policy does not permit a direct connection.
+    #[must_use]
+    fn gateway_url_allowed(&self, gateway_url: &str) -> bool;
+
     /// Starts opening the configured Gateway URL.
     ///
     /// # Errors
@@ -956,7 +963,8 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
                 self.session_id = Some(ready.session_id.to_owned());
                 self.resume_gateway_url = ready
                     .resume_gateway_url
-                    .and_then(|url| validated_resume_gateway_url(url, &self.gateway_origin));
+                    .and_then(|url| validated_resume_gateway_url(url, &self.gateway_origin))
+                    .filter(|url| self.transport.gateway_url_allowed(url));
                 self.phase = DiscordGatewayPhase::Ready;
                 self.reconnect_attempts = 0;
                 Ok(DiscordPacketOutcome::Ready)
