@@ -121,6 +121,75 @@ fn manifest_rejects_unrepresentable_exact_length_bounds() {
 }
 
 #[test]
+fn manifest_schema_preflight_rejects_limits_before_exact_tree_construction() {
+    let wide_enum = std::iter::repeat_n("0", 4_096)
+        .collect::<Vec<_>>()
+        .join(",");
+    let wide_manifest = format!(
+        r#"{{
+            "id":"wide-schema",
+            "description":"Reject before cloning a wide schema.",
+            "parameters":{{"enum":[{wide_enum}]}},
+            "execution":{{"kind":"native","handler":"echo"}}
+        }}"#
+    );
+    assert!(matches!(
+        load_manifest(&wide_manifest),
+        Err(ManifestError::InvalidParameterSchema(error))
+            if error.kind == SchemaErrorKind::ResourceLimit
+    ));
+
+    let mut deep_schema = "{}".to_owned();
+    for _ in 0..64 {
+        deep_schema = format!(r#"{{"type":"array","items":{deep_schema}}}"#);
+    }
+    let deep_manifest = format!(
+        r#"{{
+            "id":"deep-schema",
+            "description":"Reject before recursively cloning a deep schema.",
+            "parameters":{deep_schema},
+            "execution":{{"kind":"native","handler":"echo"}}
+        }}"#
+    );
+    assert!(matches!(
+        load_manifest(&deep_manifest),
+        Err(ManifestError::InvalidParameterSchema(error))
+            if error.kind == SchemaErrorKind::ResourceLimit
+    ));
+
+    let long_name = "x".repeat(1_024);
+    let long_path_manifest = format!(
+        r#"{{
+            "id":"long-schema-path",
+            "description":"Reject before allocating an overlong schema path.",
+            "parameters":{{"type":"object","properties":{{"{long_name}":{{}}}}}},
+            "execution":{{"kind":"native","handler":"echo"}}
+        }}"#
+    );
+    assert!(matches!(
+        load_manifest(&long_path_manifest),
+        Err(ManifestError::InvalidParameterSchema(error))
+            if error.kind == SchemaErrorKind::ResourceLimit
+                && error.path == "$"
+    ));
+
+    let huge_number = "9".repeat(4_097);
+    let huge_number_manifest = format!(
+        r#"{{
+            "id":"huge-schema-number",
+            "description":"Reject an over-budget numeric lexeme before exact parsing.",
+            "parameters":{{"minimum":{huge_number}}},
+            "execution":{{"kind":"native","handler":"echo"}}
+        }}"#
+    );
+    assert!(matches!(
+        load_manifest(&huge_number_manifest),
+        Err(ManifestError::InvalidParameterSchema(error))
+            if error.kind == SchemaErrorKind::ResourceLimit
+    ));
+}
+
+#[test]
 fn exact_parameters_validate_and_encode_without_rounding() {
     let manifest = load_manifest(
         r#"{
@@ -143,6 +212,20 @@ fn exact_parameters_validate_and_encode_without_rounding() {
         }"#,
     )
     .expect("valid exact-number manifest");
+    assert_eq!(
+        manifest
+            .parameters()
+            .to_json_vec()
+            .expect("serialize the public exact schema"),
+        br#"{"type":"object","properties":{"value":{"type":"number","minimum":9007199254740993.0}},"required":["value"],"additionalProperties":false}"#
+    );
+    assert!(
+        manifest.parameters().value().is_none(),
+        "the public schema must not expose a rounded serde_json::Value"
+    );
+    let public_debug = format!("{:?}", manifest.parameters());
+    assert!(public_debug.contains("9007199254740993.0"));
+    assert!(!public_debug.contains("Number(0)"));
     let native_manifest = load_manifest(
         r#"{
             "id":"exact-native",

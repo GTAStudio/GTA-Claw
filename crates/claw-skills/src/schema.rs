@@ -75,7 +75,7 @@ impl Default for ValidationLimits {
 
 /// A JSON document that retains every original number lexeme for exact schema
 /// comparison without changing workspace-wide `serde_json` behavior.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ExactJsonDocument {
     value: Value,
     exact: ExactNode,
@@ -89,13 +89,47 @@ impl ExactJsonDocument {
     ///
     /// Returns the underlying JSON syntax or value error.
     pub fn parse(json: &str) -> Result<Self, serde_json::Error> {
-        let raw: Box<RawValue> = serde_json::from_str(json)?;
-        let (value, exact, lossless_value) = ExactNode::parse_document(raw.get())?;
-        Ok(Self {
-            value,
-            exact,
-            lossless_value,
+        let raw: &RawValue = serde_json::from_str(json)?;
+        let limits = RawJsonLimits {
+            max_nodes: DEFAULT_MAX_INPUT_NODES.get(),
+            max_depth: DEFAULT_MAX_DEPTH.get(),
+            max_path_bytes: DEFAULT_MAX_PATH_BYTES.get(),
+            reject_unbounded_numbers: false,
+            track_paths: true,
+        };
+        Self::parse_bounded(raw, limits).map_err(|error| match error {
+            ExactSchemaDocumentError::Json(error) => error,
+            ExactSchemaDocumentError::Schema(error) => {
+                <serde_json::Error as serde::de::Error>::custom(format!(
+                    "exact JSON resource limit at {}",
+                    error.path
+                ))
+            }
         })
+    }
+
+    pub(crate) fn parse_schema(
+        raw: &RawValue,
+        limits: ValidationLimits,
+    ) -> Result<Self, ExactSchemaDocumentError> {
+        Self::parse_bounded(
+            raw,
+            RawJsonLimits {
+                max_nodes: limits.max_schema_nodes.get(),
+                max_depth: limits.max_depth.get(),
+                max_path_bytes: limits.max_path_bytes.get(),
+                reject_unbounded_numbers: true,
+                track_paths: true,
+            },
+        )
+    }
+
+    fn parse_bounded(
+        raw: &RawValue,
+        limits: RawJsonLimits,
+    ) -> Result<Self, ExactSchemaDocumentError> {
+        preflight_raw_json(raw.get(), limits).map_err(ExactSchemaDocumentError::Schema)?;
+        ExactNode::parse_document_bounded(raw, limits)
     }
 
     /// Returns the ordinary JSON value when every exact number is representable
@@ -112,14 +146,30 @@ impl ExactJsonDocument {
         self.lossless_value.then_some(self.value)
     }
 
-    pub(crate) fn to_json_vec(&self) -> Result<Vec<u8>, serde_json::Error> {
+    /// Serializes the exact document without rounding retained number lexemes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error if a retained string cannot be serialized.
+    pub fn to_json_vec(&self) -> Result<Vec<u8>, serde_json::Error> {
         let mut output = Vec::new();
         write_exact_json(&self.value, &self.exact, &mut output)?;
         Ok(output)
     }
 
-    pub(crate) fn into_parts(self) -> (Value, ExactNode) {
-        (self.value, self.exact)
+    pub(crate) const fn parts(&self) -> (&Value, &ExactNode) {
+        (&self.value, &self.exact)
+    }
+}
+
+impl fmt::Debug for ExactJsonDocument {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let json = self.to_json_vec().map_err(|_| fmt::Error)?;
+        let json = std::str::from_utf8(&json).map_err(|_| fmt::Error)?;
+        formatter
+            .debug_struct("ExactJsonDocument")
+            .field("json", &json)
+            .finish()
     }
 }
 
@@ -132,6 +182,11 @@ impl From<Value> for ExactJsonDocument {
             lossless_value: true,
         }
     }
+}
+
+pub(crate) enum ExactSchemaDocumentError {
+    Json(serde_json::Error),
+    Schema(SchemaError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -174,71 +229,339 @@ impl ExactNumber {
 }
 
 impl ExactNode {
-    fn parse_document(json: &str) -> Result<(Value, Self, bool), serde_json::Error> {
-        let raw = json.trim();
-        match raw.as_bytes().first() {
-            Some(b'{') => {
-                let RawObject(entries) = serde_json::from_str(raw)?;
-                let mut object = Map::with_capacity(entries.len());
-                let mut exact = BTreeMap::new();
-                let mut lossless_by_name = BTreeMap::new();
-                for (name, raw_value) in entries {
-                    let (child_value, child_exact, child_lossless) =
-                        Self::parse_document(raw_value.get())?;
-                    object.insert(name.clone(), child_value);
-                    exact.insert(name.clone(), child_exact);
-                    lossless_by_name.insert(name, child_lossless);
-                }
-                let lossless = lossless_by_name.values().all(|lossless| *lossless);
-                Ok((Value::Object(object), Self::Object(exact), lossless))
-            }
-            Some(b'[') => {
-                let entries: Vec<Box<RawValue>> = serde_json::from_str(raw)?;
-                let mut array = Vec::with_capacity(entries.len());
-                let mut exact = Vec::with_capacity(entries.len());
-                let mut lossless = true;
-                for raw_value in entries {
-                    let (child_value, child_exact, child_lossless) =
-                        Self::parse_document(raw_value.get())?;
-                    lossless &= child_lossless;
-                    array.push(child_value);
-                    exact.push(child_exact);
-                }
-                Ok((Value::Array(array), Self::Array(exact), lossless))
-            }
-            Some(b'-' | b'0'..=b'9') => {
-                let exact = ExactNumber::new(raw.to_owned());
-                let (value, representable) = serde_json::from_str(raw).map_or_else(
-                    |_| (Value::from(0), false),
-                    |value: Value| {
-                        let representable = value.as_number().is_some_and(|number| {
-                            let normalized = ExactNumber::new(number.to_string());
-                            exact
-                                .decimal()
-                                .zip(normalized.decimal())
-                                .is_some_and(|(left, right)| left == right)
-                        });
-                        (value, representable)
-                    },
-                );
-                Ok((value, Self::Number(exact), representable))
-            }
-            Some(_) | None => Ok((serde_json::from_str(raw)?, Self::Other, true)),
-        }
+    pub(crate) fn from_value(value: &Value) -> Self {
+        Self::from_value_with_limits(value, None)
+            .expect("unbounded exact-node construction cannot reach a resource limit")
     }
 
-    pub(crate) fn from_value(value: &Value) -> Self {
-        match value {
-            Value::Number(number) => Self::Number(ExactNumber::new(number.to_string())),
-            Value::Array(values) => Self::Array(values.iter().map(Self::from_value).collect()),
-            Value::Object(values) => Self::Object(
-                values
-                    .iter()
-                    .map(|(name, value)| (name.clone(), Self::from_value(value)))
-                    .collect(),
-            ),
-            Value::Null | Value::Bool(_) | Value::String(_) => Self::Other,
+    fn from_value_bounded(value: &Value, limits: RawJsonLimits) -> Result<Self, SchemaError> {
+        Self::from_value_with_limits(value, Some(limits))
+    }
+
+    fn from_value_with_limits(
+        value: &Value,
+        limits: Option<RawJsonLimits>,
+    ) -> Result<Self, SchemaError> {
+        enum Frame<'a> {
+            Visit {
+                value: &'a Value,
+                depth: usize,
+                path: Option<String>,
+            },
+            Array {
+                values: &'a [Value],
+                next_index: usize,
+                depth: usize,
+                path: Option<String>,
+                output_start: usize,
+            },
+            Object {
+                values: serde_json::map::Iter<'a>,
+                names: Vec<String>,
+                depth: usize,
+                path: Option<String>,
+                output_start: usize,
+            },
         }
+
+        let mut remaining_nodes = limits.map_or(usize::MAX, |limits| limits.max_nodes);
+        let mut frames = vec![Frame::Visit {
+            value,
+            depth: 0,
+            path: limits.and_then(|limits| limits.track_paths.then(|| "$".to_owned())),
+        }];
+        let mut output = Vec::new();
+        while let Some(frame) = frames.pop() {
+            match frame {
+                Frame::Visit { value, depth, path } => {
+                    if let Some(limits) = limits {
+                        if depth >= limits.max_depth || remaining_nodes == 0 {
+                            return Err(resource_limit(path.unwrap_or_else(|| "$".to_owned())));
+                        }
+                        remaining_nodes -= 1;
+                    }
+                    match value {
+                        Value::Number(number) => {
+                            let raw = number.to_string();
+                            if limits.is_some() && raw.len() > MAX_NUMBER_LEXEME_BYTES {
+                                return Err(resource_limit(path.unwrap_or_else(|| "$".to_owned())));
+                            }
+                            let exact = ExactNumber::new(raw);
+                            if limits.is_some_and(|limits| limits.reject_unbounded_numbers)
+                                && exact.decimal().is_none()
+                            {
+                                return Err(resource_limit(path.unwrap_or_else(|| "$".to_owned())));
+                            }
+                            output.push(Self::Number(exact));
+                        }
+                        Value::Array(values) => frames.push(Frame::Array {
+                            values,
+                            next_index: 0,
+                            depth,
+                            path,
+                            output_start: output.len(),
+                        }),
+                        Value::Object(values) => {
+                            let capacity =
+                                limits.map_or(values.len(), |_| values.len().min(remaining_nodes));
+                            frames.push(Frame::Object {
+                                values: values.iter(),
+                                names: Vec::with_capacity(capacity),
+                                depth,
+                                path,
+                                output_start: output.len(),
+                            });
+                        }
+                        Value::Null | Value::Bool(_) | Value::String(_) => {
+                            output.push(Self::Other);
+                        }
+                    }
+                }
+                Frame::Array {
+                    values,
+                    next_index,
+                    depth,
+                    path,
+                    output_start,
+                } => {
+                    if let Some(value) = values.get(next_index) {
+                        let child_path = bounded_build_path(
+                            path.as_deref(),
+                            &["[", &next_index.to_string(), "]"],
+                            limits,
+                        );
+                        frames.push(Frame::Array {
+                            values,
+                            next_index: next_index + 1,
+                            depth,
+                            path,
+                            output_start,
+                        });
+                        frames.push(Frame::Visit {
+                            value,
+                            depth: depth + 1,
+                            path: child_path,
+                        });
+                    } else {
+                        let children = output.split_off(output_start);
+                        output.push(Self::Array(children));
+                    }
+                }
+                Frame::Object {
+                    mut values,
+                    mut names,
+                    depth,
+                    path,
+                    output_start,
+                } => {
+                    if let Some((name, value)) = values.next() {
+                        let child_path = bounded_build_path(path.as_deref(), &[".", name], limits);
+                        names.push(name.clone());
+                        frames.push(Frame::Object {
+                            values,
+                            names,
+                            depth,
+                            path,
+                            output_start,
+                        });
+                        frames.push(Frame::Visit {
+                            value,
+                            depth: depth + 1,
+                            path: child_path,
+                        });
+                    } else {
+                        let children = output.split_off(output_start);
+                        output.push(Self::Object(names.into_iter().zip(children).collect()));
+                    }
+                }
+            }
+        }
+        debug_assert_eq!(output.len(), 1);
+        Ok(output
+            .pop()
+            .expect("one input value constructs one exact node"))
+    }
+
+    fn parse_document_bounded(
+        raw: &RawValue,
+        limits: RawJsonLimits,
+    ) -> Result<ExactJsonDocument, ExactSchemaDocumentError> {
+        enum Frame<'a> {
+            Visit {
+                raw: &'a RawValue,
+                depth: usize,
+                path: String,
+            },
+            Array {
+                values: std::vec::IntoIter<&'a RawValue>,
+                next_index: usize,
+                depth: usize,
+                path: String,
+                output_start: usize,
+            },
+            Object {
+                values: std::vec::IntoIter<(String, &'a RawValue)>,
+                names: Vec<String>,
+                depth: usize,
+                path: String,
+                output_start: usize,
+            },
+        }
+
+        let mut remaining_nodes = limits.max_nodes;
+        let mut frames = vec![Frame::Visit {
+            raw,
+            depth: 0,
+            path: "$".to_owned(),
+        }];
+        let mut output = Vec::new();
+        while let Some(frame) = frames.pop() {
+            match frame {
+                Frame::Visit { raw, depth, path } => {
+                    if depth >= limits.max_depth || remaining_nodes == 0 {
+                        return Err(ExactSchemaDocumentError::Schema(resource_limit(path)));
+                    }
+                    remaining_nodes -= 1;
+                    let json = raw.get().trim();
+                    match json.as_bytes().first() {
+                        Some(b'{') => {
+                            let RawObject(values) = serde_json::from_str(json)
+                                .map_err(ExactSchemaDocumentError::Json)?;
+                            frames.push(Frame::Object {
+                                names: Vec::with_capacity(values.len()),
+                                values: values.into_iter(),
+                                depth,
+                                path,
+                                output_start: output.len(),
+                            });
+                        }
+                        Some(b'[') => {
+                            let values: Vec<&RawValue> = serde_json::from_str(json)
+                                .map_err(ExactSchemaDocumentError::Json)?;
+                            frames.push(Frame::Array {
+                                values: values.into_iter(),
+                                next_index: 0,
+                                depth,
+                                path,
+                                output_start: output.len(),
+                            });
+                        }
+                        Some(b'-' | b'0'..=b'9') => {
+                            if json.len() > MAX_NUMBER_LEXEME_BYTES {
+                                return Err(ExactSchemaDocumentError::Schema(resource_limit(path)));
+                            }
+                            let document = parse_exact_number(json);
+                            if limits.reject_unbounded_numbers
+                                && document
+                                    .exact
+                                    .number()
+                                    .is_none_or(|number| number.decimal().is_none())
+                            {
+                                return Err(ExactSchemaDocumentError::Schema(resource_limit(path)));
+                            }
+                            output.push(document);
+                        }
+                        Some(_) | None => {
+                            let value = serde_json::from_str(json)
+                                .map_err(ExactSchemaDocumentError::Json)?;
+                            output.push(ExactJsonDocument {
+                                value,
+                                exact: Self::Other,
+                                lossless_value: true,
+                            });
+                        }
+                    }
+                }
+                Frame::Array {
+                    mut values,
+                    next_index,
+                    depth,
+                    path,
+                    output_start,
+                } => {
+                    if let Some(raw) = values.next() {
+                        let child_path = bounded_raw_child_path(
+                            &path,
+                            &["[", &next_index.to_string(), "]"],
+                            limits.max_path_bytes,
+                        )
+                        .map_err(ExactSchemaDocumentError::Schema)?;
+                        frames.push(Frame::Array {
+                            values,
+                            next_index: next_index + 1,
+                            depth,
+                            path,
+                            output_start,
+                        });
+                        frames.push(Frame::Visit {
+                            raw,
+                            depth: depth + 1,
+                            path: child_path,
+                        });
+                    } else {
+                        let children = output.split_off(output_start);
+                        let mut value = Vec::with_capacity(children.len());
+                        let mut exact = Vec::with_capacity(children.len());
+                        let mut lossless_value = true;
+                        for child in children {
+                            value.push(child.value);
+                            exact.push(child.exact);
+                            lossless_value &= child.lossless_value;
+                        }
+                        output.push(ExactJsonDocument {
+                            value: Value::Array(value),
+                            exact: Self::Array(exact),
+                            lossless_value,
+                        });
+                    }
+                }
+                Frame::Object {
+                    mut values,
+                    mut names,
+                    depth,
+                    path,
+                    output_start,
+                } => {
+                    if let Some((name, raw)) = values.next() {
+                        let child_path =
+                            bounded_raw_child_path(&path, &[".", &name], limits.max_path_bytes)
+                                .map_err(ExactSchemaDocumentError::Schema)?;
+                        names.push(name);
+                        frames.push(Frame::Object {
+                            values,
+                            names,
+                            depth,
+                            path,
+                            output_start,
+                        });
+                        frames.push(Frame::Visit {
+                            raw,
+                            depth: depth + 1,
+                            path: child_path,
+                        });
+                    } else {
+                        let children = output.split_off(output_start);
+                        let mut value = Map::with_capacity(children.len());
+                        let mut exact = BTreeMap::new();
+                        let mut lossless_by_name = BTreeMap::new();
+                        for (name, child) in names.into_iter().zip(children) {
+                            value.insert(name.clone(), child.value);
+                            exact.insert(name.clone(), child.exact);
+                            lossless_by_name.insert(name, child.lossless_value);
+                        }
+                        output.push(ExactJsonDocument {
+                            value: Value::Object(value),
+                            exact: Self::Object(exact),
+                            lossless_value: lossless_by_name.values().all(|lossless| *lossless),
+                        });
+                    }
+                }
+            }
+        }
+        debug_assert_eq!(output.len(), 1);
+        Ok(output
+            .pop()
+            .expect("one raw JSON value constructs one exact document"))
     }
 
     const fn number(&self) -> Option<&ExactNumber> {
@@ -263,6 +586,38 @@ impl ExactNode {
         } else {
             None
         }
+    }
+}
+
+fn bounded_build_path(
+    path: Option<&str>,
+    suffixes: &[&str],
+    limits: Option<RawJsonLimits>,
+) -> Option<String> {
+    let path = path?;
+    let maximum = limits.map_or(usize::MAX, |limits| limits.max_path_bytes);
+    Some(extend_path(path, suffixes, maximum).unwrap_or_else(|| path.to_owned()))
+}
+
+fn parse_exact_number(raw: &str) -> ExactJsonDocument {
+    let exact = ExactNumber::new(raw.to_owned());
+    let (value, lossless_value) = serde_json::from_str(raw).map_or_else(
+        |_| (Value::from(0), false),
+        |value: Value| {
+            let representable = value.as_number().is_some_and(|number| {
+                let normalized = ExactNumber::new(number.to_string());
+                exact
+                    .decimal()
+                    .zip(normalized.decimal())
+                    .is_some_and(|(left, right)| left == right)
+            });
+            (value, representable)
+        },
+    );
+    ExactJsonDocument {
+        value,
+        exact: ExactNode::Number(exact),
+        lossless_value,
     }
 }
 
@@ -322,9 +677,9 @@ fn write_exact_json(
     }
 }
 
-struct RawObject(Vec<(String, Box<RawValue>)>);
+struct RawObject<'a>(Vec<(String, &'a RawValue)>);
 
-impl<'de> Deserialize<'de> for RawObject {
+impl<'de> Deserialize<'de> for RawObject<'de> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -336,7 +691,7 @@ impl<'de> Deserialize<'de> for RawObject {
 struct RawObjectVisitor;
 
 impl<'de> Visitor<'de> for RawObjectVisitor {
-    type Value = RawObject;
+    type Value = RawObject<'de>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a JSON object")
@@ -347,10 +702,359 @@ impl<'de> Visitor<'de> for RawObjectVisitor {
         A: MapAccess<'de>,
     {
         let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
-        while let Some(entry) = map.next_entry()? {
-            entries.push(entry);
+        while let Some((name, value)) = map.next_entry::<String, &'de RawValue>()? {
+            entries.push((name, value));
         }
         Ok(RawObject(entries))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RawJsonLimits {
+    max_nodes: usize,
+    max_depth: usize,
+    max_path_bytes: usize,
+    reject_unbounded_numbers: bool,
+    track_paths: bool,
+}
+
+enum RawContainer {
+    Array {
+        path: String,
+        depth: usize,
+        next_index: usize,
+        expect_value: bool,
+    },
+    Object {
+        path: String,
+        depth: usize,
+        key: Option<String>,
+        state: RawObjectState,
+    },
+}
+
+enum RawObjectState {
+    Key,
+    Colon,
+    Value,
+    Comma,
+}
+
+#[derive(Clone, Copy)]
+enum RawToken<'a> {
+    ObjectStart,
+    ObjectEnd,
+    ArrayStart,
+    ArrayEnd,
+    Colon,
+    Comma,
+    String(&'a str, usize),
+    Number(usize),
+    Scalar,
+}
+
+struct RawJsonCursor<'a> {
+    json: &'a str,
+    offset: usize,
+}
+
+impl<'a> RawJsonCursor<'a> {
+    const fn new(json: &'a str) -> Self {
+        Self { json, offset: 0 }
+    }
+
+    fn next(&mut self) -> Option<RawToken<'a>> {
+        let bytes = self.json.as_bytes();
+        while bytes.get(self.offset).is_some_and(u8::is_ascii_whitespace) {
+            self.offset += 1;
+        }
+        let byte = *bytes.get(self.offset)?;
+        self.offset += 1;
+        Some(match byte {
+            b'{' => RawToken::ObjectStart,
+            b'}' => RawToken::ObjectEnd,
+            b'[' => RawToken::ArrayStart,
+            b']' => RawToken::ArrayEnd,
+            b':' => RawToken::Colon,
+            b',' => RawToken::Comma,
+            b'"' => self.string_token(),
+            byte => {
+                let start = self.offset - 1;
+                while bytes.get(self.offset).is_some_and(|byte| {
+                    !byte.is_ascii_whitespace() && !matches!(byte, b',' | b']' | b'}')
+                }) {
+                    self.offset += 1;
+                }
+                if matches!(byte, b'-' | b'0'..=b'9') {
+                    RawToken::Number(self.offset - start)
+                } else {
+                    RawToken::Scalar
+                }
+            }
+        })
+    }
+
+    fn string_token(&mut self) -> RawToken<'a> {
+        let start = self.offset - 1;
+        let bytes = self.json.as_bytes();
+        let mut decoded_bytes = 0_usize;
+        loop {
+            let byte = bytes[self.offset];
+            self.offset += 1;
+            match byte {
+                b'"' => {
+                    return RawToken::String(&self.json[start..self.offset], decoded_bytes);
+                }
+                b'\\' => {
+                    let escape = bytes[self.offset];
+                    self.offset += 1;
+                    if escape != b'u' {
+                        decoded_bytes += 1;
+                        continue;
+                    }
+                    let first = decode_hex_quad(bytes, self.offset);
+                    self.offset += 4;
+                    if (0xD800..=0xDBFF).contains(&first) {
+                        self.offset += 2;
+                        let second = decode_hex_quad(bytes, self.offset);
+                        self.offset += 4;
+                        let scalar = 0x1_0000
+                            + ((u32::from(first) - 0xD800) << 10)
+                            + (u32::from(second) - 0xDC00);
+                        decoded_bytes += char::from_u32(scalar)
+                            .expect("serde_json validated the surrogate pair")
+                            .len_utf8();
+                    } else {
+                        decoded_bytes += char::from_u32(u32::from(first))
+                            .expect("serde_json validated the Unicode escape")
+                            .len_utf8();
+                    }
+                }
+                byte if byte.is_ascii() => decoded_bytes += 1,
+                _ => {
+                    let character = self.json[self.offset - 1..]
+                        .chars()
+                        .next()
+                        .expect("serde_json validated the UTF-8 string");
+                    let width = character.len_utf8();
+                    decoded_bytes += width;
+                    self.offset += width - 1;
+                }
+            }
+        }
+    }
+}
+
+fn decode_hex_quad(bytes: &[u8], offset: usize) -> u16 {
+    bytes[offset..offset + 4].iter().fold(0_u16, |value, byte| {
+        value * 16
+            + u16::from(match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                b'A'..=b'F' => byte - b'A' + 10,
+                _ => unreachable!("serde_json validated the hexadecimal escape"),
+            })
+    })
+}
+
+fn preflight_raw_json(json: &str, limits: RawJsonLimits) -> Result<(), SchemaError> {
+    let mut cursor = RawJsonCursor::new(json);
+    let mut remaining_nodes = limits.max_nodes;
+    let mut containers = Vec::new();
+    let root = cursor
+        .next()
+        .expect("serde_json validated a non-empty document");
+    start_raw_value(
+        root,
+        "$".to_owned(),
+        0,
+        limits,
+        &mut remaining_nodes,
+        &mut containers,
+    )?;
+    while let Some(container) = containers.pop() {
+        let token = cursor
+            .next()
+            .expect("serde_json validated the complete document");
+        match container {
+            RawContainer::Array {
+                path,
+                depth,
+                next_index,
+                expect_value: true,
+            } => {
+                if matches!(token, RawToken::ArrayEnd) {
+                    continue;
+                }
+                let index = next_index.to_string();
+                let child_path =
+                    bounded_raw_child_path(&path, &["[", &index, "]"], limits.max_path_bytes)?;
+                containers.push(RawContainer::Array {
+                    path,
+                    depth,
+                    next_index: next_index + 1,
+                    expect_value: false,
+                });
+                start_raw_value(
+                    token,
+                    child_path,
+                    depth + 1,
+                    limits,
+                    &mut remaining_nodes,
+                    &mut containers,
+                )?;
+            }
+            RawContainer::Array {
+                path,
+                depth,
+                next_index,
+                expect_value: false,
+            } => match token {
+                RawToken::Comma => containers.push(RawContainer::Array {
+                    path,
+                    depth,
+                    next_index,
+                    expect_value: true,
+                }),
+                RawToken::ArrayEnd => {}
+                _ => unreachable!("serde_json validated the array separators"),
+            },
+            RawContainer::Object {
+                path,
+                depth,
+                key: None,
+                state: RawObjectState::Key,
+            } => match token {
+                RawToken::ObjectEnd => {}
+                RawToken::String(raw_key, decoded_bytes) => {
+                    let minimum_length = path
+                        .len()
+                        .checked_add(1)
+                        .and_then(|length| length.checked_add(decoded_bytes));
+                    if minimum_length.is_none_or(|length| length > limits.max_path_bytes) {
+                        return Err(resource_limit("$".to_owned()));
+                    }
+                    let key =
+                        serde_json::from_str(raw_key).expect("serde_json validated the object key");
+                    containers.push(RawContainer::Object {
+                        path,
+                        depth,
+                        key: Some(key),
+                        state: RawObjectState::Colon,
+                    });
+                }
+                _ => unreachable!("serde_json validated the object key"),
+            },
+            RawContainer::Object {
+                path,
+                depth,
+                key,
+                state: RawObjectState::Colon,
+            } => {
+                debug_assert!(matches!(token, RawToken::Colon));
+                containers.push(RawContainer::Object {
+                    path,
+                    depth,
+                    key,
+                    state: RawObjectState::Value,
+                });
+            }
+            RawContainer::Object {
+                path,
+                depth,
+                key: Some(key),
+                state: RawObjectState::Value,
+            } => {
+                let child_path =
+                    bounded_raw_child_path(&path, &[".", &key], limits.max_path_bytes)?;
+                containers.push(RawContainer::Object {
+                    path,
+                    depth,
+                    key: None,
+                    state: RawObjectState::Comma,
+                });
+                start_raw_value(
+                    token,
+                    child_path,
+                    depth + 1,
+                    limits,
+                    &mut remaining_nodes,
+                    &mut containers,
+                )?;
+            }
+            RawContainer::Object {
+                path,
+                depth,
+                key: None,
+                state: RawObjectState::Comma,
+            } => match token {
+                RawToken::Comma => containers.push(RawContainer::Object {
+                    path,
+                    depth,
+                    key: None,
+                    state: RawObjectState::Key,
+                }),
+                RawToken::ObjectEnd => {}
+                _ => unreachable!("serde_json validated the object separators"),
+            },
+            RawContainer::Object { .. } => {
+                unreachable!("object keys exist only between key and value states")
+            }
+        }
+    }
+    let trailing = cursor.next();
+    debug_assert!(trailing.is_none());
+    Ok(())
+}
+
+fn start_raw_value(
+    token: RawToken<'_>,
+    path: String,
+    depth: usize,
+    limits: RawJsonLimits,
+    remaining_nodes: &mut usize,
+    containers: &mut Vec<RawContainer>,
+) -> Result<(), SchemaError> {
+    if depth >= limits.max_depth || *remaining_nodes == 0 {
+        return Err(resource_limit(path));
+    }
+    *remaining_nodes -= 1;
+    match token {
+        RawToken::ObjectStart => containers.push(RawContainer::Object {
+            path,
+            depth,
+            key: None,
+            state: RawObjectState::Key,
+        }),
+        RawToken::ArrayStart => containers.push(RawContainer::Array {
+            path,
+            depth,
+            next_index: 0,
+            expect_value: true,
+        }),
+        RawToken::Number(length) if length > MAX_NUMBER_LEXEME_BYTES => {
+            return Err(resource_limit(path));
+        }
+        RawToken::String(_, _) | RawToken::Number(_) | RawToken::Scalar => {}
+        RawToken::ObjectEnd | RawToken::ArrayEnd | RawToken::Colon | RawToken::Comma => {
+            unreachable!("serde_json validated a value at this position")
+        }
+    }
+    Ok(())
+}
+
+fn bounded_raw_child_path(
+    path: &str,
+    suffixes: &[&str],
+    maximum: usize,
+) -> Result<String, SchemaError> {
+    extend_path(path, suffixes, maximum).ok_or_else(|| resource_limit("$".to_owned()))
+}
+
+const fn resource_limit(path: String) -> SchemaError {
+    SchemaError {
+        path,
+        kind: SchemaErrorKind::ResourceLimit,
     }
 }
 
@@ -507,8 +1211,17 @@ pub fn validate_schema_with_limits(
     schema: &Value,
     limits: ValidationLimits,
 ) -> Result<(), SchemaError> {
-    let exact = ExactNode::from_value(schema);
-    validate_schema_with_exact(schema, &exact, limits)
+    let exact = ExactNode::from_value_bounded(
+        schema,
+        RawJsonLimits {
+            max_nodes: limits.max_schema_nodes.get(),
+            max_depth: limits.max_depth.get(),
+            max_path_bytes: limits.max_path_bytes.get(),
+            reject_unbounded_numbers: true,
+            track_paths: true,
+        },
+    )?;
+    validate_schema_at(schema, &exact, "$", 0, limits)
 }
 
 pub(crate) fn validate_schema_with_exact(
@@ -516,9 +1229,115 @@ pub(crate) fn validate_schema_with_exact(
     exact_schema: &ExactNode,
     limits: ValidationLimits,
 ) -> Result<(), SchemaError> {
-    let mut remaining_nodes = limits.max_schema_nodes.get();
-    validate_json_node(schema, 0, limits, &mut remaining_nodes, &mut Vec::new())?;
+    preflight_schema_value(schema, limits)?;
     validate_schema_at(schema, exact_schema, "$", 0, limits)
+}
+
+fn preflight_schema_value(schema: &Value, limits: ValidationLimits) -> Result<(), SchemaError> {
+    enum Frame<'a> {
+        Visit {
+            value: &'a Value,
+            depth: usize,
+            path: String,
+        },
+        Array {
+            values: &'a [Value],
+            next_index: usize,
+            depth: usize,
+            path: String,
+        },
+        Object {
+            values: std::iter::Peekable<serde_json::map::Iter<'a>>,
+            depth: usize,
+            path: String,
+        },
+    }
+
+    let mut remaining_nodes = limits.max_schema_nodes.get();
+    let mut pending = vec![Frame::Visit {
+        value: schema,
+        depth: 0,
+        path: "$".to_owned(),
+    }];
+    while let Some(frame) = pending.pop() {
+        match frame {
+            Frame::Visit { value, depth, path } => {
+                if depth >= limits.max_depth.get() || remaining_nodes == 0 {
+                    return Err(resource_limit(path));
+                }
+                remaining_nodes -= 1;
+                match value {
+                    Value::Array(values) if !values.is_empty() => pending.push(Frame::Array {
+                        values,
+                        next_index: 0,
+                        depth,
+                        path,
+                    }),
+                    Value::Object(values) if !values.is_empty() => {
+                        pending.push(Frame::Object {
+                            values: values.iter().peekable(),
+                            depth,
+                            path,
+                        });
+                    }
+                    Value::Array(_)
+                    | Value::Object(_)
+                    | Value::Null
+                    | Value::Bool(_)
+                    | Value::Number(_)
+                    | Value::String(_) => {}
+                }
+            }
+            Frame::Array {
+                values,
+                next_index,
+                depth,
+                path,
+            } => {
+                let index = next_index.to_string();
+                let child_path =
+                    extend_path(&path, &["[", &index, "]"], limits.max_path_bytes.get())
+                        .unwrap_or_else(|| path.clone());
+                if next_index + 1 < values.len() {
+                    pending.push(Frame::Array {
+                        values,
+                        next_index: next_index + 1,
+                        depth,
+                        path,
+                    });
+                }
+                pending.push(Frame::Visit {
+                    value: &values[next_index],
+                    depth: depth + 1,
+                    path: child_path,
+                });
+            }
+            Frame::Object {
+                mut values,
+                depth,
+                path,
+            } => {
+                let (name, value) = values
+                    .next()
+                    .expect("empty schema objects do not create traversal frames");
+                let child_path = extend_path(&path, &[".", name], limits.max_path_bytes.get())
+                    .unwrap_or_else(|| path.clone());
+                if values.peek().is_some() {
+                    pending.push(Frame::Object {
+                        values,
+                        depth,
+                        path,
+                    });
+                }
+                pending.push(Frame::Visit {
+                    value,
+                    depth: depth + 1,
+                    path: child_path,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_schema_at(
@@ -749,42 +1568,6 @@ fn schema_child_path(
     })
 }
 
-fn validate_json_node<'a>(
-    value: &'a Value,
-    depth: usize,
-    limits: ValidationLimits,
-    remaining_nodes: &mut usize,
-    path: &mut Vec<InputPathComponent<'a>>,
-) -> Result<(), SchemaError> {
-    if depth >= limits.max_depth.get() || *remaining_nodes == 0 {
-        return Err(SchemaError {
-            path: render_input_path(path, limits.max_path_bytes.get()),
-            kind: SchemaErrorKind::ResourceLimit,
-        });
-    }
-    *remaining_nodes -= 1;
-    match value {
-        Value::Array(values) => {
-            for (index, value) in values.iter().enumerate() {
-                path.push(InputPathComponent::Index(index));
-                let result = validate_json_node(value, depth + 1, limits, remaining_nodes, path);
-                path.pop();
-                result?;
-            }
-        }
-        Value::Object(values) => {
-            for (name, value) in values {
-                path.push(InputPathComponent::Key(name));
-                let result = validate_json_node(value, depth + 1, limits, remaining_nodes, path);
-                path.pop();
-                result?;
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-    }
-    Ok(())
-}
-
 fn extend_path(path: &str, suffixes: &[&str], maximum: usize) -> Option<String> {
     let length = suffixes.iter().try_fold(path.len(), |length, suffix| {
         length.checked_add(suffix.len())
@@ -846,9 +1629,35 @@ pub fn validate_parameters_with_limits(
     parameters: &Value,
     limits: ValidationLimits,
 ) -> Result<(), ParameterValidationError> {
-    let exact_schema = ExactNode::from_value(schema);
+    let exact_schema = ExactNode::from_value_bounded(
+        schema,
+        RawJsonLimits {
+            max_nodes: limits.max_schema_nodes.get(),
+            max_depth: limits.max_depth.get(),
+            max_path_bytes: limits.max_path_bytes.get(),
+            reject_unbounded_numbers: true,
+            track_paths: true,
+        },
+    )
+    .map_err(ParameterValidationError::InvalidSchema)?;
+    validate_schema_at(schema, &exact_schema, "$", 0, limits)
+        .map_err(ParameterValidationError::InvalidSchema)?;
+    let mut remaining_values = limits.max_input_nodes.get();
+    validate_input_node(
+        parameters,
+        0,
+        limits,
+        &mut remaining_values,
+        &mut Vec::new(),
+    )?;
     let exact_parameters = ExactNode::from_value(parameters);
-    validate_parameters_inner(schema, &exact_schema, parameters, &exact_parameters, limits)
+    validate_parameters_after_preflight(
+        schema,
+        &exact_schema,
+        parameters,
+        &exact_parameters,
+        limits,
+    )
 }
 
 /// Validates exact JSON documents under explicit traversal and diagnostic
@@ -903,6 +1712,16 @@ fn validate_parameters_inner(
         &mut remaining_values,
         &mut Vec::new(),
     )?;
+    validate_parameters_after_preflight(schema, exact_schema, parameters, exact_parameters, limits)
+}
+
+fn validate_parameters_after_preflight(
+    schema: &Value,
+    exact_schema: &ExactNode,
+    parameters: &Value,
+    exact_parameters: &ExactNode,
+    limits: ValidationLimits,
+) -> Result<(), ParameterValidationError> {
     let mut context = ValidationContext {
         violations: Vec::new(),
         limits,

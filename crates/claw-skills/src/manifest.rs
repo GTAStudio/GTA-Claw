@@ -5,11 +5,11 @@ use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 
 use serde::Deserialize;
-use serde_json::Value;
 use serde_json::value::RawValue;
 
 use crate::schema::{
-    ExactJsonDocument, ExactNode, SchemaError, ValidationLimits, validate_schema_with_exact,
+    ExactJsonDocument, ExactSchemaDocumentError, SchemaError, ValidationLimits,
+    validate_schema_with_exact,
 };
 
 /// A validated modern skill manifest.
@@ -17,8 +17,7 @@ use crate::schema::{
 pub struct SkillManifest {
     id: String,
     description: String,
-    parameters: Value,
-    exact_parameters: Option<ExactNode>,
+    parameters: ExactJsonDocument,
     execution: SkillExecution,
 }
 
@@ -35,14 +34,10 @@ impl SkillManifest {
         &self.description
     }
 
-    /// Returns the parameter JSON Schema.
+    /// Returns the exact parameter JSON Schema enforced by the runtime.
     #[must_use]
-    pub const fn parameters(&self) -> &Value {
+    pub const fn parameters(&self) -> &ExactJsonDocument {
         &self.parameters
-    }
-
-    pub(crate) const fn exact_parameters(&self) -> Option<&ExactNode> {
-        self.exact_parameters.as_ref()
     }
 
     /// Returns the selected execution backend.
@@ -58,21 +53,9 @@ impl SkillManifest {
         if self.description.trim().is_empty() {
             return Err(ManifestError::EmptyDescription);
         }
-        let fallback_exact = self
-            .exact_parameters
-            .is_none()
-            .then(|| ExactNode::from_value(&self.parameters));
-        let exact_parameters = self
-            .exact_parameters
-            .as_ref()
-            .or(fallback_exact.as_ref())
-            .expect("manifest parameters always have an exact representation");
-        validate_schema_with_exact(
-            &self.parameters,
-            exact_parameters,
-            ValidationLimits::default(),
-        )
-        .map_err(ManifestError::InvalidParameterSchema)?;
+        let (parameters, exact_parameters) = self.parameters.parts();
+        validate_schema_with_exact(parameters, exact_parameters, ValidationLimits::default())
+            .map_err(ManifestError::InvalidParameterSchema)?;
         self.execution.validate()
     }
 }
@@ -290,19 +273,19 @@ pub fn load_manifest(json: &str) -> Result<SkillManifest, ManifestError> {
             column: error.column(),
             message: error.to_string(),
         })?;
-    let parameters = ExactJsonDocument::parse(raw.parameters.get()).map_err(|error| {
-        ManifestError::MalformedJson {
+    let parameters = ExactJsonDocument::parse_schema(raw.parameters, ValidationLimits::default())
+        .map_err(|error| match error {
+        ExactSchemaDocumentError::Json(error) => ManifestError::MalformedJson {
             line: error.line(),
             column: error.column(),
             message: error.to_string(),
-        }
+        },
+        ExactSchemaDocumentError::Schema(error) => ManifestError::InvalidParameterSchema(error),
     })?;
-    let (parameters, exact_parameters) = parameters.into_parts();
     let manifest = SkillManifest {
         id: raw.id,
         description: raw.description,
         parameters,
-        exact_parameters: Some(exact_parameters),
         execution: raw.execution,
     };
     manifest.validate()?;

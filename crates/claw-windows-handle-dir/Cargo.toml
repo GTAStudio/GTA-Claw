@@ -1,10 +1,11 @@
 [package]
 name = "claw-windows-handle-dir"
 description = "Handle-relative Windows filesystem operations for claw-tools"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.94.0"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = false
 
 [target.'cfg(windows)'.dependencies]
@@ -16,3 +17,6 @@ windows-sys = { version = "=0.61.2", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_IO",
 ] }
+
+[lints]
+workspace = true

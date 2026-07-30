@@ -85,6 +85,21 @@ fn schema_node_budget_is_enforced_deterministically() {
 }
 
 #[test]
+fn schema_construction_enforces_depth_during_iterative_assembly() {
+    let mut schema = json!({});
+    for _ in 0..32 {
+        schema = json!({"items": schema});
+    }
+    let mut constrained = limits(4, 128);
+    constrained.max_depth = NonZeroUsize::new(4).expect("positive depth limit");
+
+    let error = validate_schema_with_limits(&schema, constrained)
+        .expect_err("construction must stop before assembling the fifth level");
+    assert_eq!(error.kind, SchemaErrorKind::ResourceLimit);
+    assert_eq!(error.path, "$.items.items.items.items");
+}
+
+#[test]
 fn schema_node_budget_includes_required_and_enum_entries() {
     let required_schema = json!({
         "type": "object",

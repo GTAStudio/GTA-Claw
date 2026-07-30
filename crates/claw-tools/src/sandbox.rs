@@ -21,7 +21,7 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 #[cfg(windows)]
-use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::fs::MetadataExt;
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -29,18 +29,10 @@ use std::fmt::{self, Display, Formatter};
 /// `FILE_ATTRIBUTE_REPARSE_POINT`.
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-/// `FILE_FLAG_OPEN_REPARSE_POINT`.
 #[cfg(windows)]
-const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-/// `FILE_FLAG_BACKUP_SEMANTICS`, required to open a directory handle.
-#[cfg(windows)]
-const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-/// `FILE_SHARE_READ`.
-#[cfg(windows)]
-const FILE_SHARE_READ: u32 = 0x0000_0001;
-/// `FILE_SHARE_WRITE`.
-#[cfg(windows)]
-const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+type PinnedDirectoryHandle = claw_windows_handle_dir::DirectoryHandle;
+#[cfg(not(windows))]
+type PinnedDirectoryHandle = File;
 
 /// Reserved Windows device names, compared case-insensitively against the
 /// portion of a component before its first dot.
@@ -821,7 +813,7 @@ struct PinnedDirectory {
     path: PathBuf,
     /// Held open for the whole check-and-use window. Unix and Windows enumerate
     /// through it directly with [`list_pinned_names`].
-    handle: File,
+    handle: PinnedDirectoryHandle,
     #[cfg(unix)]
     identity: DirectoryIdentity,
 }
@@ -848,7 +840,7 @@ impl DirectoryPin {
     ///
     /// Enumeration acts on this handle rather than on [`Self::path`], so a
     /// listing cannot be redirected by an ancestor swapped after validation.
-    fn handle(&self) -> Result<&File, SandboxError> {
+    fn handle(&self) -> Result<&PinnedDirectoryHandle, SandboxError> {
         self.levels
             .last()
             .map(|level| &level.handle)
@@ -880,7 +872,7 @@ fn pin_directory(path: &Path) -> Result<PinnedDirectory, SandboxError> {
 
 fn pinned_directory_from_handle(
     path: &Path,
-    handle: File,
+    handle: PinnedDirectoryHandle,
 ) -> Result<PinnedDirectory, SandboxError> {
     let metadata = handle.metadata().map_err(|error| map_io(&error))?;
     if is_link_like(&metadata) {
@@ -899,22 +891,19 @@ fn pinned_directory_from_handle(
 
 #[cfg(windows)]
 fn pin_child_directory(
-    parent: &File,
+    parent: &PinnedDirectoryHandle,
     path: &Path,
     name: &str,
 ) -> Result<PinnedDirectory, SandboxError> {
-    let handle = claw_windows_handle_dir::open_relative(
-        parent,
-        Path::new(name),
-        claw_windows_handle_dir::OpenMode::Directory,
-    )
-    .map_err(|error| map_io(&error))?;
+    let handle = parent
+        .open_directory(Path::new(name))
+        .map_err(|error| map_io(&error))?;
     pinned_directory_from_handle(path, handle)
 }
 
 #[cfg(unix)]
 fn pin_child_directory(
-    parent: &File,
+    parent: &PinnedDirectoryHandle,
     path: &Path,
     name: &str,
 ) -> Result<PinnedDirectory, SandboxError> {
@@ -933,7 +922,7 @@ fn pin_child_directory(
 
 #[cfg(not(any(windows, unix)))]
 fn pin_child_directory(
-    _parent: &File,
+    _parent: &PinnedDirectoryHandle,
     path: &Path,
     _name: &str,
 ) -> Result<PinnedDirectory, SandboxError> {
@@ -941,20 +930,12 @@ fn pin_child_directory(
 }
 
 #[cfg(windows)]
-fn open_directory_no_follow(path: &Path) -> Result<File, SandboxError> {
-    OpenOptions::new()
-        .read(true)
-        // Delete sharing is withheld to prevent rename/removal. In-place
-        // reparse changes remain possible, so every descendant is opened
-        // relative to this handle rather than by re-walking its path.
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|error| map_io(&error))
+fn open_directory_no_follow(path: &Path) -> Result<PinnedDirectoryHandle, SandboxError> {
+    claw_windows_handle_dir::DirectoryHandle::open(path).map_err(|error| map_io(&error))
 }
 
 #[cfg(unix)]
-fn open_directory_no_follow(path: &Path) -> Result<File, SandboxError> {
+fn open_directory_no_follow(path: &Path) -> Result<PinnedDirectoryHandle, SandboxError> {
     use std::os::unix::fs::OpenOptionsExt;
 
     OpenOptions::new()
@@ -965,7 +946,7 @@ fn open_directory_no_follow(path: &Path) -> Result<File, SandboxError> {
 }
 
 #[cfg(not(any(windows, unix)))]
-fn open_directory_no_follow(path: &Path) -> Result<File, SandboxError> {
+fn open_directory_no_follow(path: &Path) -> Result<PinnedDirectoryHandle, SandboxError> {
     File::open(path).map_err(|error| map_io(&error))
 }
 
@@ -976,7 +957,7 @@ fn open_directory_no_follow(path: &Path) -> Result<File, SandboxError> {
 /// planted after the metadata check fail promptly instead of hanging on open.
 #[cfg(unix)]
 fn open_write_no_follow(
-    parent: &File,
+    parent: &PinnedDirectoryHandle,
     _absolute: &Path,
     leaf: &str,
     mode: WriteMode,
@@ -1008,25 +989,17 @@ fn open_write_no_follow(
 /// in-place reparse change on that parent therefore cannot redirect this open.
 #[cfg(windows)]
 fn open_write_no_follow(
-    parent: &File,
+    parent: &PinnedDirectoryHandle,
     _absolute: &Path,
     leaf: &str,
     mode: WriteMode,
 ) -> Result<File, SandboxError> {
-    fn open_existing(parent: &File, leaf: &str) -> io::Result<File> {
-        claw_windows_handle_dir::open_relative(
-            parent,
-            Path::new(leaf),
-            claw_windows_handle_dir::OpenMode::Write,
-        )
+    fn open_existing(parent: &PinnedDirectoryHandle, leaf: &str) -> io::Result<File> {
+        parent.open_write(Path::new(leaf))
     }
 
-    fn create_new(parent: &File, leaf: &str) -> io::Result<File> {
-        claw_windows_handle_dir::open_relative(
-            parent,
-            Path::new(leaf),
-            claw_windows_handle_dir::OpenMode::CreateNew,
-        )
+    fn create_new(parent: &PinnedDirectoryHandle, leaf: &str) -> io::Result<File> {
+        parent.create_new(Path::new(leaf))
     }
 
     if mode == WriteMode::CreateNew {
@@ -1047,7 +1020,7 @@ fn open_write_no_follow(
 
 #[cfg(not(any(windows, unix)))]
 fn open_write_no_follow(
-    _parent: &File,
+    _parent: &PinnedDirectoryHandle,
     absolute: &Path,
     _leaf: &str,
     mode: WriteMode,
@@ -1067,17 +1040,22 @@ fn open_write_no_follow(
 }
 
 #[cfg(windows)]
-fn open_read_no_follow(parent: &File, _absolute: &Path, leaf: &str) -> Result<File, SandboxError> {
-    claw_windows_handle_dir::open_relative(
-        parent,
-        Path::new(leaf),
-        claw_windows_handle_dir::OpenMode::Read,
-    )
-    .map_err(|error| map_io(&error))
+fn open_read_no_follow(
+    parent: &PinnedDirectoryHandle,
+    _absolute: &Path,
+    leaf: &str,
+) -> Result<File, SandboxError> {
+    parent
+        .open_read(Path::new(leaf))
+        .map_err(|error| map_io(&error))
 }
 
 #[cfg(unix)]
-fn open_read_no_follow(parent: &File, _absolute: &Path, leaf: &str) -> Result<File, SandboxError> {
+fn open_read_no_follow(
+    parent: &PinnedDirectoryHandle,
+    _absolute: &Path,
+    leaf: &str,
+) -> Result<File, SandboxError> {
     use rustix::fs::{Mode, OFlags, openat};
 
     openat(
@@ -1091,7 +1069,11 @@ fn open_read_no_follow(parent: &File, _absolute: &Path, leaf: &str) -> Result<Fi
 }
 
 #[cfg(not(any(windows, unix)))]
-fn open_read_no_follow(_parent: &File, absolute: &Path, _leaf: &str) -> Result<File, SandboxError> {
+fn open_read_no_follow(
+    _parent: &PinnedDirectoryHandle,
+    absolute: &Path,
+    _leaf: &str,
+) -> Result<File, SandboxError> {
     let mut options = OpenOptions::new();
     options.read(true);
     apply_no_follow(&mut options);
@@ -1323,7 +1305,7 @@ fn is_reserved_device_name(component: &str) -> bool {
 /// protection the descriptor provides.
 #[cfg(unix)]
 fn list_pinned_names(
-    handle: &File,
+    handle: &PinnedDirectoryHandle,
     _path: &Path,
     limit: usize,
 ) -> Result<Vec<String>, SandboxError> {
@@ -1355,11 +1337,12 @@ fn list_pinned_names(
 /// in-place reparse-point toggle cannot redirect the operation.
 #[cfg(windows)]
 fn list_pinned_names(
-    handle: &File,
+    handle: &PinnedDirectoryHandle,
     _path: &Path,
     limit: usize,
 ) -> Result<Vec<String>, SandboxError> {
-    let names = claw_windows_handle_dir::read_names(handle, limit.saturating_add(1))
+    let names = handle
+        .read_names(limit.saturating_add(1))
         .map_err(|error| map_io(&error))?;
     if names.len() > limit {
         return Err(SandboxError::DirectoryTooLarge);
@@ -1373,7 +1356,7 @@ fn list_pinned_names(
 /// Other platforms do not have descriptor-relative enumeration support.
 #[cfg(not(any(unix, windows)))]
 fn list_pinned_names(
-    _handle: &File,
+    _handle: &PinnedDirectoryHandle,
     path: &Path,
     limit: usize,
 ) -> Result<Vec<String>, SandboxError> {
@@ -1394,7 +1377,7 @@ fn list_pinned_names(
 /// Classifies one child of a pinned directory without following a link.
 #[cfg(unix)]
 fn stat_pinned_child(
-    handle: &File,
+    handle: &PinnedDirectoryHandle,
     _path: &Path,
     name: &str,
 ) -> Result<(EntryKind, u64), SandboxError> {
@@ -1414,23 +1397,20 @@ fn stat_pinned_child(
 
 #[cfg(windows)]
 fn stat_pinned_child(
-    handle: &File,
+    handle: &PinnedDirectoryHandle,
     _path: &Path,
     name: &str,
 ) -> Result<(EntryKind, u64), SandboxError> {
-    let child = claw_windows_handle_dir::open_relative(
-        handle,
-        Path::new(name),
-        claw_windows_handle_dir::OpenMode::Metadata,
-    )
-    .map_err(|error| map_io(&error))?;
+    let child = handle
+        .open_metadata(Path::new(name))
+        .map_err(|error| map_io(&error))?;
     let metadata = child.metadata().map_err(|error| map_io(&error))?;
     Ok((classify(&metadata), metadata.len()))
 }
 
 #[cfg(not(any(unix, windows)))]
 fn stat_pinned_child(
-    _handle: &File,
+    _handle: &PinnedDirectoryHandle,
     path: &Path,
     name: &str,
 ) -> Result<(EntryKind, u64), SandboxError> {

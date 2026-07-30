@@ -12,7 +12,7 @@ use crate::manifest::{
     HttpMethod, HttpParameterEncoding, HttpResponseMode, SkillExecution, SkillManifest,
 };
 use crate::schema::{
-    ExactJsonDocument, ExactNode, ParameterValidationError, validate_parameters_with_exact_schema,
+    ExactJsonDocument, ParameterValidationError, validate_parameters_with_exact_schema,
 };
 
 const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -394,15 +394,8 @@ impl<'a> SkillRuntime<'a> {
         manifest
             .validate()
             .map_err(SkillExecutionError::InvalidManifest)?;
-        let fallback_schema = manifest
-            .exact_parameters()
-            .is_none()
-            .then(|| ExactNode::from_value(manifest.parameters()));
-        let exact_schema = manifest
-            .exact_parameters()
-            .or(fallback_schema.as_ref())
-            .expect("manifest schema always has an exact representation");
-        validate_parameters_with_exact_schema(manifest.parameters(), exact_schema, &parameters)
+        let (schema, exact_schema) = manifest.parameters().parts();
+        validate_parameters_with_exact_schema(schema, exact_schema, &parameters)
             .map_err(SkillExecutionError::InvalidParameters)?;
         match manifest.execution() {
             SkillExecution::Native { handler } => self.native.execute(
