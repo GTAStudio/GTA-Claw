@@ -61,6 +61,24 @@ impl DependencyReadiness {
             .insert(name, ready);
     }
 
+    pub(crate) fn set_and_aggregate(
+        &self,
+        name: &'static str,
+        ready: bool,
+        aggregate: &'static str,
+        members: impl IntoIterator<Item = &'static str>,
+    ) {
+        let mut dependencies = self
+            .dependencies
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        dependencies.insert(name, ready);
+        let aggregate_ready = members
+            .into_iter()
+            .all(|member| dependencies.get(member).copied().unwrap_or(false));
+        dependencies.insert(aggregate, aggregate_ready);
+    }
+
     /// Reports whether every required dependency is live.
     #[must_use]
     pub fn is_ready(&self) -> bool {

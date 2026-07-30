@@ -1115,9 +1115,11 @@ pub enum ConfigurationError {
     InvalidAdapterConfiguration,
 }
 
-/// Network failure category without unsafe backend-provided strings.
+/// Transport failure category without unsafe backend-provided strings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportErrorKind {
+    /// Cancellation was observed before transport invocation.
+    CancelledBeforeSend,
     /// Connection could not be established.
     Connection,
     /// Operation timed out.
@@ -1201,7 +1203,8 @@ impl ChannelError {
         match self {
             Self::RateLimited { .. }
             | Self::Transport(
-                TransportErrorKind::Connection
+                TransportErrorKind::CancelledBeforeSend
+                | TransportErrorKind::Connection
                 | TransportErrorKind::Timeout
                 | TransportErrorKind::NameResolution
                 | TransportErrorKind::Io,

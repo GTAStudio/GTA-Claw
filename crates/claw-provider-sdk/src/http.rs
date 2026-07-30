@@ -13,10 +13,11 @@
 pub mod proxy;
 mod tls;
 
-use std::fmt::{self, Debug, Formatter};
-use std::future::Future;
+use std::fmt::{self, Debug, Display, Formatter};
+use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 use std::task::Poll;
 use std::time::Duration;
@@ -49,6 +50,54 @@ use crate::secret::{REDACTED, SecretString, is_sensitive_header};
 /// request into unbounded memory. Streaming responses are unaffected: they are
 /// delivered chunk by chunk and never accumulate here.
 pub const MAX_BUFFERED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Whether an HTTP failure occurred before or after the request future was polled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpSendStage {
+    /// The request future was never polled and cannot have transmitted bytes.
+    NotSent,
+    /// The request future was polled, so transmission cannot be ruled out.
+    MayHaveTransmitted,
+}
+
+/// Provider error paired with conservative HTTP transmission metadata.
+#[derive(Debug)]
+pub struct HttpSendError {
+    error: ProviderError,
+    stage: HttpSendStage,
+}
+
+impl HttpSendError {
+    const fn new(error: ProviderError, stage: HttpSendStage) -> Self {
+        Self { error, stage }
+    }
+
+    /// Returns whether the request may have transmitted bytes.
+    #[must_use]
+    pub const fn stage(&self) -> HttpSendStage {
+        self.stage
+    }
+
+    /// Returns the underlying safe provider error.
+    #[must_use]
+    pub const fn error(&self) -> &ProviderError {
+        &self.error
+    }
+
+    /// Discards transmission metadata and returns the provider error.
+    #[must_use]
+    pub fn into_error(self) -> ProviderError {
+        self.error
+    }
+}
+
+impl Display for HttpSendError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for HttpSendError {}
 
 /// HTTP methods used by provider APIs.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -713,9 +762,28 @@ impl HttpTransport {
         request: HttpRequest,
         cancel: &CancelToken,
     ) -> Result<HttpResponse, ProviderError> {
+        self.send_with_stage(provider, operation, request, cancel)
+            .await
+            .map_err(HttpSendError::into_error)
+    }
+
+    /// Sends a buffered request and reports whether failure may follow transmission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpSendError`] with [`HttpSendStage::NotSent`] only when the
+    /// request future was never polled. Any failure after its first poll is
+    /// conservatively [`HttpSendStage::MayHaveTransmitted`].
+    pub async fn send_with_stage(
+        &self,
+        provider: &str,
+        operation: Operation,
+        request: HttpRequest,
+        cancel: &CancelToken,
+    ) -> Result<HttpResponse, HttpSendError> {
         let deadline = deadline_after(request.timeout.unwrap_or(self.request_timeout));
         let response = self
-            .dispatch(provider, operation, &request, deadline, cancel)
+            .dispatch_with_stage(provider, operation, &request, deadline, cancel)
             .await?;
         let status = response.status().as_u16();
         let headers = collect_headers(response.headers());
@@ -729,7 +797,9 @@ impl HttpTransport {
             "the request was cancelled while the body was being read",
             collect_bounded(provider, operation, response.into_body()),
         )
-        .await??;
+        .await
+        .map_err(|error| HttpSendError::new(error, HttpSendStage::MayHaveTransmitted))?
+        .map_err(|error| HttpSendError::new(error, HttpSendStage::MayHaveTransmitted))?;
         Ok(HttpResponse::new(status, headers, body))
     }
 
@@ -780,17 +850,47 @@ impl HttpTransport {
         deadline: Instant,
         cancel: &CancelToken,
     ) -> Result<http::Response<Incoming>, ProviderError> {
-        let wire = self.build(provider, operation, request)?;
-        with_deadline(
+        self.dispatch_with_stage(provider, operation, request, deadline, cancel)
+            .await
+            .map_err(HttpSendError::into_error)
+    }
+
+    async fn dispatch_with_stage(
+        &self,
+        provider: &str,
+        operation: Operation,
+        request: &HttpRequest,
+        deadline: Instant,
+        cancel: &CancelToken,
+    ) -> Result<http::Response<Incoming>, HttpSendError> {
+        let wire = self
+            .build(provider, operation, request)
+            .map_err(|error| HttpSendError::new(error, HttpSendStage::NotSent))?;
+        let request_future = self.client.request(wire);
+        tokio::pin!(request_future);
+        let request_polled = AtomicBool::new(false);
+        let result = with_deadline(
             provider,
             operation,
             deadline,
             cancel,
             "the request was cancelled before a response arrived",
-            self.client.request(wire),
+            poll_fn(|context| {
+                request_polled.store(true, Ordering::Release);
+                request_future.as_mut().poll(context)
+            }),
         )
-        .await?
-        .map_err(|error| classify_legacy(provider, operation, &error))
+        .await;
+        let stage = if request_polled.load(Ordering::Acquire) {
+            HttpSendStage::MayHaveTransmitted
+        } else {
+            HttpSendStage::NotSent
+        };
+        result
+            .map_err(|error| HttpSendError::new(error, stage))?
+            .map_err(|error| {
+                HttpSendError::new(classify_legacy(provider, operation, &error), stage)
+            })
     }
 
     fn build(
@@ -1403,7 +1503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cancelled_buffered_request_with_an_extreme_timeout_never_opens_a_socket() {
+    async fn biased_cancellation_before_first_request_poll_is_not_sent() {
         let transport = HttpTransport::with_config(&TransportConfig {
             tls_policy: TlsPolicy::AllowLoopbackPlaintext,
             ..TransportConfig::default()
@@ -1414,7 +1514,7 @@ mod tests {
         // Port 1 has no listener; reaching the socket at all would produce a
         // transport error rather than a cancellation.
         let error = transport
-            .send(
+            .send_with_stage(
                 "ollama",
                 Operation::Complete,
                 HttpRequest::new(Method::Get, url("http://127.0.0.1:1/api/tags"))
@@ -1423,9 +1523,10 @@ mod tests {
             )
             .await
             .expect_err("cancelled");
-        assert_eq!(error.kind(), ErrorKind::Cancelled);
+        assert_eq!(error.stage(), HttpSendStage::NotSent);
+        assert_eq!(error.error().kind(), ErrorKind::Cancelled);
         assert_eq!(
-            error.detail(),
+            error.error().detail(),
             "the request was cancelled before a response arrived"
         );
     }

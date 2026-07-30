@@ -1,21 +1,24 @@
 //! Supervised Telegram and Discord channel transports.
 
+use std::fmt::{self, Display, Formatter};
+use std::future::Future;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use claw_channel_sdk::{
-    Channel, ChannelCredential, ChannelError, CredentialBinding, CredentialKind, CredentialRequest,
-    InboundMessage, NetworkOrigin, OriginTrustError, OriginTrustStore, OutboundMessage,
-    TransportErrorKind, authorize_origin,
+    ApprovedOrigin, Channel, ChannelCredential, ChannelError, ConnectionState, CredentialBinding,
+    CredentialKind, CredentialRequest, InboundMessage, NetworkOrigin, OriginTrustError,
+    OriginTrustStore, OutboundMessage, TransportErrorKind, authorize_origin,
 };
 use claw_channels::{
     AuthenticationPrompt, DiagnosticLevel, DiagnosticSink, DiscordChannel,
-    DiscordCreateMessageRequest, DiscordGatewayRequest, DiscordPacketOutcome, DiscordTransport,
-    DispatchInput, DispatchOutcome, OperatorDiagnostic, ProviderResponse, SystemClock,
-    TelegramChannel, TelegramPollRequest, TelegramSendRequest, TelegramTransport,
-    dispatch_incoming, segment_outbound_text_iter,
+    DiscordCreateMessageRequest, DiscordGatewayClose, DiscordGatewayRequest, DiscordPacketOutcome,
+    DiscordTransport, DispatchInput, DispatchOutcome, MAX_PROVIDER_RESPONSE_BYTES,
+    OperatorDiagnostic, ProviderResponse, SystemClock, TelegramChannel, TelegramPollRequest,
+    TelegramSendRequest, TelegramTransport, dispatch_incoming, segment_outbound_text_iter,
 };
 use claw_provider_sdk::http::{
     Body, HttpRequest, HttpTransport, Method, ProxyPolicy, TransportConfig,
@@ -31,10 +34,71 @@ use tokio_util::task::TaskTracker;
 use url::Url;
 
 use super::agent_runtime::AgentRuntime;
-use super::http_api::Diagnostics;
+use super::http_api::{DependencyReadiness, Diagnostics};
 
 const CHANNEL_START_TIMEOUT: Duration = Duration::from_secs(20);
 const CHANNEL_STOP_GRACE: Duration = Duration::from_secs(2);
+const DISCORD_REPLY_MAX_ATTEMPTS: u32 = 3;
+const TELEGRAM_READINESS_ATTEMPTS: u32 = 3;
+const TELEGRAM_PERSISTENT_FAILURES: u32 = 3;
+
+#[derive(Clone, Copy)]
+enum ConfiguredChannel {
+    Telegram,
+    Discord,
+}
+
+#[derive(Clone)]
+struct ChannelReadiness {
+    dependency: Arc<DependencyReadiness>,
+    telegram_configured: bool,
+    discord_configured: bool,
+}
+
+impl ChannelReadiness {
+    fn new(
+        dependency: Arc<DependencyReadiness>,
+        telegram_configured: bool,
+        discord_configured: bool,
+    ) -> Self {
+        let readiness = Self {
+            dependency,
+            telegram_configured,
+            discord_configured,
+        };
+        if telegram_configured {
+            readiness.dependency.set("telegram", false);
+        }
+        if discord_configured {
+            readiness.dependency.set("discord", false);
+        }
+        readiness
+            .dependency
+            .set("channels", !telegram_configured && !discord_configured);
+        readiness
+    }
+
+    fn set(&self, channel: ConfiguredChannel, ready: bool) {
+        let name = match channel {
+            ConfiguredChannel::Telegram => "telegram",
+            ConfiguredChannel::Discord => "discord",
+        };
+        let members = [
+            self.telegram_configured.then_some("telegram"),
+            self.discord_configured.then_some("discord"),
+        ];
+        self.dependency
+            .set_and_aggregate(name, ready, "channels", members.into_iter().flatten());
+    }
+
+    fn set_discord_state(&self, state: ConnectionState, phase: claw_channels::DiscordGatewayPhase) {
+        self.set(
+            ConfiguredChannel::Discord,
+            state == ConnectionState::Connected
+                && phase == claw_channels::DiscordGatewayPhase::Ready,
+        );
+    }
+}
 
 /// Configured Telegram worker.
 pub struct TelegramSettings {
@@ -52,6 +116,36 @@ pub struct DiscordSettings {
     pub gateway_url: String,
     /// Gateway intent bitset.
     pub intents: u64,
+}
+
+type TelegramProbeFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ChannelError>> + Send + 'a>>;
+
+trait TelegramReadinessProbe: Sync {
+    fn probe<'a>(
+        &'a self,
+        credential: &'a ChannelCredential,
+        origin: &'a ApprovedOrigin,
+        cancellation: &'a CancellationToken,
+    ) -> TelegramProbeFuture<'a>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TelegramReadinessError {
+    Cancelled,
+    Terminal(ChannelError),
+    Persistent(ChannelError),
+}
+
+impl Display for TelegramReadinessError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("Telegram readiness was cancelled"),
+            Self::Terminal(error) => write!(formatter, "Telegram readiness failed: {error}"),
+            Self::Persistent(error) => {
+                write!(formatter, "Telegram readiness repeatedly failed: {error}")
+            }
+        }
+    }
 }
 
 /// Shutdown accounting for live channel tasks.
@@ -166,6 +260,59 @@ fn cancel_requests(requests: &RequestCancellations) {
     }
 }
 
+async fn wait_for_telegram_readiness<P: TelegramReadinessProbe>(
+    probe: &P,
+    credential: &ChannelCredential,
+    origin: &ApprovedOrigin,
+    cancellation: &CancellationToken,
+    default_retry_after: Duration,
+    max_attempts: u32,
+) -> Result<(), TelegramReadinessError> {
+    for attempt in 1..=max_attempts {
+        let result = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(TelegramReadinessError::Cancelled),
+            result = probe.probe(credential, origin, cancellation) => result,
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if telegram_failure_is_terminal(&error) => {
+                return Err(TelegramReadinessError::Terminal(error));
+            }
+            Err(error) if attempt == max_attempts => {
+                return Err(TelegramReadinessError::Persistent(error));
+            }
+            Err(error) => {
+                let retry_after = error.retry_after().unwrap_or(default_retry_after);
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {
+                        return Err(TelegramReadinessError::Cancelled);
+                    }
+                    () = tokio::time::sleep(retry_after) => {}
+                }
+            }
+        }
+    }
+    unreachable!("the non-zero readiness attempt loop always returns")
+}
+
+const fn telegram_failure_is_terminal(error: &ChannelError) -> bool {
+    matches!(
+        error,
+        ChannelError::InvalidMessage(_)
+            | ChannelError::Configuration(_)
+            | ChannelError::Credential(_)
+            | ChannelError::CredentialBinding(_)
+            | ChannelError::Authentication
+            | ChannelError::Protocol(_)
+            | ChannelError::Unsupported(_)
+            | ChannelError::Lifecycle(_)
+            | ChannelError::NotConnected { .. }
+            | ChannelError::RemoteRejected { status: 400..=499 }
+    )
+}
+
 impl ChannelSupervisor {
     /// Builds and starts every configured channel.
     ///
@@ -181,6 +328,7 @@ impl ChannelSupervisor {
         authentication: Arc<RwLock<Option<String>>>,
         proxy: ProxyPolicy,
         diagnostics: Arc<Diagnostics>,
+        readiness: Arc<DependencyReadiness>,
         startup_cancellation: CancellationToken,
     ) -> Result<Self, String> {
         let cancellation = startup_cancellation.child_token();
@@ -195,6 +343,11 @@ impl ChannelSupervisor {
             armed: true,
         };
         let mut spawned = 0_u64;
+        let channel_readiness = ChannelReadiness::new(
+            Arc::clone(&readiness),
+            telegram.is_some(),
+            discord.is_some(),
+        );
 
         if let Some(settings) = telegram {
             let request_cancel = Arc::new(Mutex::new(None));
@@ -208,6 +361,27 @@ impl ChannelSupervisor {
                 origin.clone(),
                 &settings.token,
             )?;
+            request_cancellations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Arc::clone(&request_cancel));
+            match tokio::time::timeout(
+                CHANNEL_START_TIMEOUT,
+                wait_for_telegram_readiness(
+                    &transport,
+                    &credential,
+                    &origin,
+                    &cancellation,
+                    settings.poll_interval,
+                    TELEGRAM_READINESS_ATTEMPTS,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(error.to_string()),
+                Err(_) => return Err("Telegram channel readiness timed out".to_owned()),
+            }
             let inbound_capacity = NonZeroUsize::new(64)
                 .ok_or_else(|| "Telegram inbound capacity must be non-zero".to_owned())?;
             let mut channel = TelegramChannel::new(
@@ -222,10 +396,12 @@ impl ChannelSupervisor {
             channel
                 .start(&mut ChannelDiagnostics(Arc::clone(&diagnostics)))
                 .map_err(|error| error.to_string())?;
+            channel_readiness.set(ConfiguredChannel::Telegram, true);
             let task_cancel = cancellation.clone();
             let task_runtime = Arc::clone(&runtime);
             let task_authentication = Arc::clone(&authentication);
             let task_diagnostics = Arc::clone(&diagnostics);
+            let task_readiness = channel_readiness.clone();
             let task_terminated = Arc::clone(&terminated);
             let handle = tracker.spawn(async move {
                 let _guard = TerminationGuard(task_terminated);
@@ -235,6 +411,7 @@ impl ChannelSupervisor {
                     task_runtime,
                     task_authentication,
                     task_diagnostics,
+                    task_readiness,
                     task_cancel,
                 )
                 .await;
@@ -244,10 +421,6 @@ impl ChannelSupervisor {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(handle.abort_handle());
             drop(handle);
-            request_cancellations
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(request_cancel);
             spawned = spawned.saturating_add(1);
         }
 
@@ -329,6 +502,7 @@ impl ChannelSupervisor {
             let task_runtime = Arc::clone(&runtime);
             let task_authentication = Arc::clone(&authentication);
             let task_diagnostics = Arc::clone(&diagnostics);
+            let task_readiness = channel_readiness.clone();
             let task_terminated = Arc::clone(&terminated);
             let channel_task = tracker.spawn(async move {
                 let _guard = TerminationGuard(task_terminated);
@@ -342,6 +516,7 @@ impl ChannelSupervisor {
                     task_runtime,
                     task_authentication,
                     task_diagnostics,
+                    task_readiness,
                     task_cancel,
                     ready_tx,
                     started,
@@ -525,6 +700,14 @@ impl Drop for RequestSlotGuard<'_> {
     }
 }
 
+struct RequestCancelGuard(CancelToken);
+
+impl Drop for RequestCancelGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 fn blocking_http(
     transport: &HttpTransport,
     request: HttpRequest,
@@ -539,6 +722,48 @@ fn blocking_http(
             .block_on(async { transport.send("channel", operation, request, &cancel).await })
     })
     .map_err(|error| provider_channel_error(&error))
+}
+
+fn blocking_http_with_cancellation(
+    transport: &HttpTransport,
+    request: HttpRequest,
+    operation: Operation,
+    slot: &Mutex<Option<CancelToken>>,
+    cancellation: &CancellationToken,
+) -> Result<claw_provider_sdk::http::HttpResponse, ChannelError> {
+    let cancel = bind_request_cancellation(slot, cancellation)?;
+    let _cancel_on_drop = RequestCancelGuard(cancel.clone());
+    let _guard = RequestSlotGuard { slot };
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    cancel.cancel();
+                    Err(ChannelError::Transport(TransportErrorKind::Io))
+                }
+                response = transport.send("channel", operation, request, &cancel) => {
+                    response.map_err(|error| provider_channel_error(&error))
+                }
+            }
+        })
+    })
+}
+
+fn bind_request_cancellation(
+    slot: &Mutex<Option<CancelToken>>,
+    cancellation: &CancellationToken,
+) -> Result<CancelToken, ChannelError> {
+    let cancel = CancelToken::new();
+    let mut active = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    *active = Some(cancel.clone());
+    if cancellation.is_cancelled() {
+        cancel.cancel();
+        *active = None;
+        return Err(ChannelError::Transport(TransportErrorKind::Io));
+    }
+    drop(active);
+    Ok(cancel)
 }
 
 struct TelegramHttpTransport {
@@ -561,6 +786,83 @@ impl TelegramHttpTransport {
             request_cancel,
         })
     }
+
+    async fn probe_request(
+        &self,
+        request: HttpRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderResponse, ChannelError> {
+        let cancel = bind_request_cancellation(self.request_cancel.as_ref(), cancellation)?;
+        let _cancel_on_drop = RequestCancelGuard(cancel.clone());
+        let _guard = RequestSlotGuard {
+            slot: self.request_cancel.as_ref(),
+        };
+        let response = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                cancel.cancel();
+                return Err(ChannelError::Transport(TransportErrorKind::Io));
+            }
+            response = self.transport.send(
+                "telegram",
+                Operation::Transport,
+                request,
+                &cancel,
+            ) => response.map_err(|error| provider_channel_error(&error))?,
+        };
+        Ok(provider_response(&response))
+    }
+}
+
+impl TelegramReadinessProbe for TelegramHttpTransport {
+    fn probe<'a>(
+        &'a self,
+        credential: &'a ChannelCredential,
+        origin: &'a ApprovedOrigin,
+        cancellation: &'a CancellationToken,
+    ) -> TelegramProbeFuture<'a> {
+        Box::pin(async move {
+            let (webhook_request, poll_request) = credential
+                .expose_for_origin(
+                    "telegram",
+                    "default",
+                    CredentialKind::Token,
+                    origin,
+                    telegram_readiness_requests,
+                )
+                .map_err(ChannelError::CredentialBinding)??;
+            let webhook_response = self.probe_request(webhook_request, cancellation).await?;
+            classify_telegram_webhook_probe_response(&webhook_response)?;
+            let poll_response = self.probe_request(poll_request, cancellation).await?;
+            classify_telegram_poll_probe_response(&poll_response)
+        })
+    }
+}
+
+fn telegram_readiness_requests(
+    bot_token: &str,
+) -> Result<(HttpRequest, HttpRequest), ChannelError> {
+    let webhook_url = Url::parse(&format!(
+        "https://api.telegram.org/bot{bot_token}/getWebhookInfo"
+    ))
+    .map_err(|_| ChannelError::Protocol(claw_channel_sdk::ProtocolErrorKind::InvalidField))?;
+    let mut poll_url = Url::parse(&format!(
+        "https://api.telegram.org/bot{bot_token}/getUpdates"
+    ))
+    .map_err(|_| ChannelError::Protocol(claw_channel_sdk::ProtocolErrorKind::InvalidField))?;
+    {
+        let mut query = poll_url.query_pairs_mut();
+        query.append_pair("timeout", "0");
+        query.append_pair("limit", "1");
+    }
+    Ok((
+        HttpRequest::new(Method::Get, webhook_url)
+            .header("accept", "application/json")
+            .timeout(Duration::from_secs(10)),
+        HttpRequest::new(Method::Get, poll_url)
+            .header("accept", "application/json")
+            .timeout(Duration::from_secs(10)),
+    ))
 }
 
 impl TelegramTransport for TelegramHttpTransport {
@@ -629,7 +931,7 @@ enum DiscordCommand {
 enum DiscordEvent {
     Opened,
     Packet(Vec<u8>),
-    Closed,
+    Closed(DiscordGatewayClose),
 }
 
 #[derive(Clone)]
@@ -670,12 +972,11 @@ impl DiscordTransportAdapter {
         ))
     }
 
-    fn create_message_raw(
-        &self,
+    fn create_message_request(
         bot_token: &str,
         channel_id: &str,
         content: &str,
-    ) -> Result<ProviderResponse, ChannelError> {
+    ) -> Result<HttpRequest, ChannelError> {
         let url = Url::parse(&format!(
             "https://discord.com/api/v10/channels/{channel_id}/messages"
         ))
@@ -687,24 +988,72 @@ impl DiscordTransportAdapter {
         let body = serde_json::to_string(&json!({"content":content})).map_err(|_| {
             ChannelError::Protocol(claw_channel_sdk::ProtocolErrorKind::InvalidField)
         })?;
-        let http_request = HttpRequest::new(Method::Post, url)
+        Ok(HttpRequest::new(Method::Post, url)
             .header("accept", "application/json")
             .bound_secret_header("authorization", "Bot ", &credential)
             .map_err(|_| ChannelError::Authentication)?
             .body(Body::Json(body))
-            .timeout(Duration::from_secs(10));
+            .timeout(Duration::from_secs(10)))
+    }
+
+    fn gateway_url_is_direct(&self, gateway_url: &str) -> bool {
+        let Ok(url) = Url::parse(gateway_url) else {
+            return false;
+        };
+        url.scheme() == "wss"
+            && url.port_or_known_default() == Some(443)
+            && url.host_str().is_some_and(|host| {
+                self.transport
+                    .proxy_rules()
+                    .intercept(host, 443)
+                    .is_direct()
+            })
+    }
+
+    fn create_message_raw(
+        &self,
+        bot_token: &str,
+        channel_id: &str,
+        content: &str,
+    ) -> Result<ProviderResponse, ChannelError> {
         let response = blocking_http(
             &self.transport,
-            http_request,
+            Self::create_message_request(bot_token, channel_id, content)?,
             Operation::Transport,
             &self.request_cancel,
+        )?;
+        Ok(provider_response(&response))
+    }
+
+    fn create_message_raw_with_cancellation(
+        &self,
+        bot_token: &str,
+        channel_id: &str,
+        content: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderResponse, ChannelError> {
+        let response = blocking_http_with_cancellation(
+            &self.transport,
+            Self::create_message_request(bot_token, channel_id, content)?,
+            Operation::Transport,
+            &self.request_cancel,
+            cancellation,
         )?;
         Ok(provider_response(&response))
     }
 }
 
 impl DiscordTransport for DiscordTransportAdapter {
+    fn gateway_url_allowed(&self, gateway_url: &str) -> bool {
+        self.gateway_url_is_direct(gateway_url)
+    }
+
     fn open_gateway(&mut self, gateway_url: &str) -> Result<(), ChannelError> {
+        if !self.gateway_url_is_direct(gateway_url) {
+            return Err(ChannelError::Configuration(
+                claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
+            ));
+        }
         self.commands
             .try_send(DiscordCommand::Open(gateway_url.to_owned()))
             .map_err(|_| ChannelError::RateLimited {
@@ -733,6 +1082,18 @@ impl DiscordTransport for DiscordTransportAdapter {
                 }
             }),
             1 => json!({"op":1,"d":request.sequence()}),
+            6 => json!({
+                "op": 6,
+                "d": {
+                    "token": request.bot_token().ok_or(ChannelError::Authentication)?,
+                    "session_id": request.session_id().ok_or(ChannelError::Protocol(
+                        claw_channel_sdk::ProtocolErrorKind::MissingField,
+                    ))?,
+                    "seq": request.sequence().ok_or(ChannelError::Protocol(
+                        claw_channel_sdk::ProtocolErrorKind::MissingField,
+                    ))?,
+                }
+            }),
             _ => {
                 return Err(ChannelError::Protocol(
                     claw_channel_sdk::ProtocolErrorKind::InvalidField,
@@ -771,13 +1132,16 @@ async fn run_discord_socket(
             continue;
         };
         let Ok((socket, _response)) = tokio_tungstenite::connect_async(url).await else {
-            let _ = events.send(DiscordEvent::Closed).await;
+            let _ = events
+                .send(DiscordEvent::Closed(DiscordGatewayClose::transport_lost()))
+                .await;
             continue;
         };
         let (mut writer, mut reader) = socket.split();
         if events.send(DiscordEvent::Opened).await.is_err() {
             return;
         }
+        let mut close = DiscordGatewayClose::transport_lost();
         loop {
             tokio::select! {
                 () = cancellation.cancelled() => {
@@ -813,12 +1177,22 @@ async fn run_discord_socket(
                             break;
                         }
                     }
-                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                    Some(Ok(Message::Close(frame))) => {
+                        close = frame.map_or_else(
+                            DiscordGatewayClose::transport_lost,
+                            |frame| DiscordGatewayClose::websocket(
+                                u16::from(frame.code),
+                                frame.reason.to_string(),
+                            ),
+                        );
+                        break;
+                    }
+                    Some(Err(_)) | None => break,
                     Some(Ok(_)) => {}
                 }
             }
         }
-        let _ = events.send(DiscordEvent::Closed).await;
+        let _ = events.send(DiscordEvent::Closed(close)).await;
     }
 }
 
@@ -833,6 +1207,7 @@ async fn run_discord(
     runtime: Arc<AgentRuntime>,
     authentication: Arc<RwLock<Option<String>>>,
     diagnostics: Arc<Diagnostics>,
+    readiness: ChannelReadiness,
     cancellation: CancellationToken,
     ready: oneshot::Sender<Result<(), String>>,
     started: Instant,
@@ -869,11 +1244,13 @@ async fn run_discord(
                         &gateway_credential,
                         &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
                     ).map(Some),
-                    DiscordEvent::Closed => channel.gateway_closed(
+                    DiscordEvent::Closed(close) => channel.gateway_closed_with(
                         started.elapsed(),
+                        close,
                         &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
                     ).map(|_| None),
                 };
+                readiness.set_discord_state(channel.state(), channel.phase());
                 match result {
                     Ok(Some(DiscordPacketOutcome::Ready)) => {
                         if let Some(ready) = ready.take() {
@@ -881,6 +1258,13 @@ async fn run_discord(
                         }
                     }
                     Ok(_) => {}
+                    Err(error) if channel.state() == ConnectionState::Closed => {
+                        diagnostics.record(format!("Discord event failed terminally: {error}"));
+                        if let Some(ready) = ready.take() {
+                            let _ = ready.send(Err(error.to_string()));
+                        }
+                        break;
+                    }
                     Err(error) => diagnostics.record(format!("Discord event failed: {error}")),
                 }
                 if let Err(error) = enqueue_discord(
@@ -892,15 +1276,18 @@ async fn run_discord(
                 }
             }
             _ = tick.tick() => {
-                if let Err(error) = channel.tick(
+                let result = channel.tick(
                     started.elapsed(),
                     &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
-                ) {
+                );
+                readiness.set_discord_state(channel.state(), channel.phase());
+                if let Err(error) = result {
                     diagnostics.record(format!("Discord tick failed: {error}"));
                 }
             }
         }
     }
+    readiness.set(ConfiguredChannel::Discord, false);
     dispatch_cancellation.cancel();
     drop(inbound_tx);
     if let Err(error) = dispatch_task.join().await {
@@ -918,18 +1305,40 @@ async fn run_telegram(
     runtime: Arc<AgentRuntime>,
     authentication: Arc<RwLock<Option<String>>>,
     diagnostics: Arc<Diagnostics>,
+    readiness: ChannelReadiness,
     cancellation: CancellationToken,
 ) {
+    let mut consecutive_failures = 0_u32;
     loop {
         if cancellation.is_cancelled() {
             break;
         }
-        if let Err(error) = channel.poll_once(
+        let poll_result = channel.poll_once(
             &credential,
             &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
-        ) {
-            diagnostics.record(format!("Telegram poll failed: {error}"));
-        }
+        );
+        let retry_after = match &poll_result {
+            Ok(_) => {
+                consecutive_failures = 0;
+                readiness.set(ConfiguredChannel::Telegram, true);
+                channel.poll_interval()
+            }
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                diagnostics.record(format!("Telegram poll failed: {error}"));
+                if telegram_failure_is_terminal(error) {
+                    readiness.set(ConfiguredChannel::Telegram, false);
+                    diagnostics.record("Telegram worker stopped after a terminal failure");
+                    break;
+                }
+                if consecutive_failures >= TELEGRAM_PERSISTENT_FAILURES {
+                    readiness.set(ConfiguredChannel::Telegram, false);
+                }
+                error
+                    .retry_after()
+                    .unwrap_or_else(|| channel.poll_interval())
+            }
+        };
         while let Ok(Some(message)) = channel.poll_inbound() {
             match process_inbound(
                 &message,
@@ -971,9 +1380,10 @@ async fn run_telegram(
         }
         tokio::select! {
             () = cancellation.cancelled() => break,
-            () = tokio::time::sleep(channel.poll_interval()) => {}
+            () = tokio::time::sleep(retry_after) => {}
         }
     }
+    readiness.set(ConfiguredChannel::Telegram, false);
     let _ = channel.stop(&mut ChannelDiagnostics(diagnostics));
 }
 
@@ -1022,8 +1432,15 @@ async fn run_discord_dispatch(
         .await
         {
             Ok(Some(reply)) => {
-                if let Err(error) =
-                    send_discord_reply(&transport, &origin, &credential, &message, &reply)
+                if let Err(error) = send_discord_reply(
+                    &transport,
+                    &origin,
+                    &credential,
+                    &message,
+                    &reply,
+                    &cancellation,
+                )
+                .await
                 {
                     diagnostics.record(format!("Discord reply failed: {error}"));
                 }
@@ -1034,12 +1451,35 @@ async fn run_discord_dispatch(
     }
 }
 
-fn send_discord_reply(
-    transport: &DiscordTransportAdapter,
+trait DiscordReplyTransport: Sync {
+    fn send_reply_raw(
+        &self,
+        bot_token: &str,
+        channel_id: &str,
+        content: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderResponse, ChannelError>;
+}
+
+impl DiscordReplyTransport for DiscordTransportAdapter {
+    fn send_reply_raw(
+        &self,
+        bot_token: &str,
+        channel_id: &str,
+        content: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderResponse, ChannelError> {
+        self.create_message_raw_with_cancellation(bot_token, channel_id, content, cancellation)
+    }
+}
+
+async fn send_discord_reply<T: DiscordReplyTransport>(
+    transport: &T,
     origin: &claw_channel_sdk::ApprovedOrigin,
     credential: &ChannelCredential,
     message: &InboundMessage,
     reply: &str,
+    cancellation: &CancellationToken,
 ) -> Result<(), ChannelError> {
     let route =
         message
@@ -1056,31 +1496,53 @@ fn send_discord_reply(
             claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
         )
     })?;
-    credential
-        .expose_for_origin(
-            "discord",
-            "default",
-            CredentialKind::Token,
-            origin,
-            |bot_token| -> Result<(), ChannelError> {
-                for segment in segments {
-                    let segment = segment.map_err(|_| {
-                        ChannelError::Configuration(
-                            claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
-                        )
-                    })?;
-                    let response =
-                        transport.create_message_raw(bot_token, channel_id, segment.as_ref())?;
-                    if !(200..300).contains(&response.status()) {
-                        return Err(ChannelError::RemoteRejected {
-                            status: response.status(),
-                        });
+    for segment in segments {
+        let segment = segment
+            .map_err(|_| {
+                ChannelError::Configuration(
+                    claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
+                )
+            })?
+            .into_owned();
+        for attempt in 1..=DISCORD_REPLY_MAX_ATTEMPTS {
+            if cancellation.is_cancelled() {
+                return Err(ChannelError::Transport(TransportErrorKind::Io));
+            }
+            let response = credential
+                .expose_for_origin(
+                    "discord",
+                    "default",
+                    CredentialKind::Token,
+                    origin,
+                    |bot_token| {
+                        transport.send_reply_raw(bot_token, channel_id, &segment, cancellation)
+                    },
+                )
+                .map_err(ChannelError::CredentialBinding)??;
+            require_provider_response_bounded(&response)?;
+            match response.status() {
+                200..=299 => break,
+                401 | 403 => return Err(ChannelError::Authentication),
+                429 => {
+                    let retry_after = response
+                        .retry_after()
+                        .unwrap_or_else(|| Duration::from_secs(1));
+                    if attempt == DISCORD_REPLY_MAX_ATTEMPTS {
+                        return Err(ChannelError::RateLimited { retry_after });
+                    }
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => {
+                            return Err(ChannelError::Transport(TransportErrorKind::Io));
+                        }
+                        () = tokio::time::sleep(retry_after) => {}
                     }
                 }
-                Ok(())
-            },
-        )
-        .map_err(ChannelError::CredentialBinding)?
+                status => return Err(ChannelError::RemoteRejected { status }),
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn process_inbound(
@@ -1151,9 +1613,95 @@ fn outbound(message: &InboundMessage, text: String) -> OutboundMessage {
 fn provider_response(response: &claw_provider_sdk::http::HttpResponse) -> ProviderResponse {
     let retry_after = response
         .header("retry-after")
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs);
+        .and_then(parse_retry_after_header);
     ProviderResponse::with_retry_after(response.status(), response.body().to_vec(), retry_after)
+}
+
+fn parse_retry_after_header(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    Duration::try_from_secs_f64(value.parse::<f64>().ok()?).ok()
+}
+
+fn require_provider_response_bounded(response: &ProviderResponse) -> Result<(), ChannelError> {
+    if response.body().len() > MAX_PROVIDER_RESPONSE_BYTES {
+        Err(ChannelError::Protocol(
+            claw_channel_sdk::ProtocolErrorKind::PayloadTooLarge,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_telegram_probe_response(
+    response: &ProviderResponse,
+) -> Result<serde_json::Value, ChannelError> {
+    match response.status() {
+        200..=299 => {
+            require_provider_response_bounded(response)?;
+            let body: serde_json::Value =
+                serde_json::from_slice(response.body()).map_err(|_| {
+                    ChannelError::Protocol(claw_channel_sdk::ProtocolErrorKind::MalformedResponse)
+                })?;
+            if body.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+                Ok(body)
+            } else {
+                Err(ChannelError::Protocol(
+                    claw_channel_sdk::ProtocolErrorKind::InvalidField,
+                ))
+            }
+        }
+        401 | 403 => Err(ChannelError::Authentication),
+        408 => Err(ChannelError::Transport(TransportErrorKind::Timeout)),
+        429 => {
+            require_provider_response_bounded(response)?;
+            let body_retry_after = serde_json::from_slice::<serde_json::Value>(response.body())
+                .ok()
+                .and_then(|body| {
+                    body.get("parameters")
+                        .and_then(|parameters| parameters.get("retry_after"))
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .map(Duration::from_secs);
+            Err(ChannelError::RateLimited {
+                retry_after: response
+                    .retry_after()
+                    .or(body_retry_after)
+                    .unwrap_or_else(|| Duration::from_secs(1)),
+            })
+        }
+        status => Err(ChannelError::RemoteRejected { status }),
+    }
+}
+
+fn classify_telegram_webhook_probe_response(
+    response: &ProviderResponse,
+) -> Result<(), ChannelError> {
+    let body = parse_telegram_probe_response(response)?;
+    match body
+        .get("result")
+        .and_then(|result| result.get("url"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("") => Ok(()),
+        Some(_) => Err(ChannelError::RemoteRejected { status: 409 }),
+        None => Err(ChannelError::Protocol(
+            claw_channel_sdk::ProtocolErrorKind::InvalidField,
+        )),
+    }
+}
+
+fn classify_telegram_poll_probe_response(response: &ProviderResponse) -> Result<(), ChannelError> {
+    let body = parse_telegram_probe_response(response)?;
+    if body.get("result").is_some_and(serde_json::Value::is_array) {
+        Ok(())
+    } else {
+        Err(ChannelError::Protocol(
+            claw_channel_sdk::ProtocolErrorKind::InvalidField,
+        ))
+    }
 }
 
 fn provider_channel_error(error: &claw_provider_sdk::ProviderError) -> ChannelError {
@@ -1177,14 +1725,418 @@ fn provider_channel_error(error: &claw_provider_sdk::ProviderError) -> ChannelEr
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::num::{NonZeroU32, NonZeroUsize};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use claw_provider_sdk::CancelToken;
+    use claw_channel_sdk::{
+        ApprovedOrigin, ChannelCredential, ChannelError, ConnectionState, CredentialKind,
+        InboundMessage, TransportErrorKind,
+    };
+    use claw_channels::{
+        DiscordChannel, DiscordGatewayClose, DiscordGatewayPhase, DiscordPacketOutcome,
+        ProviderResponse, SystemClock,
+    };
+    use claw_http_api::ReadinessPort;
+    use claw_provider_sdk::http::ProxyPolicy;
+    use claw_provider_sdk::{CancelToken, SecretString};
     use tokio_util::sync::CancellationToken;
     use tokio_util::task::TaskTracker;
 
-    use super::ChannelStartGuard;
+    use super::{
+        ChannelReadiness, ChannelStartGuard, ConfiguredChannel, DependencyReadiness,
+        DiscordCommand, DiscordReplyTransport, DiscordTransportAdapter, TelegramProbeFuture,
+        TelegramReadinessError, TelegramReadinessProbe, approved_origin, bind_credential,
+        bind_request_cancellation, cancel_requests, classify_telegram_poll_probe_response,
+        classify_telegram_webhook_probe_response, parse_retry_after_header, send_discord_reply,
+        telegram_failure_is_terminal, telegram_readiness_requests, wait_for_telegram_readiness,
+    };
+
+    #[test]
+    fn configured_channel_readiness_aggregates_without_cross_channel_overwrite() {
+        let dependency = Arc::new(DependencyReadiness::new(["channels"]));
+        let channels = ChannelReadiness::new(Arc::clone(&dependency), true, true);
+
+        assert!(!dependency.snapshot().expect("snapshot").ready);
+        channels.set(ConfiguredChannel::Telegram, true);
+        assert!(!dependency.snapshot().expect("snapshot").ready);
+        channels.set(ConfiguredChannel::Discord, true);
+        assert!(dependency.snapshot().expect("snapshot").ready);
+
+        channels.set(ConfiguredChannel::Discord, false);
+        channels.set(ConfiguredChannel::Telegram, true);
+        let snapshot = dependency.snapshot().expect("snapshot");
+        assert!(!snapshot.ready);
+        assert_eq!(snapshot.failing, ["channels", "discord"]);
+    }
+
+    #[test]
+    fn discord_terminal_and_exhausted_states_clear_aggregate_readiness() {
+        let dependency = Arc::new(DependencyReadiness::new(["channels"]));
+        let channels = ChannelReadiness::new(Arc::clone(&dependency), true, true);
+        channels.set(ConfiguredChannel::Telegram, true);
+        channels.set(ConfiguredChannel::Discord, true);
+
+        channels.set_discord_state(
+            ConnectionState::Closed,
+            DiscordGatewayPhase::ReconnectExhausted,
+        );
+        channels.set(ConfiguredChannel::Telegram, true);
+        assert_eq!(
+            dependency.snapshot().expect("terminal snapshot").failing,
+            ["channels", "discord"]
+        );
+
+        channels.set(ConfiguredChannel::Discord, true);
+        channels.set_discord_state(
+            ConnectionState::Disconnected,
+            DiscordGatewayPhase::ReconnectExhausted,
+        );
+        channels.set(ConfiguredChannel::Telegram, true);
+        assert_eq!(
+            dependency.snapshot().expect("exhausted snapshot").failing,
+            ["channels", "discord"]
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_adapter_async_resume_failure_falls_back_and_still_sends_resume() {
+        let request_cancel = Arc::new(Mutex::new(None));
+        let (transport, mut commands, _event_tx, _events) =
+            DiscordTransportAdapter::new(ProxyPolicy::Disabled, request_cancel)
+                .expect("Discord transport");
+        let gateway_origin =
+            approved_origin("discord", "default", "gateway.discord.gg").expect("Gateway origin");
+        let rest_origin =
+            approved_origin("discord", "default", "discord.com").expect("REST origin");
+        let gateway_credential = bind_credential(
+            "discord",
+            "default",
+            CredentialKind::Token,
+            gateway_origin.clone(),
+            &SecretString::new("discord-secret"),
+        )
+        .expect("Gateway credential");
+        let mut channel = DiscordChannel::new(
+            "default",
+            "wss://gateway.discord.gg/?v=10&encoding=json",
+            gateway_origin,
+            rest_origin,
+            32_768,
+            transport,
+            SystemClock,
+            NonZeroUsize::new(2).expect("non-zero capacity"),
+            NonZeroU32::new(3).expect("non-zero attempts"),
+        )
+        .expect("Discord channel");
+
+        channel.start(Duration::ZERO, &mut ()).expect("start");
+        match commands.recv().await {
+            Some(DiscordCommand::Open(url)) => {
+                assert_eq!(url, "wss://gateway.discord.gg/?v=10&encoding=json");
+            }
+            Some(_) | None => panic!("bootstrap open command expected"),
+        }
+        channel.gateway_opened(&mut ()).expect("bootstrap opened");
+        assert_eq!(
+            channel.handle_gateway_packet(
+                br#"{"op":10,"t":null,"s":null,"d":{"heartbeat_interval":1000}}"#,
+                Duration::ZERO,
+                &gateway_credential,
+                &mut (),
+            ),
+            Ok(DiscordPacketOutcome::Identified)
+        );
+        match commands.recv().await {
+            Some(DiscordCommand::Send(payload)) => {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&payload).expect("IDENTIFY")["op"],
+                    2
+                );
+            }
+            Some(_) | None => panic!("IDENTIFY command expected"),
+        }
+        assert_eq!(
+            channel.handle_gateway_packet(
+                br#"{"op":0,"t":"READY","s":41,"d":{"session_id":"session","resume_gateway_url":"wss://gateway-us-east1-b.discord.gg"}}"#,
+                Duration::ZERO,
+                &gateway_credential,
+                &mut (),
+            ),
+            Ok(DiscordPacketOutcome::Ready)
+        );
+        assert_eq!(
+            channel.handle_gateway_packet(
+                br#"{"op":7,"t":null,"s":null,"d":null}"#,
+                Duration::from_secs(1),
+                &gateway_credential,
+                &mut (),
+            ),
+            Ok(DiscordPacketOutcome::ReconnectRequested)
+        );
+        assert!(matches!(commands.recv().await, Some(DiscordCommand::Close)));
+
+        assert_eq!(channel.tick(Duration::from_secs(4), &mut ()), Ok(true));
+        match commands.recv().await {
+            Some(DiscordCommand::Open(url)) => {
+                assert_eq!(
+                    url,
+                    "wss://gateway-us-east1-b.discord.gg?v=10&encoding=json"
+                );
+            }
+            Some(_) | None => panic!("resume open command expected"),
+        }
+        assert_eq!(
+            channel.gateway_closed_with(
+                Duration::from_secs(4),
+                DiscordGatewayClose::transport_lost(),
+                &mut (),
+            ),
+            Ok(true)
+        );
+        assert_eq!(channel.session_id(), Some("session"));
+        assert_eq!(channel.sequence(), Some(41));
+        assert_eq!(channel.resume_gateway_url(), None);
+
+        assert_eq!(channel.tick(Duration::from_secs(7), &mut ()), Ok(true));
+        match commands.recv().await {
+            Some(DiscordCommand::Open(url)) => {
+                assert_eq!(url, "wss://gateway.discord.gg/?v=10&encoding=json");
+            }
+            Some(_) | None => panic!("bootstrap fallback command expected"),
+        }
+        channel.gateway_opened(&mut ()).expect("fallback opened");
+        assert_eq!(
+            channel.handle_gateway_packet(
+                br#"{"op":10,"t":null,"s":null,"d":{"heartbeat_interval":1000}}"#,
+                Duration::from_secs(7),
+                &gateway_credential,
+                &mut (),
+            ),
+            Ok(DiscordPacketOutcome::Identified)
+        );
+        match commands.recv().await {
+            Some(DiscordCommand::Send(payload)) => {
+                let resume =
+                    serde_json::from_str::<serde_json::Value>(&payload).expect("RESUME payload");
+                assert_eq!(resume["op"], 6);
+                assert_eq!(resume["d"]["session_id"], "session");
+                assert_eq!(resume["d"]["seq"], 41);
+            }
+            Some(_) | None => panic!("RESUME command expected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn discord_resume_url_must_share_bootstrap_no_proxy_policy() {
+        let request_cancel = Arc::new(Mutex::new(None));
+        let proxy = ProxyPolicy::Explicit {
+            url: "http://proxy.internal:3128".to_owned(),
+            no_proxy: Some("gateway.discord.gg".to_owned()),
+        };
+        let (transport, mut commands, _event_tx, _events) =
+            DiscordTransportAdapter::new(proxy, request_cancel).expect("Discord transport");
+        assert!(transport.gateway_url_is_direct("wss://gateway.discord.gg/?v=10&encoding=json"));
+        assert!(
+            !transport
+                .gateway_url_is_direct("wss://gateway-us-east1-b.discord.gg?v=10&encoding=json")
+        );
+
+        let gateway_origin =
+            approved_origin("discord", "default", "gateway.discord.gg").expect("Gateway origin");
+        let rest_origin =
+            approved_origin("discord", "default", "discord.com").expect("REST origin");
+        let gateway_credential = bind_credential(
+            "discord",
+            "default",
+            CredentialKind::Token,
+            gateway_origin.clone(),
+            &SecretString::new("discord-secret"),
+        )
+        .expect("Gateway credential");
+        let mut channel = DiscordChannel::new(
+            "default",
+            "wss://gateway.discord.gg/?v=10&encoding=json",
+            gateway_origin,
+            rest_origin,
+            32_768,
+            transport,
+            SystemClock,
+            NonZeroUsize::new(2).expect("non-zero capacity"),
+            NonZeroU32::new(3).expect("non-zero attempts"),
+        )
+        .expect("Discord channel");
+
+        channel.start(Duration::ZERO, &mut ()).expect("start");
+        assert!(matches!(
+            commands.recv().await,
+            Some(DiscordCommand::Open(_))
+        ));
+        channel.gateway_opened(&mut ()).expect("opened");
+        channel
+            .handle_gateway_packet(
+                br#"{"op":10,"t":null,"s":null,"d":{"heartbeat_interval":1000}}"#,
+                Duration::ZERO,
+                &gateway_credential,
+                &mut (),
+            )
+            .expect("identified");
+        assert!(matches!(
+            commands.recv().await,
+            Some(DiscordCommand::Send(_))
+        ));
+        assert_eq!(
+            channel.handle_gateway_packet(
+                br#"{"op":0,"t":"READY","s":41,"d":{"session_id":"session","resume_gateway_url":"wss://gateway-us-east1-b.discord.gg"}}"#,
+                Duration::ZERO,
+                &gateway_credential,
+                &mut (),
+            ),
+            Ok(DiscordPacketOutcome::Ready)
+        );
+        assert_eq!(channel.resume_gateway_url(), None);
+
+        channel
+            .handle_gateway_packet(
+                br#"{"op":7,"t":null,"s":null,"d":null}"#,
+                Duration::from_secs(1),
+                &gateway_credential,
+                &mut (),
+            )
+            .expect("reconnect requested");
+        assert!(matches!(commands.recv().await, Some(DiscordCommand::Close)));
+        assert_eq!(channel.tick(Duration::from_secs(4), &mut ()), Ok(true));
+        match commands.recv().await {
+            Some(DiscordCommand::Open(url)) => {
+                assert_eq!(url, "wss://gateway.discord.gg/?v=10&encoding=json");
+            }
+            Some(_) | None => panic!("bootstrap fallback expected"),
+        }
+        channel.gateway_opened(&mut ()).expect("fallback opened");
+        channel
+            .handle_gateway_packet(
+                br#"{"op":10,"t":null,"s":null,"d":{"heartbeat_interval":1000}}"#,
+                Duration::from_secs(4),
+                &gateway_credential,
+                &mut (),
+            )
+            .expect("resume sent");
+        match commands.recv().await {
+            Some(DiscordCommand::Send(payload)) => {
+                let resume =
+                    serde_json::from_str::<serde_json::Value>(&payload).expect("RESUME payload");
+                assert_eq!(resume["op"], 6);
+                assert_eq!(resume["d"]["session_id"], "session");
+                assert_eq!(resume["d"]["seq"], 41);
+            }
+            Some(_) | None => panic!("RESUME command expected"),
+        }
+    }
+
+    struct ScriptedTelegramProbe {
+        results: Mutex<VecDeque<Result<(), ChannelError>>>,
+        calls: AtomicUsize,
+    }
+
+    impl TelegramReadinessProbe for ScriptedTelegramProbe {
+        fn probe<'a>(
+            &'a self,
+            _credential: &'a ChannelCredential,
+            _origin: &'a ApprovedOrigin,
+            _cancellation: &'a CancellationToken,
+        ) -> TelegramProbeFuture<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.results
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pop_front()
+                    .expect("scripted Telegram readiness result")
+            })
+        }
+    }
+
+    fn telegram_probe_credential() -> (ApprovedOrigin, ChannelCredential) {
+        let origin = approved_origin("telegram", "default", "api.telegram.org").expect("origin");
+        let credential = bind_credential(
+            "telegram",
+            "default",
+            CredentialKind::Token,
+            origin.clone(),
+            &SecretString::new("telegram-secret"),
+        )
+        .expect("credential");
+        (origin, credential)
+    }
+
+    struct ScriptedDiscordReplies {
+        responses: Mutex<VecDeque<Result<ProviderResponse, ChannelError>>>,
+        calls: AtomicUsize,
+        cancel_on_call: AtomicUsize,
+    }
+
+    impl DiscordReplyTransport for ScriptedDiscordReplies {
+        fn send_reply_raw(
+            &self,
+            bot_token: &str,
+            channel_id: &str,
+            content: &str,
+            cancellation: &CancellationToken,
+        ) -> Result<ProviderResponse, ChannelError> {
+            assert_eq!(bot_token, "discord-secret");
+            assert_eq!(channel_id, "room");
+            assert_eq!(content, "reply");
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.cancel_on_call.load(Ordering::SeqCst) == call {
+                cancellation.cancel();
+            }
+            self.responses
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+                .expect("scripted Discord response")
+        }
+    }
+
+    fn discord_reply_fixture(
+        responses: VecDeque<Result<ProviderResponse, ChannelError>>,
+    ) -> (
+        ScriptedDiscordReplies,
+        claw_channel_sdk::ApprovedOrigin,
+        claw_channel_sdk::ChannelCredential,
+        InboundMessage,
+    ) {
+        let origin = approved_origin("discord", "default", "discord.com").expect("origin");
+        let credential = bind_credential(
+            "discord",
+            "default",
+            CredentialKind::Token,
+            origin.clone(),
+            &SecretString::new("discord-secret"),
+        )
+        .expect("credential");
+        (
+            ScriptedDiscordReplies {
+                responses: Mutex::new(responses),
+                calls: AtomicUsize::new(0),
+                cancel_on_call: AtomicUsize::new(0),
+            },
+            origin,
+            credential,
+            InboundMessage {
+                id: "message-1".to_owned(),
+                channel_id: "discord".to_owned(),
+                account_id: "default".to_owned(),
+                conversation_id: "discord:room:user".to_owned(),
+                sender_id: "user".to_owned(),
+                text: Some("question".to_owned()),
+                attachments: Vec::new(),
+                received_at_unix_ms: 1,
+            },
+        )
+    }
 
     #[tokio::test]
     async fn dropping_channel_start_aborts_accepted_workers() {
@@ -1219,5 +2171,337 @@ mod tests {
             aborts.lock().unwrap_or_else(PoisonError::into_inner).len(),
             1
         );
+    }
+
+    #[test]
+    fn discord_request_cancellation_binding_closes_shutdown_races() {
+        let cancellation = CancellationToken::new();
+        let request_slot = Arc::new(Mutex::new(None));
+        let request_cancel =
+            bind_request_cancellation(request_slot.as_ref(), &cancellation).expect("bound request");
+        let requests = Arc::new(Mutex::new(vec![Arc::clone(&request_slot)]));
+
+        cancellation.cancel();
+        cancel_requests(&requests);
+        assert!(request_cancel.is_cancelled());
+
+        let late_slot = Mutex::new(None);
+        assert!(matches!(
+            bind_request_cancellation(&late_slot, &cancellation),
+            Err(ChannelError::Transport(TransportErrorKind::Io))
+        ));
+        assert!(
+            late_slot
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_reply_honors_retry_after_and_retries_only_429() {
+        let retry_after = Duration::from_millis(20);
+        let (transport, origin, credential, message) = discord_reply_fixture(VecDeque::from([
+            Ok(ProviderResponse::with_retry_after(
+                429,
+                Vec::new(),
+                Some(retry_after),
+            )),
+            Ok(ProviderResponse::new(200, Vec::new())),
+        ]));
+        let started = Instant::now();
+
+        send_discord_reply(
+            &transport,
+            &origin,
+            &credential,
+            &message,
+            "reply",
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("rate-limited reply recovers");
+
+        assert!(started.elapsed() >= retry_after);
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn discord_reply_bounds_persistent_rate_limit_retries() {
+        let retry_after = Duration::from_millis(1);
+        let limited = || {
+            Ok(ProviderResponse::with_retry_after(
+                429,
+                Vec::new(),
+                Some(retry_after),
+            ))
+        };
+        let (transport, origin, credential, message) =
+            discord_reply_fixture(VecDeque::from([limited(), limited(), limited()]));
+
+        assert_eq!(
+            send_discord_reply(
+                &transport,
+                &origin,
+                &credential,
+                &message,
+                "reply",
+                &CancellationToken::new(),
+            )
+            .await,
+            Err(ChannelError::RateLimited { retry_after })
+        );
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn discord_reply_does_not_start_after_cancellation() {
+        let (transport, origin, credential, message) =
+            discord_reply_fixture(VecDeque::from([Ok(ProviderResponse::new(200, Vec::new()))]));
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        assert_eq!(
+            send_discord_reply(
+                &transport,
+                &origin,
+                &credential,
+                &message,
+                "reply",
+                &cancellation,
+            )
+            .await,
+            Err(ChannelError::Transport(TransportErrorKind::Io))
+        );
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn discord_reply_binds_cancellation_and_stops_before_retry() {
+        let retry_after = Duration::from_secs(1);
+        let (transport, origin, credential, message) = discord_reply_fixture(VecDeque::from([
+            Ok(ProviderResponse::with_retry_after(
+                429,
+                Vec::new(),
+                Some(retry_after),
+            )),
+            Ok(ProviderResponse::new(200, Vec::new())),
+        ]));
+        transport.cancel_on_call.store(1, Ordering::SeqCst);
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            send_discord_reply(
+                &transport,
+                &origin,
+                &credential,
+                &message,
+                "reply",
+                &cancellation,
+            )
+            .await,
+            Err(ChannelError::Transport(TransportErrorKind::Io))
+        );
+        assert!(cancellation.is_cancelled());
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn telegram_readiness_requires_a_success_and_honors_retry_after() {
+        let retry_after = Duration::from_millis(20);
+        let probe = ScriptedTelegramProbe {
+            results: Mutex::new(VecDeque::from([
+                Err(ChannelError::RateLimited { retry_after }),
+                Ok(()),
+            ])),
+            calls: AtomicUsize::new(0),
+        };
+        let (origin, credential) = telegram_probe_credential();
+        let started = Instant::now();
+
+        wait_for_telegram_readiness(
+            &probe,
+            &credential,
+            &origin,
+            &CancellationToken::new(),
+            Duration::from_millis(1),
+            3,
+        )
+        .await
+        .expect("probe eventually succeeds");
+
+        assert!(started.elapsed() >= retry_after);
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn telegram_readiness_retries_http_408_as_timeout() {
+        let failure =
+            classify_telegram_poll_probe_response(&ProviderResponse::new(408, Vec::new()))
+                .expect_err("408 is a timeout");
+        assert_eq!(
+            failure,
+            ChannelError::Transport(TransportErrorKind::Timeout)
+        );
+        assert!(!telegram_failure_is_terminal(&failure));
+
+        let probe = ScriptedTelegramProbe {
+            results: Mutex::new(VecDeque::from([Err(failure), Ok(())])),
+            calls: AtomicUsize::new(0),
+        };
+        let (origin, credential) = telegram_probe_credential();
+        wait_for_telegram_readiness(
+            &probe,
+            &credential,
+            &origin,
+            &CancellationToken::new(),
+            Duration::from_millis(1),
+            2,
+        )
+        .await
+        .expect("408 readiness retries");
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn telegram_readiness_fails_fast_terminal_and_bounds_persistent_failure() {
+        let (origin, credential) = telegram_probe_credential();
+        let terminal_failure =
+            classify_telegram_poll_probe_response(&ProviderResponse::new(409, Vec::new()))
+                .expect_err("poll conflict is terminal");
+        let terminal = ScriptedTelegramProbe {
+            results: Mutex::new(VecDeque::from([Err(terminal_failure.clone()), Ok(())])),
+            calls: AtomicUsize::new(0),
+        };
+        assert_eq!(
+            wait_for_telegram_readiness(
+                &terminal,
+                &credential,
+                &origin,
+                &CancellationToken::new(),
+                Duration::from_millis(1),
+                3,
+            )
+            .await,
+            Err(TelegramReadinessError::Terminal(terminal_failure))
+        );
+        assert_eq!(terminal.calls.load(Ordering::SeqCst), 1);
+
+        let failure = ChannelError::Transport(TransportErrorKind::Timeout);
+        let persistent = ScriptedTelegramProbe {
+            results: Mutex::new(VecDeque::from([
+                Err(failure.clone()),
+                Err(failure.clone()),
+                Err(failure.clone()),
+            ])),
+            calls: AtomicUsize::new(0),
+        };
+        assert_eq!(
+            wait_for_telegram_readiness(
+                &persistent,
+                &credential,
+                &origin,
+                &CancellationToken::new(),
+                Duration::from_millis(1),
+                3,
+            )
+            .await,
+            Err(TelegramReadinessError::Persistent(failure))
+        );
+        assert_eq!(persistent.calls.load(Ordering::SeqCst), 3);
+
+        let cancelled_probe = ScriptedTelegramProbe {
+            results: Mutex::new(VecDeque::from([Ok(())])),
+            calls: AtomicUsize::new(0),
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert_eq!(
+            wait_for_telegram_readiness(
+                &cancelled_probe,
+                &credential,
+                &origin,
+                &cancellation,
+                Duration::from_millis(1),
+                3,
+            )
+            .await,
+            Err(TelegramReadinessError::Cancelled)
+        );
+        assert_eq!(cancelled_probe.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn telegram_readiness_requests_check_webhook_then_zero_timeout_polling() {
+        let (webhook_request, poll_request) =
+            telegram_readiness_requests("telegram-secret").expect("readiness requests");
+
+        assert_eq!(
+            webhook_request.url().path(),
+            "/bottelegram-secret/getWebhookInfo"
+        );
+        assert_eq!(poll_request.url().path(), "/bottelegram-secret/getUpdates");
+        assert_eq!(poll_request.url().query(), Some("timeout=0&limit=1"));
+    }
+
+    #[test]
+    fn telegram_poll_probe_requires_a_bounded_result_array() {
+        assert_eq!(
+            classify_telegram_poll_probe_response(&ProviderResponse::new(
+                200,
+                br#"{"ok":true,"result":[]}"#.as_slice(),
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            classify_telegram_poll_probe_response(&ProviderResponse::new(
+                200,
+                br#"{"ok":false}"#.as_slice(),
+            )),
+            Err(ChannelError::Protocol(
+                claw_channel_sdk::ProtocolErrorKind::InvalidField
+            ))
+        );
+        assert_eq!(
+            classify_telegram_poll_probe_response(&ProviderResponse::new(
+                200,
+                br#"{"ok":true,"result":{"id":1}}"#.as_slice(),
+            )),
+            Err(ChannelError::Protocol(
+                claw_channel_sdk::ProtocolErrorKind::InvalidField
+            ))
+        );
+    }
+
+    #[test]
+    fn telegram_webhook_probe_rejects_an_active_webhook() {
+        assert_eq!(
+            classify_telegram_webhook_probe_response(&ProviderResponse::new(
+                200,
+                br#"{"ok":true,"result":{"url":""}}"#.as_slice(),
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            classify_telegram_webhook_probe_response(&ProviderResponse::new(
+                200,
+                br#"{"ok":true,"result":{"url":"https://example.test/telegram"}}"#.as_slice(),
+            )),
+            Err(ChannelError::RemoteRejected { status: 409 })
+        );
+    }
+
+    #[test]
+    fn discord_fractional_retry_after_header_is_preserved() {
+        assert_eq!(
+            parse_retry_after_header("0.25"),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            parse_retry_after_header("17"),
+            Some(Duration::from_secs(17))
+        );
+        assert_eq!(parse_retry_after_header("-1"), None);
+        assert_eq!(parse_retry_after_header("NaN"), None);
     }
 }

@@ -1,5 +1,6 @@
 //! Microsoft Teams activity compatibility state machine.
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::num::NonZeroUsize;
@@ -238,7 +239,7 @@ impl TeamsActivityHandler {
         authentication: AuthenticationPrompt<'_>,
         diagnostics: &mut impl DiagnosticSink,
     ) -> Result<TeamsActivityOutcome, TeamsActivityError> {
-        let Some(text) = activity.text.map(str::trim).filter(|text| !text.is_empty()) else {
+        let Some(raw_text) = activity.text.map(str::trim).filter(|text| !text.is_empty()) else {
             diagnostics.record(self.diagnostic(
                 DiagnosticLevel::Info,
                 DiagnosticCode::EmptyMessageIgnored,
@@ -257,6 +258,16 @@ impl TeamsActivityHandler {
             diagnostics.record(self.diagnostic(
                 DiagnosticLevel::Info,
                 DiagnosticCode::BotMessageIgnored,
+                None,
+            ));
+            return Ok(TeamsActivityOutcome::Ignored);
+        }
+        let text = strip_recipient_mentions(raw_text, &activity.entities, recipient_id);
+        let text = text.trim();
+        if text.is_empty() {
+            diagnostics.record(self.diagnostic(
+                DiagnosticLevel::Info,
+                DiagnosticCode::EmptyMessageIgnored,
                 None,
             ));
             return Ok(TeamsActivityOutcome::Ignored);
@@ -430,6 +441,8 @@ struct TeamsActivity<'a> {
     recipient: Option<TeamsMember<'a>>,
     #[serde(rename = "membersAdded", default, borrow)]
     members_added: Vec<TeamsMember<'a>>,
+    #[serde(default, borrow)]
+    entities: Vec<TeamsEntity<'a>>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -441,4 +454,35 @@ struct TeamsConversation<'a> {
 struct TeamsMember<'a> {
     id: &'a str,
     role: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct TeamsEntity<'a> {
+    #[serde(rename = "type")]
+    kind: Option<&'a str>,
+    text: Option<&'a str>,
+    #[serde(borrow)]
+    mentioned: Option<TeamsMember<'a>>,
+}
+
+fn strip_recipient_mentions<'a>(
+    text: &'a str,
+    entities: &[TeamsEntity<'_>],
+    recipient_id: &str,
+) -> Cow<'a, str> {
+    let mut stripped = Cow::Borrowed(text);
+    for mention in entities.iter().filter(|entity| {
+        entity.kind == Some("mention")
+            && entity
+                .mentioned
+                .is_some_and(|mentioned| mentioned.id == recipient_id)
+    }) {
+        let Some(markup) = mention.text.filter(|markup| !markup.is_empty()) else {
+            continue;
+        };
+        if stripped.contains(markup) {
+            stripped = Cow::Owned(stripped.replace(markup, ""));
+        }
+    }
+    stripped
 }

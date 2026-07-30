@@ -13,15 +13,17 @@ use claw_channel_sdk::{
 };
 use claw_channels::{
     AuthenticationPrompt, DiagnosticLevel, DiagnosticSink, OperatorDiagnostic, SystemClock,
-    TeamsAction, TeamsActivityHandler, TeamsActivityOutcome, WhatsAppChannel, WhatsAppSendRequest,
-    WhatsAppTransport, segment_outbound_text_iter,
+    TeamsAction, TeamsActivityHandler, TeamsActivityOutcome, UnixClock, WhatsAppChannel,
+    WhatsAppSendError, WhatsAppSendRequest, WhatsAppTransport, segment_outbound_text_iter,
+    verify_whatsapp_webhook_signature,
 };
 use claw_http_api::{
-    LegacyAdminAction, LegacyDeviceFlowPort, LegacyExecResult, LegacyHostAdminPort, LegacyOsInfo,
-    LegacyProcessInfo, LegacyProcessMemory, LegacySystemInfo, LegacyTeamsPort,
-    LegacyTeamsRequestContext, LegacyWhatsAppPort, PortError, PortErrorKind, PortFuture,
+    LegacyAdminAction, LegacyChannelMessage, LegacyChannelMessagePort, LegacyDeviceFlowPort,
+    LegacyExecResult, LegacyHostAdminPort, LegacyOsInfo, LegacyProcessInfo, LegacyProcessMemory,
+    LegacySystemInfo, LegacyTeamsPort, LegacyTeamsRequestContext, LegacyWhatsAppPort, PortError,
+    PortErrorKind, PortFuture,
 };
-use claw_provider_sdk::http::{Body, HttpRequest, HttpTransport, Method};
+use claw_provider_sdk::http::{Body, HttpRequest, HttpSendStage, HttpTransport, Method};
 use claw_provider_sdk::{BoundSecret, CancelToken, Operation, Origin, SecretString};
 use claw_providers::{DeviceFlow, DeviceFlowSession};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
@@ -59,6 +61,26 @@ struct TerminationGuard(Arc<AtomicU64>);
 impl Drop for TerminationGuard {
     fn drop(&mut self) {
         self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct DeviceInstructionsGuard {
+    shared: Arc<RwLock<Option<String>>>,
+    current: String,
+}
+
+impl DeviceInstructionsGuard {
+    const fn new(shared: Arc<RwLock<Option<String>>>, current: String) -> Self {
+        Self { shared, current }
+    }
+}
+
+impl Drop for DeviceInstructionsGuard {
+    fn drop(&mut self) {
+        let mut instructions = self.shared.write().unwrap_or_else(PoisonError::into_inner);
+        if instructions.as_deref() == Some(self.current.as_str()) {
+            *instructions = None;
+        }
     }
 }
 
@@ -135,6 +157,10 @@ impl LegacyDeviceFlowAdapter {
             cancel.cancel();
         }
         let _ = self.flow.clear().await;
+        *self
+            .instructions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         let Ok(_single_flight) = tokio::time::timeout(budget, self.single_flight.lock()).await
         else {
             return DeviceTaskReport {
@@ -230,8 +256,11 @@ impl LegacyDeviceFlowPort for LegacyDeviceFlowAdapter {
             let activator = Arc::clone(&self.activator);
             let diagnostics = Arc::clone(&self.diagnostics);
             let terminated = Arc::clone(&self.terminated);
+            let prompt_guard =
+                DeviceInstructionsGuard::new(Arc::clone(&self.instructions), instructions.clone());
             let task = tokio::spawn(async move {
                 let _guard = TerminationGuard(terminated);
+                let _prompt_guard = prompt_guard;
                 match flow
                     .activate_with(&sdk_cancel, |token, cancel| async {
                         activator.activate(token, cancel).await.map_err(|error| {
@@ -888,21 +917,21 @@ impl WhatsAppTransport for GraphWhatsAppTransport {
     fn send_text(
         &mut self,
         request: &WhatsAppSendRequest<'_>,
-    ) -> Result<claw_channels::ProviderResponse, ChannelError> {
+    ) -> Result<claw_channels::ProviderResponse, WhatsAppSendError> {
         let endpoint = Url::parse(&format!(
             "https://graph.facebook.com/v{}.0/{}/messages",
             request.api_version(),
             request.phone_number_id()
         ))
         .map_err(|_| {
-            ChannelError::Configuration(
+            WhatsAppSendError::FailedBeforeSend(ChannelError::Configuration(
                 claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
-            )
+            ))
         })?;
         let origin = Origin::of(&endpoint).map_err(|_| {
-            ChannelError::Configuration(
+            WhatsAppSendError::FailedBeforeSend(ChannelError::Configuration(
                 claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
-            )
+            ))
         })?;
         let credential = BoundSecret::new(origin, SecretString::new(request.access_token()));
         let body = serde_json::to_string(&json!({
@@ -911,11 +940,15 @@ impl WhatsAppTransport for GraphWhatsAppTransport {
             "type": "text",
             "text": {"body": request.text()},
         }))
-        .map_err(|_| ChannelError::Protocol(claw_channel_sdk::ProtocolErrorKind::InvalidField))?;
+        .map_err(|_| {
+            WhatsAppSendError::FailedBeforeSend(ChannelError::Protocol(
+                claw_channel_sdk::ProtocolErrorKind::InvalidField,
+            ))
+        })?;
         let http_request = HttpRequest::new(Method::Post, endpoint)
             .header("accept", "application/json")
             .bound_secret_header("authorization", "Bearer ", &credential)
-            .map_err(|_| ChannelError::Authentication)?
+            .map_err(|_| WhatsAppSendError::FailedBeforeSend(ChannelError::Authentication))?
             .body(Body::Json(body))
             .timeout(request.request_timeout());
         let cancel = self
@@ -923,21 +956,41 @@ impl WhatsAppTransport for GraphWhatsAppTransport {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-            .ok_or(ChannelError::Transport(
-                claw_channel_sdk::TransportErrorKind::Io,
-            ))?;
-        let response = self
-            .runtime
-            .block_on(async {
-                self.transport
-                    .send("whatsapp", Operation::Transport, http_request, &cancel)
-                    .await
-            })
-            .map_err(|error| provider_channel_error(&error))?;
+            .ok_or(WhatsAppSendError::CancelledBeforeSend)?;
+        let response = self.runtime.block_on(async {
+            if cancel.is_cancelled() {
+                return Err(WhatsAppSendError::CancelledBeforeSend);
+            }
+            self.transport
+                .send_with_stage("whatsapp", Operation::Transport, http_request, &cancel)
+                .await
+                .map_err(|error| classify_whatsapp_send_failure(&error))
+        })?;
         Ok(claw_channels::ProviderResponse::new(
             response.status(),
             response.body().to_vec(),
         ))
+    }
+}
+
+fn classify_whatsapp_send_failure(
+    error: &claw_provider_sdk::http::HttpSendError,
+) -> WhatsAppSendError {
+    let provider_error = error.error();
+    let stage = error.stage();
+    let channel_error = if provider_error.kind() == claw_provider_sdk::ErrorKind::Cancelled {
+        ChannelError::Transport(claw_channel_sdk::TransportErrorKind::Io)
+    } else {
+        provider_channel_error(provider_error)
+    };
+    match stage {
+        HttpSendStage::NotSent
+            if provider_error.kind() == claw_provider_sdk::ErrorKind::Cancelled =>
+        {
+            WhatsAppSendError::CancelledBeforeSend
+        }
+        HttpSendStage::NotSent => WhatsAppSendError::FailedBeforeSend(channel_error),
+        HttpSendStage::MayHaveTransmitted => WhatsAppSendError::AmbiguousAfterSend(channel_error),
     }
 }
 
@@ -946,7 +999,9 @@ pub struct GraphWhatsAppAdapter {
     account_id: String,
     channel: Arc<AsyncMutex<WhatsAppChannel<GraphWhatsAppTransport, SystemClock>>>,
     credential: ChannelCredential,
+    app_secret: ChannelCredential,
     request_cancel: Arc<Mutex<Option<CancelToken>>>,
+    diagnostics: Arc<Diagnostics>,
 }
 
 struct WhatsAppRequestGuard {
@@ -954,10 +1009,115 @@ struct WhatsAppRequestGuard {
     slot: Arc<Mutex<Option<CancelToken>>>,
 }
 
+struct WhatsAppCancelOnDrop(CancelToken);
+
+impl Drop for WhatsAppCancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 impl Drop for WhatsAppRequestGuard {
     fn drop(&mut self) {
         self.cancel.cancel();
         *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_whatsapp_webhook<T, C>(
+    channel: Arc<AsyncMutex<WhatsAppChannel<T, C>>>,
+    credential: ChannelCredential,
+    request_cancel: Arc<Mutex<Option<CancelToken>>>,
+    diagnostics: Arc<Diagnostics>,
+    payload: Vec<u8>,
+    messages: Arc<dyn LegacyChannelMessagePort>,
+    max_reply_bytes: usize,
+    cancellation: CancellationToken,
+) -> Result<(), PortError>
+where
+    T: WhatsAppTransport + Send + 'static,
+    C: UnixClock + Send + 'static,
+{
+    if cancellation.is_cancelled() {
+        return Err(PortError::new(
+            PortErrorKind::Unavailable,
+            "request cancelled",
+        ));
+    }
+    let channel = tokio::select! {
+        channel = channel.lock_owned() => channel,
+        () = cancellation.cancelled() => {
+            return Err(PortError::new(
+                PortErrorKind::Unavailable,
+                "request cancelled",
+            ));
+        }
+    };
+    let sdk_cancel = CancelToken::new();
+    *request_cancel
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(sdk_cancel.clone());
+    let _cancel_on_drop = WhatsAppCancelOnDrop(sdk_cancel.clone());
+    let request_guard = WhatsAppRequestGuard {
+        cancel: sdk_cancel.clone(),
+        slot: request_cancel,
+    };
+    let task_cancellation = cancellation.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let mut task = tokio::task::spawn_blocking(move || {
+        let mut channel = channel;
+        let _request_guard = request_guard;
+        channel
+            .handle_webhook(
+                &payload,
+                &credential,
+                |message| {
+                    if task_cancellation.is_cancelled() {
+                        return Err(ChannelError::Transport(
+                            claw_channel_sdk::TransportErrorKind::CancelledBeforeSend,
+                        ));
+                    }
+                    let reply = runtime
+                        .block_on(messages.process(
+                            LegacyChannelMessage {
+                                channel: "whatsapp",
+                                conversation_id: message.conversation_id.clone(),
+                                user_name: message.sender_id.clone(),
+                                text: message.text.clone().unwrap_or_default(),
+                            },
+                            task_cancellation.clone(),
+                        ))
+                        .map_err(|_| ChannelError::RemoteRejected { status: 503 })?;
+                    if reply.len() > max_reply_bytes {
+                        return Err(ChannelError::Protocol(
+                            claw_channel_sdk::ProtocolErrorKind::PayloadTooLarge,
+                        ));
+                    }
+                    Ok(Some(reply))
+                },
+                &mut ChannelDiagnostics(diagnostics),
+            )
+            .map(|_| ())
+            .map_err(|error| channel_port_error(&error))
+    });
+    tokio::select! {
+        result = &mut task => {
+            result.map_err(|_| {
+                PortError::new(
+                    PortErrorKind::Internal,
+                    "WhatsApp webhook task failed",
+                )
+            })?
+        }
+        () = cancellation.cancelled() => {
+            sdk_cancel.cancel();
+            let _ = task.await;
+            Err(PortError::new(
+                PortErrorKind::Unavailable,
+                "request cancelled",
+            ))
+        }
     }
 }
 
@@ -972,6 +1132,7 @@ impl GraphWhatsAppAdapter {
         transport: HttpTransport,
         phone_number_id: &str,
         access_token: &SecretString,
+        app_secret: &SecretString,
         diagnostics: Arc<Diagnostics>,
     ) -> Result<Arc<Self>, PortError> {
         if phone_number_id.is_empty()
@@ -993,6 +1154,16 @@ impl GraphWhatsAppAdapter {
             },
         )
         .map_err(|error| invalid(format!("WhatsApp credential binding failed: {error}")))?;
+        let app_secret = ChannelCredential::bind(
+            app_secret.expose(),
+            CredentialRequest {
+                channel_id: "whatsapp".to_owned(),
+                account_id: account_id.clone(),
+                kind: CredentialKind::WebhookSecret,
+                binding: CredentialBinding::LocalOnly,
+            },
+        )
+        .map_err(|error| invalid(format!("WhatsApp app-secret binding failed: {error}")))?;
         let inbound_capacity = NonZeroUsize::new(64)
             .ok_or_else(|| invalid("WhatsApp inbound capacity must be non-zero"))?;
         let request_cancel = Arc::new(Mutex::new(None));
@@ -1010,18 +1181,44 @@ impl GraphWhatsAppAdapter {
         )
         .map_err(|error| invalid(format!("WhatsApp channel configuration failed: {error}")))?;
         channel
-            .start(&mut ChannelDiagnostics(diagnostics))
+            .start(&mut ChannelDiagnostics(Arc::clone(&diagnostics)))
             .map_err(|error| invalid(format!("WhatsApp channel startup failed: {error}")))?;
         Ok(Arc::new(Self {
             account_id,
             channel: Arc::new(AsyncMutex::new(channel)),
             credential,
+            app_secret,
             request_cancel,
+            diagnostics,
         }))
     }
 }
 
 impl LegacyWhatsAppPort for GraphWhatsAppAdapter {
+    fn verify_webhook_signature(&self, payload: &[u8], signature: &str) -> Result<bool, PortError> {
+        verify_whatsapp_webhook_signature(&self.account_id, payload, signature, &self.app_secret)
+            .map_err(|error| channel_port_error(&error))
+    }
+
+    fn handle_webhook(
+        &self,
+        payload: Vec<u8>,
+        messages: Arc<dyn LegacyChannelMessagePort>,
+        max_reply_bytes: usize,
+        cancellation: CancellationToken,
+    ) -> PortFuture<'_, Result<(), PortError>> {
+        Box::pin(handle_whatsapp_webhook(
+            Arc::clone(&self.channel),
+            self.credential.clone(),
+            Arc::clone(&self.request_cancel),
+            Arc::clone(&self.diagnostics),
+            payload,
+            messages,
+            max_reply_bytes,
+            cancellation,
+        ))
+    }
+
     fn send_text(
         &self,
         to: String,
@@ -1052,7 +1249,8 @@ impl LegacyWhatsAppPort for GraphWhatsAppAdapter {
                 .request_cancel
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some(sdk_cancel.clone());
-            let _cancel_on_drop = WhatsAppRequestGuard {
+            let _cancel_on_drop = WhatsAppCancelOnDrop(sdk_cancel.clone());
+            let request_guard = WhatsAppRequestGuard {
                 cancel: sdk_cancel.clone(),
                 slot: Arc::clone(&self.request_cancel),
             };
@@ -1060,6 +1258,7 @@ impl LegacyWhatsAppPort for GraphWhatsAppAdapter {
             let account_id = self.account_id.clone();
             let mut task = tokio::task::spawn_blocking(move || {
                 let mut channel = channel;
+                let _request_guard = request_guard;
                 let segments = segment_outbound_text_iter("whatsapp", &text)
                     .map_err(|error| invalid(format!("WhatsApp segmentation failed: {error}")))?;
                 for (index, segment) in segments.enumerate() {
@@ -1522,16 +1721,81 @@ fn invalid(message: impl Into<String>) -> PortError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
+    use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, RwLock};
     use std::time::{Duration, Instant};
 
+    use claw_channel_sdk::{
+        ChannelCredential, CredentialBinding, CredentialKind, CredentialRequest,
+    };
+    use claw_channels::{
+        ProviderResponse, SystemClock, WhatsAppChannel, WhatsAppSendError, WhatsAppSendRequest,
+        WhatsAppTransport,
+    };
+    use claw_http_api::{LegacyChannelMessage, LegacyChannelMessagePort, PortError, PortFuture};
     use claw_provider_sdk::{CancelToken, SecretString};
     use claw_providers::github_copilot::DeviceAuthorization;
+    use tokio::sync::{Mutex as AsyncMutex, oneshot};
+    use tokio_util::sync::CancellationToken;
 
     use super::{
-        CachedTeamsJwtKeys, LegacyDeviceFlowAdapter, TeamsRsaKey, WhatsAppRequestGuard,
-        cache_refreshed_teams_keys, official_origin, three_floats, valid_command_target,
+        CachedTeamsJwtKeys, DeviceInstructionsGuard, Diagnostics, LegacyDeviceFlowAdapter,
+        TeamsRsaKey, WhatsAppRequestGuard, cache_refreshed_teams_keys, handle_whatsapp_webhook,
+        official_origin, three_floats, valid_command_target,
     };
+
+    struct PausedWhatsAppTransport {
+        request_cancel: Arc<Mutex<Option<CancelToken>>>,
+        entered: Mutex<Option<oneshot::Sender<()>>>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        sends: Arc<AtomicUsize>,
+    }
+
+    impl WhatsAppTransport for PausedWhatsAppTransport {
+        fn send_text(
+            &mut self,
+            _request: &WhatsAppSendRequest<'_>,
+        ) -> Result<ProviderResponse, WhatsAppSendError> {
+            let entered = self.entered.lock().expect("entered lock").take();
+            if let Some(entered) = entered {
+                let _ = entered.send(());
+            }
+            let (released, wake) = self.release.as_ref();
+            let mut released = released.lock().expect("release lock");
+            while !*released {
+                released = wake.wait(released).expect("release wait");
+            }
+            drop(released);
+
+            let cancel = self
+                .request_cancel
+                .lock()
+                .expect("request slot")
+                .clone()
+                .ok_or(WhatsAppSendError::CancelledBeforeSend)?;
+            if cancel.is_cancelled() {
+                return Err(WhatsAppSendError::CancelledBeforeSend);
+            }
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(ProviderResponse::new(200, Vec::new()))
+        }
+    }
+
+    struct ReplyingMessages {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LegacyChannelMessagePort for ReplyingMessages {
+        fn process(
+            &self,
+            _message: LegacyChannelMessage,
+            _cancellation: CancellationToken,
+        ) -> PortFuture<'_, Result<String, PortError>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok("reply".to_owned()) })
+        }
+    }
 
     #[test]
     fn host_helpers_are_bounded_and_deterministic() {
@@ -1568,6 +1832,26 @@ mod tests {
     }
 
     #[test]
+    fn terminal_device_flow_clears_only_its_own_prompt() {
+        let instructions = Arc::new(RwLock::new(Some("expired prompt".to_owned())));
+        drop(DeviceInstructionsGuard::new(
+            Arc::clone(&instructions),
+            "expired prompt".to_owned(),
+        ));
+        assert!(instructions.read().expect("prompt lock").is_none());
+
+        *instructions.write().expect("prompt lock") = Some("old prompt".to_owned());
+        let guard =
+            DeviceInstructionsGuard::new(Arc::clone(&instructions), "old prompt".to_owned());
+        *instructions.write().expect("prompt lock") = Some("replacement prompt".to_owned());
+        drop(guard);
+        assert_eq!(
+            instructions.read().expect("prompt lock").as_deref(),
+            Some("replacement prompt")
+        );
+    }
+
+    #[test]
     fn dropped_whatsapp_request_cancels_transport_and_clears_slot() {
         let cancel = CancelToken::new();
         let slot = Arc::new(Mutex::new(Some(cancel.clone())));
@@ -1577,6 +1861,113 @@ mod tests {
         });
         assert!(cancel.is_cancelled());
         assert!(slot.lock().expect("request slot").is_none());
+    }
+
+    #[tokio::test]
+    async fn route_timeout_drop_retries_unsent_whatsapp_chunk_once() {
+        let request_cancel = Arc::new(Mutex::new(None));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let sends = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let origin = official_origin("whatsapp", "phone-id", "graph.facebook.com").expect("origin");
+        let credential = ChannelCredential::bind(
+            "access-token",
+            CredentialRequest {
+                channel_id: "whatsapp".to_owned(),
+                account_id: "phone-id".to_owned(),
+                kind: CredentialKind::Token,
+                binding: CredentialBinding::Origin(origin.clone()),
+            },
+        )
+        .expect("credential");
+        let mut channel = WhatsAppChannel::new(
+            "phone-id",
+            "phone-id",
+            origin,
+            PausedWhatsAppTransport {
+                request_cancel: Arc::clone(&request_cancel),
+                entered: Mutex::new(Some(entered_tx)),
+                release: Arc::clone(&release),
+                sends: Arc::clone(&sends),
+            },
+            SystemClock,
+            NonZeroUsize::new(1).expect("non-zero capacity"),
+        )
+        .expect("WhatsApp channel");
+        channel.start(&mut ()).expect("started");
+        let channel = Arc::new(AsyncMutex::new(channel));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let messages: Arc<dyn LegacyChannelMessagePort> = Arc::new(ReplyingMessages {
+            calls: Arc::clone(&calls),
+        });
+        let diagnostics = Arc::new(Diagnostics::new(16));
+        let payload = br#"{"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"phone-id"},"messages":[{"from":"15550001","id":"one","type":"text","text":{"body":"question"}}]}}]}]}"#.to_vec();
+
+        let mut route = Box::pin(handle_whatsapp_webhook(
+            Arc::clone(&channel),
+            credential.clone(),
+            Arc::clone(&request_cancel),
+            Arc::clone(&diagnostics),
+            payload.clone(),
+            Arc::clone(&messages),
+            1024,
+            CancellationToken::new(),
+        ));
+        tokio::select! {
+            result = &mut route => panic!("route completed before timeout: {result:?}"),
+            entered = entered_rx => entered.expect("send reaches pre-invocation gate"),
+        }
+        drop(route);
+        let retained_cancel = request_cancel.lock().expect("request slot").clone();
+        let sends_before_release = sends.load(Ordering::SeqCst);
+
+        let (released, wake) = release.as_ref();
+        *released.lock().expect("release lock") = true;
+        wake.notify_all();
+        let channel_after_cancel = tokio::time::timeout(Duration::from_secs(1), channel.lock())
+            .await
+            .expect("detached task releases the channel");
+        assert!(request_cancel.lock().expect("request slot").is_none());
+        drop(channel_after_cancel);
+        assert!(
+            retained_cancel
+                .as_ref()
+                .is_some_and(CancelToken::is_cancelled),
+            "detached task retains its cancelled request token"
+        );
+        assert_eq!(sends_before_release, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+
+        handle_whatsapp_webhook(
+            Arc::clone(&channel),
+            credential.clone(),
+            Arc::clone(&request_cancel),
+            Arc::clone(&diagnostics),
+            payload.clone(),
+            Arc::clone(&messages),
+            1024,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("replay retries the unsent chunk");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+
+        handle_whatsapp_webhook(
+            channel,
+            credential,
+            request_cancel,
+            diagnostics,
+            payload,
+            messages,
+            1024,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("completed replay is acknowledged");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -3,8 +3,9 @@
 use claw_channel_sdk::{CommandDispatchError, CommandInvocation, parse_command};
 
 use crate::commands::{command_registry, help_text};
+use crate::descriptor;
 use crate::diagnostics::{DiagnosticCode, DiagnosticLevel, DiagnosticSink, OperatorDiagnostic};
-use crate::routing::RoutingError;
+use crate::routing::{RoutingError, supports_inbound};
 
 /// Legacy reply when non-Teams channels have no active engine or Device Flow.
 pub const COMMON_UNCONFIGURED_REPLY: &str = "GTA-Claw is not configured with authentication.";
@@ -167,6 +168,10 @@ pub fn dispatch_incoming<E: ConversationService>(
     input: DispatchInput<'_>,
     diagnostics: &mut impl DiagnosticSink,
 ) -> Result<DispatchOutcome, RoutingError> {
+    let entry = descriptor(input.channel_id).ok_or(RoutingError::UnknownChannel)?;
+    if !supports_inbound(entry) {
+        return Err(RoutingError::InboundUnsupported);
+    }
     let text = input.text.trim();
     if text.is_empty() {
         diagnostics.record(diagnostic(
@@ -427,5 +432,30 @@ mod tests {
             ),
             Ok(DispatchOutcome::DeferredCommand(_))
         ));
+    }
+
+    #[test]
+    fn plain_text_still_requires_a_known_inbound_capable_channel() {
+        for (channel_id, expected) in [
+            ("not-a-channel", RoutingError::UnknownChannel),
+            ("slack", RoutingError::InboundUnsupported),
+        ] {
+            let mut engine = Engine::default();
+            assert_eq!(
+                dispatch_incoming(
+                    Some(&mut engine),
+                    AuthenticationPrompt::Unconfigured,
+                    COMMON_DISPATCH_POLICY,
+                    DispatchInput {
+                        channel_id,
+                        ..input("hello")
+                    },
+                    &mut (),
+                ),
+                Err(expected),
+                "{channel_id}"
+            );
+            assert!(engine.calls.is_empty(), "{channel_id}");
+        }
     }
 }

@@ -616,6 +616,16 @@ struct TelegramSendResult {
     message_id: i64,
 }
 
+#[derive(Deserialize)]
+struct TelegramErrorEnvelope {
+    parameters: Option<TelegramErrorParameters>,
+}
+
+#[derive(Deserialize)]
+struct TelegramErrorParameters {
+    retry_after: Option<u64>,
+}
+
 fn classify_response(
     response: &ProviderResponse,
     default_retry_after: Duration,
@@ -623,9 +633,23 @@ fn classify_response(
     match response.status() {
         200..=299 => Ok(()),
         401 | 403 => Err(ChannelError::Authentication),
-        429 => Err(ChannelError::RateLimited {
-            retry_after: response.retry_after().unwrap_or(default_retry_after),
-        }),
+        408 => Err(ChannelError::Transport(
+            claw_channel_sdk::TransportErrorKind::Timeout,
+        )),
+        429 => {
+            response.require_bounded()?;
+            let body_retry_after = serde_json::from_slice::<TelegramErrorEnvelope>(response.body())
+                .ok()
+                .and_then(|envelope| envelope.parameters)
+                .and_then(|parameters| parameters.retry_after)
+                .map(Duration::from_secs);
+            Err(ChannelError::RateLimited {
+                retry_after: response
+                    .retry_after()
+                    .or(body_retry_after)
+                    .unwrap_or(default_retry_after),
+            })
+        }
         status => Err(ChannelError::RemoteRejected { status }),
     }
 }

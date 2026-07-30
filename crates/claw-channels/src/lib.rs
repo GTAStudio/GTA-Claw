@@ -41,8 +41,8 @@ pub use commands::{
 pub use diagnostics::{DiagnosticCode, DiagnosticLevel, DiagnosticSink, OperatorDiagnostic};
 pub use discord::{
     DISCORD_CLIENT_LABEL, DISCORD_RECONNECT_DELAY, DISCORD_SEND_REQUEST_TIMEOUT, DiscordChannel,
-    DiscordCreateMessageRequest, DiscordGatewayPhase, DiscordGatewayRequest, DiscordPacketOutcome,
-    DiscordTransport,
+    DiscordCreateMessageRequest, DiscordGatewayClose, DiscordGatewayPhase, DiscordGatewayRequest,
+    DiscordPacketOutcome, DiscordTransport,
 };
 pub use lifecycle::SupervisedChannel;
 pub use message_processor::{
@@ -62,10 +62,10 @@ pub use telegram::{
 };
 pub use transport::{MAX_PROVIDER_RESPONSE_BYTES, ProviderResponse};
 pub use whatsapp::{
-    WHATSAPP_GRAPH_API_VERSION, WHATSAPP_SEND_REQUEST_TIMEOUT, WhatsAppChannel,
-    WhatsAppSendRequest, WhatsAppTransport, WhatsAppVerificationQuery,
-    WhatsAppVerificationResponse, WhatsAppWebhookHandling, WhatsAppWebhookResponse,
-    WhatsAppWebhookStats,
+    WHATSAPP_GRAPH_API_VERSION, WHATSAPP_MAX_MESSAGES_PER_WEBHOOK, WHATSAPP_SEND_REQUEST_TIMEOUT,
+    WhatsAppChannel, WhatsAppSendError, WhatsAppSendRequest, WhatsAppTransport,
+    WhatsAppVerificationQuery, WhatsAppVerificationResponse, WhatsAppWebhookHandling,
+    WhatsAppWebhookResponse, WhatsAppWebhookStats, verify_whatsapp_webhook_signature,
 };
 
 const CATALOG_PATH: &str = "scripts/lib/official-external-channel-catalog.json";

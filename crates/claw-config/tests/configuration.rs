@@ -134,6 +134,35 @@ fn rejects_plaintext_secrets() {
 }
 
 #[test]
+fn whatsapp_app_secret_round_trips_as_a_secret_reference() {
+    let source = VALID.replace(
+        "whatsapp: { enabled: false, webhook_path: \"/whatsapp/webhook\", }",
+        "whatsapp: {
+            enabled: true,
+            verify_token: \"env:WHATSAPP_VERIFY_TOKEN\",
+            access_token: \"env:WHATSAPP_ACCESS_TOKEN\",
+            app_secret: \"env:WHATSAPP_APP_SECRET\",
+            phone_number_id: \"phone-id\",
+            webhook_path: \"/whatsapp/webhook\",
+        }",
+    );
+    let config = parse_json5(&source, "whatsapp.json5").expect("WhatsApp configuration");
+    let output = to_json5(&config).expect("serialize WhatsApp configuration");
+
+    assert!(output.contains("app_secret"));
+    assert!(output.contains("env:WHATSAPP_APP_SECRET"));
+
+    let plaintext = source.replace("env:WHATSAPP_APP_SECRET", "plaintext-app-secret");
+    let error = parse_json5(&plaintext, "whatsapp-secret.json5")
+        .expect_err("plaintext app secret must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("core.channels.whatsapp.app_secret")
+    );
+}
+
+#[test]
 fn output_and_schema_are_deterministic() {
     let config = parse_json5(VALID, "test.json5").expect("valid JSON5");
     let first = to_json5(&config).expect("serialize");
