@@ -41,13 +41,13 @@ rebase onto current `main`, independently review, and validate before publicatio
 | Updater / PR #236 | `handoff/2026-07-30-0833/updater-pr236` | `efae570296e36c8c20ba4eca2c09e6dd62a9bce6` | `0f31d8eaf71f16724407489ade364263e6b20f9a` |
 | Local performance harness | `handoff/2026-07-30-0833/local-perf-harness` | `3b1b76972fd3b0b181c1a8b564ed40d8e3a4f39c` | `4ef4d921e5301bc34a436d416b913cbb0f65f83c` |
 | Durable-memory port | `handoff/2026-07-30-0833/durable-memory-port` | `4f4455f3d7e5290d94697a2393996ef05488e4e3` | `d2493b07b7c064bd8b72c836852c4ae1617b56f5` |
-| Packaging / PR #233 | `handoff/2026-07-30-0852/packaging-pr233-frozen` | `e03c45a05a52a8b77c02c76310bd0d766f343384` | `67b5a779ede6ec03eb4c91e1ad6b074e933c0521` |
+| Packaging / PR #233 | `handoff/2026-07-30-0859/packaging-pr233-locked` | `b0d2b49fd1a2f00717c38a9c4809b3217871465b` | `e03c45a05a52a8b77c02c76310bd0d766f343384` |
 | Daemon / PR #232 | `handoff/2026-07-30-0833/daemon-pr232` | `1bfe93661dd959702732d672f80be57bca6ccd1a` | `97b19df94799974167bb1c193833e2d1efeaeb26` |
-| Plugin / PR #235 | `handoff/2026-07-30-0833/plugin-pr235` | `7660bce81942919ddf72be07fa60dc1937b5d6aa` | `c7d22a2d13f46eb2b2b7b18d818ab7820f1b9c18` |
+| Plugin / PR #235 | `handoff/2026-07-30-0859/plugin-pr235-locked` | `517810ff524aacc2c31b04a088f935f95c9c9ecb` | `7660bce81942919ddf72be07fa60dc1937b5d6aa` |
 | Discovery/fleet port | `handoff/2026-07-30-0840/discovery-fleet-port-final` | `152bfbc81e10967a3eff3f1627b222f1ba4f3bd2` | `8686c27fa55ba768db473c3d4e7f602b978aa021` |
 | Trusted A1 candidate | `handoff/2026-07-30-0833/trusted-a1-candidate` | `221226f4a4dc77795696994f8930aae39f8a2260` | `5e85d6d080712c82dc0814985df1472bdfab5dd9` |
-| Trusted A1 new-owner candidate | `handoff/2026-07-30-0852/trusted-a1-new-owner-frozen` | `3d21c1fa24ad1c552fa32a7cafd68c124ee49b52` | `9b2e22996a02461dd1b4ebcffd713f2f71d03569` |
-| Compat-oracle partial port | `handoff/2026-07-30-0852/compat-oracle-frozen` | `df0baddc1812acf41b2504dca824ddb94b45259b` | `f2f8d28a87205d4c2decde41b0066294dac18862` |
+| Trusted A1 new-owner candidate | `handoff/2026-07-30-0859/trusted-a1-new-owner-locked` | `7a3542484141d21983e4f6acfbb907c0a620787e` | `3d21c1fa24ad1c552fa32a7cafd68c124ee49b52` |
+| Compat-oracle partial port | `handoff/2026-07-30-0859/compat-oracle-locked` | `8c8e1766770ebbfd1dc219b5bca570680ef15bcb` | `df0baddc1812acf41b2504dca824ddb94b45259b` |
 | Duplicate trusted supply-chain candidate | `handoff/2026-07-30-0833/duplicate-trusted-supply-chain` | `9f3f3a23fbedfccd48981c9bc306b775b9c00c95` | `92c2329b151d4b71b342a54d944254da2f3c61a5` |
 | Dirty PR #234 source | `handoff/2026-07-30-0833/supply-chain-pr234-dirty` | `e70aedb0b2cb4e1e18baf398de4f1b4b78114d4f` | `28fba25d12817f04c8fddee63c6b6fa711941f33` |
 | Duplicate Rust channels | `handoff/2026-07-30-0833/duplicate-rust-channels` | `6c07745e267900683629421f69c231faeed3ab6a` | `c1444f5fb37e5bb625d1b6b40a9c465a1d90c357` |
@@ -63,9 +63,9 @@ Their `-final` refs are successor commits whose parents are the earlier snapshot
 Those raced edits were not reviewed or tested.
 
 The new Trusted A1 and compat-oracle sessions also wrote after the first inventory.
-Their final refs are independent snapshots. In total, 27 handoff refs exist: the 19
-final table entries plus eight predecessor refs in the Legacy, Packaging, Discovery,
-Compat, and Trusted successor chains.
+Their final refs are independent snapshots. In total, 31 handoff refs exist: the 19
+final table entries plus twelve predecessor refs in the Legacy, Packaging, Discovery,
+Compat, Plugin, and Trusted successor chains.
 
 ### Current open PR inventory
 
@@ -116,6 +116,9 @@ not merged from their stale heads:
      security-policy edits raced the stop and are preserved in the frozen new-owner
      snapshot. No validation or independent final review was completed after the
      final split.
+   - The locked new-owner snapshot also contains a duplicate
+     `AUDIT_REMEDIATION_HANDOFF.md` copied from main. Drop that duplicate when
+     reconstructing the A1 product diff.
    - Do not use the older mixed trusted snapshots as authority.
 
 2. **PR #226 Conformance**
@@ -154,6 +157,8 @@ not merged from their stale heads:
 
 6. **Plugin / PR #235**
    - Dirty snapshot is preserved; no final validation.
+   - Late schema/runtime limit tests and `claw-windows-handle-dir` edits are included
+     in the locked snapshot and remain unreviewed.
    - Still requires current-safe helper API/policy, construction-time budgets,
      lossless public/enforced schema identity, fail-closed unsupported keys, Windows
      handle-relative semantics, exact lifecycle rollback/deadlines, and adaptive
@@ -197,9 +202,9 @@ not merged from their stale heads:
     - Discovery/fleet is partially implemented in its snapshot. A one-line
       `dns_sd.rs` change raced the stop and is unreviewed.
     - Durable state stopped before writing files.
-    - Compat-oracle produced unreviewed changes to `compat/upstream/README.md`,
-      `validate-self-test.ps1`, `validate.ps1`, and the provider ledger, stored in
-      `compat-oracle-frozen`.
+    - Compat-oracle produced unreviewed README, validator/self-test, reachability
+      sweep, gateway/client/integration ledger, and provider-ledger changes, stored in
+      `compat-oracle-locked`.
     - PR #238 already completed the #171/#144 client-contract port and is on main.
     - Still create reviewed current-main ports for compat/conformance, trusted policy,
       HTTP API, durable state, durable memory, discovery/fleet, remaining iOS/client
