@@ -14,9 +14,8 @@
 //!   fails loudly rather than quietly discarding the operator's rules — a
 //!   dropped instruction is a privilege escalation, not a formatting detail.
 //! * **Ports, not vendors.** Summarization, embedding, vector search and
-//!   persistence are traits. The only implementations shipped here are
-//!   dependency-free and deterministic, so the crate is fully testable
-//!   offline; production adapters live outside it.
+//!   persistence are traits. In-memory adapters remain the default; optional
+//!   file-backed durable ports are opened explicitly and stay testable offline.
 //! * **Bounded by construction.** Identifier lengths, embedding
 //!   dimensionality, retrieval limits, retriever corpora and store capacity
 //!   all have explicit ceilings. Nothing grows without a bound an operator
@@ -32,7 +31,10 @@
 //! | [`vector`] | Embedding port and an exact-search index |
 //! | [`retrieval`] | Memory records, queries, and retriever ports |
 //! | [`context`] | Budget-aware assembly of the final model input |
-//! | [`store`] | Narrow persistence port and an in-memory adapter |
+//! | [`store`] | Narrow persistence port and the default in-memory adapter |
+//! | [`durable`] | Optional scoped durable memory and user profiles |
+//! | [`transcript`] | Optional scoped durable conversation history |
+//! | [`runtime`] | Object-safe durable ports and explicit composition |
 //!
 //! # Assembly order
 //!
@@ -67,11 +69,16 @@
 mod bounded;
 pub mod budget;
 pub mod context;
+pub mod durable;
 pub mod json;
+mod persistence;
 pub mod retrieval;
+pub mod runtime;
+pub mod safety;
 pub mod session;
 pub mod store;
 pub mod summarize;
+pub mod transcript;
 pub mod vector;
 
 pub use budget::{
@@ -81,17 +88,31 @@ pub use budget::{
 pub use context::{
     AssembledContext, ContextAssembler, ContextError, ContextTruncation, DroppedMessage,
 };
+pub use durable::{
+    DurableMemoryEntry, DurableMemoryError, DurableMemoryStore, MemoryMutation, MemoryPage,
+    MemoryReference, MemoryTarget, MemoryUsage, VisibleMemoryEntry,
+};
 pub use json::{JsonDecodeError, from_json_reader};
+pub use persistence::{PersistenceError, WriteOutcome, WriteWarning};
 pub use retrieval::{
     KeywordRetriever, MAX_KEYWORD_RECORD_TERMS, MAX_QUERY_BYTES, MAX_RECORD_BYTES, MAX_RECORD_TAGS,
     MAX_RETRIEVAL_LIMIT, MAX_TAG_BYTES, MemoryRecord, RecordError, RecordKind, RetrievalCoverage,
     RetrievalError, RetrievalQuery, RetrievalReport, RetrievedItem, Retriever, VectorRetriever,
 };
+pub use runtime::{
+    DurableMemoryPort, DurableStateConfig, DurableStateRuntime, DurableStateRuntimeError,
+    DurableTranscriptPort,
+};
+pub use safety::{ContentScanResult, UnsafeContentReason, scan_persistent_content};
 pub use session::{Message, MessageId, Role, Session, SessionError, SessionId, Summary};
 pub use store::{InMemoryMemoryStore, MemoryStore, StoreError};
 pub use summarize::{
     ExtractiveSummarizer, SummarizationPlan, SummarizationPolicy, Summarizer, SummaryError,
     SummaryRequest, compact, plan_summarization,
+};
+pub use transcript::{
+    DurableTranscriptStore, TRANSCRIPT_WARNING, TranscriptError, TranscriptHit, TranscriptMessage,
+    TranscriptPage, TranscriptRole, TranscriptSearch, VisibleTranscriptMessage,
 };
 pub use vector::{
     Embedding, EmbeddingModel, ExactVectorIndex, HashingEmbeddingModel, RecordId, ScoredMatch,

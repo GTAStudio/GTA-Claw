@@ -18,7 +18,7 @@ use crate::bounded::{BoundedString, BoundedVec, reject_unbounded_json_reader};
 /// Inclusive maximum embedding dimensionality accepted by this crate.
 const MAX_DIMENSIONS: usize = 8192;
 
-const MAX_RECORD_ID_BYTES: usize = 256;
+pub(crate) const MAX_RECORD_ID_BYTES: usize = 256;
 
 /// Default maximum number of records one in-crate index will hold.
 pub(crate) const DEFAULT_INDEX_CAPACITY: usize = 100_000;
