@@ -35,6 +35,24 @@ use super::http_api::Diagnostics;
 
 const CHANNEL_START_TIMEOUT: Duration = Duration::from_secs(20);
 const CHANNEL_STOP_GRACE: Duration = Duration::from_secs(2);
+const DISCORD_REPLY_MAX_RATE_LIMIT_RETRIES: u8 = 3;
+const TELEGRAM_START_MAX_FAILURES: u8 = 3;
+
+fn telegram_startup_probe_result(
+    result: &Result<claw_channels::TelegramPollStats, ChannelError>,
+    consecutive_failures: u8,
+) -> Result<bool, String> {
+    match result {
+        Ok(_) => Ok(true),
+        Err(error) if !error.is_retryable() => {
+            Err(format!("Telegram readiness probe failed: {error}"))
+        }
+        Err(error) if consecutive_failures >= TELEGRAM_START_MAX_FAILURES => Err(format!(
+            "Telegram readiness probe failed after {consecutive_failures} consecutive attempts: {error}"
+        )),
+        Err(_) => Ok(false),
+    }
+}
 
 /// Configured Telegram worker.
 pub struct TelegramSettings {
@@ -227,6 +245,7 @@ impl ChannelSupervisor {
             let task_authentication = Arc::clone(&authentication);
             let task_diagnostics = Arc::clone(&diagnostics);
             let task_terminated = Arc::clone(&terminated);
+            let (ready_tx, ready_rx) = oneshot::channel();
             let handle = tracker.spawn(async move {
                 let _guard = TerminationGuard(task_terminated);
                 run_telegram(
@@ -236,6 +255,7 @@ impl ChannelSupervisor {
                     task_authentication,
                     task_diagnostics,
                     task_cancel,
+                    ready_tx,
                 )
                 .await;
             });
@@ -249,6 +269,25 @@ impl ChannelSupervisor {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(request_cancel);
             spawned = spawned.saturating_add(1);
+            let readiness = tokio::select! {
+                () = cancellation.cancelled() => {
+                    Err("Telegram channel readiness cancelled".to_owned())
+                }
+                result = tokio::time::timeout(CHANNEL_START_TIMEOUT, ready_rx) => {
+                    match result {
+                        Ok(Ok(result)) => result,
+                        Ok(Err(_)) => {
+                            Err("Telegram channel stopped before readiness".to_owned())
+                        }
+                        Err(_) => Err("Telegram channel readiness timed out".to_owned()),
+                    }
+                }
+            };
+            if let Err(error) = readiness {
+                cancellation.cancel();
+                cancel_requests(&request_cancellations);
+                return Err(error);
+            }
         }
 
         if let Some(settings) = discord {
@@ -703,6 +742,26 @@ impl DiscordTransportAdapter {
     }
 }
 
+trait DiscordReplyTransport: Sync {
+    fn create_message_raw(
+        &self,
+        bot_token: &str,
+        channel_id: &str,
+        content: &str,
+    ) -> Result<ProviderResponse, ChannelError>;
+}
+
+impl DiscordReplyTransport for DiscordTransportAdapter {
+    fn create_message_raw(
+        &self,
+        bot_token: &str,
+        channel_id: &str,
+        content: &str,
+    ) -> Result<ProviderResponse, ChannelError> {
+        Self::create_message_raw(self, bot_token, channel_id, content)
+    }
+}
+
 impl DiscordTransport for DiscordTransportAdapter {
     fn open_gateway(&mut self, gateway_url: &str) -> Result<(), ChannelError> {
         self.commands
@@ -733,6 +792,18 @@ impl DiscordTransport for DiscordTransportAdapter {
                 }
             }),
             1 => json!({"op":1,"d":request.sequence()}),
+            6 => json!({
+                "op": 6,
+                "d": {
+                    "token": request.bot_token().ok_or(ChannelError::Authentication)?,
+                    "session_id": request.session_id().ok_or(ChannelError::Protocol(
+                        claw_channel_sdk::ProtocolErrorKind::InvalidField,
+                    ))?,
+                    "seq": request.sequence().ok_or(ChannelError::Protocol(
+                        claw_channel_sdk::ProtocolErrorKind::InvalidField,
+                    ))?,
+                }
+            }),
             _ => {
                 return Err(ChannelError::Protocol(
                     claw_channel_sdk::ProtocolErrorKind::InvalidField,
@@ -919,15 +990,45 @@ async fn run_telegram(
     authentication: Arc<RwLock<Option<String>>>,
     diagnostics: Arc<Diagnostics>,
     cancellation: CancellationToken,
+    ready: oneshot::Sender<Result<(), String>>,
 ) {
+    let mut ready = Some(ready);
+    let mut consecutive_failures = 0_u8;
     loop {
         if cancellation.is_cancelled() {
             break;
         }
-        if let Err(error) = channel.poll_once(
+        let poll = channel.poll_once(
             &credential,
             &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
-        ) {
+        );
+        consecutive_failures = if poll.is_ok() {
+            0
+        } else {
+            consecutive_failures.saturating_add(1)
+        };
+        if ready.is_some() {
+            match telegram_startup_probe_result(&poll, consecutive_failures) {
+                Ok(true) => {
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(Ok(()));
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(Err(error));
+                    }
+                    break;
+                }
+            }
+        }
+        let retry_after = poll
+            .as_ref()
+            .err()
+            .and_then(ChannelError::retry_after)
+            .unwrap_or_else(|| channel.poll_interval());
+        if let Err(error) = poll {
             diagnostics.record(format!("Telegram poll failed: {error}"));
         }
         while let Ok(Some(message)) = channel.poll_inbound() {
@@ -971,10 +1072,13 @@ async fn run_telegram(
         }
         tokio::select! {
             () = cancellation.cancelled() => break,
-            () = tokio::time::sleep(channel.poll_interval()) => {}
+            () = tokio::time::sleep(retry_after) => {}
         }
     }
     let _ = channel.stop(&mut ChannelDiagnostics(diagnostics));
+    if let Some(ready) = ready {
+        let _ = ready.send(Err("Telegram stopped before readiness".to_owned()));
+    }
 }
 
 fn enqueue_discord(
@@ -1022,8 +1126,15 @@ async fn run_discord_dispatch(
         .await
         {
             Ok(Some(reply)) => {
-                if let Err(error) =
-                    send_discord_reply(&transport, &origin, &credential, &message, &reply)
+                if let Err(error) = send_discord_reply(
+                    &transport,
+                    &origin,
+                    &credential,
+                    &message,
+                    &reply,
+                    &cancellation,
+                )
+                .await
                 {
                     diagnostics.record(format!("Discord reply failed: {error}"));
                 }
@@ -1034,12 +1145,13 @@ async fn run_discord_dispatch(
     }
 }
 
-fn send_discord_reply(
-    transport: &DiscordTransportAdapter,
+async fn send_discord_reply<T: DiscordReplyTransport>(
+    transport: &T,
     origin: &claw_channel_sdk::ApprovedOrigin,
     credential: &ChannelCredential,
     message: &InboundMessage,
     reply: &str,
+    cancellation: &CancellationToken,
 ) -> Result<(), ChannelError> {
     let route =
         message
@@ -1056,31 +1168,50 @@ fn send_discord_reply(
             claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
         )
     })?;
-    credential
+    let bot_token = credential
         .expose_for_origin(
             "discord",
             "default",
             CredentialKind::Token,
             origin,
-            |bot_token| -> Result<(), ChannelError> {
-                for segment in segments {
-                    let segment = segment.map_err(|_| {
-                        ChannelError::Configuration(
-                            claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
-                        )
-                    })?;
-                    let response =
-                        transport.create_message_raw(bot_token, channel_id, segment.as_ref())?;
-                    if !(200..300).contains(&response.status()) {
-                        return Err(ChannelError::RemoteRejected {
-                            status: response.status(),
-                        });
+            |value| SecretString::new(value),
+        )
+        .map_err(ChannelError::CredentialBinding)?;
+    for segment in segments {
+        let segment = segment.map_err(|_| {
+            ChannelError::Configuration(
+                claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
+            )
+        })?;
+        let mut retries = 0_u8;
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(ChannelError::Transport(TransportErrorKind::Io));
+            }
+            let response =
+                transport.create_message_raw(bot_token.expose(), channel_id, segment.as_ref())?;
+            match response.status() {
+                200..=299 => break,
+                429 => {
+                    let retry_after = response
+                        .retry_after()
+                        .unwrap_or_else(|| Duration::from_secs(1));
+                    if retries == DISCORD_REPLY_MAX_RATE_LIMIT_RETRIES {
+                        return Err(ChannelError::RateLimited { retry_after });
+                    }
+                    retries += 1;
+                    tokio::select! {
+                        () = cancellation.cancelled() => {
+                            return Err(ChannelError::Transport(TransportErrorKind::Io));
+                        }
+                        () = tokio::time::sleep(retry_after) => {}
                     }
                 }
-                Ok(())
-            },
-        )
-        .map_err(ChannelError::CredentialBinding)?
+                status => return Err(ChannelError::RemoteRejected { status }),
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn process_inbound(
@@ -1177,14 +1308,41 @@ fn provider_channel_error(error: &claw_provider_sdk::ProviderError) -> ChannelEr
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, PoisonError};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use claw_provider_sdk::CancelToken;
+    use claw_channel_sdk::{ChannelError, CredentialKind, InboundMessage};
+    use claw_channels::ProviderResponse;
+    use claw_provider_sdk::{CancelToken, SecretString};
     use tokio_util::sync::CancellationToken;
     use tokio_util::task::TaskTracker;
 
-    use super::ChannelStartGuard;
+    use super::{
+        ChannelStartGuard, DiscordReplyTransport, approved_origin, bind_credential,
+        send_discord_reply,
+    };
+
+    struct ScriptedDiscordReplies {
+        responses: Mutex<VecDeque<ProviderResponse>>,
+        calls: Mutex<usize>,
+    }
+
+    impl DiscordReplyTransport for ScriptedDiscordReplies {
+        fn create_message_raw(
+            &self,
+            _bot_token: &str,
+            _channel_id: &str,
+            _content: &str,
+        ) -> Result<ProviderResponse, ChannelError> {
+            *self.calls.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+            self.responses
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+                .ok_or(ChannelError::RemoteRejected { status: 599 })
+        }
+    }
 
     #[tokio::test]
     async fn dropping_channel_start_aborts_accepted_workers() {
@@ -1218,6 +1376,83 @@ mod tests {
         assert_eq!(
             aborts.lock().unwrap_or_else(PoisonError::into_inner).len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_reply_retries_after_provider_rate_limit() {
+        let origin = approved_origin("discord", "default", "discord.com").expect("origin");
+        let credential = bind_credential(
+            "discord",
+            "default",
+            CredentialKind::Token,
+            origin.clone(),
+            &SecretString::new("discord-token"),
+        )
+        .expect("credential");
+        let transport = ScriptedDiscordReplies {
+            responses: Mutex::new(VecDeque::from([
+                ProviderResponse::with_retry_after(
+                    429,
+                    Vec::new(),
+                    Some(Duration::from_millis(20)),
+                ),
+                ProviderResponse::new(200, Vec::new()),
+            ])),
+            calls: Mutex::new(0),
+        };
+        let message = InboundMessage {
+            id: "message".to_owned(),
+            channel_id: "discord".to_owned(),
+            account_id: "default".to_owned(),
+            conversation_id: "discord:room:user".to_owned(),
+            sender_id: "user".to_owned(),
+            text: Some("question".to_owned()),
+            attachments: Vec::new(),
+            received_at_unix_ms: 1,
+        };
+
+        let started = Instant::now();
+        assert_eq!(
+            send_discord_reply(
+                &transport,
+                &origin,
+                &credential,
+                &message,
+                "reply",
+                &CancellationToken::new(),
+            )
+            .await,
+            Ok(())
+        );
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert_eq!(*transport.calls.lock().expect("call count"), 2);
+    }
+
+    #[test]
+    fn telegram_readiness_requires_success_and_faults_after_persistent_failure() {
+        assert_eq!(
+            super::telegram_startup_probe_result(
+                &Ok(claw_channels::TelegramPollStats::default()),
+                0,
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            super::telegram_startup_probe_result(&Err(ChannelError::Authentication), 1,),
+            Err("Telegram readiness probe failed: channel authentication failed".to_owned())
+        );
+        assert_eq!(
+            super::telegram_startup_probe_result(
+                &Err(ChannelError::Transport(
+                    claw_channel_sdk::TransportErrorKind::Timeout,
+                )),
+                3,
+            ),
+            Err(
+                "Telegram readiness probe failed after 3 consecutive attempts: channel transport failed: Timeout"
+                    .to_owned()
+            )
         );
     }
 }

@@ -250,9 +250,9 @@ impl<T, C> WhatsAppChannel<T, C> {
     ///
     /// Returns [`ChannelError::Configuration`] for invalid account or phone
     /// routing, or when `graph_origin` is not the exact enrolled
-    /// `https://graph.facebook.com` origin for this account. `inbound_capacity`
-    /// also bounds recent completion IDs and partial reply checkpoints used to
-    /// make webhook redelivery resumable.
+    /// `https://graph.facebook.com` origin for this account. Twice
+    /// `inbound_capacity` bounds recent completion IDs, retaining both halves of
+    /// one queue-pressure retry window without unbounded dedupe state.
     pub fn new(
         account_id: impl Into<String>,
         phone_number_id: impl Into<String>,
@@ -277,7 +277,7 @@ impl<T, C> WhatsAppChannel<T, C> {
             clock,
             lifecycle: ConnectionStateMachine::new(),
             inbound: BoundedQueue::new(inbound_capacity),
-            delivery_history_capacity: inbound_capacity.get(),
+            delivery_history_capacity: inbound_capacity.get().saturating_mul(2),
             completed_message_ids: VecDeque::new(),
             pending_replies: VecDeque::new(),
         })
@@ -496,12 +496,30 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
                 let Some(value) = change.value else {
                     continue;
                 };
+                if !value.messages.is_empty()
+                    && value
+                        .metadata
+                        .is_none_or(|metadata| metadata.phone_number_id != self.phone_number_id)
+                {
+                    diagnostics.record(self.diagnostic(
+                        DiagnosticLevel::Warning,
+                        DiagnosticCode::MalformedPayload,
+                        None,
+                        None,
+                        None,
+                    ));
+                    return Err(ChannelError::Protocol(ProtocolErrorKind::InvalidField));
+                }
                 for message in value.messages {
                     stats.messages += 1;
                     if self
                         .completed_message_ids
                         .iter()
                         .any(|message_id| message_id == message.id)
+                        || self
+                            .pending_replies
+                            .iter()
+                            .any(|pending| pending.message_id == message.id)
                         || self.inbound.iter().any(|queued| queued.id == message.id)
                     {
                         stats.ignored += 1;
@@ -591,37 +609,36 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
     ) -> Result<usize, ChannelError> {
         self.require_running()?;
         let mut processed = 0;
+        while let Some(mut pending) = self.pending_replies.pop_front() {
+            if let Err(error) = self.resume_pending_reply(&mut pending, access_credential) {
+                self.pending_replies.push_front(pending);
+                return Err(error);
+            }
+            self.remember_completed(pending.message_id);
+            processed += 1;
+        }
         while let Some(message) = self.inbound.pop() {
-            let pending_index = self
-                .pending_replies
+            if self
+                .completed_message_ids
                 .iter()
-                .position(|pending| pending.message_id == message.id);
-            let mut pending = if let Some(index) = pending_index {
-                let Some(pending) = self.pending_replies.remove(index) else {
-                    return Err(ChannelError::Protocol(ProtocolErrorKind::InvalidField));
-                };
-                pending
-            } else {
-                let reply = process(&message)?;
-                let Some(reply) = reply.filter(|reply| !reply.trim().is_empty()) else {
-                    self.remember_completed(message.id);
-                    processed += 1;
-                    continue;
-                };
-                if self.pending_replies.len() == self.delivery_history_capacity {
-                    return Err(ChannelError::RateLimited {
-                        retry_after: Duration::from_secs(1),
-                    });
-                }
-                let to = message.conversation_id.strip_prefix("whatsapp:").ok_or(
-                    ChannelError::Configuration(ConfigurationError::ConversationScopeMismatch),
-                )?;
-                PendingWhatsAppReply {
-                    message_id: message.id,
-                    to: to.to_owned(),
-                    text: reply,
-                    next_chunk: 0,
-                }
+                .any(|message_id| message_id == &message.id)
+            {
+                continue;
+            }
+            let reply = process(&message)?;
+            let Some(reply) = reply.filter(|reply| !reply.trim().is_empty()) else {
+                self.remember_completed(message.id);
+                processed += 1;
+                continue;
+            };
+            let to = message.conversation_id.strip_prefix("whatsapp:").ok_or(
+                ChannelError::Configuration(ConfigurationError::ConversationScopeMismatch),
+            )?;
+            let mut pending = PendingWhatsAppReply {
+                message_id: message.id,
+                to: to.to_owned(),
+                text: reply,
+                next_chunk: 0,
             };
             if let Err(error) = self.resume_pending_reply(&mut pending, access_credential) {
                 self.pending_replies.push_back(pending);
@@ -802,8 +819,15 @@ struct WhatsAppChange<'a> {
 
 #[derive(Deserialize)]
 struct WhatsAppValue<'a> {
+    #[serde(borrow)]
+    metadata: Option<WhatsAppMetadata<'a>>,
     #[serde(default, borrow)]
     messages: Vec<WhatsAppMessage<'a>>,
+}
+
+#[derive(Deserialize)]
+struct WhatsAppMetadata<'a> {
+    phone_number_id: &'a str,
 }
 
 #[derive(Deserialize)]

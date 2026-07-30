@@ -79,6 +79,7 @@ impl Running {
             .env("MicrosoftAppId", "teams-app")
             .env("MicrosoftAppPassword", "teams-password")
             .env("WHATSAPP_VERIFY_TOKEN", "verify-token")
+            .env("WHATSAPP_APP_SECRET", "app-secret")
             .env("WHATSAPP_ACCESS_TOKEN", "access-token")
             .env("WHATSAPP_PHONE_NUMBER_ID", "phone-id")
             .env("GTA_CLAW_LOG", "off")
@@ -401,11 +402,26 @@ fn legacy_conditional_channel_routes_use_composed_adapters() {
     );
     assert!(verified.starts_with("HTTP/1.1 200"), "{verified}");
     assert!(verified.ends_with("challenge-1"), "{verified}");
-    let empty_webhook = request(
+    let unsigned_webhook = request(
         daemon.legacy,
         "POST",
         "/whatsapp/webhook",
         None,
+        Some(r#"{"entry":[]}"#),
+    );
+    assert!(
+        unsigned_webhook.starts_with("HTTP/1.1 403"),
+        "{unsigned_webhook}"
+    );
+    let empty_webhook = request_with_headers(
+        daemon.legacy,
+        "POST",
+        "/whatsapp/webhook",
+        None,
+        &[(
+            "X-Hub-Signature-256",
+            "sha256=fe6aaed5aff30b5679e782271914a2287bdd7de6bedb495c95c24ad91e5e3fdb",
+        )],
         Some(r#"{"entry":[]}"#),
     );
     assert!(empty_webhook.starts_with("HTTP/1.1 200"), "{empty_webhook}");
@@ -726,9 +742,16 @@ fn write_config_fixture(path: &Path, model: &str, role_url: &str, teams: bool, w
         ("AGENT_ROLE_URL", role_url),
     ])
     .expect("fixture configuration migrates");
+    let serialized = to_json5(&migrated.config).expect("fixture configuration serializes");
+    let mut config: serde_json::Value =
+        json5::from_str(&serialized).expect("fixture configuration parses");
+    if whatsapp {
+        config["core"]["channels"]["whatsapp"]["app_secret"] =
+            serde_json::Value::String("env:WHATSAPP_APP_SECRET".to_owned());
+    }
     std::fs::write(
         path,
-        to_json5(&migrated.config).expect("fixture configuration serializes"),
+        serde_json::to_string_pretty(&config).expect("fixture configuration serializes"),
     )
     .expect("fixture configuration is written");
 }
@@ -759,6 +782,17 @@ fn request(
     bearer: Option<&str>,
     body: Option<&str>,
 ) -> String {
+    request_with_headers(address, method, path, bearer, &[], body)
+}
+
+fn request_with_headers(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> String {
     let mut stream = TcpStream::connect(address).expect("HTTP listener accepts");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -775,6 +809,9 @@ fn request(
     .expect("request head is written");
     if let Some(bearer) = bearer {
         write!(stream, "Authorization: Bearer {bearer}\r\n").expect("authorization is written");
+    }
+    for (name, value) in headers {
+        write!(stream, "{name}: {value}\r\n").expect("request header is written");
     }
     if !body.is_empty() {
         write!(stream, "Content-Type: application/json\r\n").expect("content type is written");

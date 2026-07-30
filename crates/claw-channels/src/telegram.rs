@@ -354,11 +354,11 @@ impl<T: TelegramTransport, C: UnixClock> TelegramChannel<T, C> {
                 return Err(error);
             }
         };
-        if let Err(error) = classify_response(&response, self.poll_interval) {
+        if let Err(error) = response.require_bounded() {
             self.record_poll_failure(diagnostics, &error, Some(response.status()));
             return Err(error);
         }
-        if let Err(error) = response.require_bounded() {
+        if let Err(error) = classify_response(&response, self.poll_interval) {
             self.record_poll_failure(diagnostics, &error, Some(response.status()));
             return Err(error);
         }
@@ -544,8 +544,8 @@ impl<T: TelegramTransport, C: UnixClock> Channel for TelegramChannel<T, C> {
                             chat_id,
                             text: chunk.as_ref(),
                         })?;
-                        classify_response(&response, Duration::from_secs(1))?;
                         response.require_bounded()?;
+                        classify_response(&response, Duration::from_secs(1))?;
                         let envelope: TelegramSendEnvelope =
                             serde_json::from_slice(response.body()).map_err(|_| {
                                 ChannelError::Protocol(ProtocolErrorKind::MalformedResponse)
@@ -616,6 +616,16 @@ struct TelegramSendResult {
     message_id: i64,
 }
 
+#[derive(Deserialize)]
+struct TelegramErrorEnvelope {
+    parameters: Option<TelegramErrorParameters>,
+}
+
+#[derive(Deserialize)]
+struct TelegramErrorParameters {
+    retry_after: Option<u64>,
+}
+
 fn classify_response(
     response: &ProviderResponse,
     default_retry_after: Duration,
@@ -624,7 +634,13 @@ fn classify_response(
         200..=299 => Ok(()),
         401 | 403 => Err(ChannelError::Authentication),
         429 => Err(ChannelError::RateLimited {
-            retry_after: response.retry_after().unwrap_or(default_retry_after),
+            retry_after: serde_json::from_slice::<TelegramErrorEnvelope>(response.body())
+                .ok()
+                .and_then(|envelope| envelope.parameters)
+                .and_then(|parameters| parameters.retry_after)
+                .map(Duration::from_secs)
+                .or_else(|| response.retry_after())
+                .unwrap_or(default_retry_after),
         }),
         status => Err(ChannelError::RemoteRejected { status }),
     }

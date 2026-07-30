@@ -70,6 +70,11 @@ enum DiscordGatewayRequestKind<'a> {
         intents: u64,
         platform: &'static str,
     },
+    Resume {
+        bot_token: &'a str,
+        session_id: &'a str,
+        sequence: i64,
+    },
     Heartbeat {
         sequence: Option<i64>,
     },
@@ -86,6 +91,7 @@ impl DiscordGatewayRequest<'_> {
     pub const fn opcode(&self) -> u8 {
         match self.kind {
             DiscordGatewayRequestKind::Identify { .. } => 2,
+            DiscordGatewayRequestKind::Resume { .. } => 6,
             DiscordGatewayRequestKind::Heartbeat { .. } => 1,
         }
     }
@@ -96,7 +102,8 @@ impl DiscordGatewayRequest<'_> {
     #[must_use]
     pub const fn bot_token(&self) -> Option<&str> {
         match self.kind {
-            DiscordGatewayRequestKind::Identify { bot_token, .. } => Some(bot_token),
+            DiscordGatewayRequestKind::Identify { bot_token, .. }
+            | DiscordGatewayRequestKind::Resume { bot_token, .. } => Some(bot_token),
             DiscordGatewayRequestKind::Heartbeat { .. } => None,
         }
     }
@@ -106,7 +113,8 @@ impl DiscordGatewayRequest<'_> {
     pub const fn intents(&self) -> Option<u64> {
         match self.kind {
             DiscordGatewayRequestKind::Identify { intents, .. } => Some(intents),
-            DiscordGatewayRequestKind::Heartbeat { .. } => None,
+            DiscordGatewayRequestKind::Resume { .. }
+            | DiscordGatewayRequestKind::Heartbeat { .. } => None,
         }
     }
 
@@ -115,7 +123,8 @@ impl DiscordGatewayRequest<'_> {
     pub const fn platform(&self) -> Option<&str> {
         match self.kind {
             DiscordGatewayRequestKind::Identify { platform, .. } => Some(platform),
-            DiscordGatewayRequestKind::Heartbeat { .. } => None,
+            DiscordGatewayRequestKind::Resume { .. }
+            | DiscordGatewayRequestKind::Heartbeat { .. } => None,
         }
     }
 
@@ -124,7 +133,18 @@ impl DiscordGatewayRequest<'_> {
     pub const fn client_label(&self) -> Option<&str> {
         match self.kind {
             DiscordGatewayRequestKind::Identify { .. } => Some(DISCORD_CLIENT_LABEL),
-            DiscordGatewayRequestKind::Heartbeat { .. } => None,
+            DiscordGatewayRequestKind::Resume { .. }
+            | DiscordGatewayRequestKind::Heartbeat { .. } => None,
+        }
+    }
+
+    /// Returns the prior Gateway session for RESUME.
+    #[must_use]
+    pub const fn session_id(&self) -> Option<&str> {
+        match self.kind {
+            DiscordGatewayRequestKind::Resume { session_id, .. } => Some(session_id),
+            DiscordGatewayRequestKind::Identify { .. }
+            | DiscordGatewayRequestKind::Heartbeat { .. } => None,
         }
     }
 
@@ -133,6 +153,7 @@ impl DiscordGatewayRequest<'_> {
     pub const fn sequence(&self) -> Option<i64> {
         match self.kind {
             DiscordGatewayRequestKind::Heartbeat { sequence } => sequence,
+            DiscordGatewayRequestKind::Resume { sequence, .. } => Some(sequence),
             DiscordGatewayRequestKind::Identify { .. } => None,
         }
     }
@@ -151,6 +172,20 @@ impl Debug for DiscordGatewayRequest<'_> {
                 .field("platform", &platform)
                 .field("browser", &DISCORD_CLIENT_LABEL)
                 .field("device", &DISCORD_CLIENT_LABEL)
+                .finish(),
+            DiscordGatewayRequestKind::Resume {
+                session_id,
+                sequence,
+                ..
+            } => formatter
+                .debug_struct("DiscordGatewayRequest")
+                .field("opcode", &6)
+                .field("bot_token", &"[REDACTED]")
+                .field(
+                    "session_id",
+                    &format_args!("[REDACTED; {} bytes]", session_id.len()),
+                )
+                .field("sequence", &sequence)
                 .finish(),
             DiscordGatewayRequestKind::Heartbeat { sequence } => formatter
                 .debug_struct("DiscordGatewayRequest")
@@ -569,26 +604,7 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
                 close_result?;
                 return Ok(true);
             }
-            if let Err(error) = self.transport.send_gateway(&DiscordGatewayRequest {
-                kind: DiscordGatewayRequestKind::Heartbeat {
-                    sequence: self.sequence,
-                },
-            }) {
-                let _ = self.transport.close_gateway();
-                self.gateway_closed(now, diagnostics)?;
-                diagnostics.record(self.diagnostic(
-                    DiagnosticLevel::Error,
-                    DiagnosticCode::ConnectionFailed,
-                    None,
-                    None,
-                    error.retry_after(),
-                ));
-                return Err(error);
-            }
-            self.awaiting_heartbeat_ack = true;
-            self.next_heartbeat = self
-                .heartbeat_interval
-                .map(|interval| now.saturating_add(interval));
+            self.send_heartbeat(now, diagnostics)?;
             return Ok(true);
         }
         Ok(false)
@@ -630,8 +646,20 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
                 self.handle_hello(packet.data.get(), now, gateway_credential, diagnostics)
             }
             0 => self.handle_dispatch(packet.event_type, packet.data.get(), diagnostics),
+            1 => {
+                self.send_heartbeat(now, diagnostics)?;
+                Ok(DiscordPacketOutcome::Ignored)
+            }
             7 | 9 => {
-                if packet.opcode == 9 {
+                let resumable = if packet.opcode == 7 {
+                    true
+                } else if let Ok(resumable) = serde_json::from_str::<bool>(packet.data.get()) {
+                    resumable
+                } else {
+                    self.record_malformed(diagnostics);
+                    return Ok(DiscordPacketOutcome::Malformed);
+                };
+                if !resumable {
                     self.sequence = None;
                     self.session_id = None;
                 }
@@ -697,6 +725,7 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
             }
         };
         let heartbeat_interval = Duration::from_millis(hello.heartbeat_interval);
+        let resumable_session = self.session_id.clone().zip(self.sequence);
         let send_result = match gateway_credential
             .expose_for_origin(
                 "discord",
@@ -704,13 +733,23 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
                 CredentialKind::Token,
                 &self.gateway_origin,
                 |bot_token| {
-                    self.transport.send_gateway(&DiscordGatewayRequest {
-                        kind: DiscordGatewayRequestKind::Identify {
-                            bot_token,
-                            intents: self.intents,
-                            platform: std::env::consts::OS,
-                        },
-                    })
+                    self.transport
+                        .send_gateway(&resumable_session.as_ref().map_or_else(
+                            || DiscordGatewayRequest {
+                                kind: DiscordGatewayRequestKind::Identify {
+                                    bot_token,
+                                    intents: self.intents,
+                                    platform: std::env::consts::OS,
+                                },
+                            },
+                            |(session_id, sequence)| DiscordGatewayRequest {
+                                kind: DiscordGatewayRequestKind::Resume {
+                                    bot_token,
+                                    session_id,
+                                    sequence: *sequence,
+                                },
+                            },
+                        ))
                 },
             )
             .map_err(map_credential_binding)
@@ -770,6 +809,16 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
                 };
                 self.lifecycle.apply(LifecycleEvent::Established, &mut ())?;
                 self.session_id = Some(ready.session_id.to_owned());
+                self.phase = DiscordGatewayPhase::Ready;
+                self.reconnect_attempts = 0;
+                Ok(DiscordPacketOutcome::Ready)
+            }
+            Some("RESUMED")
+                if self.phase == DiscordGatewayPhase::Identifying
+                    && self.session_id.is_some()
+                    && self.sequence.is_some() =>
+            {
+                self.lifecycle.apply(LifecycleEvent::Established, &mut ())?;
                 self.phase = DiscordGatewayPhase::Ready;
                 self.reconnect_attempts = 0;
                 Ok(DiscordPacketOutcome::Ready)
@@ -871,6 +920,34 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
             Some(DISCORD_RECONNECT_DELAY),
         ));
         Ok(true)
+    }
+
+    fn send_heartbeat(
+        &mut self,
+        now: Duration,
+        diagnostics: &mut impl DiagnosticSink,
+    ) -> Result<(), ChannelError> {
+        if let Err(error) = self.transport.send_gateway(&DiscordGatewayRequest {
+            kind: DiscordGatewayRequestKind::Heartbeat {
+                sequence: self.sequence,
+            },
+        }) {
+            let _ = self.transport.close_gateway();
+            self.gateway_closed(now, diagnostics)?;
+            diagnostics.record(self.diagnostic(
+                DiagnosticLevel::Error,
+                DiagnosticCode::ConnectionFailed,
+                None,
+                None,
+                error.retry_after(),
+            ));
+            return Err(error);
+        }
+        self.awaiting_heartbeat_ack = true;
+        self.next_heartbeat = self
+            .heartbeat_interval
+            .map(|interval| now.saturating_add(interval));
+        Ok(())
     }
 
     const fn reset_connection_protocol(&mut self) {

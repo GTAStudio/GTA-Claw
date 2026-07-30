@@ -3,6 +3,7 @@
 use std::fmt::{self, Debug, Formatter};
 use std::time::Duration;
 
+use ring::hmac;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -123,6 +124,8 @@ impl Debug for LegacyAdminCredential {
 pub struct LegacyWhatsAppConfig {
     webhook_path: String,
     verify_digest: [u8; 32],
+    signature_key: hmac::Key,
+    phone_number_id: String,
 }
 
 impl LegacyWhatsAppConfig {
@@ -135,14 +138,28 @@ impl LegacyWhatsAppConfig {
     pub fn new(
         webhook_path: impl Into<String>,
         verify_token: &str,
+        app_secret: &str,
+        phone_number_id: impl Into<String>,
     ) -> Result<Self, LegacyConfigError> {
         let webhook_path = webhook_path.into();
         if !valid_webhook_path(&webhook_path) {
             return Err(LegacyConfigError::InvalidWebhookPath);
         }
+        let phone_number_id = phone_number_id.into();
+        if verify_token.is_empty()
+            || app_secret.is_empty()
+            || phone_number_id.is_empty()
+            || !phone_number_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(LegacyConfigError::InvalidWhatsAppConfiguration);
+        }
         Ok(Self {
             webhook_path,
             verify_digest: Sha256::digest(verify_token.as_bytes()).into(),
+            signature_key: hmac::Key::new(hmac::HMAC_SHA256, app_secret.as_bytes()),
+            phone_number_id,
         })
     }
 
@@ -156,6 +173,20 @@ impl LegacyWhatsAppConfig {
         let presented: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         bool::from(self.verify_digest.ct_eq(&presented))
     }
+
+    pub(crate) fn verifies_signature(&self, payload: &[u8], signature: Option<&str>) -> bool {
+        let Some(signature) = signature.and_then(|value| value.strip_prefix("sha256=")) else {
+            return false;
+        };
+        let Some(digest) = decode_sha256(signature) else {
+            return false;
+        };
+        hmac::verify(&self.signature_key, payload, &digest).is_ok()
+    }
+
+    pub(crate) fn phone_number_id(&self) -> &str {
+        &self.phone_number_id
+    }
 }
 
 impl Debug for LegacyWhatsAppConfig {
@@ -164,7 +195,29 @@ impl Debug for LegacyWhatsAppConfig {
             .debug_struct("LegacyWhatsAppConfig")
             .field("webhook_path", &self.webhook_path)
             .field("verify_digest", &"[REDACTED]")
+            .field("signature_key", &"[REDACTED]")
+            .field("phone_number_id", &self.phone_number_id)
             .finish()
+    }
+}
+
+fn decode_sha256(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        digest[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(digest)
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -268,6 +321,8 @@ pub enum LegacyConfigError {
     ZeroLimit,
     /// The configured `WhatsApp` path is not a safe absolute static path.
     InvalidWebhookPath,
+    /// The `WhatsApp` verification, signing, or phone identity is empty or malformed.
+    InvalidWhatsAppConfiguration,
     /// Teams is enabled but no Teams adapter was supplied.
     MissingTeamsAdapter,
     /// `WhatsApp` is enabled without both route configuration and an adapter.
@@ -280,6 +335,9 @@ impl fmt::Display for LegacyConfigError {
             Self::EmptyDefaultModel => "legacy default model must not be empty",
             Self::ZeroLimit => "legacy HTTP limits and rate capacity must be nonzero",
             Self::InvalidWebhookPath => "legacy WhatsApp webhook path is invalid",
+            Self::InvalidWhatsAppConfiguration => {
+                "legacy WhatsApp authentication configuration is invalid"
+            }
             Self::MissingTeamsAdapter => "Teams is enabled without a Teams adapter",
             Self::MissingWhatsAppAdapter => {
                 "WhatsApp is enabled without route configuration and an adapter"

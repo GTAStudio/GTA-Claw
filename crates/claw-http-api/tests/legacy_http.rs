@@ -1,6 +1,7 @@
 //! Frozen legacy `src/server.ts` HTTP acceptance and resource-bound regressions.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -18,6 +19,7 @@ use claw_http_api::{
     LegacyWhatsAppConfig, LegacyWhatsAppPort, LegacyWhatsAppServices, PortError, PortErrorKind,
     PortFuture, ProviderLegacyRuntime, ProviderLegacyRuntimeConfig, ServingStateHandle,
 };
+use ring::hmac;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -27,6 +29,8 @@ use tokio_util::sync::CancellationToken;
 
 const DEVICE_INSTRUCTIONS: &str = "Please authorize GTA-Claw with your GitHub account:\n1. Open: https://github.com/login/device\n2. Enter code: **ABCD-EFGH**";
 const ADMIN_TOKEN: &str = "legacy-admin-token";
+const WHATSAPP_APP_SECRET: &str = "fixture-app-secret";
+const WHATSAPP_PHONE_NUMBER_ID: &str = "phone-id";
 
 #[derive(Clone)]
 struct ScriptedRuntime {
@@ -702,7 +706,13 @@ async fn whatsapp_reload_system_and_exec_match_frozen_shapes() {
     let mut config = LegacyApiConfig::default();
     config.channels.set_whatsapp(true);
     config.whatsapp = Some(
-        LegacyWhatsAppConfig::new("/whatsapp/webhook", "fixture-token").expect("valid webhook"),
+        LegacyWhatsAppConfig::new(
+            "/whatsapp/webhook",
+            "fixture-token",
+            WHATSAPP_APP_SECRET,
+            WHATSAPP_PHONE_NUMBER_ID,
+        )
+        .expect("valid webhook"),
     );
     config.admin_credential = Some(LegacyAdminCredential::new(ADMIN_TOKEN));
     let server = spawn(config, fixtures.services()).await;
@@ -741,14 +751,14 @@ async fn whatsapp_reload_system_and_exec_match_frozen_shapes() {
     let webhook = json!({
         "entry":[{
             "changes":[{
-                "value":{"messages":[
+                "value":{"metadata":{"phone_number_id":"phone-id"},"messages":[
                     {"from":"15551234567","type":"image"},
                     {"from":"15551234567","type":"text","text":{"body":" hello "}}
                 ]}
             }]
         }]
     });
-    let incoming = json_request(&server, "/whatsapp/webhook", None, &webhook).await;
+    let incoming = whatsapp_json_request(&server, &webhook).await;
     assert_eq!(
         incoming.json(),
         frozen_response("whatsapp-incoming", "accepted")
@@ -772,7 +782,7 @@ async fn whatsapp_reload_system_and_exec_match_frozen_shapes() {
     }
 
     fixtures.whatsapp.fail.store(true, Ordering::Release);
-    let failed = json_request(&server, "/whatsapp/webhook", None, &webhook).await;
+    let failed = whatsapp_json_request(&server, &webhook).await;
     assert_eq!(
         failed.json(),
         frozen_response("whatsapp-incoming", "handling-failed")
@@ -847,6 +857,68 @@ async fn whatsapp_reload_system_and_exec_match_frozen_shapes() {
             Some("missing-container".to_owned())
         ))
     );
+}
+
+#[tokio::test]
+async fn whatsapp_post_requires_an_app_secret_signature() {
+    let fixtures = Fixtures::new(true);
+    let mut config = LegacyApiConfig::default();
+    config.channels.set_whatsapp(true);
+    config.whatsapp = Some(
+        LegacyWhatsAppConfig::new(
+            "/whatsapp/webhook",
+            "fixture-token",
+            WHATSAPP_APP_SECRET,
+            WHATSAPP_PHONE_NUMBER_ID,
+        )
+        .expect("valid webhook"),
+    );
+    let server = spawn(config, fixtures.services()).await;
+
+    let unsigned = request(
+        &server,
+        "POST",
+        "/whatsapp/webhook",
+        None,
+        &[("Content-Type", "application/json")],
+        br#"{"entry":[]}"#,
+    )
+    .await;
+
+    assert_eq!(unsigned.status, 403);
+
+    let invalid = request(
+        &server,
+        "POST",
+        "/whatsapp/webhook",
+        None,
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hub-Signature-256", "sha256=00"),
+        ],
+        br#"{"entry":[]}"#,
+    )
+    .await;
+    assert_eq!(invalid.status, 403);
+
+    let accepted = whatsapp_json_request(&server, &json!({"entry":[]})).await;
+    assert_eq!(accepted.status, 200);
+
+    let wrong_phone = whatsapp_json_request(
+        &server,
+        &json!({
+            "entry":[{
+                "changes":[{
+                    "value":{
+                        "metadata":{"phone_number_id":"other-phone"},
+                        "messages":[{"from":"15551234567","type":"text","text":{"body":"hello"}}]
+                    }
+                }]
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(wrong_phone.status, 400);
 }
 
 #[tokio::test]
@@ -973,13 +1045,13 @@ fn invalid_legacy_compositions_fail_before_binding() {
     ));
 
     assert!(matches!(
-        LegacyWhatsAppConfig::new("relative", "token"),
+        LegacyWhatsAppConfig::new("relative", "token", "secret", "phone-id"),
         Err(LegacyConfigError::InvalidWebhookPath)
     ));
     for path in ["/chat", "/:route", "/*tail", "/double//segment"] {
         assert!(
             matches!(
-                LegacyWhatsAppConfig::new(path, "token"),
+                LegacyWhatsAppConfig::new(path, "token", "secret", "phone-id"),
                 Err(LegacyConfigError::InvalidWebhookPath)
             ),
             "{path} must be rejected before Axum route construction"
@@ -1055,6 +1127,32 @@ async fn json_request(
         &body,
     )
     .await
+}
+
+async fn whatsapp_json_request(server: &Server, body: &Value) -> HttpResponse {
+    let body = serde_json::to_vec(body).expect("serialize WhatsApp request");
+    let signature = whatsapp_signature(&body);
+    request(
+        server,
+        "POST",
+        "/whatsapp/webhook",
+        None,
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hub-Signature-256", &signature),
+        ],
+        &body,
+    )
+    .await
+}
+
+fn whatsapp_signature(body: &[u8]) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, WHATSAPP_APP_SECRET.as_bytes());
+    let mut signature = String::from("sha256=");
+    for byte in hmac::sign(&key, body).as_ref() {
+        write!(signature, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    signature
 }
 
 async fn request(

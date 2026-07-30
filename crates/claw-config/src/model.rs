@@ -492,6 +492,7 @@ impl DiscordConfig {
 pub struct WhatsappConfig {
     pub(crate) enabled: bool,
     pub(crate) verify_token: Option<SecretRef>,
+    pub(crate) app_secret: Option<SecretRef>,
     pub(crate) access_token: Option<SecretRef>,
     pub(crate) phone_number_id: Option<String>,
     pub(crate) webhook_path: String,

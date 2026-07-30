@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::{ConnectInfo, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -23,7 +24,7 @@ use super::ports::{
 use super::rate_limit::RateLimiter;
 use crate::auth::bearer_token;
 use crate::http_support::{
-    CancelOnDrop, close_connection_response, drain_request_body, json_response, read_json_value,
+    CancelOnDrop, close_connection_response, drain_request_body, json_response, read_body,
     rejected_response,
 };
 use crate::{PortError, PortErrorKind, ServingStatePort};
@@ -438,16 +439,33 @@ async fn whatsapp_incoming(State(state): State<LegacyState>, request: Request) -
     if !state.inner.serving.serving_state().accepts_work() {
         return drain_for_refusal(&state, request, draining_error()).await;
     }
-    let value = match read_legacy_json(&state, request).await {
-        Ok(value) => value,
+    let signature = request
+        .headers()
+        .get("x-hub-signature-256")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let bytes = match read_legacy_body(&state, request).await {
+        Ok(bytes) => bytes,
         Err(response) => return response,
     };
-    let body: WhatsAppBody = match serde_json::from_value(value) {
+    let config = state
+        .inner
+        .config
+        .whatsapp
+        .as_ref()
+        .expect("validated WhatsApp configuration");
+    if !config.verifies_signature(&bytes, signature.as_deref()) {
+        return legacy_error(StatusCode::FORBIDDEN, "Forbidden");
+    }
+    let body: WhatsAppBody = match serde_json::from_slice(&bytes) {
         Ok(body) => body,
         Err(_) => {
             return legacy_error(StatusCode::BAD_REQUEST, "Webhook handling failed");
         }
     };
+    if !body.matches_phone_number_id(config.phone_number_id()) {
+        return legacy_error(StatusCode::BAD_REQUEST, "Webhook handling failed");
+    }
     let services = state
         .inner
         .services
@@ -836,7 +854,13 @@ async fn drain_for_refusal(state: &LegacyState, request: Request, response: Resp
 }
 
 async fn read_legacy_json(state: &LegacyState, request: Request) -> Result<Value, Response> {
-    read_json_value(
+    let bytes = read_legacy_body(state, request).await?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| legacy_error(StatusCode::BAD_REQUEST, "Invalid request body"))
+}
+
+async fn read_legacy_body(state: &LegacyState, request: Request) -> Result<Bytes, Response> {
+    read_body(
         request,
         state.inner.config.limits.body_bytes,
         state.inner.config.limits.body_timeout,
@@ -878,6 +902,21 @@ struct WhatsAppBody {
     entry: Vec<WhatsAppEntry>,
 }
 
+impl WhatsAppBody {
+    fn matches_phone_number_id(&self, expected: &str) -> bool {
+        self.entry.iter().all(|entry| {
+            entry.changes.iter().all(|change| {
+                change.value.messages.is_empty()
+                    || change
+                        .value
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.phone_number_id == expected)
+            })
+        })
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct WhatsAppEntry {
     #[serde(default)]
@@ -892,8 +931,14 @@ struct WhatsAppChange {
 
 #[derive(Deserialize, Default)]
 struct WhatsAppValue {
+    metadata: Option<WhatsAppMetadata>,
     #[serde(default)]
     messages: Vec<WhatsAppMessage>,
+}
+
+#[derive(Deserialize)]
+struct WhatsAppMetadata {
+    phone_number_id: String,
 }
 
 #[derive(Deserialize)]

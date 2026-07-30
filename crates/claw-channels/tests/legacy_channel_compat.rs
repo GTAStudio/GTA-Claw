@@ -240,11 +240,48 @@ fn telegram_polling_advances_offsets_filters_bots_bounds_queues_and_segments_rep
     );
 }
 
+#[test]
+fn telegram_rate_limit_uses_json_retry_after_parameters() {
+    let poll_offsets = Rc::new(RefCell::new(Vec::new()));
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let debug = Rc::new(RefCell::new(Vec::new()));
+    let transport = TelegramFixture {
+        polls: VecDeque::from([Ok(ProviderResponse::new(
+            429,
+            br#"{"ok":false,"parameters":{"retry_after":17}}"#.as_slice(),
+        ))]),
+        poll_offsets,
+        sent,
+        debug,
+    };
+    let mut channel = TelegramChannel::new(
+        ACCOUNT,
+        approved_origin("telegram", "api.telegram.org"),
+        transport,
+        FixedClock(999),
+        NonZeroUsize::new(1).expect("non-zero capacity"),
+        Duration::from_millis(250),
+    )
+    .expect("Telegram adapter");
+    channel.start(&mut ()).expect("started");
+
+    assert_eq!(
+        channel.poll_once(
+            &token_credential("telegram", "api.telegram.org", "telegram-secret"),
+            &mut (),
+        ),
+        Err(ChannelError::RateLimited {
+            retry_after: Duration::from_secs(17),
+        })
+    );
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GatewayRecord {
     opcode: u8,
     token: Option<String>,
     intents: Option<u64>,
+    session_id: Option<String>,
     sequence: Option<i64>,
 }
 
@@ -275,6 +312,7 @@ impl DiscordTransport for DiscordFixture {
             opcode: request.opcode(),
             token: request.bot_token().map(str::to_owned),
             intents: request.intents(),
+            session_id: request.session_id().map(str::to_owned),
             sequence: request.sequence(),
         });
         Ok(())
@@ -396,6 +434,7 @@ fn discord_gateway_contains_bad_packets_heartbeats_reconnects_and_filters_bots()
             opcode: 2,
             token: Some("discord-gateway-secret".to_owned()),
             intents: Some(32_768),
+            session_id: None,
             sequence: None,
         }]
     );
@@ -461,6 +500,7 @@ fn discord_gateway_contains_bad_packets_heartbeats_reconnects_and_filters_bots()
             opcode: 1,
             token: None,
             intents: None,
+            session_id: None,
             sequence: Some(9),
         })
     );
@@ -504,6 +544,124 @@ fn discord_gateway_contains_bad_packets_heartbeats_reconnects_and_filters_bots()
     assert!(debug.borrow().iter().all(|rendered| {
         !rendered.contains("discord-gateway-secret") && !rendered.contains("discord-rest-secret")
     }));
+}
+
+#[test]
+fn discord_gateway_opcode_one_sends_an_immediate_heartbeat() {
+    let DiscordHarness {
+        mut channel,
+        gateway,
+        ..
+    } = discord_channel(VecDeque::from([Ok(())]), 2);
+    let credential = token_credential("discord", "gateway.discord.gg", "discord-gateway-secret");
+    channel.start(Duration::ZERO, &mut ()).expect("start");
+    channel.gateway_opened(&mut ()).expect("opened");
+    channel
+        .handle_gateway_packet(
+            br#"{"op":10,"t":null,"s":null,"d":{"heartbeat_interval":1000}}"#,
+            Duration::ZERO,
+            &credential,
+            &mut (),
+        )
+        .expect("hello");
+    channel
+        .handle_gateway_packet(
+            br#"{"op":0,"t":"READY","s":7,"d":{"session_id":"session-1"}}"#,
+            Duration::ZERO,
+            &credential,
+            &mut (),
+        )
+        .expect("ready");
+
+    assert_eq!(
+        channel.handle_gateway_packet(
+            br#"{"op":1,"t":null,"s":null,"d":null}"#,
+            Duration::from_millis(100),
+            &credential,
+            &mut (),
+        ),
+        Ok(DiscordPacketOutcome::Ignored)
+    );
+    assert_eq!(
+        gateway.borrow().last(),
+        Some(&GatewayRecord {
+            opcode: 1,
+            token: None,
+            intents: None,
+            session_id: None,
+            sequence: Some(7),
+        })
+    );
+}
+
+#[test]
+fn discord_gateway_reconnect_and_resumable_invalid_session_resume() {
+    for packet in [
+        br#"{"op":7,"t":null,"s":null,"d":null}"#.as_slice(),
+        br#"{"op":9,"t":null,"s":null,"d":true}"#.as_slice(),
+    ] {
+        let DiscordHarness {
+            mut channel,
+            gateway,
+            ..
+        } = discord_channel(VecDeque::from([Ok(()), Ok(())]), 2);
+        let credential =
+            token_credential("discord", "gateway.discord.gg", "discord-gateway-secret");
+        channel.start(Duration::ZERO, &mut ()).expect("start");
+        channel.gateway_opened(&mut ()).expect("opened");
+        channel
+            .handle_gateway_packet(
+                br#"{"op":10,"t":null,"s":null,"d":{"heartbeat_interval":1000}}"#,
+                Duration::ZERO,
+                &credential,
+                &mut (),
+            )
+            .expect("hello");
+        channel
+            .handle_gateway_packet(
+                br#"{"op":0,"t":"READY","s":7,"d":{"session_id":"session-1"}}"#,
+                Duration::ZERO,
+                &credential,
+                &mut (),
+            )
+            .expect("ready");
+        assert_eq!(
+            channel.handle_gateway_packet(packet, Duration::from_secs(1), &credential, &mut (),),
+            Ok(DiscordPacketOutcome::ReconnectRequested)
+        );
+        channel
+            .tick(Duration::from_secs(4), &mut ())
+            .expect("reconnect due");
+        channel.gateway_opened(&mut ()).expect("reopened");
+        channel
+            .handle_gateway_packet(
+                br#"{"op":10,"t":null,"s":null,"d":{"heartbeat_interval":1000}}"#,
+                Duration::from_secs(4),
+                &credential,
+                &mut (),
+            )
+            .expect("resume hello");
+
+        let gateway = gateway.borrow();
+        let resumed = gateway.last().expect("resume request");
+        assert_eq!(resumed.opcode, 6, "{packet:?}");
+        assert_eq!(resumed.token.as_deref(), Some("discord-gateway-secret"));
+        assert_eq!(resumed.intents, None);
+        assert_eq!(resumed.session_id.as_deref(), Some("session-1"));
+        assert_eq!(resumed.sequence, Some(7));
+        drop(gateway);
+        assert_eq!(
+            channel.handle_gateway_packet(
+                br#"{"op":0,"t":"RESUMED","s":8,"d":{}}"#,
+                Duration::from_secs(4),
+                &credential,
+                &mut (),
+            ),
+            Ok(DiscordPacketOutcome::Ready)
+        );
+        assert_eq!(channel.phase(), DiscordGatewayPhase::Ready);
+        assert_eq!(channel.sequence(), Some(8));
+    }
 }
 
 #[test]
@@ -688,7 +846,7 @@ fn whatsapp_verifies_challenges_normalizes_webhooks_and_waits_for_sends() {
     let payload = br#"{
       "entry":[{
         "changes":[{
-          "value":{"messages":[
+          "value":{"metadata":{"phone_number_id":"phone-id"},"messages":[
             {"from":"15550002","id":"image","timestamp":"1","type":"image"},
             {"from":"phone-id","id":"self","timestamp":"2","type":"text","text":{"body":"loop"}},
             {"from":"15550003","id":"blank","timestamp":"3","type":"text","text":{"body":"   "}},
@@ -715,7 +873,7 @@ fn whatsapp_verifies_challenges_normalizes_webhooks_and_waits_for_sends() {
     assert_eq!(inbound.received_at_unix_ms, 4_000);
 
     let handled = channel.handle_webhook(
-        br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"15550001","id":"reply","type":"text","text":{"body":"question"}}]}}]}]}"#,
+        br#"{"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"phone-id"},"messages":[{"from":"15550001","id":"reply","type":"text","text":{"body":"question"}}]}}]}]}"#,
         &access,
         |message| {
             assert_eq!(message.text.as_deref(), Some("question"));
@@ -759,7 +917,8 @@ fn whatsapp_redelivery_skips_completed_messages_and_resumes_failed_reply() {
     let access = token_credential("whatsapp", "graph.facebook.com", "whatsapp-secret");
     channel.start(&mut ()).expect("started");
     let callback_calls = RefCell::new(Vec::new());
-    let payload = br#"{"entry":[{"changes":[{"value":{"messages":[
+    let payload =
+        br#"{"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"phone-id"},"messages":[
         {"from":"15550001","id":"one","type":"text","text":{"body":"first"}},
         {"from":"15550001","id":"two","type":"text","text":{"body":"second"}}
     ]}}]}]}"#;
@@ -813,7 +972,8 @@ fn whatsapp_redelivery_skips_completed_messages_and_resumes_failed_reply() {
 fn whatsapp_queue_pressure_returns_retry_and_redelivery_skips_completed_messages() {
     let WhatsAppHarness { mut channel, .. } = whatsapp_channel(1, VecDeque::new());
     let access = token_credential("whatsapp", "graph.facebook.com", "whatsapp-secret");
-    let payload = br#"{"entry":[{"changes":[{"value":{"messages":[
+    let payload =
+        br#"{"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"phone-id"},"messages":[
         {"from":"15550001","id":"one","type":"text","text":{"body":"first"}},
         {"from":"15550002","id":"two","type":"text","text":{"body":"second"}}
     ]}}]}]}"#;
@@ -869,7 +1029,8 @@ fn whatsapp_connection_failure_retries_the_unsent_checkpoint() {
         ]),
     );
     let access = token_credential("whatsapp", "graph.facebook.com", "whatsapp-secret");
-    let payload = br#"{"entry":[{"changes":[{"value":{"messages":[
+    let payload =
+        br#"{"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"phone-id"},"messages":[
         {"from":"15550001","id":"one","type":"text","text":{"body":"question"}}
     ]}}]}]}"#;
     let callback_calls = Cell::new(0);
@@ -901,6 +1062,74 @@ fn whatsapp_connection_failure_retries_the_unsent_checkpoint() {
     );
     assert_eq!(callback_calls.get(), 1);
     assert_eq!(sent.borrow().as_slice(), ["reply", "reply"]);
+}
+
+#[test]
+fn whatsapp_rejects_webhooks_for_a_different_phone_number_id() {
+    let WhatsAppHarness { mut channel, .. } = whatsapp_channel(1, VecDeque::new());
+    channel.start(&mut ()).expect("started");
+
+    assert_eq!(
+        channel.ingest_webhook(
+            br#"{"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"other-phone"},"messages":[{"from":"15550001","id":"one","type":"text","text":{"body":"question"}}]}}]}]}"#,
+            &mut (),
+        ),
+        Err(ChannelError::Protocol(ProtocolErrorKind::InvalidField))
+    );
+    assert_eq!(channel.queued_inbound(), 0);
+}
+
+#[test]
+fn whatsapp_retries_pending_a_before_b_without_rerunning_either_processor() {
+    let WhatsAppHarness {
+        mut channel, sent, ..
+    } = whatsapp_channel(1, VecDeque::from([Ok(500), Ok(500), Ok(200), Ok(200)]));
+    let access = token_credential("whatsapp", "graph.facebook.com", "whatsapp-secret");
+    let first =
+        br#"{"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"phone-id"},"messages":[
+        {"from":"15550001","id":"a","type":"text","text":{"body":"first"}},
+        {"from":"15550001","id":"b","type":"text","text":{"body":"second"}}
+    ]}}]}]}"#;
+    let reversed =
+        br#"{"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"phone-id"},"messages":[
+        {"from":"15550001","id":"b","type":"text","text":{"body":"second"}},
+        {"from":"15550001","id":"a","type":"text","text":{"body":"first"}}
+    ]}}]}]}"#;
+    let processed = RefCell::new(Vec::new());
+    channel.start(&mut ()).expect("started");
+
+    let mut process = |message: &InboundMessage| {
+        processed.borrow_mut().push(message.id.clone());
+        Ok(Some(format!("reply-{}", message.id)))
+    };
+    assert_eq!(
+        channel.handle_webhook(first, &access, &mut process, &mut ()),
+        Err(ChannelError::RemoteRejected { status: 500 })
+    );
+    assert_eq!(
+        channel.handle_webhook(reversed, &access, &mut process, &mut ()),
+        Err(ChannelError::RemoteRejected { status: 500 })
+    );
+    let completed = channel
+        .handle_webhook(reversed, &access, &mut process, &mut ())
+        .expect("both messages eventually complete");
+
+    assert_eq!(completed.processed, 2);
+    assert_eq!(processed.borrow().as_slice(), ["a", "b"]);
+    assert_eq!(
+        sent.borrow().as_slice(),
+        ["reply-a", "reply-a", "reply-a", "reply-b"]
+    );
+    let duplicate = channel
+        .handle_webhook(
+            reversed,
+            &access,
+            |_| panic!("an acknowledged A/B retry window must remain deduplicated"),
+            &mut (),
+        )
+        .expect("completed batch is acknowledged");
+    assert_eq!(duplicate.ingestion.ignored, 2);
+    assert_eq!(duplicate.processed, 0);
 }
 
 #[derive(Default)]
@@ -1088,6 +1317,35 @@ fn teams_activity_handler_preserves_auth_typing_edit_greeting_and_queue_contract
             state: ConnectionState::Closed
         })
     );
+}
+
+#[test]
+fn teams_strips_the_recipient_mention_before_command_routing() {
+    let mut handler = teams_handler(2);
+    let mut engine = Engine {
+        reply: "conversation reply".to_owned(),
+        ..Engine::default()
+    };
+    handler.start(&mut ()).expect("started");
+
+    assert_eq!(
+        handler.handle_activity(
+            br#"{"type":"message","text":"<at>GTA-Claw</at> /help","from":{"id":"user-id","role":"user"},"recipient":{"id":"bot-id"},"conversation":{"id":"teams-room"},"entities":[{"type":"mention","text":"<at>GTA-Claw</at>","mentioned":{"id":"bot-id","name":"GTA-Claw"}}]}"#,
+            Some(&mut engine),
+            AuthenticationPrompt::Unconfigured,
+            &mut (),
+        ),
+        Ok(TeamsActivityOutcome::ActionsQueued { count: 1 })
+    );
+    let TeamsAction::Reply(help) = handler
+        .poll_action()
+        .expect("running")
+        .expect("help response")
+    else {
+        panic!("recipient mention must route to help without typing");
+    };
+    assert!(help.contains("/help - "));
+    assert!(engine.calls.is_empty());
 }
 
 #[test]

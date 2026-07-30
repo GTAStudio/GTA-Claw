@@ -1964,12 +1964,20 @@ fn legacy_settings(snapshot: &ConfigSnapshot) -> Result<LegacySettings, Producti
             .ok_or_else(|| {
                 ProductionError::message("legacy-config", "WhatsApp access token is missing")
             })?;
+        let app_secret_reference = get(&["core", "channels", "whatsapp", "app_secret"])
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProductionError::message("legacy-config", "WhatsApp app secret is missing")
+            })?;
         let verify_reference = SecretRef::parse(verify_reference)
             .map_err(|error| ProductionError::message("legacy-config", error))?;
         let access_reference = SecretRef::parse(access_reference)
             .map_err(|error| ProductionError::message("legacy-config", error))?;
+        let app_secret_reference = SecretRef::parse(app_secret_reference)
+            .map_err(|error| ProductionError::message("legacy-config", error))?;
         let verify_token = resolve_secret(&verify_reference)?;
         let access_token = resolve_secret(&access_reference)?;
+        let app_secret = resolve_secret(&app_secret_reference)?;
         let path = get(&["core", "channels", "whatsapp", "webhook_path"])
             .and_then(Value::as_str)
             .ok_or_else(|| {
@@ -1981,8 +1989,13 @@ fn legacy_settings(snapshot: &ConfigSnapshot) -> Result<LegacySettings, Producti
                 ProductionError::message("legacy-config", "WhatsApp phone number id is missing")
             })?;
         Some(LegacyWhatsAppSettings {
-            route: LegacyWhatsAppConfig::new(path, verify_token.expose())
-                .map_err(|error| ProductionError::new("legacy-config", error))?,
+            route: LegacyWhatsAppConfig::new(
+                path,
+                verify_token.expose(),
+                app_secret.expose(),
+                phone_number_id,
+            )
+            .map_err(|error| ProductionError::new("legacy-config", error))?,
             access_token,
             phone_number_id: phone_number_id.to_owned(),
         })

@@ -62,6 +62,23 @@ impl Drop for TerminationGuard {
     }
 }
 
+struct DevicePromptGuard {
+    instructions: Arc<RwLock<Option<String>>>,
+    prompt: String,
+}
+
+impl Drop for DevicePromptGuard {
+    fn drop(&mut self) {
+        let mut instructions = self
+            .instructions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if instructions.as_deref() == Some(self.prompt.as_str()) {
+            *instructions = None;
+        }
+    }
+}
+
 /// Task accounting for Device Flow shutdown.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceTaskReport {
@@ -135,6 +152,10 @@ impl LegacyDeviceFlowAdapter {
             cancel.cancel();
         }
         let _ = self.flow.clear().await;
+        *self
+            .instructions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         let Ok(_single_flight) = tokio::time::timeout(budget, self.single_flight.lock()).await
         else {
             return DeviceTaskReport {
@@ -230,8 +251,14 @@ impl LegacyDeviceFlowPort for LegacyDeviceFlowAdapter {
             let activator = Arc::clone(&self.activator);
             let diagnostics = Arc::clone(&self.diagnostics);
             let terminated = Arc::clone(&self.terminated);
+            let task_instructions = Arc::clone(&self.instructions);
+            let task_prompt = instructions.clone();
             let task = tokio::spawn(async move {
                 let _guard = TerminationGuard(terminated);
+                let _prompt_guard = DevicePromptGuard {
+                    instructions: task_instructions,
+                    prompt: task_prompt,
+                };
                 match flow
                     .activate_with(&sdk_cancel, |token, cancel| async {
                         activator.activate(token, cancel).await.map_err(|error| {
@@ -1522,16 +1549,38 @@ fn invalid(message: impl Into<String>) -> PortError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, RwLock};
     use std::time::{Duration, Instant};
 
+    use claw_http_api::{LegacyDeviceFlowPort, PortError, PortFuture};
+    use claw_provider_sdk::clock::{Clock, FixedJitter, ManualClock};
+    use claw_provider_sdk::http::{HttpTransport, TlsPolicy, TransportConfig};
+    use claw_provider_sdk::origin::{Origin, OriginApproval};
+    use claw_provider_sdk::retry::RetryPolicy;
     use claw_provider_sdk::{CancelToken, SecretString};
-    use claw_providers::github_copilot::DeviceAuthorization;
+    use claw_providers::github_copilot::{DeviceAuthorization, DeviceFlow, DeviceFlowConfig};
+    use claw_providers::runtime::{ProviderRuntime, ReliabilityConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::sync::CancellationToken;
+    use url::Url;
 
     use super::{
-        CachedTeamsJwtKeys, LegacyDeviceFlowAdapter, TeamsRsaKey, WhatsAppRequestGuard,
-        cache_refreshed_teams_keys, official_origin, three_floats, valid_command_target,
+        CachedTeamsJwtKeys, DeviceTokenActivator, Diagnostics, LegacyDeviceFlowAdapter,
+        TeamsRsaKey, WhatsAppRequestGuard, cache_refreshed_teams_keys, official_origin,
+        three_floats, valid_command_target,
     };
+
+    struct UnexpectedActivator;
+
+    impl DeviceTokenActivator for UnexpectedActivator {
+        fn activate(
+            &self,
+            _token: SecretString,
+            _cancellation: CancelToken,
+        ) -> PortFuture<'_, Result<(), PortError>> {
+            Box::pin(async { panic!("an expired grant must not activate") })
+        }
+    }
 
     #[test]
     fn host_helpers_are_bounded_and_deterministic() {
@@ -1565,6 +1614,81 @@ mod tests {
         assert!(instructions.contains("ABCD-EFGH"));
         assert!(instructions.contains("https://github.com/login/device"));
         assert!(!instructions.contains("secret-device-code"));
+    }
+
+    #[tokio::test]
+    async fn expired_device_flow_clears_the_shared_channel_prompt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("device fixture binds");
+        let address = listener.local_addr().expect("device fixture address");
+        let response_body = r#"{"device_code":"secret-device-code","user_code":"ABCD-EFGH","verification_uri":"https://github.com/login/device","expires_in":1,"interval":1}"#;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("device request");
+            let mut request = [0_u8; 2048];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("device request body");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len(),
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("device response");
+        });
+        let endpoint = Url::parse(&format!("http://{address}/device")).expect("fixture URL");
+        let origin = Origin::of(&endpoint).expect("fixture origin");
+        let clock = Arc::new(ManualClock::new(0));
+        let runtime = ProviderRuntime::with_parts(
+            "github-copilot",
+            HttpTransport::with_config(&TransportConfig {
+                tls_policy: TlsPolicy::AllowLoopbackPlaintext,
+                ..TransportConfig::default()
+            })
+            .expect("device transport"),
+            ReliabilityConfig {
+                retry: RetryPolicy::never(),
+                ..ReliabilityConfig::default()
+            },
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            Arc::new(FixedJitter::new(1.0)),
+        );
+        let flow = DeviceFlow::new(DeviceFlowConfig {
+            client_id: "device-client".to_owned(),
+            scope: "copilot".to_owned(),
+            device_code_url: endpoint.clone(),
+            access_token_url: endpoint,
+            approved_origins: vec![OriginApproval::enroll(origin)],
+            reliability: ReliabilityConfig::default(),
+            request_timeout: Duration::from_secs(1),
+            max_wait: Duration::from_secs(5),
+        })
+        .expect("device flow")
+        .with_runtime(runtime);
+        let prompt = Arc::new(RwLock::new(None));
+        let adapter = LegacyDeviceFlowAdapter::new(
+            flow,
+            Arc::new(UnexpectedActivator),
+            Arc::clone(&prompt),
+            Arc::new(Diagnostics::new(16)),
+        );
+
+        let rendered =
+            LegacyDeviceFlowPort::instructions(adapter.as_ref(), CancellationToken::new())
+                .await
+                .expect("device instructions");
+        assert!(rendered.contains("ABCD-EFGH"));
+        let task = adapter.task.lock().await.take().expect("poll task");
+        task.await.expect("poll task completes");
+        server.await.expect("fixture completes");
+
+        assert!(
+            prompt.read().expect("prompt lock").is_none(),
+            "an expired authorization must not remain visible to channels"
+        );
     }
 
     #[test]
