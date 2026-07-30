@@ -62,13 +62,9 @@ async fn execute(arguments: Arguments) -> Result<(), String> {
         UpdateOutcome::Installed(version) => {
             println!("GTA Claw {version} installed successfully.");
         }
-        UpdateOutcome::RestartRequired {
-            version,
-            staged_path,
-        } => {
+        UpdateOutcome::RestartRequired { version } => {
             println!(
-                "GTA Claw {version} is verified at {}. Close the running application and run the updater again; elevation was not attempted.",
-                staged_path.display()
+                "GTA Claw {version} was not installed because the application is running. Close it and run the updater again; the rerun downloads and verifies the release again, and elevation was not attempted."
             );
         }
     }

@@ -5,7 +5,7 @@
 //! them again. Successful installs remove staging artifacts and obsolete
 //! anti-rollback floor files.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
@@ -46,20 +46,11 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use unicode_casefold::UnicodeCaseFold as _;
-use unicode_normalization::UnicodeNormalization as _;
 use url::{Host, Position, Url};
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PROXY_RESPONSE_HEAD_BYTES: usize = 32 * 1024;
 const MAX_CLOCK_SKEW_SECONDS: u64 = 5 * 60;
-const MAX_BUNDLE_FILES: usize = 4096;
-const MAX_BUNDLE_PATH_BYTES: usize = 1024;
-const MAX_BUNDLE_DEPTH: usize = 64;
-const MAX_BUNDLE_ENTRY_BYTES: usize = 256 * 1024 * 1024;
-const MAX_BUNDLE_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_BUNDLE_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const BUNDLE_MAGIC: &str = "gta-claw-bundle-v1";
 const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const STAGED_PART: &str = "artifact.part";
 const STAGED_VERIFIED: &str = "artifact.verified";
@@ -67,6 +58,9 @@ const RESUME_BINDING: &str = "artifact.resume.json";
 const SWAP_JOURNAL: &str = "swap-journal.json";
 const ROLLBACK_LOCK: &str = "release-floor.lock";
 const STAGE_LOCK: &str = "stage.lock";
+const DURABLE_MARKER: &str = ".gta-claw-durable";
+const QUARANTINE_PREFIX: &str = ".retired-backup-";
+const DURABLE_MARKER_CONTENTS: &[u8] = b"gta-claw-updater-durable-v1";
 
 trait UpdateIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -94,6 +88,24 @@ pub enum InjectedFault {
     FailNewStateDirectorySync,
     /// Fail the first parent sync after the installed target is renamed aside.
     FailParentSyncAfterSwap,
+    /// Stop the process once the target has been moved aside durably, before
+    /// the journal records the committed phase.
+    ExitAfterTargetMovedAside,
+    /// Stop the process once a recovery restore is durable, before its journal
+    /// is removed.
+    ExitAfterRecoveryRestore,
+    /// Fail the read-back of the installation this run just moved aside.
+    FailMovedAsideDigest,
+    /// Fail the parent sync that follows removing a failed replacement.
+    FailParentSyncDuringRollback,
+    /// Stop the process once the durability marker exists but is still empty.
+    ExitAfterEmptyDurabilityMarker,
+    /// Stop the process once a quarantine is journalled but nothing has moved.
+    ExitAfterQuarantinePlanned,
+    /// Stop the process once a quarantined object has moved but not been deleted.
+    ExitAfterQuarantineMoved,
+    /// Fail the identity re-check that publication depends on.
+    FailPublishedIdentity,
 }
 
 impl InjectedFault {
@@ -103,12 +115,23 @@ impl InjectedFault {
             Self::ExitAfterSwapCommitted => 2,
             Self::FailNewStateDirectorySync => 3,
             Self::FailParentSyncAfterSwap => 4,
+            Self::ExitAfterTargetMovedAside => 5,
+            Self::ExitAfterRecoveryRestore => 6,
+            Self::FailMovedAsideDigest => 8,
+            Self::FailParentSyncDuringRollback => 10,
+            Self::ExitAfterEmptyDurabilityMarker => 11,
+            Self::ExitAfterQuarantinePlanned => 12,
+            Self::ExitAfterQuarantineMoved => 13,
+            Self::FailPublishedIdentity => 14,
         }
     }
 }
 
 thread_local! {
     static ARMED_FAULT: Cell<u8> = const { Cell::new(0) };
+    static FAULT_SKIPS: Cell<u32> = const { Cell::new(0) };
+    /// Faults queued behind the armed one, consumed in order as each fires.
+    static FAULT_SCRIPT: RefCell<Vec<(u8, u32)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Arms one fault for the rest of this thread.
@@ -118,11 +141,77 @@ thread_local! {
 /// cannot reach another thread's run.
 #[doc(hidden)]
 pub fn arm_injected_fault(fault: InjectedFault) {
-    ARMED_FAULT.with(|armed| armed.set(fault.code()));
+    arm_injected_fault_after(fault, 0);
+}
+
+/// Arms one fault to fire only after `skips` earlier chances to fire.
+///
+/// A durability step that runs several times per call — confirming each level
+/// of a directory tree, say — needs the failure aimed at one specific
+/// occurrence. Without that, a fault on the first occurrence stops the run
+/// before the state a test is about to inspect has been created at all.
+#[doc(hidden)]
+pub fn arm_injected_fault_after(fault: InjectedFault, skips: u32) {
+    arm_injected_fault_script(&[(fault, skips)]);
+}
+
+/// Arms an ordered script of faults, each firing after its own skip count.
+///
+/// A single armed fault can only describe one crash. Recovery behaviour needs
+/// more: stop a run mid-move, let the next run get further, stop it again. The
+/// script advances as each entry fires, so one process can walk a sequence of
+/// boundaries in order instead of the test having to guess which call a lone
+/// counter will land on.
+#[doc(hidden)]
+pub fn arm_injected_fault_script(script: &[(InjectedFault, u32)]) {
+    let mut queued: Vec<(u8, u32)> = script
+        .iter()
+        .map(|(fault, skips)| (fault.code(), *skips))
+        .collect();
+    let (code, skips) = if queued.is_empty() {
+        (0, 0)
+    } else {
+        queued.remove(0)
+    };
+    ARMED_FAULT.with(|armed| armed.set(code));
+    FAULT_SKIPS.with(|remaining| remaining.set(skips));
+    FAULT_SCRIPT.with(|rest| rest.replace(queued));
+}
+
+/// Clears any fault, and any queued script, armed on this thread.
+#[doc(hidden)]
+pub fn disarm_injected_fault() {
+    ARMED_FAULT.with(|armed| armed.set(0));
+    FAULT_SKIPS.with(|remaining| remaining.set(0));
+    FAULT_SCRIPT.with(|rest| rest.borrow_mut().clear());
+}
+
+/// Moves to the next entry of an armed script once the current one has fired.
+fn advance_fault_script() {
+    let next = FAULT_SCRIPT.with(|rest| {
+        let mut rest = rest.borrow_mut();
+        if rest.is_empty() {
+            None
+        } else {
+            Some(rest.remove(0))
+        }
+    });
+    let (code, skips) = next.unwrap_or((0, 0));
+    ARMED_FAULT.with(|armed| armed.set(code));
+    FAULT_SKIPS.with(|remaining| remaining.set(skips));
 }
 
 fn fault_is_armed(fault: InjectedFault) -> bool {
-    ARMED_FAULT.with(Cell::get) == fault.code()
+    if ARMED_FAULT.with(Cell::get) != fault.code() {
+        return false;
+    }
+    let remaining = FAULT_SKIPS.with(Cell::get);
+    if remaining > 0 {
+        FAULT_SKIPS.with(|skips| skips.set(remaining - 1));
+        return false;
+    }
+    advance_fault_script();
+    true
 }
 
 /// Stops the process at `fault` when it is armed, leaving the disk exactly as
@@ -133,8 +222,75 @@ fn exit_at_armed_fault(fault: InjectedFault) {
     }
 }
 
+#[cfg(not(windows))]
 fn armed_fault_error(fault: InjectedFault) -> Option<io::Error> {
     fault_is_armed(fault).then(|| io::Error::other("injected updater durability fault"))
+}
+
+/// Runs blocking updater work on the blocking pool instead of the runtime thread.
+///
+/// Taking the staging or anti-rollback lock waits for whatever other updater run
+/// currently holds it, and on Windows that wait is a retry loop that can last
+/// minutes. Doing it inline would stall a current-thread runtime completely and
+/// starve a multi-thread one, so every lock-taking step is moved off the runtime.
+///
+/// An armed [`InjectedFault`] is thread-local, so it is carried over to the
+/// blocking thread explicitly; nothing else observes it.
+async fn run_off_runtime<T, F>(work: F) -> Result<T, UpdateError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, UpdateError> + Send + 'static,
+{
+    let armed = ARMED_FAULT.with(Cell::get);
+    let skips = FAULT_SKIPS.with(Cell::get);
+    let script = FAULT_SCRIPT.with(|rest| rest.borrow().clone());
+    tokio::task::spawn_blocking(move || {
+        ARMED_FAULT.with(|fault| fault.set(armed));
+        FAULT_SKIPS.with(|remaining| remaining.set(skips));
+        FAULT_SCRIPT.with(|rest| rest.replace(script));
+        work()
+    })
+    .await
+    .map_err(UpdateError::BlockingTask)?
+}
+
+/// Opens the staging directory, and waits for its lock, off the runtime thread.
+async fn open_staging_off_runtime(target: InstallTarget) -> Result<SecureStaging, UpdateError> {
+    run_off_runtime(move || SecureStaging::open(&target)).await
+}
+
+/// Refuses to run where the durability primitives this crate depends on are absent.
+///
+/// Every persistent decision the updater makes — the anti-rollback floor, the
+/// staging journal, the install swap — is only sound if a directory entry can be
+/// forced to disk before the next step depends on it. That needs a
+/// directory-metadata flush.
+///
+/// Windows has none reachable from here: `File::sync_all` on a directory handle
+/// is not a supported operation, and the volume flush that would substitute for
+/// it needs a raw handle and administrative rights. This crate's Windows
+/// directory syncs were therefore `Ok(())` — the ordering was never enforced,
+/// and every guarantee built on it was a claim rather than a fact.
+///
+/// Telling one filesystem object from another is blocked by the same wall:
+/// `MetadataExt::file_index`/`volume_serial_number` are unstable
+/// (`windows_by_handle`, rust-lang/rust#63010), the raw
+/// `GetFileInformationByHandle` call and handle-relative `NtCreateFile`
+/// operations need `unsafe`, which this workspace sets to `forbid` — a level a
+/// crate cannot override — and `--locked` builds rule out adding a wrapper.
+///
+/// So this refuses **before touching anything**: no anti-rollback floor is
+/// written or pruned, no staging directory is created, no target is moved.
+/// Refusing to start is the honest outcome; mutating state whose ordering
+/// cannot be enforced, and reporting it as durable, is not.
+///
+/// [`Updater::verify_manifest`] is unaffected: it only inspects bytes.
+const fn ensure_durable_platform() -> Result<(), UpdateError> {
+    if cfg!(windows) {
+        Err(UpdateError::PlatformDurabilityUnsupported)
+    } else {
+        Ok(())
+    }
 }
 
 /// Streaming scratch space kept on the heap.
@@ -230,6 +386,68 @@ struct SwapJournal {
     phase: SwapPhase,
     recovery_digest: String,
     original_digest: Option<String>,
+    /// Rollback object moved into staging and not yet resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quarantine: Option<Quarantine>,
+}
+
+/// An object this run is moving out of the install directory to delete it.
+///
+/// Written before the move, so a restart always knows what a leftover
+/// quarantined object is and where it belongs. Without it a restart would find
+/// an unexplained object under a name it invented and could only guess — and
+/// the only safe guess is never to delete.
+///
+/// The record names both endpoints and the phase, because the move has three
+/// observable outcomes and they are not distinguishable from the filesystem
+/// alone: nothing moved, both names present, or only the quarantine present.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Quarantine {
+    /// What the quarantine is for, which decides where a rejected object goes.
+    operation: QuarantineKind,
+    /// The name in the install directory the object was taken from.
+    source: String,
+    /// The name inside the private staging directory it was moved to.
+    destination: String,
+    /// The identity the object must still have to be deleted.
+    digest: String,
+    /// How far the move had got when this record was last written.
+    phase: QuarantinePhase,
+}
+
+/// Which object a quarantine is retiring.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum QuarantineKind {
+    /// The superseded installation, once the replacement is in place.
+    RetiredBackup,
+    /// A replacement this run placed and then had to withdraw.
+    WithdrawnInstall,
+}
+
+impl QuarantineKind {
+    /// Whether a quarantined object may be put back under the name it came from.
+    ///
+    /// A retired backup came from the rollback slot, where it is inert, so
+    /// putting it back is the safe outcome when it cannot be verified for
+    /// deletion. A withdrawn install came from the **target name**: restoring
+    /// it would republish the very replacement this run already decided not to
+    /// keep, as the live installation. It stays quarantined instead, where the
+    /// journal still describes it and a later run can identify it.
+    const fn may_return_to_source(self) -> bool {
+        matches!(self, Self::RetiredBackup)
+    }
+}
+
+/// How far a quarantine move had progressed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum QuarantinePhase {
+    /// The record is durable; the object is still under its source name.
+    Planned,
+    /// The object has been moved to the quarantine name.
+    Moved,
 }
 
 /// One signed update artifact.
@@ -368,25 +586,234 @@ impl InstallTarget {
     }
 }
 
-fn discard_backup(stage: &SecureStaging) -> Result<(), UpdateError> {
-    let retired = OsString::from(format!(".retired-backup-{}", unique_nonce()?));
-    stage
-        .parent
-        .rename_to(&stage.backup_name, &stage.directory, &retired)
-        .map_err(UpdateError::Io)?;
-    stage.directory.remove_entry_recursive(&retired)
+/// Retires the rollback object once the replacement is installed.
+///
+/// `original_digest` is the identity the run recorded before it moved the
+/// installation aside, and it is required: an object with no recorded identity
+/// was never this run's to retire. Deleting one that no longer matches would
+/// discard an installation this run never measured, so a mismatch is reported.
+fn discard_backup(
+    stage: &SecureStaging,
+    journal: &SwapJournal,
+    original_digest: &str,
+) -> Result<(), UpdateError> {
+    // Quarantine first, then verify. Hashing the object under its public name
+    // and deleting it afterwards leaves a window in which the thing that was
+    // measured is not the thing that is removed; moving it into the private
+    // staging directory first closes that window, because nothing outside this
+    // run knows the quarantine name and the staging directory is owner-only.
+    //
+    // The quarantine name and the identity it is expected to hold are journalled
+    // *before* the move, so a crash in the middle leaves a leftover that the
+    // next run can identify instead of guess at.
+    quarantine_and_delete(
+        stage,
+        journal,
+        QuarantineKind::RetiredBackup,
+        &stage.backup_name,
+        original_digest,
+    )
 }
 
-fn cleanup_retired_backups(stage: &SecureStaging) -> Result<(), UpdateError> {
+/// Resolves a rollback object an interrupted run had moved into staging.
+///
+/// A quarantined object is only ever removed when the journal says it is the
+/// recorded original *and* it still hashes to that identity; anything else goes
+/// back under the rollback name. A leftover with no journal entry describing it
+/// is not this run's to interpret, so it is reported rather than deleted: a
+/// blind sweep is exactly how an installation nobody can recover gets thrown
+/// away after a restart.
+fn resolve_quarantine(
+    stage: &SecureStaging,
+    quarantine: Option<&Quarantine>,
+) -> Result<(), UpdateError> {
+    // Any quarantined object the journal does not describe belongs to something
+    // this run cannot identify, so it is reported rather than swept.
+    let recorded = quarantine.map(|record| OsString::from(&record.destination));
     for name in stage.directory.list_names()? {
-        if name
-            .to_str()
-            .is_some_and(|name| name.starts_with(".retired-backup-"))
-        {
-            stage.directory.remove_entry_recursive(&name)?;
+        let Some(text) = name.to_str() else {
+            continue;
+        };
+        if text.starts_with(QUARANTINE_PREFIX) && recorded.as_deref() != Some(name.as_os_str()) {
+            return Err(UpdateError::SwapRecoveryConflict);
         }
     }
-    Ok(())
+
+    let Some(record) = quarantine else {
+        return Ok(());
+    };
+    let source = OsString::from(&record.source);
+    let destination = OsString::from(&record.destination);
+    let source_present = stage.parent.object_exists(&source)?;
+    let destination_present = stage.directory.object_exists(&destination)?;
+
+    match (record.phase, source_present, destination_present) {
+        // Recorded but never moved: the object is still where it started and
+        // nothing is owed. Deleting from here would be acting on a plan that
+        // never began.
+        (QuarantinePhase::Planned, true, false) => Ok(()),
+
+        // The move landed; the phase update did not. Finish the deletion the
+        // record describes, which re-verifies identity before removing anything.
+        (QuarantinePhase::Planned | QuarantinePhase::Moved, false, true) => {
+            finish_quarantine(
+                stage,
+                &destination,
+                &record.digest,
+                record.operation.may_return_to_source().then_some(&*source),
+            )
+        }
+
+        // Both names present. On a filesystem with an atomic no-replace rename
+        // this cannot arise from the move itself, so something else took the
+        // source name and the two objects cannot be told apart by role.
+        (_, true, true) => Err(UpdateError::SwapRecoveryConflict),
+
+        // Neither name present. The deletion completed and the source was never
+        // meant to come back, so there is nothing left to do — but only when the
+        // record says the move had actually happened. A `Planned` record with
+        // its source gone means the object vanished before this run touched it,
+        // which is not a state to call success.
+        (QuarantinePhase::Moved, false, false) => Ok(()),
+        (QuarantinePhase::Planned, false, false) => Err(UpdateError::SwapRecoveryConflict),
+
+        // Moved away, yet the source name is occupied again. Whatever is there
+        // cannot be the quarantined object — that one was moved out and, with
+        // the destination gone, deleted. So an independent object took the name
+        // while this run was interrupted.
+        //
+        // Reporting it matters more than it looks: recovery reads the rollback
+        // name straight after this, and a bare `Ok` would let that foreign
+        // object be measured and restored as the installation.
+        (QuarantinePhase::Moved, true, false) => Err(UpdateError::SwapRecoveryConflict),
+    }
+}
+
+/// Moves an object out of the install directory and deletes it, recoverably.
+///
+/// The record naming both endpoints, the identity and the phase is made durable
+/// *before* the move and updated after it, so a restart can tell "nothing moved"
+/// from "moved but not yet deleted" instead of inferring it from which names
+/// happen to exist.
+fn quarantine_and_delete(
+    stage: &SecureStaging,
+    journal: &SwapJournal,
+    operation: QuarantineKind,
+    source: &OsStr,
+    expected: &str,
+) -> Result<(), UpdateError> {
+    let destination = OsString::from(format!("{QUARANTINE_PREFIX}{}", unique_nonce()?));
+    let mut record = Quarantine {
+        operation,
+        source: source.to_string_lossy().into_owned(),
+        destination: destination.to_string_lossy().into_owned(),
+        digest: expected.to_owned(),
+        phase: QuarantinePhase::Planned,
+    };
+    let mut pending = journal.clone();
+    pending.quarantine = Some(record.clone());
+    stage
+        .directory
+        .write_json_atomic(OsStr::new(SWAP_JOURNAL), &pending)?;
+    exit_at_armed_fault(InjectedFault::ExitAfterQuarantinePlanned);
+
+    stage
+        .parent
+        .rename_to_new(source, &stage.directory, &destination)?;
+
+    record.phase = QuarantinePhase::Moved;
+    pending.quarantine = Some(record);
+    stage
+        .directory
+        .write_json_atomic(OsStr::new(SWAP_JOURNAL), &pending)?;
+    exit_at_armed_fault(InjectedFault::ExitAfterQuarantineMoved);
+
+    finish_quarantine(
+        stage,
+        &destination,
+        expected,
+        operation.may_return_to_source().then_some(source),
+    )
+}
+
+/// Deletes a quarantined object, but only while it is still the one measured.
+///
+/// The object is opened once and that handle is held across the digest and the
+/// unlink, and the directory entry is re-checked against it immediately before
+/// the unlink. Digesting a name and then deleting that name leaves a window in
+/// which the two are not the same object; holding the handle and re-verifying
+/// closes it as tightly as POSIX allows, since the unlink itself goes through
+/// the retained directory handle rather than a resolved path.
+///
+/// An object that fails any of those checks is put back under `restore_to`
+/// rather than left stranded in the private staging directory, where no later
+/// run would look for it.
+fn finish_quarantine(
+    stage: &SecureStaging,
+    retired: &OsStr,
+    expected: &str,
+    restore_to: Option<&OsStr>,
+) -> Result<(), UpdateError> {
+    let kept = match stage.directory.open_object(retired) {
+        Ok(object) => object,
+        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(restore_quarantined(stage, retired, restore_to, error)),
+    };
+    let measured = match kept.try_clone() {
+        Ok(handle) => handle,
+        Err(error) => {
+            return Err(restore_quarantined(
+                stage,
+                retired,
+                restore_to,
+                UpdateError::Io(error),
+            ));
+        }
+    };
+    let path = stage.directory.path.join(retired);
+    match object_digest_of(measured, &path) {
+        Ok(digest) if digest == expected => {}
+        Ok(_) => {
+            return Err(restore_quarantined(
+                stage,
+                retired,
+                restore_to,
+                UpdateError::SwapRecoveryConflict,
+            ));
+        }
+        Err(error) => return Err(restore_quarantined(stage, retired, restore_to, error)),
+    }
+
+    // Re-checked against the very handle that was digested, so the entry about
+    // to be unlinked is provably the object that was measured.
+    if let Err(error) = ensure_entry_identity(&stage.directory, retired, &kept) {
+        return Err(restore_quarantined(stage, retired, restore_to, error));
+    }
+    drop(kept);
+    stage.directory.remove_entry_recursive(retired)?;
+    stage.directory.sync().map_err(UpdateError::Io)
+}
+
+/// Puts a quarantined object back under the name it came from.
+fn restore_quarantined(
+    stage: &SecureStaging,
+    retired: &OsStr,
+    restore_to: Option<&OsStr>,
+    reason: UpdateError,
+) -> UpdateError {
+    // No name to go back to means the object must not become live again. It
+    // stays under its quarantine name, which the journal still records, so the
+    // next run can identify it instead of finding an unexplained object.
+    let Some(restore_to) = restore_to else {
+        return reason;
+    };
+    match stage
+        .directory
+        .rename_to_new(retired, &stage.parent, restore_to)
+    {
+        Ok(()) => reason,
+        Err(error) => error,
+    }
 }
 
 /// Result of a complete updater run.
@@ -398,12 +825,15 @@ pub enum UpdateOutcome {
     Current(Version),
     /// The update was installed atomically.
     Installed(Version),
-    /// Windows kept the target locked. The verified replacement remains staged.
+    /// The target was locked by a running process, so nothing was installed.
+    ///
+    /// No staging path is reported. Close the application and run the update
+    /// again: the rerun re-fetches and re-verifies the release from scratch,
+    /// because bytes left on disk across a restart are not trustworthy enough
+    /// to install from. See [`InstallOutcome::RestartRequired`].
     RestartRequired {
         /// New version.
         version: Version,
-        /// Locally derived verified staging path.
-        staged_path: PathBuf,
     },
 }
 
@@ -533,13 +963,17 @@ impl Updater {
     /// [`UpdateError::RevokedRelease`] for a withdrawn release,
     /// [`UpdateError::ArtifactUnavailable`] when no artifact matches this target
     /// triple, and [`UpdateError::CorruptState`],
-    /// [`UpdateError::UnsafeFilesystemObject`] or [`UpdateError::Io`] while
-    /// persisting the anti-rollback floor.
+    /// [`UpdateError::UnsafeFilesystemObject`],
+    /// [`UpdateError::BlockingTask`] or [`UpdateError::Io`] while persisting the
+    /// anti-rollback floor.
     pub async fn check(
         &self,
         manifest_url: &Url,
         current: &Version,
     ) -> Result<UpdateDecision, UpdateError> {
+        // Before the network, because accepting a manifest persists the
+        // anti-rollback floor and prunes older ones.
+        ensure_durable_platform()?;
         validate_network_url(manifest_url, self.allow_loopback_http)?;
         let response = self.get(manifest_url, None).await?;
         ensure_success(response.status())?;
@@ -549,7 +983,11 @@ impl Updater {
         )
         .await
         .map_err(|_| UpdateError::HttpTimeout)??;
-        self.check_manifest_bytes(&bytes, current)
+        // Accepting the manifest takes the anti-rollback lock, which waits on
+        // any other updater run holding it, so it is kept off the runtime thread.
+        let updater = self.clone();
+        let current = current.clone();
+        run_off_runtime(move || updater.check_manifest_bytes(&bytes, &current)).await
     }
 
     /// Verifies and accepts already-fetched manifest bytes before comparing versions.
@@ -568,6 +1006,7 @@ impl Updater {
         bytes: &[u8],
         current: &Version,
     ) -> Result<UpdateDecision, UpdateError> {
+        ensure_durable_platform()?;
         let (manifest, manifest_sha256) = self.verify_manifest_with_digest(bytes)?;
         let rollback_state = self.accept_manifest_with_digest(&manifest, &manifest_sha256)?;
         let available =
@@ -741,22 +1180,32 @@ impl Updater {
     /// [`Updater::verify_manifest`], [`UpdateError::SwapRecoveryConflict`] when
     /// an earlier interrupted swap cannot be resolved without overwriting an
     /// unknown object, and [`UpdateError::UnsafeFilesystemObject`],
-    /// [`UpdateError::CorruptState`] or [`UpdateError::Io`] for staging
-    /// failures. No elevation is attempted, so a read-only or foreign-owned
-    /// install directory surfaces as [`UpdateError::Io`].
+    /// [`UpdateError::CorruptState`], [`UpdateError::BlockingTask`] or
+    /// [`UpdateError::Io`] for staging failures. No elevation is attempted, so a
+    /// read-only or foreign-owned install directory surfaces as
+    /// [`UpdateError::Io`].
     pub async fn download(
         &self,
         update: &AvailableUpdate,
         target: &InstallTarget,
     ) -> Result<VerifiedArtifact, UpdateError> {
+        ensure_durable_platform()?;
+        // Refused before the staging directory exists, so an install shape this
+        // crate cannot publish never creates state it would have to clean up.
+        ensure_supported_install(target.mode)?;
         validate_update_binding(update)?;
         let artifact = &update.artifact;
         validate_artifact(artifact, self.allow_loopback_http)?;
         ensure_kind_matches(artifact.kind, target.mode)?;
         let url = Url::parse(&artifact.url).map_err(|_| UpdateError::InvalidArtifactUrl)?;
         validate_network_url(&url, self.allow_loopback_http)?;
-        let stage = Arc::new(SecureStaging::open(target)?);
-        recover_interrupted_swap(&stage)?;
+        let stage = Arc::new(open_staging_off_runtime(target.clone()).await?);
+        // Recovery reads, hashes and renames whole objects. That is blocking
+        // work, so it belongs on the blocking pool rather than on the caller's
+        // runtime thread, which a current-thread runtime needs to drive its own
+        // timers and every other task.
+        let recovering = Arc::clone(&stage);
+        run_off_runtime(move || recover_interrupted_swap(&recovering)).await?;
         let expected_binding = resume_binding(artifact, target);
         let binding_matches = match stage
             .directory
@@ -926,6 +1375,9 @@ impl Updater {
     /// changed size, digest, or filesystem identity after it was verified.
     /// [`UpdateError::InstallTargetMismatch`] means `target` is not the
     /// destination the staged bytes were verified for.
+    /// [`UpdateError::SwapRecoveryConflict`] means the object this run moved
+    /// aside is no longer the installation it measured, so something replaced
+    /// the target mid-swap; the previous installation is put back.
     /// [`UpdateError::RollbackManifest`], [`UpdateError::ReleaseSequenceConflict`]
     /// or [`UpdateError::RevokedRelease`] mean the persisted anti-rollback floor
     /// moved past this artifact — most benignly because another updater run
@@ -943,17 +1395,25 @@ impl Updater {
     /// underlying [`io::Error`] values.
     ///
     /// Also possible: [`UpdateError::InstallModeMismatch`],
-    /// [`UpdateError::InvalidBundle`] for a malformed or path-traversing macOS
-    /// bundle archive, [`UpdateError::SwapRecoveryConflict`],
-    /// [`UpdateError::CorruptState`], [`UpdateError::UnsafeFilesystemObject`]
-    /// and [`UpdateError::Io`]. A Windows sharing lock is not an error: it is
-    /// reported as an `Ok` value holding [`InstallOutcome::RestartRequired`],
-    /// with the verified bytes left staged.
+    /// [`UpdateError::BundleInstallUnsupported`] for a directory bundle, which
+    /// this crate refuses before staging anything,
+    /// [`UpdateError::SwapRecoveryConflict`],
+    /// [`UpdateError::CorruptState`], [`UpdateError::UnsafeFilesystemObject`],
+    /// [`UpdateError::BlockingTask`] and [`UpdateError::Io`]. A sharing lock is
+    /// not an error: it is reported as an `Ok` value holding
+    /// [`InstallOutcome::RestartRequired`], which names no staging path and
+    /// discards the verified staging, so the rerun downloads and verifies the
+    /// release again rather than installing bytes left behind on disk.
     pub async fn install(
         &self,
         verified: VerifiedArtifact,
         target: &InstallTarget,
     ) -> Result<InstallOutcome, UpdateError> {
+        ensure_durable_platform()?;
+        // Before the staging lock and before anything is measured: a bundle can
+        // never be published by this crate, so refusing here keeps the failure
+        // away from any state at all.
+        ensure_supported_install(target.mode)?;
         verified.stage.ensure_verified_destination(target)?;
         ensure_kind_matches(verified.kind, target.mode)?;
         let metadata = verified.file.metadata().map_err(UpdateError::Io)?;
@@ -967,31 +1427,28 @@ impl Updater {
             OsStr::new(STAGED_VERIFIED),
             &verified.file,
         )?;
-        let prepared = match verified.kind {
-            ArtifactKind::Executable => PreparedArtifact {
-                path: verified.path.clone(),
-                source_name: OsString::from(STAGED_VERIFIED),
-                handle: verified.file.try_clone().map_err(UpdateError::Io)?,
-                stage: Arc::clone(&verified.stage),
-                #[cfg(windows)]
+        let prepared = PreparedArtifact {
+            path: verified.path.clone(),
+            source_name: OsString::from(STAGED_VERIFIED),
+            handle: verified.file.try_clone().map_err(UpdateError::Io)?,
+            stage: Arc::clone(&verified.stage),
+            signed: SignedContent {
                 digest: verified.digest,
-                #[cfg(windows)]
                 size: verified.size,
             },
-            ArtifactKind::MacOsBundle => prepare_bundle(&verified).await?,
         };
-        let outcome = (|| {
-            let guard = self.lock_rollback_state()?;
-            authorize_install(&verified.authorization, &guard)?;
+        // The rollback lock and the swap are blocking filesystem work that waits
+        // on other updater runs, so they must not occupy the caller's runtime
+        // thread: a current-thread runtime would otherwise stop driving every
+        // other task, including its own timers, until the lock came free.
+        let updater = self.clone();
+        let authorization = verified.authorization.clone();
+        run_off_runtime(move || {
+            let guard = updater.lock_rollback_state()?;
+            authorize_install(&authorization, &guard)?;
             atomic_swap_verified(&prepared, cfg!(windows))
-        })();
-        if outcome.is_err() && verified.kind == ArtifactKind::MacOsBundle {
-            let _ = verified
-                .stage
-                .directory
-                .remove_entry_recursive(&prepared.source_name);
-        }
-        outcome
+        })
+        .await
     }
 
     /// Runs the full signed update flow.
@@ -1018,17 +1475,15 @@ impl Updater {
         if target.mode == InstallMode::LinuxPackage {
             return Ok(UpdateOutcome::SystemManaged);
         }
+        ensure_durable_platform()?;
         match self.check(manifest_url, current).await? {
             UpdateDecision::Current { version } => Ok(UpdateOutcome::Current(version)),
             UpdateDecision::Available { version, update } => {
                 let verified = self.download(&update, target).await?;
                 match self.install(verified, target).await? {
                     InstallOutcome::Installed => Ok(UpdateOutcome::Installed(version)),
-                    InstallOutcome::RestartRequired { staged_path } => {
-                        Ok(UpdateOutcome::RestartRequired {
-                            version,
-                            staged_path,
-                        })
+                    InstallOutcome::RestartRequired => {
+                        Ok(UpdateOutcome::RestartRequired { version })
                     }
                 }
             }
@@ -1304,14 +1759,69 @@ struct PreparedArtifact {
     source_name: OsString,
     handle: File,
     stage: Arc<SecureStaging>,
-    #[cfg(windows)]
+    /// What the signed release says this artifact must contain.
+    ///
+    /// Carried all the way to publication so the bytes can be re-checked
+    /// against the *signature*, not merely against themselves. Identity alone
+    /// is not enough: an attacker who can write through an existing descriptor
+    /// mutates the object in place, leaving the inode — and therefore every
+    /// identity check — unchanged while the content becomes something else.
+    signed: SignedContent,
+}
+
+/// The exact content a signed release authorises.
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// What the signed release says this artifact must contain.
+///
+/// Only single-file artifacts are installable, so this is always the signed
+/// bytes at the signed length. Both are checked: length alone is trivially
+/// forged, and a digest without a length lets a truncated read pass when the
+/// object is replaced mid-verification.
+struct SignedContent {
     digest: [u8; 32],
-    #[cfg(windows)]
     size: u64,
 }
 
+impl SignedContent {
+    /// Confirms the object behind `handle` still holds exactly this content.
+    ///
+    /// Read through the retained descriptor rather than by reopening a name, so
+    /// what is measured is the object this run owns.
+    #[cfg(not(windows))]
+    fn verify(&self, handle: &File) -> Result<(), UpdateError> {
+        let length = handle.metadata().map_err(UpdateError::Io)?.len();
+        if length != self.size || handle_content_digest(handle)? != self.digest {
+            return Err(UpdateError::StagedArtifactChanged);
+        }
+        Ok(())
+    }
+}
+
+/// Digests the bytes an open handle refers to, without reopening its name.
+#[cfg(not(windows))]
+fn handle_content_digest(handle: &File) -> Result<[u8; 32], UpdateError> {
+    let mut handle = handle.try_clone().map_err(UpdateError::Io)?;
+    handle.seek(SeekFrom::Start(0)).map_err(UpdateError::Io)?;
+    let mut digest = Sha256::new();
+    let mut buffer = stream_buffer();
+    loop {
+        let count = handle.read(&mut buffer).map_err(UpdateError::Io)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(digest.finalize().into())
+}
+
 impl VerifiedArtifact {
-    /// Returns the locally derived staging path.
+    /// Returns the locally derived staging path, for diagnostics only.
+    ///
+    /// This is a name, not a handle, and names are not identities: by the time
+    /// anything acts on it the path may resolve to a different object. Nothing
+    /// may be installed, verified or trusted on the strength of it — the
+    /// installation reads through the descriptor this artifact retains. It is
+    /// exposed for logs and error messages.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -1323,11 +1833,24 @@ impl VerifiedArtifact {
 pub enum InstallOutcome {
     /// Replacement completed.
     Installed,
-    /// A Windows lock prevented the swap; verified bytes remain staged.
-    RestartRequired {
-        /// Locally derived staging path.
-        staged_path: PathBuf,
-    },
+    /// A sharing lock prevented the swap, so nothing was installed.
+    ///
+    /// # The restart contract
+    ///
+    /// This outcome deliberately carries **no staging path**, and the verified
+    /// staging it would have named is discarded before it is returned.
+    ///
+    /// Naming a staged file to a caller invites exactly the attack the
+    /// signature checks exist to stop: the caller reports "restart to finish
+    /// installing from this path", and anything that can write that pathname
+    /// between the two runs chooses what gets installed. Re-verifying on the
+    /// second run does not help either, because a pathname is not an identity —
+    /// the object checked and the object installed need not be the same one.
+    ///
+    /// So a restart is not a resumption. The next run fetches the release
+    /// again, checks its signature, its size and its digest, and installs only
+    /// what it verified itself.
+    RestartRequired,
 }
 
 /// Explicit updater failures.
@@ -1428,12 +1951,28 @@ pub enum UpdateError {
     InstallModeMismatch,
     /// A verified artifact was offered for a destination it was not verified for.
     InstallTargetMismatch,
+    /// A blocking updater step could not be run to completion.
+    BlockingTask(tokio::task::JoinError),
+    /// This filesystem cannot claim a name without risking replacing it.
+    NoReplaceRenameUnsupported(io::Error),
+    /// This platform cannot provide the durability the updater depends on.
+    ///
+    /// Nothing was written, moved or pruned. Signature verification still
+    /// works; use a mechanism that has the guarantee — a platform installer or
+    /// a restart helper — to deliver the update itself.
+    PlatformDurabilityUnsupported,
     /// Staged bytes changed after verification.
     StagedArtifactChanged,
     /// An interrupted swap cannot be recovered without overwriting an unknown object.
     SwapRecoveryConflict,
-    /// Bundle archive was malformed or unsafe.
-    InvalidBundle,
+    /// Installing an expanded directory bundle is not supported.
+    ///
+    /// Publishing a tree needs guarantees this crate does not yet have: the
+    /// signed bytes must be hashed once and extracted from that same immutable
+    /// buffer, every nested directory must be made durable, and the tree digest
+    /// must distinguish shapes that a flat walk cannot. Nothing was written,
+    /// moved or pruned. Manifests describing bundles still verify.
+    BundleInstallUnsupported,
     /// Filesystem access failed. No elevation is attempted.
     Io(io::Error),
     /// New content could not be installed, but rollback restored the old target.
@@ -1521,13 +2060,20 @@ impl Display for UpdateError {
             Self::InstallTargetMismatch => {
                 formatter.write_str("verified artifact belongs to a different install target")
             }
+            Self::BlockingTask(_) => formatter.write_str("update filesystem step did not complete"),
+            Self::NoReplaceRenameUnsupported(_) => formatter
+                .write_str("this filesystem cannot install without risking an existing file"),
+            Self::PlatformDurabilityUnsupported => formatter
+                .write_str("this platform cannot store updater state safely; nothing was changed"),
             Self::StagedArtifactChanged => {
                 formatter.write_str("verified staged artifact changed before installation")
             }
             Self::SwapRecoveryConflict => {
                 formatter.write_str("interrupted update conflicts with an unknown local object")
             }
-            Self::InvalidBundle => formatter.write_str("macOS bundle archive is invalid"),
+            Self::BundleInstallUnsupported => {
+                formatter.write_str("this updater cannot install directory bundles safely")
+            }
             Self::Io(error) if error.kind() == io::ErrorKind::PermissionDenied => formatter
                 .write_str("update needs filesystem permission; elevation was not attempted"),
             Self::Io(_) => formatter.write_str("update filesystem operation failed"),
@@ -1547,9 +2093,10 @@ impl Error for UpdateError {
             Self::ManifestJson(error) => Some(error),
             Self::Http(error) => Some(error),
             Self::HttpsProtocol(error) => Some(error),
-            Self::HttpTask(error) => Some(error),
+            Self::HttpTask(error) | Self::BlockingTask(error) => Some(error),
             Self::HttpsIo(error)
             | Self::Io(error)
+            | Self::NoReplaceRenameUnsupported(error)
             | Self::InstallRolledBack(error)
             | Self::RollbackFailed { install: error, .. } => Some(error),
             _ => None,
@@ -1571,7 +2118,7 @@ struct SecureDirectory {
 impl SecureDirectory {
     fn open_or_create(path: &Path, owner_only: bool) -> Result<Self, UpdateError> {
         reject_reparse_components(path)?;
-        create_directory_tree_durable(path)?;
+        ensure_directory_tree_durable(path)?;
         #[cfg(unix)]
         {
             let directory = Self::open_existing(path, false)?;
@@ -1635,25 +2182,15 @@ impl SecureDirectory {
     }
 
     fn create_child(&self, name: &OsStr, owner_only: bool) -> Result<Self, UpdateError> {
-        self.create_child_reporting(name, owner_only)
-            .map(|(child, _)| child)
-    }
-
-    /// Creates `name` and reports whether this call is the one that created it.
-    fn create_child_reporting(
-        &self,
-        name: &OsStr,
-        owner_only: bool,
-    ) -> Result<(Self, bool), UpdateError> {
         validate_single_component(name)?;
         #[cfg(unix)]
         {
             let mode = rustix::fs::Mode::from_raw_mode(0o700);
-            let created = match rustix::fs::mkdirat(&*self.handle, name, mode) {
-                Ok(()) => true,
-                Err(rustix::io::Errno::EXIST) => false,
-                Err(error) => return Err(UpdateError::Io(rustix_error(error))),
-            };
+            if let Err(error) = rustix::fs::mkdirat(&*self.handle, name, mode)
+                && error != rustix::io::Errno::EXIST
+            {
+                return Err(UpdateError::Io(rustix_error(error)));
+            }
             let descriptor = rustix::fs::openat(
                 &*self.handle,
                 name,
@@ -1675,7 +2212,7 @@ impl SecureDirectory {
                     .map_err(UpdateError::Io)?;
             }
             child.validate_directory(owner_only)?;
-            Ok((child, created))
+            Ok(child)
         }
         #[cfg(windows)]
         {
@@ -1691,38 +2228,26 @@ impl SecureDirectory {
             if owner_only && created {
                 lock_down_windows_directory(&path)?;
             }
-            Self::open_existing(&path, owner_only).map(|child| (child, created))
+            Self::open_existing(&path, owner_only)
         }
     }
 
-    /// Creates an owner-only child and makes its directory entry durable.
+    /// Creates an owner-only child, and confirms its directory entry is durable.
     ///
-    /// Only the run that creates the child pays for the parent sync, so
-    /// repeated use of an existing state directory keeps its current cost.
+    /// Confirmation is recorded by a marker inside the child, for the same
+    /// reason [`ensure_directory_tree_durable`] does it: an unconfirmed
+    /// directory is indistinguishable from a confirmed one after a crash, so
+    /// "sync only when this call created it" would let a run build on an entry
+    /// that never reached the disk. With the marker, a run that finds no marker
+    /// syncs again, and no caller sees the child until the marker is durable.
     fn create_child_durable(&self, name: &OsStr) -> Result<Self, UpdateError> {
-        let (child, created) = self.create_child_reporting(name, true)?;
-        if created {
-            sync_new_directory_handle(&self.handle)?;
+        let child = self.create_child(name, true)?;
+        if directory_tree_is_confirmed(&child.path)? {
+            return Ok(child);
         }
+        sync_directory_handle(&self.handle)?;
+        record_directory_tree_confirmed(&child.path)?;
         Ok(child)
-    }
-
-    fn create_child_new(&self, name: &OsStr) -> Result<Self, UpdateError> {
-        validate_single_component(name)?;
-        #[cfg(unix)]
-        rustix::fs::mkdirat(&*self.handle, name, rustix::fs::Mode::from_raw_mode(0o700))
-            .map_err(rustix_error)
-            .map_err(UpdateError::Io)?;
-        #[cfg(windows)]
-        {
-            let path = self.path.join(name);
-            verify_windows_parent_not_shared(&self.path)?;
-            fs::create_dir(&path).map_err(UpdateError::Io)?;
-            lock_down_windows_directory(&path)?;
-            Self::open_existing(&path, true)
-        }
-        #[cfg(unix)]
-        self.create_child(name, true)
     }
 
     fn open_regular(&self, name: &OsStr, create_new: bool) -> Result<File, UpdateError> {
@@ -1777,24 +2302,6 @@ impl SecureDirectory {
         Ok(file)
     }
 
-    #[cfg(windows)]
-    fn create_exclusive_regular(&self, name: &OsStr) -> Result<File, UpdateError> {
-        validate_single_component(name)?;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .share_mode(0)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(self.path.join(name))
-            .map_err(UpdateError::Io)?;
-        let metadata = file.metadata().map_err(UpdateError::Io)?;
-        if !metadata.is_file() || is_windows_reparse(&metadata) {
-            return Err(UpdateError::UnsafeFilesystemObject);
-        }
-        Ok(file)
-    }
 
     fn lock_file(&self, name: &OsStr) -> Result<File, UpdateError> {
         validate_single_component(name)?;
@@ -1927,6 +2434,12 @@ impl SecureDirectory {
         result.map_err(UpdateError::Io)
     }
 
+    /// Renames, replacing the destination if it exists.
+    ///
+    /// Only for names inside this run's own owner-only staging directory, held
+    /// under the staging lock, where the object being replaced is this run's
+    /// own scratch state. Anything that claims a name another installation
+    /// could occupy must use [`SecureDirectory::rename_to_new`] instead.
     fn rename_to(
         &self,
         source_name: &OsStr,
@@ -1951,6 +2464,73 @@ impl SecureDirectory {
                 self.path.join(source_name),
                 destination.path.join(destination_name),
             )
+        }
+    }
+
+    /// Renames onto a destination name that must not already exist.
+    ///
+    /// Plain POSIX `rename` replaces the destination atomically, which is the
+    /// wrong operation every time this updater claims a slot it believes is
+    /// empty. An independent reinstall that appeared between the check and the
+    /// rename would be silently overwritten, and the swap journal would then
+    /// describe an installation nobody can recover. `renameat2`/`renameatx_np`
+    /// refuse instead, so the race surfaces as
+    /// [`UpdateError::SwapRecoveryConflict`] and the other installation is left
+    /// exactly as it is.
+    ///
+    /// A platform or filesystem with no no-replace rename is reported as
+    /// unsupported rather than served by a check-then-replace fallback, which
+    /// would reintroduce the race this exists to remove.
+    fn rename_to_new(
+        &self,
+        source_name: &OsStr,
+        destination: &Self,
+        destination_name: &OsStr,
+    ) -> Result<(), UpdateError> {
+        validate_single_component(source_name)?;
+        validate_single_component(destination_name)?;
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        ))]
+        {
+            match rustix::fs::renameat_with(
+                &*self.handle,
+                source_name,
+                &*destination.handle,
+                destination_name,
+                rustix::fs::RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => Ok(()),
+                Err(rustix::io::Errno::EXIST | rustix::io::Errno::NOTEMPTY) => {
+                    Err(UpdateError::SwapRecoveryConflict)
+                }
+                Err(
+                    error @ (rustix::io::Errno::NOSYS
+                    | rustix::io::Errno::INVAL
+                    | rustix::io::Errno::OPNOTSUPP),
+                ) => Err(UpdateError::NoReplaceRenameUnsupported(rustix_error(error))),
+                Err(error) => Err(UpdateError::Io(rustix_error(error))),
+            }
+        }
+        // Everything else, Windows included, has no atomic no-replace rename
+        // reachable from here: `fs::rename` maps to `MoveFileEx` *with*
+        // `REPLACE_EXISTING`, and the flag-free call needs `unsafe`. Reporting
+        // that is the whole point — a check-then-replace stand-in would
+        // reintroduce the race this exists to remove.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        {
+            let _ = destination;
+            Err(UpdateError::NoReplaceRenameUnsupported(io::Error::from(
+                io::ErrorKind::Unsupported,
+            )))
         }
     }
 
@@ -2126,6 +2706,12 @@ impl SecureStaging {
         let parent = SecureDirectory::open_existing(parent_path, false)?;
         let stage_name = OsString::from(format!(".{target_name}.gta-claw-stage"));
         let directory = parent.create_child(&stage_name, true)?;
+        // The swap journal lives *inside* this directory, so the directory's own
+        // entry has to reach the disk before anything is written into it.
+        // Otherwise a crash can lose the entry and take the journal with it,
+        // and the "journal before the target moves" ordering that all recovery
+        // depends on would be describing a directory that no longer exists.
+        parent.sync().map_err(UpdateError::Io)?;
         let lock = directory.lock_file(OsStr::new(STAGE_LOCK))?;
         Ok(Self {
             directory,
@@ -2160,27 +2746,59 @@ impl SecureStaging {
             .parent()
             .ok_or(UpdateError::InvalidInstallTarget)?;
         let parent = SecureDirectory::open_existing(parent_path, false)?;
-        if same_directory(&parent, &self.parent)? {
+        self.ensure_same_parent(&parent)
+    }
+
+    /// Confirms `candidate` is the directory this run's staging area lives in.
+    ///
+    /// Unix compares the identity of the two open directory objects, which no
+    /// path substitution can forge.
+    #[cfg(unix)]
+    fn ensure_same_parent(&self, candidate: &SecureDirectory) -> Result<(), UpdateError> {
+        if file_identity(&candidate.handle)? == file_identity(&self.parent.handle)? {
             Ok(())
         } else {
             Err(UpdateError::InstallTargetMismatch)
         }
     }
-}
 
-/// Reports whether two open handles name the same directory object.
-#[cfg(unix)]
-fn same_directory(left: &SecureDirectory, right: &SecureDirectory) -> Result<bool, UpdateError> {
-    Ok(file_identity(&left.handle)? == file_identity(&right.handle)?)
-}
-
-/// Windows has no stable per-handle identity on the stable toolchain, so the
-/// fully resolved paths of the two verified-and-open directories are compared.
-#[cfg(windows)]
-fn same_directory(left: &SecureDirectory, right: &SecureDirectory) -> Result<bool, UpdateError> {
-    let left = fs::canonicalize(&left.path).map_err(UpdateError::Io)?;
-    let right = fs::canonicalize(&right.path).map_err(UpdateError::Io)?;
-    Ok(left == right)
+    /// Confirms `candidate` is the directory this run's staging area lives in.
+    ///
+    /// # Platform limitation, stated plainly
+    ///
+    /// On Windows this is **not** an object-identity check and must not be
+    /// relied on as one. By-handle identity needs
+    /// `MetadataExt::file_index`/`volume_serial_number`, which are unstable
+    /// (`windows_by_handle`, rust-lang/rust#63010); the raw
+    /// `GetFileInformationByHandle` call needs `unsafe`, which this workspace
+    /// sets to `forbid` — a level a crate cannot override — and `--locked`
+    /// builds rule out adding a wrapper crate. Handle-relative directory
+    /// operations (`NtCreateFile` with a root directory handle) are unreachable
+    /// for the same reason, so the Windows arm of [`SecureDirectory`] resolves
+    /// names under a retained path. An earlier attempt to synthesise identity
+    /// from a held anchor file was removed because it was forgeable.
+    ///
+    /// What this therefore is: a check that rejects a *different* destination,
+    /// which is what a caller mistake looks like. It does not detect a parent
+    /// replaced under the same pathname.
+    ///
+    /// # Why the swap is still safe
+    ///
+    /// Nothing in the swap reads this argument. Every object the swap touches —
+    /// the staging directory, the target name, the rollback name — comes from
+    /// the [`SecureStaging`] built during [`Updater::download`] and held open
+    /// since, so a caller cannot redirect the installation whatever this check
+    /// answers. That is the property under test in
+    /// `the_swap_uses_only_the_staging_state_never_the_callers_path`, and it is
+    /// what carries the guarantee on Windows.
+    #[cfg(windows)]
+    fn ensure_same_parent(&self, candidate: &SecureDirectory) -> Result<(), UpdateError> {
+        if candidate.path == self.parent.path {
+            Ok(())
+        } else {
+            Err(UpdateError::InstallTargetMismatch)
+        }
+    }
 }
 
 fn resume_binding(artifact: &ReleaseArtifact, target: &InstallTarget) -> ResumeBinding {
@@ -2200,6 +2818,24 @@ fn file_identity(file: &File) -> Result<(u64, u64), UpdateError> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
+/// Confirms a directory entry still names the object behind `retained`.
+///
+/// There is no by-handle object identity on Windows reachable from stable Rust
+/// without `unsafe`, so this cannot be answered there. It refuses rather than
+/// approximating with a path comparison: every caller uses the answer to decide
+/// whether it may delete or replace something, and a wrong "yes" destroys an
+/// installation. The public API already refuses on that platform before any of
+/// these callers can run — see [`ensure_durable_platform`] — so this is a
+/// second, structural guard rather than the first line of defence.
+#[cfg(not(unix))]
+const fn ensure_entry_identity(
+    _directory: &SecureDirectory,
+    _name: &OsStr,
+    _retained: &File,
+) -> Result<(), UpdateError> {
+    Err(UpdateError::PlatformDurabilityUnsupported)
+}
+
 #[cfg(unix)]
 fn ensure_entry_identity(
     directory: &SecureDirectory,
@@ -2216,8 +2852,16 @@ fn ensure_entry_identity(
 
 fn object_digest(directory: &SecureDirectory, name: &OsStr) -> Result<String, UpdateError> {
     let object = directory.open_object(name)?;
+    object_digest_of(object, &directory.path.join(name))
+}
+
+/// Digests the object an already-open handle refers to.
+///
+/// Callers that must be sure they measured the same object they are about to
+/// act on hold the handle across both steps and use this.
+fn object_digest_of(object: File, path: &Path) -> Result<String, UpdateError> {
     let mut digest = Sha256::new();
-    update_object_digest(object, &directory.path.join(name), None, &mut digest)?;
+    update_object_digest(object, path, None, &mut digest)?;
     Ok(encode_hex(&digest.finalize()))
 }
 
@@ -2270,6 +2914,17 @@ fn update_object_digest(
         })
         .collect::<Result<Vec<_>, _>>()?;
     entries.sort_unstable();
+    // The child count is what makes the encoding unambiguous. Without it a
+    // directory's children run straight into whatever follows, so
+    // `{a: {b: file}}` and `{a: {}, b: file}` produce byte-for-byte identical
+    // input: the same digest for two different trees. Length-prefixed names
+    // alone do not separate them, because the ambiguity is in the *nesting*,
+    // not in where a name ends.
+    digest.update(
+        u64::try_from(entries.len())
+            .map_err(|_| UpdateError::StagedArtifactChanged)?
+            .to_be_bytes(),
+    );
     for entry in entries {
         let object = child.open_object(OsStr::new(&entry))?;
         update_object_digest(object, &child.path.join(&entry), Some(&entry), digest)?;
@@ -2289,7 +2944,6 @@ fn update_object_digest(
 /// [`UpdateError::SwapRecoveryConflict`] when the evidence does not identify
 /// what is on disk.
 fn recover_interrupted_swap(stage: &SecureStaging) -> Result<(), UpdateError> {
-    cleanup_retired_backups(stage)?;
     let journal = match stage
         .directory
         .read_json::<SwapJournal>(OsStr::new(SWAP_JOURNAL))
@@ -2298,14 +2952,23 @@ fn recover_interrupted_swap(stage: &SecureStaging) -> Result<(), UpdateError> {
         Err(UpdateError::CorruptState) => return Err(UpdateError::SwapRecoveryConflict),
         Err(error) => return Err(error),
     };
+    // Resolved against what the journal recorded, never by sweeping names, so a
+    // restart can tell its own leftovers from anything else.
+    resolve_quarantine(stage, journal.as_ref().and_then(|j| j.quarantine.as_ref()))?;
     let target_exists = stage.parent.object_exists(&stage.target_name)?;
     let backup_exists = stage.parent.object_exists(&stage.backup_name)?;
 
     let Some(journal) = journal else {
         return match (target_exists, backup_exists) {
             (_, false) => Ok(()),
-            (false, true) => restore_original(stage, None),
-            (true, true) => Err(UpdateError::SwapRecoveryConflict),
+            // A rollback object with no journal describing it was not put there
+            // by this updater: the journal is made durable *before* the target
+            // is moved aside, so every rollback object this crate creates has a
+            // record naming it and its identity. Measuring one now and adopting
+            // it would install an object of unknown provenance under the
+            // application's own name — the same mistake as sweeping an
+            // unjournalled quarantine, and unrecoverable once it is live.
+            (_, true) => Err(UpdateError::SwapRecoveryConflict),
         };
     };
     let has_original = journal.original_digest.is_some();
@@ -2316,24 +2979,42 @@ fn recover_interrupted_swap(stage: &SecureStaging) -> Result<(), UpdateError> {
         // the run had nothing to move aside and never filled the target slot.
         // The journal is all that is left to clean up.
         (SwapPhase::Prepared, true, false, _)
-        | (SwapPhase::Prepared | SwapPhase::Swapped, false, false, false) => discard_journal(stage),
+        | (SwapPhase::Prepared | SwapPhase::Swapped, false, false, false) => {
+            clear_journal_after_durable_parent(stage)
+        }
         // The target was moved aside, so the recorded original is the rollback
         // object. The phase may still read `Prepared` when the crash landed
         // between the rename and the phase update.
         (SwapPhase::Prepared | SwapPhase::Swapped, false, true, true) => {
-            restore_original(stage, journal.original_digest.as_deref())
+            restore_original(stage, &journal)
         }
-        (SwapPhase::Swapped, true, has_backup, _) => {
-            if object_digest(&stage.parent, &stage.target_name)? != journal.recovery_digest {
-                // The target slot belonged to the interrupted run, but it does
-                // not hold that run's replacement. Nothing here identifies the
-                // object, so it must not be deleted.
+        (SwapPhase::Swapped, true, has_backup, has_original) => {
+            // A run that found nothing at the target never created a rollback
+            // object, so one existing here belongs to something else and must
+            // not be retired, whatever the target holds.
+            if has_backup && !has_original {
                 return Err(UpdateError::SwapRecoveryConflict);
             }
-            if has_backup {
-                discard_backup(stage)?;
+            let installed = object_digest(&stage.parent, &stage.target_name)?;
+            if installed == journal.recovery_digest {
+                if has_backup {
+                    let Some(expected) = journal.original_digest.as_deref() else {
+                        return Err(UpdateError::SwapRecoveryConflict);
+                    };
+                    discard_backup(stage, &journal, expected)?;
+                }
+                return clear_journal_after_durable_parent(stage);
             }
-            discard_journal(stage)
+            // The target still holds the installation this run measured before
+            // it started, so the move aside never reached the disk even though
+            // the phase did. Nothing was replaced and nothing is pending.
+            if !has_backup && journal.original_digest.as_deref() == Some(installed.as_str()) {
+                return clear_journal_after_durable_parent(stage);
+            }
+            // The target slot belonged to the interrupted run, but it holds
+            // neither that run's replacement nor the installation it measured.
+            // Nothing here identifies the object, so it must not be deleted.
+            Err(UpdateError::SwapRecoveryConflict)
         }
         // Every remaining shape contradicts the journal: a rollback object the
         // run never created, an original that is gone with nothing to restore
@@ -2344,81 +3025,244 @@ fn recover_interrupted_swap(stage: &SecureStaging) -> Result<(), UpdateError> {
 
 /// Moves the rollback object back into the target slot, which must be empty.
 ///
-/// `original_digest` is the identity the interrupted run recorded before it
-/// moved the installation aside. An unjournalled backup has no recorded
-/// identity and is restored as-is, which is what the target slot lost.
-fn restore_original(
-    stage: &SecureStaging,
-    original_digest: Option<&str>,
-) -> Result<(), UpdateError> {
-    if let Some(expected) = original_digest
-        && object_digest(&stage.parent, &stage.backup_name)? != expected
-    {
+/// The identity checked is the journal's own `original_digest`: what the
+/// interrupted run recorded before it moved the installation aside. Taking it
+/// from the journal rather than an argument means a caller cannot ask for a
+/// restore verified against some other identity, and a record without one is
+/// refused rather than restored — an object this crate never measured must not
+/// be published under the application's own name.
+fn restore_original(stage: &SecureStaging, journal: &SwapJournal) -> Result<(), UpdateError> {
+    // Opened once and held across the whole restore. Digesting the object under
+    // its name, dropping the handle and then renaming that name would let a
+    // different object be restored than the one that was verified; keeping the
+    // descriptor lets the arrival be compared against the very object measured.
+    let kept = stage.parent.open_object(&stage.backup_name)?;
+    // A rollback object this run cannot verify is never put back. The journal is
+    // written before the target moves, so a record without an identity does not
+    // describe anything this crate moved aside, and restoring on that evidence
+    // would install an unmeasured object under the application's own name.
+    let Some(expected) = journal.original_digest.as_deref() else {
+        return Err(UpdateError::SwapRecoveryConflict);
+    };
+    let measured = kept.try_clone().map_err(UpdateError::Io)?;
+    let path = stage.parent.path.join(&stage.backup_name);
+    if object_digest_of(measured, &path)? != expected {
         return Err(UpdateError::SwapRecoveryConflict);
     }
-    stage
-        .parent
-        .rename_to(&stage.backup_name, &stage.parent, &stage.target_name)
-        .map_err(UpdateError::Io)?;
-    stage
-        .directory
-        .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
-    stage.parent.sync().map_err(UpdateError::Io)
+
+    // The target slot must still be empty. A reinstall that appeared while this
+    // recovery was deciding is an independent installation, and restoring over
+    // it would destroy it, so the conflict is reported instead.
+    stage.parent.rename_to_new(
+        &stage.backup_name,
+        &stage.parent,
+        &stage.target_name,
+    )?;
+
+    // What now occupies the target must be the object that was just verified,
+    // not something that raced into the name.
+    let restored = ensure_entry_identity(&stage.parent, &stage.target_name, &kept);
+    drop(kept);
+    restored?;
+
+    stage.parent.sync().map_err(UpdateError::Io)?;
+    exit_at_armed_fault(InjectedFault::ExitAfterRecoveryRestore);
+    retire_journal(stage)
 }
 
-fn discard_journal(stage: &SecureStaging) -> Result<(), UpdateError> {
-    stage
-        .directory
-        .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
-    stage.parent.sync().map_err(UpdateError::Io)
-}
-
-/// Creates `path` and every missing ancestor, making each new directory entry
-/// durable before the tree is reported as usable.
+/// Retires the swap journal once, and only once, the install directory is durable.
 ///
-/// Returns the directories this call created, shallowest first. Only newly
-/// created levels cost a sync, so reusing an existing state directory keeps the
-/// cost it already had.
-fn create_directory_tree_durable(path: &Path) -> Result<Vec<PathBuf>, UpdateError> {
-    let mut missing: Vec<PathBuf> = Vec::new();
-    let mut cursor = Some(path);
-    while let Some(current) = cursor {
-        match fs::symlink_metadata(current) {
-            Ok(metadata) if metadata.is_dir() => break,
-            Ok(_) => {
-                return Err(UpdateError::Io(io::Error::from(
-                    io::ErrorKind::AlreadyExists,
-                )));
-            }
+/// The journal is the only record of how to finish or undo an interrupted swap,
+/// so it may not be removed while the restored or completed installation could
+/// still be lost: the parent is synced first.
+fn clear_journal_after_durable_parent(stage: &SecureStaging) -> Result<(), UpdateError> {
+    stage.parent.sync().map_err(UpdateError::Io)?;
+    retire_journal(stage)
+}
+
+/// Removes the journal and makes that removal itself durable.
+///
+/// Without the staging sync a crash would resurrect a journal that no longer
+/// describes anything on disk, and the next run would try to recover a swap
+/// that has already been settled.
+fn retire_journal(stage: &SecureStaging) -> Result<(), UpdateError> {
+    stage
+        .directory
+        .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
+    stage.directory.sync().map_err(UpdateError::Io)
+}
+
+/// The directories [`ensure_directory_tree_durable`] confirms, shallowest first.
+///
+/// Only `Normal` components name a directory this updater can create or sync;
+/// a root or prefix component is part of the path but not a level of its own.
+fn state_tree_levels(path: &Path) -> Vec<PathBuf> {
+    let mut levels = Vec::new();
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if matches!(component, Component::Normal(_)) {
+            levels.push(current.clone());
+        }
+    }
+    levels
+}
+
+/// How many directory syncs confirming `path` performs before the marker's own.
+///
+/// Tests aim an injected sync failure at one specific occurrence, and counting
+/// path components by hand gets it wrong — `Path::components` yields a root or
+/// prefix component that is never synced. Deriving the number from the same
+/// function the implementation uses keeps the two from drifting apart.
+#[doc(hidden)]
+#[must_use]
+pub fn state_tree_sync_points(path: &Path) -> u32 {
+    u32::try_from(state_tree_levels(path).len()).unwrap_or(u32::MAX)
+}
+
+/// Creates `path` and every missing ancestor, and confirms the whole tree is
+/// durable before it is reported as usable.
+///
+/// The confirmation cannot be limited to the levels *this* call created. After
+/// a crash a directory whose entry never reached the disk is indistinguishable
+/// from one whose entry did, so a run that found a level present and skipped
+/// its sync would build on an entry that may not exist after the next power
+/// loss. Confirming every level on every run would fix that but would fsync
+/// directories the updater does not own, up to and including the filesystem
+/// root.
+///
+/// So the fact of confirmation is recorded instead: a marker file written and
+/// synced inside the deepest directory *after* every level's parent has been
+/// synced. Its presence is durable evidence that some run confirmed the whole
+/// chain, so later runs need only stat it. Its absence — including after a run
+/// whose sync failed — forces the full confirmation again. A level is never
+/// removed on failure, because a removal is exactly the step a crash can also
+/// lose.
+///
+/// Returns the directories this call created, shallowest first.
+fn ensure_directory_tree_durable(path: &Path) -> Result<Vec<PathBuf>, UpdateError> {
+    let levels = state_tree_levels(path);
+    let Some(deepest) = levels.last().cloned() else {
+        return Err(UpdateError::InvalidInstallTarget);
+    };
+
+    let mut created = Vec::new();
+    let mut confirmed = directory_tree_is_confirmed(&deepest)?;
+    for level in &levels {
+        // Existence is checked before creating: `create_dir` on an ancestor the
+        // updater does not own can report a permission failure instead of the
+        // "already there" it really means.
+        match fs::symlink_metadata(level) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(UpdateError::UnsafeFilesystemObject),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                missing.push(current.to_path_buf());
-                cursor = current
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty());
+                match fs::create_dir(level) {
+                    Ok(()) => {
+                        // A level that had to be created cannot have been part
+                        // of whatever an earlier run confirmed.
+                        confirmed = false;
+                        created.push(level.clone());
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(UpdateError::Io(error)),
+                }
             }
             Err(error) => return Err(UpdateError::Io(error)),
         }
     }
+    if confirmed {
+        return Ok(created);
+    }
 
-    let mut created = Vec::with_capacity(missing.len());
-    for directory in missing.iter().rev() {
-        match fs::create_dir(directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(UpdateError::Io(error)),
-        }
-        let parent = directory
+    for level in &levels {
+        let parent = level
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        sync_new_directory_path(parent)?;
-        created.push(directory.clone());
+        sync_directory_path(parent)?;
     }
+    record_directory_tree_confirmed(&deepest)?;
     Ok(created)
 }
 
+/// Reports whether some earlier run recorded this tree as fully confirmed.
+///
+/// Where directory entries cannot be flushed there is nothing a marker could
+/// honestly record, so confirmation is never claimed and the syncs — themselves
+/// no-ops there — are simply repeated. See [`sync_directory_path`].
+#[cfg(windows)]
+fn directory_tree_is_confirmed(_deepest: &Path) -> Result<bool, UpdateError> {
+    Ok(false)
+}
+
+/// Records, durably, that every level of this tree has been synced.
+#[cfg(windows)]
+fn record_directory_tree_confirmed(_deepest: &Path) -> Result<(), UpdateError> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn directory_tree_is_confirmed(deepest: &Path) -> Result<bool, UpdateError> {
+    let marker = deepest.join(DURABLE_MARKER);
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if !metadata.is_file() => Err(UpdateError::UnsafeFilesystemObject),
+        Ok(metadata) => {
+            if metadata.len() != DURABLE_MARKER_CONTENTS.len() as u64 {
+                return Ok(false);
+            }
+            match fs::read(&marker) {
+                Ok(contents) => Ok(contents == DURABLE_MARKER_CONTENTS),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(UpdateError::Io(error)),
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(UpdateError::Io(error)),
+    }
+}
+
+/// Records, durably, that every level of this tree has been synced.
+///
+/// The marker is published in two steps so that no intermediate state can be
+/// mistaken for confirmation. It is created **empty**, which
+/// [`directory_tree_is_confirmed`] reads as "not confirmed", and its directory
+/// entry is made durable while it is still empty. Only then are the contents
+/// written and synced. A crash or failure at any point therefore leaves either
+/// no marker or an empty one, and both mean unconfirmed — there is no window in
+/// which a marker that says "confirmed" exists without its own entry being
+/// durable.
+///
+/// This ordering is why a failed publication needs no retraction: the durable
+/// state it leaves behind is already the unconfirmed one. A retraction that
+/// itself failed could not be trusted, which is exactly the trap the previous
+/// write-then-retract shape fell into.
+#[cfg(not(windows))]
+fn record_directory_tree_confirmed(deepest: &Path) -> Result<(), UpdateError> {
+    let directory = SecureDirectory::open_existing(deepest, false)?;
+    let mut marker = match directory.open_regular(OsStr::new(DURABLE_MARKER), true) {
+        Ok(marker) => marker,
+        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // A leftover empty marker from an interrupted publication is
+            // reopened and finished, never assumed complete.
+            directory.open_regular(OsStr::new(DURABLE_MARKER), false)?
+        }
+        Err(error) => return Err(error),
+    };
+    // The empty marker's own entry becomes durable first. Until this succeeds
+    // the tree reads as unconfirmed no matter what happens next.
+    marker.sync_all().map_err(UpdateError::Io)?;
+    sync_directory_handle(&directory.handle)?;
+    exit_at_armed_fault(InjectedFault::ExitAfterEmptyDurabilityMarker);
+
+    marker.set_len(0).map_err(UpdateError::Io)?;
+    marker
+        .write_all(DURABLE_MARKER_CONTENTS)
+        .map_err(UpdateError::Io)?;
+    marker.sync_all().map_err(UpdateError::Io)
+}
+
 #[cfg(unix)]
-fn sync_new_directory_path(path: &Path) -> Result<(), UpdateError> {
+fn sync_directory_path(path: &Path) -> Result<(), UpdateError> {
     if let Some(error) = armed_fault_error(InjectedFault::FailNewStateDirectorySync) {
         return Err(UpdateError::Io(error));
     }
@@ -2434,25 +3278,35 @@ fn sync_new_directory_path(path: &Path) -> Result<(), UpdateError> {
     File::from(descriptor).sync_all().map_err(UpdateError::Io)
 }
 
-/// Windows exposes no directory sync primitive, so directory creation keeps the
-/// behaviour it already had there.
+/// Windows cannot flush a directory entry, so this confirms nothing.
+///
+/// `File::sync_all` on a directory handle is not a supported operation there,
+/// and the volume flush that would substitute for it needs a raw handle and
+/// administrative rights.
+///
+/// Nothing depends on it any more. Because no ordering can be enforced here,
+/// [`ensure_durable_platform`] refuses at every public entry point before any
+/// state is written, so on Windows this is never reached with work to do: no
+/// anti-rollback floor is created, accepted or pruned, nothing is staged, and
+/// no target is moved. It is kept, rather than deleted, so that the Windows
+/// build of [`SecureDirectory`] still type-checks against one shared
+/// implementation instead of a second path-based copy.
 #[cfg(windows)]
-fn sync_new_directory_path(_path: &Path) -> Result<(), UpdateError> {
+fn sync_directory_path(_path: &Path) -> Result<(), UpdateError> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn sync_new_directory_handle(handle: &File) -> Result<(), UpdateError> {
+fn sync_directory_handle(handle: &File) -> Result<(), UpdateError> {
     if let Some(error) = armed_fault_error(InjectedFault::FailNewStateDirectorySync) {
         return Err(UpdateError::Io(error));
     }
     handle.sync_all().map_err(UpdateError::Io)
 }
 
-/// Windows exposes no directory sync primitive, so directory creation keeps the
-/// behaviour it already had there.
+/// Windows cannot flush a directory entry; see [`sync_directory_path`].
 #[cfg(windows)]
-fn sync_new_directory_handle(_handle: &File) -> Result<(), UpdateError> {
+fn sync_directory_handle(_handle: &File) -> Result<(), UpdateError> {
     Ok(())
 }
 
@@ -3131,26 +3985,6 @@ async fn hash_handle(file: &File) -> Result<[u8; 32], UpdateError> {
     Ok(digest.finalize().into())
 }
 
-async fn read_handle_limited(file: &File, limit: u64) -> Result<Vec<u8>, UpdateError> {
-    let length = file.metadata().map_err(UpdateError::Io)?.len();
-    if length > limit {
-        return Err(UpdateError::InvalidBundle);
-    }
-    let mut file = tokio::fs::File::from_std(file.try_clone().map_err(UpdateError::Io)?);
-    file.seek(std::io::SeekFrom::Start(0))
-        .await
-        .map_err(UpdateError::Io)?;
-    let mut bytes =
-        Vec::with_capacity(usize::try_from(length).map_err(|_| UpdateError::InvalidBundle)?);
-    file.read_to_end(&mut bytes)
-        .await
-        .map_err(UpdateError::Io)?;
-    if u64::try_from(bytes.len()).map_err(|_| UpdateError::InvalidBundle)? != length {
-        return Err(UpdateError::StagedArtifactChanged);
-    }
-    Ok(bytes)
-}
-
 fn unique_nonce() -> Result<u128, UpdateError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3171,8 +4005,21 @@ fn sibling_path(target: &Path, suffix: &str) -> Result<PathBuf, UpdateError> {
     Ok(parent.join(format!(".{name}.gta-claw.{suffix}")))
 }
 
-const fn ensure_kind_matches(kind: ArtifactKind, mode: InstallMode) -> Result<(), UpdateError> {
-    if matches!(
+/// Refuses installs whose shape this crate cannot publish with its guarantees.
+///
+/// A directory bundle needs the signed archive hashed once and expanded from
+/// that same immutable buffer, every nested directory made durable, and a tree
+/// digest that separates shapes a flat walk conflates. None of that is in place,
+/// so the bundle is refused before anything is staged rather than published on
+/// weaker evidence than the executable path gets.
+const fn ensure_supported_install(mode: InstallMode) -> Result<(), UpdateError> {
+    match mode {
+        InstallMode::Executable | InstallMode::LinuxPackage => Ok(()),
+        InstallMode::MacOsBundle => Err(UpdateError::BundleInstallUnsupported),
+    }
+}
+
+const fn ensure_kind_matches(kind: ArtifactKind, mode: InstallMode) -> Result<(), UpdateError> {    if matches!(
         (kind, mode),
         (ArtifactKind::Executable, InstallMode::Executable)
             | (ArtifactKind::MacOsBundle, InstallMode::MacOsBundle)
@@ -3183,138 +4030,6 @@ const fn ensure_kind_matches(kind: ArtifactKind, mode: InstallMode) -> Result<()
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BundleArchive {
-    format: String,
-    files: Vec<BundleFile>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BundleFile {
-    path: String,
-    mode: u32,
-    contents: String,
-}
-
-async fn prepare_bundle(verified: &VerifiedArtifact) -> Result<PreparedArtifact, UpdateError> {
-    let archive = read_handle_limited(&verified.file, MAX_BUNDLE_ARCHIVE_BYTES).await?;
-    let archive: BundleArchive =
-        serde_json::from_slice(&archive).map_err(|_| UpdateError::InvalidBundle)?;
-    if archive.format != BUNDLE_MAGIC
-        || archive.files.is_empty()
-        || archive.files.len() > MAX_BUNDLE_FILES
-    {
-        return Err(UpdateError::InvalidBundle);
-    }
-    let prepared_name =
-        OsString::from(format!("bundle-{}-{}", std::process::id(), unique_nonce()?));
-    let prepared = verified.stage.directory.create_child_new(&prepared_name)?;
-    if let Err(error) = extract_bundle_files(archive.files, &prepared) {
-        let _ = verified
-            .stage
-            .directory
-            .remove_entry_recursive(&prepared_name);
-        return Err(error);
-    }
-    prepared.sync().map_err(UpdateError::Io)?;
-    Ok(PreparedArtifact {
-        path: prepared.path.clone(),
-        source_name: prepared_name,
-        handle: prepared.handle.try_clone().map_err(UpdateError::Io)?,
-        stage: Arc::clone(&verified.stage),
-        #[cfg(windows)]
-        digest: verified.digest,
-        #[cfg(windows)]
-        size: verified.size,
-    })
-}
-
-fn extract_bundle_files(
-    files: Vec<BundleFile>,
-    prepared: &SecureDirectory,
-) -> Result<(), UpdateError> {
-    let mut seen = BTreeSet::new();
-    let mut expanded = 0_u64;
-    for entry in files {
-        let relative = safe_relative_path(&entry.path)?;
-        let collision_key = bundle_collision_key(&entry.path);
-        if !seen.insert(collision_key) {
-            return Err(UpdateError::InvalidBundle);
-        }
-        let bytes = STANDARD
-            .decode(entry.contents.as_bytes())
-            .map_err(|_| UpdateError::InvalidBundle)?;
-        if bytes.len() > MAX_BUNDLE_ENTRY_BYTES {
-            return Err(UpdateError::InvalidBundle);
-        }
-        expanded = expanded
-            .checked_add(u64::try_from(bytes.len()).map_err(|_| UpdateError::InvalidBundle)?)
-            .ok_or(UpdateError::InvalidBundle)?;
-        if expanded > MAX_BUNDLE_EXPANDED_BYTES {
-            return Err(UpdateError::InvalidBundle);
-        }
-
-        let components: Vec<OsString> = relative
-            .components()
-            .map(|component| component.as_os_str().to_owned())
-            .collect();
-        let (file_name, directories) = components.split_last().ok_or(UpdateError::InvalidBundle)?;
-        let mut directory = prepared.clone();
-        for component in directories {
-            directory = directory.create_child(component, true)?;
-        }
-        let mut file = directory.open_regular(file_name, true)?;
-        file.write_all(&bytes).map_err(UpdateError::Io)?;
-        set_safe_mode(&file, entry.mode)?;
-        file.sync_all().map_err(UpdateError::Io)?;
-    }
-    Ok(())
-}
-
-fn bundle_collision_key(path: &str) -> String {
-    path.nfc().case_fold().nfc().collect()
-}
-
-fn safe_relative_path(value: &str) -> Result<PathBuf, UpdateError> {
-    if value.len() > MAX_BUNDLE_PATH_BYTES
-        || value.contains('\\')
-        || value.contains(':')
-        || value.contains('\0')
-        || value
-            .split('/')
-            .any(|component| component.is_empty() || component == "." || component == "..")
-    {
-        return Err(UpdateError::InvalidBundle);
-    }
-    let path = Path::new(value);
-    if path.as_os_str().is_empty() || path.is_absolute() {
-        return Err(UpdateError::InvalidBundle);
-    }
-    let components: Vec<_> = path.components().collect();
-    if components.len() > MAX_BUNDLE_DEPTH
-        || components
-            .iter()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(UpdateError::InvalidBundle);
-    }
-    Ok(path.to_owned())
-}
-
-#[cfg(unix)]
-fn set_safe_mode(file: &File, requested: u32) -> Result<(), UpdateError> {
-    let mode = requested & 0o777;
-    file.set_permissions(fs::Permissions::from_mode(mode))
-        .map_err(UpdateError::Io)
-}
-
-#[cfg(not(unix))]
-fn set_safe_mode(_file: &File, _requested: u32) -> Result<(), UpdateError> {
-    Ok(())
-}
-
 #[cfg(not(windows))]
 fn atomic_swap_verified(
     prepared: &PreparedArtifact,
@@ -3323,35 +4038,87 @@ fn atomic_swap_verified(
     let stage = &prepared.stage;
     recover_interrupted_swap(stage)?;
     ensure_entry_identity(&stage.directory, &prepared.source_name, &prepared.handle)?;
-    let recovery_digest = object_digest(&stage.directory, &prepared.source_name)?;
-    let Some(guard) = enter_swap(stage, recovery_digest, windows_lock_behavior)? else {
-        return Ok(InstallOutcome::RestartRequired {
-            staged_path: prepared.path.clone(),
-        });
-    };
-    let had_target = guard.had_target;
 
+    // Content, not just identity, immediately before publication. An attacker
+    // holding a descriptor on the staged object rewrites it in place: the inode
+    // never changes, so every identity check still passes while the bytes have
+    // become something the release never signed.
+    prepared
+        .signed
+        .verify(&prepared.handle)
+        .map_err(|_| UpdateError::StagedArtifactChanged)?;
+
+    let recovery_digest = object_digest(&stage.directory, &prepared.source_name)?;
+    // The ownership proof is duplicated before anything moves, so a failure to
+    // duplicate it cannot leave a placed object the guard does not own.
+    let placed_proof = prepared.handle.try_clone().map_err(UpdateError::Io)?;
+    let Some(guard) = enter_swap(stage, recovery_digest, windows_lock_behavior)? else {
+        // The target is locked, so nothing was installed. The verified staging
+        // is discarded here rather than kept for a second attempt: bytes that
+        // outlive this process are bytes something else can rewrite while no
+        // updater run holds the staging lock, and the next run must not install
+        // them on the strength of a check this run made. It re-downloads and
+        // re-verifies instead.
+        discard_verified_staging(stage)?;
+        return Ok(InstallOutcome::RestartRequired);
+    };
+
+    // The slot this run emptied must still be empty: an independent reinstall
+    // that arrived in between is somebody's working installation, not something
+    // to replace.
     if let Err(install) =
         stage
             .directory
-            .rename_to(&prepared.source_name, &stage.parent, &stage.target_name)
+            .rename_to_new(&prepared.source_name, &stage.parent, &stage.target_name)
     {
         return Err(guard.roll_back(install));
     }
-    stage.parent.sync().map_err(UpdateError::Io)?;
-    if let Err(identity_error) =
-        ensure_entry_identity(&stage.parent, &stage.target_name, &prepared.handle)
-    {
-        let install = io::Error::other(identity_error.to_string());
-        return Err(guard.roll_back(install));
+    guard.mark_target_placed(placed_proof);
+    // Destination first: the object must be reachable under its new name before
+    // the old name's removal becomes durable, or a crash between the two could
+    // leave it reachable from neither.
+    if let Err(error) = stage.parent.sync() {
+        return Err(guard.roll_back(UpdateError::Io(error)));
+    }
+    // Then the source. The rename removed an entry from the staging directory
+    // too, and until that removal is durable a crash can resurrect the staged
+    // name alongside the installed one, leaving two names for one object and a
+    // journal that describes neither.
+    if let Err(error) = stage.directory.sync() {
+        return Err(guard.roll_back(UpdateError::Io(error)));
+    }
+    let published = match armed_fault_error(InjectedFault::FailPublishedIdentity) {
+        Some(error) => Err(UpdateError::Io(error)),
+        None => ensure_entry_identity(&stage.parent, &stage.target_name, &prepared.handle),
+    };
+    if let Err(identity_error) = published {
+        return Err(guard.roll_back(identity_error));
     }
 
-    if had_target {
-        discard_backup(stage)?;
+    // And again immediately after publication, through the same retained
+    // descriptor. Between the two checks the object became reachable under the
+    // installed name, which is exactly the window in which an in-place rewrite
+    // would otherwise be published as if it were signed. Failing here rolls the
+    // previous installation back rather than leaving unsigned bytes installed.
+    if let Err(error) = prepared.signed.verify(&prepared.handle) {
+        return Err(guard.roll_back(error));
     }
-    stage
-        .directory
-        .remove_file_if_exists(&prepared.source_name)?;
+
+    complete_swap(stage, &prepared.source_name, &guard)
+}
+
+/// Removes the verified staging so a later run cannot install from it.
+///
+/// Used when an install stops without publishing anything. Everything the next
+/// run would otherwise resume from goes together: the verified artifact, the
+/// partial download and the resume binding that ties them to a release. Leaving
+/// any one behind would let a rerun skip the network and install bytes that sat
+/// on disk, unguarded by the staging lock, while this process was gone.
+///
+/// The removal is made durable before it is reported, so a crash cannot bring
+/// the discarded artifact back.
+#[cfg(not(windows))]
+fn discard_verified_staging(stage: &SecureStaging) -> Result<(), UpdateError> {
     stage
         .directory
         .remove_file_if_exists(OsStr::new(STAGED_VERIFIED))?;
@@ -3361,127 +4128,103 @@ fn atomic_swap_verified(
     stage
         .directory
         .remove_file_if_exists(OsStr::new(RESUME_BINDING))?;
+    stage.directory.sync().map_err(UpdateError::Io)
+}
+
+/// Retires the rollback object and staging artifacts of a completed swap.
+///
+/// The journal outlives every other artifact and is removed last, only once the
+/// installed target and the retired rollback object are durable.
+#[cfg(not(windows))]
+fn complete_swap(
+    stage: &SecureStaging,
+    source_name: &OsStr,
+    guard: &SwapGuard<'_>,
+) -> Result<InstallOutcome, UpdateError> {
+    if guard.had_target {
+        let Some(expected) = guard.original_digest.as_deref() else {
+            return Err(UpdateError::SwapRecoveryConflict);
+        };
+        discard_backup(stage, &guard.journal.borrow(), expected)?;
+    }
+    stage.directory.remove_file_if_exists(source_name)?;
     stage
         .directory
-        .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
-    stage.parent.sync().map_err(UpdateError::Io)?;
-    stage.directory.sync().map_err(UpdateError::Io)?;
+        .remove_file_if_exists(OsStr::new(STAGED_VERIFIED))?;
+    stage
+        .directory
+        .remove_file_if_exists(OsStr::new(STAGED_PART))?;
+    stage
+        .directory
+        .remove_file_if_exists(OsStr::new(RESUME_BINDING))?;
+    clear_journal_after_durable_parent(stage)?;
     Ok(InstallOutcome::Installed)
 }
 
+/// Refuses to swap on a platform whose durability primitives are unavailable.
+///
+/// # Why Windows fails closed instead of installing
+///
+/// Every guarantee the swap makes rests on ordering two things against a crash:
+/// a journal must reach the disk *before* an object moves, and a moved object
+/// must reach the disk *before* the journal describing it is retired. Enforcing
+/// that needs a directory-metadata flush, and none is reachable here —
+/// `File::sync_all` on a directory handle is not a supported operation on
+/// Windows, and the volume-level flush that would substitute for it needs a raw
+/// handle and administrative rights. The previous shape returned `Ok(())` from
+/// every directory sync, which meant the ordering was never enforced and the
+/// code claimed a durability it did not provide.
+///
+/// The same wall blocks the other half. Telling one filesystem object from
+/// another needs `MetadataExt::file_index`/`volume_serial_number`, which are
+/// unstable (`windows_by_handle`, rust-lang/rust#63010); the raw
+/// `GetFileInformationByHandle` call and handle-relative `NtCreateFile`
+/// operations need `unsafe`, which this workspace sets to `forbid` — a level a
+/// crate cannot override — and `--locked` builds rule out adding a wrapper
+/// crate. Without object identity, every recovery decision would have to be
+/// made by re-resolving a pathname, which is exactly what a replaced parent or
+/// a changed working directory redirects.
+///
+/// Layering more path-based recovery on those two gaps produces machinery that
+/// cannot be shown correct. So this refuses, and
+/// [`UpdateError::PlatformDurabilityUnsupported`] tells the caller to complete
+/// the replacement through a mechanism that does have the guarantees, such as a
+/// platform installer or a restart helper.
+///
+/// In practice no Windows caller reaches this: [`ensure_durable_platform`]
+/// already refuses at every public entry point, before the network and before
+/// any state, staging or target is touched. This is the second line of that
+/// defence, so that removing the boundary check cannot silently re-enable a
+/// swap whose ordering nothing enforces.
 #[cfg(windows)]
 fn atomic_swap_verified(
     prepared: &PreparedArtifact,
-    windows_lock_behavior: bool,
+    _windows_lock_behavior: bool,
 ) -> Result<InstallOutcome, UpdateError> {
-    let stage = &prepared.stage;
-    recover_interrupted_swap(stage)?;
-    let recovery_digest = file_object_digest(&prepared.handle)?;
-    let Some(guard) = enter_swap(stage, recovery_digest, windows_lock_behavior)? else {
-        return Ok(InstallOutcome::RestartRequired {
-            staged_path: prepared.path.clone(),
-        });
-    };
-    let had_target = guard.had_target;
-
-    let install_result = (|| {
-        let mut destination = stage.parent.create_exclusive_regular(&stage.target_name)?;
-        copy_verified_handle(
-            &prepared.handle,
-            &mut destination,
-            prepared.size,
-            prepared.digest,
-        )?;
-        destination.sync_all().map_err(UpdateError::Io)
-    })();
-    if let Err(error) = install_result {
-        let install = io::Error::other(error.to_string());
-        return Err(guard.roll_back(install));
-    }
-    stage.parent.sync().map_err(UpdateError::Io)?;
-
-    if had_target {
-        discard_backup(stage)?;
-    }
-    stage
-        .directory
-        .remove_file_if_exists(&prepared.source_name)?;
-    stage
-        .directory
-        .remove_file_if_exists(OsStr::new(STAGED_VERIFIED))?;
-    stage
-        .directory
-        .remove_file_if_exists(OsStr::new(STAGED_PART))?;
-    stage
-        .directory
-        .remove_file_if_exists(OsStr::new(RESUME_BINDING))?;
-    stage
-        .directory
-        .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
-    stage.parent.sync().map_err(UpdateError::Io)?;
-    stage.directory.sync().map_err(UpdateError::Io)?;
-    Ok(InstallOutcome::Installed)
+    let _ = &prepared.stage;
+    Err(UpdateError::PlatformDurabilityUnsupported)
 }
 
-#[cfg(windows)]
-fn copy_verified_handle(
-    source: &File,
-    destination: &mut File,
-    expected_size: u64,
-    expected_digest: [u8; 32],
-) -> Result<(), UpdateError> {
-    let mut source = source.try_clone().map_err(UpdateError::Io)?;
-    source.seek(SeekFrom::Start(0)).map_err(UpdateError::Io)?;
-    destination.set_len(0).map_err(UpdateError::Io)?;
-    destination
-        .seek(SeekFrom::Start(0))
-        .map_err(UpdateError::Io)?;
-    let mut digest = Sha256::new();
-    let mut written = 0_u64;
-    let mut buffer = stream_buffer();
-    loop {
-        let count = source.read(&mut buffer).map_err(UpdateError::Io)?;
-        if count == 0 {
-            break;
-        }
-        written = written
-            .checked_add(u64::try_from(count).map_err(|_| UpdateError::StagedArtifactChanged)?)
-            .ok_or(UpdateError::StagedArtifactChanged)?;
-        if written > expected_size {
-            return Err(UpdateError::StagedArtifactChanged);
-        }
-        digest.update(&buffer[..count]);
-        destination
-            .write_all(&buffer[..count])
-            .map_err(UpdateError::Io)?;
+/// Reads the identity of whatever currently occupies the target name.
+///
+/// Both the existence probe and the digest can hit a sharing violation on
+/// Windows, so they are done together and the error is left typed for the
+/// caller to classify.
+#[cfg(not(windows))]
+fn measure_existing_target(stage: &SecureStaging) -> Result<Option<String>, UpdateError> {
+    if !stage.parent.object_exists(&stage.target_name)? {
+        return Ok(None);
     }
-    let actual_digest: [u8; 32] = digest.finalize().into();
-    if written != expected_size || actual_digest != expected_digest {
-        return Err(UpdateError::StagedArtifactChanged);
-    }
-    Ok(())
+    object_digest(&stage.parent, &stage.target_name).map(Some)
 }
 
-#[cfg(windows)]
-fn file_object_digest(file: &File) -> Result<String, UpdateError> {
-    let mut file = file.try_clone().map_err(UpdateError::Io)?;
-    let metadata = file.metadata().map_err(UpdateError::Io)?;
-    if !metadata.is_file() {
-        return Err(UpdateError::UnsafeFilesystemObject);
+/// Reports whether an updater error is a Windows sharing violation underneath.
+#[cfg(not(windows))]
+fn is_sharing_violation_error(error: &UpdateError) -> bool {
+    match error {
+        UpdateError::Io(error) => is_windows_sharing_violation(error),
+        _ => false,
     }
-    let mut digest = Sha256::new();
-    digest.update(b"file");
-    digest.update(metadata.len().to_be_bytes());
-    file.seek(SeekFrom::Start(0)).map_err(UpdateError::Io)?;
-    let mut buffer = stream_buffer();
-    loop {
-        let count = file.read(&mut buffer).map_err(UpdateError::Io)?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    Ok(encode_hex(&digest.finalize()))
 }
 
 /// Journals the swap, moves any installed target aside, and returns the guard
@@ -3492,21 +4235,33 @@ fn file_object_digest(file: &File) -> Result<String, UpdateError> {
 /// recovery needs to tell an untouched previous install from a target slot this
 /// run already owns. `Ok(None)` means a Windows sharing lock kept the current
 /// target in place and nothing was journalled or moved.
+#[cfg(not(windows))]
 fn enter_swap(
     stage: &SecureStaging,
     recovery_digest: String,
     windows_lock_behavior: bool,
 ) -> Result<Option<SwapGuard<'_>>, UpdateError> {
-    let original_digest = if stage.parent.object_exists(&stage.target_name)? {
-        Some(object_digest(&stage.parent, &stage.target_name)?)
-    } else {
-        None
+    // Discovery happens before anything is written. A running installation on
+    // Windows refuses to be opened for reading, and that is the ordinary
+    // "close the app and try again" case, not a failure: it has to surface as
+    // `RestartRequired` *here*, while the journal does not yet exist and
+    // nothing on disk has been touched. Journalling first and discovering the
+    // lock afterwards would leave a journal describing a swap that never began.
+    let original_digest = match measure_existing_target(stage) {
+        Ok(digest) => digest,
+        Err(error) => {
+            if windows_lock_behavior && is_sharing_violation_error(&error) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
     };
     let had_target = original_digest.is_some();
     let mut journal = SwapJournal {
         phase: SwapPhase::Prepared,
         recovery_digest,
-        original_digest,
+        original_digest: original_digest.clone(),
+        quarantine: None,
     };
     stage
         .directory
@@ -3514,93 +4269,284 @@ fn enter_swap(
     exit_at_armed_fault(InjectedFault::ExitAfterSwapPrepared);
 
     if had_target
-        && let Err(error) =
-            stage
-                .parent
-                .rename_to(&stage.target_name, &stage.parent, &stage.backup_name)
+        && let Err(error) = stage.parent.rename_to_new(
+            &stage.target_name,
+            &stage.parent,
+            &stage.backup_name,
+        )
     {
         stage
             .directory
             .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
-        if windows_lock_behavior && is_windows_sharing_violation(&error) {
+        stage.directory.sync().map_err(UpdateError::Io)?;
+        if windows_lock_behavior && is_sharing_violation_error(&error) {
             return Ok(None);
         }
-        return Err(UpdateError::Io(error));
+        return Err(error);
     }
 
-    let guard = SwapGuard { stage, had_target };
+    let guard = SwapGuard {
+        stage,
+        had_target,
+        original_digest,
+        journal: RefCell::new(journal.clone()),
+        placed: RefCell::new(None),
+    };
+
+    // The committed phase asserts that the target slot belongs to this run, so
+    // the rename that made it so has to be durable first. Recording the phase
+    // ahead of the sync would let a crash leave a journal claiming a move the
+    // filesystem never kept.
+    if let Some(error) = armed_fault_error(InjectedFault::FailParentSyncAfterSwap) {
+        return Err(guard.roll_back(UpdateError::Io(error)));
+    }
+    if let Err(error) = stage.parent.sync() {
+        return Err(guard.roll_back(UpdateError::Io(error)));
+    }
+    exit_at_armed_fault(InjectedFault::ExitAfterTargetMovedAside);
+
+    // The object now in the rollback slot must be the installation that was
+    // measured, or something replaced the target between the measurement and
+    // the rename. Completing the swap would then retire an install this run
+    // never saw, so the previous state is put back instead. Every outcome here,
+    // including a failure to read the object at all, runs through the guard:
+    // the target slot is empty at this point, so nothing may return without it.
+    if let Some(expected) = guard.original_digest.as_deref() {
+        let moved = match armed_fault_error(InjectedFault::FailMovedAsideDigest) {
+            Some(error) => Err(UpdateError::Io(error)),
+            None => object_digest(&stage.parent, &stage.backup_name),
+        };
+        match moved {
+            Ok(moved) if moved == expected => {}
+            Ok(_) => {
+                // Something replaced the installation between the measurement
+                // and the rename: a conflict, not an I/O fault.
+                return Err(guard.roll_back(UpdateError::SwapRecoveryConflict));
+            }
+            Err(error) => {
+                return Err(guard.roll_back(error));
+            }
+        }
+    }
+
     journal.phase = SwapPhase::Swapped;
     if let Err(error) = stage
         .directory
         .write_json_atomic(OsStr::new(SWAP_JOURNAL), &journal)
     {
-        return Err(guard.roll_back(io::Error::other(error.to_string())));
+        return Err(guard.roll_back(error));
     }
+    // The guard writes further records on top of whatever is on disk, so it has
+    // to hold the record that is actually there. Keeping the `Prepared` clone
+    // would make the next write revert the phase, and recovery would then read
+    // a journal claiming the target had never been moved aside.
+    guard.adopt_journal(journal);
     exit_at_armed_fault(InjectedFault::ExitAfterSwapCommitted);
-
-    if let Some(error) = armed_fault_error(InjectedFault::FailParentSyncAfterSwap) {
-        return Err(guard.roll_back(error));
-    }
-    if let Err(error) = stage.parent.sync() {
-        return Err(guard.roll_back(error));
-    }
     Ok(Some(guard))
+}
+
+/// Proof that this run is the one that put the object now at the target name there.
+///
+/// Rollback removes a partially installed object only while this proof still
+/// holds, so a failure can never delete an installation the run did not create.
+#[cfg(not(windows))]
+#[derive(Debug)]
+struct PlacedTarget {
+    handle: File,
+}
+
+#[cfg(not(windows))]
+impl PlacedTarget {
+    /// Reports whether the object at the target name is still the one this run placed.
+    ///
+    /// Compares the identity of the retained open file against the entry the
+    /// name resolves to now, so a replacement is visible as a different object
+    /// rather than as an equal path. Platforms without by-handle identity
+    /// cannot answer and refuse; see [`ensure_entry_identity`].
+    fn is_still_owned(&self, stage: &SecureStaging) -> Result<bool, UpdateError> {
+        match ensure_entry_identity(&stage.parent, &stage.target_name, &self.handle) {
+            Ok(()) => Ok(true),
+            Err(UpdateError::StagedArtifactChanged) => Ok(false),
+            Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+
+    /// The identity the owned object has right now, measured through the
+    /// handle that owns it.
+    ///
+    /// Taken with the ownership handle still open, so it describes the object
+    /// this run placed rather than whatever a name resolves to later. It is
+    /// computed with the same routine that re-verifies the object after it has
+    /// been quarantined, so the two are directly comparable.
+    fn owned_identity(&self, path: &Path) -> Result<String, UpdateError> {
+        let handle = self.handle.try_clone().map_err(UpdateError::Io)?;
+        object_digest_of(handle, path)
+    }
 }
 
 /// Restores the previous installation when a step after the target was moved
 /// aside fails, so no failure path can return with the target missing.
+#[cfg(not(windows))]
 struct SwapGuard<'stage> {
     stage: &'stage SecureStaging,
     had_target: bool,
+    original_digest: Option<String>,
+    journal: RefCell<SwapJournal>,
+    placed: RefCell<Option<PlacedTarget>>,
 }
 
+#[cfg(not(windows))]
 impl SwapGuard<'_> {
-    fn roll_back(&self, install: io::Error) -> UpdateError {
-        rollback_secure_swap(self.stage, self.had_target, install)
+    /// Replaces the guard's record with the one now on disk.
+    ///
+    /// Every later write derives from this, so it must never lag behind the
+    /// journal the filesystem actually holds.
+    fn adopt_journal(&self, journal: SwapJournal) {
+        self.journal.replace(journal);
+    }
+
+    /// Takes ownership of the object this run has just put at the target name.
+    ///
+    /// This is called with the handle the creating call returned, before any
+    /// content is written through it, so the guard owns the object from the
+    /// moment it exists.
+    fn mark_target_placed(&self, handle: File) {
+        self.placed.replace(Some(PlacedTarget { handle }));
+    }
+
+    fn roll_back(&self, install: UpdateError) -> UpdateError {
+        let placed = self.placed.borrow_mut().take();
+        rollback_secure_swap(
+            self.stage,
+            self.had_target,
+            &self.journal.borrow(),
+            placed,
+            install,
+        )
     }
 }
 
 /// Puts the previous installation back and reports why the swap was undone.
 ///
+/// An object this run placed at the target is removed, and that removal is made
+/// durable, before the journal is cleared, so a fresh install that failed midway
+/// never leaves a truncated executable a later run would take for a complete
+/// one. An object that is no longer the one this run placed is left alone and
+/// reported as [`UpdateError::SwapRecoveryConflict`].
+///
 /// The returned error is always a failure: [`UpdateError::InstallRolledBack`]
 /// when the previous installation is in place again,
 /// [`UpdateError::RollbackFailed`] when it could not be restored, and the
 /// underlying filesystem error when the rollback itself could not run.
+#[cfg(not(windows))]
 fn rollback_secure_swap(
     stage: &SecureStaging,
     had_target: bool,
-    install: io::Error,
+    journal: &SwapJournal,
+    placed: Option<PlacedTarget>,
+    install: UpdateError,
 ) -> UpdateError {
-    if !had_target {
-        if let Err(error) = stage
-            .directory
-            .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))
-        {
+    // Removing the failed replacement and restoring the previous installation
+    // are separate obligations. A durability failure in the first must not skip
+    // the second: the target being empty is the state this whole guard exists to
+    // avoid, so a restore is always attempted and any deferred failure is
+    // reported only once the installation is back.
+    let mut deferred: Option<UpdateError> = None;
+    if let Some(placed) = placed
+        && let Err(error) = remove_placed_target(stage, journal, placed)
+    {
+        if !had_target {
             return error;
         }
-        return UpdateError::Io(install);
+        deferred = Some(error);
     }
-    if let Err(error) = stage.parent.remove_entry_recursive(&stage.target_name) {
-        return error;
+
+    if !had_target {
+        if let Err(error) = clear_journal_after_durable_parent(stage) {
+            return error;
+        }
+        return install;
     }
-    match stage
-        .parent
-        .rename_to(&stage.backup_name, &stage.parent, &stage.target_name)
-    {
+
+    match stage.parent.rename_to_new(
+        &stage.backup_name,
+        &stage.parent,
+        &stage.target_name,
+    ) {
         Ok(()) => {
-            if let Err(error) = stage
-                .directory
-                .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))
-            {
+            // The installation is back, so the journal no longer describes
+            // anything pending and must not outlive this run: a journal left
+            // behind here would make the next run try to recover a swap that is
+            // already settled, against a target it can no longer explain. It is
+            // cleared even when a durability failure is already owed, and only
+            // then is that failure reported.
+            let settled = clear_journal_after_durable_parent(stage);
+            if let Some(deferred) = deferred {
+                return deferred;
+            }
+            if let Err(error) = settled {
                 return error;
             }
-            if let Err(error) = stage.parent.sync() {
-                return UpdateError::Io(error);
+            // A cause that already has a type keeps it: flattening
+            // `SwapRecoveryConflict` or `NoReplaceRenameUnsupported` into a
+            // string would tell the caller "the install failed" while hiding
+            // *which* failure it was, and those two carry different guidance.
+            // `InstallRolledBack` is for causes that are genuinely just I/O.
+            match install {
+                UpdateError::Io(install) => UpdateError::InstallRolledBack(install),
+                typed => typed,
             }
-            UpdateError::InstallRolledBack(install)
         }
-        Err(rollback) => UpdateError::RollbackFailed { install, rollback },
+        Err(restore) => match (install, restore) {
+            (UpdateError::Io(install), UpdateError::Io(rollback)) => {
+                UpdateError::RollbackFailed { install, rollback }
+            }
+            // The restore failing is the more serious of the two, so its type
+            // is the one that survives when both cannot be represented.
+            (_, restore) => restore,
+        },
     }
+}
+
+/// Removes the object this run placed, keeping the ownership proof until it is gone.
+///
+/// The handle is never released before the name is mutated on a platform where
+/// releasing it would let something else take the name: Unix unlinks through the
+/// retained directory handle while still holding the file handle, so the entry
+/// that goes is the entry this run owns. Windows cannot unlink a name held with
+/// no sharing, so the object is first truncated through the owning handle and
+/// then atomically moved into the private staging directory, where it is
+/// re-verified as this run's before being deleted. Either way nothing is
+/// deleted by pathname after ownership has been given up.
+#[cfg(not(windows))]
+fn remove_placed_target(
+    stage: &SecureStaging,
+    journal: &SwapJournal,
+    placed: PlacedTarget,
+) -> Result<(), UpdateError> {
+    if !placed.is_still_owned(stage)? {
+        return Err(UpdateError::SwapRecoveryConflict);
+    }
+    // Measured through the ownership handle, so it describes the object this run
+    // placed rather than whatever the name resolves to later. The handle stays
+    // open across the move so the object that arrives can be compared against
+    // it directly.
+    let expected = placed.owned_identity(&stage.parent.path.join(&stage.target_name))?;
+    drop(placed);
+
+    quarantine_and_delete(
+        stage,
+        journal,
+        QuarantineKind::WithdrawnInstall,
+        &stage.target_name,
+        &expected,
+    )?;
+    if let Some(error) = armed_fault_error(InjectedFault::FailParentSyncDuringRollback) {
+        return Err(UpdateError::Io(error));
+    }
+    stage.parent.sync().map_err(UpdateError::Io)
 }
 
 #[cfg(test)]
@@ -3624,9 +4570,7 @@ fn atomic_swap(
     let had_target = operations.exists(target);
     if had_target && let Err(error) = operations.rename(target, &backup) {
         if windows_lock_behavior && is_windows_sharing_violation(&error) {
-            return Ok(InstallOutcome::RestartRequired {
-                staged_path: staged.to_owned(),
-            });
+            return Ok(InstallOutcome::RestartRequired);
         }
         return Err(UpdateError::Io(error));
     }
@@ -3651,10 +4595,10 @@ fn is_windows_sharing_violation(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod unit_tests {
-    #[cfg(windows)]
-    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Barrier, Mutex, mpsc};
+    #[cfg(not(windows))]
+    use std::sync::{Barrier, mpsc};
 
     use rustls::ServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -3694,6 +4638,17 @@ mod unit_tests {
     impl Drop for UnitTestDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// A journal with no pending records, for tests that only need the identity.
+    #[cfg(not(windows))]
+    fn plain_journal(recovery: &[u8], original: Option<&[u8]>) -> SwapJournal {
+        SwapJournal {
+            phase: SwapPhase::Swapped,
+            recovery_digest: encode_hex(&Sha256::digest(recovery)),
+            original_digest: original.map(|bytes| encode_hex(&Sha256::digest(bytes))),
+            quarantine: None,
         }
     }
 
@@ -3942,6 +4897,8 @@ mod unit_tests {
         );
     }
 
+    // The swap only exists where its durability primitives do.
+    #[cfg(not(windows))]
     #[test]
     fn real_filesystem_commit_and_crash_recovery_preserve_object_identity() {
         let directory = UnitTestDir::new("real-commit");
@@ -3963,10 +4920,10 @@ mod unit_tests {
             source_name: OsString::from(STAGED_VERIFIED),
             handle: staged,
             stage: Arc::clone(&stage),
-            #[cfg(windows)]
-            digest: Sha256::digest(b"new executable").into(),
-            #[cfg(windows)]
-            size: 14,
+            signed: SignedContent {
+                digest: Sha256::digest(b"new executable").into(),
+                size: u64::try_from(b"new executable".len()).expect("small executable"),
+            },
         };
 
         let outcome = atomic_swap_verified(&prepared, false).expect("real commit succeeds");
@@ -3989,9 +4946,6 @@ mod unit_tests {
         next.write_all(b"third executable")
             .expect("write next executable");
         next.sync_all().expect("sync next executable");
-        #[cfg(windows)]
-        let recovery_digest = file_object_digest(&next).expect("staged digest");
-        #[cfg(not(windows))]
         let recovery_digest =
             object_digest(&stage.directory, OsStr::new(STAGED_VERIFIED)).expect("staged digest");
         let original_digest =
@@ -4004,6 +4958,7 @@ mod unit_tests {
                     phase: SwapPhase::Swapped,
                     recovery_digest,
                     original_digest: Some(original_digest),
+                    quarantine: None,
                 },
             )
             .expect("write swap journal");
@@ -4032,6 +4987,7 @@ mod unit_tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn real_filesystem_rollback_removes_failed_object_and_restores_backup() {
         let directory = UnitTestDir::new("real-rollback");
@@ -4052,12 +5008,13 @@ mod unit_tests {
             .write_all(b"untrusted replacement")
             .expect("write failed replacement");
         failed.sync_all().expect("sync failed replacement");
-        drop(failed);
 
         let error = rollback_secure_swap(
             &stage,
             true,
-            io::Error::other("simulated real rename failure"),
+            &plain_journal(b"a replacement", Some(b"previous")),
+            Some(PlacedTarget { handle: failed }),
+            UpdateError::Io(io::Error::other("simulated real rename failure")),
         );
         assert_eq!(
             error.to_string(),
@@ -4075,6 +5032,132 @@ mod unit_tests {
         );
     }
 
+    /// A rollback object nobody journalled must never become the installation.
+    ///
+    /// The journal is made durable before the target is moved aside, so every
+    /// rollback object this crate creates has a record naming it. One without a
+    /// record came from somewhere else, and adopting it would publish an object
+    /// of unknown provenance under the application's own name.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_rollback_object_with_no_journal_is_never_adopted_as_the_installation() {
+        let directory = UnitTestDir::new("unjournalled-backup");
+        let target_path = directory.path.join("gta-claw");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        let rollback_path = directory.path.join(".gta-claw.gta-claw.rollback");
+        fs::write(&rollback_path, b"an object nobody journalled").expect("write rollback object");
+
+        let error = recover_interrupted_swap(&stage)
+            .expect_err("an unjournalled rollback object is not this run's to publish");
+
+        assert_eq!(
+            error.to_string(),
+            "interrupted update conflicts with an unknown local object"
+        );
+        assert_eq!(
+            fs::read(&rollback_path).expect("the object is left exactly where it was"),
+            b"an object nobody journalled"
+        );
+        assert!(
+            !target_path.exists(),
+            "a conflict must never install the unidentified object"
+        );
+    }
+
+    /// A withdrawn replacement stays quarantined instead of going back live.
+    ///
+    /// Its quarantine source *is* the target name, so putting it back would
+    /// republish the very object the run already decided not to keep.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_withdrawn_install_is_never_returned_to_the_target_name() {
+        let directory = UnitTestDir::new("withdrawn-quarantine");
+        let target_path = directory.path.join("gta-claw");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        let retired = OsString::from(format!("{QUARANTINE_PREFIX}91"));
+        let mut quarantined = stage
+            .directory
+            .open_regular(&retired, true)
+            .expect("create quarantined object");
+        quarantined
+            .write_all(b"the withdrawn replacement")
+            .expect("write quarantined object");
+        quarantined.sync_all().expect("sync quarantined object");
+        drop(quarantined);
+        stage
+            .directory
+            .write_json_atomic(
+                OsStr::new(SWAP_JOURNAL),
+                &SwapJournal {
+                    phase: SwapPhase::Swapped,
+                    recovery_digest: encode_hex(&Sha256::digest(b"a replacement")),
+                    original_digest: Some(encode_hex(&Sha256::digest(b"the original"))),
+                    quarantine: Some(Quarantine {
+                        operation: QuarantineKind::WithdrawnInstall,
+                        source: stage.target_name.to_string_lossy().into_owned(),
+                        // Recorded identity deliberately does not match what is
+                        // on disk, which is what drives the restore path.
+                        digest: encode_hex(&Sha256::digest(b"something else")),
+                        destination: retired.to_string_lossy().into_owned(),
+                        phase: QuarantinePhase::Moved,
+                    }),
+                },
+            )
+            .expect("write swap journal");
+
+        let error = recover_interrupted_swap(&stage)
+            .expect_err("a withdrawn install that cannot be verified is not deleted either");
+
+        assert_eq!(
+            error.to_string(),
+            "interrupted update conflicts with an unknown local object"
+        );
+        assert!(
+            !target_path.exists(),
+            "a withdrawn replacement must never be restored as the live installation"
+        );
+        assert!(
+            stage
+                .directory
+                .object_exists(&retired)
+                .expect("quarantine state"),
+            "it stays quarantined, where the journal still describes it"
+        );
+    }
+
+    /// Two trees a flat walk cannot tell apart must not share a digest.
+    #[cfg(not(windows))]
+    #[test]
+    fn nested_and_sibling_trees_of_the_same_names_digest_differently() {
+        let directory = UnitTestDir::new("tree-digest");
+        // `nested/a/b` is a file inside a directory; `sibling/a` is an empty
+        // directory with `sibling/b` beside it. Same names, same contents, and
+        // without a child count the two walks emit identical bytes.
+        let nested = directory.path.join("nested");
+        fs::create_dir(&nested).expect("create nested root");
+        fs::create_dir(nested.join("a")).expect("create nested child");
+        fs::write(nested.join("a").join("b"), b"").expect("write nested leaf");
+
+        let sibling = directory.path.join("sibling");
+        fs::create_dir(&sibling).expect("create sibling root");
+        fs::create_dir(sibling.join("a")).expect("create sibling directory");
+        fs::write(sibling.join("b"), b"").expect("write sibling leaf");
+
+        let root = SecureDirectory::open_existing(&directory.path, false).expect("open root");
+        let nested_digest = object_digest(&root, OsStr::new("nested")).expect("nested digest");
+        let sibling_digest = object_digest(&root, OsStr::new("sibling")).expect("sibling digest");
+
+        assert_ne!(
+            nested_digest, sibling_digest,
+            "a tree digest that conflates nesting with siblings cannot detect a swapped tree"
+        );
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn fresh_install_recovery_refuses_to_delete_an_unidentified_target() {
         let directory = UnitTestDir::new("fresh-crash");
@@ -4090,9 +5173,6 @@ mod unit_tests {
             .write_all(b"complete replacement")
             .expect("write staged executable");
         staged.sync_all().expect("sync staged executable");
-        #[cfg(windows)]
-        let recovery_digest = file_object_digest(&staged).expect("staged digest");
-        #[cfg(not(windows))]
         let recovery_digest =
             object_digest(&stage.directory, OsStr::new(STAGED_VERIFIED)).expect("staged digest");
         stage
@@ -4103,6 +5183,7 @@ mod unit_tests {
                     phase: SwapPhase::Swapped,
                     recovery_digest,
                     original_digest: None,
+                    quarantine: None,
                 },
             )
             .expect("write swap journal");
@@ -4135,6 +5216,7 @@ mod unit_tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn recovery_before_the_swap_keeps_the_installation_it_found() {
         let directory = UnitTestDir::new("pre-swap-crash");
@@ -4151,9 +5233,6 @@ mod unit_tests {
             .write_all(b"complete replacement")
             .expect("write staged executable");
         staged.sync_all().expect("sync staged executable");
-        #[cfg(windows)]
-        let recovery_digest = file_object_digest(&staged).expect("staged digest");
-        #[cfg(not(windows))]
         let recovery_digest =
             object_digest(&stage.directory, OsStr::new(STAGED_VERIFIED)).expect("staged digest");
         let original_digest =
@@ -4166,6 +5245,7 @@ mod unit_tests {
                     phase: SwapPhase::Prepared,
                     recovery_digest,
                     original_digest: Some(original_digest),
+                    quarantine: None,
                 },
             )
             .expect("write swap journal");
@@ -4184,6 +5264,7 @@ mod unit_tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn recovery_rejects_a_rollback_object_that_is_not_the_recorded_original() {
         let directory = UnitTestDir::new("foreign-rollback");
@@ -4208,6 +5289,7 @@ mod unit_tests {
                     phase: SwapPhase::Swapped,
                     recovery_digest: encode_hex(&Sha256::digest(b"replacement")),
                     original_digest: Some(encode_hex(&Sha256::digest(b"a different original"))),
+                    quarantine: None,
                 },
             )
             .expect("write swap journal");
@@ -4222,6 +5304,7 @@ mod unit_tests {
         assert!(!target_path.exists());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn first_use_creates_and_syncs_every_new_state_directory() {
         let directory = UnitTestDir::new("durable-state");
@@ -4231,7 +5314,7 @@ mod unit_tests {
             .join("gta-claw")
             .join("updater");
 
-        let created = create_directory_tree_durable(&root).expect("create protected state tree");
+        let created = ensure_directory_tree_durable(&root).expect("create protected state tree");
 
         assert_eq!(
             created,
@@ -4243,85 +5326,982 @@ mod unit_tests {
         );
         assert!(root.is_dir());
         assert!(
-            create_directory_tree_durable(&root)
+            ensure_directory_tree_durable(&root)
                 .expect("reopen protected state tree")
                 .is_empty(),
             "an existing state tree must not be recreated"
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(not(windows))]
     #[test]
-    fn a_new_state_directory_is_not_reported_before_its_parent_is_synced() {
-        let directory = UnitTestDir::new("unsynced-state");
-        let root = directory.path.join("state").join("gta-claw");
-        arm_injected_fault(InjectedFault::FailNewStateDirectorySync);
+    fn a_state_path_blocked_by_a_file_is_refused() {
+        let directory = UnitTestDir::new("state-blocked");
+        fs::write(directory.path.join("state"), b"not a directory").expect("write blocking file");
 
-        let error = create_directory_tree_durable(&root)
-            .expect_err("an unsynced new state directory is not usable");
+        let error = ensure_directory_tree_durable(&directory.path.join("state").join("updater"))
+            .expect_err("a state path blocked by a file is refused");
 
-        assert_eq!(error.to_string(), "update filesystem operation failed");
-        assert!(
-            !root.exists(),
-            "the level whose parent could not be synced must not be reported as created"
+        assert_eq!(
+            error.to_string(),
+            "updater refused an unsafe filesystem object"
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(unix)]
     #[test]
-    fn real_windows_sharing_lock_keeps_verified_object_staged() {
-        use std::os::windows::fs::OpenOptionsExt as _;
+    fn a_selected_level_sync_failure_leaves_the_tree_unconfirmed_and_retried() {
+        let directory = UnitTestDir::new("unsynced-state");
+        let root = directory.path.join("state").join("gta-claw").join("updater");
+        let syncs = state_tree_sync_points(&root);
 
-        let directory = UnitTestDir::new("windows-lock");
-        let target_path = directory.path.join("gta-claw.exe");
-        fs::write(&target_path, b"running executable").expect("write running executable");
-        let lock = OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(&target_path)
-            .expect("lock running executable");
+        // Aimed at the *last* level's sync, so every level exists and only the
+        // final one fails. A fault on the first sync would stop the run before
+        // the state this test inspects had been created at all.
+        arm_injected_fault_after(InjectedFault::FailNewStateDirectorySync, syncs - 1);
+        let error = ensure_directory_tree_durable(&root)
+            .expect_err("an unconfirmed state tree is not usable");
+        assert_eq!(error.to_string(), "update filesystem operation failed");
+
+        // Every level was created before any of them was confirmed, so the
+        // directories are on disk but the tree is not marked durable.
+        assert!(root.is_dir(), "the levels are created before they are confirmed");
+        assert!(
+            !root.join(DURABLE_MARKER).exists(),
+            "a tree with a failed sync must not be recorded as confirmed"
+        );
+
+        // The directories are left alone on purpose: after a crash they are
+        // indistinguishable from confirmed ones, so the guarantee comes from
+        // the missing marker, not from cleaning up. A retry must therefore
+        // confirm again and fail the same way while the sync keeps failing.
+        // Aimed at the last level's parent sync: skip the ones before it.
+        arm_injected_fault_after(InjectedFault::FailNewStateDirectorySync, syncs - 1);
+        let repeated = ensure_directory_tree_durable(&root)
+            .expect_err("an existing unconfirmed tree must be confirmed again, not skipped");
+        assert_eq!(repeated.to_string(), "update filesystem operation failed");
+
+        disarm_injected_fault();
+        ensure_directory_tree_durable(&root).expect("confirmation succeeds once the sync can run");
+        assert!(
+            root.join(DURABLE_MARKER).is_file(),
+            "a confirmed tree records the fact durably"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_confirmed_state_tree_is_not_synced_again() {
+        let directory = UnitTestDir::new("confirmed-state");
+        let root = directory.path.join("state").join("gta-claw");
+        ensure_directory_tree_durable(&root).expect("confirm the state tree");
+
+        // Every sync would now fail, so a run that still reached one would be
+        // reported. Reaching none is what the recorded confirmation buys.
+        arm_injected_fault(InjectedFault::FailNewStateDirectorySync);
+        let created = ensure_directory_tree_durable(&root)
+            .expect("a confirmed tree needs no further syncs");
+        disarm_injected_fault();
+
+        assert!(created.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_state_child_is_confirmed_again_and_never_skips_its_sync() {
+        let directory = UnitTestDir::new("unsynced-child");
+        let root =
+            SecureDirectory::open_or_create(&directory.path.join("state"), true).expect("root");
+        let child = OsStr::new("target-abcdef");
+
+        arm_injected_fault(InjectedFault::FailNewStateDirectorySync);
+        let error = root
+            .create_child_durable(child)
+            .expect_err("an unconfirmed child is not usable");
+        assert_eq!(error.to_string(), "update filesystem operation failed");
+        assert!(
+            !directory
+                .path
+                .join("state")
+                .join("target-abcdef")
+                .join(DURABLE_MARKER)
+                .exists()
+        );
+
+        // Still armed: an existing but unconfirmed child must be confirmed
+        // again rather than accepted because it is already there.
+        let repeated = root
+            .create_child_durable(child)
+            .expect_err("an existing unconfirmed child must be confirmed again, not skipped");
+        assert_eq!(repeated.to_string(), "update filesystem operation failed");
+
+        disarm_injected_fault();
+        root.create_child_durable(child)
+            .expect("confirmation succeeds once the sync can run");
+        assert!(
+            directory
+                .path
+                .join("state")
+                .join("target-abcdef")
+                .join(DURABLE_MARKER)
+                .is_file()
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn recovery_keeps_a_target_that_still_matches_the_recorded_original() {
+        let directory = UnitTestDir::new("lost-rename");
+        let target_path = directory.path.join("gta-claw");
+        fs::write(&target_path, b"known good").expect("write existing install");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        let original_digest =
+            object_digest(&stage.parent, &stage.target_name).expect("installed digest");
+        // A journal that claims the swap phase while the target still holds the
+        // installation it measured: the move aside never reached the disk.
+        stage
+            .directory
+            .write_json_atomic(
+                OsStr::new(SWAP_JOURNAL),
+                &SwapJournal {
+                    phase: SwapPhase::Swapped,
+                    recovery_digest: encode_hex(&Sha256::digest(b"a replacement never installed")),
+                    original_digest: Some(original_digest),
+                    quarantine: None,
+                },
+            )
+            .expect("write swap journal");
+
+        recover_interrupted_swap(&stage).expect("an untouched original is not a conflict");
+
+        assert_eq!(
+            fs::read(&target_path).expect("read untouched install"),
+            b"known good"
+        );
+        assert!(
+            !stage
+                .directory
+                .object_exists(OsStr::new(SWAP_JOURNAL))
+                .expect("journal state")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_rollback_object_that_is_not_the_recorded_original_is_never_deleted() {
+        let directory = UnitTestDir::new("foreign-backup-discard");
+        let target_path = directory.path.join("gta-claw");
+        fs::write(&target_path, b"installed replacement").expect("write installed replacement");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        let mut backup = stage
+            .parent
+            .open_regular(&stage.backup_name, true)
+            .expect("create rollback object");
+        backup
+            .write_all(b"an independent replacement")
+            .expect("write rollback object");
+        backup.sync_all().expect("sync rollback object");
+        drop(backup);
+
+        let measured = encode_hex(&Sha256::digest(b"measured"));
+        let journal = plain_journal(b"a replacement", Some(b"measured"));
+        let error = discard_backup(&stage, &journal, &measured)
+            .expect_err("a rollback object with another identity is not retired");
+
+        assert_eq!(
+            error.to_string(),
+            "interrupted update conflicts with an unknown local object"
+        );
+        assert_eq!(
+            fs::read(directory.path.join(".gta-claw.gta-claw.rollback"))
+                .expect("read retained rollback object"),
+            b"an independent replacement"
+        );
+    }
+
+    // The swap only exists where its durability primitives do.
+    #[cfg(not(windows))]
+    #[test]
+    fn an_unreadable_moved_aside_object_rolls_back_instead_of_escaping() {
+        let directory = UnitTestDir::new("unreadable-backup");
+        let target_path = directory.path.join("gta-claw");
+        fs::write(&target_path, b"known good").expect("write existing install");
         let target =
             InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
         let stage = Arc::new(SecureStaging::open(&target).expect("secure stage"));
+        let replacement = b"verified replacement";
         let mut staged = stage
             .directory
             .open_regular(OsStr::new(STAGED_VERIFIED), true)
             .expect("create staged executable");
-        staged
-            .write_all(b"verified replacement")
-            .expect("write staged executable");
-        staged.sync_all().expect("sync staged executable");
-        let staged_path = stage.directory.path.join(STAGED_VERIFIED);
+        staged.write_all(replacement).expect("write staged bytes");
+        staged.sync_all().expect("sync staged bytes");
         let prepared = PreparedArtifact {
-            path: staged_path.clone(),
+            path: stage.directory.path.join(STAGED_VERIFIED),
             source_name: OsString::from(STAGED_VERIFIED),
-            handle: staged,
-            stage,
-            #[cfg(windows)]
-            digest: Sha256::digest(b"verified replacement").into(),
-            #[cfg(windows)]
-            size: 20,
+            handle: staged.try_clone().expect("clone staged handle"),
+            stage: Arc::clone(&stage),
+            signed: SignedContent {
+                digest: Sha256::digest(replacement).into(),
+                size: u64::try_from(replacement.len()).expect("small replacement"),
+            },
         };
 
-        let outcome =
-            atomic_swap_verified(&prepared, true).expect("sharing lock is restart-required");
+        // Reading the moved-aside object back fails while the target slot is
+        // empty. That failure must go through the guard, not escape.
+        arm_injected_fault(InjectedFault::FailMovedAsideDigest);
+        let error =
+            atomic_swap_verified(&prepared, false).expect_err("an unreadable move aside is caught");
+        disarm_injected_fault();
+
         assert_eq!(
-            outcome,
-            InstallOutcome::RestartRequired {
-                staged_path: staged_path.clone(),
-            }
+            error.to_string(),
+            "update installation failed; previous version was restored",
+            "an unreadable moved-aside object must roll back, not escape with the target missing"
         );
-        drop(lock);
         assert_eq!(
-            fs::read(&target_path).expect("read locked executable"),
-            b"running executable"
+            fs::read(&target_path).expect("read restored install"),
+            b"known good",
+            "the install must never return with the target missing"
         );
-        assert_eq!(
-            fs::read(staged_path).expect("read retained staged executable"),
-            b"verified replacement"
+        assert!(
+            !stage
+                .parent
+                .object_exists(&stage.backup_name)
+                .expect("backup state")
+        );
+        assert!(
+            !stage
+                .directory
+                .object_exists(OsStr::new(SWAP_JOURNAL))
+                .expect("journal state")
         );
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn a_fresh_install_journal_never_retires_a_rollback_object_it_did_not_create() {
+        let directory = UnitTestDir::new("unowned-backup");
+        let target_path = directory.path.join("gta-claw");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        let replacement = b"this run's replacement";
+        let mut installed = stage
+            .parent
+            .open_regular(&stage.target_name, true)
+            .expect("create installed target");
+        installed.write_all(replacement).expect("write target");
+        installed.sync_all().expect("sync target");
+        drop(installed);
+        let mut backup = stage
+            .parent
+            .open_regular(&stage.backup_name, true)
+            .expect("create unrelated rollback object");
+        backup
+            .write_all(b"an unrelated rollback object")
+            .expect("write rollback object");
+        backup.sync_all().expect("sync rollback object");
+        drop(backup);
+        // A fresh install records no original, so any rollback object present
+        // belongs to something else even when the target holds this run's
+        // replacement.
+        let recovery_digest =
+            object_digest(&stage.parent, &stage.target_name).expect("installed digest");
+        stage
+            .directory
+            .write_json_atomic(
+                OsStr::new(SWAP_JOURNAL),
+                &SwapJournal {
+                    phase: SwapPhase::Swapped,
+                    recovery_digest,
+                    original_digest: None,
+                    quarantine: None,
+                },
+            )
+            .expect("write swap journal");
+
+        let error = recover_interrupted_swap(&stage)
+            .expect_err("a fresh-install journal cannot retire an unowned rollback object");
+
+        assert_eq!(
+            error.to_string(),
+            "interrupted update conflicts with an unknown local object"
+        );
+        assert_eq!(
+            fs::read(directory.path.join(".gta-claw.gta-claw.rollback"))
+                .expect("read retained rollback object"),
+            b"an unrelated rollback object"
+        );
+        assert_eq!(fs::read(&target_path).expect("read target"), replacement);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn recovery_refuses_to_restore_over_an_independent_reinstall() {
+        let directory = UnitTestDir::new("reinstall-race");
+        let target_path = directory.path.join("gta-claw");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+
+        // The state a crash leaves right after the move aside...
+        let mut backup = stage
+            .parent
+            .open_regular(&stage.backup_name, true)
+            .expect("create rollback object");
+        backup.write_all(b"previous install").expect("write backup");
+        backup.sync_all().expect("sync backup");
+        drop(backup);
+        let original_digest =
+            object_digest(&stage.parent, &stage.backup_name).expect("backup digest");
+        stage
+            .directory
+            .write_json_atomic(
+                OsStr::new(SWAP_JOURNAL),
+                &SwapJournal {
+                    phase: SwapPhase::Swapped,
+                    recovery_digest: encode_hex(&Sha256::digest(b"a replacement")),
+                    original_digest: Some(original_digest),
+                    quarantine: None,
+                },
+            )
+            .expect("write swap journal");
+
+        // ...and an independent reinstall that arrived before recovery ran.
+        // Restoring over it would destroy a working installation, so a
+        // replacing rename is exactly the wrong operation here.
+        let mut reinstall = stage
+            .parent
+            .open_regular(&stage.target_name, true)
+            .expect("create independent reinstall");
+        reinstall
+            .write_all(b"independent reinstall")
+            .expect("write reinstall");
+        reinstall.sync_all().expect("sync reinstall");
+        drop(reinstall);
+
+        let error = recover_interrupted_swap(&stage)
+            .expect_err("recovery must not restore over an independent reinstall");
+
+        assert_eq!(
+            error.to_string(),
+            "interrupted update conflicts with an unknown local object"
+        );
+        assert_eq!(
+            fs::read(&target_path).expect("read the independent reinstall"),
+            b"independent reinstall",
+            "the independent installation must survive untouched"
+        );
+        assert_eq!(
+            fs::read(directory.path.join(".gta-claw.gta-claw.rollback"))
+                .expect("read retained rollback object"),
+            b"previous install"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn claiming_an_occupied_target_reports_a_conflict_instead_of_replacing() {
+        let directory = UnitTestDir::new("no-replace");
+        let target_path = directory.path.join("gta-claw");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        let mut occupant = stage
+            .parent
+            .open_regular(&stage.target_name, true)
+            .expect("create occupant");
+        occupant.write_all(b"an occupant").expect("write occupant");
+        occupant.sync_all().expect("sync occupant");
+        drop(occupant);
+        let mut staged = stage
+            .directory
+            .open_regular(OsStr::new(STAGED_VERIFIED), true)
+            .expect("create staged object");
+        staged.write_all(b"a claimant").expect("write staged object");
+        staged.sync_all().expect("sync staged object");
+        drop(staged);
+
+        let error = stage
+            .directory
+            .rename_to_new(
+                OsStr::new(STAGED_VERIFIED),
+                &stage.parent,
+                &stage.target_name,
+            )
+            .expect_err("claiming an occupied name is refused");
+
+        assert_eq!(
+            error.to_string(),
+            "interrupted update conflicts with an unknown local object"
+        );
+        assert_eq!(
+            fs::read(&target_path).expect("read the occupant"),
+            b"an occupant",
+            "a no-replace claim must leave the occupant exactly as it was"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_rollback_object_that_changed_after_quarantine_is_put_back() {
+        let directory = UnitTestDir::new("quarantine-restore");
+        let target_path = directory.path.join("gta-claw");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        let mut backup = stage
+            .parent
+            .open_regular(&stage.backup_name, true)
+            .expect("create rollback object");
+        backup
+            .write_all(b"not what was measured")
+            .expect("write rollback object");
+        backup.sync_all().expect("sync rollback object");
+        drop(backup);
+
+        let journal = plain_journal(b"a replacement", Some(b"measured"));
+        let error = discard_backup(&stage, &journal, &encode_hex(&Sha256::digest(b"measured")))
+            .expect_err("an object that is not the recorded original is not discarded");
+
+        assert_eq!(
+            error.to_string(),
+            "interrupted update conflicts with an unknown local object"
+        );
+        assert_eq!(
+            fs::read(directory.path.join(".gta-claw.gta-claw.rollback"))
+                .expect("the quarantined object is put back under its own name"),
+            b"not what was measured"
+        );
+        assert!(
+            !stage
+                .directory
+                .list_names()
+                .expect("staging entries")
+                .iter()
+                .any(|name| name.to_string_lossy().starts_with(".retired-backup-")),
+            "nothing may be left stranded in the private staging directory"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn an_unjournalled_quarantine_leftover_is_never_blindly_deleted() {
+        let directory = UnitTestDir::new("stray-quarantine");
+        let target_path = directory.path.join("gta-claw");
+        fs::write(&target_path, b"an installation").expect("write installation");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+
+        // A quarantined object left by something this run has no record of.
+        let stray = OsString::from(format!("{QUARANTINE_PREFIX}999"));
+        let mut leftover = stage
+            .directory
+            .open_regular(&stray, true)
+            .expect("create stray quarantined object");
+        leftover
+            .write_all(b"somebody else's installation")
+            .expect("write leftover");
+        leftover.sync_all().expect("sync leftover");
+        drop(leftover);
+
+        let error = recover_interrupted_swap(&stage)
+            .expect_err("an unexplained quarantined object is not this run's to delete");
+
+        assert_eq!(
+            error.to_string(),
+            "interrupted update conflicts with an unknown local object"
+        );
+        assert_eq!(
+            fs::read(stage.directory.path.join(&stray)).expect("read retained leftover"),
+            b"somebody else's installation",
+            "a restart must never sweep a quarantined object it cannot identify"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_journalled_quarantine_that_no_longer_matches_is_put_back() {
+        let directory = UnitTestDir::new("journalled-quarantine");
+        let target_path = directory.path.join("gta-claw");
+        fs::write(&target_path, b"an installation").expect("write installation");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        let retired = OsString::from(format!("{QUARANTINE_PREFIX}42"));
+        let mut quarantined = stage
+            .directory
+            .open_regular(&retired, true)
+            .expect("create quarantined object");
+        quarantined
+            .write_all(b"not what was recorded")
+            .expect("write quarantined object");
+        quarantined.sync_all().expect("sync quarantined object");
+        drop(quarantined);
+        stage
+            .directory
+            .write_json_atomic(
+                OsStr::new(SWAP_JOURNAL),
+                &SwapJournal {
+                    phase: SwapPhase::Swapped,
+                    recovery_digest: encode_hex(&Sha256::digest(b"a replacement")),
+                    original_digest: Some(encode_hex(&Sha256::digest(b"the original"))),
+                    quarantine: Some(Quarantine {
+                        operation: QuarantineKind::RetiredBackup,
+                        source: stage.backup_name.to_string_lossy().into_owned(),
+                        destination: retired.to_string_lossy().into_owned(),
+                        digest: encode_hex(&Sha256::digest(b"the original")),
+                        phase: QuarantinePhase::Moved,
+                    }),
+                },
+            )
+            .expect("write swap journal");
+
+        let error = recover_interrupted_swap(&stage)
+            .expect_err("a quarantined object that changed is not deleted");
+
+        assert_eq!(
+            error.to_string(),
+            "interrupted update conflicts with an unknown local object"
+        );
+        assert_eq!(
+            fs::read(directory.path.join(".gta-claw.gta-claw.rollback"))
+                .expect("the quarantined object is restored under the rollback name"),
+            b"not what was recorded"
+        );
+    }
+
+    /// The quarantine completed, but something else now holds the source name.
+    ///
+    /// Recovery reads the rollback name immediately after resolving the
+    /// quarantine, so treating this as "nothing left to do" would let the
+    /// foreign object be measured and restored as the installation.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_finished_quarantine_never_adopts_an_object_that_took_the_source_name() {
+        let directory = UnitTestDir::new("quarantine-source-retaken");
+        let target_path = directory.path.join("gta-claw");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        let rollback_path = directory.path.join(".gta-claw.gta-claw.rollback");
+
+        // The retirement finished: the quarantined object is gone. An
+        // independent run then created something under the rollback name.
+        fs::write(&rollback_path, b"an independent object").expect("write independent object");
+        let retired = OsString::from(format!("{QUARANTINE_PREFIX}77"));
+        stage
+            .directory
+            .write_json_atomic(
+                OsStr::new(SWAP_JOURNAL),
+                &SwapJournal {
+                    phase: SwapPhase::Swapped,
+                    recovery_digest: encode_hex(&Sha256::digest(b"a replacement")),
+                    original_digest: Some(encode_hex(&Sha256::digest(b"the original"))),
+                    quarantine: Some(Quarantine {
+                        operation: QuarantineKind::RetiredBackup,
+                        source: stage.backup_name.to_string_lossy().into_owned(),
+                        destination: retired.to_string_lossy().into_owned(),
+                        digest: encode_hex(&Sha256::digest(b"the original")),
+                        phase: QuarantinePhase::Moved,
+                    }),
+                },
+            )
+            .expect("write swap journal");
+
+        let error = recover_interrupted_swap(&stage)
+            .expect_err("an object that took the source name is not this run's to interpret");
+
+        assert_eq!(
+            error.to_string(),
+            "interrupted update conflicts with an unknown local object"
+        );
+        assert_eq!(
+            fs::read(&rollback_path).expect("the independent object is left alone"),
+            b"an independent object",
+            "an object this run never measured must never be restored or deleted"
+        );
+        assert!(
+            !target_path.exists(),
+            "a conflict must not install anything into the target slot"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_whose_directory_sync_failed_is_not_accepted_as_evidence() {
+        let directory = UnitTestDir::new("retracted-marker");
+        let root = directory.path.join("state").join("gta-claw");
+        let syncs = state_tree_sync_points(&root);
+
+        // One past every level: each level is created and synced, and only the
+        // marker's own directory sync fails — the step that makes it believable.
+        arm_injected_fault_after(InjectedFault::FailNewStateDirectorySync, syncs);
+        let error = ensure_directory_tree_durable(&root)
+            .expect_err("a marker that is not itself durable is not confirmation");
+        disarm_injected_fault();
+
+        assert_eq!(error.to_string(), "update filesystem operation failed");
+        assert!(
+            !directory_tree_is_confirmed(&root).expect("read marker state"),
+            "a marker whose entry was never made durable must not read as confirmation"
+        );
+
+        ensure_directory_tree_durable(&root).expect("a later run confirms the tree");
+        assert!(directory_tree_is_confirmed(&root).expect("read marker state"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_marker_is_treated_as_no_marker() {
+        let directory = UnitTestDir::new("empty-marker");
+        let root = directory.path.join("state");
+        ensure_directory_tree_durable(&root).expect("confirm the tree");
+        assert!(directory_tree_is_confirmed(&root).expect("read marker state"));
+
+        fs::write(root.join(DURABLE_MARKER), b"").expect("empty the marker");
+
+        assert!(
+            !directory_tree_is_confirmed(&root).expect("read marker state"),
+            "an empty marker stands in for 'unconfirmed' and must not be believed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rollback_restores_the_backup_even_when_the_removal_sync_fails() {
+        let directory = UnitTestDir::new("deferred-durability");
+        let target_path = directory.path.join("gta-claw");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        let mut backup = stage
+            .parent
+            .open_regular(&stage.backup_name, true)
+            .expect("create rollback object");
+        backup
+            .write_all(b"previous install")
+            .expect("write rollback object");
+        backup.sync_all().expect("sync rollback object");
+        drop(backup);
+        let mut failed = stage
+            .parent
+            .open_regular(&stage.target_name, true)
+            .expect("create failed replacement");
+        failed
+            .write_all(b"a failed replacement")
+            .expect("write failed replacement");
+        failed.sync_all().expect("sync failed replacement");
+
+        // The removal of the failed replacement cannot be made durable. The
+        // restore must still happen: leaving the target empty is the one
+        // outcome this guard exists to prevent.
+        arm_injected_fault(InjectedFault::FailParentSyncDuringRollback);
+        let error = rollback_secure_swap(
+            &stage,
+            true,
+            &plain_journal(b"a replacement", Some(b"previous")),
+            Some(PlacedTarget { handle: failed }),
+            UpdateError::Io(io::Error::other("simulated install failure")),
+        );
+        disarm_injected_fault();
+
+        assert_eq!(
+            fs::read(&target_path).expect("read restored installation"),
+            b"previous install",
+            "the previous installation must be restored even when a sync failed"
+        );
+        assert_eq!(
+            error.to_string(),
+            "update filesystem operation failed",
+            "the deferred durability failure is reported once the target is back"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_rolled_back_conflict_keeps_its_type_instead_of_becoming_an_io_error() {
+        let directory = UnitTestDir::new("typed-rollback");
+        let target_path = directory.path.join("gta-claw");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        let mut backup = stage
+            .parent
+            .open_regular(&stage.backup_name, true)
+            .expect("create rollback object");
+        backup.write_all(b"previous").expect("write rollback object");
+        backup.sync_all().expect("sync rollback object");
+        drop(backup);
+
+        // A conflict cause must arrive at the caller as a conflict: flattening
+        // it into `InstallRolledBack` would hide which failure occurred, and
+        // the two carry different guidance.
+        let error = rollback_secure_swap(
+            &stage,
+            true,
+            &plain_journal(b"a replacement", Some(b"previous")),
+            None,
+            UpdateError::SwapRecoveryConflict,
+        );
+
+        assert!(
+            matches!(error, UpdateError::SwapRecoveryConflict),
+            "a typed cause must survive rollback, got: {error}"
+        );
+        assert_eq!(
+            fs::read(&target_path).expect("read restored installation"),
+            b"previous",
+            "the installation is still restored while the type is preserved"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_rolled_back_io_failure_is_reported_as_rolled_back() {
+        let directory = UnitTestDir::new("io-rollback");
+        let target_path = directory.path.join("gta-claw");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        let mut backup = stage
+            .parent
+            .open_regular(&stage.backup_name, true)
+            .expect("create rollback object");
+        backup.write_all(b"previous").expect("write rollback object");
+        backup.sync_all().expect("sync rollback object");
+        drop(backup);
+
+        let error = rollback_secure_swap(
+            &stage,
+            true,
+            &plain_journal(b"a replacement", Some(b"previous")),
+            None,
+            UpdateError::Io(io::Error::other("a genuine io fault")),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "update installation failed; previous version was restored"
+        );
+        assert_eq!(
+            fs::read(&target_path).expect("read restored installation"),
+            b"previous"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn claiming_an_occupied_name_reports_a_conflict_not_a_replacement() {
+        let directory = UnitTestDir::new("no-replace-restore");
+        let target_path = directory.path.join("gta-claw");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        let mut occupant = stage
+            .parent
+            .open_regular(&stage.target_name, true)
+            .expect("create occupant");
+        occupant
+            .write_all(b"an independent reinstall")
+            .expect("write occupant");
+        occupant.sync_all().expect("sync occupant");
+        drop(occupant);
+        let mut backup = stage
+            .parent
+            .open_regular(&stage.backup_name, true)
+            .expect("create rollback object");
+        backup.write_all(b"previous").expect("write rollback object");
+        backup.sync_all().expect("sync rollback object");
+        drop(backup);
+
+        // The restore cannot happen, and its typed reason is what the caller
+        // must see: a conflict, not a stringified rollback failure.
+        let error = rollback_secure_swap(
+            &stage,
+            true,
+            &plain_journal(b"a replacement", Some(b"previous")),
+            None,
+            UpdateError::Io(io::Error::other("an install failure")),
+        );
+
+        assert!(
+            matches!(error, UpdateError::SwapRecoveryConflict),
+            "a blocked restore must report the conflict, got: {error}"
+        );
+        assert_eq!(
+            fs::read(&target_path).expect("read the independent reinstall"),
+            b"an independent reinstall",
+            "the occupant must survive untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_is_published_empty_before_it_is_believed() {
+        let directory = UnitTestDir::new("two-phase-marker");
+        let root = directory.path.join("state");
+        fs::create_dir(&root).expect("create state directory");
+
+        // The state a crash leaves during the first publication phase: the
+        // marker exists and its entry is durable, but it is still empty. The
+        // child-process test drives the real fault; this pins the reading.
+        let marker = root.join(DURABLE_MARKER);
+        fs::write(&marker, b"").expect("write the empty published marker");
+
+        assert!(
+            !directory_tree_is_confirmed(&root).expect("read marker state"),
+            "an empty marker is the durable 'unconfirmed' state and must not be believed"
+        );
+
+        // Finishing publication over the leftover empty marker must work, so an
+        // interrupted publication is completed rather than blocking the tree.
+        record_directory_tree_confirmed(&root).expect("finish the interrupted publication");
+        assert!(directory_tree_is_confirmed(&root).expect("read marker state"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_failed_fresh_install_removes_the_object_it_placed() {
+        let directory = UnitTestDir::new("fresh-partial");
+        let target_path = directory.path.join("gta-claw");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        stage
+            .directory
+            .write_json_atomic(
+                OsStr::new(SWAP_JOURNAL),
+                &SwapJournal {
+                    phase: SwapPhase::Swapped,
+                    recovery_digest: encode_hex(&Sha256::digest(b"replacement")),
+                    original_digest: None,
+                    quarantine: None,
+                },
+            )
+            .expect("write swap journal");
+        let mut partial = stage
+            .parent
+            .open_regular(&stage.target_name, true)
+            .expect("create partial target");
+        partial.write_all(b"half a c").expect("write partial target");
+        partial.sync_all().expect("sync partial target");
+
+        let error = rollback_secure_swap(
+            &stage,
+            false,
+            &plain_journal(b"a replacement", Some(b"previous")),
+            Some(PlacedTarget { handle: partial }),
+            UpdateError::Io(io::Error::other("simulated fresh install failure")),
+        );
+
+        assert_eq!(error.to_string(), "update filesystem operation failed");
+        assert!(
+            !target_path.exists(),
+            "a fresh install that failed midway must not leave a partial object behind"
+        );
+        assert!(
+            !stage
+                .directory
+                .object_exists(OsStr::new(SWAP_JOURNAL))
+                .expect("journal state")
+        );
+    }
+
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_destination_check_rejects_an_unrelated_parent() {
+        let directory = UnitTestDir::new("windows-destination");
+        let real_parent = directory.path.join("real");
+        let other_parent = directory.path.join("other");
+        fs::create_dir(&real_parent).expect("create real parent");
+        fs::create_dir(&other_parent).expect("create other parent");
+        lock_down_windows_directory(&real_parent).expect("protect real parent");
+        lock_down_windows_directory(&other_parent).expect("protect other parent");
+        let target = InstallTarget::new(real_parent.join("gta-claw.exe"), InstallMode::Executable)
+            .expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        let elsewhere =
+            InstallTarget::new(other_parent.join("gta-claw.exe"), InstallMode::Executable)
+                .expect("other target");
+
+        let error = stage
+            .ensure_verified_destination(&elsewhere)
+            .expect_err("an unrelated destination is rejected");
+        assert_eq!(
+            error.to_string(),
+            "verified artifact belongs to a different install target"
+        );
+
+        stage
+            .ensure_verified_destination(&target)
+            .expect("the verified destination is accepted");
+    }
+
+    /// The swap must never read the destination out of the caller's argument.
+    ///
+    /// This is the property that actually protects the install on Windows,
+    /// where object identity is unavailable: even a destination check that
+    /// answered wrongly could not redirect anything, because every object the
+    /// swap touches comes from the staging state built during `download`.
+    // The swap only exists where its durability primitives do.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_swap_uses_only_the_staging_state_never_the_callers_path() {
+        let directory = UnitTestDir::new("structural-destination");
+        let target_path = directory.path.join("gta-claw");
+        fs::write(&target_path, b"previous install").expect("write previous install");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = Arc::new(SecureStaging::open(&target).expect("secure stage"));
+        let replacement = b"verified replacement";
+        let mut staged = stage
+            .directory
+            .open_regular(OsStr::new(STAGED_VERIFIED), true)
+            .expect("create staged executable");
+        staged.write_all(replacement).expect("write staged bytes");
+        staged.sync_all().expect("sync staged bytes");
+        let prepared = PreparedArtifact {
+            path: stage.directory.path.join(STAGED_VERIFIED),
+            source_name: OsString::from(STAGED_VERIFIED),
+            handle: staged,
+            stage: Arc::clone(&stage),
+            signed: SignedContent {
+                digest: Sha256::digest(replacement).into(),
+                size: u64::try_from(replacement.len()).expect("small replacement"),
+            },
+        };
+
+        // A decoy that a redirected swap would land in.
+        let decoy = directory.path.join("decoy");
+        fs::create_dir(&decoy).expect("create decoy directory");
+
+        assert_eq!(
+            atomic_swap_verified(&prepared, false).expect("swap"),
+            InstallOutcome::Installed
+        );
+
+        assert_eq!(
+            fs::read(&target_path).expect("read installed object"),
+            replacement
+        );
+        assert_eq!(
+            fs::read_dir(&decoy).expect("read decoy directory").count(),
+            0,
+            "the swap must not touch anything outside the staging state"
+        );
+    }
+
+
+    // The swap only exists where its durability primitives do.
+    #[cfg(not(windows))]
     #[test]
     fn stale_install_contends_with_and_yields_to_a_higher_floor() {
         let directory = UnitTestDir::new("floor-race");
@@ -4443,91 +6423,6 @@ mod unit_tests {
         }
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn windows_verified_handle_rejects_racing_writers_during_real_swaps() {
-        for iteration in 0..32 {
-            let directory = UnitTestDir::new("windows-writer-race");
-            let target_path = directory.path.join(format!("gta-claw-{iteration}.exe"));
-            fs::write(&target_path, b"known good").expect("write existing target");
-            let target = InstallTarget::new(target_path.clone(), InstallMode::Executable)
-                .expect("install target");
-            let stage = Arc::new(SecureStaging::open(&target).expect("secure stage"));
-            let replacement = format!("verified replacement {iteration}").into_bytes();
-            let mut staged = stage
-                .directory
-                .open_regular(OsStr::new(STAGED_VERIFIED), true)
-                .expect("create staged replacement");
-            staged
-                .write_all(&replacement)
-                .expect("write staged replacement");
-            staged.sync_all().expect("sync staged replacement");
-            let staged_path = stage.directory.path.join(STAGED_VERIFIED);
-            let prepared = PreparedArtifact {
-                path: staged_path.clone(),
-                source_name: OsString::from(STAGED_VERIFIED),
-                handle: staged,
-                stage: Arc::clone(&stage),
-                digest: Sha256::digest(&replacement).into(),
-                size: u64::try_from(replacement.len()).expect("small replacement"),
-            };
-
-            let start = Arc::new(Barrier::new(2));
-            let first_attempt = Arc::new(Barrier::new(2));
-            let done = Arc::new(AtomicBool::new(false));
-            let attempts = Arc::new(AtomicUsize::new(0));
-            let successful_writes = Arc::new(AtomicUsize::new(0));
-            let writer_start = Arc::clone(&start);
-            let writer_first_attempt = Arc::clone(&first_attempt);
-            let writer_done = Arc::clone(&done);
-            let writer_attempts = Arc::clone(&attempts);
-            let writer_successes = Arc::clone(&successful_writes);
-            let writer = std::thread::spawn(move || {
-                writer_start.wait();
-                for attempt in 0..128 {
-                    writer_attempts.fetch_add(1, Ordering::SeqCst);
-                    if let Ok(mut replacement) = OpenOptions::new()
-                        .write(true)
-                        .truncate(true)
-                        .open(&staged_path)
-                    {
-                        replacement
-                            .write_all(b"attacker-controlled bytes")
-                            .expect("racing write");
-                        replacement.sync_all().expect("sync racing write");
-                        writer_successes.fetch_add(1, Ordering::SeqCst);
-                    }
-                    if attempt == 0 {
-                        writer_first_attempt.wait();
-                    }
-                    if writer_done.load(Ordering::SeqCst) && attempt >= 63 {
-                        break;
-                    }
-                    std::thread::yield_now();
-                }
-            });
-
-            start.wait();
-            first_attempt.wait();
-            let outcome = atomic_swap_verified(&prepared, true).expect("real swap");
-            done.store(true, Ordering::SeqCst);
-            writer.join().expect("racing writer thread");
-
-            assert_eq!(outcome, InstallOutcome::Installed);
-            assert!(attempts.load(Ordering::SeqCst) >= 64);
-            assert_eq!(successful_writes.load(Ordering::SeqCst), 0);
-            assert_eq!(
-                fs::read(&target_path).expect("read installed object"),
-                replacement
-            );
-            assert!(
-                !stage
-                    .parent
-                    .object_exists(&stage.backup_name)
-                    .expect("backup state")
-            );
-        }
-    }
 
     #[cfg(windows)]
     #[test]
@@ -4630,8 +6525,50 @@ mod unit_tests {
         );
     }
 
+    /// Nothing a rerun could resume from survives the discard.
+    ///
+    /// The verified artifact is the obvious one, but the partial download and
+    /// the resume binding matter just as much: either one left behind lets the
+    /// next run rebuild a "verified" artifact from bytes that sat on disk while
+    /// no updater run held the staging lock.
+    #[cfg(not(windows))]
     #[test]
-    fn windows_locked_target_preserves_verified_staging() {
+    fn discarding_staging_leaves_nothing_to_resume_from() {
+        let directory = UnitTestDir::new("discard-staging");
+        let target_path = directory.path.join("gta-claw");
+        let target =
+            InstallTarget::new(target_path, InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        for name in [STAGED_VERIFIED, STAGED_PART, RESUME_BINDING] {
+            let mut staged = stage
+                .directory
+                .open_regular(OsStr::new(name), true)
+                .expect("create staged artifact");
+            staged.write_all(b"resumable").expect("write staged artifact");
+            staged.sync_all().expect("sync staged artifact");
+        }
+
+        discard_verified_staging(&stage).expect("discard the staging");
+
+        for name in [STAGED_VERIFIED, STAGED_PART, RESUME_BINDING] {
+            assert!(
+                !stage
+                    .directory
+                    .object_exists(OsStr::new(name))
+                    .expect("staging state"),
+                "{name} must not survive a discard"
+            );
+        }
+    }
+
+    /// A locked target reports a restart without naming any staging path.
+    ///
+    /// The old contract handed the caller the staged pathname so a rerun could
+    /// finish from it. That is the hole: whatever can write that name between
+    /// the two runs decides what gets installed. The outcome carries no path
+    /// now, and the swap leaves the installation untouched.
+    #[test]
+    fn a_locked_target_reports_a_restart_that_names_no_staging_path() {
         let target = PathBuf::from("app").join("gta-claw");
         let staged = PathBuf::from("app").join(".gta-claw.gta-claw.verified");
         let operations = MockOps::default();
@@ -4645,53 +6582,12 @@ mod unit_tests {
 
         let outcome =
             atomic_swap(&operations, &staged, &target, true).expect("lock is restart-required");
-        assert_eq!(
-            outcome,
-            InstallOutcome::RestartRequired {
-                staged_path: staged.clone(),
-            }
-        );
+
+        assert_eq!(outcome, InstallOutcome::RestartRequired);
         assert_eq!(
             operations.existing.lock().expect("existing lock").clone(),
-            BTreeSet::from([target, staged])
-        );
-    }
-
-    #[test]
-    fn bundle_paths_reject_parent_absolute_and_prefix_components() {
-        assert_eq!(
-            safe_relative_path("Contents/MacOS/gta-claw").expect("safe path"),
-            PathBuf::from("Contents/MacOS/gta-claw")
-        );
-        assert_eq!(
-            safe_relative_path("../outside")
-                .expect_err("parent path rejected")
-                .to_string(),
-            "macOS bundle archive is invalid"
-        );
-        assert_eq!(
-            safe_relative_path("C:\\outside")
-                .expect_err("Windows prefix rejected")
-                .to_string(),
-            "macOS bundle archive is invalid"
-        );
-        assert_eq!(
-            safe_relative_path(&"a".repeat(MAX_BUNDLE_PATH_BYTES + 1))
-                .expect_err("oversized bundle path rejected")
-                .to_string(),
-            "macOS bundle archive is invalid"
-        );
-        assert_eq!(
-            bundle_collision_key("Contents/Info.plist"),
-            bundle_collision_key("contents/info.plist")
-        );
-        assert_eq!(
-            bundle_collision_key("Contents/Caf\u{00e9}"),
-            bundle_collision_key("contents/Cafe\u{0301}")
-        );
-        assert_eq!(
-            bundle_collision_key("Contents/STRA\u{00df}E"),
-            bundle_collision_key("contents/strasse")
+            BTreeSet::from([target, staged]),
+            "a locked target must be left exactly as it was found"
         );
     }
 

@@ -1,24 +1,31 @@
 //! Local-only adversarial updater integration coverage.
 
+#[cfg(not(windows))]
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(not(windows))]
 use std::sync::{Arc, Mutex};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
-use ed25519_dalek::{Signer as _, SigningKey};
 #[cfg(not(windows))]
-use gta_claw_updater::InstallOutcome;
+use base64::Engine as _;
+#[cfg(not(windows))]
+use base64::engine::general_purpose::STANDARD;
+#[cfg(not(windows))]
+use ed25519_dalek::Signer as _;
+use ed25519_dalek::SigningKey;
 use gta_claw_updater::{
-    ArtifactKind, AvailableUpdate, InstallMode, InstallTarget, ReleaseArtifact, ReleaseManifest,
-    SignedManifest, UpdateDecision, UpdateOutcome, Updater,
+    ArtifactKind, InstallMode, InstallTarget, ReleaseArtifact, ReleaseManifest, UpdateOutcome,
+    Updater,
 };
+#[cfg(not(windows))]
+use gta_claw_updater::{AvailableUpdate, SignedManifest, UpdateDecision};
 use semver::Version;
 #[cfg(not(windows))]
-use serde_json::json;
 use sha2::{Digest as _, Sha256};
+#[cfg(not(windows))]
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+#[cfg(not(windows))]
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
 
@@ -82,12 +89,14 @@ impl Drop for TestDir {
     }
 }
 
+#[cfg(not(windows))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Request {
     path: String,
     range: Option<String>,
 }
 
+#[cfg(not(windows))]
 struct ResponsePlan {
     status: &'static str,
     headers: Vec<(String, String)>,
@@ -95,13 +104,16 @@ struct ResponsePlan {
     write_bytes: usize,
 }
 
+#[cfg(not(windows))]
 type Handler = Arc<dyn Fn(Request, usize) -> ResponsePlan + Send + Sync>;
+#[cfg(not(windows))]
 struct LocalServer {
     url: Url,
     requests: Arc<Mutex<Vec<Request>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(not(windows))]
 impl LocalServer {
     async fn spawn(handler: Handler) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -131,12 +143,14 @@ impl LocalServer {
     }
 }
 
+#[cfg(not(windows))]
 impl Drop for LocalServer {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
+#[cfg(not(windows))]
 async fn handle_connection(
     mut stream: TcpStream,
     handler: Handler,
@@ -197,6 +211,7 @@ async fn handle_connection(
     }
 }
 
+#[cfg(not(windows))]
 fn handler<F>(handler: F) -> Handler
 where
     F: Fn(Request, usize) -> ResponsePlan + Send + Sync + 'static,
@@ -206,8 +221,9 @@ where
 
 /// Lists the staging directory without the lock that serializes concurrent runs.
 ///
-/// The lock object is the staging directory's own mutex: it outlives every
-/// download and install, so it is never part of what a run cleans up.
+/// The lock is the staging directory's own mutex: it outlives every download
+/// and install, so it is never part of what a run cleans up.
+#[cfg(not(windows))]
 fn staging_entries(stage: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(stage)
         .expect("read staging directory")
@@ -237,6 +253,7 @@ fn updater(directory: &Path) -> Updater {
     .expect("test updater")
 }
 
+#[cfg(not(windows))]
 fn signed_bytes(manifest: ReleaseManifest) -> Vec<u8> {
     let canonical = serde_json::to_vec(&manifest).expect("canonical test manifest");
     let signature = signing_key().sign(&canonical);
@@ -247,6 +264,7 @@ fn signed_bytes(manifest: ReleaseManifest) -> Vec<u8> {
     .expect("signed envelope")
 }
 
+#[cfg(not(windows))]
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(digest.len() * 2);
@@ -256,6 +274,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     encoded
 }
 
+#[cfg(not(windows))]
 fn artifact(url: &Url, bytes: &[u8], kind: ArtifactKind) -> ReleaseArtifact {
     ReleaseArtifact {
         release_sequence: 1,
@@ -286,11 +305,13 @@ fn manifest(
     }
 }
 
+#[cfg(not(windows))]
 fn executable_target(directory: &Path) -> InstallTarget {
     InstallTarget::new(directory.join("gta-claw.exe"), InstallMode::Executable)
         .expect("test executable target")
 }
 
+#[cfg(not(windows))]
 fn authorized_update(updater: &Updater, artifact: &ReleaseArtifact) -> AvailableUpdate {
     let sequence = artifact.release_sequence;
     let version = format!("2.0.{sequence}");
@@ -346,6 +367,7 @@ fn verifies_independent_ed25519_signature_vector() {
     );
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn checks_valid_signed_manifest_and_rejects_forged_or_unsigned_data() {
     let directory = TestDir::new("manifest");
@@ -421,6 +443,7 @@ async fn checks_valid_signed_manifest_and_rejects_forged_or_unsigned_data() {
     );
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn persists_anti_rollback_floor_and_enforces_expiry_and_revocation() {
     let directory = TestDir::new("anti-rollback");
@@ -512,6 +535,7 @@ async fn persists_anti_rollback_floor_and_enforces_expiry_and_revocation() {
     );
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn interrupted_verified_upgrade_cannot_install_after_a_newer_persisted_floor() {
     let directory = TestDir::new("interrupted-floor");
@@ -587,6 +611,7 @@ async fn interrupted_verified_upgrade_cannot_install_after_a_newer_persisted_flo
     );
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn rejects_tampered_artifact_and_removes_untrusted_partial() {
     let directory = TestDir::new("tampered");
@@ -631,6 +656,7 @@ async fn rejects_tampered_artifact_and_removes_untrusted_partial() {
     );
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn verified_stage_is_reused_without_redownload_and_cleaned_after_install() {
     let directory = TestDir::new("verified-reuse");
@@ -681,6 +707,7 @@ async fn verified_stage_is_reused_without_redownload_and_cleaned_after_install()
     );
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn rejects_mismatched_content_range_and_cross_artifact_resume() {
     let directory = TestDir::new("resume-binding");
@@ -761,6 +788,7 @@ async fn rejects_mismatched_content_range_and_cross_artifact_resume() {
     );
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn interrupted_download_resumes_from_exact_persisted_offset() {
     let directory = TestDir::new("resume");
@@ -843,6 +871,7 @@ async fn interrupted_download_resumes_from_exact_persisted_offset() {
     );
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn complete_partial_is_verified_without_an_invalid_range_request() {
     let directory = TestDir::new("complete-partial");
@@ -898,101 +927,6 @@ async fn complete_partial_is_verified_without_an_invalid_range_request() {
 }
 
 #[cfg(not(windows))]
-#[tokio::test]
-async fn installs_complete_macos_bundle_and_rejects_archive_traversal() {
-    let directory = TestDir::new("bundle");
-    let target_path = directory.path.join("GTA Claw.app");
-    std::fs::create_dir(&target_path).expect("create old bundle");
-    std::fs::write(target_path.join("old.txt"), b"old").expect("write old bundle");
-    let bundle = serde_json::to_vec(&json!({
-        "format": "gta-claw-bundle-v1",
-        "files": [
-            {
-                "path": "Contents/MacOS/gta-claw",
-                "mode": 493,
-                "contents": STANDARD.encode(b"new executable")
-            },
-            {
-                "path": "Contents/Info.plist",
-                "mode": 420,
-                "contents": STANDARD.encode(b"plist")
-            }
-        ]
-    }))
-    .expect("bundle archive");
-    let server_bundle = bundle.clone();
-    let server = LocalServer::spawn(handler(move |_, _| ResponsePlan {
-        status: "200 OK",
-        headers: Vec::new(),
-        write_bytes: server_bundle.len(),
-        body: server_bundle.clone(),
-    }))
-    .await;
-    let release = artifact(&server.url("bundle"), &bundle, ArtifactKind::MacOsBundle);
-    let target = InstallTarget::new(target_path.clone(), InstallMode::MacOsBundle)
-        .expect("macOS bundle target");
-    let updater = updater(&directory.path);
-    let update = authorized_update(&updater, &release);
-    let verified = updater
-        .download(&update, &target)
-        .await
-        .expect("download bundle");
-    let outcome = updater
-        .install(verified, &target)
-        .await
-        .expect("install bundle");
-    assert_eq!(outcome, InstallOutcome::Installed);
-    assert_eq!(
-        std::fs::read(target_path.join("Contents/MacOS/gta-claw")).expect("new bundle executable"),
-        b"new executable"
-    );
-    assert_eq!(
-        std::fs::read(target_path.join("Contents/Info.plist")).expect("new bundle metadata"),
-        b"plist"
-    );
-    assert!(!target_path.join("old.txt").exists());
-    assert_eq!(
-        staging_entries(&directory.path.join(".GTA Claw.app.gta-claw-stage")),
-        Vec::<String>::new(),
-        "successful bundle install must remove its verified archive"
-    );
-
-    let unsafe_bundle = serde_json::to_vec(&json!({
-        "format": "gta-claw-bundle-v1",
-        "files": [{
-            "path": "../escaped",
-            "mode": 420,
-            "contents": STANDARD.encode(b"escape")
-        }]
-    }))
-    .expect("unsafe bundle archive");
-    let unsafe_server_body = unsafe_bundle.clone();
-    let unsafe_server = LocalServer::spawn(handler(move |_, _| ResponsePlan {
-        status: "200 OK",
-        headers: Vec::new(),
-        write_bytes: unsafe_server_body.len(),
-        body: unsafe_server_body.clone(),
-    }))
-    .await;
-    let mut unsafe_release = artifact(
-        &unsafe_server.url("bundle"),
-        &unsafe_bundle,
-        ArtifactKind::MacOsBundle,
-    );
-    unsafe_release.release_sequence = 2;
-    let unsafe_update = authorized_update(&updater, &unsafe_release);
-    let verified = updater
-        .download(&unsafe_update, &target)
-        .await
-        .expect("unsafe archive bytes still verify");
-    let error = updater
-        .install(verified, &target)
-        .await
-        .expect_err("archive traversal rejected");
-    assert_eq!(error.to_string(), "macOS bundle archive is invalid");
-    assert!(!directory.path.join("escaped").exists());
-}
-
 #[test]
 fn advancing_release_floor_prunes_obsolete_state_files() {
     let directory = TestDir::new("floor-cleanup");
@@ -1040,86 +974,6 @@ fn advancing_release_floor_prunes_obsolete_state_files() {
     );
 }
 
-#[cfg(not(windows))]
-#[tokio::test]
-async fn bundle_install_rejected_by_the_floor_removes_its_expanded_staging() {
-    let directory = TestDir::new("bundle-stale-floor");
-    let target_path = directory.path.join("GTA Claw.app");
-    std::fs::create_dir(&target_path).expect("create old bundle");
-    std::fs::write(target_path.join("old.txt"), b"old").expect("write old bundle");
-    let bundle = serde_json::to_vec(&json!({
-        "format": "gta-claw-bundle-v1",
-        "files": [{
-            "path": "Contents/Info.plist",
-            "mode": 420,
-            "contents": STANDARD.encode(b"plist")
-        }]
-    }))
-    .expect("bundle archive");
-    let server_bundle = bundle.clone();
-    let server = LocalServer::spawn(handler(move |_, _| ResponsePlan {
-        status: "200 OK",
-        headers: Vec::new(),
-        write_bytes: server_bundle.len(),
-        body: server_bundle.clone(),
-    }))
-    .await;
-    let target = InstallTarget::new(target_path.clone(), InstallMode::MacOsBundle)
-        .expect("macOS bundle target");
-
-    let mut release_30 = artifact(&server.url("bundle"), &bundle, ArtifactKind::MacOsBundle);
-    release_30.release_sequence = 30;
-    let updater_30 = updater(&directory.path);
-    let decision_30 = updater_30
-        .check_manifest_bytes(
-            &signed_bytes(manifest("3.0.0", 30, Vec::new(), vec![release_30.clone()])),
-            &Version::parse("1.0.0").expect("current version"),
-        )
-        .expect("sequence 30 accepted");
-    let authorized_30 = match decision_30 {
-        UpdateDecision::Available { update, .. } => update,
-        UpdateDecision::Current { version } => {
-            panic!("expected available update, got current {version}")
-        }
-    };
-    let verified_30 = updater_30
-        .download(&authorized_30, &target)
-        .await
-        .expect("sequence 30 bundle verifies");
-
-    let mut release_40 = release_30;
-    release_40.release_sequence = 40;
-    let updater_40 = updater(&directory.path);
-    updater_40
-        .check_manifest_bytes(
-            &signed_bytes(manifest("4.0.0", 40, Vec::new(), vec![release_40])),
-            &Version::parse("1.0.0").expect("current version"),
-        )
-        .expect("sequence 40 persists");
-
-    let stale_error = updater_40
-        .install(verified_30, &target)
-        .await
-        .expect_err("stale bundle rejected at install");
-    assert_eq!(
-        stale_error.to_string(),
-        "signed release sequence 30 is below verified floor 40"
-    );
-    assert_eq!(
-        std::fs::read(target_path.join("old.txt")).expect("read untouched bundle"),
-        b"old"
-    );
-    let leftover: Vec<_> = std::fs::read_dir(directory.path.join(".GTA Claw.app.gta-claw-stage"))
-        .expect("read protected staging directory")
-        .map(|entry| entry.expect("staging entry").file_name())
-        .filter(|name| name.to_string_lossy().starts_with("bundle-"))
-        .collect();
-    assert!(
-        leftover.is_empty(),
-        "rejected bundle install left expanded staging behind: {leftover:?}"
-    );
-}
-
 #[tokio::test]
 async fn linux_package_mode_is_network_and_filesystem_noop() {
     let directory = TestDir::new("linux-noop");
@@ -1145,5 +999,114 @@ async fn linux_package_mode_is_network_and_filesystem_noop() {
             .expect("read Linux test directory")
             .count(),
         1
+    );
+}
+
+/// A directory bundle is refused before any staging state exists.
+///
+/// Publishing a tree needs guarantees this crate does not have — the signed
+/// archive hashed once and expanded from that same buffer, every nested
+/// directory made durable, and a tree digest that separates shapes a flat walk
+/// conflates. Rather than publish on weaker evidence than the executable path
+/// gets, the bundle is refused at the boundary, and this asserts the refusal
+/// leaves the existing installation and the filesystem untouched.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_directory_bundle_is_refused_before_anything_is_staged() {
+    let directory = TestDir::new("bundle-refused");
+    let target_path = directory.path.join("GTA Claw.app");
+    std::fs::create_dir(&target_path).expect("create the existing bundle");
+    std::fs::write(target_path.join("old.txt"), b"old").expect("write the existing bundle");
+    let target =
+        InstallTarget::new(target_path.clone(), InstallMode::MacOsBundle).expect("bundle target");
+    let updater = updater(&directory.path);
+    let bundle = artifact(
+        &Url::parse("http://127.0.0.1:1/bundle").expect("bundle URL"),
+        b"bundle",
+        ArtifactKind::MacOsBundle,
+    );
+    let update = authorized_update(&updater, &bundle);
+
+    let error = updater
+        .download(&update, &target)
+        .await
+        .expect_err("a bundle cannot be installed by this crate");
+
+    assert_eq!(
+        error.to_string(),
+        "this updater cannot install directory bundles safely"
+    );
+    assert!(
+        !directory.path.join(".GTA Claw.app.gta-claw-stage").exists(),
+        "refusing must precede creating the staging directory"
+    );
+    assert_eq!(
+        std::fs::read(target_path.join("old.txt")).expect("the installation is untouched"),
+        b"old"
+    );
+}
+
+/// Discarded staging forces the next run to fetch and verify the release again.
+///
+/// This is the half of the restart contract that is observable from outside:
+/// once the verified staging is gone, nothing on disk can stand in for a
+/// download, so the updater goes back to the network and re-checks the
+/// signature, size and digest of what it receives. An install that could be
+/// completed from leftover bytes would be installing something no run of this
+/// process ever verified against the release it is installing.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn discarded_staging_forces_a_fresh_verified_download() {
+    let directory = TestDir::new("restart-redownload");
+    let bytes = b"verified replacement payload".to_vec();
+    let response = bytes.clone();
+    let server = LocalServer::spawn(handler(move |_request, _index| ResponsePlan {
+        status: "200 OK",
+        headers: Vec::new(),
+        body: response.clone(),
+        write_bytes: response.len(),
+    }))
+    .await;
+    let release = artifact(&server.url("artifact"), &bytes, ArtifactKind::Executable);
+    let target = executable_target(&directory.path);
+    std::fs::write(target.path(), b"old executable").expect("write old executable");
+    let updater = updater(&directory.path);
+    let update = authorized_update(&updater, &release);
+
+    let first = updater
+        .download(&update, &target)
+        .await
+        .expect("first verified download");
+    drop(first);
+    assert_eq!(server.requests.lock().expect("request log lock").len(), 1);
+
+    // Stand in for the discard an interrupted install performs: everything a
+    // rerun could resume from is gone.
+    let stage = directory.path.join(".gta-claw.exe.gta-claw-stage");
+    for name in ["artifact.verified", "artifact.part", "artifact.resume.json"] {
+        let path = stage.join(name);
+        if path.exists() {
+            std::fs::remove_file(&path).expect("discard staged artifact");
+        }
+    }
+
+    let refetched = updater
+        .download(&update, &target)
+        .await
+        .expect("a discarded stage is downloaded again");
+    updater
+        .install(refetched, &target)
+        .await
+        .expect("install the freshly verified bytes");
+
+    assert_eq!(
+        server.requests.lock().expect("request log lock").len(),
+        2,
+        "a discarded stage must be fetched again, not reconstructed from disk"
+    );
+    assert_eq!(
+        std::fs::read(target.path()).expect("read installed executable"),
+        bytes,
+        "only bytes this run verified may be installed"
     );
 }

@@ -26,6 +26,8 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
+# Retained only to keep Cargo.lock valid for `--locked` builds: the bundle path
+# that used these was removed, and dropping them needs a lockfile regeneration.
 unicode-casefold = "=0.2.0"
 unicode-normalization = "=0.1.25"
 url = "=2.5.8"

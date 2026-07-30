@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use gta_claw_updater::{
-    InjectedFault, InstallMode, InstallTarget, UpdateDecision, Updater, arm_injected_fault,
+    InjectedFault, InstallMode, InstallTarget, UpdateDecision, Updater, arm_injected_fault_script,
+    state_tree_sync_points,
 };
 use semver::Version;
 use url::Url;
@@ -47,8 +48,25 @@ fn main() -> ExitCode {
 }
 
 async fn run(arguments: Arguments) -> Result<String, String> {
-    if let Some(fault) = arguments.fault {
-        arm_injected_fault(fault);
+    if !arguments.faults.is_empty() {
+        // Skip counts are expressed relative to the number of directory syncs
+        // confirming this state path performs, so a test never has to count
+        // path components itself and get it wrong.
+        let script: Vec<(InjectedFault, u32)> = arguments
+            .faults
+            .iter()
+            .map(|(fault, skip)| {
+                let skip = match skip {
+                    FaultSkip::Exact(count) => *count,
+                    FaultSkip::LastStateLevel => {
+                        state_tree_sync_points(&arguments.state).saturating_sub(1)
+                    }
+                    FaultSkip::StateMarker => state_tree_sync_points(&arguments.state),
+                };
+                (*fault, skip)
+            })
+            .collect();
+        arm_injected_fault_script(&script);
     }
     let updater = Updater::with_public_key_and_state(
         arguments.public_key,
@@ -130,7 +148,18 @@ struct Arguments {
     current: Version,
     public_key: [u8; 32],
     marker: Option<PathBuf>,
-    fault: Option<InjectedFault>,
+    /// Faults to arm, in the order they should fire.
+    faults: Vec<(InjectedFault, FaultSkip)>,
+}
+
+/// Which occurrence of a repeated durability step a fault should hit.
+#[derive(Clone, Copy)]
+enum FaultSkip {
+    Exact(u32),
+    /// The sync of the deepest state directory's own parent.
+    LastStateLevel,
+    /// The sync that publishes the durability marker's directory entry.
+    StateMarker,
 }
 
 impl Arguments {
@@ -156,7 +185,7 @@ impl Arguments {
         let mut current = None;
         let mut public_key = None;
         let mut marker = None;
-        let mut fault = None;
+        let mut faults: Vec<(InjectedFault, FaultSkip)> = Vec::new();
         while let Some(argument) = values.next() {
             let name = argument.to_string_lossy().into_owned();
             let mut value = || {
@@ -172,7 +201,9 @@ impl Arguments {
                 "--current" => current = Some(value()?),
                 "--public-key" => public_key = Some(value()?),
                 "--marker" => marker = Some(PathBuf::from(value()?)),
-                "--fault" => fault = Some(parse_fault(&value()?.to_string_lossy())?),
+                // `--fault a --fault b` arms them in order; each may be
+                // written `name@skip` to place it at one specific occurrence.
+                "--fault" => faults.push(parse_fault(&value()?.to_string_lossy())?),
                 unknown => return Err(format!("unknown argument: {unknown}")),
             }
         }
@@ -197,17 +228,42 @@ impl Arguments {
                 .ok_or_else(|| "--public-key is required".to_owned())
                 .and_then(|value| decode_public_key(&value.to_string_lossy()))?,
             marker,
-            fault,
+            faults,
         })
     }
 }
 
-fn parse_fault(value: &str) -> Result<InjectedFault, String> {
+fn parse_fault(value: &str) -> Result<(InjectedFault, FaultSkip), String> {
+    let (name, skip) = match value.split_once('@') {
+        Some((name, "last-state-level")) => (name, FaultSkip::LastStateLevel),
+        Some((name, "state-marker")) => (name, FaultSkip::StateMarker),
+        Some((name, count)) => (
+            name,
+            FaultSkip::Exact(
+                count
+                    .parse()
+                    .map_err(|_| format!("invalid fault skip: {count}"))?,
+            ),
+        ),
+        None => (value, FaultSkip::Exact(0)),
+    };
+    named_fault(name).map(|fault| (fault, skip))
+}
+
+fn named_fault(value: &str) -> Result<InjectedFault, String> {
     match value {
         "exit-after-swap-prepared" => Ok(InjectedFault::ExitAfterSwapPrepared),
         "exit-after-swap-committed" => Ok(InjectedFault::ExitAfterSwapCommitted),
         "fail-new-state-directory-sync" => Ok(InjectedFault::FailNewStateDirectorySync),
         "fail-parent-sync-after-swap" => Ok(InjectedFault::FailParentSyncAfterSwap),
+        "exit-after-target-moved-aside" => Ok(InjectedFault::ExitAfterTargetMovedAside),
+        "exit-after-recovery-restore" => Ok(InjectedFault::ExitAfterRecoveryRestore),
+        "fail-moved-aside-digest" => Ok(InjectedFault::FailMovedAsideDigest),
+        "fail-parent-sync-during-rollback" => Ok(InjectedFault::FailParentSyncDuringRollback),
+        "exit-after-empty-durability-marker" => Ok(InjectedFault::ExitAfterEmptyDurabilityMarker),
+        "exit-after-quarantine-planned" => Ok(InjectedFault::ExitAfterQuarantinePlanned),
+        "exit-after-quarantine-moved" => Ok(InjectedFault::ExitAfterQuarantineMoved),
+        "fail-published-identity" => Ok(InjectedFault::FailPublishedIdentity),
         unknown => Err(format!("unknown fault: {unknown}")),
     }
 }
