@@ -377,7 +377,9 @@ export class DiscordGatewayClient {
         !ready ||
         typeof ready.session_id !== "string" ||
         ready.session_id.length === 0 ||
-        ready.session_id.length > 256
+        ready.session_id.length > 256 ||
+        ready.session_id.trim() !== ready.session_id ||
+        /[\u0000-\u001f\u007f]/u.test(ready.session_id)
       ) {
         this.clearSession();
         logger.warn("Discarding malformed Discord READY payload");
@@ -481,31 +483,35 @@ export class DiscordGatewayClient {
         return null;
       }
     }
-    if (value.includes("#") || !value.startsWith("wss://")) {
+    if (!value.startsWith("wss://")) {
       return null;
     }
 
-    const authority = value.slice("wss://".length).split(/[/?]/, 1)[0];
-    if (!authority || authority.includes("@")) {
+    let resumeUrl: URL;
+    let bootstrapUrl: URL;
+    try {
+      resumeUrl = new URL(value);
+      bootstrapUrl = new URL(this.gatewayUrl);
+    } catch {
       return null;
     }
 
-    const separator = authority.lastIndexOf(":");
-    const hostname =
-      separator === -1 ? authority : authority.slice(0, separator);
-    let port = 443;
-    if (separator !== -1) {
-      const portText = authority.slice(separator + 1);
-      if (!/^\+?\d+$/.test(portText)) {
-        return null;
-      }
-      port = Number(portText);
-    }
-    const normalizedHostname = hostname.toLowerCase();
     if (
-      port !== 443 ||
-      (normalizedHostname !== "discord.gg" &&
-        !normalizedHostname.endsWith(".discord.gg"))
+      resumeUrl.protocol !== "wss:" ||
+      resumeUrl.username !== "" ||
+      resumeUrl.password !== "" ||
+      resumeUrl.hash !== "" ||
+      resumeUrl.port !== ""
+    ) {
+      return null;
+    }
+
+    const normalizedHostname = resumeUrl.hostname.toLowerCase();
+    const bootstrapHostname = bootstrapUrl.hostname.toLowerCase();
+    if (
+      normalizedHostname !== bootstrapHostname &&
+      normalizedHostname !== "discord.gg" &&
+      !normalizedHostname.endsWith(".discord.gg")
     ) {
       return null;
     }

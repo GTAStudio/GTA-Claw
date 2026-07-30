@@ -468,6 +468,10 @@ test("Discord accepts the PR230 resume gateway URL forms", async () => {
       "wss://gateway.discord.gg/?compression=zlib-stream",
       "wss://gateway.discord.gg/?compression=zlib-stream",
     ],
+    [
+      "wss://gateway.example/resume?encoding=json",
+      "wss://gateway.example/resume?encoding=json",
+    ],
   ];
 
   for (const [resumeGatewayUrl, expectedUrl] of safeUrls) {
@@ -518,6 +522,7 @@ test("Discord atomically rejects READY with an unsafe resume gateway URL", async
     "wss://resume.discord.gg:8443",
     "wss://discord.gg.attacker.example",
     "wss://attacker.example",
+    "wss://evil.example\\.discord.gg",
     " wss://resume.discord.gg",
     "not a URL",
     42,
@@ -532,6 +537,16 @@ test("Discord atomically rejects READY with an unsafe resume gateway URL", async
       t: null,
       d: { heartbeat_interval: 60_000 },
     });
+    packet(first, {
+      op: 0,
+      t: "READY",
+      s: 41,
+      d: {
+        session_id: "prior-session",
+        resume_gateway_url: "wss://resume.discord.gg",
+      },
+    });
+    assert.equal(client.sessionId, "prior-session");
     packet(first, {
       op: 0,
       t: "READY",
@@ -563,6 +578,70 @@ test("Discord atomically rejects READY with an unsafe resume gateway URL", async
       d: { heartbeat_interval: 60_000 },
     });
     assert.equal(bootstrap.sent[0].op, 2, String(resumeGatewayUrl));
+    await client.stop();
+  }
+});
+
+test("Discord atomically rejects READY with a malformed session ID", async () => {
+  const invalidSessionIds = [
+    "",
+    " session-1",
+    "session-1 ",
+    "session\u0000-1",
+    "session\n1",
+    "x".repeat(257),
+    42,
+  ];
+
+  for (const sessionId of invalidSessionIds) {
+    const { client, sockets, urls } = createClient();
+    client.start();
+    const first = sockets[0];
+    packet(first, {
+      op: 10,
+      t: null,
+      d: { heartbeat_interval: 60_000 },
+    });
+    packet(first, {
+      op: 0,
+      t: "READY",
+      s: 41,
+      d: {
+        session_id: "prior-session",
+        resume_gateway_url: "wss://resume.discord.gg",
+      },
+    });
+    assert.equal(client.sessionId, "prior-session");
+    packet(first, {
+      op: 0,
+      t: "READY",
+      s: 42,
+      d: {
+        session_id: sessionId,
+        resume_gateway_url: "wss://resume.discord.gg",
+      },
+    });
+    assert.equal(client.sessionId, null, String(sessionId));
+    assert.equal(client.seq, null, String(sessionId));
+    assert.equal(client.resumeGatewayUrl, null, String(sessionId));
+
+    first.remoteClose(1006);
+    clearTimeout(client.reconnectTimer);
+    client.reconnectTimer = null;
+    client.connect();
+    assert.equal(
+      urls[1],
+      "wss://gateway.example/?v=10&encoding=json",
+      String(sessionId),
+    );
+
+    const bootstrap = sockets[1];
+    packet(bootstrap, {
+      op: 10,
+      t: null,
+      d: { heartbeat_interval: 60_000 },
+    });
+    assert.equal(bootstrap.sent[0].op, 2, String(sessionId));
     await client.stop();
   }
 });
