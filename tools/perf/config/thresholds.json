@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "throughput_min_ratio": 0.95,
+  "median_max_ratio": 1.05,
+  "startup_max_ratio": 1.05,
+  "p95_max_ratio": 1.10,
+  "p99_max_ratio": 1.10,
+  "rss_max_ratio": 1.10,
+  "size_max_ratio": 1.05,
+  "max_errors_below_capacity": 0
+}
+

@@ -1,0 +1,565 @@
+{
+  "definition_version": 1,
+  "defaults": {
+    "warmups": 1,
+    "repetitions": 6,
+    "timeout_seconds": 300
+  },
+  "suites": [
+    {
+      "id": "daemon",
+      "name": "Daemon local surfaces",
+      "description": "Credential-free probe, smoke readiness, and loopback HTTP health/readiness fixtures.",
+      "enabled_by_default": true,
+      "workloads": [
+        {
+          "id": "daemon-probe-startup",
+          "description": "Runs the production daemon's one-shot --probe path.",
+          "enabled_by_default": true,
+          "latency_class": "startup",
+          "network_policy": "none",
+          "command": [
+            "cargo",
+            "run",
+            "--locked",
+            "--quiet",
+            "-p",
+            "gta-claw-daemon",
+            "--",
+            "--probe"
+          ],
+          "environment": {
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TARGET_DIR": "{target_dir}",
+            "GTA_CLAW_LOG": "off"
+          },
+          "required_tools": ["cargo"],
+          "required_paths": ["Cargo.lock", "apps/gta-claw-daemon/Cargo.toml"],
+          "capacity": {
+            "value": 1,
+            "unit": "probe/invocation"
+          },
+          "operations_per_sample": 1,
+          "artifacts": [
+            {
+              "path": "{target_dir}/debug/gta-claw-daemon{exe_suffix}",
+              "required": true,
+              "executable_only": true
+            }
+          ]
+        },
+        {
+          "id": "daemon-smoke-readiness",
+          "description": "Runs the existing process fixture that starts smoke mode, observes readiness, and proves it remains supervised.",
+          "enabled_by_default": true,
+          "latency_class": "startup",
+          "network_policy": "loopback-only",
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "gta-claw-daemon",
+            "--test",
+            "process_lifecycle",
+            "normal_mode_remains_running_until_terminated",
+            "--",
+            "--exact"
+          ],
+          "environment": {
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TARGET_DIR": "{target_dir}"
+          },
+          "required_tools": ["cargo"],
+          "required_paths": ["Cargo.lock", "apps/gta-claw-daemon/tests/process_lifecycle.rs"],
+          "capacity": {
+            "value": 1,
+            "unit": "readiness-scenario/invocation"
+          },
+          "operations_per_sample": 1,
+          "artifacts": [
+            {
+              "path": "{target_dir}/debug/deps/process_lifecycle-*{exe_suffix}",
+              "required": true,
+              "executable_only": true
+            }
+          ]
+        },
+        {
+          "id": "daemon-http-health-readiness",
+          "description": "Runs the existing smoke provider fixture and checks /health, /ready, and the legacy loopback health route.",
+          "enabled_by_default": true,
+          "latency_class": "latency",
+          "network_policy": "loopback-only",
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "gta-claw-daemon",
+            "--test",
+            "production_composition",
+            "bound_http_is_ready_and_dispatches_to_the_composed_provider",
+            "--",
+            "--exact"
+          ],
+          "environment": {
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TARGET_DIR": "{target_dir}"
+          },
+          "required_tools": ["cargo"],
+          "required_paths": ["Cargo.lock", "apps/gta-claw-daemon/tests/production_composition.rs"],
+          "capacity": {
+            "value": 1,
+            "unit": "HTTP-fixture-scenario/invocation"
+          },
+          "operations_per_sample": 1,
+          "artifacts": [
+            {
+              "path": "{target_dir}/debug/deps/production_composition-*{exe_suffix}",
+              "required": true,
+              "executable_only": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "protocol",
+      "name": "MCP and ACP framing",
+      "description": "Existing local subprocess fixtures for bounded newline-delimited MCP and ACP framing.",
+      "enabled_by_default": true,
+      "workloads": [
+        {
+          "id": "mcp-stdio-framing",
+          "description": "Exercises the MCP stdio fixture's negotiation, framed requests, notifications, timeout, cancellation, and shutdown path.",
+          "enabled_by_default": true,
+          "latency_class": "latency",
+          "network_policy": "none",
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "claw-mcp",
+            "--test",
+            "stdio_interop",
+            "stdio_subprocess_negotiates_lists_calls_times_out_and_shuts_down",
+            "--",
+            "--exact"
+          ],
+          "environment": {
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TARGET_DIR": "{target_dir}"
+          },
+          "required_tools": ["cargo"],
+          "required_paths": ["Cargo.lock", "crates/claw-mcp/tests/fixtures/mcp_fixture.rs"],
+          "capacity": {
+            "value": 1,
+            "unit": "framing-scenario/invocation"
+          },
+          "operations_per_sample": 1,
+          "artifacts": [
+            {
+              "path": "{target_dir}/debug/deps/stdio_interop-*{exe_suffix}",
+              "required": true,
+              "executable_only": true
+            },
+            {
+              "path": "{target_dir}/debug/claw-mcp-fixture{exe_suffix}",
+              "required": true,
+              "executable_only": true
+            }
+          ]
+        },
+        {
+          "id": "acp-ndjson-framing",
+          "description": "Feeds three deterministic ACP frames through the existing subprocess fixture and verifies draining after EOF.",
+          "enabled_by_default": true,
+          "latency_class": "latency",
+          "network_policy": "none",
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "claw-acp",
+            "--test",
+            "subprocess_interop",
+            "bridge_drains_notifications_and_responses_after_input_eof",
+            "--",
+            "--exact"
+          ],
+          "environment": {
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TARGET_DIR": "{target_dir}"
+          },
+          "required_tools": ["cargo"],
+          "required_paths": ["Cargo.lock", "crates/claw-acp/tests/fixtures/acp_fixture.rs"],
+          "capacity": {
+            "value": 3,
+            "unit": "request-frames/invocation"
+          },
+          "operations_per_sample": 3,
+          "artifacts": [
+            {
+              "path": "{target_dir}/debug/deps/subprocess_interop-*{exe_suffix}",
+              "required": true,
+              "executable_only": true
+            },
+            {
+              "path": "{target_dir}/debug/claw-acp-fixture{exe_suffix}",
+              "required": true,
+              "executable_only": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "state",
+      "name": "Memory and goals",
+      "description": "Deterministic in-process memory planning and durable goal compaction fixtures.",
+      "enabled_by_default": true,
+      "workloads": [
+        {
+          "id": "memory-deterministic-planning",
+          "description": "Runs the existing pure-function context planning determinism fixture.",
+          "enabled_by_default": true,
+          "latency_class": "latency",
+          "network_policy": "none",
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "claw-memory",
+            "--test",
+            "memory_determinism",
+            "planning_is_a_pure_function_of_its_inputs",
+            "--",
+            "--exact"
+          ],
+          "environment": {
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TARGET_DIR": "{target_dir}"
+          },
+          "required_tools": ["cargo"],
+          "required_paths": ["Cargo.lock", "crates/claw-memory/tests/memory_determinism.rs"],
+          "capacity": {
+            "value": 3,
+            "unit": "planning-passes/invocation"
+          },
+          "operations_per_sample": 3,
+          "artifacts": [
+            {
+              "path": "{target_dir}/debug/deps/memory_determinism-*{exe_suffix}",
+              "required": true,
+              "executable_only": true
+            }
+          ]
+        },
+        {
+          "id": "goals-durable-compaction",
+          "description": "Runs the existing deterministic durable goal history compaction and reopen fixture.",
+          "enabled_by_default": true,
+          "latency_class": "latency",
+          "network_policy": "none",
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "claw-goals",
+            "--test",
+            "store_maintenance",
+            "closed_history_compaction_reclaims_bytes_without_reusing_goal_ids",
+            "--",
+            "--exact"
+          ],
+          "environment": {
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TARGET_DIR": "{target_dir}"
+          },
+          "required_tools": ["cargo"],
+          "required_paths": ["Cargo.lock", "crates/claw-goals/tests/store_maintenance.rs"],
+          "capacity": {
+            "value": 1,
+            "unit": "compaction-scenario/invocation"
+          },
+          "operations_per_sample": 1,
+          "artifacts": [
+            {
+              "path": "{target_dir}/debug/deps/store_maintenance-*{exe_suffix}",
+              "required": true,
+              "executable_only": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "desktop",
+      "name": "Slint software renderer",
+      "description": "The existing headless software-renderer product-screen smoke fixture.",
+      "enabled_by_default": true,
+      "workloads": [
+        {
+          "id": "slint-software-renderer-smoke",
+          "description": "Constructs onboarding and every product screen using Slint's isolated software renderer.",
+          "enabled_by_default": true,
+          "latency_class": "latency",
+          "network_policy": "none",
+          "platforms": ["darwin", "windows"],
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "--manifest-path",
+            "desktop/Cargo.toml",
+            "-p",
+            "gta-claw-desktop",
+            "software_renderer_smoke::software_renderer_constructs_onboarding_and_every_product_screen",
+            "--",
+            "--exact"
+          ],
+          "environment": {
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TARGET_DIR": "{target_dir}"
+          },
+          "required_tools": ["cargo"],
+          "required_paths": ["desktop/Cargo.lock", "desktop/apps/gta-claw-desktop/src/software_renderer_smoke.rs"],
+          "capacity": {
+            "value": 1,
+            "unit": "full-screen-render-scenario/invocation"
+          },
+          "operations_per_sample": 1,
+          "timeout_seconds": 600,
+          "artifacts": [
+            {
+              "path": "{target_dir}/debug/deps/gta_claw_desktop-*{exe_suffix}",
+              "required": true,
+              "executable_only": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "node",
+      "name": "Legacy Node local fixture",
+      "description": "A deterministic local fixture over the existing splitMessage implementation; requires an already-installed root node_modules directory.",
+      "enabled_by_default": true,
+      "workloads": [
+        {
+          "id": "node-split-message-fixture",
+          "description": "Builds into an isolated target once, then runs 10,000 deterministic splitMessage calls without credentials or network.",
+          "enabled_by_default": true,
+          "latency_class": "latency",
+          "network_policy": "none",
+          "prepare_command": [
+            "node",
+            "node_modules/typescript/bin/tsc",
+            "--project",
+            "tsconfig.json",
+            "--outDir",
+            "{target_dir}/node-dist"
+          ],
+          "command": [
+            "node",
+            "--no-node-snapshot",
+            "--input-type=module",
+            "--eval",
+            "import { pathToFileURL } from 'node:url'; const { splitMessage } = await import(pathToFileURL(process.env.GTA_CLAW_PERF_NODE_FIXTURE).href); const text = 'alpha beta gamma\\n'.repeat(64); let chunks = 0; for (let i = 0; i < 10000; i += 1) chunks += splitMessage(text, 160).length; if (chunks <= 0) process.exit(2);"
+          ],
+          "environment": {
+            "GTA_CLAW_PERF_NODE_FIXTURE": "{target_dir}/node-dist/utils/splitMessage.js",
+            "npm_config_offline": "true",
+            "npm_config_audit": "false",
+            "npm_config_fund": "false"
+          },
+          "links": [
+            {
+              "source": "{repo}/node_modules",
+              "target": "node_modules",
+              "required": true
+            }
+          ],
+          "required_tools": ["node"],
+          "required_link_paths": ["node_modules/typescript/bin/tsc"],
+          "required_paths": ["package-lock.json", "src/utils/splitMessage.ts"],
+          "capacity": {
+            "value": 10000,
+            "unit": "messages/invocation"
+          },
+          "operations_per_sample": 10000,
+          "artifacts": [
+            {
+              "path": "{target_dir}/node-dist/utils/splitMessage.js",
+              "required": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "build",
+      "name": "Opt-in build timing hooks",
+      "description": "Resource-intensive clean and no-op build hooks. This suite is disabled unless selected explicitly.",
+      "enabled_by_default": false,
+      "workloads": [
+        {
+          "id": "rust-workspace-cold-build",
+          "description": "Builds the root Rust workspace into a fresh per-sample target directory.",
+          "enabled_by_default": false,
+          "latency_class": "latency",
+          "network_policy": "none",
+          "target_scope": "sample",
+          "warmups": 0,
+          "command": ["cargo", "build", "--locked", "--workspace"],
+          "environment": {
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TARGET_DIR": "{target_dir}"
+          },
+          "required_tools": ["cargo"],
+          "required_paths": ["Cargo.lock", "Cargo.toml"],
+          "capacity": {
+            "value": 1,
+            "unit": "workspace-build/invocation"
+          },
+          "operations_per_sample": 1,
+          "timeout_seconds": 3600,
+          "artifacts": [
+            {
+              "path": "{target_dir}/debug/gta-claw-daemon{exe_suffix}",
+              "required": true,
+              "executable_only": true
+            }
+          ]
+        },
+        {
+          "id": "rust-workspace-noop-build",
+          "description": "Builds once during preparation, then times an unchanged root workspace build against the same target directory.",
+          "enabled_by_default": false,
+          "latency_class": "latency",
+          "network_policy": "none",
+          "prepare_command": ["cargo", "build", "--locked", "--workspace"],
+          "command": ["cargo", "build", "--locked", "--workspace"],
+          "environment": {
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TARGET_DIR": "{target_dir}"
+          },
+          "required_tools": ["cargo"],
+          "required_paths": ["Cargo.lock", "Cargo.toml"],
+          "capacity": {
+            "value": 1,
+            "unit": "no-op-workspace-build/invocation"
+          },
+          "operations_per_sample": 1,
+          "timeout_seconds": 3600,
+          "artifacts": [
+            {
+              "path": "{target_dir}/debug/gta-claw-daemon{exe_suffix}",
+              "required": true,
+              "executable_only": true
+            }
+          ]
+        },
+        {
+          "id": "node-cold-build",
+          "description": "Runs the existing TypeScript compiler into a fresh per-sample output directory.",
+          "enabled_by_default": false,
+          "latency_class": "latency",
+          "network_policy": "none",
+          "target_scope": "sample",
+          "warmups": 0,
+          "command": [
+            "node",
+            "node_modules/typescript/bin/tsc",
+            "--project",
+            "tsconfig.json",
+            "--outDir",
+            "{target_dir}/node-dist"
+          ],
+          "environment": {
+            "npm_config_offline": "true",
+            "npm_config_audit": "false",
+            "npm_config_fund": "false"
+          },
+          "links": [
+            {
+              "source": "{repo}/node_modules",
+              "target": "node_modules",
+              "required": true
+            }
+          ],
+          "required_tools": ["node"],
+          "required_link_paths": ["node_modules/typescript/bin/tsc"],
+          "required_paths": ["package-lock.json", "tsconfig.json"],
+          "capacity": {
+            "value": 1,
+            "unit": "TypeScript-build/invocation"
+          },
+          "operations_per_sample": 1,
+          "timeout_seconds": 1800,
+          "artifacts": [
+            {
+              "path": "{target_dir}/node-dist/index.js",
+              "required": true
+            }
+          ]
+        },
+        {
+          "id": "node-existing-output-build",
+          "description": "Builds once during preparation, then times the existing non-incremental TypeScript build over unchanged output.",
+          "enabled_by_default": false,
+          "latency_class": "latency",
+          "network_policy": "none",
+          "prepare_command": [
+            "node",
+            "node_modules/typescript/bin/tsc",
+            "--project",
+            "tsconfig.json",
+            "--outDir",
+            "{target_dir}/node-dist"
+          ],
+          "command": [
+            "node",
+            "node_modules/typescript/bin/tsc",
+            "--project",
+            "tsconfig.json",
+            "--outDir",
+            "{target_dir}/node-dist"
+          ],
+          "environment": {
+            "npm_config_offline": "true",
+            "npm_config_audit": "false",
+            "npm_config_fund": "false"
+          },
+          "links": [
+            {
+              "source": "{repo}/node_modules",
+              "target": "node_modules",
+              "required": true
+            }
+          ],
+          "required_tools": ["node"],
+          "required_link_paths": ["node_modules/typescript/bin/tsc"],
+          "required_paths": ["package-lock.json", "tsconfig.json"],
+          "capacity": {
+            "value": 1,
+            "unit": "unchanged-output-TypeScript-build/invocation"
+          },
+          "operations_per_sample": 1,
+          "timeout_seconds": 1800,
+          "artifacts": [
+            {
+              "path": "{target_dir}/node-dist/index.js",
+              "required": true
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

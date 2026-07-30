@@ -1,0 +1,242 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/GTAStudio/GTA-Claw/main/tools/perf/schema/v1/perf-run.schema.json",
+  "title": "GTA-Claw local performance run",
+  "description": "Version 1 contract for exact run metadata, raw samples, and comparison summaries.",
+  "x-gta-claw-schema-version": 1,
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "run_id",
+    "status",
+    "created_at",
+    "updated_at",
+    "metadata",
+    "workloads",
+    "raw_samples",
+    "summary"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "https://raw.githubusercontent.com/GTAStudio/GTA-Claw/main/tools/perf/schema/v1/perf-run.schema.json"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "enum": ["running", "completed", "interrupted", "failed"]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    },
+    "workloads": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/workload"
+      }
+    },
+    "raw_samples": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/sample"
+      }
+    },
+    "summary": {
+      "$ref": "#/$defs/summary"
+    }
+  },
+  "$defs": {
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "harness",
+        "repository",
+        "toolchains",
+        "environment",
+        "configuration",
+        "thresholds"
+      ],
+      "properties": {
+        "harness": {
+          "type": "object"
+        },
+        "repository": {
+          "type": "object"
+        },
+        "toolchains": {
+          "type": "array"
+        },
+        "environment": {
+          "type": "object"
+        },
+        "configuration": {
+          "type": "object"
+        },
+        "thresholds": {
+          "type": "object"
+        }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "suite_id",
+        "id",
+        "description",
+        "command",
+        "capacity",
+        "operations_per_sample",
+        "availability"
+      ],
+      "properties": {
+        "suite_id": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "capacity": {
+          "type": "object",
+          "required": ["value", "unit"],
+          "properties": {
+            "value": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "unit": {
+              "type": "string"
+            }
+          }
+        },
+        "operations_per_sample": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "availability": {
+          "type": "object"
+        }
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["argv", "cwd", "environment"],
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "environment": {
+          "type": "object"
+        }
+      }
+    },
+    "sample": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "sample_id",
+        "slot_id",
+        "phase",
+        "variant",
+        "suite_id",
+        "workload_id",
+        "status",
+        "command"
+      ],
+      "properties": {
+        "sample_id": {
+          "type": "string"
+        },
+        "slot_id": {
+          "type": "string"
+        },
+        "phase": {
+          "enum": ["prepare", "warmup", "measure"]
+        },
+        "variant": {
+          "enum": ["reference", "candidate"]
+        },
+        "suite_id": {
+          "type": "string"
+        },
+        "workload_id": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "running",
+            "success",
+            "error",
+            "timeout",
+            "interrupted",
+            "blocked"
+          ]
+        },
+        "command": {
+          "$ref": "#/$defs/command"
+        },
+        "wall_time_seconds": {
+          "type": ["number", "null"],
+          "minimum": 0
+        },
+        "max_rss_bytes": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "artifacts": {
+          "type": "array"
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["status", "workloads"],
+      "properties": {
+        "status": {
+          "enum": [
+            "NOT_COMPARED",
+            "PASS",
+            "FAIL",
+            "BLOCKED",
+            "INTERRUPTED"
+          ]
+        },
+        "workloads": {
+          "type": "array"
+        }
+      }
+    }
+  }
+}
