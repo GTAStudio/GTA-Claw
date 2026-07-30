@@ -50,22 +50,7 @@ pub(crate) async fn read_body(
     max_bytes: usize,
     body_timeout: Duration,
 ) -> Result<Bytes, ApiError> {
-    let bytes = timeout(body_timeout, to_bytes(request.into_body(), max_bytes))
-        .await
-        .map_err(|_| {
-            ApiError::openai(
-                StatusCode::REQUEST_TIMEOUT,
-                "Request body timeout",
-                "invalid_request_error",
-            )
-        })?
-        .map_err(|_| {
-            ApiError::openai(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "Payload too large",
-                "invalid_request_error",
-            )
-        })?;
+    let bytes = read_raw_body(request, max_bytes, body_timeout).await?;
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Err(ApiError::openai(
             StatusCode::BAD_REQUEST,
@@ -76,11 +61,11 @@ pub(crate) async fn read_body(
     Ok(bytes)
 }
 
-pub(crate) async fn drain_request_body(
+pub(crate) async fn read_raw_body(
     request: Request,
     max_bytes: usize,
     body_timeout: Duration,
-) -> Result<(), ApiError> {
+) -> Result<Bytes, ApiError> {
     timeout(body_timeout, to_bytes(request.into_body(), max_bytes))
         .await
         .map_err(|_| {
@@ -96,7 +81,15 @@ pub(crate) async fn drain_request_body(
                 "Payload too large",
                 "invalid_request_error",
             )
-        })?;
+        })
+}
+
+pub(crate) async fn drain_request_body(
+    request: Request,
+    max_bytes: usize,
+    body_timeout: Duration,
+) -> Result<(), ApiError> {
+    read_raw_body(request, max_bytes, body_timeout).await?;
     Ok(())
 }
 

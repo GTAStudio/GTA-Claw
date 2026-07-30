@@ -24,8 +24,8 @@ use super::ports::{
 use super::rate_limit::RateLimiter;
 use crate::auth::bearer_token;
 use crate::http_support::{
-    CancelOnDrop, close_connection_response, drain_request_body, json_response, read_body,
-    read_json_value, rejected_response,
+    CancelOnDrop, close_connection_response, drain_request_body, json_response, read_json_value,
+    read_raw_body, rejected_response,
 };
 use crate::{PortError, PortErrorKind, ServingStatePort};
 
@@ -452,7 +452,7 @@ async fn whatsapp_incoming(State(state): State<LegacyState>, request: Request) -
         )
         .await;
     };
-    let payload = match read_legacy_body(&state, request).await {
+    let payload = match read_legacy_raw_body(&state, request).await {
         Ok(payload) => payload,
         Err(response) => return response,
     };
@@ -815,8 +815,8 @@ async fn read_legacy_json(state: &LegacyState, request: Request) -> Result<Value
     })
 }
 
-async fn read_legacy_body(state: &LegacyState, request: Request) -> Result<Bytes, Response> {
-    read_body(
+async fn read_legacy_raw_body(state: &LegacyState, request: Request) -> Result<Bytes, Response> {
+    read_raw_body(
         request,
         state.inner.config.limits.body_bytes,
         state.inner.config.limits.body_timeout,

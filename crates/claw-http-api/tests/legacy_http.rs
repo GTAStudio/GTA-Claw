@@ -1107,6 +1107,65 @@ async fn whatsapp_webhook_authenticates_bounded_raw_bytes_before_parse_and_scope
 }
 
 #[tokio::test]
+async fn whatsapp_empty_and_whitespace_bodies_authenticate_before_parse() {
+    let fixtures = Fixtures::new(true);
+    let mut config = LegacyApiConfig::default();
+    config.channels.set_whatsapp(true);
+    config.whatsapp = Some(
+        LegacyWhatsAppConfig::new("/whatsapp/webhook", "fixture-token").expect("valid webhook"),
+    );
+    let server = spawn(config, fixtures.services()).await;
+    let bodies = [b"".as_slice(), b" \t\r\n".as_slice()];
+
+    for body in bodies {
+        let unsigned = request(
+            &server,
+            "POST",
+            "/whatsapp/webhook",
+            None,
+            &[("Content-Type", "application/json")],
+            body,
+        )
+        .await;
+        assert_eq!(unsigned.status, 403);
+    }
+    assert_eq!(
+        fixtures.whatsapp.signature_calls.load(Ordering::Acquire),
+        0,
+        "unsigned bodies must not reach HMAC verification"
+    );
+
+    for body in bodies {
+        let signed = signed_whatsapp_bytes(&server, body).await;
+        assert_eq!(signed.status, 400);
+        assert_eq!(signed.json(), json!({"error":"Webhook handling failed"}));
+    }
+    assert_eq!(fixtures.whatsapp.signature_calls.load(Ordering::Acquire), 2);
+    {
+        let payloads = fixtures
+            .whatsapp
+            .signature_payloads
+            .lock()
+            .expect("signature payloads");
+        assert_eq!(payloads.as_slice(), [Vec::new(), b" \t\r\n".to_vec()]);
+        drop(payloads);
+    }
+    assert_eq!(
+        fixtures.whatsapp.webhook_calls.load(Ordering::Acquire),
+        0,
+        "empty and whitespace JSON must fail before stateful processing"
+    );
+    assert!(
+        fixtures
+            .messages
+            .received
+            .lock()
+            .expect("messages")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn legacy_facade_exposes_readiness_and_refuses_new_work_while_draining() {
     let fixtures = Fixtures::new(true);
     let serving = ServingStateHandle::serving();
