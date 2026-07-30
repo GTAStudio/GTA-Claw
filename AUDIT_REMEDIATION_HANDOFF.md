@@ -40,7 +40,7 @@ rebase onto current `main`, independently review, and validate before publicatio
 | Legacy / PR #227 | `handoff/2026-07-30-0840/legacy-pr227-final` | `3dafa9d3adaebd9628c0c46c630db66934ef9152` | `e6c7692f8bcb5b55cd8c3c89cca418ceeb80eade` |
 | Updater / PR #236 | `handoff/2026-07-30-0833/updater-pr236` | `efae570296e36c8c20ba4eca2c09e6dd62a9bce6` | `0f31d8eaf71f16724407489ade364263e6b20f9a` |
 | Local performance harness | `handoff/2026-07-30-0833/local-perf-harness` | `3b1b76972fd3b0b181c1a8b564ed40d8e3a4f39c` | `4ef4d921e5301bc34a436d416b913cbb0f65f83c` |
-| Durable-memory port | `handoff/2026-07-30-0833/durable-memory-port` | `4f4455f3d7e5290d94697a2393996ef05488e4e3` | `d2493b07b7c064bd8b72c836852c4ae1617b56f5` |
+| Durable-memory port | `handoff/2026-07-30-0904/durable-memory-terminated` | `8f1eb5ec4f17f50e952ad6683a4e3684344d6142` | `4f4455f3d7e5290d94697a2393996ef05488e4e3` |
 | Packaging / PR #233 | `handoff/2026-07-30-0901/packaging-pr233-terminated` | `a9301965e6b10c24be75bfafe359577afc0b20a4` | `b0d2b49fd1a2f00717c38a9c4809b3217871465b` |
 | Daemon / PR #232 | `handoff/2026-07-30-0833/daemon-pr232` | `1bfe93661dd959702732d672f80be57bca6ccd1a` | `97b19df94799974167bb1c193833e2d1efeaeb26` |
 | Plugin / PR #235 | `handoff/2026-07-30-0901/plugin-pr235-terminated` | `7d17a15598497334c409262d3e108dbc0abd81c4` | `517810ff524aacc2c31b04a088f935f95c9c9ecb` |
@@ -63,9 +63,9 @@ Their `-final` refs are successor commits whose parents are the earlier snapshot
 Those raced edits were not reviewed or tested.
 
 The new Trusted A1 and compat-oracle sessions also wrote after the first inventory.
-Their final refs are independent snapshots. In total, 33 handoff refs exist: the 19
-final table entries plus fourteen predecessor refs in the Legacy, Packaging,
-Discovery, Compat, Plugin, and Trusted successor chains.
+Their final refs are independent snapshots. In total, 34 handoff refs exist: the 19
+final table entries plus fifteen predecessor refs in the Legacy, Packaging, Discovery,
+Compat, Plugin, Durable Memory, and Trusted successor chains.
 
 ### Current open PR inventory
 
@@ -202,7 +202,9 @@ not merged from their stale heads:
       threshold direction/units, honest BLOCKED reporting, then validate locally.
 
 11. **Historical ports**
-    - Durable memory is partially implemented in its snapshot.
+    - Durable memory is partially implemented in its snapshot. Its final Cargo,
+      persistence, durable-state, transcript, and test edits completed before the
+      owner CLI was terminated and remain unreviewed.
     - Discovery/fleet is partially implemented in its snapshot. A one-line
       `dns_sd.rs` change raced the stop and is unreviewed.
     - Durable state stopped before writing files.
