@@ -325,7 +325,14 @@ fn apply_mappings(
                 wire.core.server.public_domain = default_when_empty(value, "localhost");
             }
             MappingId::AutoUpdate => {
-                wire.core.updates.enabled = parse_bool(mapping, value)?;
+                let enabled = parse_bool(mapping, value)?;
+                if enabled {
+                    return Err(invalid(
+                        mapping,
+                        "true is unsupported because dependency updates are review-only",
+                    ));
+                }
+                wire.core.updates.enabled = false;
             }
             MappingId::AdminToken => {
                 wire.core.admin.bearer_token = secret_reference(mapping, name, value, false)?;

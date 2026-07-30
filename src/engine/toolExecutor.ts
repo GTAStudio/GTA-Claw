@@ -24,11 +24,15 @@ interface RegisteredSkill {
 export function selectIsolationMode(
   isolatedVmAvailable: boolean,
   nodeEnvironment = process.env["NODE_ENV"],
+  reducedIsolationOptIn = process.env["GTA_CLAW_ALLOW_REDUCED_ISOLATION"],
 ): "isolated-vm" | "node-vm" {
   if (isolatedVmAvailable) return "isolated-vm";
-  if (nodeEnvironment === "production") {
+  if (
+    nodeEnvironment !== "development" ||
+    reducedIsolationOptIn !== "true"
+  ) {
     throw new Error(
-      "isolated-vm is required in production; node:vm provides reduced isolation and is development-only",
+      "isolated-vm is required; reduced node:vm isolation requires NODE_ENV=development and GTA_CLAW_ALLOW_REDUCED_ISOLATION=true",
     );
   }
   return "node-vm";
@@ -52,7 +56,7 @@ export class ToolExecutor {
       logger.info("ToolExecutor using isolated-vm backend");
     } else {
       logger.warn(
-        "isolated-vm not available; using the development-only node:vm backend with reduced isolation",
+        "isolated-vm not available; using explicitly enabled development-only node:vm isolation",
       );
     }
   }

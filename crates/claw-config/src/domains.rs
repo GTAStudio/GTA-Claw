@@ -1076,7 +1076,16 @@ fn apply_source_environment(
                 Value::from(parse_environment_u64(name, value, minimum, maximum)?)
             }
             "AUTO_UPDATE" | "ENABLE_TEAMS" | "ENABLE_TELEGRAM" | "ENABLE_DISCORD"
-            | "ENABLE_WHATSAPP" => Value::Bool(parse_environment_bool(name, value)?),
+            | "ENABLE_WHATSAPP" => {
+                let enabled = parse_environment_bool(name, value)?;
+                if name == "AUTO_UPDATE" && enabled {
+                    return Err(environment_layer_error(
+                        name,
+                        "true is unsupported because dependency updates are review-only",
+                    ));
+                }
+                Value::Bool(enabled)
+            }
             "LOG_LEVEL" => Value::String(parse_environment_log_level(name, value)?),
             _ => Value::String(value.clone()),
         };

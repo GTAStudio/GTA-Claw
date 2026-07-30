@@ -124,11 +124,18 @@ pub(crate) fn ensure_same_contract(
     canonical: &Contract,
     candidate: &Contract,
 ) -> Result<(), String> {
-    if canonical == candidate {
+    let canonical_bytes = canonical_contract_bytes(canonical)?;
+    let candidate_bytes = canonical_contract_bytes(candidate)?;
+    if canonical_bytes == candidate_bytes {
         Ok(())
     } else {
         Err(first_difference(canonical, candidate))
     }
+}
+
+pub(crate) fn canonical_contract_bytes(contract: &Contract) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(contract)
+        .map_err(|error| format!("serialize mapping contract to canonical JSON bytes: {error}"))
 }
 
 fn first_difference(canonical: &Contract, candidate: &Contract) -> String {

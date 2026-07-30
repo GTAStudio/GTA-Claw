@@ -6,37 +6,53 @@ on:
       - main
     paths:
       - ".cargo/**"
+      - ".env.example"
       - ".gitattributes"
       - ".github/fixtures/cargo-audit/**"
       - ".github/fixtures/security-tools/**"
       - ".github/workflows/macos-packaging.yml"
       - ".github/workflows/rust.yml"
       - "apps/**"
+      - "compat/**"
       - "crates/**"
       - "desktop/**"
+      - "src/**"
+      - "test/**"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "Dockerfile"
       - ".deny*.toml"
       - "deny*.toml"
+      - "package-lock.json"
+      - "package.json"
       - "rust-toolchain.toml"
       - "rustfmt.toml"
+      - "tsconfig.json"
   pull_request:
     paths:
       - ".cargo/**"
+      - ".env.example"
       - ".gitattributes"
       - ".github/fixtures/cargo-audit/**"
       - ".github/fixtures/security-tools/**"
       - ".github/workflows/macos-packaging.yml"
       - ".github/workflows/rust.yml"
       - "apps/**"
+      - "compat/**"
       - "crates/**"
       - "desktop/**"
+      - "src/**"
+      - "test/**"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "Dockerfile"
       - ".deny*.toml"
       - "deny*.toml"
+      - "package-lock.json"
+      - "package.json"
       - "rust-toolchain.toml"
       - "rustfmt.toml"
+      - "tsconfig.json"
   workflow_dispatch:
 
 permissions:
@@ -78,11 +94,22 @@ jobs:
       - name: Validate locked Python compatibility policy
         if: runner.os == 'Linux'
         run: |
+          source_revision="$(
+            python3 -c 'import json; print(json.load(open("compat/legacy/contract.json", encoding="utf-8"))["source_revision"])'
+          )"
+          if ! [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "compatibility source_revision must be an exact lowercase commit SHA"
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "$source_revision"
+          test "$(git rev-parse FETCH_HEAD)" = "$source_revision"
+          git cat-file -e "${source_revision}^{commit}"
           python3 -m pip install \
             --disable-pip-version-check \
             --only-binary=:all: \
             --require-hashes \
             --requirement compat/legacy/scripts/requirements.txt
+          python3 -m pip check
           python3 compat/legacy/scripts/validate.py
 
       - name: Check workspace
@@ -181,6 +208,16 @@ jobs:
       - name: Check desktop workspace at MSRV
         run: cargo +1.94.0 check --manifest-path desktop/Cargo.toml --workspace --all-targets --locked
 
+      - name: Check Windows ARM64 desktop target at MSRV
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup target add --toolchain 1.94.0 aarch64-pc-windows-msvc
+          cargo +1.94.0 check --manifest-path desktop/Cargo.toml `
+            --package gta-claw-desktop --all-targets `
+            --target aarch64-pc-windows-msvc --locked
+
       - name: Check workspace
         run: cargo check --manifest-path desktop/Cargo.toml --workspace --all-targets --locked
 
@@ -231,21 +268,7 @@ jobs:
             echo "Desktop build unexpectedly succeeded on Linux"
             exit 1
           fi
-          grep -F "gta-claw-desktop supports only Windows and macOS" <<<"$output"
-
-      - name: Assert desktop cross builds fail before UI compilation
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustup target add x86_64-pc-windows-msvc
-          set +e
-          output=$(cargo check --manifest-path desktop/Cargo.toml \
-            --package gta-claw-desktop --target x86_64-pc-windows-msvc --locked 2>&1)
-          status=$?
-          set -e
-          printf '%s\n' "$output"
-          test "$status" -ne 0
-          grep -F "requires native builds with matching host and target triples" <<<"$output"
+          grep -F "requires a Windows or macOS build host" <<<"$output"
 
   supply-chain:
     name: Supply chain
@@ -514,7 +537,7 @@ jobs:
           set +e
           rejected_output="$(
             "$deny_runner" --manifest-path "$fixture/Cargo.toml" \
-              --config "$fixture/deny.toml" --locked check licenses 2>&1
+              check --config "$fixture/deny.toml" --locked licenses 2>&1
           )"
           rejected_status=$?
           set -e
@@ -528,7 +551,7 @@ jobs:
           ]
           EOF
           "$deny_runner" --manifest-path "$fixture/Cargo.toml" \
-            --config "$fixture/deny.toml" --locked check licenses
+            check --config "$fixture/deny.toml" --locked licenses
           rm "$fixture/deny.exceptions.toml"
 
           mkdir -p "$fixture/late/src"
@@ -548,7 +571,7 @@ jobs:
           set +e
           stale_output="$(
             "$deny_runner" --manifest-path "$fixture/Cargo.toml" \
-              --config "$fixture/deny.toml" --locked check licenses 2>&1
+              check --config "$fixture/deny.toml" --locked licenses 2>&1
           )"
           stale_status=$?
           set -e
@@ -560,15 +583,15 @@ jobs:
         run: >-
           "${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-deny-clean"
           --manifest-path "${{ github.workspace }}/Cargo.toml"
-          --config "${{ github.workspace }}/deny.toml"
-          --locked --all-features check
+          check --config "${{ github.workspace }}/deny.toml"
+          --locked --all-features
 
       - name: Check shipped desktop dependency policy
         run: >-
           "${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-deny-clean"
-          --config "${{ github.workspace }}/desktop/deny.toml"
-          --manifest-path "${{ github.workspace }}/desktop/Cargo.toml" --locked
-          --all-features check --warn unmaintained
+          --manifest-path "${{ github.workspace }}/desktop/Cargo.toml"
+          check --config "${{ github.workspace }}/desktop/deny.toml"
+          --locked --all-features --warn unmaintained
 
       - name: Assert shipped desktop trees exclude Skia
         shell: bash
@@ -622,8 +645,8 @@ jobs:
             output="$(
               "$deny_runner" \
                 --manifest-path "${{ github.workspace }}/desktop/Cargo.toml" \
-                --config "${{ github.workspace }}/desktop/deny.toml" \
-                --locked --target "$target" check bans 2>&1
+                check --config "${{ github.workspace }}/desktop/deny.toml" \
+                --locked --target "$target" bans 2>&1
             )"
             status=$?
             set -e

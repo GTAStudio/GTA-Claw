@@ -92,6 +92,33 @@ fn rejects_invalid_boolean_and_range_values() {
 }
 
 #[test]
+fn rejects_legacy_auto_update_enablement() {
+    let mut environment = minimum_environment();
+    environment.push(("AUTO_UPDATE", "true"));
+
+    let error =
+        migrate_legacy_environment(environment).expect_err("automatic mutation must fail closed");
+    assert!(matches!(
+        error,
+        MigrationError::InvalidValue {
+            legacy_env: "AUTO_UPDATE",
+            target: "updates.enabled",
+            ..
+        }
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("dependency updates are review-only")
+    );
+
+    let mut disabled = minimum_environment();
+    disabled.push(("AUTO_UPDATE", "false"));
+    let result = migrate_legacy_environment(disabled).expect("explicit disable remains supported");
+    assert!(!result.config.core().updates().enabled());
+}
+
+#[test]
 fn matches_number_parse_int_whitespace_and_reports_overflow() {
     let mut whitespace = minimum_environment();
     whitespace.push(("PORT", " \t3978rest"));

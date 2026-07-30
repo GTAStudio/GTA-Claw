@@ -596,6 +596,14 @@ pub struct UpdatesConfig {
     pub(crate) enabled: bool,
 }
 
+impl UpdatesConfig {
+    /// Returns whether signed update checks are enabled.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
 /// Administrator route settings.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminConfig {

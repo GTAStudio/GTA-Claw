@@ -37,7 +37,7 @@ env:
 jobs:
   policy:
     name: iOS source and dependency policy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -67,10 +67,22 @@ jobs:
         shell: bash
         run: ./ios/scripts/workflow-self-test.sh
 
-      - name: Check iOS host workspace at MSRV
+      - name: Install pinned Linux host renderer prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libfontconfig-dev=2.15.0-1.1ubuntu2 \
+            pkgconf=1.8.1-2build1
+
+      - name: Check iOS Linux host graph at MSRV
         run: |
           rustup toolchain install 1.94.0 --profile minimal
           cargo +1.94.0 check --manifest-path ios/Cargo.toml --workspace --all-targets --locked
+
+      - name: Check iOS Linux host dependency policy
+        run: >-
+          cargo deny --manifest-path ios/Cargo.toml --config ios/deny.toml
+          --locked --all-features --target x86_64-unknown-linux-gnu check
 
       - name: Check iOS dependency policy
         run: cargo deny --manifest-path ios/Cargo.toml --config ios/deny.toml --locked --all-features check

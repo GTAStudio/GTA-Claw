@@ -5,7 +5,9 @@ mod build_support;
 
 use std::path::PathBuf;
 
-use build_support::{Contract, ensure_same_contract, load_contract, validate_contract};
+use build_support::{
+    Contract, canonical_contract_bytes, ensure_same_contract, load_contract, validate_contract,
+};
 
 #[test]
 fn workspace_and_packaged_contracts_match_completely() {
@@ -19,6 +21,26 @@ fn workspace_and_packaged_contracts_match_completely() {
     }
     let workspace = load_contract(&manifest.join("../../compat/legacy/config/env-mapping.json"));
     validate_contract(&workspace).expect("workspace contract is structurally valid");
+    assert_eq!(
+        canonical_contract_bytes(&packaged).expect("canonical packaged bytes"),
+        canonical_contract_bytes(&workspace).expect("canonical workspace bytes"),
+        "build inputs must have identical canonical bytes"
+    );
+    let auto_update = packaged
+        .mappings
+        .iter()
+        .find(|mapping| mapping.legacy_env == "AUTO_UPDATE")
+        .expect("AUTO_UPDATE mapping");
+    assert_eq!(
+        auto_update.validation,
+        "Boolean; true is rejected because dependency updates are review-only."
+    );
+    assert!(
+        auto_update
+            .known_legacy_quirk
+            .as_deref()
+            .is_some_and(|value| value.contains("AUTO_UPDATE=true fails"))
+    );
     ensure_same_contract(&packaged, &workspace).expect("contracts must match");
 }
 

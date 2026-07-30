@@ -834,6 +834,25 @@ fn source_environment_projection_uses_typed_references_and_cli_wins() {
         other => panic!("expected environment layer validation, got {other}"),
     }
 
+    let auto_update = OpenClawConfigLayers::new()
+        .with_environment([("AUTO_UPDATE", "true")])
+        .resolve()
+        .expect_err("automatic mutation must fail closed");
+    match auto_update {
+        LayeredConfigError::Layer {
+            layer,
+            error: ConfigError::Validation { path, message },
+        } => {
+            assert_eq!(layer, ConfigLayerKind::Environment);
+            assert_eq!(path, "AUTO_UPDATE");
+            assert_eq!(
+                message,
+                "true is unsupported because dependency updates are review-only"
+            );
+        }
+        other => panic!("expected AUTO_UPDATE environment validation, got {other}"),
+    }
+
     let out_of_range = OpenClawConfigLayers::new()
         .with_environment([("TELEGRAM_POLL_INTERVAL_MS", "499ms")])
         .resolve()

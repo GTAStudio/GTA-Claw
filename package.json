@@ -7,7 +7,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node --no-node-snapshot dist/index.js",
-    "dev": "node --no-node-snapshot --loader ts-node/esm src/index.ts"
+    "dev": "node --no-node-snapshot --loader ts-node/esm src/index.ts",
+    "test:isolation-policy": "node --input-type=module --eval \"const assert = (await import('node:assert/strict')).default; const { selectIsolationMode } = await import('./dist/engine/toolExecutor.js'); delete process.env.NODE_ENV; delete process.env.GTA_CLAW_ALLOW_REDUCED_ISOLATION; assert.equal(selectIsolationMode(true), 'isolated-vm'); assert.throws(() => selectIsolationMode(false), /isolated-vm is required/); for (const [environment, optIn] of [['production', 'true'], ['development', ''], ['development', 'TRUE']]) assert.throws(() => selectIsolationMode(false, environment, optIn), /isolated-vm is required/); assert.equal(selectIsolationMode(false, 'development', 'true'), 'node-vm');\""
   },
   "dependencies": {
     "@github/copilot-sdk": "1.0.8",

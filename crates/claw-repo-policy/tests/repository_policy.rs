@@ -589,58 +589,71 @@ fn legacy_node_supply_chain_rejects_mutable_or_uncoupled_inputs() {
         );
     }
 
-    let mutable_package = package.replace(
-        "\"@github/copilot-sdk\": \"1.0.8\"",
-        "\"@github/copilot-sdk\": \"^1.0.8\"",
-    );
-    assert!(
-        legacy_node_supply_chain_violations(&mutable_package, &lock, &docker)
-            .iter()
-            .any(|violation| violation.contains("exact versions")),
-        "mutable package constraint unexpectedly passed"
-    );
+    for mutable in [
+        "^1.0.8",
+        "~1.0.8",
+        "latest",
+        "https://example.test/copilot-sdk.tgz",
+        "git+https://example.test/copilot-sdk.git",
+        "file:../copilot-sdk",
+    ] {
+        let mutable_package = package.replace(
+            "\"@github/copilot-sdk\": \"1.0.8\"",
+            &format!("\"@github/copilot-sdk\": \"{mutable}\""),
+        );
+        assert!(
+            legacy_node_supply_chain_violations(&mutable_package, &lock, &docker)
+                .iter()
+                .any(|violation| violation.contains("exact versions")),
+            "mutable package constraint unexpectedly passed: {mutable}"
+        );
+    }
 }
 
 #[test]
-fn legacy_runtime_updates_and_production_isolation_fail_closed() {
+fn legacy_runtime_updates_and_reduced_isolation_fail_closed() {
     let root = workspace_root();
+    let package = fs::read_to_string(root.join("package.json")).expect("read Node package");
     let config = fs::read_to_string(root.join("src/config.ts")).expect("read runtime config");
     let executor =
         fs::read_to_string(root.join("src/engine/toolExecutor.ts")).expect("read tool executor");
     let updater =
         fs::read_to_string(root.join("src/updater/sdkUpdater.ts")).expect("read SDK updater");
     assert!(
-        legacy_runtime_source_violations(&config, &executor, &updater).is_empty(),
+        legacy_runtime_source_violations(&package, &config, &executor, &updater).is_empty(),
         "legacy runtime update and isolation policy is not fail-closed"
     );
 
-    for (label, config, executor, updater, expected) in [
+    for (label, package, config, executor, updater, expected) in [
         (
             "auto-update bypass",
+            package.clone(),
             config.replace("if (AUTO_UPDATE) {", "if (false) {"),
             executor.clone(),
             updater.clone(),
             "AUTO_UPDATE=true must fail configuration",
         ),
         (
-            "production node:vm fallback",
+            "implicit node:vm fallback",
+            package.clone(),
             config.clone(),
             executor.replace(
-                "if (nodeEnvironment === \"production\")",
-                "if (nodeEnvironment === \"disabled-production\")",
+                "nodeEnvironment !== \"development\"",
+                "nodeEnvironment === \"production\"",
             ),
             updater.clone(),
-            "production must reject reduced node:vm isolation",
+            "reduced node:vm isolation must require explicit development opt-in",
         ),
         (
             "mutable updater",
+            package.clone(),
             config.clone(),
             executor.clone(),
             format!("{updater}\nconst removedInstaller = \"gh.io/copilot-install\";\n"),
             "mutable runtime update logic is forbidden",
         ),
     ] {
-        let violations = legacy_runtime_source_violations(&config, &executor, &updater);
+        let violations = legacy_runtime_source_violations(&package, &config, &executor, &updater);
         assert!(
             violations
                 .iter()
@@ -685,6 +698,24 @@ fn python_compatibility_policy_is_interpreter_and_hash_locked() {
             unhashed_requirements,
             "requirement entry has no SHA-256 hash",
         ),
+        (
+            "mutable pip bootstrap",
+            workflow.replace(
+                "python3 -m pip install \\",
+                "python3 -m pip install --upgrade \\",
+            ),
+            requirements.clone(),
+            "mutable pip upgrade is forbidden",
+        ),
+        (
+            "missing declared source fetch",
+            workflow.replace(
+                "git fetch --no-tags --depth=1 origin \"$source_revision\"",
+                "git fetch --no-tags --depth=1 origin HEAD",
+            ),
+            requirements.clone(),
+            "declared source revision is not fetched exactly",
+        ),
     ] {
         let violations = python_supply_chain_violations(&workflow, &requirements);
         assert!(
@@ -693,6 +724,136 @@ fn python_compatibility_policy_is_interpreter_and_hash_locked() {
                 .any(|violation| violation.contains(expected)),
             "{label} failed through the wrong rule: {violations:?}"
         );
+    }
+}
+
+#[test]
+fn pinned_cargo_deny_019_uses_check_before_config() {
+    let workflow =
+        fs::read_to_string(workspace_root().join(".github/workflows/rust.yml"))
+            .expect("read Rust workflow");
+    assert!(workflow.contains("CARGO_DENY_VERSION: \"0.19.8\""));
+    assert_eq!(
+        workflow.matches("check --config").count(),
+        6,
+        "every pinned cargo-deny 0.19.8 invocation must place check before --config"
+    );
+    assert!(
+        !workflow.contains("--locked check") && !workflow.contains("--config check"),
+        "cargo-deny 0.19.8 command uses incompatible argument ordering"
+    );
+
+    let mutated = workflow.replacen("check --config", "--config", 1);
+    assert_eq!(
+        mutated.matches("check --config").count(),
+        5,
+        "negative cargo-deny ordering fixture did not mutate exactly one invocation"
+    );
+}
+
+#[test]
+fn desktop_build_is_target_aware_and_preserves_windows_arm64() {
+    let root = workspace_root();
+    let build =
+        fs::read_to_string(root.join("desktop/apps/gta-claw-desktop/build.rs"))
+            .expect("read desktop build script");
+    let rust_workflow =
+        fs::read_to_string(root.join(".github/workflows/rust.yml")).expect("read Rust workflow");
+    let windows_workflow =
+        fs::read_to_string(root.join(".github/workflows/windows-packaging.yml"))
+            .expect("read Windows packaging workflow");
+
+    for required in [
+        "CARGO_CFG_TARGET_OS",
+        "\"windows\" => \"fluent\"",
+        "\"macos\" => \"cupertino\"",
+    ] {
+        assert!(
+            build.contains(required),
+            "desktop build script is not target-aware: missing {required}"
+        );
+    }
+    for forbidden in ["std::env::var(\"HOST\")", "host != target", "HOST == TARGET"] {
+        assert!(
+            !build.contains(forbidden),
+            "desktop build script blocks supported cross-architecture packaging: {forbidden}"
+        );
+    }
+    for required in [
+        "Check Windows ARM64 desktop target at MSRV",
+        "cargo +1.94.0 check --manifest-path desktop/Cargo.toml",
+        "--target aarch64-pc-windows-msvc --locked",
+        "-Architecture arm64",
+    ] {
+        assert!(
+            rust_workflow.contains(required) || windows_workflow.contains(required),
+            "Windows ARM64 packaging or MSRV coverage is missing {required}"
+        );
+    }
+}
+
+#[test]
+fn mobile_policy_checks_host_and_shipped_graphs_separately() {
+    let root = workspace_root();
+    for (platform, target_step, target) in [
+        (
+            "android",
+            "Check all declared Android targets at MSRV",
+            "aarch64-linux-android",
+        ),
+        (
+            "ios",
+            "Check device and simulator targets at MSRV",
+            "aarch64-apple-ios",
+        ),
+    ] {
+        let workflow = fs::read_to_string(
+            root.join(format!(".github/workflows/{platform}-packaging.yml")),
+        )
+        .expect("read mobile packaging workflow");
+        assert!(
+            mobile_policy_violations(&workflow, platform, target_step, target).is_empty(),
+            "{platform} workflow does not enforce distinct host and shipped-target graphs"
+        );
+
+        for (label, mutated, expected) in [
+            (
+                "unpinned host dependency",
+                workflow.replace(
+                    "libfontconfig-dev=2.15.0-1.1ubuntu2",
+                    "libfontconfig-dev",
+                ),
+                "pinned fontconfig prerequisite",
+            ),
+            (
+                "unpinned host pkg-config",
+                workflow.replace("pkgconf=1.8.1-2build1", "pkgconf"),
+                "pinned fontconfig prerequisite",
+            ),
+            (
+                "missing host graph check",
+                workflow.replace(
+                    &format!(
+                        "cargo +1.94.0 check --manifest-path {platform}/Cargo.toml --workspace --all-targets --locked"
+                    ),
+                    "cargo +1.94.0 --version",
+                ),
+                "Linux host MSRV coverage",
+            ),
+            (
+                "missing host deny target",
+                workflow.replace(" --target x86_64-unknown-linux-gnu check", " check"),
+                "Linux host dependency-policy coverage",
+            ),
+        ] {
+            let violations = mobile_policy_violations(&mutated, platform, target_step, target);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains(expected)),
+                "{label} negative {platform} fixture failed through the wrong rule: {violations:?}"
+            );
+        }
     }
 }
 
@@ -1087,7 +1248,12 @@ fn legacy_node_supply_chain_violations(
     violations
 }
 
-fn legacy_runtime_source_violations(config: &str, executor: &str, updater: &str) -> Vec<String> {
+fn legacy_runtime_source_violations(
+    package: &str,
+    config: &str,
+    executor: &str,
+    updater: &str,
+) -> Vec<String> {
     let mut violations = Vec::new();
     for required in [
         "if (AUTO_UPDATE) {",
@@ -1100,12 +1266,23 @@ fn legacy_runtime_source_violations(config: &str, executor: &str, updater: &str)
         }
     }
     for required in [
-        "if (nodeEnvironment === \"production\")",
-        "isolated-vm is required in production; node:vm provides reduced isolation and is development-only",
+        "nodeEnvironment !== \"development\"",
+        "reducedIsolationOptIn !== \"true\"",
+        "GTA_CLAW_ALLOW_REDUCED_ISOLATION=true",
     ] {
         if !executor.contains(required) {
             violations.push(format!(
-                "production must reject reduced node:vm isolation: missing {required}"
+                "reduced node:vm isolation must require explicit development opt-in: missing {required}"
+            ));
+        }
+    }
+    for required in [
+        "\"start\": \"node --no-node-snapshot dist/index.js\"",
+        "\"test:isolation-policy\"",
+    ] {
+        if !package.contains(required) {
+            violations.push(format!(
+                "npm start and isolation policy checks must fail closed: missing {required}"
             ));
         }
     }
@@ -1131,20 +1308,46 @@ fn python_supply_chain_violations(workflow: &str, requirements: &str) -> Vec<Str
     for required in [
         setup_python_use.as_str(),
         "python-version: \"3.13.5\"",
+        "git fetch --no-tags --depth=1 origin \"$source_revision\"",
+        "git cat-file -e \"${source_revision}^{commit}\"",
         "python3 -m pip install",
         "--require-hashes",
         "--requirement compat/legacy/scripts/requirements.txt",
+        "python3 -m pip check",
         "python3 compat/legacy/scripts/validate.py",
     ] {
         if !workflow.contains(required) {
             let label = if required.starts_with("uses:") {
                 "setup-python action is not pinned"
+            } else if required.starts_with("git ") {
+                "declared source revision is not fetched exactly"
             } else if required == "--require-hashes" {
                 "pip install does not require hashes"
             } else {
                 "Python workflow invocation is not exact"
             };
             violations.push(format!("{label}: {required}"));
+        }
+    }
+    if workflow.contains("python3 -m pip install --upgrade")
+        || workflow.contains("python3 -m pip install -U")
+    {
+        violations.push("mutable pip upgrade is forbidden".to_owned());
+    }
+    for required_path in [
+        "- \".env.example\"",
+        "- \"compat/**\"",
+        "- \"src/**\"",
+        "- \"test/**\"",
+        "- \"Dockerfile\"",
+        "- \"package-lock.json\"",
+        "- \"package.json\"",
+        "- \"tsconfig.json\"",
+    ] {
+        if workflow.matches(required_path).count() != 2 {
+            violations.push(format!(
+                "compatibility workflow path triggers are incomplete: {required_path}"
+            ));
         }
     }
 
@@ -1176,6 +1379,69 @@ fn python_supply_chain_violations(workflow: &str, requirements: &str) -> Vec<Str
     if let Some(previous) = current_requirement {
         if !current_has_hash {
             violations.push(format!("requirement entry has no SHA-256 hash: {previous}"));
+        }
+    }
+    violations.sort();
+    violations
+}
+
+fn mobile_policy_violations(
+    workflow: &str,
+    platform: &str,
+    target_step: &str,
+    target: &str,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    for required in [
+        "runs-on: ubuntu-24.04",
+        "libfontconfig-dev=2.15.0-1.1ubuntu2",
+        "pkgconf=1.8.1-2build1",
+    ] {
+        if !workflow.contains(required) {
+            violations.push(format!(
+                "{platform} Linux host graph is missing pinned fontconfig prerequisite {required:?}"
+            ));
+        }
+    }
+    for required in [
+        format!(
+            "Check {platform_label} Linux host graph at MSRV",
+            platform_label = if platform == "ios" { "iOS" } else { "Android" }
+        ),
+        format!(
+            "cargo +1.94.0 check --manifest-path {platform}/Cargo.toml --workspace --all-targets --locked"
+        ),
+    ] {
+        if !workflow.contains(&required) {
+            violations.push(format!(
+                "{platform} Linux host MSRV coverage is missing {required:?}"
+            ));
+        }
+    }
+    for required in [
+        format!(
+            "Check {platform_label} Linux host dependency policy",
+            platform_label = if platform == "ios" { "iOS" } else { "Android" }
+        ),
+        format!("--manifest-path {platform}/Cargo.toml --config {platform}/deny.toml"),
+        "--target x86_64-unknown-linux-gnu check".to_owned(),
+    ] {
+        if !workflow.contains(&required) {
+            violations.push(format!(
+                "{platform} Linux host dependency-policy coverage is missing {required:?}"
+            ));
+        }
+    }
+    for required in [
+        target_step,
+        "RUSTUP_TOOLCHAIN: 1.94.0",
+        "rustup target add --toolchain 1.94.0",
+        target,
+    ] {
+        if !workflow.contains(required) {
+            violations.push(format!(
+                "{platform} shipped-target MSRV coverage is missing {required:?}"
+            ));
         }
     }
     violations.sort();
