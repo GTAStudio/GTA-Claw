@@ -18,10 +18,12 @@ include = [
 
 [dependencies]
 json5 = "1.3.1"
+libc = "=0.2.189"
 schemars = "1.2.2"
 serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
+sha2.workspace = true
 url = "2.5.8"
 
 [build-dependencies]
@@ -29,12 +31,18 @@ serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+] }
 
 [lints.rust]
 missing_docs = "warn"
-# Windows-only `ReplaceFileW` atomic-rename FFI in `io::windows_replace` needs a
-# local `allow(unsafe_code)`, which `forbid` cannot grant.
+# Atomic exchange plus Windows replacement/security FFI need local
+# `expect(unsafe_code)` scopes, which the workspace's `forbid` setting cannot
+# grant.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 unreachable_pub = "warn"

@@ -11,6 +11,7 @@
 //! The transport half stays behind the [`RoleSourceFetcher`] port, because this
 //! crate has no HTTP client and does not gain one.
 
+mod atomicfs;
 /// Strongly typed source configuration for the frozen 47-domain contract.
 pub mod domains;
 mod error;
@@ -42,7 +43,10 @@ pub use domains::{
     openclaw_schema_json, openclaw_to_json5, parse_openclaw_json5,
 };
 pub use error::ConfigError;
-pub use io::{WriteOutcome, WriteWarning, load_file, write_bytes_atomically, write_file};
+pub use io::{
+    CompareOutcome, PublicationConflict, PublicationLock, PublicationSnapshot, WriteOutcome,
+    WriteWarning, load_file, write_bytes_atomically, write_file,
+};
 pub use layer::{ConfigLayerKind, ConfigLayers, LayeredConfigError, ResolvedConfig};
 pub use migration::{
     ManualMapping, MigrationDiagnostic, MigrationError, MigrationResult, migrate_legacy_environment,
@@ -65,7 +69,7 @@ pub use role::{
 };
 pub use versioning::{
     ConfigMigrationError, ConfigMigrationOutcome, ConfigMigrationRecord, migrate_config_file,
-    rollback_config_migration,
+    read_config_schema_version, rollback_config_migration,
 };
 use wire::EnvelopeWire;
 

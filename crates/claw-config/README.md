@@ -42,9 +42,29 @@ because a model string is returned exactly as the document spelled it.
 
 Layered runtime resolution uses built-in, system, user, workspace, frozen
 legacy environment, then command-line precedence. Nested objects merge
-recursively while arrays and scalars replace lower layers. File migrations keep
-exact durable backups and expose rollback. `ConfigHub` and `ConfigFileWatcher`
-publish complete immutable snapshots and ordered typed notifications.
+recursively while arrays and scalars replace lower layers. Every cooperating
+publication API uses one stable target-sidecar lock. Current and unsupported
+schema probes stay read-only; `read_config_schema_version` exposes that tolerant
+probe without accepting the rest of a future document as typed configuration.
+Before returning from a read-only fast path, migration rechecks both the
+handle-pinned generation and canonical recovery-journal path, so a journal or
+edit arriving during the probe forces locked recovery/re-read.
+`PublicationLock::acquire_all` canonicalizes, sorts, and deduplicates a complete
+target set before taking its first lock. A held lock can snapshot raw
+bytes/absence and feed that private generation token to `compare_write` or
+`compare_remove`; comparison loss is a `CompareOutcome::Conflict`, not an I/O
+failure. Conditional removal returns post-linearization cleanup and directory
+sync limitations through the applied `WriteOutcome`.
+Destructive migration re-reads under the publication lock, then publishes
+through a synchronized recovery journal and atomic displacement so the exact
+object replaced at the CAS point can be validated by both digest and stable
+filesystem identity. Same-byte replacement objects are therefore conflicts
+rather than an ABA success. Conflicting bytes are backed up and restored without
+replacing a still-newer live edit, and the active journal is retired so a
+corrected retry is not poisoned. File migrations keep exact
+restrictive-permission backups and expose rollback. `ConfigHub` and
+`ConfigFileWatcher` publish complete immutable snapshots and ordered typed
+notifications.
 `ResolvedConfig::environment_diagnostics` records each exact legacy mapping that
 contributed and each unknown input that was ignored, while `applied_layers`
 includes the environment layer only when a runtime mapping actually applied.
@@ -74,15 +94,28 @@ The generated Rust table embeds every behavioral field so contract changes are
 visible to code review; executable conversion remains an explicitly tested,
 typed Rust implementation rather than an interpreted rule engine.
 
-Atomic writes require a trusted configuration directory. Existing destination
-and parent symlinks/reparse points are rejected, but path-based replacement
-cannot eliminate every rename race in a directory writable by an attacker.
+Atomic writes require a trusted configuration directory. The destination and
+configuration directory symlinks/reparse points are rejected. Canonicalization
+resolves platform layout aliases above that directory (including normal macOS
+`/var` aliases) before the resolved chain is validated, but path-based
+replacement cannot eliminate every rename race in a directory writable by an
+attacker.
 Unix flushes the temporary file and directory around atomic rename. When a
 Windows destination already exists, the writer flushes the temporary file and
 uses `ReplaceFileW` with a recovery backup, preserving destination ACLs and
-filesystem metadata. A first write has no destination metadata to preserve and
-uses a same-directory rename. Windows does not document a supported
-directory-handle flush equivalent, so final directory entry durability across
-sudden power loss is not claimed. Post-publication cleanup/durability problems
-are returned as `WriteOutcome` warnings rather than falsely reporting that the
-atomic replacement failed.
+filesystem metadata. Ambiguous partial `ReplaceFileW` outcomes keep every
+recovery path and fail closed instead of deleting a possibly authoritative
+backup; restoration uses an atomic no-replace move rather than an
+absence-check/rename pair. Windows backup and conflict artifacts copy the source
+DACL and protect that effective access list from broader inheritance. A first
+write has no destination metadata to preserve and uses a same-directory rename.
+Windows does not document a supported directory-handle flush equivalent, so
+final directory entry durability across sudden power loss is not claimed.
+Post-publication cleanup/durability problems are returned as `WriteOutcome`
+warnings rather than falsely reporting that the atomic replacement failed.
+Existing Windows destinations are normalized from their open handles and use
+the full volume plus 128-bit `FILE_ID_INFO` identity; long, extended, and
+available 8.3 spellings therefore derive the same sidecar and journal. Multiply
+linked regular files fail closed rather than splitting cooperating locks.
+Targets without no-follow identity, atomic exchange, or atomic no-replace
+support return an explicit unsupported I/O error instead of approximating CAS.

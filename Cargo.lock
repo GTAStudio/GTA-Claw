@@ -298,10 +298,12 @@ name = "claw-config"
 version = "0.1.0"
 dependencies = [
  "json5",
+ "libc",
  "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_path_to_error",
+ "sha2 0.11.0",
  "url",
  "windows-sys 0.61.2",
 ]
