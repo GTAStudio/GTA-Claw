@@ -61,6 +61,69 @@ version = "=0.16.1"
 name = "sha2"
 version = "=0.10.9"
 
+# Hickory 0.26's system resolver uses core-foundation 0.9 while the native
+# certificate stack uses 0.10. Remove when Hickory's system resolver converges.
+[[bans.skip]]
+name = "core-foundation"
+version = "=0.9.4"
+
+# russh 0.62 requires generic-array 1.x, whose compat bridge retains 0.14.
+# Remove when generic-array drops its compat-0_14 dependency.
+[[bans.skip]]
+name = "generic-array"
+version = "=0.14.7"
+
+# Ring and the legacy gateway stack retain getrandom 0.2, while tungstenite
+# retains 0.3 and the current SSH cryptography stack uses 0.4.
+[[bans.skip]]
+name = "getrandom"
+version = "=0.2.17"
+
+[[bans.skip]]
+name = "getrandom"
+version = "=0.3.4"
+
+# getrandom 0.3 retains r-efi 5 while current cryptography uses r-efi 6.
+[[bans.skip]]
+name = "r-efi"
+version = "=5.3.0"
+
+# fastwebsockets and tungstenite retain rand 0.8 and 0.9 respectively, while
+# Hickory and russh use rand 0.10.
+[[bans.skip]]
+name = "rand"
+version = "=0.8.7"
+
+[[bans.skip]]
+name = "rand"
+version = "=0.9.5"
+
+# fastwebsockets' rand 0.8 line retains rand_chacha 0.3.
+[[bans.skip]]
+name = "rand_chacha"
+version = "=0.3.1"
+
+# tungstenite's rand 0.9 line retains rand_core 0.9 while current identity and
+# SSH cryptography use rand_core 0.10.
+[[bans.skip]]
+name = "rand_core"
+version = "=0.9.5"
+
+# tungstenite retains SHA-1 0.10 while the gateway and russh use 0.11.
+[[bans.skip]]
+name = "sha1"
+version = "=0.10.7"
+
+# ml-kem 0.3 uses SHA-3 0.11 while russh directly uses 0.12.
+[[bans.skip]]
+name = "sha3"
+version = "=0.11.0"
+
+# windows-acl 0.3 retains widestring 0.4 while Hickory uses 1.x.
+[[bans.skip]]
+name = "widestring"
+version = "=0.4.3"
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

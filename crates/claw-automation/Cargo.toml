@@ -1,0 +1,29 @@
+[package]
+name = "claw-automation"
+description = "Fleet, ClawHub, and authenticated webhook automation for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+async-trait = "=0.1.91"
+base64 = "=0.22.1"
+hmac = "=0.13.0"
+hyper = { version = "=1.11.0", features = ["client", "http1"] }
+hyper-util = { version = "=0.1.20", features = ["client-proxy"] }
+rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "=0.8.4"
+secrecy = "=0.10.3"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+semver = "=1.0.28"
+tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
+url = "=2.5.8"
+
+[lints]
+workspace = true
