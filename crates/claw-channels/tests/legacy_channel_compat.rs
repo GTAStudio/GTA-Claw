@@ -833,7 +833,7 @@ fn discord_close_codes_preserve_invalidate_or_terminate_sessions() {
         Some("wss://gateway-us-east1-b.discord.gg?v=10&encoding=json")
     );
 
-    for code in [4003, 4005, 4007, 4009] {
+    for code in [1000, 1001, 4003, 4005, 4007, 4009] {
         let DiscordHarness {
             mut channel,
             open_urls,
@@ -906,6 +906,118 @@ fn discord_close_codes_preserve_invalidate_or_terminate_sessions() {
         assert_eq!(channel.session_id(), None, "close code {code}");
         assert_eq!(channel.resume_gateway_url(), None, "close code {code}");
     }
+}
+
+#[test]
+fn discord_failed_resume_gateway_falls_back_to_bootstrap_and_still_resumes() {
+    let gateway_credential =
+        token_credential("discord", "gateway.discord.gg", "discord-gateway-secret");
+    let failure = ChannelError::Transport(TransportErrorKind::Connection);
+    let DiscordHarness {
+        mut channel,
+        open_urls,
+        gateway,
+        ..
+    } = discord_channel(VecDeque::from([Ok(()), Err(failure.clone()), Ok(())]), 3);
+    establish_discord_session(&mut channel, &gateway_credential);
+    channel
+        .handle_gateway_packet(
+            br#"{"op":7,"t":null,"s":null,"d":null}"#,
+            Duration::from_secs(1),
+            &gateway_credential,
+            &mut (),
+        )
+        .expect("reconnect requested");
+
+    assert_eq!(channel.tick(Duration::from_secs(4), &mut ()), Err(failure));
+    assert_eq!(channel.session_id(), Some("resumable-session"));
+    assert_eq!(channel.sequence(), Some(41));
+    assert_eq!(channel.resume_gateway_url(), None);
+    assert_eq!(
+        open_urls.borrow().last().map(String::as_str),
+        Some("wss://gateway-us-east1-b.discord.gg?v=10&encoding=json")
+    );
+
+    assert_eq!(channel.tick(Duration::from_secs(7), &mut ()), Ok(true));
+    assert_eq!(
+        open_urls.borrow().last().map(String::as_str),
+        Some("wss://gateway.discord.gg/?v=10&encoding=json")
+    );
+    channel.gateway_opened(&mut ()).expect("bootstrap reopened");
+    assert_eq!(
+        channel.handle_gateway_packet(
+            br#"{"op":10,"t":null,"s":null,"d":{"heartbeat_interval":1000}}"#,
+            Duration::from_secs(7),
+            &gateway_credential,
+            &mut (),
+        ),
+        Ok(DiscordPacketOutcome::Identified)
+    );
+    assert_eq!(channel.phase(), DiscordGatewayPhase::Resuming);
+    assert_eq!(
+        gateway.borrow().last(),
+        Some(&GatewayRecord {
+            opcode: 6,
+            token: Some("discord-gateway-secret".to_owned()),
+            intents: None,
+            session_id: Some("resumable-session".to_owned()),
+            sequence: Some(41),
+        })
+    );
+}
+
+#[test]
+fn discord_pre_hello_resume_close_falls_back_to_bootstrap_and_still_resumes() {
+    let gateway_credential =
+        token_credential("discord", "gateway.discord.gg", "discord-gateway-secret");
+    let DiscordHarness {
+        mut channel,
+        open_urls,
+        gateway,
+        ..
+    } = discord_channel(VecDeque::from([Ok(()), Ok(()), Ok(())]), 3);
+    establish_discord_session(&mut channel, &gateway_credential);
+    channel
+        .handle_gateway_packet(
+            br#"{"op":7,"t":null,"s":null,"d":null}"#,
+            Duration::from_secs(1),
+            &gateway_credential,
+            &mut (),
+        )
+        .expect("reconnect requested");
+    assert_eq!(channel.tick(Duration::from_secs(4), &mut ()), Ok(true));
+    channel
+        .gateway_opened(&mut ())
+        .expect("resume socket opened");
+
+    assert_eq!(
+        channel.gateway_closed_with(
+            Duration::from_secs(4),
+            DiscordGatewayClose::transport_lost(),
+            &mut (),
+        ),
+        Ok(true)
+    );
+    assert_eq!(channel.session_id(), Some("resumable-session"));
+    assert_eq!(channel.sequence(), Some(41));
+    assert_eq!(channel.resume_gateway_url(), None);
+
+    assert_eq!(channel.tick(Duration::from_secs(7), &mut ()), Ok(true));
+    assert_eq!(
+        open_urls.borrow().last().map(String::as_str),
+        Some("wss://gateway.discord.gg/?v=10&encoding=json")
+    );
+    channel.gateway_opened(&mut ()).expect("bootstrap reopened");
+    channel
+        .handle_gateway_packet(
+            br#"{"op":10,"t":null,"s":null,"d":{"heartbeat_interval":1000}}"#,
+            Duration::from_secs(7),
+            &gateway_credential,
+            &mut (),
+        )
+        .expect("resume sent over bootstrap");
+    assert_eq!(channel.phase(), DiscordGatewayPhase::Resuming);
+    assert_eq!(gateway.borrow().last().map(|record| record.opcode), Some(6));
 }
 
 #[test]

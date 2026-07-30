@@ -612,9 +612,10 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
 
     /// Records a socket close frame and applies Discord's reconnect policy.
     ///
-    /// Close codes 4003, 4005, 4007, and 4009 invalidate the resumable session.
-    /// Authentication, sharding, API-version, and intent failures are terminal.
-    /// All other transport and peer closes preserve a resumable session.
+    /// Normal closes 1000/1001 and close codes 4003, 4005, 4007, and 4009
+    /// invalidate the resumable session. Authentication, sharding, API-version,
+    /// and intent failures are terminal. All other transport and peer closes
+    /// preserve a resumable session.
     ///
     /// # Errors
     ///
@@ -632,9 +633,15 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
         if self.lifecycle.state() == ConnectionState::Reconnecting {
             return Ok(false);
         }
+        let resume_gateway_failed_before_hello = self.phase == DiscordGatewayPhase::AwaitingHello
+            && self.session_id.is_some()
+            && self.resume_gateway_url.is_some();
         self.lifecycle
             .apply(LifecycleEvent::ConnectionLost, &mut ())?;
         self.reset_connection_protocol();
+        if resume_gateway_failed_before_hello {
+            self.resume_gateway_url = None;
+        }
         self.last_close = close;
         diagnostics.record(self.diagnostic(
             DiagnosticLevel::Warning,
@@ -684,8 +691,13 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
             self.reconnect_due = None;
             self.lifecycle
                 .apply(LifecycleEvent::ConnectRequested, &mut ())?;
+            let using_resume_gateway =
+                self.session_id.is_some() && self.resume_gateway_url.is_some();
             let gateway_url = self.reconnect_gateway_url().to_owned();
             if let Err(error) = self.transport.open_gateway(&gateway_url) {
+                if using_resume_gateway {
+                    self.resume_gateway_url = None;
+                }
                 self.lifecycle
                     .apply(LifecycleEvent::ConnectionLost, &mut ())?;
                 self.schedule_reconnect(now, diagnostics)?;
@@ -1280,7 +1292,7 @@ enum DiscordClosePolicy {
 
 const fn discord_close_policy(code: Option<u16>) -> DiscordClosePolicy {
     match code {
-        Some(4003 | 4005 | 4007 | 4009) => DiscordClosePolicy::Reidentify,
+        Some(1000 | 1001 | 4003 | 4005 | 4007 | 4009) => DiscordClosePolicy::Reidentify,
         Some(4004) => DiscordClosePolicy::Terminal(ChannelError::Authentication),
         Some(4010..=4014) => DiscordClosePolicy::Terminal(ChannelError::Configuration(
             ConfigurationError::InvalidAdapterConfiguration,

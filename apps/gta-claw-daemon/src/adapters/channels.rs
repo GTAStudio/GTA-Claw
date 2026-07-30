@@ -42,6 +42,64 @@ const DISCORD_REPLY_MAX_ATTEMPTS: u32 = 3;
 const TELEGRAM_READINESS_ATTEMPTS: u32 = 3;
 const TELEGRAM_PERSISTENT_FAILURES: u32 = 3;
 
+#[derive(Clone, Copy)]
+enum ConfiguredChannel {
+    Telegram,
+    Discord,
+}
+
+#[derive(Clone)]
+struct ChannelReadiness {
+    dependency: Arc<DependencyReadiness>,
+    telegram_configured: bool,
+    discord_configured: bool,
+}
+
+impl ChannelReadiness {
+    fn new(
+        dependency: Arc<DependencyReadiness>,
+        telegram_configured: bool,
+        discord_configured: bool,
+    ) -> Self {
+        let readiness = Self {
+            dependency,
+            telegram_configured,
+            discord_configured,
+        };
+        if telegram_configured {
+            readiness.dependency.set("telegram", false);
+        }
+        if discord_configured {
+            readiness.dependency.set("discord", false);
+        }
+        readiness
+            .dependency
+            .set("channels", !telegram_configured && !discord_configured);
+        readiness
+    }
+
+    fn set(&self, channel: ConfiguredChannel, ready: bool) {
+        let name = match channel {
+            ConfiguredChannel::Telegram => "telegram",
+            ConfiguredChannel::Discord => "discord",
+        };
+        let members = [
+            self.telegram_configured.then_some("telegram"),
+            self.discord_configured.then_some("discord"),
+        ];
+        self.dependency
+            .set_and_aggregate(name, ready, "channels", members.into_iter().flatten());
+    }
+
+    fn set_discord_state(&self, state: ConnectionState, phase: claw_channels::DiscordGatewayPhase) {
+        self.set(
+            ConfiguredChannel::Discord,
+            state == ConnectionState::Connected
+                && phase == claw_channels::DiscordGatewayPhase::Ready,
+        );
+    }
+}
+
 /// Configured Telegram worker.
 pub struct TelegramSettings {
     /// Bot token.
@@ -285,7 +343,11 @@ impl ChannelSupervisor {
             armed: true,
         };
         let mut spawned = 0_u64;
-        readiness.set("channels", true);
+        let channel_readiness = ChannelReadiness::new(
+            Arc::clone(&readiness),
+            telegram.is_some(),
+            discord.is_some(),
+        );
 
         if let Some(settings) = telegram {
             let request_cancel = Arc::new(Mutex::new(None));
@@ -334,11 +396,12 @@ impl ChannelSupervisor {
             channel
                 .start(&mut ChannelDiagnostics(Arc::clone(&diagnostics)))
                 .map_err(|error| error.to_string())?;
+            channel_readiness.set(ConfiguredChannel::Telegram, true);
             let task_cancel = cancellation.clone();
             let task_runtime = Arc::clone(&runtime);
             let task_authentication = Arc::clone(&authentication);
             let task_diagnostics = Arc::clone(&diagnostics);
-            let task_readiness = Arc::clone(&readiness);
+            let task_readiness = channel_readiness.clone();
             let task_terminated = Arc::clone(&terminated);
             let handle = tracker.spawn(async move {
                 let _guard = TerminationGuard(task_terminated);
@@ -439,6 +502,7 @@ impl ChannelSupervisor {
             let task_runtime = Arc::clone(&runtime);
             let task_authentication = Arc::clone(&authentication);
             let task_diagnostics = Arc::clone(&diagnostics);
+            let task_readiness = channel_readiness.clone();
             let task_terminated = Arc::clone(&terminated);
             let channel_task = tracker.spawn(async move {
                 let _guard = TerminationGuard(task_terminated);
@@ -452,6 +516,7 @@ impl ChannelSupervisor {
                     task_runtime,
                     task_authentication,
                     task_diagnostics,
+                    task_readiness,
                     task_cancel,
                     ready_tx,
                     started,
@@ -1119,6 +1184,7 @@ async fn run_discord(
     runtime: Arc<AgentRuntime>,
     authentication: Arc<RwLock<Option<String>>>,
     diagnostics: Arc<Diagnostics>,
+    readiness: ChannelReadiness,
     cancellation: CancellationToken,
     ready: oneshot::Sender<Result<(), String>>,
     started: Instant,
@@ -1161,6 +1227,7 @@ async fn run_discord(
                         &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
                     ).map(|_| None),
                 };
+                readiness.set_discord_state(channel.state(), channel.phase());
                 match result {
                     Ok(Some(DiscordPacketOutcome::Ready)) => {
                         if let Some(ready) = ready.take() {
@@ -1186,15 +1253,18 @@ async fn run_discord(
                 }
             }
             _ = tick.tick() => {
-                if let Err(error) = channel.tick(
+                let result = channel.tick(
                     started.elapsed(),
                     &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
-                ) {
+                );
+                readiness.set_discord_state(channel.state(), channel.phase());
+                if let Err(error) = result {
                     diagnostics.record(format!("Discord tick failed: {error}"));
                 }
             }
         }
     }
+    readiness.set(ConfiguredChannel::Discord, false);
     dispatch_cancellation.cancel();
     drop(inbound_tx);
     if let Err(error) = dispatch_task.join().await {
@@ -1212,7 +1282,7 @@ async fn run_telegram(
     runtime: Arc<AgentRuntime>,
     authentication: Arc<RwLock<Option<String>>>,
     diagnostics: Arc<Diagnostics>,
-    readiness: Arc<DependencyReadiness>,
+    readiness: ChannelReadiness,
     cancellation: CancellationToken,
 ) {
     let mut consecutive_failures = 0_u32;
@@ -1227,19 +1297,19 @@ async fn run_telegram(
         let retry_after = match &poll_result {
             Ok(_) => {
                 consecutive_failures = 0;
-                readiness.set("channels", true);
+                readiness.set(ConfiguredChannel::Telegram, true);
                 channel.poll_interval()
             }
             Err(error) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 diagnostics.record(format!("Telegram poll failed: {error}"));
                 if telegram_failure_is_terminal(error) {
-                    readiness.set("channels", false);
+                    readiness.set(ConfiguredChannel::Telegram, false);
                     diagnostics.record("Telegram worker stopped after a terminal failure");
                     break;
                 }
                 if consecutive_failures >= TELEGRAM_PERSISTENT_FAILURES {
-                    readiness.set("channels", false);
+                    readiness.set(ConfiguredChannel::Telegram, false);
                 }
                 error
                     .retry_after()
@@ -1290,6 +1360,7 @@ async fn run_telegram(
             () = tokio::time::sleep(retry_after) => {}
         }
     }
+    readiness.set(ConfiguredChannel::Telegram, false);
     let _ = channel.stop(&mut ChannelDiagnostics(diagnostics));
 }
 
@@ -1636,21 +1707,70 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use claw_channel_sdk::{
-        ApprovedOrigin, ChannelCredential, ChannelError, CredentialKind, InboundMessage,
-        TransportErrorKind,
+        ApprovedOrigin, ChannelCredential, ChannelError, ConnectionState, CredentialKind,
+        InboundMessage, TransportErrorKind,
     };
-    use claw_channels::ProviderResponse;
+    use claw_channels::{DiscordGatewayPhase, ProviderResponse};
+    use claw_http_api::ReadinessPort;
     use claw_provider_sdk::{CancelToken, SecretString};
     use tokio_util::sync::CancellationToken;
     use tokio_util::task::TaskTracker;
 
     use super::{
-        ChannelStartGuard, DiscordReplyTransport, TelegramProbeFuture, TelegramReadinessError,
-        TelegramReadinessProbe, approved_origin, bind_credential, bind_request_cancellation,
-        cancel_requests, classify_telegram_poll_probe_response,
-        classify_telegram_webhook_probe_response, parse_retry_after_header, send_discord_reply,
-        telegram_readiness_requests, wait_for_telegram_readiness,
+        ChannelReadiness, ChannelStartGuard, ConfiguredChannel, DependencyReadiness,
+        DiscordReplyTransport, TelegramProbeFuture, TelegramReadinessError, TelegramReadinessProbe,
+        approved_origin, bind_credential, bind_request_cancellation, cancel_requests,
+        classify_telegram_poll_probe_response, classify_telegram_webhook_probe_response,
+        parse_retry_after_header, send_discord_reply, telegram_readiness_requests,
+        wait_for_telegram_readiness,
     };
+
+    #[test]
+    fn configured_channel_readiness_aggregates_without_cross_channel_overwrite() {
+        let dependency = Arc::new(DependencyReadiness::new(["channels"]));
+        let channels = ChannelReadiness::new(Arc::clone(&dependency), true, true);
+
+        assert!(!dependency.snapshot().expect("snapshot").ready);
+        channels.set(ConfiguredChannel::Telegram, true);
+        assert!(!dependency.snapshot().expect("snapshot").ready);
+        channels.set(ConfiguredChannel::Discord, true);
+        assert!(dependency.snapshot().expect("snapshot").ready);
+
+        channels.set(ConfiguredChannel::Discord, false);
+        channels.set(ConfiguredChannel::Telegram, true);
+        let snapshot = dependency.snapshot().expect("snapshot");
+        assert!(!snapshot.ready);
+        assert_eq!(snapshot.failing, ["channels", "discord"]);
+    }
+
+    #[test]
+    fn discord_terminal_and_exhausted_states_clear_aggregate_readiness() {
+        let dependency = Arc::new(DependencyReadiness::new(["channels"]));
+        let channels = ChannelReadiness::new(Arc::clone(&dependency), true, true);
+        channels.set(ConfiguredChannel::Telegram, true);
+        channels.set(ConfiguredChannel::Discord, true);
+
+        channels.set_discord_state(
+            ConnectionState::Closed,
+            DiscordGatewayPhase::ReconnectExhausted,
+        );
+        channels.set(ConfiguredChannel::Telegram, true);
+        assert_eq!(
+            dependency.snapshot().expect("terminal snapshot").failing,
+            ["channels", "discord"]
+        );
+
+        channels.set(ConfiguredChannel::Discord, true);
+        channels.set_discord_state(
+            ConnectionState::Disconnected,
+            DiscordGatewayPhase::ReconnectExhausted,
+        );
+        channels.set(ConfiguredChannel::Telegram, true);
+        assert_eq!(
+            dependency.snapshot().expect("exhausted snapshot").failing,
+            ["channels", "discord"]
+        );
+    }
 
     struct ScriptedTelegramProbe {
         results: Mutex<VecDeque<Result<(), ChannelError>>>,
