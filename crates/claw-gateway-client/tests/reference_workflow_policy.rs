@@ -1,10 +1,10 @@
-//! Static policy checks for the frozen, Rust-only upstream reference workflow.
+//! Static policy checks for the protected upstream parity workflow.
 
 use std::fs;
 use std::path::PathBuf;
 
 #[test]
-fn reference_workflow_is_rust_only_and_uses_frozen_contracts() {
+fn reference_workflow_uses_protected_validator_and_candidate_data() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -17,20 +17,23 @@ fn reference_workflow_is_rust_only_and_uses_frozen_contracts() {
 
     assert_eq!(
         workflow.matches("persist-credentials: false").count(),
-        1,
-        "the repository checkout must reject persisted GitHub credentials"
+        2,
+        "both repository checkouts must reject persisted GitHub credentials"
     );
     for required in [
-        "on:\n  pull_request:\n  workflow_dispatch:",
+        "on:\n  pull_request_target:",
         "permissions:\n  contents: read",
-        "Verify frozen compatibility snapshot",
-        "./compat/upstream/validate.ps1",
-        "Reject JavaScript toolchain artifacts",
-        "--package claw-repo-policy",
-        "--test repository_policy",
-        "Test protocol and Gateway client against frozen contracts",
-        "--package claw-protocol",
-        "--package claw-gateway-client",
+        "Checkout exact protected base",
+        "ref: ${{ github.event.pull_request.base.sha }}",
+        "path: parity-checkouts/trusted",
+        "Checkout exact immutable candidate",
+        "repository: ${{ github.event.pull_request.head.repo.full_name }}",
+        "ref: ${{ github.event.pull_request.head.sha }}",
+        "path: parity-checkouts/candidate",
+        "Validate candidate parity as bounded data",
+        "compat/upstream/validate.ps1",
+        "-ContractRoot",
+        "-RepositoryRoot",
     ] {
         assert!(
             workflow.contains(required),
@@ -43,6 +46,10 @@ fn reference_workflow_is_rust_only_and_uses_frozen_contracts() {
         "node_modules",
         "openclaw.mjs",
         "persist-credentials: true",
+        "cancel-in-progress:",
+        "cargo test",
+        "& (Join-Path $candidate",
+        "./compat/upstream/validate.ps1",
     ] {
         assert!(
             !workflow.contains(forbidden),

@@ -13,10 +13,11 @@ pub const CODEOWNER: &str = "@aizhihuxiao";
 
 const CANONICAL_CODEOWNERS: &[u8] = include_bytes!("../../../CODEOWNERS");
 
-const PATTERNS: [&str; 21] = [
+const PATTERNS: [&str; 23] = [
     "/.github/CODEOWNERS",
     "/.github/workflows/bootstrap-desktop-supply-chain-policy.yml",
     "/.github/workflows/trusted-desktop-supply-chain-policy.yml",
+    "/.github/workflows/upstream-gateway-reference.yml",
     "/.github/trusted/desktop-supply-chain-policy/**",
     "/.github/workflows/rust.yml",
     "/.github/workflows/macos-packaging.yml",
@@ -35,12 +36,14 @@ const PATTERNS: [&str; 21] = [
     "/desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs",
     "/crates/claw-security/tests/desktop_supply_chain_policy.rs",
     "/crates/claw-security/tests/fixtures/desktop_supply_chain_policy/**",
+    "/compat/upstream/**",
 ];
 
-const FROZEN_SURFACES: [&str; 21] = [
+const FROZEN_SURFACES: [&str; 23] = [
     ".github/CODEOWNERS",
     ".github/workflows/bootstrap-desktop-supply-chain-policy.yml",
     ".github/workflows/trusted-desktop-supply-chain-policy.yml",
+    ".github/workflows/upstream-gateway-reference.yml",
     ".github/trusted/desktop-supply-chain-policy/Cargo.toml",
     ".github/workflows/rust.yml",
     ".github/workflows/macos-packaging.yml",
@@ -59,6 +62,7 @@ const FROZEN_SURFACES: [&str; 21] = [
     "desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs",
     "crates/claw-security/tests/desktop_supply_chain_policy.rs",
     "crates/claw-security/tests/fixtures/desktop_supply_chain_policy/negative-cases.toml",
+    "compat/upstream/validate.ps1",
 ];
 
 fn normalized(bytes: &[u8]) -> Vec<u8> {

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use desktop_supply_chain_policy::policy::BootstrapSnapshotArchive;
 
 const EXPECTED_FINGERPRINT: &str =
-    "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3";
+    "6fc1d523b87633589928e0333ab6b4a2dd9e4a74f3465b4139a5dc627bd7b273";
 const SNAPSHOT_PATH: &str = ".github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot";
 const UPSTREAM_WORKFLOW: &str = ".github/workflows/upstream-gateway-reference.yml";
 

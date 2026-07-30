@@ -843,28 +843,8 @@ fn tracked_symlink_and_gitlink_modes_are_rejected() {
 }
 "#;
 
-const ACTIVE_REPOSITORY_POLICY_WORKFLOW: &str = r#"name: pinned upstream Gateway reference
-
-on:
-  pull_request:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  policy:
-    name: Repository policy
-    runs-on: windows-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout GTA Claw
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          persist-credentials: false
-      - name: Reject JavaScript toolchain artifacts
-        run: cargo test --locked --package claw-repo-policy --test repository_policy
-"#;
+const ACTIVE_REPOSITORY_POLICY_WORKFLOW: &str =
+    include_str!("../../../workflows/upstream-gateway-reference.yml");
 
 fn deactivate_repository_policy(tree: &TempTree) {
     let root_manifest_path = tree.join("Cargo.toml");
@@ -3653,30 +3633,37 @@ fn repository_policy_activation_requires_exact_shape_and_zero_node_workflows() {
 }
 
 #[test]
-fn repository_policy_activation_rejects_self_hosted_runners() {
+fn repository_policy_activation_rejects_candidate_owned_execution() {
     let trusted = final_tree("repository-policy-runner-base");
     deactivate_repository_policy(&trusted);
     let trusted_root = SafeRoot::new(&trusted.path).expect("open inactive policy base");
 
-    for runner in ["self-hosted", "[self-hosted, windows]"] {
+    for (from, to) in [
+        ("runs-on: windows-latest", "runs-on: self-hosted"),
+        ("pull_request_target:", "pull_request:"),
+        (
+            "& (Join-Path $trusted \"compat/upstream/validate.ps1\")",
+            "& (Join-Path $candidate \"compat/upstream/validate.ps1\")",
+        ),
+    ] {
         let candidate = final_tree("repository-policy-runner-candidate");
         deactivate_repository_policy(&candidate);
         activate_repository_policy(&candidate);
         replace(
             &candidate.join(".github/workflows/upstream-gateway-reference.yml"),
-            "runs-on: windows-latest",
-            &format!("runs-on: {runner}"),
+            from,
+            to,
         );
 
         let error = validate_repository_policy_transition(
             &trusted_root,
-            &SafeRoot::new(&candidate.path).expect("open self-hosted runner candidate"),
+            &SafeRoot::new(&candidate.path).expect("open candidate-owned execution candidate"),
         )
-        .expect_err("candidate-controlled repository-policy runner unexpectedly passed")
+        .expect_err("candidate-controlled parity execution unexpectedly passed")
         .to_string();
         assert_eq!(
-            error, "repository-policy test job shape or execution order changed",
-            "self-hosted runner {runner:?} failed through the wrong rule"
+            error, "base-owned parity workflow or candidate-data execution boundary changed",
+            "candidate-owned mutation {to:?} failed through the wrong rule"
         );
     }
 }

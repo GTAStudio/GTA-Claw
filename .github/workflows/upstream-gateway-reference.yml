@@ -1,15 +1,20 @@
 name: pinned upstream Gateway reference
 
 on:
-  pull_request:
-  workflow_dispatch:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
 
 permissions:
   contents: read
 
 concurrency:
-  group: upstream-gateway-reference-${{ github.ref }}
-  cancel-in-progress: true
+  group: upstream-gateway-reference-${{ github.event.pull_request.number }}
 
 jobs:
   frozen-rust-reference:
@@ -17,20 +22,68 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - name: Checkout GTA Claw
+      - name: Validate immutable pull request event
+        shell: powershell
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          REPOSITORY: ${{ github.repository }}
+          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:EVENT_NAME -ne "pull_request_target" -or
+              $env:REPOSITORY -ne "GTAStudio/GTA-Claw" -or
+              $env:BASE_REPOSITORY -ne "GTAStudio/GTA-Claw" -or
+              $env:BASE_REF -ne "main" -or
+              $env:EVENT_ACTION -notmatch "^(opened|reopened|synchronize|ready_for_review)$" -or
+              $env:BASE_SHA -notmatch "^[0-9a-f]{40}$" -or
+              $env:HEAD_SHA -notmatch "^[0-9a-f]{40}$" -or
+              $env:BASE_SHA -eq $env:HEAD_SHA -or
+              $env:HEAD_REPOSITORY -notmatch "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}$" -or
+              $env:HEAD_REPOSITORY.Contains("..")) {
+            throw "pull request event identity is not an immutable GTA-Claw candidate"
+          }
+
+      - name: Checkout exact protected base
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          repository: GTAStudio/GTA-Claw
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: parity-checkouts/trusted
+          fetch-depth: 1
+          fetch-tags: false
           persist-credentials: false
+          submodules: false
+          lfs: false
+          clean: true
+          set-safe-directory: false
+          show-progress: false
 
-      - name: Reject JavaScript toolchain artifacts
-        run: cargo test --locked --package claw-repo-policy --test repository_policy
+      - name: Checkout exact immutable candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: parity-checkouts/candidate
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+          submodules: false
+          lfs: false
+          clean: true
+          set-safe-directory: false
+          show-progress: false
 
-      - name: Verify frozen compatibility snapshot
+      - name: Validate candidate parity as bounded data
         shell: powershell
-        run: ./compat/upstream/validate.ps1
-
-      - name: Test protocol and Gateway client against frozen contracts
-        run: >-
-          cargo test --locked
-          --package claw-protocol
-          --package claw-gateway-client
+        run: |
+          $ErrorActionPreference = "Stop"
+          $trusted = Join-Path "${{ github.workspace }}" "parity-checkouts/trusted"
+          $candidate = Join-Path "${{ github.workspace }}" "parity-checkouts/candidate"
+          & (Join-Path $trusted "compat/upstream/validate.ps1") `
+            -ContractRoot (Join-Path $candidate "compat/upstream") `
+            -RepositoryRoot $candidate

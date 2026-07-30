@@ -437,7 +437,7 @@ default output is deliberately human-facing and names the archive subject before
 
 ```text
 cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- bootstrap-fingerprint --snapshot "$PWD/.github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"
-bootstrap archive /reviewed/GTA-Claw/.github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot fingerprint 96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3
+bootstrap archive /reviewed/GTA-Claw/.github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot fingerprint 6fc1d523b87633589928e0333ab6b4a2dd9e4a74f3465b4139a5dc627bd7b273
 ```
 
 Do not run fingerprinting against `--root "$PWD"`. Current Final intentionally differs from
@@ -469,6 +469,11 @@ requiring Synchronize or Preserve for changed Bootstrap source paths.
 
 This note records the accepted historical decision. It does not claim that Bootstrap must mirror
 current Final, and it does not authorize regenerating or reverting the archive.
+
+The later parity trust-root hardening synchronizes that workflow entry again, together with
+`.github/CODEOWNERS`, so the historical archive also uses a protected-base validator and owns the
+parity surface. The audited writer reports exactly those two modified paths and preserves the
+other 26 entries; this advances the accepted parity boundary without rebasing unrelated history.
 
 During an audited Final dependency-surface update, copy the reviewed live root deny
 policy, desktop manifests, desktop lock, and desktop deny policy into their exact audit

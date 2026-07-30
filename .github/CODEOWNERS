@@ -2,6 +2,7 @@
 /.github/CODEOWNERS @aizhihuxiao
 /.github/workflows/bootstrap-desktop-supply-chain-policy.yml @aizhihuxiao
 /.github/workflows/trusted-desktop-supply-chain-policy.yml @aizhihuxiao
+/.github/workflows/upstream-gateway-reference.yml @aizhihuxiao
 /.github/trusted/desktop-supply-chain-policy/** @aizhihuxiao
 /.github/workflows/rust.yml @aizhihuxiao
 /.github/workflows/macos-packaging.yml @aizhihuxiao
@@ -20,3 +21,4 @@ rust-toolchain @aizhihuxiao
 /desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs @aizhihuxiao
 /crates/claw-security/tests/desktop_supply_chain_policy.rs @aizhihuxiao
 /crates/claw-security/tests/fixtures/desktop_supply_chain_policy/** @aizhihuxiao
+/compat/upstream/** @aizhihuxiao
