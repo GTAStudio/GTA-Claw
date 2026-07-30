@@ -461,7 +461,7 @@ default output is deliberately human-facing and names the archive subject before
 
 ```text
 cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- bootstrap-fingerprint --snapshot "$PWD/.github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"
-bootstrap archive /reviewed/GTA-Claw/.github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot fingerprint 96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3
+bootstrap archive /reviewed/GTA-Claw/.github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot fingerprint 57315d1c0b87b7e1c323c723b330f894fcec4f651a6786314532ddc8b3104394
 ```
 
 Do not run fingerprinting against `--root "$PWD"`. Current Final intentionally differs from

@@ -130,7 +130,7 @@ fn dependency_assignment_is(assignment: &str, package: &str) -> bool {
 }
 
 fn manifest_dependency_edges(
-    manifest: PathBuf,
+    manifest: &Path,
     text: &str,
     package: &str,
 ) -> Vec<ManifestDependencyEdge> {
@@ -139,13 +139,13 @@ fn manifest_dependency_edges(
     for raw_line in text.lines() {
         let line = raw_line.trim();
         if line.starts_with('[') && line.ends_with(']') {
-            section = line
+            line
                 .trim_start_matches('[')
                 .trim_end_matches(']')
-                .to_owned();
+                .clone_into(&mut section);
         } else if dependency_section(&section) && dependency_assignment_is(line, package) {
             edges.push(ManifestDependencyEdge {
-                manifest: manifest.clone(),
+                manifest: manifest.to_path_buf(),
                 section: section.clone(),
                 assignment: line.to_owned(),
             });
@@ -261,7 +261,7 @@ fn windows_file_identity_ffi_is_isolated() {
     let workspace_manifest =
         fs::read_to_string(root.join("Cargo.toml")).expect("read workspace manifest");
     let root_edges = manifest_dependency_edges(
-        PathBuf::from("Cargo.toml"),
+        Path::new("Cargo.toml"),
         &workspace_manifest,
         WINDOWS_FILE_ID_PACKAGE,
     );
@@ -309,14 +309,12 @@ fn windows_file_identity_ffi_is_isolated() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         source_files,
-        ["lib.rs".to_owned()]
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>(),
+        std::iter::once("lib.rs".to_owned()).collect::<std::collections::BTreeSet<_>>(),
         "helper source inventory changed"
     );
 
     let helper_edges = manifest_dependency_edges(
-        PathBuf::from("crates/claw-windows-file-id/Cargo.toml"),
+        Path::new("crates/claw-windows-file-id/Cargo.toml"),
         &helper_manifest,
         "windows-sys",
     );
@@ -380,7 +378,7 @@ fn windows_file_identity_ffi_is_isolated() {
                 .expect("manifest is below workspace")
                 .to_path_buf();
             consumer_edges.extend(manifest_dependency_edges(
-                relative,
+                &relative,
                 &fs::read_to_string(&manifest).expect("read first-party manifest"),
                 WINDOWS_FILE_ID_PACKAGE,
             ));

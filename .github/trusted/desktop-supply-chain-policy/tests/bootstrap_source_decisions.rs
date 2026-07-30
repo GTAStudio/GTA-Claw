@@ -211,6 +211,38 @@ fn append_bytes(tree: &TempTree, path: &str, suffix: &[u8]) {
     fs::write(destination, bytes).expect("write mutation");
 }
 
+fn remove_once(mut text: String, exact: &str) -> String {
+    assert_eq!(
+        text.matches(exact).count(),
+        1,
+        "Phase-A1 base reconstruction input changed: {exact:?}"
+    );
+    text = text.replacen(exact, "", 1);
+    text
+}
+
+fn phase_a1_base_input(path: &str, admitted: &[u8]) -> Vec<u8> {
+    let mut text = String::from_utf8(admitted.to_vec()).expect("Phase-A1 Cargo input is UTF-8");
+    match path {
+        ROOT_MANIFEST => {
+            text = remove_once(text, "  \"crates/claw-windows-file-id\",\n");
+            text = remove_once(
+                text,
+                "claw-windows-file-id = { path = \"crates/claw-windows-file-id\", version = \"0.1.0\" }\n",
+            );
+        }
+        ROOT_LOCK => {
+            text = remove_once(text, " \"claw-windows-file-id\",\n");
+            text = remove_once(
+                text,
+                "[[package]]\nname = \"claw-windows-file-id\"\nversion = \"0.1.0\"\ndependencies = [\n \"windows-sys 0.61.2\",\n]\n\n",
+            );
+        }
+        _ => panic!("unsupported Phase-A1 base input: {path}"),
+    }
+    text.into_bytes()
+}
+
 fn replace_fingerprint(tree: &TempTree, fingerprint: &str) {
     let path = tree.join(BOOTSTRAP_FINGERPRINT_SOURCE_PATH);
     let mut source = fs::read_to_string(&path).expect("read fingerprint source");
@@ -305,6 +337,26 @@ fn write_ledger(tree: &TempTree, decisions: &[TestDecision]) {
         render_ledger(decisions),
     )
     .expect("write decision ledger");
+}
+
+fn append_ledger_decisions(tree: &TempTree, decisions: &[TestDecision]) {
+    let path = tree.join(BOOTSTRAP_SOURCE_DECISIONS_PATH);
+    let mut ledger = fs::read_to_string(&path).expect("read decision ledger");
+    let next_id = ledger.matches("\n[[decisions]]\n").count() + 1;
+    assert!(
+        decisions
+            .iter()
+            .enumerate()
+            .all(|(offset, decision)| decision.id == next_id + offset),
+        "appended fixture decisions must retain consecutive ids"
+    );
+    let rendered = render_ledger(decisions);
+    let blocks = rendered
+        .strip_prefix("schema_version = 1\n")
+        .expect("rendered decision prefix");
+    let insertion = ledger.find("\n[[standing]]\n").unwrap_or(ledger.len());
+    ledger.insert_str(insertion, blocks);
+    fs::write(path, ledger).expect("append decision ledger entries");
 }
 
 fn placeholder_decision(id: usize, path: &str) -> TestDecision {
@@ -456,11 +508,9 @@ fn phase_a1_rotates_only_codeowners_and_preserves_exact_root_inputs() {
     .expect("write Phase-A1 protected ledger");
 
     for path in [ROOT_LOCK, ROOT_MANIFEST] {
-        write_file(
-            &candidate,
-            path,
-            fs::read(repo_root().join(path)).expect("read admitted root input"),
-        );
+        let admitted = fs::read(repo_root().join(path)).expect("read admitted root input");
+        write_file(&trusted, path, phase_a1_base_input(path, &admitted));
+        write_file(&candidate, path, admitted);
     }
 
     let before = BootstrapSnapshotArchive::parse(
@@ -568,9 +618,9 @@ fn synchronized_and_bound_preservation_branches_both_pass() {
         &preserved_trusted,
         &preserved_candidate,
         UPSTREAM_WORKFLOW,
-        1,
+        3,
     );
-    write_ledger(&preserved_candidate, &[decision]);
+    append_ledger_decisions(&preserved_candidate, &[decision]);
     assert_eq!(
         validate(
             &preserved_trusted,
@@ -600,8 +650,8 @@ fn multiple_paths_support_one_synchronized_and_one_preserved_decision() {
     );
     synchronize_snapshot(&candidate);
     append_bytes(&candidate, RUSTFMT, b"\n# preserved in mixed update\n");
-    let decision = decision_for(&trusted, &candidate, RUSTFMT, 1);
-    write_ledger(&candidate, &[decision]);
+    let decision = decision_for(&trusted, &candidate, RUSTFMT, 3);
+    append_ledger_decisions(&candidate, &[decision]);
 
     assert_eq!(
         validate(
@@ -641,7 +691,7 @@ fn stale_or_incomplete_preservation_bindings_fail_closed() {
             UPSTREAM_WORKFLOW,
             b"\n# preservation binding mutation\n",
         );
-        let mut decision = decision_for(&trusted, &candidate, UPSTREAM_WORKFLOW, 1);
+        let mut decision = decision_for(&trusted, &candidate, UPSTREAM_WORKFLOW, 3);
         match field {
             "base_oid" => decision.base_oid = "3333333333333333333333333333333333333333".to_owned(),
             "base_live_sha256" => decision.base_live_sha256 = "a".repeat(64),
@@ -651,7 +701,7 @@ fn stale_or_incomplete_preservation_bindings_fail_closed() {
             "rationale" => decision.rationale.clear(),
             _ => unreachable!(),
         }
-        write_ledger(&candidate, &[decision]);
+        append_ledger_decisions(&candidate, &[decision]);
         expect_error(
             &trusted,
             &candidate,
@@ -736,6 +786,7 @@ fn existing_decisions_are_immutable_and_new_decisions_cannot_be_extraneous() {
     let deleted_trusted = snapshot_fixture("deleted-trusted");
     let deleted_candidate = snapshot_fixture("deleted-candidate");
     write_ledger(&deleted_trusted, std::slice::from_ref(&historical));
+    write_ledger(&deleted_candidate, &[]);
     expect_error(
         &deleted_trusted,
         &deleted_candidate,
@@ -758,6 +809,7 @@ fn existing_decisions_are_immutable_and_new_decisions_cannot_be_extraneous() {
 
     let extra_trusted = snapshot_fixture("extra-trusted");
     let extra_candidate = snapshot_fixture("extra-candidate");
+    write_ledger(&extra_trusted, &[]);
     write_ledger(
         &extra_candidate,
         &[placeholder_decision(1, UPSTREAM_WORKFLOW)],
@@ -970,7 +1022,7 @@ fn active_fingerprint_declaration_decoys_are_rejected_without_matching_comments(
 }
 
 #[test]
-fn standing_preservations_admit_dependency_changes_without_writing_the_protected_tree() {
+fn rotated_archive_voids_old_standing_preservations() {
     let trusted = snapshot_fixture("standing-trusted");
     let candidate = snapshot_fixture("standing-candidate");
     append_bytes(&candidate, ROOT_LOCK, b"\n# resolved a new dependency\n");
@@ -991,18 +1043,13 @@ fn standing_preservations_admit_dependency_changes_without_writing_the_protected
         "an ordinary dependency change must not rewrite the historical archive",
     );
 
-    assert_eq!(
-        validate(
-            &trusted,
-            &candidate,
-            &manifest([('M', ROOT_LOCK), ('M', SECURITY_MANIFEST)]),
-        )
-        .expect("standing preservations cover the dependency-graph surface"),
-        BootstrapSourceDecisionEvidence {
-            changed_paths: 2,
-            synchronized_paths: 0,
-            preserved_paths: 2,
-        }
+    expect_error(
+        &trusted,
+        &candidate,
+        &manifest([('M', ROOT_LOCK), ('M', SECURITY_MANIFEST)]),
+        &format!(
+            "Bootstrap standing preservation no longer binds the candidate Bootstrap archive fingerprint: {ROOT_LOCK}"
+        ),
     );
 }
 
