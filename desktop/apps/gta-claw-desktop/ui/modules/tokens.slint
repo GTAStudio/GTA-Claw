@@ -32,11 +32,11 @@ export global VisualPreferences {
     out property <bool> dark: VisualPreferences.effective-theme-mode == ThemeMode.dark;
 
     public function request-theme-mode(mode: ThemeMode) {
-        VisualPreferences.theme-override-active = true;
         VisualPreferences.theme-mode-requested(mode);
     }
 
     callback theme-mode-requested(ThemeMode);
+    callback follow-system-theme-requested(ThemeMode);
     callback high-contrast-requested(bool);
     callback reduced-motion-requested(bool);
     callback density-scale-requested(float);
@@ -123,18 +123,22 @@ export global DesignTokens {
 
 export global Metrics {
     private property <float> density: clamp(VisualPreferences.density-scale, 0.8, 2.0);
+    // Typography honors the full requested scale. Structural geometry stops
+    // growing sooner so 200% remains scrollable at the supported 720x520
+    // minimum instead of consuming the viewport with padding and chrome.
+    private property <float> geometry-density: min(Metrics.density, 1.4);
 
-    out property <length> space-1: 4px * Metrics.density;
-    out property <length> space-2: 8px * Metrics.density;
-    out property <length> space-3: 12px * Metrics.density;
-    out property <length> space-4: 16px * Metrics.density;
-    out property <length> space-6: 24px * Metrics.density;
-    out property <length> space-8: 32px * Metrics.density;
-    out property <length> space-12: 48px * Metrics.density;
+    out property <length> space-1: 4px * Metrics.geometry-density;
+    out property <length> space-2: 8px * Metrics.geometry-density;
+    out property <length> space-3: 12px * Metrics.geometry-density;
+    out property <length> space-4: 16px * Metrics.geometry-density;
+    out property <length> space-6: 24px * Metrics.geometry-density;
+    out property <length> space-8: 32px * Metrics.geometry-density;
+    out property <length> space-12: 48px * Metrics.geometry-density;
 
-    out property <length> radius-small: 4px * Metrics.density;
-    out property <length> radius-medium: 8px * Metrics.density;
-    out property <length> radius-large: 12px * Metrics.density;
+    out property <length> radius-small: 4px * Metrics.geometry-density;
+    out property <length> radius-medium: 8px * Metrics.geometry-density;
+    out property <length> radius-large: 12px * Metrics.geometry-density;
     out property <length> radius-pill: 999px;
 
     out property <length> type-caption: 11px * Metrics.density;
@@ -146,10 +150,10 @@ export global Metrics {
     out property <length> line-body: 22px * Metrics.density;
     out property <length> line-title: 26px * Metrics.density;
 
-    out property <length> control-small: 28px * Metrics.density;
-    out property <length> control-medium: 36px * Metrics.density;
-    out property <length> control-large: 44px * Metrics.density;
-    out property <length> touch-target: 48px * Metrics.density;
+    out property <length> control-small: 28px * Metrics.geometry-density;
+    out property <length> control-medium: 36px * Metrics.geometry-density;
+    out property <length> control-large: 44px * Metrics.geometry-density;
+    out property <length> touch-target: 48px * Metrics.geometry-density;
 
     out property <length> focus-width: VisualPreferences.high-contrast ? 3px : 2px;
     out property <length> focus-offset: 2px;

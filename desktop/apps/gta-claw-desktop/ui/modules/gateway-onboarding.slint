@@ -12,30 +12,61 @@ import {
     TextField,
     ToastBanner,
 } from "./primitives.slint";
-import { DesignTokens, Metrics, StatusKind } from "./tokens.slint";
+import { DesignTokens, Metrics, StatusKind, VisualPreferences } from "./tokens.slint";
 
 component SummaryRow {
     in property <string> label;
     in property <string> value;
+    out property <bool> stacked: VisualPreferences.density-scale > 1.25 || root.width < 320px;
+    out property <bool> text-bounds-fit:
+        root.width > 0px
+        && root.height > 0px
+        && summary-grid.width > 0px
+        && summary-grid.height > 0px
+        && label-text.width > 0px
+        && label-text.height > 0px
+        && label-text.preferred-height > 0px
+        && label-text.height >= label-text.preferred-height
+        && value-text.width > 0px
+        && value-text.height > 0px
+        && value-text.preferred-height > 0px
+        && value-text.height >= value-text.preferred-height
+        && label-text.absolute-position.x >= root.absolute-position.x
+        && label-text.absolute-position.y >= root.absolute-position.y
+        && value-text.absolute-position.x >= root.absolute-position.x
+        && value-text.absolute-position.y >= root.absolute-position.y
+        && label-text.absolute-position.x + label-text.width
+            <= root.absolute-position.x + root.width + 1px
+        && value-text.absolute-position.x + value-text.width
+            <= root.absolute-position.x + root.width + 1px
+        && label-text.absolute-position.y + label-text.height
+            <= root.absolute-position.y + root.height + 1px
+        && value-text.absolute-position.y + value-text.height
+            <= root.absolute-position.y + root.height + 1px;
 
-    min-height: Metrics.line-body;
+    min-height: summary-grid.min-height;
     accessible-role: text;
     accessible-label: root.label + ": " + root.value;
 
-    HorizontalLayout {
+    summary-grid := GridLayout {
         spacing: Metrics.space-3;
 
-        Text {
+        label-text := Text {
+            row: 0;
+            col: 0;
             text: root.label;
             color: DesignTokens.text-muted;
             font-size: Metrics.type-caption;
             font-weight: 700;
-            width: 112px;
-            horizontal-stretch: 0;
+            width: root.stacked ? parent.width : min(112px, parent.width * 0.36);
+            horizontal-stretch: root.stacked ? 1 : 0;
+            wrap: word-wrap;
             accessible-role: none;
         }
 
-        Text {
+        value-text := Text {
+            row: root.stacked ? 1 : 0;
+            col: root.stacked ? 0 : 1;
             text: root.value;
             color: DesignTokens.text-primary;
             font-size: Metrics.type-small;
@@ -54,6 +85,16 @@ component ConnectionSummary {
     in property <string> scopes;
     in property <string> health;
     in property <string> identity;
+    out property <bool> text-bounds-fit:
+        endpoint-row.text-bounds-fit
+        && server-row.text-bounds-fit
+        && protocol-row.text-bounds-fit
+        && role-row.text-bounds-fit
+        && scopes-row.text-bounds-fit
+        && health-row.text-bounds-fit
+        && identity-row.text-bounds-fit;
+    out property <bool> high-density-stacked:
+        scopes-row.stacked && identity-row.stacked;
 
     Card {
         accessible-name: "Safe Gateway connection summary";
@@ -74,13 +115,13 @@ component ConnectionSummary {
         }
 
         Divider { }
-        SummaryRow { label: "Endpoint"; value: root.endpoint; }
-        SummaryRow { label: "Server"; value: root.server; }
-        SummaryRow { label: "Protocol"; value: root.protocol; }
-        SummaryRow { label: "Role"; value: root.role; }
-        SummaryRow { label: "Effective scopes"; value: root.scopes; }
-        SummaryRow { label: "Health"; value: root.health; }
-        SummaryRow { label: "Device identity"; value: root.identity; }
+        endpoint-row := SummaryRow { label: "Endpoint"; value: root.endpoint; }
+        server-row := SummaryRow { label: "Server"; value: root.server; }
+        protocol-row := SummaryRow { label: "Protocol"; value: root.protocol; }
+        role-row := SummaryRow { label: "Role"; value: root.role; }
+        scopes-row := SummaryRow { label: "Effective scopes"; value: root.scopes; }
+        health-row := SummaryRow { label: "Health"; value: root.health; }
+        identity-row := SummaryRow { label: "Device identity"; value: root.identity; }
     }
 }
 
@@ -209,6 +250,7 @@ component ConnectionActions {
     in property <bool> can-retry;
     out property <string> focused-action: "";
     callback connect-requested;
+    callback preview-requested;
     callback retry-requested;
     callback cancel-requested;
     callback disconnect-requested;
@@ -221,6 +263,13 @@ component ConnectionActions {
             root.focused-action = "";
         }
         root.focus-changed();
+    }
+
+    changed can-disconnect => {
+        if (primary-action.has-focus) {
+            root.focused-action = root.can-disconnect ? "Open preview" : "Connect";
+            root.focus-changed();
+        }
     }
 
     accessible-role: region;
@@ -237,17 +286,31 @@ component ConnectionActions {
         padding: Metrics.space-2;
         spacing: Metrics.space-2;
 
-        PrimaryButton {
+        primary-action := PrimaryButton {
             row: 0;
             col: 0;
             min-width: 0px;
             horizontal-stretch: 1;
             compact: true;
-            text: "Connect";
-            accessible-name: "Connect to Gateway";
-            enabled: root.can-connect && !root.can-retry;
-            focus-changed(focused) => { root.record-action-focus("Connect", focused); }
-            clicked => { root.connect-requested(); }
+            focus-id: "gateway.primary-action";
+            text: root.can-disconnect ? "Preview" : "Connect";
+            accessible-name: root.can-disconnect
+                ? "Open read-only product preview"
+                : "Connect to Gateway";
+            description: root.can-disconnect
+                ? "The preview uses sample data and has no interactive product backend."
+                : "Run the real read-only Gateway diagnostic.";
+            enabled: root.can-disconnect || (root.can-connect && !root.can-retry);
+            focus-changed(focused) => {
+                root.record-action-focus(root.can-disconnect ? "Open preview" : "Connect", focused);
+            }
+            clicked => {
+                if (root.can-disconnect) {
+                    root.preview-requested();
+                } else {
+                    root.connect-requested();
+                }
+            }
         }
 
         PrimaryButton {
@@ -324,13 +387,20 @@ export component GatewayOnboardingSurface inherits FocusScope {
     out property <bool> endpoint-has-focus: connection-form.endpoint-has-focus;
     out property <bool> token-has-focus: connection-form.token-has-focus;
     out property <string> focused-action: connection-actions.focused-action;
+    out property <bool> summary-text-bounds-fit: connection-summary.text-bounds-fit;
+    out property <bool> summary-high-density-stacked: connection-summary.high-density-stacked;
+    private property <bool> observed-summary-text-bounds-fit: root.summary-text-bounds-fit;
+    private property <bool> observed-summary-high-density-stacked:
+        root.summary-high-density-stacked;
 
     callback connect-requested(string, string, bool);
+    callback preview-requested;
     callback retry-requested(string, string, bool);
     callback cancel-requested;
     callback disconnect-requested;
     callback error-dismiss-requested;
     callback focus-changed(bool, bool, string);
+    callback summary-geometry-changed(bool, bool);
 
     // The surface is created on demand, so claim keyboard focus for the Escape
     // handler - unless a field is being restored after a reset.
@@ -338,6 +408,22 @@ export component GatewayOnboardingSurface inherits FocusScope {
         if (!root.endpoint-preserve-focus && !root.token-preserve-focus) {
             root.focus();
         }
+        root.summary-geometry-changed(
+            root.summary-text-bounds-fit,
+            root.summary-high-density-stacked
+        );
+    }
+    changed observed-summary-text-bounds-fit => {
+        root.summary-geometry-changed(
+            root.summary-text-bounds-fit,
+            root.summary-high-density-stacked
+        );
+    }
+    changed observed-summary-high-density-stacked => {
+        root.summary-geometry-changed(
+            root.summary-text-bounds-fit,
+            root.summary-high-density-stacked
+        );
     }
 
     key-pressed(event) => {
@@ -442,6 +528,7 @@ export component GatewayOnboardingSurface inherits FocusScope {
                     root.consent-checked
                 );
             }
+            preview-requested => { root.preview-requested(); }
             retry-requested => {
                 root.retry-requested(
                     root.endpoint-input,
@@ -558,7 +645,7 @@ export component GatewayOnboardingSurface inherits FocusScope {
                 }
 
                 Text {
-                    text: "This diagnostic does not enroll a persistent device, store credentials, or enable chat and account features.";
+                    text: "This diagnostic does not enroll a persistent device, store credentials, or enable product actions. The optional product preview is read-only sample data.";
                     color: DesignTokens.text-muted;
                     font-size: Metrics.type-caption;
                     wrap: word-wrap;

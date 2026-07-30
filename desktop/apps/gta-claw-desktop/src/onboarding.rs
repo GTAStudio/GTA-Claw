@@ -485,6 +485,8 @@ pub(crate) struct OnboardingModel {
     summary: SafeSummary,
     error: Option<UserError>,
     reconnect_attempt: Option<u32>,
+    identity_active: bool,
+    reset_consent: bool,
 }
 
 impl Default for OnboardingModel {
@@ -495,6 +497,8 @@ impl Default for OnboardingModel {
             summary: SafeSummary::default(),
             error: None,
             reconnect_attempt: None,
+            identity_active: false,
+            reset_consent: false,
         }
     }
 }
@@ -529,10 +533,12 @@ impl OnboardingModel {
         };
         self.error = None;
         self.reconnect_attempt = None;
+        self.reset_consent = false;
         self.generation
     }
 
     pub(crate) fn reject_submission(&mut self, endpoint_display: Option<String>, error: UserError) {
+        self.reset_consent = false;
         self.generation = self.generation.wrapping_add(1);
         if let Some(endpoint) = endpoint_display {
             self.summary.endpoint = endpoint;
@@ -550,6 +556,7 @@ impl OnboardingModel {
         if generation != self.generation {
             return false;
         }
+        self.reset_consent = false;
         match update {
             AttemptUpdate::Connecting => self.phase = OnboardingPhase::Connecting,
             AttemptUpdate::Authenticating => self.phase = OnboardingPhase::Authenticating,
@@ -560,6 +567,8 @@ impl OnboardingModel {
             }
             AttemptUpdate::IdentityCreated(identity) => {
                 self.summary.identity = bounded_text(identity, 96);
+                self.identity_active = true;
+                self.reset_consent = false;
             }
             AttemptUpdate::Ready(info) => {
                 self.phase = OnboardingPhase::HealthChecking;
@@ -599,6 +608,7 @@ impl OnboardingModel {
     }
 
     pub(crate) fn start_disconnect(&mut self) -> u64 {
+        self.reset_consent = false;
         self.generation = self.generation.wrapping_add(1);
         self.phase = OnboardingPhase::Disconnecting;
         self.error = None;
@@ -616,7 +626,14 @@ impl OnboardingModel {
         "Not authenticated".clone_into(&mut self.summary.role);
         "No effective scopes".clone_into(&mut self.summary.scopes);
         "Disconnected".clone_into(&mut self.summary.health);
-        "Discarded on disconnect".clone_into(&mut self.summary.identity);
+        let discarded_identity = self.identity_active;
+        if discarded_identity {
+            "Discarded on disconnect".clone_into(&mut self.summary.identity);
+        } else {
+            "No session identity created".clone_into(&mut self.summary.identity);
+        }
+        self.reset_consent = discarded_identity;
+        self.identity_active = false;
         true
     }
 
@@ -668,8 +685,8 @@ impl OnboardingModel {
                 UiStatusKind::Success,
                 "Success",
                 "OK",
-                "Gateway ready",
-                "The pinned protocol is authenticated and the safe health probe passed.",
+                "Gateway diagnostic passed",
+                "The read-only health probe passed. Product actions remain unavailable.",
             ),
             OnboardingPhase::Failed => (
                 UiStatusKind::Danger,
@@ -708,7 +725,14 @@ impl OnboardingModel {
             health: self.summary.health.clone(),
             identity: self.summary.identity.clone(),
             error: self.error.clone(),
+            reset_consent: self.reset_consent,
         }
+    }
+
+    pub(crate) fn take_snapshot(&mut self) -> ViewSnapshot {
+        let snapshot = self.snapshot();
+        self.reset_consent = false;
+        snapshot
     }
 
     #[cfg(test)]
@@ -734,6 +758,7 @@ pub(crate) struct ViewSnapshot {
     health: String,
     identity: String,
     error: Option<UserError>,
+    reset_consent: bool,
 }
 
 impl ViewSnapshot {
@@ -796,6 +821,10 @@ impl ViewSnapshot {
 
     pub(crate) const fn error(&self) -> Option<&UserError> {
         self.error.as_ref()
+    }
+
+    pub(crate) const fn reset_consent(&self) -> bool {
+        self.reset_consent
     }
 
     pub(crate) const fn busy(&self) -> bool {
@@ -918,6 +947,7 @@ mod tests {
         assert_eq!(ready.protocol(), "Gateway v4");
         assert_eq!(ready.role(), "operator");
         assert_eq!(ready.scopes(), "operator.read");
+        assert!(!ready.reset_consent());
 
         let disconnect_generation = model.start_disconnect();
         assert_eq!(model.snapshot().phase(), OnboardingPhase::Disconnecting);
@@ -925,6 +955,7 @@ mod tests {
         let stopped = model.snapshot();
         assert_eq!(stopped.phase(), OnboardingPhase::Disconnected);
         assert_eq!(stopped.identity(), "Discarded on disconnect");
+        assert!(stopped.reset_consent());
     }
 
     #[test]
@@ -1045,6 +1076,82 @@ mod tests {
         .expect_err("malformed endpoint rejected before consent");
         assert_eq!(rejection.error.code(), "endpoint.invalid");
         assert_eq!(rejection.endpoint_input, None);
+    }
+
+    #[test]
+    fn consent_reset_is_emitted_only_after_identity_discard() {
+        let mut no_identity = OnboardingModel::default();
+        let empty_disconnect = no_identity.start_disconnect();
+        assert!(no_identity.finish_disconnect(empty_disconnect));
+        assert!(
+            !no_identity.take_snapshot().reset_consent(),
+            "disconnect without an identity has no consent to reset"
+        );
+        assert_eq!(
+            no_identity.snapshot().identity(),
+            "No session identity created"
+        );
+
+        let mut model = OnboardingModel::default();
+        assert!(!model.snapshot().reset_consent());
+        let generation = model.begin("ws://localhost:18789/".to_owned());
+        assert!(model.apply(
+            generation,
+            AttemptUpdate::IdentityCreated("session-device".to_owned())
+        ));
+        assert!(model.apply(
+            generation,
+            AttemptUpdate::Failed(UserError::transport(TransportFailure::Closed))
+        ));
+        assert!(
+            !model.snapshot().reset_consent(),
+            "retry retains the same session identity and its consent"
+        );
+
+        let disconnect = model.start_disconnect();
+        assert!(model.finish_disconnect(disconnect));
+        assert!(model.take_snapshot().reset_consent());
+        assert!(
+            !model.snapshot().reset_consent(),
+            "publishing consumes the identity-discard reset directive"
+        );
+
+        let retry = model.begin("ws://localhost:18789/".to_owned());
+        assert!(
+            !model.snapshot().reset_consent(),
+            "a new attempt clears the one-shot reset directive"
+        );
+        assert!(model.apply(
+            retry,
+            AttemptUpdate::IdentityCreated("new-session-device".to_owned())
+        ));
+        assert!(!model.snapshot().reset_consent());
+    }
+
+    #[test]
+    fn invalid_submission_after_rechecking_consent_does_not_replay_consumed_reset() {
+        let mut model = OnboardingModel::default();
+        let generation = model.begin("ws://localhost:18789/".to_owned());
+        assert!(model.apply(
+            generation,
+            AttemptUpdate::IdentityCreated("session-device".to_owned())
+        ));
+        let disconnect = model.start_disconnect();
+        assert!(model.finish_disconnect(disconnect));
+        assert!(model.take_snapshot().reset_consent());
+
+        model.reject_submission(
+            None,
+            UserError::input(
+                "endpoint.invalid",
+                "Enter a complete Gateway address.",
+                "Correct the address and retry.",
+            ),
+        );
+        assert!(
+            !model.take_snapshot().reset_consent(),
+            "the invalid submission must not replay the prior identity-discard reset"
+        );
     }
 
     #[test]

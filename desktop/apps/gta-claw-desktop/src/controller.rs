@@ -337,7 +337,7 @@ async fn controller_loop(
     attempt_stop_observer: Option<AttemptStopObserver>,
 ) {
     let mut model = OnboardingModel::default();
-    publish(&sink, &model);
+    publish(&sink, &mut model);
     let (attempt_events, mut events) = mpsc::channel(ATTEMPT_EVENT_CAPACITY);
     let mut active: Option<ActiveAttempt> = None;
     let mut session_identity: Option<Arc<DeviceIdentity>> = None;
@@ -347,21 +347,21 @@ async fn controller_loop(
             biased;
             () = close.cancelled() => {
                 let generation = model.start_disconnect();
-                publish(&sink, &model);
+                publish(&sink, &mut model);
                 stop_attempt(active.take(), attempt_stop_observer.as_ref()).await;
                 drop(session_identity.take());
                 model.finish_disconnect(generation);
-                publish(&sink, &model);
+                publish(&sink, &mut model);
                 break;
             }
             command = commands.recv() => {
                 let Some(command) = command else {
                     let generation = model.start_disconnect();
-                    publish(&sink, &model);
+                    publish(&sink, &mut model);
                     stop_attempt(active.take(), attempt_stop_observer.as_ref()).await;
                     drop(session_identity.take());
                     model.finish_disconnect(generation);
-                    publish(&sink, &model);
+                    publish(&sink, &mut model);
                     break;
                 };
                 match command {
@@ -375,7 +375,7 @@ async fn controller_loop(
                         }
                         let endpoint = request.endpoint_display().to_owned();
                         let generation = model.begin(endpoint);
-                        publish(&sink, &model);
+                        publish(&sink, &mut model);
                         stop_attempt(active.take(), attempt_stop_observer.as_ref()).await;
                         if close.is_cancelled() {
                             complete_connect(completion, ConnectDisposition::Closed);
@@ -392,7 +392,7 @@ async fn controller_loop(
                                 identity.device_id()
                             )),
                         );
-                        publish(&sink, &model);
+                        publish(&sink, &mut model);
                         let cancellation = CancellationToken::new();
                         let task = tokio::spawn(run_attempt(
                             generation,
@@ -412,15 +412,15 @@ async fn controller_loop(
                         }
                         stop_attempt(active.take(), attempt_stop_observer.as_ref()).await;
                         model.reject_submission(rejection.endpoint_display, rejection.error);
-                        publish(&sink, &model);
+                        publish(&sink, &mut model);
                     }
                     ControllerCommand::Cancel | ControllerCommand::Disconnect => {
                         let generation = model.start_disconnect();
-                        publish(&sink, &model);
+                        publish(&sink, &mut model);
                         stop_attempt(active.take(), attempt_stop_observer.as_ref()).await;
                         session_identity = None;
                         model.finish_disconnect(generation);
-                        publish(&sink, &model);
+                        publish(&sink, &mut model);
                     }
                 }
             }
@@ -428,7 +428,7 @@ async fn controller_loop(
                 if let Some((generation, update)) = event
                     && model.apply(generation, update)
                 {
-                    publish(&sink, &model);
+                    publish(&sink, &mut model);
                 }
             }
         }
@@ -444,8 +444,8 @@ fn complete_connect(
     }
 }
 
-fn publish(sink: &ViewSink, model: &OnboardingModel) {
-    sink(model.snapshot());
+fn publish(sink: &ViewSink, model: &mut OnboardingModel) {
+    sink(model.take_snapshot());
 }
 
 async fn stop_attempt(
@@ -1094,17 +1094,22 @@ mod tests {
         assert_eq!(ready.role(), "operator");
         assert_eq!(ready.scopes(), "operator.read");
         assert_eq!(ready.health(), "Healthy - safe RPC completed");
+        assert!(
+            !ready.reset_consent(),
+            "successful and failed attempts retain consent while the identity is reusable"
+        );
         let rendered = format!("{ready:?}");
         assert!(!rendered.contains("desktop-session-token"));
         assert!(!rendered.contains("issued-device-secret"));
         assert!(!rendered.contains("must-never-render"));
 
         controller.sender().disconnect().expect("disconnect");
-        wait_snapshot(&snapshots, |snapshot| {
+        let disconnected = wait_snapshot(&snapshots, |snapshot| {
             snapshot.phase() == OnboardingPhase::Disconnected
                 && snapshot.identity() == "Discarded on disconnect"
         })
         .await;
+        assert!(disconnected.reset_consent());
         controller.shutdown().expect("shutdown");
         gateway.shutdown().await;
     }
@@ -1330,10 +1335,14 @@ mod tests {
         sender
             .connect(request(&gateway.url))
             .expect("first connect");
-        wait_snapshot(&snapshots, |snapshot| {
+        let pairing = wait_snapshot(&snapshots, |snapshot| {
             snapshot.phase() == OnboardingPhase::PairingRequired
         })
         .await;
+        assert!(
+            !pairing.reset_consent(),
+            "pairing retry reuses the same identity and consent"
+        );
         sender
             .connect(request(&gateway.url))
             .expect("pairing retry");

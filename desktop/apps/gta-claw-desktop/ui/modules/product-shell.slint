@@ -4,6 +4,7 @@ import {
     ComposerShell,
     DangerButton,
     Divider,
+    FocusHistory,
     ModalSheetShell,
     NavigationItem,
     PrimaryButton,
@@ -37,6 +38,8 @@ export struct ScheduleItem {
     cadence: string,
     next-run: string,
     enabled: bool,
+    configured: bool,
+    state: string,
     can-toggle: bool,
     workspace: string,
 }
@@ -141,13 +144,234 @@ component SectionTitle {
     }
 }
 
+component PreviewCard {
+    in property <string> glyph;
+    in property <string> title;
+    in property <string> detail;
+    in property <string> metadata;
+    in property <string> badge;
+    in property <int> badge-tone;
+    in property <string> action-text;
+    in property <string> action-name;
+    in property <string> action-focus-id;
+    in property <bool> action-enabled: true;
+    out property <bool> stacked: VisualPreferences.density-scale > 1.25
+        || root.width < 760px;
+    out property <bool> text-bounds-fit:
+        root.width > 0px
+        && root.height > 0px
+        && card-layout.width > 0px
+        && card-layout.height > 0px
+        && card-copy.width > 0px
+        && card-copy.height > 0px
+        && title-text.width > 0px
+        && title-text.height > 0px
+        && title-text.preferred-height > 0px
+        && title-text.height >= title-text.preferred-height
+        && detail-text.width > 0px
+        && detail-text.height > 0px
+        && detail-text.preferred-height > 0px
+        && detail-text.height >= detail-text.preferred-height
+        && metadata-text.width > 0px
+        && metadata-text.height > 0px
+        && metadata-text.preferred-height > 0px
+        && metadata-text.height >= metadata-text.preferred-height
+        && title-text.absolute-position.x >= card-copy.absolute-position.x
+        && detail-text.absolute-position.x >= card-copy.absolute-position.x
+        && metadata-text.absolute-position.x >= card-copy.absolute-position.x
+        && title-text.absolute-position.y >= card-copy.absolute-position.y
+        && detail-text.absolute-position.y >= card-copy.absolute-position.y
+        && metadata-text.absolute-position.y >= card-copy.absolute-position.y
+        && title-text.absolute-position.x + title-text.width
+            <= card-copy.absolute-position.x + card-copy.width + 1px
+        && detail-text.absolute-position.x + detail-text.width
+            <= card-copy.absolute-position.x + card-copy.width + 1px
+        && metadata-text.absolute-position.x + metadata-text.width
+            <= card-copy.absolute-position.x + card-copy.width + 1px
+        && title-text.absolute-position.y + title-text.height
+            <= card-copy.absolute-position.y + card-copy.height + 1px
+        && detail-text.absolute-position.y + detail-text.height
+            <= card-copy.absolute-position.y + card-copy.height + 1px
+        && metadata-text.absolute-position.y + metadata-text.height
+            <= card-copy.absolute-position.y + card-copy.height + 1px;
+    out property <bool> icon-bounds-fit:
+        card-icon.width > 0px
+        && card-icon.height > 0px
+        && icon-text.width > 0px
+        && icon-text.height > 0px
+        && card-icon.absolute-position.x >= card-layout.absolute-position.x
+        && card-icon.absolute-position.y >= card-layout.absolute-position.y
+        && card-icon.absolute-position.x + card-icon.width
+            <= root.absolute-position.x + root.width - Metrics.space-4 + 1px
+        && card-icon.absolute-position.y + card-icon.height
+            <= root.absolute-position.y + root.height - Metrics.space-4 + 1px
+        && icon-text.width >= icon-text.preferred-width
+        && icon-text.height >= icon-text.preferred-height
+        && icon-text.absolute-position.x >= card-icon.absolute-position.x
+        && icon-text.absolute-position.y >= card-icon.absolute-position.y
+        && icon-text.absolute-position.x + icon-text.width
+            <= card-icon.absolute-position.x + card-icon.width + 1px
+        && icon-text.absolute-position.y + icon-text.height
+            <= card-icon.absolute-position.y + card-icon.height + 1px;
+    out property <bool> button-bounds-fit:
+        card-action.width > 0px
+        && card-action.height > 0px
+        && card-action.content-bounds-fit
+        && card-action.absolute-position.x >= card-layout.absolute-position.x
+        && card-action.absolute-position.y >= card-layout.absolute-position.y
+        && card-action.absolute-position.x + card-action.width
+            <= root.absolute-position.x + root.width - Metrics.space-4 + 1px
+        && card-action.absolute-position.y + card-action.height
+            <= root.absolute-position.y + root.height - Metrics.space-4 + 1px;
+    out property <bool> badge-bounds-fit:
+        card-badge.width > 0px
+        && card-badge.height > 0px
+        && card-badge.content-bounds-fit
+        && card-badge.absolute-position.x >= card-layout.absolute-position.x
+        && card-badge.absolute-position.y >= card-layout.absolute-position.y
+        && card-badge.absolute-position.x + card-badge.width
+            <= root.absolute-position.x + root.width - Metrics.space-4 + 1px
+        && card-badge.absolute-position.y + card-badge.height
+            <= root.absolute-position.y + root.height - Metrics.space-4 + 1px;
+    out property <bool> no-overlap: root.stacked
+        ? card-icon.absolute-position.y + card-icon.height
+                <= card-copy.absolute-position.y + 1px
+            && card-copy.absolute-position.y + card-copy.height
+                <= card-badge.absolute-position.y + 1px
+            && card-badge.absolute-position.y + card-badge.height
+                <= card-action.absolute-position.y + 1px
+        : card-icon.absolute-position.x + card-icon.width
+                <= card-copy.absolute-position.x + 1px
+            && card-copy.absolute-position.x + card-copy.width
+                <= card-badge.absolute-position.x + 1px
+            && card-badge.absolute-position.x + card-badge.width
+                <= card-action.absolute-position.x + 1px;
+    private property <bool> observed-text-bounds-fit: root.text-bounds-fit;
+    private property <bool> observed-icon-bounds-fit: root.icon-bounds-fit;
+    private property <bool> observed-button-bounds-fit: root.button-bounds-fit;
+    private property <bool> observed-badge-bounds-fit: root.badge-bounds-fit;
+    private property <bool> observed-no-overlap: root.no-overlap;
+    private property <bool> observed-stacked: root.stacked;
+    callback action-requested;
+    callback geometry-changed(bool, bool, bool, bool, bool, bool);
+
+    min-height: card-layout.min-height + 2 * Metrics.space-4;
+    accessible-role: region;
+    accessible-label: root.title + ". " + root.detail + ". " + root.metadata;
+
+    function report-geometry() {
+        root.geometry-changed(
+            root.text-bounds-fit,
+            root.icon-bounds-fit,
+            root.badge-bounds-fit,
+            root.button-bounds-fit,
+            root.no-overlap,
+            root.stacked
+        );
+    }
+
+    init => { root.report-geometry(); }
+    changed observed-text-bounds-fit => { root.report-geometry(); }
+    changed observed-icon-bounds-fit => { root.report-geometry(); }
+    changed observed-button-bounds-fit => { root.report-geometry(); }
+    changed observed-badge-bounds-fit => { root.report-geometry(); }
+    changed observed-no-overlap => { root.report-geometry(); }
+    changed observed-stacked => { root.report-geometry(); }
+
+    Rectangle {
+        background: DesignTokens.surface-raised;
+        border-width: 1px;
+        border-color: DesignTokens.border-default;
+        border-radius: Metrics.radius-large;
+    }
+
+    card-layout := GridLayout {
+        x: Metrics.space-4;
+        y: Metrics.space-4;
+        width: parent.width - 2 * Metrics.space-4;
+        spacing: Metrics.space-3;
+
+        card-icon := Rectangle {
+            row: 0;
+            col: 0;
+            width: Metrics.control-large;
+            height: Metrics.control-large;
+            horizontal-stretch: 0;
+            background: DesignTokens.accent-surface;
+            border-radius: Metrics.radius-medium;
+
+            icon-text := Text {
+                text: root.glyph;
+                color: DesignTokens.accent;
+                font-size: Metrics.type-small;
+                font-weight: 850;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                accessible-role: none;
+            }
+        }
+
+        card-copy := VerticalLayout {
+            row: root.stacked ? 1 : 0;
+            col: root.stacked ? 0 : 1;
+            min-width: 0px;
+            horizontal-stretch: 1;
+            spacing: Metrics.space-1;
+
+            title-text := Text {
+                text: root.title;
+                color: DesignTokens.text-primary;
+                font-size: Metrics.type-title;
+                font-weight: 800;
+                wrap: word-wrap;
+                accessible-role: none;
+            }
+            detail-text := Text {
+                text: root.detail;
+                color: DesignTokens.text-secondary;
+                font-size: Metrics.type-small;
+                wrap: word-wrap;
+                accessible-role: none;
+            }
+            metadata-text := Text {
+                text: root.metadata;
+                color: DesignTokens.text-muted;
+                font-size: Metrics.type-caption;
+                wrap: word-wrap;
+                accessible-role: none;
+            }
+        }
+
+        card-badge := SemanticBadge {
+            row: root.stacked ? 2 : 0;
+            col: root.stacked ? 0 : 2;
+            text: root.badge;
+            tone: root.badge-tone;
+        }
+
+        card-action := SecondaryButton {
+            row: root.stacked ? 3 : 0;
+            col: root.stacked ? 0 : 3;
+            horizontal-stretch: root.stacked ? 1 : 0;
+            text: root.action-text;
+            accessible-name: root.action-name;
+            focus-id: root.action-focus-id;
+            enabled: root.action-enabled;
+            clicked => { root.action-requested(); }
+        }
+    }
+}
+
 component MetricCard {
     in property <string> value;
     in property <string> label;
     in property <string> detail;
     in property <int> tone;
 
-    min-height: 112px;
+    min-height: max(
+        112px,
+        Metrics.line-title + Metrics.line-body + 2 * Metrics.line-caption + 2 * Metrics.space-3
+    );
     accessible-role: region;
     accessible-label: root.label + ": " + root.value + ". " + root.detail;
 
@@ -196,7 +420,7 @@ component LifecycleLegend {
     // Twelve static badges that never change once laid out.
     cache-rendering-hint: true;
 
-    GridLayout {
+    if (VisualPreferences.density-scale <= 1.25) : GridLayout {
         spacing: Metrics.space-2;
 
         Row {
@@ -218,13 +442,48 @@ component LifecycleLegend {
             SemanticBadge { text: "Completed with changes"; tone: 4; }
         }
     }
+
+    if (VisualPreferences.density-scale > 1.25) : VerticalLayout {
+        spacing: Metrics.space-2;
+        SemanticBadge { text: "Draft"; tone: 0; }
+        SemanticBadge { text: "Queued"; tone: 0; }
+        SemanticBadge { text: "Starting"; tone: 1; }
+        SemanticBadge { text: "Running"; tone: 1; }
+        SemanticBadge { text: "Waiting for approval"; tone: 2; }
+        SemanticBadge { text: "Waiting for answer"; tone: 1; }
+        SemanticBadge { text: "Paused"; tone: 0; }
+        SemanticBadge { text: "Blocked"; tone: 2; }
+        SemanticBadge { text: "Failed"; tone: 3; }
+        SemanticBadge { text: "Cancelled"; tone: 0; }
+        SemanticBadge { text: "Completed"; tone: 4; }
+        SemanticBadge { text: "Completed with changes"; tone: 4; }
+    }
 }
 
 component RunList {
     in property <[RunItem]> runs;
     in-out property <int> focused-index: -1;
     callback open-requested(int);
-    private property <length> row-height: max(76px, Metrics.control-large + 2 * Metrics.space-3);
+    callback focus-reveal-requested(length, length);
+    private property <bool> stacked-row: root.width < 800px
+        || VisualPreferences.density-scale > 1.25;
+    private property <length> row-height: root.stacked-row
+        ? max(148px, Metrics.control-large + Metrics.line-body + 2 * Metrics.line-caption + 3 * Metrics.space-2)
+        : max(76px, Metrics.control-large + 2 * Metrics.space-3);
+    out property <length> focused-row-y: root.focused-index < 0
+        ? 0px
+        : run-list.viewport-y + root.focused-index * root.row-height;
+    out property <length> focused-row-height: root.row-height;
+    out property <bool> focused-row-visible: root.focused-index < 0
+        || (root.row-height > 0px
+            && run-list.width > 0px
+            && run-list.visible-height > 0px
+            && root.focused-row-y >= -1px
+            && root.focused-row-y + root.row-height <= run-list.visible-height + 1px
+            && run-list.absolute-position.y + root.focused-row-y
+                >= run-list.absolute-position.y - 1px
+            && run-list.absolute-position.y + root.focused-row-y + root.row-height
+                <= run-list.absolute-position.y + run-list.visible-height + 1px);
 
     accessible-role: none;
 
@@ -263,7 +522,7 @@ component RunList {
                 border-color: DesignTokens.border-default;
                 border-radius: Metrics.radius-medium;
 
-                HorizontalLayout {
+                if (!root.stacked-row) : HorizontalLayout {
                     padding: Metrics.space-3;
                     spacing: Metrics.space-3;
                     alignment: center;
@@ -306,13 +565,65 @@ component RunList {
                     }
 
                     SecondaryButton {
-                        text: "Open";
-                        accessible-name: "Open " + run.title;
+                        text: "Preview";
+                        accessible-name: "Open " + run.title + " preview";
                         focus-received => {
                             root.focused-index = index;
                             root.reveal-row(index);
+                            root.focus-reveal-requested(
+                                run-list.absolute-position.y + root.focused-row-y,
+                                root.row-height
+                            );
                         }
                         clicked => { root.open-requested(index); }
+                    }
+                }
+
+                if (root.stacked-row) : VerticalLayout {
+                    padding: Metrics.space-2;
+                    spacing: Metrics.space-1;
+
+                    HorizontalLayout {
+                        spacing: Metrics.space-2;
+                        Text {
+                            text: run.title;
+                            color: DesignTokens.text-primary;
+                            font-size: Metrics.type-small;
+                            font-weight: 750;
+                            overflow: elide;
+                            accessible-role: none;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        SecondaryButton {
+                            text: "Preview";
+                            accessible-name: "Open " + run.title + " preview";
+                            focus-received => {
+                                root.focused-index = index;
+                                root.reveal-row(index);
+                                root.focus-reveal-requested(
+                                    run-list.absolute-position.y + root.focused-row-y,
+                                    root.row-height
+                                );
+                            }
+                            clicked => { root.open-requested(index); }
+                        }
+                    }
+                    SemanticBadge {
+                        text: run.state;
+                        tone: run.tone;
+                    }
+                    Text {
+                        text: run.workspace + " · " + run.detail;
+                        color: DesignTokens.text-muted;
+                        font-size: Metrics.type-caption;
+                        overflow: elide;
+                        accessible-role: none;
+                    }
+                    Text {
+                        text: "Updated " + run.updated;
+                        color: DesignTokens.text-muted;
+                        font-size: Metrics.type-caption;
+                        accessible-role: none;
                     }
                 }
             }
@@ -323,12 +634,55 @@ component RunList {
 component FocusScreen {
     in property <[RunItem]> runs;
     in-out property <int> focused-run-index;
+    in property <int> awaiting-review;
+    in property <int> running;
+    in property <int> blocked;
+    in property <int> workspace-count;
     callback open-session-requested(int);
+    callback focused-run-visibility-changed(bool);
+    callback background-scroll-position-changed(length);
+    private property <bool> stack-metrics: root.width < 760px
+        || VisualPreferences.density-scale > 1.25;
+    out property <bool> focused-run-visible: root.focused-run-index < 0
+        || (root.width > 0px
+            && root.height > 0px
+            && focus-scroll.width > 0px
+            && focus-scroll.visible-height > 0px
+            && focus-run-list.focused-row-visible
+            && focus-run-list.absolute-position.y + focus-run-list.focused-row-y
+                >= focus-scroll.absolute-position.y - 1px
+            && focus-run-list.absolute-position.y + focus-run-list.focused-row-y
+                    + focus-run-list.focused-row-height
+                <= focus-scroll.absolute-position.y + focus-scroll.visible-height + 1px);
+    private property <bool> observed-focused-run-visible: root.focused-run-visible;
+    private property <length> observed-background-scroll-position: focus-scroll.viewport-y;
+
+    function reveal-focused-control(item-y: length, item-height: length) {
+        let view-top = focus-scroll.absolute-position.y;
+        let view-bottom = view-top + focus-scroll.visible-height;
+        if (item-y < view-top) {
+            focus-scroll.viewport-y += view-top - item-y;
+        } else if (item-y + item-height > view-bottom) {
+            focus-scroll.viewport-y -= item-y + item-height - view-bottom;
+        }
+        root.focused-run-visibility-changed(root.focused-run-visible);
+    }
+
+    init => {
+        root.focused-run-visibility-changed(root.focused-run-visible);
+        root.background-scroll-position-changed(focus-scroll.viewport-y);
+    }
+    changed observed-focused-run-visible => {
+        root.focused-run-visibility-changed(root.focused-run-visible);
+    }
+    changed observed-background-scroll-position => {
+        root.background-scroll-position-changed(focus-scroll.viewport-y);
+    }
 
     accessible-role: main;
-    accessible-label: "Focus";
+    accessible-label: "Preview focus overview";
 
-    ScrollView {
+    focus-scroll := ScrollView {
         viewport-width: self.width;
         viewport-height: body.min-height;
 
@@ -339,15 +693,22 @@ component FocusScreen {
 
             SectionTitle {
                 eyebrow: "FOCUS";
-                title: "What needs your attention";
-                detail: "Pending decisions, running work, and review requests across every workspace.";
+                title: "Read-only product preview";
+                detail: "Sample runs demonstrate the desktop information architecture. They are not live Gateway work.";
             }
 
-            HorizontalLayout {
+            if (!root.stack-metrics) : HorizontalLayout {
                 spacing: Metrics.space-3;
-                MetricCard { value: "3"; label: "Awaiting review"; detail: "Commands and diffs"; tone: 2; }
-                MetricCard { value: "7"; label: "Running"; detail: "Across 3 workspaces"; tone: 1; }
-                MetricCard { value: "2"; label: "Blocked"; detail: "Needs intervention"; tone: 3; }
+                MetricCard { value: "" + root.awaiting-review; label: "Awaiting review"; detail: "Derived from preview runs"; tone: 2; }
+                MetricCard { value: "" + root.running; label: "Running"; detail: "Across " + root.workspace-count + " preview workspaces"; tone: 1; }
+                MetricCard { value: "" + root.blocked; label: "Blocked"; detail: "Derived from preview runs"; tone: 3; }
+            }
+
+            if (root.stack-metrics) : VerticalLayout {
+                spacing: Metrics.space-3;
+                MetricCard { value: "" + root.awaiting-review; label: "Awaiting review"; detail: "Derived from preview runs"; tone: 2; }
+                MetricCard { value: "" + root.running; label: "Running"; detail: "Across " + root.workspace-count + " preview workspaces"; tone: 1; }
+                MetricCard { value: "" + root.blocked; label: "Blocked"; detail: "Derived from preview runs"; tone: 3; }
             }
 
             Card {
@@ -370,11 +731,14 @@ component FocusScreen {
                 accessible-role: text;
             }
 
-            RunList {
+            focus-run-list := RunList {
                 height: 320px;
                 runs: root.runs;
                 focused-index <=> root.focused-run-index;
                 open-requested(index) => { root.open-session-requested(index); }
+                focus-reveal-requested(item-y, item-height) => {
+                    root.reveal-focused-control(item-y, item-height);
+                }
             }
         }
     }
@@ -383,6 +747,7 @@ component FocusScreen {
 component WorkspacesScreen {
     in property <[WorkspaceItem]> workspaces;
     callback open-workspace-requested(int);
+    callback card-geometry-changed(int, bool, bool, bool, bool, bool, bool);
 
     accessible-role: main;
     accessible-label: "Workspaces";
@@ -402,61 +767,34 @@ component WorkspacesScreen {
                 detail: @tr("Workspace trust and discovery are not composed. These rows are product previews and do not represent trusted paths.");
             }
 
-            for workspace[index] in root.workspaces : Card {
-                accessible-name: workspace.name + " workspace";
-
-                HorizontalLayout {
-                    spacing: Metrics.space-3;
-                    cross-axis-alignment: center;
-
-                    Rectangle {
-                        width: Metrics.control-large;
-                        height: Metrics.control-large;
-                        horizontal-stretch: 0;
-                        background: DesignTokens.accent-surface;
-                        border-radius: Metrics.radius-medium;
-
-                        Text {
-                            text: workspace.kind == "Remote workspace" ? "R" : "W";
-                            color: DesignTokens.accent;
-                            font-size: Metrics.type-small;
-                            font-weight: 850;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                            accessible-role: none;
-                        }
-                    }
-
-                    VerticalLayout {
-                        spacing: Metrics.space-1;
-                        Text {
-                            text: workspace.name;
-                            color: DesignTokens.text-primary;
-                            font-size: Metrics.type-title;
-                            font-weight: 800;
-                            accessible-role: none;
-                        }
-                        Text {
-                            text: workspace.kind + " · " + workspace.location;
-                            color: DesignTokens.text-muted;
-                            font-size: Metrics.type-caption;
-                            overflow: elide;
-                            accessible-role: none;
-                        }
-                        Text {
-                            text: workspace.branch + " · " + workspace.active-runs + " active runs";
-                            color: DesignTokens.text-secondary;
-                            font-size: Metrics.type-caption;
-                            accessible-role: none;
-                        }
-                    }
-
-                    Rectangle { horizontal-stretch: 1; }
-                    SecondaryButton {
-                        text: @tr("Open preview");
-                        accessible-name: @tr("Open {} preview", workspace.name);
-                        clicked => { root.open-workspace-requested(index); }
-                    }
+            for workspace[index] in root.workspaces : PreviewCard {
+                glyph: workspace.kind == "Remote workspace" ? "R" : "W";
+                title: workspace.name;
+                detail: workspace.kind + " · " + workspace.location;
+                metadata: workspace.branch;
+                badge: workspace.active-runs + " active runs";
+                badge-tone: workspace.active-runs > 0 ? 1 : 0;
+                action-text: @tr("Open preview");
+                action-name: @tr("Open {} preview", workspace.name);
+                action-focus-id: "workspaces.open." + index;
+                action-requested => { root.open-workspace-requested(index); }
+                geometry-changed(
+                    text-bounds-fit,
+                    icon-bounds-fit,
+                    badge-bounds-fit,
+                    button-bounds-fit,
+                    no-overlap,
+                    stacked
+                ) => {
+                    root.card-geometry-changed(
+                        index,
+                        text-bounds-fit,
+                        icon-bounds-fit,
+                        badge-bounds-fit,
+                        button-bounds-fit,
+                        no-overlap,
+                        stacked
+                    );
                 }
             }
         }
@@ -474,7 +812,7 @@ component RunsScreen {
     callback next-requested;
 
     accessible-role: main;
-    accessible-label: "Run Monitor";
+    accessible-label: "Run monitor preview";
 
     VerticalLayout {
         padding: Metrics.space-6;
@@ -482,13 +820,20 @@ component RunsScreen {
 
         SectionTitle {
             eyebrow: "RUN MONITOR";
-            title: "Every session and background task";
-            detail: "A paginated view of live and historical work.";
+            title: "Run monitor preview";
+            detail: "A bounded sample of lifecycle states. No live or historical runs are loaded.";
         }
 
-        Card {
+        if (VisualPreferences.density-scale <= 1.25) : Card {
             accessible-name: "Supported run states";
             LifecycleLegend { }
+        }
+        if (VisualPreferences.density-scale > 1.25) : Text {
+            text: "All 12 lifecycle states are represented in the bounded preview pages.";
+            color: DesignTokens.text-secondary;
+            font-size: Metrics.type-caption;
+            wrap: word-wrap;
+            accessible-role: text;
         }
 
         RunList {
@@ -524,11 +869,13 @@ component RunsScreen {
 
 component SchedulesScreen {
     in property <[ScheduleItem]> schedules;
+    in property <bool> interactions-enabled;
     callback create-requested;
     callback toggled(int);
+    callback card-geometry-changed(int, bool, bool, bool, bool, bool, bool);
 
     accessible-role: main;
-    accessible-label: "Schedule Manager";
+    accessible-label: "Schedule preview";
 
     ScrollView {
         viewport-width: self.width;
@@ -541,59 +888,51 @@ component SchedulesScreen {
 
             SectionTitle {
                 eyebrow: "SCHEDULE MANAGER";
-                title: "Recurring work, on your terms";
-                detail: "Review cadence, destination, and next execution before enabling automation.";
+                title: "Schedule preview";
+                detail: "Scheduling is not connected. These bounded sample rows cannot be created, enabled, or paused.";
             }
 
             HorizontalLayout {
                 alignment: end;
                 PrimaryButton {
-                    text: "New schedule";
+                    text: "Creation unavailable";
+                    accessible-name: "Schedule creation unavailable in read-only preview";
+                    description: "No schedule service or editor is connected.";
+                    enabled: root.interactions-enabled;
                     clicked => { root.create-requested(); }
                 }
             }
 
-            for schedule[index] in root.schedules : Card {
-                accessible-name: schedule.name + " schedule";
-
-                HorizontalLayout {
-                    spacing: Metrics.space-3;
-                    cross-axis-alignment: center;
-
-                    VerticalLayout {
-                        spacing: Metrics.space-1;
-                        Text {
-                            text: schedule.name;
-                            color: DesignTokens.text-primary;
-                            font-size: Metrics.type-title;
-                            font-weight: 800;
-                            accessible-role: none;
-                        }
-                        Text {
-                            text: schedule.cadence + " · " + schedule.workspace;
-                            color: DesignTokens.text-secondary;
-                            font-size: Metrics.type-small;
-                            accessible-role: none;
-                        }
-                        Text {
-                            text: "Next: " + schedule.next-run;
-                            color: DesignTokens.text-muted;
-                            font-size: Metrics.type-caption;
-                            accessible-role: none;
-                        }
+            for schedule[index] in root.schedules : PreviewCard {
+                glyph: "S";
+                title: schedule.name;
+                detail: schedule.cadence + " · " + schedule.workspace;
+                metadata: "Next: " + schedule.next-run;
+                badge: schedule.state;
+                badge-tone: schedule.enabled ? 4 : 0;
+                action-text: schedule.enabled ? "Pause" : "Enable";
+                action-name: (schedule.enabled ? "Pause " : "Enable ") + schedule.name;
+                action-focus-id: "schedules.toggle." + index;
+                action-enabled: schedule.can-toggle;
+                action-requested => { root.toggled(index); }
+                geometry-changed(
+                    text-bounds-fit,
+                    icon-bounds-fit,
+                    badge-bounds-fit,
+                    button-bounds-fit,
+                    no-overlap,
+                    stacked
+                ) => {
+                    root.card-geometry-changed(
+                        index,
+                        text-bounds-fit,
+                        icon-bounds-fit,
+                        badge-bounds-fit,
+                        button-bounds-fit,
+                        no-overlap,
+                        stacked
+                    );
                     }
-                    Rectangle { horizontal-stretch: 1; }
-                    SemanticBadge {
-                        text: schedule.enabled ? "Enabled" : (schedule.can-toggle ? "Paused" : "Draft");
-                        tone: schedule.enabled ? 4 : 0;
-                    }
-                    SecondaryButton {
-                        text: schedule.enabled ? "Pause" : "Enable";
-                        accessible-name: (schedule.enabled ? "Pause " : "Enable ") + schedule.name;
-                        enabled: schedule.can-toggle;
-                        clicked => { root.toggled(index); }
-                    }
-                }
             }
         }
     }
@@ -608,31 +947,33 @@ component DeliverablesScreen {
     in property <string> selected-size;
     in property <string> selected-content;
     in property <bool> selected-pinned;
+    in property <bool> interactions-enabled;
     callback selected(int);
     callback pin-toggle-requested;
 
     accessible-role: main;
-    accessible-label: "Deliverables and artifact viewer";
+    accessible-label: "Artifact preview";
 
-    VerticalLayout {
-        padding: Metrics.space-6;
-        spacing: Metrics.space-4;
+    ScrollView {
+        viewport-width: self.width;
+        viewport-height: body.min-height;
 
-        SectionTitle {
-            eyebrow: "DELIVERABLES";
-            title: "Files worth keeping";
-            detail: "Generated documents, previews, structured data, and pinned artifacts.";
-        }
-
-        HorizontalLayout {
+        body := VerticalLayout {
+            width: parent.width;
+            padding: Metrics.space-6;
             spacing: Metrics.space-4;
 
+            SectionTitle {
+                eyebrow: "DELIVERABLES";
+                title: "Artifact preview";
+                detail: "Sample documents and structured data. Pinning and persistence are unavailable.";
+            }
+
             Card {
-                width: 42%;
                 accessible-name: "Deliverable list";
 
                 Text {
-                    text: "Recent artifacts";
+                    text: "Preview artifacts";
                     color: DesignTokens.text-primary;
                     font-size: Metrics.type-title;
                     font-weight: 800;
@@ -649,7 +990,6 @@ component DeliverablesScreen {
             }
 
             Card {
-                horizontal-stretch: 1;
                 accessible-name: "Artifact viewer";
 
                 HorizontalLayout {
@@ -662,7 +1002,7 @@ component DeliverablesScreen {
                     }
                     Rectangle { horizontal-stretch: 1; }
                     SemanticBadge {
-                        text: root.selected-pinned ? "Pinned" : "Not pinned";
+                        text: root.selected-pinned ? "Sample pinned state" : "Sample unpinned state";
                         tone: root.selected-pinned ? 4 : 0;
                     }
                 }
@@ -678,6 +1018,7 @@ component DeliverablesScreen {
                     text: root.selected-kind + " · " + root.selected-size + " · " + root.selected-source;
                     color: DesignTokens.text-muted;
                     font-size: Metrics.type-caption;
+                    wrap: word-wrap;
                     accessible-role: text;
                 }
                 Text {
@@ -685,13 +1026,14 @@ component DeliverablesScreen {
                     color: DesignTokens.text-secondary;
                     font-size: Metrics.type-small;
                     wrap: word-wrap;
-                    vertical-stretch: 1;
                     accessible-role: text;
                 }
                 HorizontalLayout {
                     alignment: end;
                     SecondaryButton {
-                        text: root.selected-pinned ? "Unpin" : "Pin";
+                        text: "Pinning unavailable";
+                        accessible-name: "Artifact pinning unavailable in read-only preview";
+                        enabled: root.interactions-enabled;
                         clicked => { root.pin-toggle-requested(); }
                     }
                 }
@@ -702,10 +1044,12 @@ component DeliverablesScreen {
 
 component ExtensionsScreen {
     in property <[ExtensionItem]> extensions;
+    in property <bool> interactions-enabled;
     callback toggled(int);
+    callback card-geometry-changed(int, bool, bool, bool, bool, bool, bool);
 
     accessible-role: main;
-    accessible-label: "Extension Manager";
+    accessible-label: "Extension preview";
 
     ScrollView {
         viewport-width: self.width;
@@ -718,66 +1062,41 @@ component ExtensionsScreen {
 
             SectionTitle {
                 eyebrow: "EXTENSION MANAGER";
-                title: "Roles, skills, connectors, and permissions";
-                detail: "Capabilities stay discoverable, scoped, and reversible.";
+                title: "Extension preview";
+                detail: "Sample roles, skills, connectors, and permissions. No extension registry is connected.";
             }
 
-            for extension[index] in root.extensions : Card {
-                accessible-name: extension.name + " " + extension.category;
-
-                HorizontalLayout {
-                    spacing: Metrics.space-3;
-                    cross-axis-alignment: center;
-
-                    Rectangle {
-                        width: Metrics.control-large;
-                        height: Metrics.control-large;
-                        horizontal-stretch: 0;
-                        background: DesignTokens.accent-surface;
-                        border-radius: Metrics.radius-medium;
-
-                        Text {
-                            text: extension.category == "Connector"
-                                ? "C"
-                                : (extension.category == "Skill" ? "S" : (extension.category == "Role" ? "R" : "P"));
-                            color: DesignTokens.accent;
-                            font-size: Metrics.type-small;
-                            font-weight: 850;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                            accessible-role: none;
-                        }
-                    }
-
-                    VerticalLayout {
-                        spacing: Metrics.space-1;
-                        Text {
-                            text: extension.name;
-                            color: DesignTokens.text-primary;
-                            font-size: Metrics.type-title;
-                            font-weight: 800;
-                            accessible-role: none;
-                        }
-                        Text {
-                            text: extension.category + " · " + extension.detail;
-                            color: DesignTokens.text-secondary;
-                            font-size: Metrics.type-small;
-                            wrap: word-wrap;
-                            accessible-role: none;
-                        }
-                        Text {
-                            text: "Permission: " + extension.permission;
-                            color: DesignTokens.text-muted;
-                            font-size: Metrics.type-caption;
-                            accessible-role: none;
-                        }
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                    SecondaryButton {
-                        text: extension.enabled ? "Disable" : "Enable";
-                        accessible-name: (extension.enabled ? "Disable " : "Enable ") + extension.name;
-                        clicked => { root.toggled(index); }
-                    }
+            for extension[index] in root.extensions : PreviewCard {
+                glyph: extension.category == "Connector"
+                    ? "C"
+                    : (extension.category == "Skill" ? "S" : (extension.category == "Role" ? "R" : "P"));
+                title: extension.name;
+                detail: extension.category + " · " + extension.detail;
+                metadata: "Permission: " + extension.permission;
+                badge: extension.enabled ? "Sample enabled" : "Sample disabled";
+                badge-tone: extension.enabled ? 4 : 0;
+                action-text: extension.enabled ? "Disable" : "Enable";
+                action-name: (extension.enabled ? "Disable " : "Enable ") + extension.name;
+                action-focus-id: "extensions.toggle." + index;
+                action-enabled: root.interactions-enabled;
+                action-requested => { root.toggled(index); }
+                geometry-changed(
+                    text-bounds-fit,
+                    icon-bounds-fit,
+                    badge-bounds-fit,
+                    button-bounds-fit,
+                    no-overlap,
+                    stacked
+                ) => {
+                    root.card-geometry-changed(
+                        index,
+                        text-bounds-fit,
+                        icon-bounds-fit,
+                        badge-bounds-fit,
+                        button-bounds-fit,
+                        no-overlap,
+                        stacked
+                    );
                 }
             }
         }
@@ -786,6 +1105,7 @@ component ExtensionsScreen {
 
 component SettingsScreen {
     in property <int> selected-section;
+    in property <bool> compact-navigation;
     in property <string> gateway-status-text;
     in property <string> gateway-status-label;
     in property <string> gateway-status-icon;
@@ -798,6 +1118,32 @@ component SettingsScreen {
     callback disconnect-requested;
     callback update-requested;
     callback diagnostics-requested;
+    callback appearance-contrast-focus-changed(bool);
+    callback rail-geometry-changed(bool);
+    private property <length> compact-rail-width:
+        max(128px, Metrics.control-large + 4 * Metrics.space-3);
+    out property <bool> rail-bounds-fit:
+        root.width > 0px
+        && root.height > 0px
+        && settings-rail.width > 0px
+        && settings-rail.height > 0px
+        && settings-navigation.width > 0px
+        && settings-navigation.height > 0px
+        && settings-rail.width >= settings-navigation.min-width
+        && (!root.compact-navigation
+            || settings-rail.width >= root.compact-rail-width)
+        && settings-rail.absolute-position.x >= root.absolute-position.x
+        && settings-rail.absolute-position.y >= root.absolute-position.y
+        && settings-rail.absolute-position.x + settings-rail.width
+            <= root.absolute-position.x + root.width + 1px
+        && settings-rail.absolute-position.y + settings-rail.height
+            <= root.absolute-position.y + root.height + 1px;
+    private property <bool> observed-rail-bounds-fit: root.rail-bounds-fit;
+
+    init => { root.rail-geometry-changed(root.rail-bounds-fit); }
+    changed observed-rail-bounds-fit => {
+        root.rail-geometry-changed(root.rail-bounds-fit);
+    }
 
     function reveal-navigation-item(item-y: length, item-height: length) {
         let view-top = settings-scroll.absolute-position.y;
@@ -815,8 +1161,10 @@ component SettingsScreen {
     HorizontalLayout {
         spacing: 0px;
 
-        Rectangle {
-            width: 220px;
+        settings-rail := Rectangle {
+            width: root.compact-navigation
+                ? root.compact-rail-width
+                : 220px;
             horizontal-stretch: 0;
             background: DesignTokens.surface-pane;
             border-width: 1px;
@@ -831,21 +1179,21 @@ component SettingsScreen {
                     padding: Metrics.space-3;
                     spacing: Metrics.space-1;
 
-                    Text {
+                    if (!root.compact-navigation) : Text {
                         text: "Settings";
                         color: DesignTokens.text-primary;
                         font-size: Metrics.type-title;
                         font-weight: 850;
                         accessible-role: text;
                     }
-                    NavigationItem { glyph: "A"; text: "Account"; selected: root.selected-section == 0; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(0); } }
-                    NavigationItem { glyph: "M"; text: "Models"; selected: root.selected-section == 1; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(1); } }
-                    NavigationItem { glyph: "E"; text: "Execution"; selected: root.selected-section == 2; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(2); } }
-                    NavigationItem { glyph: "V"; text: "Appearance"; selected: root.selected-section == 3; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(3); } }
-                    NavigationItem { glyph: "N"; text: "Notifications"; selected: root.selected-section == 4; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(4); } }
-                    NavigationItem { glyph: "K"; text: "Shortcuts"; selected: root.selected-section == 5; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(5); } }
-                    NavigationItem { glyph: "U"; text: "Updates"; selected: root.selected-section == 6; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(6); } }
-                    NavigationItem { glyph: "D"; text: "Diagnostics"; selected: root.selected-section == 7; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(7); } }
+                    NavigationItem { glyph: "A"; text: root.compact-navigation ? "" : "Account"; accessible-name: "Account settings"; selected: root.selected-section == 0; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(0); } }
+                    NavigationItem { glyph: "M"; text: root.compact-navigation ? "" : "Models"; accessible-name: "Model settings"; selected: root.selected-section == 1; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(1); } }
+                    NavigationItem { glyph: "E"; text: root.compact-navigation ? "" : "Execution"; accessible-name: "Execution settings"; selected: root.selected-section == 2; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(2); } }
+                    NavigationItem { glyph: "V"; text: root.compact-navigation ? "" : "Appearance"; accessible-name: "Appearance settings"; selected: root.selected-section == 3; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(3); } }
+                    NavigationItem { glyph: "N"; text: root.compact-navigation ? "" : "Notifications"; accessible-name: "Notification settings"; selected: root.selected-section == 4; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(4); } }
+                    NavigationItem { glyph: "K"; text: root.compact-navigation ? "" : "Shortcuts"; accessible-name: "Keyboard shortcuts"; selected: root.selected-section == 5; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(5); } }
+                    NavigationItem { glyph: "U"; text: root.compact-navigation ? "" : "Updates"; accessible-name: "Update settings"; selected: root.selected-section == 6; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(6); } }
+                    NavigationItem { glyph: "D"; text: root.compact-navigation ? "" : "Diagnostics"; accessible-name: "Diagnostic settings"; selected: root.selected-section == 7; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.section-requested(7); } }
                 }
             }
         }
@@ -913,22 +1261,22 @@ component SettingsScreen {
 
                     if (root.selected-section == 1) : VerticalLayout {
                         spacing: Metrics.space-3;
-                        Text { text: "Default model"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
-                        TextField { label: "Model"; text: "Automatic"; read-only: true; }
-                        Text { text: "Routing prefers capability and policy compatibility over latency."; color: DesignTokens.text-muted; font-size: Metrics.type-caption; wrap: word-wrap; accessible-role: text; }
+                        Text { text: "Model configuration preview"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                        TextField { label: "Model"; text: "No model backend connected"; read-only: true; }
+                        Text { text: "This sample control does not read or update model routing."; color: DesignTokens.text-muted; font-size: Metrics.type-caption; wrap: word-wrap; accessible-role: text; }
                     }
 
                     if (root.selected-section == 2) : VerticalLayout {
                         spacing: Metrics.space-3;
-                        Text { text: "Execution policy"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
-                        Text { text: "Commands: ask before elevated or networked execution"; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
-                        Text { text: "Parallel runs: 4 · Background runtime: multi-threaded Tokio"; color: DesignTokens.text-muted; font-size: Metrics.type-caption; accessible-role: text; }
+                        Text { text: "Execution policy preview"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                        Text { text: "No command, approval, sandbox, or run service is connected."; color: DesignTokens.text-secondary; font-size: Metrics.type-small; wrap: word-wrap; accessible-role: text; }
                     }
 
                     if (root.selected-section == 3) : VerticalLayout {
                         spacing: Metrics.space-3;
                         Text { text: "Appearance"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
-                        Text { text: "Light, dark, and high-contrast themes · scaling from 80% to 200% · reduced motion"; color: DesignTokens.text-secondary; font-size: Metrics.type-small; wrap: word-wrap; accessible-role: text; }
+                        Text { text: "Session-only light, dark, high-contrast, 80% to 200% scale, and reduced-motion preferences."; color: DesignTokens.text-secondary; font-size: Metrics.type-small; wrap: word-wrap; accessible-role: text; }
+                        Text { text: "Appearance preferences reset when this application closes because no platform preference store is connected."; color: DesignTokens.warning; font-size: Metrics.type-caption; wrap: word-wrap; accessible-role: text; }
                         VerticalLayout {
                             spacing: Metrics.space-2;
                             Text {
@@ -941,6 +1289,7 @@ component SettingsScreen {
                             }
                             SecondaryButton {
                                 text: "Theme";
+                                focus-id: "settings.appearance.theme";
                                 accessible-name: VisualPreferences.effective-theme-mode == ThemeMode.light
                                     ? "Use dark theme"
                                     : "Use light theme";
@@ -956,8 +1305,7 @@ component SettingsScreen {
                                 accessible-name: "Follow the system light and dark setting";
                                 enabled: VisualPreferences.theme-override-active;
                                 clicked => {
-                                    VisualPreferences.theme-override-active = false;
-                                    VisualPreferences.theme-mode-requested(VisualPreferences.system-theme-mode);
+                                    VisualPreferences.follow-system-theme-requested(VisualPreferences.system-theme-mode);
                                 }
                             }
                             Text {
@@ -968,9 +1316,13 @@ component SettingsScreen {
                             }
                             SecondaryButton {
                                 text: "Contrast";
+                                focus-id: "settings.appearance.contrast";
                                 accessible-name: VisualPreferences.high-contrast ? "Disable high contrast" : "Enable high contrast";
                                 checkable: true;
                                 checked: VisualPreferences.high-contrast;
+                                focus-changed(focused) => {
+                                    root.appearance-contrast-focus-changed(focused);
+                                }
                                 clicked => { VisualPreferences.high-contrast-requested(!VisualPreferences.high-contrast); }
                             }
                             Text {
@@ -1000,6 +1352,7 @@ component SettingsScreen {
                             }
                             SecondaryButton {
                                 text: "Motion";
+                                focus-id: "settings.appearance.motion";
                                 accessible-name: VisualPreferences.reduced-motion ? "Enable motion" : "Reduce motion";
                                 checkable: true;
                                 checked: VisualPreferences.reduced-motion;
@@ -1011,14 +1364,14 @@ component SettingsScreen {
 
                     if (root.selected-section == 4) : VerticalLayout {
                         spacing: Metrics.space-3;
-                        Text { text: "Notifications"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
-                        Text { text: "Notify for approvals, questions, failures, and completed runs."; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
+                        Text { text: "Notifications unavailable"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
+                        Text { text: "No notification service is connected to this preview."; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
                     }
 
                     if (root.selected-section == 5) : VerticalLayout {
                         spacing: Metrics.space-3;
                         Text { text: "Keyboard shortcuts"; color: DesignTokens.text-primary; font-size: Metrics.type-title; font-weight: 800; accessible-role: text; }
-                        Text { text: "F1  Command palette\nCtrl+1…7  Primary destinations\nEscape  Close the active dialog\nEnter  Send message"; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
+                        Text { text: "F1  Command palette\nCtrl+1…7  Preview destinations\nEscape  Close the active dialog\nEnter  Open the selected palette command"; color: DesignTokens.text-secondary; font-size: Metrics.type-small; accessible-role: text; }
                     }
 
                     if (root.selected-section == 6) : VerticalLayout {
@@ -1118,6 +1471,473 @@ component DiffViewer {
     }
 }
 
+component ApprovalPrompt {
+    in property <string> prompt;
+    in property <string> scope;
+    in property <bool> interactions-enabled;
+    in property <bool> narrow;
+    out property <bool> stacked: root.narrow
+        || VisualPreferences.density-scale > 1.25
+        || root.width < 680px;
+    out property <bool> text-bounds-fit:
+        root.width > 0px
+        && root.height > 0px
+        && approval-layout.width > 0px
+        && approval-layout.height > 0px
+        && prompt-copy.width > 0px
+        && prompt-copy.height > 0px
+        && title-text.width > 0px
+        && title-text.height > 0px
+        && title-text.preferred-height > 0px
+        && title-text.height >= title-text.preferred-height
+        && prompt-text.width > 0px
+        && prompt-text.height > 0px
+        && prompt-text.preferred-height > 0px
+        && prompt-text.height >= prompt-text.preferred-height
+        && scope-text.width > 0px
+        && scope-text.height > 0px
+        && scope-text.preferred-height > 0px
+        && scope-text.height >= scope-text.preferred-height
+        && title-text.absolute-position.x >= prompt-copy.absolute-position.x
+        && prompt-text.absolute-position.x >= prompt-copy.absolute-position.x
+        && scope-text.absolute-position.x >= prompt-copy.absolute-position.x
+        && title-text.absolute-position.y >= prompt-copy.absolute-position.y
+        && prompt-text.absolute-position.y >= prompt-copy.absolute-position.y
+        && scope-text.absolute-position.y >= prompt-copy.absolute-position.y
+        && title-text.absolute-position.x + title-text.width
+            <= prompt-copy.absolute-position.x + prompt-copy.width + 1px
+        && prompt-text.absolute-position.x + prompt-text.width
+            <= prompt-copy.absolute-position.x + prompt-copy.width + 1px
+        && scope-text.absolute-position.x + scope-text.width
+            <= prompt-copy.absolute-position.x + prompt-copy.width + 1px
+        && title-text.absolute-position.y + title-text.height
+            <= prompt-copy.absolute-position.y + prompt-copy.height + 1px
+        && prompt-text.absolute-position.y + prompt-text.height
+            <= prompt-copy.absolute-position.y + prompt-copy.height + 1px
+        && scope-text.absolute-position.y + scope-text.height
+            <= prompt-copy.absolute-position.y + prompt-copy.height + 1px;
+    out property <bool> controls-bounds-fit:
+        deny-button.width > 0px
+        && deny-button.height > 0px
+        && approve-button.width > 0px
+        && approve-button.height > 0px
+        && deny-button.absolute-position.x >= approval-layout.absolute-position.x
+        && approve-button.absolute-position.x >= approval-layout.absolute-position.x
+        && deny-button.absolute-position.y >= approval-layout.absolute-position.y
+        && approve-button.absolute-position.y >= approval-layout.absolute-position.y
+        && deny-button.content-bounds-fit
+        && approve-button.content-bounds-fit
+        && deny-button.absolute-position.x + deny-button.width
+            <= root.absolute-position.x + root.width - Metrics.space-4 + 1px
+        && approve-button.absolute-position.x + approve-button.width
+            <= root.absolute-position.x + root.width - Metrics.space-4 + 1px
+        && deny-button.absolute-position.y + deny-button.height
+            <= root.absolute-position.y + root.height - Metrics.space-4 + 1px
+        && approve-button.absolute-position.y + approve-button.height
+            <= root.absolute-position.y + root.height - Metrics.space-4 + 1px;
+    out property <bool> controls-no-overlap: root.stacked
+        ? prompt-copy.absolute-position.y + prompt-copy.height
+                <= deny-button.absolute-position.y + 1px
+            && deny-button.absolute-position.y + deny-button.height
+                <= approve-button.absolute-position.y + 1px
+        : prompt-copy.absolute-position.x + prompt-copy.width
+                <= deny-button.absolute-position.x + 1px
+            && deny-button.absolute-position.x + deny-button.width
+                <= approve-button.absolute-position.x + 1px;
+    private property <bool> observed-text-bounds-fit: root.text-bounds-fit;
+    private property <bool> observed-controls-bounds-fit: root.controls-bounds-fit;
+    private property <bool> observed-controls-no-overlap: root.controls-no-overlap;
+    private property <bool> observed-stacked: root.stacked;
+    callback decision(bool);
+    callback geometry-changed(bool, bool, bool, bool);
+
+    min-height: approval-layout.min-height + 2 * Metrics.space-4;
+    vertical-stretch: 0;
+    accessible-role: region;
+    accessible-label: "Sample approval prompt, actions unavailable";
+
+    function report-geometry() {
+        root.geometry-changed(
+            root.text-bounds-fit,
+            root.controls-bounds-fit,
+            root.controls-no-overlap,
+            root.stacked
+        );
+    }
+
+    init => { root.report-geometry(); }
+    changed observed-text-bounds-fit => { root.report-geometry(); }
+    changed observed-controls-bounds-fit => { root.report-geometry(); }
+    changed observed-controls-no-overlap => { root.report-geometry(); }
+    changed observed-stacked => { root.report-geometry(); }
+
+    Rectangle {
+        background: DesignTokens.surface-raised;
+        border-width: 1px;
+        border-color: DesignTokens.border-default;
+        border-radius: Metrics.radius-large;
+    }
+
+    approval-layout := GridLayout {
+        x: Metrics.space-4;
+        y: Metrics.space-4;
+        width: parent.width - 2 * Metrics.space-4;
+        spacing: Metrics.space-3;
+
+        prompt-copy := VerticalLayout {
+            row: 0;
+            col: 0;
+            min-width: 0px;
+            horizontal-stretch: 1;
+            spacing: Metrics.space-1;
+
+            title-text := Text {
+                text: "Sample approval prompt";
+                color: DesignTokens.warning;
+                font-size: Metrics.type-small;
+                font-weight: 850;
+                wrap: word-wrap;
+                accessible-role: text;
+            }
+            prompt-text := Text {
+                text: root.prompt;
+                color: DesignTokens.text-primary;
+                font-size: Metrics.type-small;
+                wrap: word-wrap;
+                accessible-role: text;
+            }
+            scope-text := Text {
+                text: root.scope;
+                color: DesignTokens.text-muted;
+                font-size: Metrics.type-caption;
+                wrap: word-wrap;
+                accessible-role: text;
+            }
+        }
+
+        deny-button := DangerButton {
+            row: root.stacked ? 1 : 0;
+            col: root.stacked ? 0 : 1;
+            horizontal-stretch: root.stacked ? 1 : 0;
+            text: "Deny unavailable";
+            accessible-name: "Deny approval unavailable in read-only preview";
+            focus-id: "session.approval.deny";
+            enabled: root.interactions-enabled;
+            clicked => { root.decision(false); }
+        }
+
+        approve-button := PrimaryButton {
+            row: root.stacked ? 2 : 0;
+            col: root.stacked ? 0 : 2;
+            horizontal-stretch: root.stacked ? 1 : 0;
+            text: "Approve unavailable";
+            accessible-name: "Approve unavailable in read-only preview";
+            focus-id: "session.approval.approve";
+            enabled: root.interactions-enabled;
+            clicked => { root.decision(true); }
+        }
+    }
+}
+
+component QuestionPrompt {
+    in property <string> question;
+    in property <bool> interactions-enabled;
+    in property <bool> narrow;
+    out property <bool> stacked: root.narrow
+        || VisualPreferences.density-scale > 1.25
+        || root.width < 560px;
+    out property <bool> text-bounds-fit:
+        root.width > 0px
+        && root.height > 0px
+        && question-layout.width > 0px
+        && question-layout.height > 0px
+        && question-copy.width > 0px
+        && question-copy.height > 0px
+        && title-text.width > 0px
+        && title-text.height > 0px
+        && title-text.preferred-height > 0px
+        && title-text.height >= title-text.preferred-height
+        && question-text.width > 0px
+        && question-text.height > 0px
+        && question-text.preferred-height > 0px
+        && question-text.height >= question-text.preferred-height
+        && title-text.absolute-position.x >= question-copy.absolute-position.x
+        && title-text.absolute-position.y >= question-copy.absolute-position.y
+        && question-text.absolute-position.x >= question-copy.absolute-position.x
+        && question-text.absolute-position.y >= question-copy.absolute-position.y
+        && title-text.absolute-position.x + title-text.width
+            <= question-copy.absolute-position.x + question-copy.width + 1px
+        && question-text.absolute-position.x + question-text.width
+            <= question-copy.absolute-position.x + question-copy.width + 1px
+        && title-text.absolute-position.y + title-text.height
+            <= question-copy.absolute-position.y + question-copy.height + 1px
+        && question-text.absolute-position.y + question-text.height
+            <= question-copy.absolute-position.y + question-copy.height + 1px;
+    out property <bool> controls-bounds-fit:
+        continue-button.width > 0px
+        && continue-button.height > 0px
+        && pause-button.width > 0px
+        && pause-button.height > 0px
+        && continue-button.content-bounds-fit
+        && pause-button.content-bounds-fit
+        && continue-button.absolute-position.x >= question-layout.absolute-position.x
+        && pause-button.absolute-position.x >= question-layout.absolute-position.x
+        && continue-button.absolute-position.y >= question-layout.absolute-position.y
+        && pause-button.absolute-position.y >= question-layout.absolute-position.y
+        && continue-button.absolute-position.x + continue-button.width
+            <= root.absolute-position.x + root.width - Metrics.space-4 + 1px
+        && pause-button.absolute-position.x + pause-button.width
+            <= root.absolute-position.x + root.width - Metrics.space-4 + 1px
+        && continue-button.absolute-position.y + continue-button.height
+            <= root.absolute-position.y + root.height - Metrics.space-4 + 1px
+        && pause-button.absolute-position.y + pause-button.height
+            <= root.absolute-position.y + root.height - Metrics.space-4 + 1px;
+    out property <bool> controls-no-overlap: root.stacked
+        ? question-copy.absolute-position.y + question-copy.height
+                <= continue-button.absolute-position.y + 1px
+            && continue-button.absolute-position.y + continue-button.height
+                <= pause-button.absolute-position.y + 1px
+        : question-copy.absolute-position.x + question-copy.width
+                <= continue-button.absolute-position.x + 1px
+            && continue-button.absolute-position.x + continue-button.width
+                <= pause-button.absolute-position.x + 1px;
+    private property <bool> observed-text-bounds-fit: root.text-bounds-fit;
+    private property <bool> observed-controls-bounds-fit: root.controls-bounds-fit;
+    private property <bool> observed-controls-no-overlap: root.controls-no-overlap;
+    private property <bool> observed-stacked: root.stacked;
+    callback answered(string);
+    callback geometry-changed(bool, bool, bool, bool);
+
+    min-height: question-layout.min-height + 2 * Metrics.space-4;
+    vertical-stretch: 0;
+    accessible-role: region;
+    accessible-label: "Sample agent question, actions unavailable";
+
+    function report-geometry() {
+        root.geometry-changed(
+            root.text-bounds-fit,
+            root.controls-bounds-fit,
+            root.controls-no-overlap,
+            root.stacked
+        );
+    }
+
+    init => { root.report-geometry(); }
+    changed observed-text-bounds-fit => { root.report-geometry(); }
+    changed observed-controls-bounds-fit => { root.report-geometry(); }
+    changed observed-controls-no-overlap => { root.report-geometry(); }
+    changed observed-stacked => { root.report-geometry(); }
+
+    Rectangle {
+        background: DesignTokens.surface-raised;
+        border-width: 1px;
+        border-color: DesignTokens.border-default;
+        border-radius: Metrics.radius-large;
+    }
+
+    question-layout := GridLayout {
+        x: Metrics.space-4;
+        y: Metrics.space-4;
+        width: parent.width - 2 * Metrics.space-4;
+        spacing: Metrics.space-2;
+
+        question-copy := VerticalLayout {
+            row: 0;
+            col: 0;
+            min-width: 0px;
+            horizontal-stretch: 1;
+            spacing: Metrics.space-1;
+
+            title-text := Text {
+                text: "Sample agent question";
+                color: DesignTokens.info;
+                font-size: Metrics.type-caption;
+                font-weight: 850;
+                wrap: word-wrap;
+                accessible-role: text;
+            }
+            question-text := Text {
+                text: root.question;
+                color: DesignTokens.text-primary;
+                font-size: Metrics.type-small;
+                wrap: word-wrap;
+                accessible-role: text;
+            }
+        }
+
+        continue-button := PrimaryButton {
+            row: root.stacked ? 1 : 0;
+            col: root.stacked ? 0 : 1;
+            horizontal-stretch: root.stacked ? 1 : 0;
+            text: "Continue unavailable";
+            accessible-name: "Continue unavailable in read-only preview";
+            focus-id: "session.question.continue";
+            enabled: root.interactions-enabled;
+            clicked => { root.answered("Continue"); }
+        }
+
+        pause-button := SecondaryButton {
+            row: root.stacked ? 2 : 0;
+            col: root.stacked ? 0 : 2;
+            horizontal-stretch: root.stacked ? 1 : 0;
+            text: "Pause unavailable";
+            accessible-name: "Pause unavailable in read-only preview";
+            focus-id: "session.question.pause";
+            enabled: root.interactions-enabled;
+            clicked => { root.answered("Pause run"); }
+        }
+    }
+}
+
+component SessionHeader {
+    in property <string> title;
+    in property <string> detail;
+    in property <string> state;
+    in property <int> tone;
+    in property <bool> narrow;
+    out property <bool> stacked: root.narrow
+        || VisualPreferences.density-scale > 1.25
+        || root.width < 760px;
+    out property <bool> text-bounds-fit:
+        root.width > 0px
+        && root.height > 0px
+        && header-layout.width > 0px
+        && header-layout.height > 0px
+        && header-copy.width > 0px
+        && header-copy.height > 0px
+        && title-text.width > 0px
+        && title-text.height > 0px
+        && title-text.preferred-height > 0px
+        && title-text.height >= title-text.preferred-height
+        && detail-text.width > 0px
+        && detail-text.height > 0px
+        && detail-text.preferred-height > 0px
+        && detail-text.height >= detail-text.preferred-height
+        && title-text.absolute-position.x >= header-copy.absolute-position.x
+        && title-text.absolute-position.y >= header-copy.absolute-position.y
+        && detail-text.absolute-position.x >= header-copy.absolute-position.x
+        && detail-text.absolute-position.y >= header-copy.absolute-position.y
+        && title-text.absolute-position.x + title-text.width
+            <= header-copy.absolute-position.x + header-copy.width + 1px
+        && detail-text.absolute-position.x + detail-text.width
+            <= header-copy.absolute-position.x + header-copy.width + 1px
+        && title-text.absolute-position.y + title-text.height
+            <= header-copy.absolute-position.y + header-copy.height + 1px
+        && detail-text.absolute-position.y + detail-text.height
+            <= header-copy.absolute-position.y + header-copy.height + 1px;
+    out property <bool> back-bounds-fit:
+        back-button.width > 0px
+        && back-button.height > 0px
+        && back-button.content-bounds-fit
+        && back-button.absolute-position.x >= header-layout.absolute-position.x
+        && back-button.absolute-position.y >= header-layout.absolute-position.y
+        && back-button.absolute-position.x + back-button.width
+            <= root.absolute-position.x + root.width - Metrics.space-3 + 1px
+        && back-button.absolute-position.y + back-button.height
+            <= root.absolute-position.y + root.height - Metrics.space-3 + 1px;
+    out property <bool> status-bounds-fit:
+        state-badge.width > 0px
+        && state-badge.height > 0px
+        && state-badge.content-bounds-fit
+        && state-badge.absolute-position.x >= header-layout.absolute-position.x
+        && state-badge.absolute-position.y >= header-layout.absolute-position.y
+        && state-badge.absolute-position.x + state-badge.width
+            <= root.absolute-position.x + root.width - Metrics.space-3 + 1px
+        && state-badge.absolute-position.y + state-badge.height
+            <= root.absolute-position.y + root.height - Metrics.space-3 + 1px;
+    out property <bool> no-overlap: root.stacked
+        ? back-button.absolute-position.y + back-button.height
+                <= header-copy.absolute-position.y + 1px
+            && header-copy.absolute-position.y + header-copy.height
+                <= state-badge.absolute-position.y + 1px
+        : back-button.absolute-position.x + back-button.width
+                <= header-copy.absolute-position.x + 1px
+            && header-copy.absolute-position.x + header-copy.width
+                <= state-badge.absolute-position.x + 1px;
+    private property <bool> observed-text-bounds-fit: root.text-bounds-fit;
+    private property <bool> observed-back-bounds-fit: root.back-bounds-fit;
+    private property <bool> observed-status-bounds-fit: root.status-bounds-fit;
+    private property <bool> observed-no-overlap: root.no-overlap;
+    private property <bool> observed-stacked: root.stacked;
+    callback back-requested;
+    callback geometry-changed(bool, bool, bool, bool, bool);
+
+    min-height: header-layout.min-height + 2 * Metrics.space-3;
+    vertical-stretch: 0;
+    accessible-role: banner;
+    accessible-label: "Read-only session preview header";
+
+    function report-geometry() {
+        root.geometry-changed(
+            root.text-bounds-fit,
+            root.back-bounds-fit,
+            root.status-bounds-fit,
+            root.no-overlap,
+            root.stacked
+        );
+    }
+
+    init => { root.report-geometry(); }
+    changed observed-text-bounds-fit => { root.report-geometry(); }
+    changed observed-back-bounds-fit => { root.report-geometry(); }
+    changed observed-status-bounds-fit => { root.report-geometry(); }
+    changed observed-no-overlap => { root.report-geometry(); }
+    changed observed-stacked => { root.report-geometry(); }
+
+    Rectangle {
+        background: DesignTokens.surface-pane;
+        border-width: 1px;
+        border-color: DesignTokens.border-default;
+    }
+
+    header-layout := GridLayout {
+        x: Metrics.space-3;
+        y: Metrics.space-3;
+        width: parent.width - 2 * Metrics.space-3;
+        spacing: Metrics.space-3;
+
+        back-button := SecondaryButton {
+            row: 0;
+            col: 0;
+            text: "Back";
+            accessible-name: "Back to run previews";
+            focus-id: "session.header.back";
+            clicked => { root.back-requested(); }
+        }
+
+        header-copy := VerticalLayout {
+            row: root.stacked ? 1 : 0;
+            col: root.stacked ? 0 : 1;
+            min-width: 0px;
+            horizontal-stretch: 1;
+            spacing: Metrics.space-1;
+
+            title-text := Text {
+                text: root.title;
+                color: DesignTokens.text-primary;
+                font-size: Metrics.type-small;
+                font-weight: 800;
+                wrap: word-wrap;
+                accessible-role: text;
+            }
+            detail-text := Text {
+                text: root.detail;
+                color: DesignTokens.text-muted;
+                font-size: Metrics.type-caption;
+                wrap: word-wrap;
+                accessible-role: text;
+            }
+        }
+
+        state-badge := SemanticBadge {
+            row: root.stacked ? 2 : 0;
+            col: root.stacked ? 0 : 2;
+            text: root.state;
+            tone: root.tone;
+        }
+    }
+}
+
 component SessionScreen {
     in property <[TranscriptItem]> transcript;
     in property <[ActivityItem]> activity;
@@ -1131,6 +1951,7 @@ component SessionScreen {
     in property <int> session-tone: 0;
     in property <bool> can-approve: false;
     in property <bool> can-answer: false;
+    in property <bool> interactions-enabled: false;
     in property <string> approval-prompt: "";
     in property <string> approval-scope: "";
     in property <string> question: "";
@@ -1143,9 +1964,12 @@ component SessionScreen {
     callback answer-requested(string);
     callback message-submitted(string);
     callback file-selected(int);
+    callback approval-geometry-changed(bool, bool, bool, bool);
+    callback question-geometry-changed(bool, bool, bool, bool);
+    callback header-geometry-changed(bool, bool, bool, bool, bool);
 
     accessible-role: main;
-    accessible-label: "Session workspace";
+    accessible-label: "Read-only session preview";
 
     // Fixed row height so the virtualized file lists can size themselves.
     private property <length> file-row-height: max(Metrics.control-large,
@@ -1154,27 +1978,27 @@ component SessionScreen {
     VerticalLayout {
         spacing: 0px;
 
-        Rectangle {
-            height: max(58px, Metrics.control-large + 2 * Metrics.space-2);
-            vertical-stretch: 0;
-            background: DesignTokens.surface-pane;
-            border-width: 1px;
-            border-color: DesignTokens.border-default;
-
-            HorizontalLayout {
-                padding-left: Metrics.space-3;
-                padding-right: Metrics.space-3;
-                spacing: Metrics.space-3;
-                cross-axis-alignment: center;
-
-                SecondaryButton { text: "Back"; clicked => { root.back-requested(); } }
-                VerticalLayout {
-                    spacing: 0px;
-                    Text { text: root.session-title; color: DesignTokens.text-primary; font-size: Metrics.type-small; font-weight: 800; accessible-role: text; }
-                    Text { text: root.session-detail; color: DesignTokens.text-muted; font-size: Metrics.type-caption; accessible-role: text; }
-                }
-                Rectangle { horizontal-stretch: 1; }
-                SemanticBadge { text: root.session-state; tone: root.session-tone; }
+        SessionHeader {
+            title: root.session-title;
+            detail: root.session-detail;
+            state: root.session-state;
+            tone: root.session-tone;
+            narrow: root.narrow;
+            back-requested => { root.back-requested(); }
+            geometry-changed(
+                text-bounds-fit,
+                back-bounds-fit,
+                status-bounds-fit,
+                no-overlap,
+                stacked
+            ) => {
+                root.header-geometry-changed(
+                    text-bounds-fit,
+                    back-bounds-fit,
+                    status-bounds-fit,
+                    no-overlap,
+                    stacked
+                );
             }
         }
 
@@ -1309,41 +2133,52 @@ component SessionScreen {
                     }
                 }
 
-                if (root.can-approve) : Card {
-                    min-height: max(134px, Metrics.control-large + 4 * Metrics.line-body);
-                    vertical-stretch: 0;
-                    accessible-name: "Approval prompt";
-
-                    HorizontalLayout {
-                        spacing: Metrics.space-3;
-                        VerticalLayout {
-                            spacing: Metrics.space-1;
-                            Text { text: "Approval required"; color: DesignTokens.warning; font-size: Metrics.type-small; font-weight: 850; accessible-role: text; }
-                            Text { text: root.approval-prompt; color: DesignTokens.text-primary; font-size: Metrics.type-small; wrap: word-wrap; accessible-role: text; }
-                            Text { text: root.approval-scope; color: DesignTokens.text-muted; font-size: Metrics.type-caption; accessible-role: text; }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        DangerButton { text: "Deny"; clicked => { root.approval-requested(false); } }
-                        PrimaryButton { text: "Approve"; clicked => { root.approval-requested(true); } }
+                if (root.can-approve) : ApprovalPrompt {
+                    prompt: root.approval-prompt;
+                    scope: root.approval-scope;
+                    interactions-enabled: root.interactions-enabled;
+                    narrow: root.narrow;
+                    decision(approved) => { root.approval-requested(approved); }
+                    geometry-changed(
+                        text-bounds-fit,
+                        controls-bounds-fit,
+                        controls-no-overlap,
+                        stacked
+                    ) => {
+                        root.approval-geometry-changed(
+                            text-bounds-fit,
+                            controls-bounds-fit,
+                            controls-no-overlap,
+                            stacked
+                        );
                     }
                 }
 
-                if (root.can-answer) : Card {
-                    min-height: max(116px, Metrics.control-large + 3 * Metrics.line-body);
-                    vertical-stretch: 0;
-                    accessible-name: "Agent question";
-                    Text { text: "Agent question"; color: DesignTokens.info; font-size: Metrics.type-caption; font-weight: 850; accessible-role: text; }
-                    Text { text: root.question; color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; }
-                    HorizontalLayout {
-                        spacing: Metrics.space-2;
-                        PrimaryButton { text: "Continue"; clicked => { root.answer-requested("Continue"); } }
-                        SecondaryButton { text: "Pause run"; clicked => { root.answer-requested("Pause run"); } }
+                if (root.can-answer) : QuestionPrompt {
+                    question: root.question;
+                    interactions-enabled: root.interactions-enabled;
+                    narrow: root.narrow;
+                    answered(answer) => { root.answer-requested(answer); }
+                    geometry-changed(
+                        text-bounds-fit,
+                        controls-bounds-fit,
+                        controls-no-overlap,
+                        stacked
+                    ) => {
+                        root.question-geometry-changed(
+                            text-bounds-fit,
+                            controls-bounds-fit,
+                            controls-no-overlap,
+                            stacked
+                        );
                     }
                 }
 
                 ComposerShell {
-                    placeholder: "Message the agent";
-                    submit-label: "Send";
+                    accessible-name: "Messaging unavailable in read-only preview";
+                    placeholder: "Messaging unavailable in preview";
+                    submit-label: "Unavailable";
+                    enabled: root.interactions-enabled;
                     submitted(message) => { root.message-submitted(message); }
                 }
 
@@ -1511,6 +2346,13 @@ component DiagnosticsScreen {
 component PaletteCommandItem inherits NavigationItem {
     in property <int> item-index;
     in property <int> item-count;
+    in property <bool> focus-when-selected;
+
+    changed selected => {
+        if (root.selected && root.focus-when-selected) {
+            root.focus();
+        }
+    }
 
     accessible-role: list-item;
     accessible-label: root.text;
@@ -1530,6 +2372,7 @@ component CommandPalette inherits FocusScope {
     callback dismiss-requested;
     callback query-changed(string);
     callback selection-step-requested(int);
+    callback selection-index-requested(int);
     callback command-requested(int);
 
     private property <length> command-row-height: max(
@@ -1585,7 +2428,10 @@ component CommandPalette inherits FocusScope {
         width: 100%;
         height: 100%;
         background: #00000066;
-        TouchArea { clicked => { root.dismiss-requested(); } }
+        TouchArea {
+            clicked => { root.dismiss-requested(); }
+            scroll-event(event) => { return accept; }
+        }
 
         ModalSheetShell {
             x: max(0px, (parent.width - self.width) / 2);
@@ -1609,6 +2455,11 @@ component CommandPalette inherits FocusScope {
                     text <=> root.query;
                     focus-on-init: true;
                     intercept-vertical-navigation: true;
+                    focus-changed(focused) => {
+                        if (focused) {
+                            root.focused-command-index = -1;
+                        }
+                    }
                     edited(value) => { root.query-changed(value); }
                     vertical-navigation-requested(step) => {
                         root.selection-step-requested(step);
@@ -1643,13 +2494,18 @@ component CommandPalette inherits FocusScope {
                             text: command.title;
                             detail: command.detail;
                             selected: index == root.selected-index;
+                            focus-when-selected: root.focused-command-index >= 0;
                             item-index: index;
                             item-count: root.command-count;
                             focus-received => {
                                 root.focused-command-index = index;
+                                root.selection-index-requested(index);
                                 root.reveal-command(index);
                             }
-                            clicked => { root.command-requested(command.action-id); }
+                            clicked => {
+                                root.selection-index-requested(index);
+                                root.command-requested(command.action-id);
+                            }
                         }
                     }
                 }
@@ -1769,17 +2625,17 @@ component PrimaryNavigation {
                     if (!root.compact) : VerticalLayout {
                         spacing: 0px;
                         Text { text: "GTA Claw"; color: DesignTokens.text-primary; font-size: Metrics.type-small; font-weight: 850; accessible-role: none; }
-                        Text { text: "Native workspace"; color: DesignTokens.text-muted; font-size: Metrics.type-caption; accessible-role: none; }
+                        Text { text: "Read-only preview"; color: DesignTokens.text-muted; font-size: Metrics.type-caption; accessible-role: none; }
                     }
                 }
 
                 Divider { }
-                NavigationItem { glyph: "F"; text: root.compact ? "" : "Focus"; detail: root.compact ? "" : "Needs attention"; accessible-name: "Focus, needs attention"; selected: root.selected-screen == 0; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.navigate-requested(0); } }
-                NavigationItem { glyph: "W"; text: root.compact ? "" : "Workspaces"; detail: root.compact ? "" : "Local and remote"; accessible-name: "Workspaces, local and remote"; selected: root.selected-screen == 1; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.navigate-requested(1); } }
-                NavigationItem { glyph: "R"; text: root.compact ? "" : "Runs"; detail: root.compact ? "" : "Sessions and tasks"; accessible-name: "Runs, sessions and tasks"; selected: root.selected-screen == 2 || root.selected-screen == 7; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.navigate-requested(2); } }
-                NavigationItem { glyph: "S"; text: root.compact ? "" : "Schedules"; detail: root.compact ? "" : "Recurring work"; accessible-name: "Schedules, recurring work"; selected: root.selected-screen == 3; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.navigate-requested(3); } }
-                NavigationItem { glyph: "D"; text: root.compact ? "" : "Deliverables"; detail: root.compact ? "" : "Files and artifacts"; accessible-name: "Deliverables, files and artifacts"; selected: root.selected-screen == 4; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.navigate-requested(4); } }
-                NavigationItem { glyph: "E"; text: root.compact ? "" : "Extensions"; detail: root.compact ? "" : "Roles and tools"; accessible-name: "Extensions, roles and tools"; selected: root.selected-screen == 5; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.navigate-requested(5); } }
+                NavigationItem { glyph: "F"; text: root.compact ? "" : "Focus"; detail: root.compact ? "" : "Sample overview"; accessible-name: "Preview focus overview"; selected: root.selected-screen == 0; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.navigate-requested(0); } }
+                NavigationItem { glyph: "W"; text: root.compact ? "" : "Workspaces"; detail: root.compact ? "" : "Sample rows"; accessible-name: "Workspace previews"; selected: root.selected-screen == 1; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.navigate-requested(1); } }
+                NavigationItem { glyph: "R"; text: root.compact ? "" : "Runs"; detail: root.compact ? "" : "Sample lifecycle"; accessible-name: "Run lifecycle previews"; selected: root.selected-screen == 2 || root.selected-screen == 7; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.navigate-requested(2); } }
+                NavigationItem { glyph: "S"; text: root.compact ? "" : "Schedules"; detail: root.compact ? "" : "Unavailable actions"; accessible-name: "Schedule previews, actions unavailable"; selected: root.selected-screen == 3; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.navigate-requested(3); } }
+                NavigationItem { glyph: "D"; text: root.compact ? "" : "Deliverables"; detail: root.compact ? "" : "Sample artifacts"; accessible-name: "Artifact previews"; selected: root.selected-screen == 4; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.navigate-requested(4); } }
+                NavigationItem { glyph: "E"; text: root.compact ? "" : "Extensions"; detail: root.compact ? "" : "Sample roles and tools"; accessible-name: "Extension previews"; selected: root.selected-screen == 5; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.navigate-requested(5); } }
                 Divider { }
                 NavigationItem { glyph: "G"; text: root.compact ? "" : "Settings"; detail: root.compact ? "" : "Preferences"; accessible-name: "Settings, preferences"; selected: root.selected-screen == 6 || root.selected-screen == 8 || root.selected-screen == 9; focus-received => { root.reveal-navigation-item(self.absolute-position.y, self.height); } clicked => { root.navigate-requested(6); } }
                 StatusBadge {
@@ -1824,6 +2680,8 @@ export component ProductShell inherits FocusScope {
     in property <int> session-tone: 0;
     in property <bool> can-approve: false;
     in property <bool> can-answer: false;
+    in property <bool> product-interactions-enabled: false;
+    in property <bool> session-narrow-layout: false;
     in property <string> approval-prompt: "";
     in property <string> approval-scope: "";
     in property <string> question: "";
@@ -1837,6 +2695,10 @@ export component ProductShell inherits FocusScope {
     in property <string> run-page-label: "Page 1 of 1";
     in property <bool> can-previous-run-page: false;
     in property <bool> can-next-run-page: false;
+    in property <int> dashboard-awaiting-review: 0;
+    in property <int> dashboard-running: 0;
+    in property <int> dashboard-blocked: 0;
+    in property <int> dashboard-workspaces: 0;
     in-out property <int> focused-run-index: -1;
     in property <string> gateway-status-text;
     in property <string> gateway-status-label;
@@ -1846,14 +2708,69 @@ export component ProductShell inherits FocusScope {
     in property <string> gateway-role;
     in property <string> gateway-scopes;
     in property <string> gateway-health;
-    out property <bool> compact-navigation: root.available-width < 900px;
+    out property <bool> compact-navigation: root.available-width < 900px
+        || VisualPreferences.density-scale > 1.25;
+    private property <length> application-title-min-width:
+        max(120px, 2 * Metrics.control-large);
+    out property <bool> application-header-title-bounds-fit:
+        application-header.width > 0px
+        && application-header.height > 0px
+        && application-title.width > 0px
+        && application-title.height > 0px
+        && application-title.width >= root.application-title-min-width
+        && application-title.preferred-width > 0px
+        && application-title.absolute-position.x >= application-header.absolute-position.x
+        && application-title.absolute-position.y >= application-header.absolute-position.y
+        && application-title.absolute-position.x + application-title.width
+            <= application-header.absolute-position.x + application-header.width + 1px
+        && application-title.absolute-position.y + application-title.height
+            <= application-header.absolute-position.y + application-header.height + 1px;
+    out property <bool> application-header-badge-bounds-fit:
+        application-badge.width > 0px
+        && application-badge.height > 0px
+        && application-badge.content-bounds-fit
+        && application-badge.absolute-position.x >= application-header.absolute-position.x
+        && application-badge.absolute-position.y >= application-header.absolute-position.y
+        && application-badge.absolute-position.x + application-badge.width
+            <= application-header.absolute-position.x + application-header.width + 1px
+        && application-badge.absolute-position.y + application-badge.height
+            <= application-header.absolute-position.y + application-header.height + 1px;
+    out property <bool> viewport-bounds-fit:
+        root.width > 0px
+        && root.height > 0px
+        && product-content.width > 0px
+        && product-content.height > 0px
+        && product-content.absolute-position.x >= root.absolute-position.x
+        && product-content.absolute-position.y >= root.absolute-position.y
+        && product-content.absolute-position.x + product-content.width
+            <= root.absolute-position.x + root.width + 1px
+        && product-content.absolute-position.y + product-content.height
+            <= root.absolute-position.y + root.height + 1px;
+    private property <bool> observed-application-header-title-bounds-fit:
+        root.application-header-title-bounds-fit;
+    private property <bool> observed-application-header-badge-bounds-fit:
+        root.application-header-badge-bounds-fit;
+    private property <bool> observed-viewport-bounds-fit: root.viewport-bounds-fit;
 
     callback navigate-requested(int);
     callback palette-toggle-requested;
     callback palette-dismiss-requested;
     callback palette-query-changed(string);
     callback palette-selection-step-requested(int);
+    callback palette-selection-index-requested(int);
     callback palette-command-requested(int);
+    callback palette-trigger-focus-changed(bool);
+    callback preview-dismiss-trigger-focus-changed(bool);
+    callback appearance-contrast-focus-changed(bool);
+    callback workspace-card-geometry-changed(int, bool, bool, bool, bool, bool, bool);
+    callback schedule-card-geometry-changed(int, bool, bool, bool, bool, bool, bool);
+    callback extension-card-geometry-changed(int, bool, bool, bool, bool, bool, bool);
+    callback application-header-geometry-changed(bool, bool);
+    callback settings-rail-geometry-changed(bool);
+    callback viewport-geometry-changed(bool);
+    callback run-focus-visibility-changed(bool);
+    callback background-scroll-position-changed(length);
+    callback preview-dismiss-requested;
     callback open-session-requested(int);
     callback open-workspace-requested(int);
     callback settings-section-requested(int);
@@ -1865,6 +2782,9 @@ export component ProductShell inherits FocusScope {
     callback previous-run-page-requested;
     callback next-run-page-requested;
     callback approval-requested(bool);
+    callback approval-geometry-changed(bool, bool, bool, bool);
+    callback question-geometry-changed(bool, bool, bool, bool);
+    callback session-header-geometry-changed(bool, bool, bool, bool, bool);
     callback answer-requested(string);
     callback message-submitted(string);
     callback file-selected(int);
@@ -1883,12 +2803,43 @@ export component ProductShell inherits FocusScope {
     horizontal-stretch: 0;
     vertical-stretch: 0;
 
-    accessible-role: region;
-    accessible-label: "GTA Claw desktop application";
+    accessible-role: root.palette-open ? AccessibleRole.none : AccessibleRole.region;
+    accessible-label: root.palette-open ? "" : "GTA Claw read-only product preview";
+
+    changed palette-open => {
+        if (!root.palette-open) {
+            root.focus();
+            FocusHistory.restore-captured();
+        }
+    }
+    init => {
+        root.application-header-geometry-changed(
+            root.application-header-title-bounds-fit,
+            root.application-header-badge-bounds-fit
+        );
+        root.viewport-geometry-changed(root.viewport-bounds-fit);
+    }
+    changed observed-application-header-title-bounds-fit => {
+        root.application-header-geometry-changed(
+            root.application-header-title-bounds-fit,
+            root.application-header-badge-bounds-fit
+        );
+    }
+    changed observed-application-header-badge-bounds-fit => {
+        root.application-header-geometry-changed(
+            root.application-header-title-bounds-fit,
+            root.application-header-badge-bounds-fit
+        );
+    }
+    changed observed-viewport-bounds-fit => {
+        root.viewport-geometry-changed(root.viewport-bounds-fit);
+    }
 
     Rectangle { background: DesignTokens.surface-app; }
 
-    HorizontalLayout {
+    product-content := HorizontalLayout {
+        visible: !root.palette-open;
+        enabled: !root.palette-open;
         spacing: 0px;
 
         PrimaryNavigation {
@@ -1909,14 +2860,14 @@ export component ProductShell inherits FocusScope {
             spacing: 0px;
             horizontal-stretch: 1;
 
-            Rectangle {
+            application-header := Rectangle {
                 height: max(58px, Metrics.control-large + 2 * Metrics.space-2);
                 vertical-stretch: 0;
                 background: DesignTokens.surface-pane;
                 border-width: 1px;
                 border-color: DesignTokens.border-default;
                 accessible-role: banner;
-                accessible-label: "Application header";
+                accessible-label: "Read-only preview header";
 
                 HorizontalLayout {
                     padding-left: Metrics.space-4;
@@ -1924,7 +2875,7 @@ export component ProductShell inherits FocusScope {
                     spacing: Metrics.space-3;
                     cross-axis-alignment: center;
 
-                    Text {
+                    application-title := Text {
                         text: root.selected-screen == 0
                             ? "Focus"
                             : (root.selected-screen == 1
@@ -1940,22 +2891,44 @@ export component ProductShell inherits FocusScope {
                                                 : (root.selected-screen == 6
                                                     ? "Settings"
                                                     : (root.selected-screen == 7
-                                                        ? "Session workspace"
+                                                        ? "Session preview"
                                                         : (root.selected-screen == 8 ? "Update" : "Diagnostics"))))))));
                         color: DesignTokens.text-primary;
                         font-size: Metrics.type-title;
                         font-weight: 800;
+                        min-width: root.application-title-min-width;
+                        horizontal-stretch: 1;
+                        overflow: elide;
                         accessible-role: text;
                     }
-                    Rectangle { horizontal-stretch: 1; }
-                    ToolbarIconButton {
+                    application-badge := SemanticBadge {
+                        text: root.compact-navigation ? "P" : "Read-only preview";
+                        accessible-name: "Read-only product preview";
+                        tone: 2;
+                    }
+                    preview-dismiss-button := ToolbarIconButton {
+                        glyph: "<";
+                        accessible-name: "Close read-only preview and return to Gateway diagnostic";
+                        focus-id: "product.preview-dismiss";
+                        focus-changed(focused) => {
+                            root.preview-dismiss-trigger-focus-changed(focused);
+                        }
+                        clicked => { root.preview-dismiss-requested(); }
+                    }
+                    palette-button := ToolbarIconButton {
                         glyph: "P";
                         accessible-name: @tr("Open command palette, F1 or Ctrl/Cmd+K");
+                        focus-id: "product.palette-trigger";
                         checked: root.palette-open;
                         checkable: true;
-                        clicked => { root.palette-toggle-requested(); }
+                        focus-changed(focused) => { root.palette-trigger-focus-changed(focused); }
+                        clicked => {
+                            FocusHistory.capture-control(palette-button.focus-id);
+                            palette-button.focus();
+                            root.palette-toggle-requested();
+                        }
                     }
-                    ToolbarIconButton {
+                    if (!root.compact-navigation) : ToolbarIconButton {
                         glyph: "?";
                         accessible-name: "Help and keyboard shortcuts";
                         clicked => {
@@ -1969,9 +2942,19 @@ export component ProductShell inherits FocusScope {
             if (root.selected-screen == 0) : FocusScreen {
                 runs: root.runs;
                 focused-run-index <=> root.focused-run-index;
+                awaiting-review: root.dashboard-awaiting-review;
+                running: root.dashboard-running;
+                blocked: root.dashboard-blocked;
+                workspace-count: root.dashboard-workspaces;
                 open-session-requested(index) => {
                     root.open-session-requested(index);
                     root.focus();
+                }
+                focused-run-visibility-changed(visible) => {
+                    root.run-focus-visibility-changed(visible);
+                }
+                background-scroll-position-changed(position) => {
+                    root.background-scroll-position-changed(position);
                 }
             }
             if (root.selected-screen == 1) : WorkspacesScreen {
@@ -1979,6 +2962,25 @@ export component ProductShell inherits FocusScope {
                 open-workspace-requested(index) => {
                     root.open-workspace-requested(index);
                     root.focus();
+                }
+                card-geometry-changed(
+                    index,
+                    text-bounds-fit,
+                    icon-bounds-fit,
+                    badge-bounds-fit,
+                    button-bounds-fit,
+                    no-overlap,
+                    stacked
+                ) => {
+                    root.workspace-card-geometry-changed(
+                        index,
+                        text-bounds-fit,
+                        icon-bounds-fit,
+                        badge-bounds-fit,
+                        button-bounds-fit,
+                        no-overlap,
+                        stacked
+                    );
                 }
             }
             if (root.selected-screen == 2) : RunsScreen {
@@ -1996,8 +2998,28 @@ export component ProductShell inherits FocusScope {
             }
             if (root.selected-screen == 3) : SchedulesScreen {
                 schedules: root.schedules;
+                interactions-enabled: root.product-interactions-enabled;
                 create-requested => { root.schedule-create-requested(); }
                 toggled(index) => { root.schedule-toggled(index); }
+                card-geometry-changed(
+                    index,
+                    text-bounds-fit,
+                    icon-bounds-fit,
+                    badge-bounds-fit,
+                    button-bounds-fit,
+                    no-overlap,
+                    stacked
+                ) => {
+                    root.schedule-card-geometry-changed(
+                        index,
+                        text-bounds-fit,
+                        icon-bounds-fit,
+                        badge-bounds-fit,
+                        button-bounds-fit,
+                        no-overlap,
+                        stacked
+                    );
+                }
             }
             if (root.selected-screen == 4) : DeliverablesScreen {
                 deliverables: root.deliverables;
@@ -2008,15 +3030,37 @@ export component ProductShell inherits FocusScope {
                 selected-size: root.selected-deliverable-size;
                 selected-content: root.selected-deliverable-content;
                 selected-pinned: root.selected-deliverable-pinned;
+                interactions-enabled: root.product-interactions-enabled;
                 selected(index) => { root.deliverable-selected(index); }
                 pin-toggle-requested => { root.deliverable-pin-toggle-requested(); }
             }
             if (root.selected-screen == 5) : ExtensionsScreen {
                 extensions: root.extensions;
+                interactions-enabled: root.product-interactions-enabled;
                 toggled(index) => { root.extension-toggled(index); }
+                card-geometry-changed(
+                    index,
+                    text-bounds-fit,
+                    icon-bounds-fit,
+                    badge-bounds-fit,
+                    button-bounds-fit,
+                    no-overlap,
+                    stacked
+                ) => {
+                    root.extension-card-geometry-changed(
+                        index,
+                        text-bounds-fit,
+                        icon-bounds-fit,
+                        badge-bounds-fit,
+                        button-bounds-fit,
+                        no-overlap,
+                        stacked
+                    );
+                }
             }
             if (root.selected-screen == 6) : SettingsScreen {
                 selected-section: root.selected-settings-section;
+                compact-navigation: root.compact-navigation;
                 gateway-status-text: root.gateway-status-text;
                 gateway-status-label: root.gateway-status-label;
                 gateway-status-icon: root.gateway-status-icon;
@@ -2035,6 +3079,12 @@ export component ProductShell inherits FocusScope {
                     root.diagnostics-requested();
                     root.focus();
                 }
+                appearance-contrast-focus-changed(focused) => {
+                    root.appearance-contrast-focus-changed(focused);
+                }
+                rail-geometry-changed(bounds-fit) => {
+                    root.settings-rail-geometry-changed(bounds-fit);
+                }
             }
             if (root.selected-screen == 7) : SessionScreen {
                 transcript: root.transcript;
@@ -2044,13 +3094,14 @@ export component ProductShell inherits FocusScope {
                 selected-file-index: root.selected-file-index;
                 selected-file-name: root.selected-file-name;
                 diff-mode: root.diff-mode;
-                narrow: root.available-width < 1040px;
+                narrow: root.session-narrow-layout;
                 session-title: root.session-title;
                 session-state: root.session-state;
                 session-detail: root.session-detail;
                 session-tone: root.session-tone;
                 can-approve: root.can-approve;
                 can-answer: root.can-answer;
+                interactions-enabled: root.product-interactions-enabled;
                 approval-prompt: root.approval-prompt;
                 approval-scope: root.approval-scope;
                 question: root.question;
@@ -2060,6 +3111,47 @@ export component ProductShell inherits FocusScope {
                 }
                 diff-mode-requested(mode) => { root.diff-mode-requested(mode); }
                 approval-requested(approved) => { root.approval-requested(approved); }
+                approval-geometry-changed(
+                    text-bounds-fit,
+                    controls-bounds-fit,
+                    controls-no-overlap,
+                    stacked
+                ) => {
+                    root.approval-geometry-changed(
+                        text-bounds-fit,
+                        controls-bounds-fit,
+                        controls-no-overlap,
+                        stacked
+                    );
+                }
+                question-geometry-changed(
+                    text-bounds-fit,
+                    controls-bounds-fit,
+                    controls-no-overlap,
+                    stacked
+                ) => {
+                    root.question-geometry-changed(
+                        text-bounds-fit,
+                        controls-bounds-fit,
+                        controls-no-overlap,
+                        stacked
+                    );
+                }
+                header-geometry-changed(
+                    text-bounds-fit,
+                    back-bounds-fit,
+                    status-bounds-fit,
+                    no-overlap,
+                    stacked
+                ) => {
+                    root.session-header-geometry-changed(
+                        text-bounds-fit,
+                        back-bounds-fit,
+                        status-bounds-fit,
+                        no-overlap,
+                        stacked
+                    );
+                }
                 answer-requested(answer) => { root.answer-requested(answer); }
                 message-submitted(message) => { root.message-submitted(message); }
                 file-selected(index) => { root.file-selected(index); }
@@ -2098,6 +3190,7 @@ export component ProductShell inherits FocusScope {
         dismiss-requested => { root.palette-dismiss-requested(); }
         query-changed(query) => { root.palette-query-changed(query); }
         selection-step-requested(step) => { root.palette-selection-step-requested(step); }
+        selection-index-requested(index) => { root.palette-selection-index-requested(index); }
         command-requested(action-id) => { root.palette-command-requested(action-id); }
     }
 }

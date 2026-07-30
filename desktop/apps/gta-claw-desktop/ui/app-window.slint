@@ -1,5 +1,6 @@
 import { FirstRunSurface } from "@gta-ui/first-run.slint";
 import { GatewayOnboardingSurface } from "@gta-ui/gateway-onboarding.slint";
+import { FocusHistory } from "@gta-ui/primitives.slint";
 import {
     ActivityItem,
     CommandItem,
@@ -64,8 +65,11 @@ export component AppWindow inherits Window {
     in-out property <bool> consent-checked: false;
     in property <length> layout-width: root.width;
     out property <bool> narrow-layout: root.layout-width < 900px;
+    out property <bool> navigation-global-focus-active: application-focus.has-focus;
     out property <string> connection-focused-action: "";
-    in property <bool> workspace-ready: false;
+    out property <bool> gateway-summary-text-bounds-fit: true;
+    out property <bool> gateway-summary-high-density-stacked: false;
+    in-out property <bool> product-preview-open: false;
     in property <int> onboarding-stage: 0;
     in property <int> selected-screen: 0;
     in property <int> selected-settings-section: 0;
@@ -77,46 +81,92 @@ export component AppWindow inherits Window {
     in property <int> palette-selected-action-id: -1;
     in property <string> palette-selected-label: "";
     in-out property <int> palette-focused-command-index: -1;
+    out property <bool> palette-trigger-focused: false;
+    out property <bool> preview-dismiss-trigger-focused: false;
+    out property <bool> appearance-contrast-focused: false;
+    out property <bool> approval-text-bounds-fit: true;
+    out property <bool> approval-controls-bounds-fit: true;
+    out property <bool> approval-controls-no-overlap: true;
+    out property <bool> approval-actions-stacked: false;
+    out property <bool> question-text-bounds-fit: true;
+    out property <bool> question-controls-bounds-fit: true;
+    out property <bool> question-controls-no-overlap: true;
+    out property <bool> question-actions-stacked: false;
+    out property <bool> workspace-card-text-bounds-fit: true;
+    out property <bool> workspace-card-icon-bounds-fit: true;
+    out property <bool> workspace-card-badge-bounds-fit: true;
+    out property <bool> workspace-card-button-bounds-fit: true;
+    out property <bool> workspace-card-no-overlap: true;
+    out property <bool> workspace-card-stacked: false;
+    out property <bool> schedule-card-text-bounds-fit: true;
+    out property <bool> schedule-card-icon-bounds-fit: true;
+    out property <bool> schedule-card-badge-bounds-fit: true;
+    out property <bool> schedule-card-button-bounds-fit: true;
+    out property <bool> schedule-card-no-overlap: true;
+    out property <bool> schedule-card-stacked: false;
+    out property <bool> extension-card-text-bounds-fit: true;
+    out property <bool> extension-card-icon-bounds-fit: true;
+    out property <bool> extension-card-badge-bounds-fit: true;
+    out property <bool> extension-card-button-bounds-fit: true;
+    out property <bool> extension-card-no-overlap: true;
+    out property <bool> extension-card-stacked: false;
+    out property <bool> first-run-heading-text-bounds-fit: true;
+    out property <bool> first-run-heading-high-density-wrapped: false;
+    out property <bool> first-run-content-bounds-fit: true;
+    out property <bool> session-header-text-bounds-fit: true;
+    out property <bool> session-header-back-bounds-fit: true;
+    out property <bool> session-header-status-bounds-fit: true;
+    out property <bool> session-header-no-overlap: true;
+    out property <bool> session-header-stacked: false;
+    out property <bool> application-header-title-bounds-fit: true;
+    out property <bool> application-header-badge-bounds-fit: true;
+    out property <bool> settings-rail-bounds-fit: true;
+    out property <bool> product-viewport-bounds-fit: true;
+    out property <bool> session-narrow-layout:
+        root.layout-width < 1040px || root.density-scale > 1.25;
+    out property <bool> focused-run-visible: true;
+    out property <int> focused-run-visibility-generation: 0;
+    out property <length> background-scroll-position: 0px;
     out property <[CommandItem]> command-catalog: [
         {
             action-id: 0,
             glyph: "F",
-            title: @tr("Go to Focus"),
+            title: @tr("Go to Preview Focus"),
             detail: @tr("Ctrl/Cmd+1"),
             keywords: @tr("focus home attention overview"),
         },
         {
             action-id: 1,
             glyph: "W",
-            title: @tr("Go to Workspaces"),
+            title: @tr("View Workspace Previews"),
             detail: @tr("Ctrl/Cmd+2"),
             keywords: @tr("workspace repository local remote git"),
         },
         {
             action-id: 2,
             glyph: "R",
-            title: @tr("Open Run Monitor"),
+            title: @tr("Open Run Preview"),
             detail: @tr("Ctrl/Cmd+3"),
             keywords: @tr("runs sessions tasks monitor"),
         },
         {
             action-id: 3,
             glyph: "S",
-            title: @tr("Open Schedule Manager"),
+            title: @tr("Open Schedule Preview"),
             detail: @tr("Ctrl/Cmd+4"),
             keywords: @tr("schedules recurring cadence automation"),
         },
         {
             action-id: 4,
             glyph: "D",
-            title: @tr("Open Deliverables"),
+            title: @tr("Open Deliverable Preview"),
             detail: @tr("Ctrl/Cmd+5"),
             keywords: @tr("deliverables files artifacts output"),
         },
         {
             action-id: 5,
             glyph: "E",
-            title: @tr("Open Extension Manager"),
+            title: @tr("Open Extension Preview"),
             detail: @tr("Ctrl/Cmd+6"),
             keywords: @tr("extensions roles tools permissions"),
         },
@@ -167,6 +217,7 @@ export component AppWindow inherits Window {
     in property <int> session-tone: 0;
     in property <bool> can-approve: false;
     in property <bool> can-answer: false;
+    in property <bool> product-interactions-enabled: false;
     in property <string> approval-prompt: "";
     in property <string> approval-scope: "";
     in property <string> question: "";
@@ -180,6 +231,10 @@ export component AppWindow inherits Window {
     in property <string> run-page-label: "Page 1 of 1";
     in property <bool> can-previous-run-page: false;
     in property <bool> can-next-run-page: false;
+    in property <int> dashboard-awaiting-review: 0;
+    in property <int> dashboard-running: 0;
+    in property <int> dashboard-blocked: 0;
+    in property <int> dashboard-workspaces: 0;
     in-out property <int> focused-run-index: -1;
     in-out property <ThemeMode> theme-mode <=> VisualPreferences.theme-mode;
     in-out property <bool> high-contrast <=> VisualPreferences.high-contrast;
@@ -188,6 +243,8 @@ export component AppWindow inherits Window {
 
     callback connect-requested(string, string, bool);
     callback retry-requested(string, string, bool);
+    callback preview-requested();
+    callback preview-dismiss-requested();
     callback cancel-requested();
     callback disconnect-requested();
     callback error-dismiss-requested();
@@ -197,6 +254,7 @@ export component AppWindow inherits Window {
     callback palette-dismiss-requested();
     callback palette-query-changed(string);
     callback palette-selection-step-requested(int);
+    callback palette-selection-index-requested(int);
     callback palette-command-requested(int);
     callback open-session-requested(int);
     callback open-workspace-requested(int);
@@ -216,6 +274,9 @@ export component AppWindow inherits Window {
     callback extension-toggled(int);
     callback deliverable-selected(int);
     callback deliverable-pin-toggle-requested();
+    callback workspace-card-geometry-observed(int, bool, bool, bool, bool, bool, bool);
+    callback schedule-card-geometry-observed(int, bool, bool, bool, bool, bool, bool);
+    callback extension-card-geometry-observed(int, bool, bool, bool, bool, bool, bool);
 
     public function request-close() -> bool {
         return root.close();
@@ -243,12 +304,14 @@ export component AppWindow inherits Window {
         height: 100%;
         focus-on-click: false;
         focus-on-tab-navigation: false;
-        private property <bool> observed-workspace-ready: root.workspace-ready;
+        private property <bool> observed-product-preview-open: root.product-preview-open;
         private property <int> observed-onboarding-stage: root.onboarding-stage;
-        private property <bool> observed-palette-open: root.palette-open;
+        private property <int> observed-selected-screen: root.selected-screen;
+        private property <int> observed-focus-restore-generation:
+            FocusHistory.restore-generation;
 
         init => { self.focus(); }
-        changed observed-workspace-ready => {
+        changed observed-product-preview-open => {
             root.connection-focused-action = "";
             self.focus();
         }
@@ -256,77 +319,104 @@ export component AppWindow inherits Window {
             root.connection-focused-action = "";
             self.focus();
         }
-        changed observed-palette-open => {
-            if (!self.observed-palette-open) {
+        changed observed-selected-screen => { self.focus(); }
+        changed observed-focus-restore-generation => {
+            if (FocusHistory.return-control == "application.global") {
                 self.focus();
             }
         }
-
         key-pressed(event) => {
-            if (root.workspace-ready
-                && (event.text == Key.F1
+            if (root.palette-open) {
+                if (event.text == Key.F1
                     || ((event.modifiers.control || event.modifiers.meta)
-                        && (event.text == "k" || event.text == "K")))) {
-                root.palette-toggle-requested();
-                return accept;
-            }
-            if (root.workspace-ready
-                && (event.modifiers.control || event.modifiers.meta)
-                && event.text == "1") {
-                root.navigate-requested(0);
-                return accept;
-            }
-            if (root.workspace-ready
-                && (event.modifiers.control || event.modifiers.meta)
-                && event.text == "2") {
-                root.navigate-requested(1);
-                return accept;
-            }
-            if (root.workspace-ready
-                && (event.modifiers.control || event.modifiers.meta)
-                && event.text == "3") {
-                root.navigate-requested(2);
-                return accept;
-            }
-            if (root.workspace-ready
-                && (event.modifiers.control || event.modifiers.meta)
-                && event.text == "4") {
-                root.navigate-requested(3);
-                return accept;
-            }
-            if (root.workspace-ready
-                && (event.modifiers.control || event.modifiers.meta)
-                && event.text == "5") {
-                root.navigate-requested(4);
-                return accept;
-            }
-            if (root.workspace-ready
-                && (event.modifiers.control || event.modifiers.meta)
-                && event.text == "6") {
-                root.navigate-requested(5);
-                return accept;
-            }
-            if (root.workspace-ready
-                && (event.modifiers.control || event.modifiers.meta)
-                && event.text == "7") {
-                root.navigate-requested(6);
-                return accept;
-            }
-            if (event.text == Key.Escape) {
-                if (root.palette-open) {
+                        && (event.text == "k" || event.text == "K"))) {
+                    root.palette-toggle-requested();
+                    return accept;
+                }
+                if (event.text == Key.Escape) {
                     root.palette-dismiss-requested();
                     return accept;
                 }
-                if (!root.workspace-ready && root.onboarding-stage > 0
+                if (event.text == Key.Tab || event.text == Key.Backtab) {
+                    return reject;
+                }
+                // Focused palette controls handle text, arrows, and Enter. Tab
+                // is rejected above for Slint's default focus traversal; all
+                // other unhandled keys are consumed before background shortcuts.
+                return accept;
+            }
+            if (root.product-preview-open
+                && (event.text == Key.F1
+                    || ((event.modifiers.control || event.modifiers.meta)
+                        && (event.text == "k" || event.text == "K")))) {
+                if (self.has-focus) {
+                    FocusHistory.capture-control("application.global");
+                } else {
+                    FocusHistory.capture-current();
+                }
+                root.palette-toggle-requested();
+                return accept;
+            }
+            if (root.product-preview-open
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "1") {
+                root.navigate-requested(0);
+                self.focus();
+                return accept;
+            }
+            if (root.product-preview-open
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "2") {
+                root.navigate-requested(1);
+                self.focus();
+                return accept;
+            }
+            if (root.product-preview-open
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "3") {
+                root.navigate-requested(2);
+                self.focus();
+                return accept;
+            }
+            if (root.product-preview-open
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "4") {
+                root.navigate-requested(3);
+                self.focus();
+                return accept;
+            }
+            if (root.product-preview-open
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "5") {
+                root.navigate-requested(4);
+                self.focus();
+                return accept;
+            }
+            if (root.product-preview-open
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "6") {
+                root.navigate-requested(5);
+                self.focus();
+                return accept;
+            }
+            if (root.product-preview-open
+                && (event.modifiers.control || event.modifiers.meta)
+                && event.text == "7") {
+                root.navigate-requested(6);
+                self.focus();
+                return accept;
+            }
+            if (event.text == Key.Escape) {
+                if (!root.product-preview-open && root.onboarding-stage > 0
                     && root.onboarding-stage < 3) {
                     root.onboarding-stage-requested(root.onboarding-stage - 1);
                     return accept;
                 }
-                if (!root.workspace-ready && root.onboarding-stage == 3 && root.can-cancel) {
+                if (!root.product-preview-open && root.onboarding-stage == 3 && root.can-cancel) {
                     root.cancel-requested();
                     return accept;
                 }
-                if (!root.workspace-ready && root.onboarding-stage == 3 && root.can-disconnect) {
+                if (!root.product-preview-open && root.onboarding-stage == 3 && root.can-disconnect) {
                     root.disconnect-requested();
                     return accept;
                 }
@@ -337,15 +427,22 @@ export component AppWindow inherits Window {
     // `if` instead of `visible`: a hidden element still exists, is laid out and
     // keeps its whole subtree alive, so all three surfaces used to be built at
     // startup. `if` builds exactly the surface that is on screen.
-    if (!root.workspace-ready && root.onboarding-stage < 3) : FirstRunSurface {
+    if (!root.product-preview-open && root.onboarding-stage < 3) : FirstRunSurface {
         width: 100%;
         height: 100%;
         stage: root.onboarding-stage;
         available-width: root.layout-width;
         stage-requested(stage) => { root.onboarding-stage-requested(stage); }
+        heading-geometry-changed(text-bounds-fit, high-density-wrapped) => {
+            root.first-run-heading-text-bounds-fit = text-bounds-fit;
+            root.first-run-heading-high-density-wrapped = high-density-wrapped;
+        }
+        content-geometry-changed(bounds-fit) => {
+            root.first-run-content-bounds-fit = bounds-fit;
+        }
     }
 
-    if (!root.workspace-ready && root.onboarding-stage == 3) : GatewayOnboardingSurface {
+    if (!root.product-preview-open && root.onboarding-stage == 3) : GatewayOnboardingSurface {
         width: 100%;
         height: 100%;
         available-width: root.layout-width;
@@ -382,6 +479,7 @@ export component AppWindow inherits Window {
         retry-requested(endpoint, token, consent) => {
             root.retry-requested(endpoint, token, consent);
         }
+        preview-requested => { root.preview-requested(); }
         cancel-requested => { root.cancel-requested(); }
         disconnect-requested => { root.disconnect-requested(); }
         error-dismiss-requested => { root.error-dismiss-requested(); }
@@ -390,9 +488,13 @@ export component AppWindow inherits Window {
             root.onboarding-token-has-focus = token-focused;
             root.connection-focused-action = focused-action;
         }
+        summary-geometry-changed(text-bounds-fit, high-density-stacked) => {
+            root.gateway-summary-text-bounds-fit = text-bounds-fit;
+            root.gateway-summary-high-density-stacked = high-density-stacked;
+        }
     }
 
-    if (root.workspace-ready) : ProductShell {
+    if (root.product-preview-open) : ProductShell {
         width: 100%;
         height: 100%;
         available-width: root.layout-width;
@@ -438,6 +540,12 @@ export component AppWindow inherits Window {
         can-previous-run-page: root.can-previous-run-page;
         can-next-run-page: root.can-next-run-page;
         focused-run-index <=> root.focused-run-index;
+        product-interactions-enabled: root.product-interactions-enabled;
+        session-narrow-layout: root.session-narrow-layout;
+        dashboard-awaiting-review: root.dashboard-awaiting-review;
+        dashboard-running: root.dashboard-running;
+        dashboard-blocked: root.dashboard-blocked;
+        dashboard-workspaces: root.dashboard-workspaces;
         gateway-status-text: root.status-text;
         gateway-status-label: root.status-label;
         gateway-status-icon: root.status-icon;
@@ -451,6 +559,7 @@ export component AppWindow inherits Window {
         palette-dismiss-requested => { root.palette-dismiss-requested(); }
         palette-query-changed(query) => { root.palette-query-changed(query); }
         palette-selection-step-requested(step) => { root.palette-selection-step-requested(step); }
+        palette-selection-index-requested(index) => { root.palette-selection-index-requested(index); }
         palette-command-requested(action-id) => { root.palette-command-requested(action-id); }
         open-session-requested(index) => { root.open-session-requested(index); }
         open-workspace-requested(index) => { root.open-workspace-requested(index); }
@@ -471,6 +580,143 @@ export component AppWindow inherits Window {
         extension-toggled(index) => { root.extension-toggled(index); }
         deliverable-selected(index) => { root.deliverable-selected(index); }
         deliverable-pin-toggle-requested => { root.deliverable-pin-toggle-requested(); }
+        palette-trigger-focus-changed(focused) => {
+            root.palette-trigger-focused = focused;
+        }
+        preview-dismiss-trigger-focus-changed(focused) => {
+            root.preview-dismiss-trigger-focused = focused;
+        }
+        appearance-contrast-focus-changed(focused) => {
+            root.appearance-contrast-focused = focused;
+        }
+        approval-geometry-changed(
+            text-bounds-fit,
+            controls-bounds-fit,
+            controls-no-overlap,
+            stacked
+        ) => {
+            root.approval-text-bounds-fit = text-bounds-fit;
+            root.approval-controls-bounds-fit = controls-bounds-fit;
+            root.approval-controls-no-overlap = controls-no-overlap;
+            root.approval-actions-stacked = stacked;
+        }
+        question-geometry-changed(
+            text-bounds-fit,
+            controls-bounds-fit,
+            controls-no-overlap,
+            stacked
+        ) => {
+            root.question-text-bounds-fit = text-bounds-fit;
+            root.question-controls-bounds-fit = controls-bounds-fit;
+            root.question-controls-no-overlap = controls-no-overlap;
+            root.question-actions-stacked = stacked;
+        }
+        workspace-card-geometry-changed(
+            index,
+            text-bounds-fit,
+            icon-bounds-fit,
+            badge-bounds-fit,
+            button-bounds-fit,
+            no-overlap,
+            stacked
+        ) => {
+            root.workspace-card-text-bounds-fit = text-bounds-fit;
+            root.workspace-card-icon-bounds-fit = icon-bounds-fit;
+            root.workspace-card-badge-bounds-fit = badge-bounds-fit;
+            root.workspace-card-button-bounds-fit = button-bounds-fit;
+            root.workspace-card-no-overlap = no-overlap;
+            root.workspace-card-stacked = stacked;
+            root.workspace-card-geometry-observed(
+                index,
+                text-bounds-fit,
+                icon-bounds-fit,
+                badge-bounds-fit,
+                button-bounds-fit,
+                no-overlap,
+                stacked
+            );
+        }
+        schedule-card-geometry-changed(
+            index,
+            text-bounds-fit,
+            icon-bounds-fit,
+            badge-bounds-fit,
+            button-bounds-fit,
+            no-overlap,
+            stacked
+        ) => {
+            root.schedule-card-text-bounds-fit = text-bounds-fit;
+            root.schedule-card-icon-bounds-fit = icon-bounds-fit;
+            root.schedule-card-badge-bounds-fit = badge-bounds-fit;
+            root.schedule-card-button-bounds-fit = button-bounds-fit;
+            root.schedule-card-no-overlap = no-overlap;
+            root.schedule-card-stacked = stacked;
+            root.schedule-card-geometry-observed(
+                index,
+                text-bounds-fit,
+                icon-bounds-fit,
+                badge-bounds-fit,
+                button-bounds-fit,
+                no-overlap,
+                stacked
+            );
+        }
+        extension-card-geometry-changed(
+            index,
+            text-bounds-fit,
+            icon-bounds-fit,
+            badge-bounds-fit,
+            button-bounds-fit,
+            no-overlap,
+            stacked
+        ) => {
+            root.extension-card-text-bounds-fit = text-bounds-fit;
+            root.extension-card-icon-bounds-fit = icon-bounds-fit;
+            root.extension-card-badge-bounds-fit = badge-bounds-fit;
+            root.extension-card-button-bounds-fit = button-bounds-fit;
+            root.extension-card-no-overlap = no-overlap;
+            root.extension-card-stacked = stacked;
+            root.extension-card-geometry-observed(
+                index,
+                text-bounds-fit,
+                icon-bounds-fit,
+                badge-bounds-fit,
+                button-bounds-fit,
+                no-overlap,
+                stacked
+            );
+        }
+        session-header-geometry-changed(
+            text-bounds-fit,
+            back-bounds-fit,
+            status-bounds-fit,
+            no-overlap,
+            stacked
+        ) => {
+            root.session-header-text-bounds-fit = text-bounds-fit;
+            root.session-header-back-bounds-fit = back-bounds-fit;
+            root.session-header-status-bounds-fit = status-bounds-fit;
+            root.session-header-no-overlap = no-overlap;
+            root.session-header-stacked = stacked;
+        }
+        application-header-geometry-changed(title-bounds-fit, badge-bounds-fit) => {
+            root.application-header-title-bounds-fit = title-bounds-fit;
+            root.application-header-badge-bounds-fit = badge-bounds-fit;
+        }
+        settings-rail-geometry-changed(bounds-fit) => {
+            root.settings-rail-bounds-fit = bounds-fit;
+        }
+        viewport-geometry-changed(bounds-fit) => {
+            root.product-viewport-bounds-fit = bounds-fit;
+        }
+        run-focus-visibility-changed(visible) => {
+            root.focused-run-visible = visible;
+            root.focused-run-visibility-generation += 1;
+        }
+        background-scroll-position-changed(position) => {
+            root.background-scroll-position = position;
+        }
+        preview-dismiss-requested => { root.preview-dismiss-requested(); }
     }
     }
 }

@@ -6,7 +6,49 @@ import {
     SecondaryButton,
     StatusBadge,
 } from "./primitives.slint";
-import { DesignTokens, Metrics, StatusKind } from "./tokens.slint";
+import { DesignTokens, Metrics, StatusKind, VisualPreferences } from "./tokens.slint";
+
+component ResponsiveHeading {
+    in property <string> text;
+    out property <bool> text-bounds-fit:
+        root.width > 0px
+        && root.height > 0px
+        && heading-text.width > 0px
+        && heading-text.height > 0px
+        && heading-text.preferred-height > 0px
+        && heading-text.height >= heading-text.preferred-height
+        && heading-text.absolute-position.x >= root.absolute-position.x
+        && heading-text.absolute-position.y >= root.absolute-position.y
+        && heading-text.absolute-position.x + heading-text.width
+            <= root.absolute-position.x + root.width + 1px
+        && heading-text.absolute-position.y + heading-text.height
+            <= root.absolute-position.y + root.height + 1px;
+    out property <bool> high-density-wrapped:
+        VisualPreferences.density-scale <= 1.25
+        || heading-text.height > Metrics.type-display + Metrics.line-caption;
+    private property <bool> observed-text-bounds-fit: root.text-bounds-fit;
+    private property <bool> observed-high-density-wrapped: root.high-density-wrapped;
+    callback geometry-changed(bool, bool);
+
+    min-height: heading-text.min-height;
+
+    function report-geometry() {
+        root.geometry-changed(root.text-bounds-fit, root.high-density-wrapped);
+    }
+
+    init => { root.report-geometry(); }
+    changed observed-text-bounds-fit => { root.report-geometry(); }
+    changed observed-high-density-wrapped => { root.report-geometry(); }
+
+    heading-text := Text {
+        text: root.text;
+        color: DesignTokens.text-primary;
+        font-size: Metrics.type-display;
+        font-weight: 850;
+        wrap: word-wrap;
+        accessible-role: text;
+    }
+}
 
 component StepMarker {
     in property <int> number;
@@ -111,8 +153,20 @@ export component FirstRunSurface inherits FocusScope {
     in property <int> stage: 0;
     in property <length> available-width;
     out property <bool> narrow-layout: root.available-width < 860px;
+    private property <length> content-padding:
+        root.narrow-layout ? Metrics.space-4 : Metrics.space-8;
+    private property <length> content-width:
+        max(0px, root.width - 2 * root.content-padding);
+    out property <bool> content-bounds-fit:
+        root.width > 0px
+        && root.height > 0px
+        && root.content-width > 0px
+        && root.content-width + 2 * root.content-padding <= root.width + 1px;
+    private property <bool> observed-content-bounds-fit: root.content-bounds-fit;
 
     callback stage-requested(int);
+    callback heading-geometry-changed(bool, bool);
+    callback content-geometry-changed(bool);
 
     accessible-role: main;
     accessible-label: root.stage == 0
@@ -122,7 +176,13 @@ export component FirstRunSurface inherits FocusScope {
             : @tr("Workspace trust availability"));
 
     // Created on demand, so take focus to keep the Escape shortcut live.
-    init => { root.focus(); }
+    init => {
+        root.focus();
+        root.content-geometry-changed(root.content-bounds-fit);
+    }
+    changed observed-content-bounds-fit => {
+        root.content-geometry-changed(root.content-bounds-fit);
+    }
 
     key-pressed(event) => {
         if (event.text == Key.Escape && root.stage > 0) {
@@ -207,12 +267,12 @@ export component FirstRunSurface inherits FocusScope {
 
             body := VerticalLayout {
                 width: parent.width;
-                padding: root.narrow-layout ? Metrics.space-4 : Metrics.space-8;
+                padding: root.content-padding;
                 spacing: Metrics.space-6;
                 alignment: start;
 
                 Rectangle {
-                    width: min(900px, parent.width);
+                    width: min(900px, root.content-width);
                     horizontal-stretch: 0;
                     min-height: step-row.min-height;
 
@@ -233,7 +293,7 @@ export component FirstRunSurface inherits FocusScope {
                 }
 
                 if (root.stage == 0) : Card {
-                    width: min(900px, parent.width);
+                    width: min(900px, root.content-width);
                     horizontal-stretch: 0;
                     accessible-name: "Welcome";
 
@@ -284,16 +344,18 @@ export component FirstRunSurface inherits FocusScope {
                 }
 
                 if (root.stage == 1) : Card {
-                    width: min(900px, parent.width);
+                    width: min(900px, root.content-width);
                     horizontal-stretch: 0;
                     accessible-name: @tr("Account authorization availability");
 
-                    Text {
+                    ResponsiveHeading {
                         text: @tr("Account authorization isn't available");
-                        color: DesignTokens.text-primary;
-                        font-size: Metrics.type-display;
-                        font-weight: 850;
-                        accessible-role: text;
+                        geometry-changed(text-bounds-fit, high-density-wrapped) => {
+                            root.heading-geometry-changed(
+                                text-bounds-fit,
+                                high-density-wrapped
+                            );
+                        }
                     }
 
                     Text {
@@ -343,16 +405,18 @@ export component FirstRunSurface inherits FocusScope {
                 }
 
                 if (root.stage == 2) : Card {
-                    width: min(900px, parent.width);
+                    width: min(900px, root.content-width);
                     horizontal-stretch: 0;
                     accessible-name: @tr("Workspace trust availability");
 
-                    Text {
+                    ResponsiveHeading {
                         text: @tr("Workspace trust isn't available");
-                        color: DesignTokens.text-primary;
-                        font-size: Metrics.type-display;
-                        font-weight: 850;
-                        accessible-role: text;
+                        geometry-changed(text-bounds-fit, high-density-wrapped) => {
+                            root.heading-geometry-changed(
+                                text-bounds-fit,
+                                high-density-wrapped
+                            );
+                        }
                     }
 
                     Text {

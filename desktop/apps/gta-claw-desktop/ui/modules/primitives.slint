@@ -7,6 +7,33 @@ export enum ButtonTone {
     danger,
 }
 
+export global FocusHistory {
+    in-out property <string> current-control: "";
+    in-out property <string> return-control: "";
+    in-out property <int> restore-generation: 0;
+
+    public function remember(control: string) {
+        if (control != "") {
+            FocusHistory.current-control = control;
+        }
+    }
+
+    public function capture-current() {
+        FocusHistory.return-control = FocusHistory.current-control;
+    }
+
+    public function capture-control(control: string) {
+        if (control != "") {
+            FocusHistory.current-control = control;
+            FocusHistory.return-control = control;
+        }
+    }
+
+    public function restore-captured() {
+        FocusHistory.restore-generation += 1;
+    }
+}
+
 component FocusableClickArea {
     in property <bool> enabled: true;
     out property <bool> has-focus: focus-scope.has-focus;
@@ -47,6 +74,9 @@ component FocusRing inherits Rectangle {
 export component ActionButton {
     in property <string> text: "Action";
     in property <string> accessible-name: root.text;
+    // Optional explicit identity for dynamic or duplicate labels. The primitive
+    // snapshots either this value or its initial accessible name exactly once.
+    in property <string> focus-id: "";
     in property <string> description: "";
     in property <bool> enabled: true;
     in property <bool> checkable: false;
@@ -57,6 +87,9 @@ export component ActionButton {
     callback focus-received;
     callback focus-changed(bool);
     out property <bool> has-focus: interaction.has-focus;
+    out property <bool> content-bounds-fit:
+        content.min-width <= root.width + 1px
+        && content.min-height <= root.height + 1px;
 
     private property <color> base-background: root.tone == ButtonTone.primary
         ? DesignTokens.accent
@@ -64,16 +97,27 @@ export component ActionButton {
     private property <color> foreground: root.tone == ButtonTone.secondary
         ? DesignTokens.text-primary
         : DesignTokens.accent-on;
+    private property <string> stable-focus-id: "";
+    private property <int> observed-restore-generation: FocusHistory.restore-generation;
 
-    min-height: Metrics.control-medium;
+    min-height: max(Metrics.control-medium, content.min-height);
     min-width: max(88px, content.min-width);
     horizontal-stretch: 0;
     vertical-stretch: 0;
     forward-focus: interaction;
+    init => {
+        root.stable-focus-id = root.focus-id == "" ? root.accessible-name : root.focus-id;
+    }
     changed has-focus => {
         root.focus-changed(root.has-focus);
         if (root.has-focus) {
+            FocusHistory.remember(root.stable-focus-id);
             root.focus-received();
+        }
+    }
+    changed observed-restore-generation => {
+        if (root.enabled && FocusHistory.return-control == root.stable-focus-id) {
+            root.focus();
         }
     }
 
@@ -181,21 +225,35 @@ export component Toolbar {
 export component ToolbarIconButton {
     in property <string> glyph: "+";
     in property <string> accessible-name: "Toolbar action";
+    in property <string> focus-id: "";
     in property <bool> enabled: true;
     in property <bool> checkable: false;
     in property <bool> checked: false;
     callback clicked;
     callback focus-received;
+    callback focus-changed(bool);
     out property <bool> has-focus: interaction.has-focus;
+    private property <string> stable-focus-id: "";
+    private property <int> observed-restore-generation: FocusHistory.restore-generation;
 
     width: Metrics.control-medium;
     height: Metrics.control-medium;
     horizontal-stretch: 0;
     vertical-stretch: 0;
     forward-focus: interaction;
+    init => {
+        root.stable-focus-id = root.focus-id == "" ? root.accessible-name : root.focus-id;
+    }
     changed has-focus => {
+        root.focus-changed(root.has-focus);
         if (root.has-focus) {
+            FocusHistory.remember(root.stable-focus-id);
             root.focus-received();
+        }
+    }
+    changed observed-restore-generation => {
+        if (root.enabled && FocusHistory.return-control == root.stable-focus-id) {
+            root.focus();
         }
     }
 
@@ -254,17 +312,31 @@ export component NavigationItem {
     in property <string> text: "Destination";
     in property <string> detail: "";
     in property <string> accessible-name: root.detail == "" ? root.text : root.text + ", " + root.detail;
+    in property <string> focus-id: "";
     in property <bool> selected: false;
     in property <bool> enabled: true;
     callback clicked;
     callback focus-received;
+    callback focus-changed(bool);
     out property <bool> has-focus: interaction.has-focus;
+    private property <string> stable-focus-id: "";
+    private property <int> observed-restore-generation: FocusHistory.restore-generation;
 
     min-height: max(Metrics.control-large, content.min-height);
     forward-focus: interaction;
+    init => {
+        root.stable-focus-id = root.focus-id == "" ? root.accessible-name : root.focus-id;
+    }
     changed has-focus => {
+        root.focus-changed(root.has-focus);
         if (root.has-focus) {
+            FocusHistory.remember(root.stable-focus-id);
             root.focus-received();
+        }
+    }
+    changed observed-restore-generation => {
+        if (root.enabled && FocusHistory.return-control == root.stable-focus-id) {
+            root.focus();
         }
     }
 
@@ -362,6 +434,7 @@ export component NavigationItem {
 export component TextField {
     in property <string> label: "";
     in property <string> accessible-name: root.label;
+    in property <string> focus-id: "";
     in-out property <string> text <=> field.text;
     in property <string> placeholder: "";
     in property <InputType> input-type: InputType.text;
@@ -373,11 +446,26 @@ export component TextField {
     callback edited(string);
     callback accepted;
     callback vertical-navigation-requested(int);
+    callback focus-changed(bool);
+    private property <string> stable-focus-id: "";
+    private property <int> observed-restore-generation: FocusHistory.restore-generation;
 
     min-width: 180px;
     min-height: field.min-height + (root.label == "" ? 0px : Metrics.line-caption + Metrics.space-1);
     forward-focus: field;
+    changed has-focus => {
+        root.focus-changed(root.has-focus);
+        if (root.has-focus) {
+            FocusHistory.remember(root.stable-focus-id);
+        }
+    }
+    changed observed-restore-generation => {
+        if (root.enabled && FocusHistory.return-control == root.stable-focus-id) {
+            root.focus();
+        }
+    }
     init => {
+        root.stable-focus-id = root.focus-id == "" ? root.accessible-name : root.focus-id;
         if (root.focus-on-init) {
             field.focus();
         }
@@ -744,8 +832,11 @@ export component StatusBadge {
         : (root.kind == StatusKind.warning
             ? DesignTokens.warning-surface
             : (root.kind == StatusKind.danger ? DesignTokens.danger-surface : (root.kind == StatusKind.info ? DesignTokens.info-surface : DesignTokens.surface-subtle)));
+    out property <bool> content-bounds-fit:
+        content.min-width <= root.width + 1px
+        && content.min-height <= root.height + 1px;
 
-    min-height: Metrics.control-small;
+    min-height: max(Metrics.control-small, content.min-height);
     min-width: content.min-width;
     horizontal-stretch: 0;
     vertical-stretch: 0;
@@ -906,8 +997,11 @@ export component ModalSheetShell {
     min-width: 0px;
     min-height: 0px;
     forward-focus: dialog-focus;
-    accessible-role: region;
+    // Slint 1.17 has no dialog role. A labeled group plus an isolated
+    // accessibility tree provides the modal semantics available in this ABI.
+    accessible-role: groupbox;
     accessible-label: root.title;
+    accessible-description: "Modal dialog. Background content is unavailable until this closes.";
 
     dialog-focus := FocusScope {
         width: 100%;
@@ -949,6 +1043,7 @@ export component ModalSheetShell {
 
         sheet-pointer-guard := TouchArea {
             clicked => { }
+            scroll-event(event) => { return accept; }
         }
 
         VerticalLayout {

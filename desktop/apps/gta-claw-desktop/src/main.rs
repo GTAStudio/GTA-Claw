@@ -43,7 +43,7 @@ use product_state::{
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use slint::{CloseRequestResponse, ComponentHandle, Model};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use ui_adapter::{UiTheme, VisualPreferencesState};
+use ui_adapter::{PreferenceLifetime, UiTheme, VisualPreferencesState};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use ui_models::{ProductModels, reconcile};
 
@@ -61,6 +61,11 @@ use generated_ui::{
     ActivityItem, AppWindow, DeliverableItem, DiffItem, ExtensionItem, FileItem, RunItem,
     ScheduleItem, StatusKind, ThemeMode, TranscriptItem, VisualPreferences, WorkspaceItem,
 };
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const fn retain_explicit_preview(currently_open: bool, diagnostic_ready: bool) -> bool {
+    currently_open && diagnostic_ready
+}
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn apply_snapshot(window: &AppWindow, snapshot: &ViewSnapshot) {
@@ -82,7 +87,16 @@ fn apply_snapshot(window: &AppWindow, snapshot: &ViewSnapshot) {
     window.set_can_cancel(snapshot.can_cancel());
     window.set_can_disconnect(snapshot.can_disconnect());
     window.set_can_retry(snapshot.can_retry());
-    window.set_workspace_ready(snapshot.can_disconnect());
+    window.set_product_preview_open(retain_explicit_preview(
+        window.get_product_preview_open(),
+        snapshot.can_disconnect(),
+    ));
+    if !snapshot.can_disconnect() {
+        window.set_palette_open(false);
+    }
+    if snapshot.reset_consent() {
+        window.set_consent_checked(false);
+    }
     if let Some(error) = snapshot.error() {
         apply_error(window, error);
     } else {
@@ -127,6 +141,7 @@ fn apply_product_state(window: &AppWindow, models: &ProductModels, state: &Produ
         i32::try_from(state.selected_settings_section()).unwrap_or(i32::MAX),
     );
     window.set_palette_open(state.palette_open());
+    window.set_product_interactions_enabled(state.interactions_enabled());
     window.set_diff_mode(match state.diff_mode() {
         DiffMode::Unified => 0,
         DiffMode::SideBySide => 1,
@@ -142,6 +157,13 @@ fn apply_product_state(window: &AppWindow, models: &ProductModels, state: &Produ
     window.set_approval_prompt(state.approval_prompt().into());
     window.set_approval_scope(state.approval_scope().into());
     window.set_question(state.question().into());
+    let dashboard = state.dashboard_counts();
+    window.set_dashboard_awaiting_review(
+        i32::try_from(dashboard.awaiting_review).unwrap_or(i32::MAX),
+    );
+    window.set_dashboard_running(i32::try_from(dashboard.running).unwrap_or(i32::MAX));
+    window.set_dashboard_blocked(i32::try_from(dashboard.blocked).unwrap_or(i32::MAX));
+    window.set_dashboard_workspaces(i32::try_from(dashboard.workspaces).unwrap_or(i32::MAX));
 
     reconcile(
         models.runs(),
@@ -163,7 +185,8 @@ fn apply_product_state(window: &AppWindow, models: &ProductModels, state: &Produ
             location: workspace.location.as_str().into(),
             kind: workspace.kind.as_str().into(),
             branch: workspace.branch.as_str().into(),
-            active_runs: i32::try_from(workspace.active_runs).unwrap_or(i32::MAX),
+            active_runs: i32::try_from(state.workspace_active_runs(&workspace.name))
+                .unwrap_or(i32::MAX),
         }),
     );
 
@@ -174,7 +197,9 @@ fn apply_product_state(window: &AppWindow, models: &ProductModels, state: &Produ
             cadence: schedule.cadence.as_str().into(),
             next_run: schedule.next_run.as_str().into(),
             enabled: schedule.enabled,
-            can_toggle: schedule.enabled || schedule.next_run != "Not scheduled",
+            configured: schedule.is_configured(),
+            state: schedule.state_label().into(),
+            can_toggle: state.interactions_enabled() && schedule.is_configured(),
             workspace: schedule.workspace.as_str().into(),
         }),
     );
@@ -348,6 +373,9 @@ fn mutate_product(
     view: &ProductView,
     update: impl FnOnce(&mut ProductState),
 ) {
+    if view.state.borrow().palette_open() {
+        return;
+    }
     update(&mut view.state.borrow_mut());
     if let Some(window) = weak_window.upgrade() {
         view.apply(&window);
@@ -401,6 +429,10 @@ const fn status_kind(kind: UiStatusKind) -> StatusKind {
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn apply_preferences(window: &AppWindow, preferences: VisualPreferencesState) {
+    debug_assert_eq!(preferences.lifetime(), PreferenceLifetime::SessionOnly);
+    window
+        .global::<VisualPreferences>()
+        .set_theme_override_active(preferences.theme_override_active());
     window.set_theme_mode(match preferences.theme() {
         UiTheme::Light => ThemeMode::Light,
         UiTheme::Dark => ThemeMode::Dark,
@@ -480,6 +512,43 @@ fn wire_callbacks(
     });
 
     let weak_window = window.as_weak();
+    let view = Rc::clone(product_view);
+    window.on_preview_requested(move || {
+        if let Some(window) = weak_window.upgrade() {
+            if !window.get_can_disconnect() {
+                apply_error(
+                    &window,
+                    &UserError::input(
+                        "preview.diagnostic-required",
+                        "The read-only product preview requires a completed Gateway diagnostic.",
+                        "Finish the diagnostic, then choose Preview explicitly.",
+                    ),
+                );
+                return;
+            }
+            view.state.borrow_mut().close_palette();
+            view.palette.borrow_mut().reset();
+            window.set_palette_query(slint::SharedString::default());
+            window.set_palette_focused_command_index(-1);
+            window.set_product_preview_open(true);
+            view.apply(&window);
+        }
+    });
+
+    let weak_window = window.as_weak();
+    let view = Rc::clone(product_view);
+    window.on_preview_dismiss_requested(move || {
+        if let Some(window) = weak_window.upgrade() {
+            view.state.borrow_mut().close_palette();
+            view.palette.borrow_mut().reset();
+            window.set_palette_open(false);
+            window.set_palette_query(slint::SharedString::default());
+            window.set_palette_focused_command_index(-1);
+            window.set_product_preview_open(false);
+        }
+    });
+
+    let weak_window = window.as_weak();
     let callback_sender = sender.clone();
     window.on_cancel_requested(move || {
         apply_command_result(&weak_window, callback_sender.cancel());
@@ -488,7 +557,14 @@ fn wire_callbacks(
     let weak_window = window.as_weak();
     let callback_sender = sender.clone();
     window.on_disconnect_requested(move || {
-        apply_command_result(&weak_window, callback_sender.disconnect());
+        let result = callback_sender.disconnect();
+        if result.is_ok()
+            && let Some(window) = weak_window.upgrade()
+        {
+            window.set_palette_open(false);
+            window.set_product_preview_open(false);
+        }
+        apply_command_result(&weak_window, result);
     });
 
     let weak_window = window.as_weak();
@@ -502,7 +578,20 @@ fn wire_callbacks(
     let weak_window = window.as_weak();
     let callback_preferences = Rc::clone(&preferences);
     visual_preferences.on_theme_mode_requested(move |theme| {
-        callback_preferences.borrow_mut().set_theme(match theme {
+        callback_preferences.borrow_mut().set_theme_override(match theme {
+            ThemeMode::Light => UiTheme::Light,
+            ThemeMode::Dark => UiTheme::Dark,
+        });
+        if let Some(window) = weak_window.upgrade() {
+            apply_preferences(&window, *callback_preferences.borrow());
+        }
+    });
+
+    let visual_preferences = window.global::<VisualPreferences>();
+    let weak_window = window.as_weak();
+    let callback_preferences = Rc::clone(&preferences);
+    visual_preferences.on_follow_system_theme_requested(move |theme| {
+        callback_preferences.borrow_mut().follow_system_theme(match theme {
             ThemeMode::Light => UiTheme::Light,
             ThemeMode::Dark => UiTheme::Dark,
         });
@@ -572,6 +661,7 @@ fn wire_callbacks(
             if opening {
                 window.set_palette_query(slint::SharedString::default());
             }
+            window.set_palette_focused_command_index(-1);
             view.apply(&window);
         }
     });
@@ -579,7 +669,11 @@ fn wire_callbacks(
     let weak_window = window.as_weak();
     let view = Rc::clone(product_view);
     window.on_palette_dismiss_requested(move || {
-        mutate_product(&weak_window, &view, ProductState::close_palette);
+        if let Some(window) = weak_window.upgrade() {
+            view.state.borrow_mut().close_palette();
+            window.set_palette_focused_command_index(-1);
+            view.apply(&window);
+        }
     });
 
     let weak_window = window.as_weak();
@@ -602,6 +696,15 @@ fn wire_callbacks(
 
     let weak_window = window.as_weak();
     let view = Rc::clone(product_view);
+    window.on_palette_selection_index_requested(move |index| {
+        let changed = view.palette.borrow_mut().select_ui_focus_index(index);
+        if changed && let Some(window) = weak_window.upgrade() {
+            view.apply_palette(&window);
+        }
+    });
+
+    let weak_window = window.as_weak();
+    let view = Rc::clone(product_view);
     window.on_palette_command_requested(move |action_id| {
         let action = PaletteAction::from_id(action_id)
             .expect("Slint palette commands must use a catalog action");
@@ -609,6 +712,7 @@ fn wire_callbacks(
         apply_palette_action(&mut view.state.borrow_mut(), action);
         if let Some(window) = weak_window.upgrade() {
             window.set_palette_query(slint::SharedString::default());
+            window.set_palette_focused_command_index(-1);
             view.apply(&window);
         }
     });
@@ -712,7 +816,7 @@ fn wire_callbacks(
                     "Approval decision rejected",
                     error.to_string(),
                 ),
-            }
+            };
         });
     });
 
@@ -733,12 +837,14 @@ fn wire_callbacks(
                         format!("The run moved to {run_state}."),
                     );
                 }
-                Err(error) => product.record_message(
-                    TranscriptRole::System,
-                    "Answer rejected",
-                    error.to_string(),
-                ),
-            }
+                Err(error) => {
+                    product.record_message(
+                        TranscriptRole::System,
+                        "Answer rejected",
+                        error.to_string(),
+                    );
+                }
+            };
         });
     });
 
@@ -766,7 +872,9 @@ fn wire_callbacks(
     let weak_window = window.as_weak();
     let view = Rc::clone(product_view);
     window.on_schedule_create_requested(move || {
-        mutate_product(&weak_window, &view, ProductState::create_schedule);
+        mutate_product(&weak_window, &view, |product| {
+            product.create_schedule();
+        });
     });
 
     let weak_window = window.as_weak();
@@ -879,7 +987,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::onboarding::OnboardingModel;
+    use crate::onboarding::{AttemptUpdate, OnboardingModel};
     #[cfg(target_os = "windows")]
     use crate::onboarding::OnboardingPhase;
 
@@ -897,7 +1005,133 @@ mod tests {
         let product_view =
             Rc::new(ProductView::attach(window, initial_product).expect("valid command catalog"));
         product_view.apply(window);
+        assert!(!window.get_product_preview_open());
+        assert!(!window.get_product_interactions_enabled());
+        assert_eq!(window.get_dashboard_awaiting_review(), 10);
+        assert_eq!(window.get_dashboard_running(), 10);
+        assert_eq!(window.get_dashboard_blocked(), 10);
+        assert_eq!(window.get_dashboard_workspaces(), 3);
+        let paused_schedule = window
+            .get_schedules()
+            .row_data(2)
+            .expect("preview includes configured paused schedule");
+        assert!(!paused_schedule.enabled);
+        assert!(paused_schedule.configured);
+        assert_eq!(paused_schedule.state, "Paused");
+        assert!(
+            !paused_schedule.can_toggle,
+            "preview action lock disables mutation without changing paused semantics"
+        );
+
+        let mut retained_identity = OnboardingModel::default();
+        let retained_generation =
+            retained_identity.begin("ws://localhost:18789/".to_owned());
+        assert!(retained_identity.apply(
+            retained_generation,
+            AttemptUpdate::IdentityCreated("session-device".to_owned())
+        ));
+        assert!(retained_identity.apply(
+            retained_generation,
+            AttemptUpdate::Failed(UserError::input(
+                "test.retry",
+                "Retry remains available.",
+                "Retry with the same identity.",
+            ))
+        ));
+        window.set_consent_checked(true);
+        apply_snapshot(window, &retained_identity.take_snapshot());
+        assert!(window.get_consent_checked());
+
+        let discarded_generation = retained_identity.start_disconnect();
+        assert!(retained_identity.finish_disconnect(discarded_generation));
+        apply_snapshot(window, &retained_identity.take_snapshot());
+        assert!(!window.get_consent_checked());
+        window.set_consent_checked(true);
+        retained_identity.reject_submission(
+            None,
+            UserError::input(
+                "test.invalid-endpoint",
+                "The rechecked submission is invalid.",
+                "Correct the address and retry.",
+            ),
+        );
+        apply_snapshot(window, &retained_identity.take_snapshot());
+        assert!(
+            window.get_consent_checked(),
+            "a later invalid submission must not replay a consumed consent reset"
+        );
+
         wire_callbacks(window, sender, preferences, &product_view);
+        window
+            .global::<VisualPreferences>()
+            .invoke_density_scale_requested(f32::NAN);
+        assert!(window.get_density_scale().is_finite());
+        assert_eq!(window.get_density_scale().to_bits(), 1.0_f32.to_bits());
+        window
+            .global::<VisualPreferences>()
+            .invoke_density_scale_requested(f32::INFINITY);
+        assert_eq!(window.get_density_scale().to_bits(), 2.0_f32.to_bits());
+        window
+            .global::<VisualPreferences>()
+            .invoke_density_scale_requested(1.0);
+        let selected_palette_index = window.get_palette_selected_index();
+        for invalid_index in [-1, i32::MIN, 10, 999, i32::MAX] {
+            window.invoke_palette_selection_index_requested(invalid_index);
+            assert_eq!(
+                window.get_palette_selected_index(),
+                selected_palette_index,
+                "invalid or stale palette focus input must be ignored"
+            );
+        }
+        window.invoke_palette_toggle_requested();
+        assert!(window.get_palette_open());
+        let modal_state = product_view.state.borrow().clone();
+        window.invoke_navigate_requested(1);
+        window.invoke_open_session_requested(0);
+        window.invoke_open_workspace_requested(0);
+        window.invoke_settings_section_requested(3);
+        window.invoke_update_requested();
+        window.invoke_diagnostics_requested();
+        window.invoke_back_requested();
+        window.invoke_diff_mode_requested(1);
+        window.invoke_next_run_page_requested();
+        window.invoke_previous_run_page_requested();
+        window.invoke_approval_requested(true);
+        window.invoke_answer_requested("Pause run".into());
+        window.invoke_message_submitted("blocked modal message".into());
+        window.invoke_file_selected(1);
+        window.invoke_schedule_create_requested();
+        window.invoke_schedule_toggled(0);
+        window.invoke_extension_toggled(0);
+        window.invoke_deliverable_selected(1);
+        window.invoke_deliverable_pin_toggle_requested();
+        assert_eq!(
+            &*product_view.state.borrow(),
+            &modal_state,
+            "modal palette must reject background accessibility actions"
+        );
+        window.invoke_palette_dismiss_requested();
+        assert!(!window.get_palette_open());
+        let preview_before_actions = product_view.state.borrow().clone();
+        window.invoke_approval_requested(true);
+        window.invoke_answer_requested("Continue".into());
+        window.invoke_message_submitted("must not be recorded".into());
+        window.invoke_schedule_create_requested();
+        window.invoke_schedule_toggled(0);
+        window.invoke_extension_toggled(0);
+        window.invoke_deliverable_pin_toggle_requested();
+        assert_eq!(
+            &*product_view.state.borrow(),
+            &preview_before_actions,
+            "backend-shaped callbacks must not mutate read-only preview data"
+        );
+
+        window.set_can_disconnect(true);
+        window.invoke_preview_requested();
+        assert!(window.get_product_preview_open());
+        window.invoke_preview_dismiss_requested();
+        assert!(!window.get_product_preview_open());
+        window.set_can_disconnect(false);
 
         window.set_layout_width(1080.0);
         assert!(!window.get_narrow_layout());
@@ -1088,8 +1322,12 @@ mod tests {
     fn secure_accessibility_keyboard_and_modal_contracts_are_explicit() {
         let app = include_str!("../ui/app-window.slint");
         let onboarding = include_str!("../ui/modules/gateway-onboarding.slint");
+        let first_run = include_str!("../ui/modules/first-run.slint");
         let primitives = include_str!("../ui/modules/primitives.slint");
         let product_shell = include_str!("../ui/modules/product-shell.slint");
+        let product_state = include_str!("product_state.rs");
+        let main = include_str!("main.rs");
+        let tokens = include_str!("../ui/modules/tokens.slint");
         let build = include_str!("../build.rs");
         let generated = include_str!(concat!(env!("OUT_DIR"), "/app-window.rs"));
 
@@ -1150,19 +1388,119 @@ mod tests {
         assert!(primitives.contains("after-focus-boundary := FocusScope"));
         assert!(primitives.contains("sheet-pointer-guard := TouchArea"));
         assert!(app.contains("out property <[CommandItem]> command-catalog"));
-        assert!(app.contains("title: @tr(\"Go to Focus\")"));
+        assert!(app.contains("title: @tr(\"Go to Preview Focus\")"));
         assert!(product_shell.contains("accessible-name: @tr(\"Search commands\")"));
         assert!(product_shell.contains("accessible-role: list-item"));
         assert!(product_shell.contains("accessible-role: search"));
         assert!(product_shell.contains("event.text == Key.UpArrow"));
         assert!(app.contains("application-focus := FocusScope"));
         assert!(app.contains("event.modifiers.meta"));
-        assert!(app.contains("changed observed-palette-open"));
+        assert!(app.contains("if (root.palette-open)"));
+        assert!(app.contains("FocusHistory.capture-current()"));
+        assert!(app.contains("changed observed-selected-screen => { self.focus(); }"));
+        assert!(product_shell.contains("changed palette-open"));
+        assert!(product_shell.contains("visible: !root.palette-open"));
+        assert!(product_shell.contains("enabled: !root.palette-open"));
+        assert!(product_shell.contains("scroll-event(event) => { return accept; }"));
+        assert!(product_shell.contains(
+            "accessible-role: root.palette-open ? AccessibleRole.none : AccessibleRole.region"
+        ));
+        assert!(primitives.contains("accessible-role: groupbox"));
+        assert!(primitives.contains("Modal dialog. Background content is unavailable"));
+        assert!(primitives.contains("export global FocusHistory"));
+        assert!(primitives.contains("public function restore-captured()"));
+        assert!(primitives.contains("public function capture-control(control: string)"));
+        assert!(primitives.contains("in property <string> focus-id: \"\""));
+        assert!(primitives.contains("private property <string> stable-focus-id: \"\""));
+        assert!(primitives.contains(
+            "root.stable-focus-id = root.focus-id == \"\" ? root.accessible-name : root.focus-id"
+        ));
+        assert!(primitives.contains("FocusHistory.remember(root.stable-focus-id)"));
+        assert!(primitives.contains("out property <bool> content-bounds-fit"));
+        assert!(primitives.contains("min-height: max(Metrics.control-medium, content.min-height)"));
+        assert!(product_shell.contains("selection-index-requested(index)"));
+        assert!(product_shell.contains("focus-when-selected"));
+        assert!(product_shell.contains(
+            "FocusHistory.capture-control(palette-button.focus-id)"
+        ));
+        assert!(product_shell.contains("focus-id: \"settings.appearance.contrast\""));
+        assert!(product_shell.contains("FocusHistory.restore-captured()"));
         assert!(product_shell.contains("width: max(0px, min(680px"));
         assert!(product_shell.contains("focus-received =>"));
         assert!(product_shell.contains("viewport-y"));
         assert!(primitives.contains("in property <bool> focus-on-init"));
         assert!(primitives.contains("intercept-vertical-navigation"));
+        assert!(tokens.contains("private property <float> geometry-density"));
+        assert!(tokens.contains("min(Metrics.density, 1.4)"));
+        assert!(first_run.contains("private property <length> content-width"));
+        assert!(first_run.contains("width: min(900px, root.content-width)"));
+        assert!(!first_run.contains("width: min(900px, parent.width)"));
+        assert!(first_run.contains("heading-text.preferred-height"));
+        assert!(onboarding.contains("summary-grid := GridLayout"));
+        assert!(onboarding.contains("row: root.stacked ? 1 : 0"));
+        assert!(onboarding.contains("out property <bool> text-bounds-fit"));
+        assert!(onboarding.contains("label-text.preferred-height"));
+        assert!(onboarding.contains("value-text.preferred-height"));
+        assert!(onboarding.contains("summary-geometry-changed(bool, bool)"));
+        assert!(!onboarding.contains("width: 112px"));
+        assert!(product_shell.contains("component ApprovalPrompt"));
+        assert!(product_shell.contains(
+            "callback geometry-changed(bool, bool, bool, bool)"
+        ));
+        assert!(product_shell.contains("out property <bool> controls-no-overlap"));
+        assert!(product_shell.contains("deny-button.content-bounds-fit"));
+        assert!(product_shell.contains("approve-button.content-bounds-fit"));
+        assert!(product_shell.contains("row: root.stacked ? 2 : 0"));
+        assert!(!product_shell.contains("HorizontalLayout {\n                        spacing: Metrics.space-3;\n                        VerticalLayout {\n                            spacing: Metrics.space-1;\n                            Text { text: \"Sample approval prompt\""));
+        assert!(product_shell.contains("component QuestionPrompt"));
+        assert!(product_shell.contains("question-text := Text"));
+        assert!(product_shell.contains("wrap: word-wrap"));
+        assert!(product_shell.contains("focus-id: \"session.question.continue\""));
+        assert!(product_shell.contains("focus-id: \"session.question.pause\""));
+        assert!(product_shell.contains("root.question-geometry-changed("));
+        assert!(!product_shell.contains("Text { text: root.question; color: DesignTokens.text-primary; font-size: Metrics.type-small; accessible-role: text; }"));
+        assert!(product_shell.contains("configured: bool"));
+        assert!(product_shell.contains("state: string"));
+        assert!(product_shell.contains("badge: schedule.state"));
+        assert!(product_state.contains("pub(crate) configured: bool"));
+        assert!(!product_state.contains("next_run != \"Not scheduled\""));
+        assert!(!product_state.contains("next_run == \"Not scheduled\""));
+        assert!(!product_state.contains("pub(crate) active_runs"));
+        assert!(main.contains("state.workspace_active_runs(&workspace.name)"));
+        assert!(main.contains("select_ui_focus_index(index)"));
+        assert!(main.contains("if view.state.borrow().palette_open()"));
+        assert!(!main.contains("Slint palette selection indexes must be non-negative"));
+        assert!(!product_shell.contains(
+            "text: schedule.enabled ? \"Enabled\" : (schedule.can-toggle ? \"Paused\" : \"Draft\")"
+        ));
+        assert!(product_shell.contains("component PreviewCard"));
+        assert!(product_shell.contains("out property <bool> icon-bounds-fit"));
+        assert!(product_shell.contains("out property <bool> button-bounds-fit"));
+        assert!(product_shell.contains("card-action.content-bounds-fit"));
+        assert!(product_shell.contains("for workspace[index] in root.workspaces : PreviewCard"));
+        assert!(product_shell.contains("for schedule[index] in root.schedules : PreviewCard"));
+        assert!(product_shell.contains("for extension[index] in root.extensions : PreviewCard"));
+        assert!(product_shell.contains("workspace-card-geometry-changed("));
+        assert!(product_shell.contains("schedule-card-geometry-changed("));
+        assert!(product_shell.contains("extension-card-geometry-changed("));
+        assert!(product_shell.contains("badge-bounds-fit"));
+        assert!(product_shell.contains("workspace-card-geometry-changed(int,"));
+        assert!(product_shell.contains("application-title-min-width"));
+        assert!(product_shell.contains("application-title.preferred-width"));
+        assert!(product_shell.contains("if (!root.compact-navigation) : ToolbarIconButton"));
+        assert!(product_shell.contains("compact-rail-width"));
+        assert!(product_shell.contains("settings-rail.width >= root.compact-rail-width"));
+        assert!(product_shell.contains("in property <bool> session-narrow-layout"));
+        assert!(product_shell.contains("narrow: root.session-narrow-layout"));
+        assert!(product_shell.contains("focus-reveal-requested(length, length)"));
+        assert!(product_shell.contains("root.reveal-focused-control(item-y, item-height)"));
+        assert!(product_shell.contains("focused-run-visibility-changed(bool)"));
+        assert!(product_shell.contains("preferred-height"));
+        assert!(!product_shell.contains(".width >= title-text.min-width"));
+        assert!(product_shell.contains("component SessionHeader"));
+        assert!(product_shell.contains("callback session-header-geometry-changed("));
+        assert!(product_shell.contains("state-badge.content-bounds-fit"));
+        assert!(product_shell.contains("header-copy.absolute-position"));
         assert!(
             primitives.contains("if (root.enabled) {\n                    touch-area.clicked();")
         );
@@ -1181,6 +1519,7 @@ mod tests {
         let onboarding = include_str!("../ui/modules/gateway-onboarding.slint");
         let product_shell = include_str!("../ui/modules/product-shell.slint");
         let product_state = include_str!("product_state.rs");
+        let main = include_str!("main.rs");
         let progress = include_str!("../../../../docs/PROGRESS.md");
 
         for invented_claim in [
@@ -1204,8 +1543,23 @@ mod tests {
 
         assert!(first_run.contains("@tr(\"Account authorization isn't available\")"));
         assert!(first_run.contains("@tr(\"Workspace trust isn't available\")"));
+        assert!(first_run.contains("component ResponsiveHeading"));
+        assert!(first_run.contains("wrap: word-wrap"));
+        assert!(first_run.contains("callback heading-geometry-changed(bool, bool)"));
         assert!(onboarding.contains("@tr(\"Desktop device authorization is not composed."));
         assert!(product_state.contains("\"No trusted path loaded\""));
+        assert!(app.contains("product-preview-open"));
+        assert!(!app.contains("workspace-ready"));
+        assert!(onboarding.contains("optional product preview is read-only sample data"));
+        assert!(product_shell.contains("GTA Claw read-only product preview"));
+        assert!(product_shell.contains("No live or historical runs are loaded."));
+        assert!(product_shell.contains("Creation unavailable"));
+        assert!(product_shell.contains("enabled: root.interactions-enabled"));
+        assert!(product_shell.contains("Appearance preferences reset when this application closes"));
+        assert!(!product_shell.contains("Native workspace"));
+        assert!(!product_shell.contains("MetricCard { value: \"3\""));
+        assert!(!product_shell.contains("MetricCard { value: \"7\""));
+        assert!(!main.contains("set_product_preview_open(snapshot.can_disconnect())"));
         assert!(app.contains("gateway-status-text: root.status-text"));
         assert!(product_shell.contains("@tr(\"In-app updates are not available\")"));
         assert!(product_shell.contains("@tr(\"Diagnostic coverage\")"));
@@ -1243,5 +1597,22 @@ mod tests {
         assert_eq!(state.surface().screen_index(), 6);
         assert_eq!(state.selected_settings_section(), 5);
         assert!(!state.palette_open());
+    }
+
+    #[test]
+    fn diagnostic_readiness_retains_only_an_explicit_preview() {
+        assert!(!retain_explicit_preview(false, false));
+        assert!(!retain_explicit_preview(false, true));
+        assert!(!retain_explicit_preview(true, false));
+        assert!(retain_explicit_preview(true, true));
+    }
+
+    #[test]
+    fn controller_to_slint_handoff_and_callbacks_keep_weak_ui_handles() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("weak_window.upgrade_in_event_loop"));
+        assert!(source.matches("let weak_window = window.as_weak();").count() >= 20);
+        assert!(!source.contains("Rc<AppWindow>"));
+        assert!(!source.contains("Arc<AppWindow>"));
     }
 }

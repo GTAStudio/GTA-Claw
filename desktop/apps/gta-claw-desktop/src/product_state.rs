@@ -3,6 +3,8 @@ use std::fmt::{self, Display, Formatter};
 
 /// Upper bound on the per-run history a session keeps in memory and renders.
 const MAX_SESSION_HISTORY: usize = 200;
+/// Defensive cap for the schedule model even after a real editor is composed.
+const MAX_SCHEDULES: usize = 64;
 
 pub(crate) const PRIMARY_DESTINATIONS: [PrimaryDestination; 7] = [
     PrimaryDestination::Focus,
@@ -177,6 +179,18 @@ impl RunState {
             Self::Failed | Self::Cancelled | Self::Completed | Self::CompletedWithChanges
         )
     }
+
+    pub(crate) const fn counts_as_active(self) -> bool {
+        matches!(
+            self,
+            Self::Queued
+                | Self::Starting
+                | Self::Running
+                | Self::WaitingForApproval
+                | Self::WaitingForAnswer
+                | Self::Blocked
+        )
+    }
 }
 
 impl Display for RunState {
@@ -268,6 +282,23 @@ impl Display for InvalidRunTransition {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProductActionError {
+    PreviewReadOnly,
+    InvalidTransition(InvalidRunTransition),
+}
+
+impl Display for ProductActionError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PreviewReadOnly => {
+                formatter.write_str("product actions are unavailable in the read-only preview")
+            }
+            Self::InvalidTransition(error) => Display::fmt(error, formatter),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RunSummary {
     pub(crate) id: String,
@@ -284,7 +315,14 @@ pub(crate) struct WorkspaceSummary {
     pub(crate) location: String,
     pub(crate) kind: String,
     pub(crate) branch: String,
-    pub(crate) active_runs: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DashboardCounts {
+    pub(crate) awaiting_review: usize,
+    pub(crate) running: usize,
+    pub(crate) blocked: usize,
+    pub(crate) workspaces: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -292,8 +330,25 @@ pub(crate) struct ScheduleSummary {
     pub(crate) name: String,
     pub(crate) cadence: String,
     pub(crate) next_run: String,
+    pub(crate) configured: bool,
     pub(crate) enabled: bool,
     pub(crate) workspace: String,
+}
+
+impl ScheduleSummary {
+    pub(crate) const fn is_configured(&self) -> bool {
+        self.configured
+    }
+
+    pub(crate) fn state_label(&self) -> &'static str {
+        if self.enabled {
+            "Enabled"
+        } else if self.is_configured() {
+            "Paused"
+        } else {
+            "Draft"
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -540,6 +595,7 @@ pub(crate) struct ProductState {
     palette_open: bool,
     diff_mode: DiffMode,
     selected_settings_section: usize,
+    interactions_enabled: bool,
     runs: PagedModel<RunSummary>,
     workspaces: Vec<WorkspaceSummary>,
     schedules: Vec<ScheduleSummary>,
@@ -551,6 +607,7 @@ pub(crate) struct ProductState {
 impl Default for ProductState {
     fn default() -> Self {
         let runs = demo_runs();
+        let workspaces = demo_workspaces();
         let selected_run = runs
             .iter()
             .find(|run| run.state == RunState::WaitingForApproval)
@@ -569,8 +626,9 @@ impl Default for ProductState {
             palette_open: false,
             diff_mode: DiffMode::Unified,
             selected_settings_section: 0,
+            interactions_enabled: false,
             runs: PagedModel::new(runs, 24),
-            workspaces: demo_workspaces(),
+            workspaces,
             schedules: demo_schedules(),
             deliverables: demo_deliverables(),
             extensions: demo_extensions(),
@@ -600,6 +658,34 @@ impl ProductState {
         self.selected_settings_section
     }
 
+    pub(crate) const fn interactions_enabled(&self) -> bool {
+        self.interactions_enabled
+    }
+
+    pub(crate) fn dashboard_counts(&self) -> DashboardCounts {
+        DashboardCounts {
+            awaiting_review: self
+                .runs
+                .rows
+                .iter()
+                .filter(|run| run.state == RunState::WaitingForApproval)
+                .count(),
+            running: self
+                .runs
+                .rows
+                .iter()
+                .filter(|run| run.state == RunState::Running)
+                .count(),
+            blocked: self
+                .runs
+                .rows
+                .iter()
+                .filter(|run| run.state == RunState::Blocked)
+                .count(),
+            workspaces: self.workspaces.len(),
+        }
+    }
+
     pub(crate) const fn runs(&self) -> &PagedModel<RunSummary> {
         &self.runs
     }
@@ -612,8 +698,19 @@ impl ProductState {
         &self.workspaces
     }
 
+    pub(crate) fn workspace_active_runs(&self, workspace: &str) -> u32 {
+        u32::try_from(
+            self.runs
+                .rows
+                .iter()
+                .filter(|run| run.workspace == workspace && run.state.counts_as_active())
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
     pub(crate) fn schedules(&self) -> &[ScheduleSummary] {
-        &self.schedules
+        &self.schedules[..self.schedules.len().min(MAX_SCHEDULES)]
     }
 
     pub(crate) fn deliverables(&self) -> &[DeliverableSummary] {
@@ -756,29 +853,46 @@ impl ProductState {
         self.selected_settings_section = index.min(7);
     }
 
-    pub(crate) fn toggle_schedule(&mut self, index: usize) {
+    pub(crate) fn toggle_schedule(&mut self, index: usize) -> bool {
+        if !self.interactions_enabled {
+            return false;
+        }
         if let Some(schedule) = self.schedules.get_mut(index) {
-            if !schedule.enabled && schedule.next_run == "Not scheduled" {
-                return;
+            if !schedule.configured {
+                return false;
             }
             schedule.enabled = !schedule.enabled;
+            true
+        } else {
+            false
         }
     }
 
-    pub(crate) fn create_schedule(&mut self) {
+    pub(crate) fn create_schedule(&mut self) -> bool {
+        if !self.interactions_enabled || self.schedules.len() >= MAX_SCHEDULES {
+            return false;
+        }
         let number = self.schedules.len() + 1;
         self.schedules.push(ScheduleSummary {
             name: format!("New schedule {number}"),
             cadence: "Choose a cadence".to_owned(),
             next_run: "Not scheduled".to_owned(),
+            configured: false,
             enabled: false,
             workspace: self.workspaces[0].name.clone(),
         });
+        true
     }
 
-    pub(crate) fn toggle_extension(&mut self, index: usize) {
+    pub(crate) fn toggle_extension(&mut self, index: usize) -> bool {
+        if !self.interactions_enabled {
+            return false;
+        }
         if let Some(extension) = self.extensions.get_mut(index) {
             extension.enabled = !extension.enabled;
+            true
+        } else {
+            false
         }
     }
 
@@ -788,9 +902,13 @@ impl ProductState {
         }
     }
 
-    pub(crate) fn toggle_selected_deliverable_pin(&mut self) {
+    pub(crate) fn toggle_selected_deliverable_pin(&mut self) -> bool {
+        if !self.interactions_enabled {
+            return false;
+        }
         self.deliverables[self.selected_deliverable].pinned =
             !self.deliverables[self.selected_deliverable].pinned;
+        true
     }
 
     pub(crate) fn select_session_file(&mut self, index: usize) {
@@ -805,7 +923,10 @@ impl ProductState {
         role: TranscriptRole,
         text: impl Into<String>,
         detail: impl Into<String>,
-    ) {
+    ) -> bool {
+        if !self.interactions_enabled {
+            return false;
+        }
         let transcript = &mut self.selected_session_mut().transcript;
         transcript.push(TranscriptEntry {
             role,
@@ -816,28 +937,34 @@ impl ProductState {
         if transcript.len() > MAX_SESSION_HISTORY {
             transcript.remove(0);
         }
+        true
     }
 
     pub(crate) fn resolve_approval(
         &mut self,
         approved: bool,
-    ) -> Result<RunState, InvalidRunTransition> {
+    ) -> Result<RunState, ProductActionError> {
+        if !self.interactions_enabled {
+            return Err(ProductActionError::PreviewReadOnly);
+        }
         if self.focused_run.state().is_terminal() {
-            return Err(InvalidRunTransition {
+            return Err(ProductActionError::InvalidTransition(InvalidRunTransition {
                 from: self.focused_run.state(),
                 to: if approved {
                     RunState::Running
                 } else {
                     RunState::Cancelled
                 },
-            });
+            }));
         }
         let next = if approved {
             RunState::Running
         } else {
             RunState::Cancelled
         };
-        self.focused_run.transition(next)?;
+        self.focused_run
+            .transition(next)
+            .map_err(ProductActionError::InvalidTransition)?;
         self.selected_run.state = next;
         self.selected_run.detail = if approved {
             "Approval recorded; execution resumed".to_owned()
@@ -857,13 +984,18 @@ impl ProductState {
     pub(crate) fn answer_question(
         &mut self,
         answer: &str,
-    ) -> Result<RunState, InvalidRunTransition> {
+    ) -> Result<RunState, ProductActionError> {
+        if !self.interactions_enabled {
+            return Err(ProductActionError::PreviewReadOnly);
+        }
         let next = if answer == "Pause run" {
             RunState::Paused
         } else {
             RunState::Running
         };
-        self.focused_run.transition(next)?;
+        self.focused_run
+            .transition(next)
+            .map_err(ProductActionError::InvalidTransition)?;
         self.selected_run.state = next;
         self.selected_run.detail = if next == RunState::Paused {
             "Answer recorded; execution paused".to_owned()
@@ -950,19 +1082,19 @@ impl ProductState {
             AccessibilityNode {
                 role: "main".to_owned(),
                 label: "Primary content".to_owned(),
-                description: "Selected GTA Claw workspace surface".to_owned(),
+                description: "Selected read-only product preview surface".to_owned(),
                 live: "off".to_owned(),
             },
             AccessibilityNode {
                 role: "status".to_owned(),
-                label: "Run status".to_owned(),
-                description: "Auditable run lifecycle updates".to_owned(),
+                label: "Preview run status".to_owned(),
+                description: "Sample run lifecycle updates".to_owned(),
                 live: "polite".to_owned(),
             },
             AccessibilityNode {
                 role: "alert".to_owned(),
-                label: "Approval request".to_owned(),
-                description: "Explicit permission required before execution".to_owned(),
+                label: "Sample approval request".to_owned(),
+                description: "Decisions are unavailable in the read-only preview".to_owned(),
                 live: "assertive".to_owned(),
             },
         ]
@@ -1005,29 +1137,31 @@ fn demo_runs() -> Vec<RunSummary> {
 }
 
 fn demo_workspaces() -> Vec<WorkspaceSummary> {
-    vec![
-        WorkspaceSummary {
-            name: "GTA-Claw".to_owned(),
-            location: "No trusted path loaded".to_owned(),
-            kind: "Preview workspace".to_owned(),
-            branch: "Workspace trust is not composed".to_owned(),
-            active_runs: 3,
-        },
-        WorkspaceSummary {
-            name: "Gateway lab".to_owned(),
-            location: "No trusted path loaded".to_owned(),
-            kind: "Preview workspace".to_owned(),
-            branch: "Workspace trust is not composed".to_owned(),
-            active_runs: 1,
-        },
-        WorkspaceSummary {
-            name: "Release workspace".to_owned(),
-            location: "No remote workspace loaded".to_owned(),
-            kind: "Preview workspace".to_owned(),
-            branch: "Remote workspace integration is not composed".to_owned(),
-            active_runs: 0,
-        },
+    [
+        (
+            "GTA-Claw",
+            "No trusted path loaded",
+            "Workspace trust is not composed",
+        ),
+        (
+            "Gateway lab",
+            "No trusted path loaded",
+            "Workspace trust is not composed",
+        ),
+        (
+            "Release workspace",
+            "No remote workspace loaded",
+            "Remote workspace integration is not composed",
+        ),
     ]
+    .into_iter()
+    .map(|(name, location, branch)| WorkspaceSummary {
+        name: name.to_owned(),
+        location: location.to_owned(),
+        kind: "Preview workspace".to_owned(),
+        branch: branch.to_owned(),
+    })
+    .collect()
 }
 
 fn demo_schedules() -> Vec<ScheduleSummary> {
@@ -1036,6 +1170,7 @@ fn demo_schedules() -> Vec<ScheduleSummary> {
             name: "Dependency health".to_owned(),
             cadence: "Weekdays at 09:00".to_owned(),
             next_run: "Monday, 09:00".to_owned(),
+            configured: true,
             enabled: true,
             workspace: "GTA-Claw".to_owned(),
         },
@@ -1043,6 +1178,7 @@ fn demo_schedules() -> Vec<ScheduleSummary> {
             name: "Nightly diagnostics".to_owned(),
             cadence: "Daily at 01:30".to_owned(),
             next_run: "Tomorrow, 01:30".to_owned(),
+            configured: true,
             enabled: true,
             workspace: "Gateway lab".to_owned(),
         },
@@ -1050,6 +1186,7 @@ fn demo_schedules() -> Vec<ScheduleSummary> {
             name: "Release notes".to_owned(),
             cadence: "Every Friday".to_owned(),
             next_run: "Friday, 16:00".to_owned(),
+            configured: true,
             enabled: false,
             workspace: "Release workspace".to_owned(),
         },
@@ -1235,6 +1372,12 @@ fn demo_diff(run: &RunSummary, file_name: &str, offset: usize) -> Vec<DiffLine> 
 mod tests {
     use super::*;
 
+    fn interactive_state() -> ProductState {
+        let mut state = ProductState::default();
+        state.interactions_enabled = true;
+        state
+    }
+
     #[test]
     fn all_twelve_run_states_have_stable_labels_and_tones() {
         let actual = RunState::ALL
@@ -1384,7 +1527,7 @@ mod tests {
 
     #[test]
     fn run_activity_history_is_bounded_like_the_transcript() {
-        let mut state = ProductState::default();
+        let mut state = interactive_state();
         assert!(!state.activity().is_empty());
         for index in 0..MAX_SESSION_HISTORY + 5 {
             let answer = if index % 2 == 0 { "" } else { "Pause run" };
@@ -1432,19 +1575,19 @@ mod tests {
                 AccessibilityNode {
                     role: "main".to_owned(),
                     label: "Primary content".to_owned(),
-                    description: "Selected GTA Claw workspace surface".to_owned(),
+                    description: "Selected read-only product preview surface".to_owned(),
                     live: "off".to_owned(),
                 },
                 AccessibilityNode {
                     role: "status".to_owned(),
-                    label: "Run status".to_owned(),
-                    description: "Auditable run lifecycle updates".to_owned(),
+                    label: "Preview run status".to_owned(),
+                    description: "Sample run lifecycle updates".to_owned(),
                     live: "polite".to_owned(),
                 },
                 AccessibilityNode {
                     role: "alert".to_owned(),
-                    label: "Approval request".to_owned(),
-                    description: "Explicit permission required before execution".to_owned(),
+                    label: "Sample approval request".to_owned(),
+                    description: "Decisions are unavailable in the read-only preview".to_owned(),
                     live: "assertive".to_owned(),
                 },
             ]
@@ -1487,26 +1630,27 @@ mod tests {
 
     #[test]
     fn mutable_controls_update_rust_owned_models_and_bound_transcript_history() {
-        let mut state = ProductState::default();
+        let mut state = interactive_state();
         assert_eq!(state.schedules().len(), 3);
-        state.create_schedule();
+        assert!(state.create_schedule());
         assert_eq!(
             state.schedules()[3],
             ScheduleSummary {
                 name: "New schedule 4".to_owned(),
                 cadence: "Choose a cadence".to_owned(),
                 next_run: "Not scheduled".to_owned(),
+                configured: false,
                 enabled: false,
                 workspace: "GTA-Claw".to_owned(),
             }
         );
-        state.toggle_schedule(3);
+        assert!(!state.toggle_schedule(3));
         assert!(!state.schedules()[3].enabled);
         assert!(state.schedules()[0].enabled);
-        state.toggle_schedule(0);
+        assert!(state.toggle_schedule(0));
         assert!(!state.schedules()[0].enabled);
         assert!(state.extensions()[0].enabled);
-        state.toggle_extension(0);
+        assert!(state.toggle_extension(0));
         assert!(!state.extensions()[0].enabled);
         assert_eq!(state.selected_deliverable().name, "desktop-architecture.md");
         state.select_deliverable(2);
@@ -1515,7 +1659,7 @@ mod tests {
             "diagnostic-availability.json"
         );
         assert!(!state.selected_deliverable().pinned);
-        state.toggle_selected_deliverable_pin();
+        assert!(state.toggle_selected_deliverable_pin());
         assert!(state.selected_deliverable().pinned);
 
         for index in 0..205 {
@@ -1532,7 +1676,7 @@ mod tests {
 
     #[test]
     fn opening_and_approving_a_run_preserves_identity_and_updates_lifecycle() {
-        let mut state = ProductState::default();
+        let mut state = interactive_state();
         assert_eq!(state.selected_run().id, "run-05-01");
         assert_eq!(state.resolve_approval(true), Ok(RunState::Running));
         assert_eq!(state.selected_run().id, "run-05-01");
@@ -1556,16 +1700,16 @@ mod tests {
         assert_eq!(state.selected_run().state, RunState::Running);
         assert_eq!(
             state.resolve_approval(true),
-            Err(InvalidRunTransition {
+            Err(ProductActionError::InvalidTransition(InvalidRunTransition {
                 from: RunState::Running,
                 to: RunState::Running,
-            })
+            }))
         );
     }
 
     #[test]
     fn workspace_opening_and_answers_use_canonical_run_records() {
-        let mut state = ProductState::default();
+        let mut state = interactive_state();
         assert_eq!(
             state.transcript()[0].detail,
             "Workspace: GTA-Claw · Run: run-05-01"
@@ -1609,7 +1753,7 @@ mod tests {
             "Answer recorded; execution resumed"
         );
 
-        let mut paused = ProductState::default();
+        let mut paused = interactive_state();
         paused.open_session(5);
         assert_eq!(paused.answer_question("Pause run"), Ok(RunState::Paused));
         assert_eq!(paused.selected_run().state, RunState::Paused);
@@ -1640,5 +1784,135 @@ mod tests {
                 .into_iter()
                 .all(|run_state| page.iter().filter(|run| run.state == run_state).count() == 2)
         }));
+    }
+
+    #[test]
+    fn preview_policy_blocks_every_backend_shaped_mutation_and_bounds_schedules() {
+        let mut preview = ProductState::default();
+        let schedules = preview.schedules().to_vec();
+        let extensions = preview.extensions().to_vec();
+        let transcript = preview.transcript().to_vec();
+        let selected_run = preview.selected_run().clone();
+        let pinned = preview.selected_deliverable().pinned;
+
+        assert!(!preview.interactions_enabled());
+        assert!(!preview.create_schedule());
+        assert!(!preview.toggle_schedule(0));
+        assert!(!preview.toggle_extension(0));
+        assert!(!preview.toggle_selected_deliverable_pin());
+        assert!(!preview.record_message(TranscriptRole::User, "not sent", "preview"));
+        assert_eq!(
+            preview.resolve_approval(true),
+            Err(ProductActionError::PreviewReadOnly)
+        );
+        assert_eq!(preview.transcript(), transcript.as_slice());
+        preview.open_session(5);
+        let answer_run = preview.selected_run().clone();
+        let answer_transcript = preview.transcript().to_vec();
+        assert_eq!(
+            preview.answer_question("Continue"),
+            Err(ProductActionError::PreviewReadOnly)
+        );
+        assert_eq!(preview.selected_run(), &answer_run);
+        assert_eq!(preview.transcript(), answer_transcript.as_slice());
+
+        assert_eq!(preview.schedules(), schedules.as_slice());
+        assert_eq!(preview.extensions(), extensions.as_slice());
+        preview.open_session(4);
+        assert_eq!(preview.selected_run(), &selected_run);
+        assert_eq!(preview.selected_deliverable().pinned, pinned);
+
+        let mut interactive = interactive_state();
+        while interactive.schedules.len() < MAX_SCHEDULES {
+            assert!(interactive.create_schedule());
+        }
+        assert_eq!(interactive.schedules().len(), MAX_SCHEDULES);
+        assert!(!interactive.create_schedule());
+        interactive.schedules.push(ScheduleSummary {
+            name: "must not render".to_owned(),
+            cadence: "Never".to_owned(),
+            next_run: "Never".to_owned(),
+            configured: false,
+            enabled: false,
+            workspace: "GTA-Claw".to_owned(),
+        });
+        assert_eq!(interactive.schedules().len(), MAX_SCHEDULES);
+    }
+
+    #[test]
+    fn dashboard_and_workspace_counts_are_derived_from_run_models() {
+        let state = ProductState::default();
+        assert_eq!(
+            state.dashboard_counts(),
+            DashboardCounts {
+                awaiting_review: 10,
+                running: 10,
+                blocked: 10,
+                workspaces: 3,
+            }
+        );
+        assert_eq!(
+            state
+                .workspaces()
+                .iter()
+                .map(|workspace| state.workspace_active_runs(&workspace.name))
+                .collect::<Vec<_>>(),
+            vec![24, 18, 18]
+        );
+    }
+
+    #[test]
+    fn workspace_active_runs_follow_approve_deny_and_pause_transitions() {
+        let mut approved = interactive_state();
+        let before_approval = approved.workspace_active_runs("GTA-Claw");
+        assert_eq!(approved.resolve_approval(true), Ok(RunState::Running));
+        assert_eq!(
+            approved.workspace_active_runs("GTA-Claw"),
+            before_approval,
+            "approval keeps the run active"
+        );
+
+        let mut denied = interactive_state();
+        let before_denial = denied.workspace_active_runs("GTA-Claw");
+        assert_eq!(denied.resolve_approval(false), Ok(RunState::Cancelled));
+        assert_eq!(
+            denied.workspace_active_runs("GTA-Claw"),
+            before_denial - 1,
+            "denial removes the cancelled run from active work"
+        );
+
+        let mut paused = interactive_state();
+        paused.open_session(5);
+        let before_pause = paused.workspace_active_runs("GTA-Claw");
+        assert_eq!(paused.answer_question("Pause run"), Ok(RunState::Paused));
+        assert_eq!(
+            paused.workspace_active_runs("GTA-Claw"),
+            before_pause - 1,
+            "pausing a waiting run removes it from active work"
+        );
+    }
+
+    #[test]
+    fn schedule_configuration_is_independent_of_preview_action_lock() {
+        let preview = ProductState::default();
+        let paused = &preview.schedules()[2];
+        assert!(!paused.enabled);
+        assert!(paused.is_configured());
+        assert_eq!(paused.state_label(), "Paused");
+        assert!(!preview.interactions_enabled());
+
+        let mut interactive = interactive_state();
+        assert!(interactive.create_schedule());
+        let draft = interactive.schedules().last().expect("created draft");
+        assert!(!draft.enabled);
+        assert!(!draft.is_configured());
+        assert_eq!(draft.state_label(), "Draft");
+
+        let mut localized = draft.clone();
+        localized.next_run = "Non planifié".to_owned();
+        assert!(
+            !localized.is_configured(),
+            "configuration semantics must not depend on localized display text"
+        );
     }
 }

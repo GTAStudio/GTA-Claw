@@ -111,6 +111,22 @@ impl CommandPaletteState {
         }
     }
 
+    pub(crate) fn select_visible_index(&mut self, index: usize) -> bool {
+        if index >= self.visible_count() || self.selected_index == index {
+            false
+        } else {
+            self.selected_index = index;
+            true
+        }
+    }
+
+    pub(crate) fn select_ui_focus_index(&mut self, index: i32) -> bool {
+        let Ok(index) = usize::try_from(index) else {
+            return false;
+        };
+        self.select_visible_index(index)
+    }
+
     pub(crate) const fn selected_index(&self) -> usize {
         self.selected_index
     }
@@ -249,6 +265,43 @@ mod tests {
         state.reset();
         assert_eq!(visible_titles(&state).len(), 4);
         assert_eq!(state.selected_action(), Some(PaletteAction::Focus));
+    }
+
+    #[test]
+    fn focus_selection_uses_the_same_index_as_footer_and_enter() {
+        let mut state = CommandPaletteState::new(catalog()).expect("valid catalog");
+
+        assert!(state.select_visible_index(2));
+        assert_eq!(state.selected_index(), 2);
+        assert_eq!(state.selected_label(), Some("Check for updates"));
+        assert_eq!(state.selected_action_id(), Some(8));
+        assert!(!state.select_visible_index(2));
+        assert!(!state.select_visible_index(99));
+        assert_eq!(state.selected_action_id(), Some(8));
+
+        state.update_query("health");
+        assert_eq!(state.selected_index(), 0);
+        assert_eq!(state.selected_label(), Some("Open diagnostics"));
+        assert_eq!(state.selected_action_id(), Some(9));
+    }
+
+    #[test]
+    fn stale_or_invalid_ui_focus_indices_are_ignored_without_losing_selection() {
+        let mut state = CommandPaletteState::new(catalog()).expect("valid catalog");
+        assert!(state.select_ui_focus_index(2));
+        assert_eq!(state.selected_action_id(), Some(8));
+
+        for invalid in [-1, i32::MIN, 4, 99, i32::MAX] {
+            assert!(!state.select_ui_focus_index(invalid));
+            assert_eq!(state.selected_index(), 2);
+            assert_eq!(state.selected_action_id(), Some(8));
+        }
+
+        state.update_query("health");
+        assert_eq!(state.selected_action_id(), Some(9));
+        assert!(!state.select_ui_focus_index(1));
+        assert_eq!(state.selected_index(), 0);
+        assert_eq!(state.selected_action_id(), Some(9));
     }
 
     #[test]
