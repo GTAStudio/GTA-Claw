@@ -37,7 +37,7 @@ rebase onto current `main`, independently review, and validate before publicatio
 |---|---|---|---|
 | Config Layer 1 | `handoff/2026-07-30-0833/config-layer-1` | `72f9d5ecbc150d713b5e5191d5738234ba5a3ede` | `4ef4d921e5301bc34a436d416b913cbb0f65f83c` |
 | Desktop | `handoff/2026-07-30-0833/desktop` | `6901a59f8ecb6bf4f7f9d2dc92b54eb23cdd977c` | `92c2329b151d4b71b342a54d944254da2f3c61a5` |
-| Legacy / PR #227 | `handoff/2026-07-30-0840/legacy-pr227-final` | `3dafa9d3adaebd9628c0c46c630db66934ef9152` | `e6c7692f8bcb5b55cd8c3c89cca418ceeb80eade` |
+| Legacy / PR #227 | `handoff/2026-07-30-0908/legacy-pr227-phase-a-corrected` | `94e766605c75e3060e5d80a36e39124486d6675c` | `3dafa9d3adaebd9628c0c46c630db66934ef9152` |
 | Updater / PR #236 | `handoff/2026-07-30-0833/updater-pr236` | `efae570296e36c8c20ba4eca2c09e6dd62a9bce6` | `0f31d8eaf71f16724407489ade364263e6b20f9a` |
 | Local performance harness | `handoff/2026-07-30-0833/local-perf-harness` | `3b1b76972fd3b0b181c1a8b564ed40d8e3a4f39c` | `4ef4d921e5301bc34a436d416b913cbb0f65f83c` |
 | Durable-memory port | `handoff/2026-07-30-0904/durable-memory-terminated` | `8f1eb5ec4f17f50e952ad6683a4e3684344d6142` | `4f4455f3d7e5290d94697a2393996ef05488e4e3` |
@@ -63,8 +63,8 @@ Their `-final` refs are successor commits whose parents are the earlier snapshot
 Those raced edits were not reviewed or tested.
 
 The new Trusted A1 and compat-oracle sessions also wrote after the first inventory.
-Their final refs are independent snapshots. In total, 34 handoff refs exist: the 19
-final table entries plus fifteen predecessor refs in the Legacy, Packaging, Discovery,
+Their final refs are independent snapshots. In total, 35 handoff refs exist: the 19
+final table entries plus sixteen predecessor refs in the Legacy, Packaging, Discovery,
 Compat, Plugin, Durable Memory, and Trusted successor chains.
 
 ### Current open PR inventory
@@ -127,13 +127,16 @@ not merged from their stale heads:
      rerun the strict local matrix and merge.
 
 3. **PR #227 Legacy**
-   - The snapshot contains the post-head Discord work plus partially started historical
-     #172 hardening.
+   - The current snapshot contains exactly the post-head
+     `src/channels/discordGateway.ts` and `test/discordGateway.test.mjs` changes.
+   - The broader historical #172 hardening was removed from the current worktree but
+     remains recoverable from predecessor snapshot `e6c7692f...`.
    - Final Discord review found three blockers: backslash URL normalization can bypass
      raw host suffix checks; exact configured bootstrap host must be accepted;
      malformed/whitespace/control session IDs must be rejected atomically. A two-file
-     fix attempt raced the stop message and is included in the final snapshot, but was
-     not reviewed or tested; re-audit all three findings.
+     fix attempt is included in the corrected snapshot, but was not independently
+     reviewed or tested; re-audit all three findings. Its test-file SHA-256 is
+     `ae6c2d3503a548f02b0bc9c9c6772538f9c4bca703398191d11f613b8969959d`.
    - After fixing those two Discord files, freeze the final seven test bytes, land
      Trusted A2, then rebase/validate/merge #227.
    - Continue #172 as a separate reviewed follow-up if it cannot remain cleanly within
