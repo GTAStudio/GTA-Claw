@@ -41,9 +41,9 @@ rebase onto current `main`, independently review, and validate before publicatio
 | Updater / PR #236 | `handoff/2026-07-30-0833/updater-pr236` | `efae570296e36c8c20ba4eca2c09e6dd62a9bce6` | `0f31d8eaf71f16724407489ade364263e6b20f9a` |
 | Local performance harness | `handoff/2026-07-30-0833/local-perf-harness` | `3b1b76972fd3b0b181c1a8b564ed40d8e3a4f39c` | `4ef4d921e5301bc34a436d416b913cbb0f65f83c` |
 | Durable-memory port | `handoff/2026-07-30-0833/durable-memory-port` | `4f4455f3d7e5290d94697a2393996ef05488e4e3` | `d2493b07b7c064bd8b72c836852c4ae1617b56f5` |
-| Packaging / PR #233 | `handoff/2026-07-30-0859/packaging-pr233-locked` | `b0d2b49fd1a2f00717c38a9c4809b3217871465b` | `e03c45a05a52a8b77c02c76310bd0d766f343384` |
+| Packaging / PR #233 | `handoff/2026-07-30-0901/packaging-pr233-terminated` | `a9301965e6b10c24be75bfafe359577afc0b20a4` | `b0d2b49fd1a2f00717c38a9c4809b3217871465b` |
 | Daemon / PR #232 | `handoff/2026-07-30-0833/daemon-pr232` | `1bfe93661dd959702732d672f80be57bca6ccd1a` | `97b19df94799974167bb1c193833e2d1efeaeb26` |
-| Plugin / PR #235 | `handoff/2026-07-30-0859/plugin-pr235-locked` | `517810ff524aacc2c31b04a088f935f95c9c9ecb` | `7660bce81942919ddf72be07fa60dc1937b5d6aa` |
+| Plugin / PR #235 | `handoff/2026-07-30-0901/plugin-pr235-terminated` | `7d17a15598497334c409262d3e108dbc0abd81c4` | `517810ff524aacc2c31b04a088f935f95c9c9ecb` |
 | Discovery/fleet port | `handoff/2026-07-30-0840/discovery-fleet-port-final` | `152bfbc81e10967a3eff3f1627b222f1ba4f3bd2` | `8686c27fa55ba768db473c3d4e7f602b978aa021` |
 | Trusted A1 candidate | `handoff/2026-07-30-0833/trusted-a1-candidate` | `221226f4a4dc77795696994f8930aae39f8a2260` | `5e85d6d080712c82dc0814985df1472bdfab5dd9` |
 | Trusted A1 new-owner candidate | `handoff/2026-07-30-0859/trusted-a1-new-owner-locked` | `7a3542484141d21983e4f6acfbb907c0a620787e` | `3d21c1fa24ad1c552fa32a7cafd68c124ee49b52` |
@@ -63,9 +63,9 @@ Their `-final` refs are successor commits whose parents are the earlier snapshot
 Those raced edits were not reviewed or tested.
 
 The new Trusted A1 and compat-oracle sessions also wrote after the first inventory.
-Their final refs are independent snapshots. In total, 31 handoff refs exist: the 19
-final table entries plus twelve predecessor refs in the Legacy, Packaging, Discovery,
-Compat, Plugin, and Trusted successor chains.
+Their final refs are independent snapshots. In total, 33 handoff refs exist: the 19
+final table entries plus fourteen predecessor refs in the Legacy, Packaging,
+Discovery, Compat, Plugin, and Trusted successor chains.
 
 ### Current open PR inventory
 
@@ -159,6 +159,8 @@ not merged from their stale heads:
    - Dirty snapshot is preserved; no final validation.
    - Late schema/runtime limit tests and `claw-windows-handle-dir` edits are included
      in the locked snapshot and remain unreviewed.
+   - A final `claw-tools/src/sandbox.rs` edit completed before the owner CLI was
+     forcibly terminated; it is included in the terminated snapshot and is unreviewed.
    - Still requires current-safe helper API/policy, construction-time budgets,
      lossless public/enforced schema identity, fail-closed unsupported keys, Windows
      handle-relative semantics, exact lifecycle rollback/deadlines, and adaptive
@@ -179,6 +181,8 @@ not merged from their stale heads:
    - Final `packaging/windows/self-test.ps1` and
      `.github/workflows/windows-packaging.yml` edits raced the stop and are preserved
      but unreviewed.
+   - The Packaging and Plugin owner CLIs were ultimately stopped by exact PID after
+     their current turns continued writing despite queued stop messages.
    - Finish Linux service/RPM/DEB/OCI lifecycle, release signing/retry safety,
      Android/iOS runtime gates, TUI cooperative EOF shutdown, and historical
      #141/#158/#138/#124/#142/#182/#179 plus current-safe #68 packaging behavior.
