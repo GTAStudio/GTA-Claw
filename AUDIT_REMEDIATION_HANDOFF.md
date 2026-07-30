@@ -37,14 +37,14 @@ rebase onto current `main`, independently review, and validate before publicatio
 |---|---|---|---|
 | Config Layer 1 | `handoff/2026-07-30-0833/config-layer-1` | `72f9d5ecbc150d713b5e5191d5738234ba5a3ede` | `4ef4d921e5301bc34a436d416b913cbb0f65f83c` |
 | Desktop | `handoff/2026-07-30-0833/desktop` | `6901a59f8ecb6bf4f7f9d2dc92b54eb23cdd977c` | `92c2329b151d4b71b342a54d944254da2f3c61a5` |
-| Legacy / PR #227 | `handoff/2026-07-30-0833/legacy-pr227` | `e6c7692f8bcb5b55cd8c3c89cca418ceeb80eade` | `224a2efc9e411288f7562270e3a7e0c92c8c4f2b` |
+| Legacy / PR #227 | `handoff/2026-07-30-0840/legacy-pr227-final` | `3dafa9d3adaebd9628c0c46c630db66934ef9152` | `e6c7692f8bcb5b55cd8c3c89cca418ceeb80eade` |
 | Updater / PR #236 | `handoff/2026-07-30-0833/updater-pr236` | `efae570296e36c8c20ba4eca2c09e6dd62a9bce6` | `0f31d8eaf71f16724407489ade364263e6b20f9a` |
 | Local performance harness | `handoff/2026-07-30-0833/local-perf-harness` | `3b1b76972fd3b0b181c1a8b564ed40d8e3a4f39c` | `4ef4d921e5301bc34a436d416b913cbb0f65f83c` |
 | Durable-memory port | `handoff/2026-07-30-0833/durable-memory-port` | `4f4455f3d7e5290d94697a2393996ef05488e4e3` | `d2493b07b7c064bd8b72c836852c4ae1617b56f5` |
-| Packaging / PR #233 | `handoff/2026-07-30-0833/packaging-pr233` | `998402c1ca9a109cfe14432a0b5f471d8a537684` | `a861f95d4e747e4f6d07f331971e30ad50f5f28a` |
+| Packaging / PR #233 | `handoff/2026-07-30-0840/packaging-pr233-final` | `bea88fdb1f1b8b5b233a838dd1d2b0758c57914b` | `998402c1ca9a109cfe14432a0b5f471d8a537684` |
 | Daemon / PR #232 | `handoff/2026-07-30-0833/daemon-pr232` | `1bfe93661dd959702732d672f80be57bca6ccd1a` | `97b19df94799974167bb1c193833e2d1efeaeb26` |
 | Plugin / PR #235 | `handoff/2026-07-30-0833/plugin-pr235` | `7660bce81942919ddf72be07fa60dc1937b5d6aa` | `c7d22a2d13f46eb2b2b7b18d818ab7820f1b9c18` |
-| Discovery/fleet port | `handoff/2026-07-30-0833/discovery-fleet-port` | `8686c27fa55ba768db473c3d4e7f602b978aa021` | `d2493b07b7c064bd8b72c836852c4ae1617b56f5` |
+| Discovery/fleet port | `handoff/2026-07-30-0840/discovery-fleet-port-final` | `152bfbc81e10967a3eff3f1627b222f1ba4f3bd2` | `8686c27fa55ba768db473c3d4e7f602b978aa021` |
 | Trusted A1 candidate | `handoff/2026-07-30-0833/trusted-a1-candidate` | `221226f4a4dc77795696994f8930aae39f8a2260` | `5e85d6d080712c82dc0814985df1472bdfab5dd9` |
 | Duplicate trusted supply-chain candidate | `handoff/2026-07-30-0833/duplicate-trusted-supply-chain` | `9f3f3a23fbedfccd48981c9bc306b775b9c00c95` | `92c2329b151d4b71b342a54d944254da2f3c61a5` |
 | Dirty PR #234 source | `handoff/2026-07-30-0833/supply-chain-pr234-dirty` | `e70aedb0b2cb4e1e18baf398de4f1b4b78114d4f` | `28fba25d12817f04c8fddee63c6b6fa711941f33` |
@@ -55,6 +55,10 @@ rebase onto current `main`, independently review, and validate before publicatio
 
 The duplicate/residual refs are preservation-only. Do not combine them with the
 authoritative scopes without a fresh source comparison.
+
+Legacy, Packaging, and Discovery received small writes after the first stop message.
+Their `-final` refs are successor commits whose parents are the earlier snapshots.
+Those raced edits were not reviewed or tested.
 
 ### Current open PR inventory
 
@@ -109,9 +113,11 @@ not merged from their stale heads:
 3. **PR #227 Legacy**
    - The snapshot contains the post-head Discord work plus partially started historical
      #172 hardening.
-   - Final Discord review still found three blockers: backslash URL normalization can
-     bypass raw host suffix checks; exact configured bootstrap host must be accepted;
-     malformed/whitespace/control session IDs must be rejected atomically.
+   - Final Discord review found three blockers: backslash URL normalization can bypass
+     raw host suffix checks; exact configured bootstrap host must be accepted;
+     malformed/whitespace/control session IDs must be rejected atomically. A two-file
+     fix attempt raced the stop message and is included in the final snapshot, but was
+     not reviewed or tested; re-audit all three findings.
    - After fixing those two Discord files, freeze the final seven test bytes, land
      Trusted A2, then rebase/validate/merge #227.
    - Continue #172 as a separate reviewed follow-up if it cannot remain cleanly within
@@ -152,6 +158,8 @@ not merged from their stale heads:
 8. **Packaging/mobile / PR #233**
    - Thirty-nine dirty files are preserved; no final validation or immutable final
      source commit.
+   - A final `packaging/windows/self-test.ps1` edit raced the stop and is preserved but
+     unreviewed.
    - Finish Linux service/RPM/DEB/OCI lifecycle, release signing/retry safety,
      Android/iOS runtime gates, TUI cooperative EOF shutdown, and historical
      #141/#158/#138/#124/#142/#182/#179 plus current-safe #68 packaging behavior.
@@ -172,7 +180,8 @@ not merged from their stale heads:
 
 11. **Historical ports**
     - Durable memory is partially implemented in its snapshot.
-    - Discovery/fleet is partially implemented in its snapshot.
+    - Discovery/fleet is partially implemented in its snapshot. A one-line
+      `dns_sd.rs` change raced the stop and is unreviewed.
     - Durable state and compat-oracle sessions stopped before writing files.
     - PR #238 already completed the #171/#144 client-contract port and is on main.
     - Still create reviewed current-main ports for compat/conformance, trusted policy,
