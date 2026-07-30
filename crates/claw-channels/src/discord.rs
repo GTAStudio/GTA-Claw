@@ -45,6 +45,12 @@ pub enum DiscordGatewayPhase {
     ReconnectExhausted,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiscordGatewayAttempt {
+    Bootstrap,
+    Resume,
+}
+
 /// WebSocket close metadata retained for Discord reconnect policy.
 #[derive(Clone, Eq, PartialEq)]
 pub struct DiscordGatewayClose {
@@ -356,6 +362,7 @@ pub struct DiscordChannel<T, C> {
     clock: C,
     lifecycle: ConnectionStateMachine,
     phase: DiscordGatewayPhase,
+    active_gateway_attempt: Option<DiscordGatewayAttempt>,
     sequence: Option<i64>,
     session_id: Option<String>,
     resume_gateway_url: Option<String>,
@@ -411,6 +418,7 @@ impl<T, C> DiscordChannel<T, C> {
             clock,
             lifecycle: ConnectionStateMachine::new(),
             phase: DiscordGatewayPhase::Idle,
+            active_gateway_attempt: None,
             sequence: None,
             session_id: None,
             resume_gateway_url: None,
@@ -540,6 +548,7 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
         self.reconnect_attempts = 0;
         self.lifecycle
             .apply(LifecycleEvent::ConnectRequested, &mut ())?;
+        self.active_gateway_attempt = Some(DiscordGatewayAttempt::Bootstrap);
         match self.transport.open_gateway(&self.gateway_url) {
             Ok(()) => {
                 diagnostics.record(self.diagnostic(
@@ -552,6 +561,7 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
                 Ok(true)
             }
             Err(error) => {
+                self.active_gateway_attempt = None;
                 self.lifecycle
                     .apply(LifecycleEvent::ConnectionLost, &mut ())?;
                 self.schedule_reconnect(now, diagnostics)?;
@@ -633,9 +643,12 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
         if self.lifecycle.state() == ConnectionState::Reconnecting {
             return Ok(false);
         }
-        let resume_gateway_failed_before_hello = self.phase == DiscordGatewayPhase::AwaitingHello
-            && self.session_id.is_some()
-            && self.resume_gateway_url.is_some();
+        let resume_gateway_failed_before_hello = self.active_gateway_attempt
+            == Some(DiscordGatewayAttempt::Resume)
+            && matches!(
+                self.phase,
+                DiscordGatewayPhase::Idle | DiscordGatewayPhase::AwaitingHello
+            );
         self.lifecycle
             .apply(LifecycleEvent::ConnectionLost, &mut ())?;
         self.reset_connection_protocol();
@@ -694,7 +707,13 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
             let using_resume_gateway =
                 self.session_id.is_some() && self.resume_gateway_url.is_some();
             let gateway_url = self.reconnect_gateway_url().to_owned();
+            self.active_gateway_attempt = Some(if using_resume_gateway {
+                DiscordGatewayAttempt::Resume
+            } else {
+                DiscordGatewayAttempt::Bootstrap
+            });
             if let Err(error) = self.transport.open_gateway(&gateway_url) {
+                self.active_gateway_attempt = None;
                 if using_resume_gateway {
                     self.resume_gateway_url = None;
                 }
@@ -838,6 +857,7 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
         gateway_credential: &ChannelCredential,
         diagnostics: &mut impl DiagnosticSink,
     ) -> Result<DiscordPacketOutcome, ChannelError> {
+        self.active_gateway_attempt = None;
         let hello: DiscordHello = match serde_json::from_str::<DiscordHello>(data) {
             Ok(hello) if hello.heartbeat_interval > 0 => hello,
             Ok(_) | Err(_) => {
@@ -1094,6 +1114,7 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
 
     const fn reset_connection_protocol(&mut self) {
         self.phase = DiscordGatewayPhase::Idle;
+        self.active_gateway_attempt = None;
         self.heartbeat_interval = None;
         self.next_heartbeat = None;
         self.awaiting_heartbeat_ack = false;

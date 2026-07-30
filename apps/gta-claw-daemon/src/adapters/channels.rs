@@ -1702,6 +1702,7 @@ fn provider_channel_error(error: &claw_provider_sdk::ProviderError) -> ChannelEr
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::num::{NonZeroU32, NonZeroUsize};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::{Duration, Instant};
@@ -1710,19 +1711,23 @@ mod tests {
         ApprovedOrigin, ChannelCredential, ChannelError, ConnectionState, CredentialKind,
         InboundMessage, TransportErrorKind,
     };
-    use claw_channels::{DiscordGatewayPhase, ProviderResponse};
+    use claw_channels::{
+        DiscordChannel, DiscordGatewayClose, DiscordGatewayPhase, DiscordPacketOutcome,
+        ProviderResponse, SystemClock,
+    };
     use claw_http_api::ReadinessPort;
+    use claw_provider_sdk::http::ProxyPolicy;
     use claw_provider_sdk::{CancelToken, SecretString};
     use tokio_util::sync::CancellationToken;
     use tokio_util::task::TaskTracker;
 
     use super::{
         ChannelReadiness, ChannelStartGuard, ConfiguredChannel, DependencyReadiness,
-        DiscordReplyTransport, TelegramProbeFuture, TelegramReadinessError, TelegramReadinessProbe,
-        approved_origin, bind_credential, bind_request_cancellation, cancel_requests,
-        classify_telegram_poll_probe_response, classify_telegram_webhook_probe_response,
-        parse_retry_after_header, send_discord_reply, telegram_readiness_requests,
-        wait_for_telegram_readiness,
+        DiscordCommand, DiscordReplyTransport, DiscordTransportAdapter, TelegramProbeFuture,
+        TelegramReadinessError, TelegramReadinessProbe, approved_origin, bind_credential,
+        bind_request_cancellation, cancel_requests, classify_telegram_poll_probe_response,
+        classify_telegram_webhook_probe_response, parse_retry_after_header, send_discord_reply,
+        telegram_readiness_requests, wait_for_telegram_readiness,
     };
 
     #[test]
@@ -1770,6 +1775,134 @@ mod tests {
             dependency.snapshot().expect("exhausted snapshot").failing,
             ["channels", "discord"]
         );
+    }
+
+    #[tokio::test]
+    async fn discord_adapter_async_resume_failure_falls_back_and_still_sends_resume() {
+        let request_cancel = Arc::new(Mutex::new(None));
+        let (transport, mut commands, _event_tx, _events) =
+            DiscordTransportAdapter::new(ProxyPolicy::Disabled, request_cancel)
+                .expect("Discord transport");
+        let gateway_origin =
+            approved_origin("discord", "default", "gateway.discord.gg").expect("Gateway origin");
+        let rest_origin =
+            approved_origin("discord", "default", "discord.com").expect("REST origin");
+        let gateway_credential = bind_credential(
+            "discord",
+            "default",
+            CredentialKind::Token,
+            gateway_origin.clone(),
+            &SecretString::new("discord-secret"),
+        )
+        .expect("Gateway credential");
+        let mut channel = DiscordChannel::new(
+            "default",
+            "wss://gateway.discord.gg/?v=10&encoding=json",
+            gateway_origin,
+            rest_origin,
+            32_768,
+            transport,
+            SystemClock,
+            NonZeroUsize::new(2).expect("non-zero capacity"),
+            NonZeroU32::new(3).expect("non-zero attempts"),
+        )
+        .expect("Discord channel");
+
+        channel.start(Duration::ZERO, &mut ()).expect("start");
+        match commands.recv().await {
+            Some(DiscordCommand::Open(url)) => {
+                assert_eq!(url, "wss://gateway.discord.gg/?v=10&encoding=json");
+            }
+            Some(_) | None => panic!("bootstrap open command expected"),
+        }
+        channel.gateway_opened(&mut ()).expect("bootstrap opened");
+        assert_eq!(
+            channel.handle_gateway_packet(
+                br#"{"op":10,"t":null,"s":null,"d":{"heartbeat_interval":1000}}"#,
+                Duration::ZERO,
+                &gateway_credential,
+                &mut (),
+            ),
+            Ok(DiscordPacketOutcome::Identified)
+        );
+        match commands.recv().await {
+            Some(DiscordCommand::Send(payload)) => {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&payload).expect("IDENTIFY")["op"],
+                    2
+                );
+            }
+            Some(_) | None => panic!("IDENTIFY command expected"),
+        }
+        assert_eq!(
+            channel.handle_gateway_packet(
+                br#"{"op":0,"t":"READY","s":41,"d":{"session_id":"session","resume_gateway_url":"wss://gateway-us-east1-b.discord.gg"}}"#,
+                Duration::ZERO,
+                &gateway_credential,
+                &mut (),
+            ),
+            Ok(DiscordPacketOutcome::Ready)
+        );
+        assert_eq!(
+            channel.handle_gateway_packet(
+                br#"{"op":7,"t":null,"s":null,"d":null}"#,
+                Duration::from_secs(1),
+                &gateway_credential,
+                &mut (),
+            ),
+            Ok(DiscordPacketOutcome::ReconnectRequested)
+        );
+        assert!(matches!(commands.recv().await, Some(DiscordCommand::Close)));
+
+        assert_eq!(channel.tick(Duration::from_secs(4), &mut ()), Ok(true));
+        match commands.recv().await {
+            Some(DiscordCommand::Open(url)) => {
+                assert_eq!(
+                    url,
+                    "wss://gateway-us-east1-b.discord.gg?v=10&encoding=json"
+                );
+            }
+            Some(_) | None => panic!("resume open command expected"),
+        }
+        assert_eq!(
+            channel.gateway_closed_with(
+                Duration::from_secs(4),
+                DiscordGatewayClose::transport_lost(),
+                &mut (),
+            ),
+            Ok(true)
+        );
+        assert_eq!(channel.session_id(), Some("session"));
+        assert_eq!(channel.sequence(), Some(41));
+        assert_eq!(channel.resume_gateway_url(), None);
+
+        assert_eq!(channel.tick(Duration::from_secs(7), &mut ()), Ok(true));
+        match commands.recv().await {
+            Some(DiscordCommand::Open(url)) => {
+                assert_eq!(url, "wss://gateway.discord.gg/?v=10&encoding=json");
+            }
+            Some(_) | None => panic!("bootstrap fallback command expected"),
+        }
+        channel.gateway_opened(&mut ()).expect("fallback opened");
+        assert_eq!(
+            channel.handle_gateway_packet(
+                br#"{"op":10,"t":null,"s":null,"d":{"heartbeat_interval":1000}}"#,
+                Duration::from_secs(7),
+                &gateway_credential,
+                &mut (),
+            ),
+            Ok(DiscordPacketOutcome::Identified)
+        );
+        match commands.recv().await {
+            Some(DiscordCommand::Send(payload)) => {
+                let resume =
+                    serde_json::from_str::<serde_json::Value>(&payload).expect("RESUME payload");
+                assert_eq!(resume["op"], 6);
+                assert_eq!(resume["d"]["session_id"], "session");
+                assert_eq!(resume["d"]["seq"], 41);
+            }
+            Some(_) | None => panic!("RESUME command expected"),
+        }
     }
 
     struct ScriptedTelegramProbe {
