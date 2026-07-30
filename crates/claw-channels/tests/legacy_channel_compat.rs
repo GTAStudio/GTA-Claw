@@ -1198,6 +1198,44 @@ fn whatsapp_pending_a_does_not_livelock_b_or_repeat_processing() {
         sent.borrow().as_slice(),
         ["reply-a", "reply-b", "reply-a", "reply-a"]
     );
+
+    for redelivery in 4..=6 {
+        let repeated = channel
+            .handle_webhook(
+                payload,
+                &access,
+                |_| panic!("repeated acknowledged batch must stay deduplicated"),
+                &mut (),
+            )
+            .unwrap_or_else(|error| panic!("redelivery {redelivery} failed: {error}"));
+        assert_eq!(repeated.ingestion.ignored, 2, "redelivery {redelivery}");
+        assert_eq!(repeated.processed, 0, "redelivery {redelivery}");
+        assert_eq!(processed.borrow().as_slice(), ["a", "b"]);
+        assert_eq!(
+            sent.borrow().as_slice(),
+            ["reply-a", "reply-b", "reply-a", "reply-a"]
+        );
+    }
+}
+
+#[test]
+fn whatsapp_rejects_a_batch_larger_than_its_deduplication_window() {
+    let WhatsAppHarness { mut channel, .. } = whatsapp_channel(1, VecDeque::new());
+    channel.start(&mut ()).expect("started");
+    let payload = br#"{"entry":[{"changes":[{"value":{
+        "metadata":{"phone_number_id":"phone-id"},
+        "messages":[
+            {"from":"15550001","id":"a","type":"text","text":{"body":"first"}},
+            {"from":"15550001","id":"b","type":"text","text":{"body":"second"}},
+            {"from":"15550001","id":"c","type":"text","text":{"body":"third"}}
+        ]
+    }}]}]}"#;
+
+    assert_eq!(
+        channel.ingest_webhook(payload, &mut ()),
+        Err(ChannelError::Protocol(ProtocolErrorKind::PayloadTooLarge))
+    );
+    assert_eq!(channel.queued_inbound(), 0);
 }
 
 #[derive(Default)]

@@ -267,6 +267,7 @@ pub struct WhatsAppChannel<T, C> {
     clock: C,
     lifecycle: ConnectionStateMachine,
     inbound: BoundedQueue<InboundMessage>,
+    webhook_batch_capacity: usize,
     delivery_history_capacity: usize,
     pending_reply_capacity: usize,
     completed_message_ids: VecDeque<String>,
@@ -281,8 +282,10 @@ impl<T, C> WhatsAppChannel<T, C> {
     /// Returns [`ChannelError::Configuration`] for invalid account or phone
     /// routing, or when `graph_origin` is not the exact enrolled
     /// `https://graph.facebook.com` origin for this account. `inbound_capacity`
-    /// bounds recent completion IDs. Partial reply checkpoints are capped at
-    /// twice that size so one failed bounded batch cannot starve the next batch.
+    /// derives a maximum webhook batch of twice that size. Pending reply
+    /// checkpoints use the same bound, and completion history covers the batch,
+    /// pending, and queued-work bounds so every ID settled or acknowledged by
+    /// one call remains deduplicated.
     pub fn new(
         account_id: impl Into<String>,
         phone_number_id: impl Into<String>,
@@ -299,6 +302,16 @@ impl<T, C> WhatsAppChannel<T, C> {
             ));
         }
         require_official_origin(&graph_origin, "whatsapp", &account_id, "graph.facebook.com")?;
+        let webhook_batch_capacity = inbound_capacity.get().checked_mul(2).ok_or(
+            ChannelError::Configuration(ConfigurationError::InvalidAdapterConfiguration),
+        )?;
+        let pending_reply_capacity = webhook_batch_capacity;
+        let delivery_history_capacity = webhook_batch_capacity
+            .checked_add(pending_reply_capacity)
+            .and_then(|capacity| capacity.checked_add(inbound_capacity.get()))
+            .ok_or(ChannelError::Configuration(
+                ConfigurationError::InvalidAdapterConfiguration,
+            ))?;
         Ok(Self {
             account_id,
             phone_number_id,
@@ -307,8 +320,9 @@ impl<T, C> WhatsAppChannel<T, C> {
             clock,
             lifecycle: ConnectionStateMachine::new(),
             inbound: BoundedQueue::new(inbound_capacity),
-            delivery_history_capacity: inbound_capacity.get(),
-            pending_reply_capacity: inbound_capacity.get().saturating_mul(2),
+            webhook_batch_capacity,
+            delivery_history_capacity,
+            pending_reply_capacity,
             completed_message_ids: VecDeque::new(),
             pending_replies: VecDeque::new(),
         })
@@ -497,7 +511,8 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
     /// # Errors
     ///
     /// Returns [`ChannelError::NotConnected`] unless started and typed protocol
-    /// errors for over-large or malformed JSON.
+    /// errors for over-large or malformed JSON, including a processable-message
+    /// count above the adapter's bounded deduplication window.
     pub fn ingest_webhook(
         &mut self,
         payload: &[u8],
@@ -524,6 +539,40 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
             ));
             ChannelError::Protocol(ProtocolErrorKind::MalformedResponse)
         })?;
+        let message_count = body
+            .entry
+            .iter()
+            .flat_map(|entry| &entry.changes)
+            .filter_map(|change| change.value.as_ref())
+            .try_fold(0_usize, |count, value| {
+                let processable = value
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        message.kind == Some("text")
+                            && message.from != self.phone_number_id
+                            && !invalid_routing_identifier(message.from)
+                            && !invalid_routing_identifier(message.id)
+                            && message
+                                .text
+                                .and_then(|text| text.body)
+                                .map(str::trim)
+                                .is_some_and(|text| !text.is_empty())
+                    })
+                    .count();
+                count.checked_add(processable)
+            })
+            .filter(|count| *count <= self.webhook_batch_capacity);
+        if message_count.is_none() {
+            diagnostics.record(self.diagnostic(
+                DiagnosticLevel::Warning,
+                DiagnosticCode::MalformedPayload,
+                None,
+                None,
+                None,
+            ));
+            return Err(ChannelError::Protocol(ProtocolErrorKind::PayloadTooLarge));
+        }
         if body
             .entry
             .iter()
@@ -553,10 +602,7 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
                 };
                 for message in value.messages {
                     stats.messages += 1;
-                    if self
-                        .completed_message_ids
-                        .iter()
-                        .any(|message_id| message_id == message.id)
+                    if self.refresh_completed(message.id)
                         || self.inbound.iter().any(|queued| queued.id == message.id)
                         || self
                             .pending_replies
@@ -765,10 +811,28 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
     }
 
     fn remember_completed(&mut self, message_id: String) {
+        if self.refresh_completed(&message_id) {
+            return;
+        }
         if self.completed_message_ids.len() == self.delivery_history_capacity {
             self.completed_message_ids.pop_front();
         }
         self.completed_message_ids.push_back(message_id);
+    }
+
+    fn refresh_completed(&mut self, message_id: &str) -> bool {
+        let Some(index) = self
+            .completed_message_ids
+            .iter()
+            .position(|completed| completed == message_id)
+        else {
+            return false;
+        };
+        let Some(completed) = self.completed_message_ids.remove(index) else {
+            return false;
+        };
+        self.completed_message_ids.push_back(completed);
+        true
     }
 
     fn send_text_to(
