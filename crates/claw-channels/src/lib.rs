@@ -41,8 +41,8 @@ pub use commands::{
 pub use diagnostics::{DiagnosticCode, DiagnosticLevel, DiagnosticSink, OperatorDiagnostic};
 pub use discord::{
     DISCORD_CLIENT_LABEL, DISCORD_RECONNECT_DELAY, DISCORD_SEND_REQUEST_TIMEOUT, DiscordChannel,
-    DiscordCreateMessageRequest, DiscordGatewayPhase, DiscordGatewayRequest, DiscordPacketOutcome,
-    DiscordTransport,
+    DiscordCreateMessageRequest, DiscordGatewayClose, DiscordGatewayPhase, DiscordGatewayRequest,
+    DiscordPacketOutcome, DiscordTransport,
 };
 pub use lifecycle::SupervisedChannel;
 pub use message_processor::{

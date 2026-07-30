@@ -23,7 +23,7 @@ use claw_http_api::{
     LegacySystemInfo, LegacyTeamsPort, LegacyTeamsRequestContext, LegacyWhatsAppPort, PortError,
     PortErrorKind, PortFuture,
 };
-use claw_provider_sdk::http::{Body, HttpRequest, HttpTransport, Method};
+use claw_provider_sdk::http::{Body, HttpRequest, HttpSendStage, HttpTransport, Method};
 use claw_provider_sdk::{BoundSecret, CancelToken, Operation, Origin, SecretString};
 use claw_providers::{DeviceFlow, DeviceFlowSession};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
@@ -962,7 +962,7 @@ impl WhatsAppTransport for GraphWhatsAppTransport {
                 return Err(WhatsAppSendError::CancelledBeforeSend);
             }
             self.transport
-                .send("whatsapp", Operation::Transport, http_request, &cancel)
+                .send_with_stage("whatsapp", Operation::Transport, http_request, &cancel)
                 .await
                 .map_err(|error| classify_whatsapp_send_failure(&error))
         })?;
@@ -973,14 +973,25 @@ impl WhatsAppTransport for GraphWhatsAppTransport {
     }
 }
 
-fn classify_whatsapp_send_failure(error: &claw_provider_sdk::ProviderError) -> WhatsAppSendError {
-    let kind = error.kind();
-    let error = if kind == claw_provider_sdk::ErrorKind::Cancelled {
+fn classify_whatsapp_send_failure(
+    error: &claw_provider_sdk::http::HttpSendError,
+) -> WhatsAppSendError {
+    let provider_error = error.error();
+    let stage = error.stage();
+    let channel_error = if provider_error.kind() == claw_provider_sdk::ErrorKind::Cancelled {
         ChannelError::Transport(claw_channel_sdk::TransportErrorKind::Io)
     } else {
-        provider_channel_error(error)
+        provider_channel_error(provider_error)
     };
-    WhatsAppSendError::AmbiguousAfterSend(error)
+    match stage {
+        HttpSendStage::NotSent
+            if provider_error.kind() == claw_provider_sdk::ErrorKind::Cancelled =>
+        {
+            WhatsAppSendError::CancelledBeforeSend
+        }
+        HttpSendStage::NotSent => WhatsAppSendError::FailedBeforeSend(channel_error),
+        HttpSendStage::MayHaveTransmitted => WhatsAppSendError::AmbiguousAfterSend(channel_error),
+    }
 }
 
 /// Origin-bound `WhatsApp` Graph API sender using the integrated channel state machine.

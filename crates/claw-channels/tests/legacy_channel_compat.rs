@@ -7,17 +7,17 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use claw_channel_sdk::{
-    ApprovedOrigin, Channel, ChannelCredential, ChannelError, ConnectionState, CredentialBinding,
-    CredentialBindingError, CredentialKind, CredentialRequest, InboundMessage, NetworkOrigin,
-    OriginTrustError, OriginTrustStore, OutboundMessage, ProtocolErrorKind, TransportErrorKind,
-    authorize_origin,
+    ApprovedOrigin, Channel, ChannelCredential, ChannelError, ConfigurationError, ConnectionState,
+    CredentialBinding, CredentialBindingError, CredentialKind, CredentialRequest, InboundMessage,
+    NetworkOrigin, OriginTrustError, OriginTrustStore, OutboundMessage, ProtocolErrorKind,
+    TransportErrorKind, authorize_origin,
 };
 use claw_channels::{
     AuthenticationPrompt, COMMON_FAILURE_REPLY, ConversationService, DiagnosticCode,
-    DiagnosticSink, DiscordChannel, DiscordCreateMessageRequest, DiscordGatewayPhase,
-    DiscordGatewayRequest, DiscordPacketOutcome, DiscordTransport, OperatorDiagnostic,
-    ProviderResponse, ReplySource, TEAMS_FAILURE_REPLY, TEAMS_GREETING, TeamsAction,
-    TeamsActivityError, TeamsActivityHandler, TeamsActivityOutcome, TelegramChannel,
+    DiagnosticSink, DiscordChannel, DiscordCreateMessageRequest, DiscordGatewayClose,
+    DiscordGatewayPhase, DiscordGatewayRequest, DiscordPacketOutcome, DiscordTransport,
+    OperatorDiagnostic, ProviderResponse, ReplySource, TEAMS_FAILURE_REPLY, TEAMS_GREETING,
+    TeamsAction, TeamsActivityError, TeamsActivityHandler, TeamsActivityOutcome, TelegramChannel,
     TelegramPollRequest, TelegramSendRequest, TelegramTransport, UnixClock,
     WHATSAPP_MAX_MESSAGES_PER_WEBHOOK, WhatsAppChannel, WhatsAppSendError, WhatsAppSendRequest,
     WhatsAppTransport, WhatsAppVerificationQuery, WhatsAppVerificationResponse,
@@ -285,6 +285,7 @@ struct GatewayRecord {
 struct DiscordFixture {
     open_results: VecDeque<Result<(), ChannelError>>,
     opens: Rc<Cell<usize>>,
+    open_urls: Rc<RefCell<Vec<String>>>,
     closes: Rc<Cell<usize>>,
     gateway: Rc<RefCell<Vec<GatewayRecord>>>,
     rest: Rc<RefCell<Vec<String>>>,
@@ -293,7 +294,7 @@ struct DiscordFixture {
 
 impl DiscordTransport for DiscordFixture {
     fn open_gateway(&mut self, gateway_url: &str) -> Result<(), ChannelError> {
-        assert_eq!(gateway_url, "wss://gateway.discord.gg/?v=10&encoding=json");
+        self.open_urls.borrow_mut().push(gateway_url.to_owned());
         self.opens.set(self.opens.get() + 1);
         self.open_results.pop_front().unwrap_or(Ok(()))
     }
@@ -336,6 +337,7 @@ impl DiscordTransport for DiscordFixture {
 struct DiscordHarness {
     channel: DiscordChannel<DiscordFixture, FixedClock>,
     opens: Rc<Cell<usize>>,
+    open_urls: Rc<RefCell<Vec<String>>>,
     closes: Rc<Cell<usize>>,
     gateway: Rc<RefCell<Vec<GatewayRecord>>>,
     rest: Rc<RefCell<Vec<String>>>,
@@ -347,6 +349,7 @@ fn discord_channel(
     max_reconnect_attempts: u32,
 ) -> DiscordHarness {
     let opens = Rc::new(Cell::new(0));
+    let open_urls = Rc::new(RefCell::new(Vec::new()));
     let closes = Rc::new(Cell::new(0));
     let gateway = Rc::new(RefCell::new(Vec::new()));
     let rest = Rc::new(RefCell::new(Vec::new()));
@@ -360,6 +363,7 @@ fn discord_channel(
         DiscordFixture {
             open_results,
             opens: Rc::clone(&opens),
+            open_urls: Rc::clone(&open_urls),
             closes: Rc::clone(&closes),
             gateway: Rc::clone(&gateway),
             rest: Rc::clone(&rest),
@@ -373,6 +377,7 @@ fn discord_channel(
     DiscordHarness {
         channel,
         opens,
+        open_urls,
         closes,
         gateway,
         rest,
@@ -389,6 +394,7 @@ fn discord_gateway_contains_bad_packets_heartbeats_reconnects_and_filters_bots()
         gateway,
         rest,
         debug,
+        ..
     } = discord_channel(VecDeque::from([Ok(()), Ok(())]), 2);
     let gateway_credential =
         token_credential("discord", "gateway.discord.gg", "discord-gateway-secret");
@@ -437,7 +443,7 @@ fn discord_gateway_contains_bad_packets_heartbeats_reconnects_and_filters_bots()
     );
     assert_eq!(
         channel.handle_gateway_packet(
-            br#"{"op":0,"t":"READY","s":7,"d":{"session_id":"session-1"}}"#,
+            br#"{"op":0,"t":"READY","s":7,"d":{"session_id":"session-1","resume_gateway_url":"wss://gateway-us-east1-b.discord.gg"}}"#,
             Duration::ZERO,
             &gateway_credential,
             &mut diagnostics,
@@ -623,7 +629,7 @@ fn establish_discord_session(
     );
     assert_eq!(
         channel.handle_gateway_packet(
-            br#"{"op":0,"t":"READY","s":41,"d":{"session_id":"resumable-session"}}"#,
+            br#"{"op":0,"t":"READY","s":41,"d":{"session_id":"resumable-session","resume_gateway_url":"wss://gateway-us-east1-b.discord.gg"}}"#,
             Duration::ZERO,
             credential,
             &mut (),
@@ -642,6 +648,7 @@ fn discord_reconnect_and_resumable_invalid_session_send_resume() {
     ] {
         let DiscordHarness {
             mut channel,
+            open_urls,
             gateway,
             ..
         } = discord_channel(VecDeque::from([Ok(()), Ok(())]), 2);
@@ -658,7 +665,15 @@ fn discord_reconnect_and_resumable_invalid_session_send_resume() {
         );
         assert_eq!(channel.session_id(), Some("resumable-session"));
         assert_eq!(channel.sequence(), Some(41));
+        assert_eq!(
+            channel.resume_gateway_url(),
+            Some("wss://gateway-us-east1-b.discord.gg?v=10&encoding=json")
+        );
         assert_eq!(channel.tick(Duration::from_secs(4), &mut ()), Ok(true));
+        assert_eq!(
+            open_urls.borrow().last().map(String::as_str),
+            Some("wss://gateway-us-east1-b.discord.gg?v=10&encoding=json")
+        );
         channel.gateway_opened(&mut ()).expect("reopened socket");
         assert_eq!(
             channel.handle_gateway_packet(
@@ -669,6 +684,7 @@ fn discord_reconnect_and_resumable_invalid_session_send_resume() {
             ),
             Ok(DiscordPacketOutcome::Identified)
         );
+        assert_eq!(channel.phase(), DiscordGatewayPhase::Resuming);
         assert_eq!(
             gateway.borrow().last(),
             Some(&GatewayRecord {
@@ -681,7 +697,19 @@ fn discord_reconnect_and_resumable_invalid_session_send_resume() {
         );
         assert_eq!(
             channel.handle_gateway_packet(
-                br#"{"op":0,"t":"RESUMED","s":42,"d":{}}"#,
+                br#"{"op":0,"t":"MESSAGE_CREATE","s":42,"d":{"id":"replayed","channel_id":"room","content":"replayed message","author":{"id":"user","username":"octocat"}}}"#,
+                Duration::from_secs(4),
+                &gateway_credential,
+                &mut (),
+            ),
+            Ok(DiscordPacketOutcome::MessageQueued)
+        );
+        assert_eq!(channel.sequence(), Some(42));
+        assert_eq!(channel.queued_inbound(), 1);
+        assert_eq!(channel.state(), ConnectionState::Connecting);
+        assert_eq!(
+            channel.handle_gateway_packet(
+                br#"{"op":0,"t":"RESUMED","s":43,"d":{}}"#,
                 Duration::from_secs(4),
                 &gateway_credential,
                 &mut (),
@@ -689,6 +717,15 @@ fn discord_reconnect_and_resumable_invalid_session_send_resume() {
             Ok(DiscordPacketOutcome::Ready)
         );
         assert_eq!(channel.state(), ConnectionState::Connected);
+        assert_eq!(channel.sequence(), Some(43));
+        assert_eq!(
+            channel
+                .poll_inbound()
+                .expect("resumed")
+                .expect("replayed dispatch")
+                .id,
+            "replayed"
+        );
     }
 }
 
@@ -730,6 +767,7 @@ fn discord_server_heartbeat_request_is_answered_immediately() {
 fn discord_nonresumable_invalid_session_falls_back_to_identify() {
     let DiscordHarness {
         mut channel,
+        open_urls,
         gateway,
         ..
     } = discord_channel(VecDeque::from([Ok(()), Ok(())]), 2);
@@ -748,7 +786,12 @@ fn discord_nonresumable_invalid_session_falls_back_to_identify() {
     );
     assert_eq!(channel.session_id(), None);
     assert_eq!(channel.sequence(), None);
+    assert_eq!(channel.resume_gateway_url(), None);
     assert_eq!(channel.tick(Duration::from_secs(4), &mut ()), Ok(true));
+    assert_eq!(
+        open_urls.borrow().last().map(String::as_str),
+        Some("wss://gateway.discord.gg/?v=10&encoding=json")
+    );
     channel.gateway_opened(&mut ()).expect("reopened socket");
     assert_eq!(
         channel.handle_gateway_packet(
@@ -760,6 +803,140 @@ fn discord_nonresumable_invalid_session_falls_back_to_identify() {
         Ok(DiscordPacketOutcome::Identified)
     );
     assert_eq!(gateway.borrow().last().map(|record| record.opcode), Some(2));
+}
+
+#[test]
+fn discord_close_codes_preserve_invalidate_or_terminate_sessions() {
+    let gateway_credential =
+        token_credential("discord", "gateway.discord.gg", "discord-gateway-secret");
+
+    let DiscordHarness {
+        mut channel,
+        open_urls,
+        ..
+    } = discord_channel(VecDeque::from([Ok(()), Ok(())]), 2);
+    establish_discord_session(&mut channel, &gateway_credential);
+    assert_eq!(
+        channel.gateway_closed_with(
+            Duration::from_secs(1),
+            DiscordGatewayClose::websocket(4000, "transient"),
+            &mut (),
+        ),
+        Ok(true)
+    );
+    assert_eq!(channel.last_close().code(), Some(4000));
+    assert_eq!(channel.last_close().reason(), "transient");
+    assert_eq!(channel.session_id(), Some("resumable-session"));
+    assert_eq!(channel.tick(Duration::from_secs(4), &mut ()), Ok(true));
+    assert_eq!(
+        open_urls.borrow().last().map(String::as_str),
+        Some("wss://gateway-us-east1-b.discord.gg?v=10&encoding=json")
+    );
+
+    for code in [4003, 4005, 4007, 4009] {
+        let DiscordHarness {
+            mut channel,
+            open_urls,
+            ..
+        } = discord_channel(VecDeque::from([Ok(()), Ok(())]), 2);
+        establish_discord_session(&mut channel, &gateway_credential);
+        assert_eq!(
+            channel.gateway_closed_with(
+                Duration::from_secs(1),
+                DiscordGatewayClose::websocket(code, "session invalid"),
+                &mut (),
+            ),
+            Ok(true)
+        );
+        assert_eq!(channel.session_id(), None, "close code {code}");
+        assert_eq!(channel.sequence(), None, "close code {code}");
+        assert_eq!(channel.resume_gateway_url(), None, "close code {code}");
+        assert_eq!(channel.tick(Duration::from_secs(4), &mut ()), Ok(true));
+        assert_eq!(
+            open_urls.borrow().last().map(String::as_str),
+            Some("wss://gateway.discord.gg/?v=10&encoding=json"),
+            "close code {code}"
+        );
+    }
+
+    for (code, expected) in [
+        (4004, ChannelError::Authentication),
+        (
+            4010,
+            ChannelError::Configuration(ConfigurationError::InvalidAdapterConfiguration),
+        ),
+        (
+            4011,
+            ChannelError::Configuration(ConfigurationError::InvalidAdapterConfiguration),
+        ),
+        (
+            4012,
+            ChannelError::Configuration(ConfigurationError::InvalidAdapterConfiguration),
+        ),
+        (
+            4013,
+            ChannelError::Configuration(ConfigurationError::InvalidAdapterConfiguration),
+        ),
+        (
+            4014,
+            ChannelError::Configuration(ConfigurationError::InvalidAdapterConfiguration),
+        ),
+    ] {
+        let DiscordHarness { mut channel, .. } = discord_channel(VecDeque::from([Ok(())]), 2);
+        establish_discord_session(&mut channel, &gateway_credential);
+        assert_eq!(
+            channel.gateway_closed_with(
+                Duration::from_secs(1),
+                DiscordGatewayClose::websocket(code, "terminal"),
+                &mut (),
+            ),
+            Err(expected),
+            "close code {code}"
+        );
+        assert_eq!(
+            channel.state(),
+            ConnectionState::Closed,
+            "close code {code}"
+        );
+        assert_eq!(
+            channel.phase(),
+            DiscordGatewayPhase::ReconnectExhausted,
+            "close code {code}"
+        );
+        assert_eq!(channel.session_id(), None, "close code {code}");
+        assert_eq!(channel.resume_gateway_url(), None, "close code {code}");
+    }
+}
+
+#[test]
+fn discord_rejects_untrusted_ready_resume_gateway_urls() {
+    let DiscordHarness { mut channel, .. } = discord_channel(VecDeque::from([Ok(())]), 2);
+    let gateway_credential =
+        token_credential("discord", "gateway.discord.gg", "discord-gateway-secret");
+    channel
+        .start(Duration::ZERO, &mut ())
+        .expect("opening started");
+    channel.gateway_opened(&mut ()).expect("socket opened");
+    channel
+        .handle_gateway_packet(
+            br#"{"op":10,"t":null,"s":null,"d":{"heartbeat_interval":1000}}"#,
+            Duration::ZERO,
+            &gateway_credential,
+            &mut (),
+        )
+        .expect("identified");
+
+    assert_eq!(
+        channel.handle_gateway_packet(
+            br#"{"op":0,"t":"READY","s":1,"d":{"session_id":"session","resume_gateway_url":"wss://discord.gg.evil.test"}}"#,
+            Duration::ZERO,
+            &gateway_credential,
+            &mut (),
+        ),
+        Ok(DiscordPacketOutcome::Malformed)
+    );
+    assert_eq!(channel.state(), ConnectionState::Connecting);
+    assert_eq!(channel.session_id(), None);
 }
 
 struct WhatsAppFixture {

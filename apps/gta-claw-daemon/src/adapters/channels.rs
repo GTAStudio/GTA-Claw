@@ -9,16 +9,16 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use claw_channel_sdk::{
-    ApprovedOrigin, Channel, ChannelCredential, ChannelError, CredentialBinding, CredentialKind,
-    CredentialRequest, InboundMessage, NetworkOrigin, OriginTrustError, OriginTrustStore,
-    OutboundMessage, TransportErrorKind, authorize_origin,
+    ApprovedOrigin, Channel, ChannelCredential, ChannelError, ConnectionState, CredentialBinding,
+    CredentialKind, CredentialRequest, InboundMessage, NetworkOrigin, OriginTrustError,
+    OriginTrustStore, OutboundMessage, TransportErrorKind, authorize_origin,
 };
 use claw_channels::{
     AuthenticationPrompt, DiagnosticLevel, DiagnosticSink, DiscordChannel,
-    DiscordCreateMessageRequest, DiscordGatewayRequest, DiscordPacketOutcome, DiscordTransport,
-    DispatchInput, DispatchOutcome, MAX_PROVIDER_RESPONSE_BYTES, OperatorDiagnostic,
-    ProviderResponse, SystemClock, TelegramChannel, TelegramPollRequest, TelegramSendRequest,
-    TelegramTransport, dispatch_incoming, segment_outbound_text_iter,
+    DiscordCreateMessageRequest, DiscordGatewayClose, DiscordGatewayRequest, DiscordPacketOutcome,
+    DiscordTransport, DispatchInput, DispatchOutcome, MAX_PROVIDER_RESPONSE_BYTES,
+    OperatorDiagnostic, ProviderResponse, SystemClock, TelegramChannel, TelegramPollRequest,
+    TelegramSendRequest, TelegramTransport, dispatch_incoming, segment_outbound_text_iter,
 };
 use claw_provider_sdk::http::{
     Body, HttpRequest, HttpTransport, Method, ProxyPolicy, TransportConfig,
@@ -866,7 +866,7 @@ enum DiscordCommand {
 enum DiscordEvent {
     Opened,
     Packet(Vec<u8>),
-    Closed,
+    Closed(DiscordGatewayClose),
 }
 
 #[derive(Clone)]
@@ -1044,13 +1044,16 @@ async fn run_discord_socket(
             continue;
         };
         let Ok((socket, _response)) = tokio_tungstenite::connect_async(url).await else {
-            let _ = events.send(DiscordEvent::Closed).await;
+            let _ = events
+                .send(DiscordEvent::Closed(DiscordGatewayClose::transport_lost()))
+                .await;
             continue;
         };
         let (mut writer, mut reader) = socket.split();
         if events.send(DiscordEvent::Opened).await.is_err() {
             return;
         }
+        let mut close = DiscordGatewayClose::transport_lost();
         loop {
             tokio::select! {
                 () = cancellation.cancelled() => {
@@ -1086,12 +1089,22 @@ async fn run_discord_socket(
                             break;
                         }
                     }
-                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                    Some(Ok(Message::Close(frame))) => {
+                        close = frame.map_or_else(
+                            DiscordGatewayClose::transport_lost,
+                            |frame| DiscordGatewayClose::websocket(
+                                u16::from(frame.code),
+                                frame.reason.to_string(),
+                            ),
+                        );
+                        break;
+                    }
+                    Some(Err(_)) | None => break,
                     Some(Ok(_)) => {}
                 }
             }
         }
-        let _ = events.send(DiscordEvent::Closed).await;
+        let _ = events.send(DiscordEvent::Closed(close)).await;
     }
 }
 
@@ -1142,8 +1155,9 @@ async fn run_discord(
                         &gateway_credential,
                         &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
                     ).map(Some),
-                    DiscordEvent::Closed => channel.gateway_closed(
+                    DiscordEvent::Closed(close) => channel.gateway_closed_with(
                         started.elapsed(),
+                        close,
                         &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
                     ).map(|_| None),
                 };
@@ -1154,6 +1168,13 @@ async fn run_discord(
                         }
                     }
                     Ok(_) => {}
+                    Err(error) if channel.state() == ConnectionState::Closed => {
+                        diagnostics.record(format!("Discord event failed terminally: {error}"));
+                        if let Some(ready) = ready.take() {
+                            let _ = ready.send(Err(error.to_string()));
+                        }
+                        break;
+                    }
                     Err(error) => diagnostics.record(format!("Discord event failed: {error}")),
                 }
                 if let Err(error) = enqueue_discord(

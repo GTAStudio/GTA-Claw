@@ -22,12 +22,12 @@ use super::ports::{
     LegacyTeamsRequestContext,
 };
 use super::rate_limit::RateLimiter;
-use crate::ServingStatePort;
 use crate::auth::bearer_token;
 use crate::http_support::{
     CancelOnDrop, close_connection_response, drain_request_body, json_response, read_body,
     read_json_value, rejected_response,
 };
+use crate::{PortError, PortErrorKind, ServingStatePort};
 
 const CHAT_HELP: &str = "GTA-Claw HTTP Chat Help\n\nUse: POST /chat with JSON body\n- message (or text/prompt): your question\n- conversation_id (optional): keep context across turns\n\nExamples:\n1) {\"message\":\"hello\"}\n2) {\"message\":\"continue\",\"conversation_id\":\"demo-1\"}\n\nAuth:\n- If not authenticated, call GET /auth/device and complete GitHub Device Flow.";
 const LEGACY_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);

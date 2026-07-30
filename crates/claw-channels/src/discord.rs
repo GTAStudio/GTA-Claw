@@ -35,12 +35,72 @@ pub enum DiscordGatewayPhase {
     Idle,
     /// The socket opened and the adapter is waiting for HELLO.
     AwaitingHello,
-    /// IDENTIFY or RESUME was sent and READY/RESUMED has not arrived.
+    /// IDENTIFY was sent and READY has not arrived.
     Identifying,
+    /// RESUME was sent; replayed dispatches may arrive before RESUMED.
+    Resuming,
     /// READY established a usable Discord session.
     Ready,
     /// No more automatic reconnect attempts remain.
     ReconnectExhausted,
+}
+
+/// WebSocket close metadata retained for Discord reconnect policy.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DiscordGatewayClose {
+    code: Option<u16>,
+    reason: String,
+}
+
+impl DiscordGatewayClose {
+    /// Represents a socket loss without a peer close frame.
+    #[must_use]
+    pub const fn transport_lost() -> Self {
+        Self {
+            code: None,
+            reason: String::new(),
+        }
+    }
+
+    /// Captures one peer close frame.
+    #[must_use]
+    pub fn websocket(code: u16, reason: impl Into<String>) -> Self {
+        Self {
+            code: Some(code),
+            reason: reason.into(),
+        }
+    }
+
+    /// Returns the WebSocket close code when the peer supplied one.
+    #[must_use]
+    pub const fn code(&self) -> Option<u16> {
+        self.code
+    }
+
+    /// Returns the peer close reason.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl Default for DiscordGatewayClose {
+    fn default() -> Self {
+        Self::transport_lost()
+    }
+}
+
+impl Debug for DiscordGatewayClose {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscordGatewayClose")
+            .field("code", &self.code)
+            .field(
+                "reason",
+                &format_args!("[REDACTED; {} bytes]", self.reason.len()),
+            )
+            .finish()
+    }
 }
 
 /// Result of handling one Gateway packet.
@@ -298,6 +358,8 @@ pub struct DiscordChannel<T, C> {
     phase: DiscordGatewayPhase,
     sequence: Option<i64>,
     session_id: Option<String>,
+    resume_gateway_url: Option<String>,
+    last_close: DiscordGatewayClose,
     heartbeat_interval: Option<Duration>,
     next_heartbeat: Option<Duration>,
     awaiting_heartbeat_ack: bool,
@@ -351,6 +413,8 @@ impl<T, C> DiscordChannel<T, C> {
             phase: DiscordGatewayPhase::Idle,
             sequence: None,
             session_id: None,
+            resume_gateway_url: None,
+            last_close: DiscordGatewayClose::transport_lost(),
             heartbeat_interval: None,
             next_heartbeat: None,
             awaiting_heartbeat_ack: false,
@@ -383,6 +447,18 @@ impl<T, C> DiscordChannel<T, C> {
     #[must_use]
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// Returns the validated Gateway URL supplied by READY for RESUME.
+    #[must_use]
+    pub fn resume_gateway_url(&self) -> Option<&str> {
+        self.resume_gateway_url.as_deref()
+    }
+
+    /// Returns the latest propagated WebSocket close metadata.
+    #[must_use]
+    pub const fn last_close(&self) -> &DiscordGatewayClose {
+        &self.last_close
     }
 
     /// Returns the scheduled reconnect deadline.
@@ -531,6 +607,25 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
         now: Duration,
         diagnostics: &mut impl DiagnosticSink,
     ) -> Result<bool, ChannelError> {
+        self.gateway_closed_with(now, DiscordGatewayClose::transport_lost(), diagnostics)
+    }
+
+    /// Records a socket close frame and applies Discord's reconnect policy.
+    ///
+    /// Close codes 4003, 4005, 4007, and 4009 invalidate the resumable session.
+    /// Authentication, sharding, API-version, and intent failures are terminal.
+    /// All other transport and peer closes preserve a resumable session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an authentication or configuration error for terminal close
+    /// codes, or a lifecycle error for an out-of-order close.
+    pub fn gateway_closed_with(
+        &mut self,
+        now: Duration,
+        close: DiscordGatewayClose,
+        diagnostics: &mut impl DiagnosticSink,
+    ) -> Result<bool, ChannelError> {
         if self.lifecycle.state() == ConnectionState::Closed {
             return Ok(false);
         }
@@ -540,6 +635,7 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
         self.lifecycle
             .apply(LifecycleEvent::ConnectionLost, &mut ())?;
         self.reset_connection_protocol();
+        self.last_close = close;
         diagnostics.record(self.diagnostic(
             DiagnosticLevel::Warning,
             DiagnosticCode::GatewayDisconnected,
@@ -547,7 +643,28 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
             None,
             None,
         ));
-        self.schedule_reconnect(now, diagnostics)
+        match discord_close_policy(self.last_close.code()) {
+            DiscordClosePolicy::Resume => self.schedule_reconnect(now, diagnostics),
+            DiscordClosePolicy::Reidentify => {
+                self.clear_resume_state();
+                self.schedule_reconnect(now, diagnostics)
+            }
+            DiscordClosePolicy::Terminal(error) => {
+                self.clear_resume_state();
+                self.reconnect_due = None;
+                self.phase = DiscordGatewayPhase::ReconnectExhausted;
+                self.lifecycle
+                    .apply(LifecycleEvent::ShutdownRequested, &mut ())?;
+                diagnostics.record(self.diagnostic(
+                    DiagnosticLevel::Error,
+                    DiagnosticCode::ConnectionFailed,
+                    None,
+                    self.last_close.code(),
+                    None,
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// Advances reconnect and heartbeat timers using caller-supplied monotonic time.
@@ -567,7 +684,8 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
             self.reconnect_due = None;
             self.lifecycle
                 .apply(LifecycleEvent::ConnectRequested, &mut ())?;
-            if let Err(error) = self.transport.open_gateway(&self.gateway_url) {
+            let gateway_url = self.reconnect_gateway_url().to_owned();
+            if let Err(error) = self.transport.open_gateway(&gateway_url) {
                 self.lifecycle
                     .apply(LifecycleEvent::ConnectionLost, &mut ())?;
                 self.schedule_reconnect(now, diagnostics)?;
@@ -654,8 +772,7 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
                     return Ok(DiscordPacketOutcome::Malformed);
                 };
                 if !resumable {
-                    self.sequence = None;
-                    self.session_id = None;
+                    self.clear_resume_state();
                 }
                 self.request_reconnect(now, diagnostics)
             }
@@ -686,6 +803,7 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
         self.lifecycle
             .apply(LifecycleEvent::ShutdownRequested, &mut ())?;
         self.reset_connection_protocol();
+        self.clear_resume_state();
         self.reconnect_due = None;
         self.inbound.clear();
         diagnostics.record(self.diagnostic(
@@ -771,7 +889,11 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
         self.heartbeat_interval = Some(heartbeat_interval);
         self.next_heartbeat = Some(now.saturating_add(heartbeat_interval));
         self.awaiting_heartbeat_ack = false;
-        self.phase = DiscordGatewayPhase::Identifying;
+        self.phase = if resumable_session.is_some() {
+            DiscordGatewayPhase::Resuming
+        } else {
+            DiscordGatewayPhase::Identifying
+        };
         Ok(DiscordPacketOutcome::Identified)
     }
 
@@ -786,7 +908,10 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
                 let ready: DiscordReady<'_> = match serde_json::from_str::<DiscordReady<'_>>(data) {
                     Ok(ready)
                         if !invalid_routing_identifier(ready.session_id)
-                            && ready.session_id.len() <= 256 =>
+                            && ready.session_id.len() <= 256
+                            && ready.resume_gateway_url.is_none_or(|url| {
+                                validated_resume_gateway_url(url, &self.gateway_origin).is_some()
+                            }) =>
                     {
                         ready
                     }
@@ -797,19 +922,27 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
                 };
                 self.lifecycle.apply(LifecycleEvent::Established, &mut ())?;
                 self.session_id = Some(ready.session_id.to_owned());
+                self.resume_gateway_url = ready
+                    .resume_gateway_url
+                    .and_then(|url| validated_resume_gateway_url(url, &self.gateway_origin));
                 self.phase = DiscordGatewayPhase::Ready;
                 self.reconnect_attempts = 0;
                 Ok(DiscordPacketOutcome::Ready)
             }
             Some("RESUMED")
-                if self.phase == DiscordGatewayPhase::Identifying && self.session_id.is_some() =>
+                if self.phase == DiscordGatewayPhase::Resuming && self.session_id.is_some() =>
             {
                 self.lifecycle.apply(LifecycleEvent::Established, &mut ())?;
                 self.phase = DiscordGatewayPhase::Ready;
                 self.reconnect_attempts = 0;
                 Ok(DiscordPacketOutcome::Ready)
             }
-            Some("MESSAGE_CREATE") if self.phase == DiscordGatewayPhase::Ready => {
+            Some("MESSAGE_CREATE")
+                if matches!(
+                    self.phase,
+                    DiscordGatewayPhase::Ready | DiscordGatewayPhase::Resuming
+                ) =>
+            {
                 let Ok(message) = serde_json::from_str::<DiscordMessage<'_>>(data) else {
                     self.record_malformed(diagnostics);
                     return Ok(DiscordPacketOutcome::Malformed);
@@ -952,6 +1085,22 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
         self.heartbeat_interval = None;
         self.next_heartbeat = None;
         self.awaiting_heartbeat_ack = false;
+    }
+
+    fn clear_resume_state(&mut self) {
+        self.sequence = None;
+        self.session_id = None;
+        self.resume_gateway_url = None;
+    }
+
+    fn reconnect_gateway_url(&self) -> &str {
+        if self.session_id.is_some() {
+            self.resume_gateway_url
+                .as_deref()
+                .unwrap_or(&self.gateway_url)
+        } else {
+            &self.gateway_url
+        }
     }
 
     fn record_malformed(&self, diagnostics: &mut impl DiagnosticSink) {
@@ -1098,6 +1247,7 @@ struct DiscordHello {
 #[derive(Deserialize)]
 struct DiscordReady<'a> {
     session_id: &'a str,
+    resume_gateway_url: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -1120,6 +1270,54 @@ struct DiscordAuthor<'a> {
 #[derive(Deserialize)]
 struct DiscordCreatedMessage<'a> {
     id: &'a str,
+}
+
+enum DiscordClosePolicy {
+    Resume,
+    Reidentify,
+    Terminal(ChannelError),
+}
+
+const fn discord_close_policy(code: Option<u16>) -> DiscordClosePolicy {
+    match code {
+        Some(4003 | 4005 | 4007 | 4009) => DiscordClosePolicy::Reidentify,
+        Some(4004) => DiscordClosePolicy::Terminal(ChannelError::Authentication),
+        Some(4010..=4014) => DiscordClosePolicy::Terminal(ChannelError::Configuration(
+            ConfigurationError::InvalidAdapterConfiguration,
+        )),
+        Some(_) | None => DiscordClosePolicy::Resume,
+    }
+}
+
+fn validated_resume_gateway_url(
+    gateway_url: &str,
+    bootstrap_origin: &ApprovedOrigin,
+) -> Option<String> {
+    if gateway_url.bytes().any(|byte| byte <= b' ' || byte == 0x7f) || gateway_url.contains('#') {
+        return None;
+    }
+    let remainder = gateway_url.strip_prefix("wss://")?;
+    let authority = remainder
+        .split(['/', '?'])
+        .next()
+        .filter(|authority| !authority.is_empty() && !authority.contains('@'))?;
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok()?),
+        None => (authority, 443),
+    };
+    let bootstrap_host = bootstrap_origin.network_origin().host();
+    if port != 443
+        || !(host.eq_ignore_ascii_case(bootstrap_host)
+            || host.eq_ignore_ascii_case("discord.gg")
+            || host.to_ascii_lowercase().ends_with(".discord.gg"))
+    {
+        return None;
+    }
+    let mut normalized = gateway_url.to_owned();
+    if !gateway_url.contains('?') {
+        normalized.push_str("?v=10&encoding=json");
+    }
+    Some(normalized)
 }
 
 fn require_gateway_origin(
