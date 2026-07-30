@@ -258,6 +258,31 @@ exact historical ceiling of 18 `src/**/*.ts` files plus `Dockerfile`, `package.j
 Tracked symbolic links, gitlinks, new package-manager artifacts, and new Node workflow or local
 action debt fail from the base side.
 
+### Minimal Phase-A1 PR226 admission
+
+Phase A1 is based on current main
+`5e85d6d080712c82dc0814985df1472bdfab5dd9` and carries actual reviewed files rather than
+preauthorizing later product branches.
+
+PR226 source `4f91f20348b030cdf6817bc1bb9c527a999a25d2` contributes only
+`crates/claw-windows-file-id/Cargo.toml` and `src/lib.rs`, both mode `100644`, plus the exact
+current-main workspace member/dependency and one lock package. The helper manifest/source blobs are
+`a9fad929ce2befd694bbb5144dd733011ae0e65f` and
+`375c6e7d4043c7168f512656ccc0902f0a9ea598`. The trusted validator requires that two-file
+inventory, exact bytes, member-local deny lint table, public `FileId`/`from_handle` API, one
+module-scoped expectation, one unsafe block, and one
+`GetFileInformationByHandleEx(FILE_ID_INFO)` primitive. The initial root manifest/lock transition
+may add only this helper; no conformance consumer or unrelated dependency is included. Product and
+trusted tests bind the current consumer graph to the root workspace declaration only, so adding a
+first-party consumer requires its own reviewed actual-files policy change.
+
+Canonical CODEOWNERS covers only the actual Phase-A1 surfaces. Because bootstrap-state validation
+requires archived and compiled ownership bytes to agree, CODEOWNERS cannot use Preserve. The
+sanctioned rotation must Synchronize exactly that one GTABOOT1 payload and update the single
+fingerprint declaration after independent review. Direct tests prove the delta is exactly
+`.github/CODEOWNERS`, reject a missing archive/fingerprint companion, and reject marker-only
+substitutions. Ordinary candidates still cannot mint standing coverage.
+
 `crates/claw-repo-policy` is transitionally absent until its accepted product-policy pull request
 lands. Its first appearance must have the exact dependency-free workspace shape, explicit
 ceiling, fixture exceptions, add-fails/delete-passes tests, workflow/action and index tests, and

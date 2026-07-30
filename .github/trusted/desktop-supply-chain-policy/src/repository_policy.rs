@@ -6,6 +6,7 @@ use serde_yaml_ng::{Mapping as YamlMapping, Value as YamlValue};
 use toml::Value as TomlValue;
 
 use crate::input::{DEFAULT_FILE_LIMIT, SafeRoot};
+use crate::policy::validate_windows_file_id_phase_a_transition;
 use crate::{PolicyError, PolicyResult, error};
 
 const MAX_REPOSITORY_FILES: usize = 50_000;
@@ -488,6 +489,8 @@ fn validate_policy_source(root: &SafeRoot) -> PolicyResult<()> {
     }
     for required in [
         "#[test]\nfn repository_legacy_javascript_surface_does_not_grow()",
+        "#[test]\nfn windows_file_identity_ffi_is_isolated()",
+        "helper_source.matches(\"unsafe {\").count() == 1",
         "#[test]\nfn new_typescript_path_outside_legacy_inventory_is_rejected()",
         "fixture.write(\"src/newFeature.ts\", b\"new\");",
         "assert_eq!(violations, [\"src/newFeature.ts\"]);",
@@ -705,6 +708,7 @@ pub fn validate_repository_policy_transition(
     trusted: &SafeRoot,
     candidate: &SafeRoot,
 ) -> PolicyResult<()> {
+    validate_windows_file_id_phase_a_transition(trusted, candidate)?;
     let trusted_files = repository_files(trusted)?;
     let candidate_files = repository_files(candidate)?;
     let trusted_artifacts = legacy_artifacts(&trusted_files);

@@ -170,6 +170,130 @@ fn repository_legacy_javascript_surface_does_not_grow() {
 }
 
 #[test]
+fn windows_file_identity_ffi_is_isolated() {
+    let root = workspace_root();
+    let workspace_manifest =
+        fs::read_to_string(root.join("Cargo.toml")).expect("read workspace manifest");
+    let helper_root = root.join("crates/claw-windows-file-id");
+    let helper_manifest =
+        fs::read_to_string(helper_root.join("Cargo.toml")).expect("read helper manifest");
+    let helper_source =
+        fs::read_to_string(helper_root.join("src/lib.rs")).expect("read helper source");
+
+    assert!(
+        workspace_manifest.contains("\"crates/claw-windows-file-id\"")
+            && workspace_manifest.contains(
+                "claw-windows-file-id = { path = \"crates/claw-windows-file-id\", version = \"0.1.0\" }"
+            ),
+        "the audited helper must be an explicit workspace member and dependency"
+    );
+    let mut consumers = Vec::new();
+    for parent in ["apps", "crates"] {
+        for entry in fs::read_dir(root.join(parent)).expect("inventory first-party manifests") {
+            let entry = entry.expect("read first-party manifest entry");
+            if !entry.file_type().expect("inspect manifest entry").is_dir()
+                || entry.path() == helper_root
+            {
+                continue;
+            }
+            let manifest = entry.path().join("Cargo.toml");
+            if manifest.is_file()
+                && fs::read_to_string(&manifest)
+                    .expect("read first-party manifest")
+                    .contains("claw-windows-file-id")
+            {
+                consumers.push(
+                    manifest
+                        .strip_prefix(&root)
+                        .expect("consumer manifest is below root")
+                        .to_path_buf(),
+                );
+            }
+        }
+    }
+    assert!(
+        consumers.is_empty(),
+        "Phase A1 must not preauthorize a first-party consumer edge: {consumers:?}"
+    );
+    let top_level = fs::read_dir(&helper_root)
+        .expect("inventory helper root")
+        .map(|entry| {
+            entry
+                .expect("read helper root entry")
+                .file_name()
+                .into_string()
+                .expect("helper root name is UTF-8")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        top_level,
+        ["Cargo.toml".to_owned(), "src".to_owned()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "helper root inventory changed"
+    );
+    let source_files = fs::read_dir(helper_root.join("src"))
+        .expect("inventory helper source")
+        .map(|entry| {
+            entry
+                .expect("read helper source entry")
+                .file_name()
+                .into_string()
+                .expect("helper source name is UTF-8")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        source_files,
+        ["lib.rs".to_owned()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "helper source inventory changed"
+    );
+    assert!(
+        helper_manifest.contains(
+            "windows-sys = { version = \"0.61.2\", features = [\"Win32_Foundation\", \"Win32_Storage_FileSystem\"] }"
+        ) && helper_manifest.contains("unsafe_code = \"deny\"")
+            && helper_manifest.contains("unsafe_op_in_unsafe_fn = \"deny\""),
+        "the helper must pin its Windows API surface and deny unsafe by default"
+    );
+    let helper_windows_dependencies = helper_manifest
+        .split_once("[target.'cfg(windows)'.dependencies]")
+        .and_then(|(_, tail)| tail.split_once("[lints.rust]"))
+        .map(|(dependencies, _)| dependencies.trim())
+        .expect("helper has one target dependency section before its lint policy");
+    assert_eq!(
+        helper_windows_dependencies,
+        "windows-sys = { version = \"0.61.2\", features = [\"Win32_Foundation\", \"Win32_Storage_FileSystem\"] }",
+        "the single-level helper must not acquire first-party or unrelated dependencies"
+    );
+    assert!(
+        helper_source.contains("GetFileInformationByHandleEx")
+            && helper_source.contains("FILE_ID_INFO")
+            && helper_source.contains("#[expect(\n    unsafe_code,")
+            && helper_source.matches("unsafe {").count() == 1
+            && !helper_source.contains("#![allow(unsafe_code")
+            && !helper_source.contains("#![expect(unsafe_code"),
+        "the helper must contain exactly one locally audited unsafe FFI call"
+    );
+    let lock = fs::read_to_string(root.join("Cargo.lock")).expect("read root lock");
+    assert_eq!(
+        lock.matches("name = \"claw-windows-file-id\"").count(),
+        1,
+        "the lock must contain one helper package"
+    );
+    assert!(
+        lock.contains(
+            "name = \"claw-windows-file-id\"\nversion = \"0.1.0\"\ndependencies = [\n \"windows-sys 0.61.2\",\n]"
+        ) && lock.contains(
+            "name = \"windows-sys\"\nversion = \"0.61.2\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc\"\ndependencies = [\n \"windows-link\",\n]"
+        ) && lock.contains(
+            "name = \"windows-link\"\nversion = \"0.2.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5\""
+        ),
+        "helper lock resolution changed"
+    );
+}
+
+#[test]
 fn new_typescript_path_outside_legacy_inventory_is_rejected() {
     let fixture = TemporaryTree::new("new-typescript");
     fixture.write("src/index.ts", b"grandfathered");

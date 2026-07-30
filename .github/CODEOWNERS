@@ -3,6 +3,10 @@
 /.github/workflows/bootstrap-desktop-supply-chain-policy.yml @aizhihuxiao
 /.github/workflows/trusted-desktop-supply-chain-policy.yml @aizhihuxiao
 /.github/trusted/desktop-supply-chain-policy/** @aizhihuxiao
+/Cargo.toml @aizhihuxiao
+/Cargo.lock @aizhihuxiao
+/crates/claw-repo-policy/** @aizhihuxiao
+/crates/claw-windows-file-id/** @aizhihuxiao
 /.github/workflows/rust.yml @aizhihuxiao
 /.github/workflows/macos-packaging.yml @aizhihuxiao
 /.github/fixtures/cargo-audit/** @aizhihuxiao

@@ -29,7 +29,9 @@ use desktop_supply_chain_policy::policy::{
     BootstrapSnapshotArchive, BootstrapSnapshotChangeStatus, bootstrap_fingerprint,
     bootstrap_snapshot, expected_bootstrap_fingerprint, is_bootstrap_state,
     validate_build_artifact_pin_table, validate_casefold_paths, validate_final_static,
-    write_bootstrap_snapshot, write_final_dependency_fixtures,
+    validate_windows_file_id_boundary, validate_windows_file_id_phase_a_transition,
+    write_bootstrap_snapshot, write_final_dependency_fixtures, WINDOWS_FILE_ID_MANIFEST_BLOB,
+    WINDOWS_FILE_ID_SOURCE_BLOB, WINDOWS_FILE_ID_SOURCE_OID,
 };
 use desktop_supply_chain_policy::process::{CommandSpec, run, run_checked};
 use desktop_supply_chain_policy::repository_policy::validate_repository_policy_transition;
@@ -487,6 +489,11 @@ unreachable_pub = "warn"
 [lints.clippy]
 all = "warn"
 "#;
+const WINDOWS_FILE_ID_MEMBER: &str = "crates/claw-windows-file-id";
+const WINDOWS_FILE_ID_MANIFEST: &str =
+    include_str!("../policy/final/crates/claw-windows-file-id/Cargo.toml.fixture");
+const WINDOWS_FILE_ID_SOURCE: &str =
+    include_str!("../policy/final/crates/claw-windows-file-id/src/lib.rs");
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -2915,7 +2922,333 @@ fn sqlite_file_control_native_ffi_lints_are_exactly_identity_bound() {
             "lint mutation failed through the wrong rule: {label}: {error}"
         );
     }
+}
 
+fn write_windows_file_id_boundary(tree: &TempTree) {
+        let root = tree.join(WINDOWS_FILE_ID_MEMBER);
+        fs::create_dir_all(root.join("src")).expect("create Windows file-ID fixture");
+        fs::write(root.join("Cargo.toml"), WINDOWS_FILE_ID_MANIFEST)
+            .expect("write Windows file-ID manifest");
+        fs::write(root.join("src/lib.rs"), WINDOWS_FILE_ID_SOURCE)
+            .expect("write Windows file-ID source");
+    }
+
+    #[test]
+    fn windows_file_id_boundary_is_exact_and_narrow() {
+        assert_eq!(
+            WINDOWS_FILE_ID_SOURCE_OID,
+            "4f91f20348b030cdf6817bc1bb9c527a999a25d2"
+        );
+        assert_eq!(
+            WINDOWS_FILE_ID_MANIFEST_BLOB,
+            "a9fad929ce2befd694bbb5144dd733011ae0e65f"
+        );
+        assert_eq!(
+            WINDOWS_FILE_ID_SOURCE_BLOB,
+            "375c6e7d4043c7168f512656ccc0902f0a9ea598"
+        );
+        assert_eq!(
+            sha256(WINDOWS_FILE_ID_MANIFEST.as_bytes()),
+            "2139338411341e1dae1db88972d05b23ff59ac8b32a10b0ec471b43d0da2af44"
+        );
+        assert_eq!(
+            sha256(WINDOWS_FILE_ID_SOURCE.as_bytes()),
+            "8561dd1f84b565332a48e497c86d8d926b33ee79d026c4336c9cdefb80f3a440"
+        );
+
+        let accepted = TempTree::new("windows-file-id-accepted");
+        write_windows_file_id_boundary(&accepted);
+        validate_windows_file_id_boundary(
+            &SafeRoot::new(&accepted.path).expect("open Windows file-ID fixture"),
+        )
+        .expect("accept exact Windows file-ID boundary");
+        let integrated = final_tree("windows-file-id-integrated");
+        let workspace = validate_final_static(
+            &SafeRoot::new(&integrated.path).expect("open integrated Windows file-ID fixture"),
+        )
+        .expect("accept exact Windows file-ID member in the root workspace");
+        assert_eq!(
+            workspace
+                .members
+                .get(WINDOWS_FILE_ID_MEMBER)
+                .map(String::as_str),
+            Some("claw-windows-file-id")
+        );
+
+        for (label, path, from, to) in [
+            (
+                "file-id-lint-allow",
+                "Cargo.toml",
+                "unsafe_code = \"deny\"",
+                "unsafe_code = \"allow\"",
+            ),
+            (
+                "file-id-workspace-lints",
+                "Cargo.toml",
+                "[lints.rust]",
+                "[lints]\nworkspace = true\n\n[lints.rust]",
+            ),
+            (
+                "file-id-extra-dependency",
+                "Cargo.toml",
+                "[lints.rust]",
+                "[dependencies]\nlibc = \"0.2\"\n\n[lints.rust]",
+            ),
+            (
+                "file-id-package-rename",
+                "Cargo.toml",
+                "name = \"claw-windows-file-id\"",
+                "name = \"claw-windows-file-identity\"",
+            ),
+            (
+                "file-id-scope-broadened",
+                "src/lib.rs",
+                "#[expect(\n    unsafe_code,",
+                "#![allow(unsafe_code)]\n\n#[expect(\n    unsafe_code,",
+            ),
+            (
+                "file-id-expectation-removed",
+                "src/lib.rs",
+                "#[expect(\n    unsafe_code,",
+                "#[cfg(windows)]\n#[allow(dead_code)]\n",
+            ),
+            (
+                "file-id-second-unsafe-block",
+                "src/lib.rs",
+                "        if succeeded == 0 {",
+                "        let _ = unsafe { std::ptr::read_volatile(&0_u8) };\n        if succeeded == 0 {",
+            ),
+            (
+                "file-id-primitive-substitution",
+                "src/lib.rs",
+                "GetFileInformationByHandleEx(",
+                "GetFileInformationByHandle(",
+            ),
+            (
+                "file-id-public-expansion",
+                "src/lib.rs",
+                "#[cfg(test)]",
+                "pub fn widened_public_api() {}\n\n#[cfg(test)]",
+            ),
+            (
+                "file-id-noop-marker",
+                "src/lib.rs",
+                "//! Audited Windows retained-handle file identity.",
+                "//! Audited Windows retained-handle file identity.\n//! GetFileInformationByHandleEx marker only.",
+            ),
+        ] {
+            let tree = TempTree::new(label);
+            write_windows_file_id_boundary(&tree);
+            replace(&tree.join(WINDOWS_FILE_ID_MEMBER).join(path), from, to);
+            let error = validate_windows_file_id_boundary(
+                &SafeRoot::new(&tree.path).expect("open Windows file-ID mutation"),
+            )
+            .expect_err("Windows file-ID mutation unexpectedly passed")
+            .to_string();
+            assert!(
+                error.contains("exact security policy file changed"),
+                "{label} failed through the wrong rule: {error}"
+            );
+        }
+
+        for (label, mutation, expected) in [
+            (
+                "file-id-source-removed",
+                "remove",
+                "claw-windows-file-id file inventory changed",
+            ),
+            (
+                "file-id-source-renamed",
+                "rename",
+                "claw-windows-file-id file inventory changed",
+            ),
+            (
+                "file-id-extra-file",
+                "extra",
+                "candidate tree exceeds 2 files",
+            ),
+        ] {
+            let tree = TempTree::new(label);
+            write_windows_file_id_boundary(&tree);
+            let source = tree.join(WINDOWS_FILE_ID_MEMBER).join("src/lib.rs");
+            match mutation {
+                "remove" => fs::remove_file(source).expect("remove Windows file-ID source"),
+                "rename" => fs::rename(
+                    source,
+                    tree.join(WINDOWS_FILE_ID_MEMBER).join("src/identity.rs"),
+                )
+                .expect("rename Windows file-ID source"),
+                "extra" => fs::write(tree.join(WINDOWS_FILE_ID_MEMBER).join("README.md"), "extra")
+                    .expect("write extra Windows file-ID file"),
+                _ => unreachable!(),
+            }
+            let error = validate_windows_file_id_boundary(
+                &SafeRoot::new(&tree.path).expect("open Windows file-ID inventory mutation"),
+            )
+            .expect_err("Windows file-ID inventory mutation unexpectedly passed")
+            .to_string();
+            assert!(
+                error.contains(expected),
+                "{label} failed through the wrong rule: {error}"
+            );
+        }
+    }
+
+    fn remove_windows_file_id_phase_a(tree: &TempTree) {
+        fs::remove_file(tree.join(WINDOWS_FILE_ID_MEMBER).join("Cargo.toml"))
+            .expect("remove helper manifest");
+        fs::remove_file(tree.join(WINDOWS_FILE_ID_MEMBER).join("src/lib.rs"))
+            .expect("remove helper source");
+        fs::remove_dir(tree.join(WINDOWS_FILE_ID_MEMBER).join("src"))
+            .expect("remove helper source directory");
+        fs::remove_dir(tree.join(WINDOWS_FILE_ID_MEMBER)).expect("remove helper directory");
+
+        let manifest_path = tree.join("Cargo.toml");
+        let mut manifest: toml::Value =
+            toml::from_str(&fs::read_to_string(&manifest_path).expect("read Phase-A1 manifest"))
+                .expect("parse Phase-A1 manifest");
+        let workspace = manifest
+            .get_mut("workspace")
+            .and_then(toml::Value::as_table_mut)
+            .expect("root workspace");
+        workspace
+            .get_mut("members")
+            .and_then(toml::Value::as_array_mut)
+            .expect("root members")
+            .retain(|member| member.as_str() != Some(WINDOWS_FILE_ID_MEMBER));
+        workspace
+            .get_mut("dependencies")
+            .and_then(toml::Value::as_table_mut)
+            .expect("root dependencies")
+            .remove("claw-windows-file-id");
+        fs::write(
+            manifest_path,
+            toml::to_string(&manifest).expect("serialize protected Phase-A1 manifest"),
+        )
+        .expect("write protected Phase-A1 manifest");
+
+        let lock_path = tree.join("Cargo.lock");
+        let mut lock: toml::Value =
+            toml::from_str(&fs::read_to_string(&lock_path).expect("read Phase-A1 lock"))
+                .expect("parse Phase-A1 lock");
+        lock.get_mut("package")
+            .and_then(toml::Value::as_array_mut)
+            .expect("lock packages")
+            .retain(|package| {
+                package.get("name").and_then(toml::Value::as_str)
+                    != Some("claw-windows-file-id")
+            });
+        fs::write(
+            lock_path,
+            toml::to_string(&lock).expect("serialize protected Phase-A1 lock"),
+        )
+        .expect("write protected Phase-A1 lock");
+    }
+
+    #[test]
+    fn windows_file_id_enters_with_only_its_exact_root_and_lock_delta() {
+        let trusted = final_tree("windows-file-id-phase-a-trusted");
+        remove_windows_file_id_phase_a(&trusted);
+        let candidate = final_tree("windows-file-id-phase-a-candidate");
+        validate_windows_file_id_phase_a_transition(
+            &SafeRoot::new(&trusted.path).expect("open pre-helper base"),
+            &SafeRoot::new(&candidate.path).expect("open exact helper candidate"),
+        )
+        .expect("accept exact helper workspace and lock delta");
+
+        let manifest_drift = final_tree("windows-file-id-manifest-drift");
+        let manifest_path = manifest_drift.join("Cargo.toml");
+        let mut manifest = fs::read_to_string(&manifest_path).expect("read manifest drift fixture");
+        manifest.push_str("\n[workspace.metadata.phase-a-noop]\nmarker = true\n");
+        fs::write(manifest_path, manifest).expect("write manifest drift");
+        let error = validate_windows_file_id_phase_a_transition(
+            &SafeRoot::new(&trusted.path).expect("open helper manifest base"),
+            &SafeRoot::new(&manifest_drift.path).expect("open helper manifest drift"),
+        )
+        .expect_err("helper bundled with manifest drift unexpectedly passed")
+        .to_string();
+        assert!(error.contains("plus only"), "{error}");
+
+        let lock_drift = final_tree("windows-file-id-lock-drift");
+        let lock_path = lock_drift.join("Cargo.lock");
+        let mut lock = fs::read_to_string(&lock_path).expect("read lock drift fixture");
+        lock.push_str("\n[[package]]\nname = \"phase-a-noop\"\nversion = \"0.0.0\"\n");
+        fs::write(lock_path, lock).expect("write lock drift");
+        let error = validate_windows_file_id_phase_a_transition(
+            &SafeRoot::new(&trusted.path).expect("open helper lock base"),
+            &SafeRoot::new(&lock_drift.path).expect("open helper lock drift"),
+        )
+        .expect_err("helper bundled with lock drift unexpectedly passed")
+        .to_string();
+        assert!(error.contains("plus only"), "{error}");
+
+        let consumer_drift = final_tree("windows-file-id-consumer-drift");
+        let consumer_path = consumer_drift.join("crates/claw-tools/Cargo.toml");
+        let mut consumer =
+            fs::read_to_string(&consumer_path).expect("read consumer drift fixture");
+        consumer = consumer.replacen(
+            "[lints]",
+            "[target.'cfg(windows)'.dependencies]\nclaw-windows-file-id.workspace = true\n\n[lints]",
+            1,
+        );
+        fs::write(consumer_path, consumer).expect("write consumer drift");
+        let error = validate_windows_file_id_phase_a_transition(
+            &SafeRoot::new(&trusted.path).expect("open helper consumer base"),
+            &SafeRoot::new(&consumer_drift.path).expect("open helper consumer drift"),
+        )
+        .expect_err("helper bundled with consumer edge unexpectedly passed")
+        .to_string();
+        assert!(error.contains("unreviewed Windows file-ID consumer edge"), "{error}");
+
+        let resolution_drift = final_tree("windows-file-id-resolution-drift");
+        replace(
+            &resolution_drift.join("Cargo.lock"),
+            "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let error = validate_windows_file_id_phase_a_transition(
+            &SafeRoot::new(&trusted.path).expect("open helper resolution base"),
+            &SafeRoot::new(&resolution_drift.path).expect("open helper resolution drift"),
+        )
+        .expect_err("helper bundled with lock resolution drift unexpectedly passed")
+        .to_string();
+        assert!(error.contains("windows-link 0.2.1 lock resolution changed"), "{error}");
+
+        let active = final_tree("windows-file-id-active");
+        let removed = final_tree("windows-file-id-removed");
+        remove_windows_file_id_phase_a(&removed);
+        let error = validate_windows_file_id_phase_a_transition(
+            &SafeRoot::new(&active.path).expect("open active helper base"),
+            &SafeRoot::new(&removed.path).expect("open removed helper candidate"),
+        )
+        .expect_err("protected helper removal unexpectedly passed")
+        .to_string();
+        assert!(error.contains("removed the protected"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_file_id_source_mode_is_exactly_non_executable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let helper = TempTree::new("windows-file-id-mode");
+        write_windows_file_id_boundary(&helper);
+        let helper_source = helper.join(WINDOWS_FILE_ID_MEMBER).join("src/lib.rs");
+        let mut permissions = fs::metadata(&helper_source)
+            .expect("inspect helper mode")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(helper_source, permissions).expect("widen helper mode");
+        let error = validate_windows_file_id_boundary(
+            &SafeRoot::new(&helper.path).expect("open helper mode mutation"),
+        )
+        .expect_err("executable helper source unexpectedly passed")
+        .to_string();
+        assert!(error.contains("expected 0644"), "{error}");
+    }
+
+#[test]
+fn sqlite_file_control_member_order_mutations_are_rejected() {
     for mutation in ["duplicate", "unsorted"] {
         let tree = final_tree(&format!("sqlite-file-control-{mutation}"));
         add_new_root_member(

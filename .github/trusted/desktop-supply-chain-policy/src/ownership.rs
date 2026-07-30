@@ -13,11 +13,15 @@ pub const CODEOWNER: &str = "@aizhihuxiao";
 
 const CANONICAL_CODEOWNERS: &[u8] = include_bytes!("../../../CODEOWNERS");
 
-const PATTERNS: [&str; 21] = [
+const PATTERNS: [&str; 25] = [
     "/.github/CODEOWNERS",
     "/.github/workflows/bootstrap-desktop-supply-chain-policy.yml",
     "/.github/workflows/trusted-desktop-supply-chain-policy.yml",
     "/.github/trusted/desktop-supply-chain-policy/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/crates/claw-repo-policy/**",
+    "/crates/claw-windows-file-id/**",
     "/.github/workflows/rust.yml",
     "/.github/workflows/macos-packaging.yml",
     "/.github/fixtures/cargo-audit/**",
@@ -37,11 +41,16 @@ const PATTERNS: [&str; 21] = [
     "/crates/claw-security/tests/fixtures/desktop_supply_chain_policy/**",
 ];
 
-const FROZEN_SURFACES: [&str; 21] = [
+const FROZEN_SURFACES: [&str; 26] = [
     ".github/CODEOWNERS",
     ".github/workflows/bootstrap-desktop-supply-chain-policy.yml",
     ".github/workflows/trusted-desktop-supply-chain-policy.yml",
     ".github/trusted/desktop-supply-chain-policy/Cargo.toml",
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/claw-repo-policy/tests/repository_policy.rs",
+    "crates/claw-windows-file-id/Cargo.toml",
+    "crates/claw-windows-file-id/src/lib.rs",
     ".github/workflows/rust.yml",
     ".github/workflows/macos-packaging.yml",
     ".github/fixtures/cargo-audit/unmaintained/Cargo.lock.fixture",

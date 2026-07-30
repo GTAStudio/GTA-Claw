@@ -403,6 +403,73 @@ fn unchanged_and_non_bootstrap_changes_need_no_decision() {
 }
 
 #[test]
+fn phase_a_codeowners_rotation_synchronizes_exactly_one_payload() {
+    let trusted = snapshot_fixture("phase-a-codeowners-trusted");
+    let candidate = snapshot_fixture("phase-a-codeowners-candidate");
+    let before = BootstrapSnapshotArchive::parse(
+        &fs::read(trusted.join(BOOTSTRAP_SNAPSHOT_PATH)).expect("read protected snapshot"),
+    )
+    .expect("parse protected snapshot");
+    let reviewed_codeowners =
+        fs::read(repo_root().join(CODEOWNERS)).expect("read reviewed Phase-A CODEOWNERS");
+    write_file(&candidate, CODEOWNERS, &reviewed_codeowners);
+    synchronize_snapshot(&candidate);
+    let after = BootstrapSnapshotArchive::parse(
+        &fs::read(candidate.join(BOOTSTRAP_SNAPSHOT_PATH)).expect("read synchronized snapshot"),
+    )
+    .expect("parse synchronized snapshot");
+    let changed = before
+        .entries()
+        .filter_map(|(path, payload)| {
+            (after.payload(path) != Some(payload)).then_some(path)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(changed, [CODEOWNERS]);
+    assert_eq!(
+        after.payload(CODEOWNERS),
+        Some(normalize_text(&reviewed_codeowners).as_slice())
+    );
+
+    let synchronized_manifest = manifest([
+        ('M', CODEOWNERS),
+        ('M', BOOTSTRAP_SNAPSHOT_PATH),
+        ('M', BOOTSTRAP_FINGERPRINT_SOURCE_PATH),
+    ]);
+    assert_eq!(
+        validate(&trusted, &candidate, &synchronized_manifest)
+            .expect("accept one-payload Phase-A ownership synchronization"),
+        BootstrapSourceDecisionEvidence {
+            changed_paths: 1,
+            synchronized_paths: 1,
+            preserved_paths: 0,
+        }
+    );
+
+    expect_error(
+        &trusted,
+        &candidate,
+        &manifest([
+            ('M', CODEOWNERS),
+            ('M', BOOTSTRAP_FINGERPRINT_SOURCE_PATH),
+        ]),
+        "trusted change manifest must name both the Bootstrap snapshot and fingerprint source",
+    );
+
+    let marker_only = snapshot_fixture("phase-a-codeowners-marker-only");
+    append_bytes(
+        &marker_only,
+        CODEOWNERS,
+        b"\n# ownership synchronization marker without archive bytes\n",
+    );
+    expect_error(
+        &trusted,
+        &marker_only,
+        &manifest([('M', CODEOWNERS)]),
+        "requires synchronized snapshot/fingerprint or a new bound preservation decision",
+    );
+}
+
+#[test]
 fn live_upstream_workflow_change_without_a_companion_reproduces_issue_50_class() {
     let trusted = snapshot_fixture("issue-50-trusted");
     let candidate = snapshot_fixture("issue-50-candidate");
