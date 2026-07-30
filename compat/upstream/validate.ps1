@@ -105,11 +105,11 @@ $ExpectedReachabilityCorpusAccepting = 15
 # Frozen exactly like the schema and corpus digests: -WriteLedgerDigests cannot
 # reach this constant, so re-blessing a hollowed-out self-test takes a reviewed
 # edit to this line.
-$ExpectedSelfTestDigest = "0000000000000000000000000000000000000000000000000000000000000000"
+$ExpectedSelfTestDigest = "20b26f2e52009b44d90d2c83a9d392248b3495d5e4b7a1dd3d673073a4d76add"
 # README.md is the normative specification for these rules. Pinning its
 # LF-normalised text makes a prose change a reviewed trust-root edit instead of a
 # silent change to the instructions future rule owners follow.
-$ExpectedReadmeDigest = "0000000000000000000000000000000000000000000000000000000000000000"
+$ExpectedReadmeDigest = "f9f5926890bb080fecea8ee616cdb7eaca9dd8cd00dcfead9e5865a4c2990dcc"
 $LedgerDigestFileName = "ledger-digests.sha256"
 $EvidenceSweepFileName = "evidence-reachability-sweep.tsv"
 $EvidenceSweepExpectedFiles = 0
@@ -2644,7 +2644,7 @@ function Get-RepositoryRustFiles {
         $results.Add($relative)
     }
     $results.Sort([System.StringComparer]::Ordinal)
-    return @($results)
+    return ,$results.ToArray()
 }
 
 function Get-EvidenceFileReachability {

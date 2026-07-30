@@ -230,8 +230,24 @@ function New-SyntheticRepositoryRoot {
         "crates/nonrunning/Cargo.toml" =
             ("[package]`nname = `"nonrunning`"`nautotests = false`n`n" +
              "[[bin]]`nname = `"notest`"`npath = `"src/bin/notest.rs`"`ntest = false`n`n" +
-             "[[test]]`nname = `"noharness`"`npath = `"tests/noharness.rs`"`nharness = false`n")
+             "[[test]]`nname = `"noharness`"`npath = `"tests/noharness.rs`"`nharness = false`n`n" +
+             "[[test]]`nname = `"gated`"`npath = `"tests/gated.rs`"`nrequired-features = [`"gated`"]`n`n" +
+             "[[test]]`nname = `"multiline-gated`"`npath = `"tests/multiline_gated.rs`"`n" +
+             "required-features = [`n  `"gated`",`n]`n`n" +
+             "[[test]]`nname = `"default-gated`"`npath = `"tests/default_gated.rs`"`n" +
+             "required-features = [`"default-gate`"]`n`n" +
+             "[[test]]`nname = `"empty-gate`"`npath = `"tests/empty_gate.rs`"`n" +
+             "required-features = []`n`n" +
+             "[features]`ndefault = [`"default-gate`"]`ngated = []`ndefault-gate = []`n")
         "crates/nonrunning/src/lib.rs" = "`n"
+        "crates/nonrunning/tests/gated.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/nonrunning/tests/multiline_gated.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/nonrunning/tests/default_gated.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/nonrunning/tests/empty_gate.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/nonrunning/src/bin/notest.rs" =
             "fn main() {}`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/nonrunning/tests/noharness.rs" =
@@ -480,6 +496,148 @@ function Write-Json {
     [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Get-Sha256OfText {
+    param([string]$Text)
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return (($algorithm.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text)) |
+            ForEach-Object { $_.ToString("x2") }) -join "")
+    } finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Set-SelfTestValidatorPin {
+    param(
+        [string]$CaseRoot,
+        [string]$Pattern,
+        [string]$Replacement,
+        [string]$Description
+    )
+    $validatorPath = Join-Path $CaseRoot "validate.ps1"
+    $validator = [System.IO.File]::ReadAllText($validatorPath)
+    if ([regex]::Matches($validator, $Pattern).Count -ne 1) {
+        throw "$Description did not find exactly one pin in $validatorPath"
+    }
+    $updated = [regex]::Replace($validator, $Pattern, $Replacement)
+    [System.IO.File]::WriteAllText(
+        $validatorPath,
+        $updated,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+}
+
+function Set-SelfTestSweepText {
+    param(
+        [string]$CaseRoot,
+        [string]$Text
+    )
+    [System.IO.File]::WriteAllText(
+        (Join-Path $CaseRoot "evidence-reachability-sweep.tsv"),
+        $Text,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+    $digest = Get-Sha256OfText ($Text -replace "`r`n", "`n")
+    Set-SelfTestValidatorPin `
+        $CaseRoot `
+        '\$ExpectedEvidenceSweepDigest = "[0-9a-f]{64}"' `
+        ('$ExpectedEvidenceSweepDigest = "' + $digest + '"') `
+        "Set-SelfTestSweepText"
+}
+
+function Set-SelfTestSweepExpectedTotals {
+    param(
+        [string]$CaseRoot,
+        [int]$Files,
+        [int]$Accepted,
+        [int]$Rejected
+    )
+    $replacements = [ordered]@{
+        '\$EvidenceSweepExpectedFiles = [0-9]+' = "`$EvidenceSweepExpectedFiles = $Files"
+        '\$EvidenceSweepExpectedAccepted = [0-9]+' = "`$EvidenceSweepExpectedAccepted = $Accepted"
+        '\$EvidenceSweepExpectedRejected = [0-9]+' = "`$EvidenceSweepExpectedRejected = $Rejected"
+    }
+    foreach ($pattern in $replacements.Keys) {
+        Set-SelfTestValidatorPin `
+            $CaseRoot $pattern ([string]$replacements[$pattern]) "Set-SelfTestSweepExpectedTotals"
+    }
+}
+
+function Set-SelfTestSweepRecord {
+    param(
+        [string]$CaseRoot,
+        [string[]]$Rows,
+        [ValidateSet("LF", "CRLF")]
+        [string]$LineEndings = "LF"
+    )
+    $accept = @($Rows | Where-Object { $_.StartsWith("accept`t", [StringComparison]::Ordinal) }).Count
+    $reject = @($Rows | Where-Object { $_.StartsWith("reject`t", [StringComparison]::Ordinal) }).Count
+    $baseCommit = "0000000000000000000000000000000000000000"
+    $sweptAt = "2026-01-01"
+    $lines = @(
+        "# GTA-Claw acceptance-evidence reachability sweep.",
+        "# Every .rs file in the working tree, judged by the reachability rule shipped in",
+        "# validate.ps1. A cross-check record only: nothing here decides whether a feature",
+        "# row is accepted. Regenerate ONLY through the reviewed command, never by hand:",
+        "#   powershell -NoProfile -File compat/upstream/validate.ps1 -ReplayEvidenceSweep",
+        "# generated-by: validate.ps1 -ReplayEvidenceSweep",
+        "# base-commit: $baseCommit",
+        "# swept-at: $sweptAt",
+        ("# totals: files={0} accept={1} reject={2}" -f $Rows.Count, $accept, $reject)
+    ) + @($Rows)
+    $newline = if ($LineEndings -eq "CRLF") { "`r`n" } else { "`n" }
+    Set-SelfTestSweepText $CaseRoot (($lines -join $newline) + $newline)
+    Set-SelfTestValidatorPin `
+        $CaseRoot `
+        '\$ExpectedEvidenceSweepBaseCommit = "[0-9a-f]{40}"' `
+        ('$ExpectedEvidenceSweepBaseCommit = "' + $baseCommit + '"') `
+        "Set-SelfTestSweepRecord"
+    Set-SelfTestValidatorPin `
+        $CaseRoot `
+        '\$ExpectedEvidenceSweepSweptAt = "[0-9]{4}-[0-9]{2}-[0-9]{2}"' `
+        ('$ExpectedEvidenceSweepSweptAt = "' + $sweptAt + '"') `
+        "Set-SelfTestSweepRecord"
+}
+
+function Set-SelfTestSweepVerdict {
+    param(
+        [string]$CaseRoot,
+        [string]$Path,
+        [ValidateSet("accept", "reject")]
+        [string]$Verdict
+    )
+    $recordPath = Join-Path $CaseRoot "evidence-reachability-sweep.tsv"
+    $lines = @(([System.IO.File]::ReadAllText($recordPath) -replace "`r`n", "`n") -split "`n")
+    $rows = New-Object System.Collections.Generic.List[string]
+    $found = $false
+    foreach ($line in $lines) {
+        if (-not [regex]::IsMatch($line, '\A(?:accept|reject)\t')) { continue }
+        $rowPath = $line.Substring($line.IndexOf("`t", [StringComparison]::Ordinal) + 1)
+        if (Test-OrdinalStringEqual $rowPath $Path) {
+            $rows.Add(("{0}`t{1}" -f $Verdict, $rowPath))
+            $found = $true
+        } else {
+            $rows.Add($line)
+        }
+    }
+    if (-not $found) {
+        throw "Set-SelfTestSweepVerdict did not find '$Path'"
+    }
+    Set-SelfTestSweepRecord $CaseRoot $rows.ToArray()
+}
+
+function Test-ByteArrayEqual {
+    param(
+        [byte[]]$Left,
+        [byte[]]$Right
+    )
+    if ($Left.Length -ne $Right.Length) { return $false }
+    for ($index = 0; $index -lt $Left.Length; $index += 1) {
+        if ($Left[$index] -ne $Right[$index]) { return $false }
+    }
+    return $true
+}
+
 function Test-OrdinalStringEqual {
     param(
         [AllowNull()]
@@ -499,7 +657,10 @@ function Invoke-Validator {
     param(
         [string]$CaseRoot,
         [string]$RepositoryRootOverride,
-        [switch]$WriteLedgerDigests
+        [switch]$WriteLedgerDigests,
+        [string]$WriteStatusTotals,
+        [switch]$ReplayEvidenceSweep,
+        [switch]$SimulateCi
     )
     # The child is started through System.Diagnostics.Process rather than the
     # PowerShell call operator for three reasons:
@@ -524,6 +685,12 @@ function Invoke-Validator {
     if ($WriteLedgerDigests) {
         $invocation += " -WriteLedgerDigests"
     }
+    if (-not [string]::IsNullOrEmpty($WriteStatusTotals)) {
+        $invocation += " -WriteStatusTotals " + (ConvertTo-PowerShellLiteral $WriteStatusTotals)
+    }
+    if ($ReplayEvidenceSweep) {
+        $invocation += " -ReplayEvidenceSweep"
+    }
     $command = '$ErrorActionPreference = ''Stop''; try { ' + $invocation +
         ' } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }'
     if ($command.Contains('"')) {
@@ -540,6 +707,18 @@ function Invoke-Validator {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.WorkingDirectory = $RepositoryRoot
+    # Writer-mode cases must remain runnable when the outer self-test itself runs
+    # in CI. Child processes start with a clean CI marker set; explicit refusal
+    # cases then add one marker back.
+    foreach ($name in @(
+        "CI", "GITHUB_ACTIONS", "TF_BUILD", "GITLAB_CI",
+        "BUILDKITE", "CIRCLECI", "JENKINS_URL", "TEAMCITY_VERSION"
+    )) {
+        [void]$startInfo.EnvironmentVariables.Remove($name)
+    }
+    if ($SimulateCi) {
+        $startInfo.EnvironmentVariables["CI"] = "true"
+    }
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
     [void]$process.Start()
@@ -573,6 +752,115 @@ function Save-FirstLedger {
         [object]$Ledger
     )
     Write-Json (Join-Path $CaseRoot "ledgers/gateway-core.json") $Ledger
+}
+
+$BaselineKnownDifference =
+    "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+$CaseLedgerPaths = @(
+    "ledgers/gateway-core.json",
+    "ledgers/official-client-interop.json",
+    "ledgers/official-integration.json"
+)
+
+function Get-CaseStatusTotals {
+    param([string]$CaseRoot)
+    $totals = [ordered]@{ unimplemented = 0; partial = 0; implemented = 0 }
+    foreach ($relativePath in $CaseLedgerPaths) {
+        $ledger = Read-Json (Join-Path $CaseRoot $relativePath)
+        foreach ($feature in @($ledger.features)) {
+            $status = [string]$feature.status
+            if (-not $totals.Contains($status)) {
+                throw "cannot derive status totals: unsupported status '$status' in $relativePath"
+            }
+            $totals[$status] += 1
+        }
+    }
+    return $totals
+}
+
+function Reset-FeatureToBaseline {
+    param([object]$Feature)
+    $Feature.status = "unimplemented"
+    $Feature.acceptance_evidence.status = "missing"
+    $Feature.acceptance_evidence.artifacts = @()
+    $Feature.known_differences = @($BaselineKnownDifference)
+    if ($null -ne $Feature.PSObject.Properties["implementation_pointers"]) {
+        $Feature.PSObject.Properties.Remove("implementation_pointers")
+    }
+}
+
+function Reset-FirstFeature {
+    param([string]$CaseRoot)
+    $ledger = Get-FirstLedger $CaseRoot
+    Reset-FeatureToBaseline $ledger.features[0]
+    Save-FirstLedger $CaseRoot $ledger
+    Set-ManifestStatusTotals $CaseRoot
+}
+
+function Get-StaleUnimplementedTotalMessage {
+    param([string]$CaseRoot)
+    $derived = [int](Get-CaseStatusTotals $CaseRoot)["unimplemented"]
+    $manifest = Read-Json (Join-Path $CaseRoot "manifest.json")
+    $declared = [int]$manifest.evidence_policy.status_totals.unimplemented
+    if ($declared -eq $derived) {
+        throw "status-totals-not-updated planted no stale manifest total"
+    }
+    return "status_totals count 'unimplemented' must be '$derived'"
+}
+
+function Add-SelfTestCanonicalReachabilityName {
+    param(
+        [string]$CaseRoot,
+        [string]$Name
+    )
+    $validatorPath = Join-Path $CaseRoot "validate.ps1"
+    $validator = [System.IO.File]::ReadAllText($validatorPath)
+    $newline = if ($validator.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $anchor = "    `"unambiguous-mod-rs-accept`"$newline)"
+    $replacement = "    `"unambiguous-mod-rs-accept`",$newline    `"$Name`"$newline)"
+    if (-not $validator.Contains($anchor)) {
+        throw "canonical reachability registry anchor moved"
+    }
+    [System.IO.File]::WriteAllText(
+        $validatorPath,
+        $validator.Replace($anchor, $replacement),
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+}
+
+function Update-SelfTestReachabilityCorpusPins {
+    param([string]$CaseRoot)
+    $corpus = Read-Json (Join-Path $CaseRoot "reachability-corpus.json")
+    $caseCount = @($corpus.cases).Count
+    $accepting = @($corpus.cases | Where-Object { $_.expect -eq "accept" }).Count
+    Set-SelfTestValidatorPin `
+        $CaseRoot `
+        '\$ExpectedReachabilityCorpusCases = [0-9]+' `
+        "`$ExpectedReachabilityCorpusCases = $caseCount" `
+        "Update-SelfTestReachabilityCorpusPins"
+    Set-SelfTestValidatorPin `
+        $CaseRoot `
+        '\$ExpectedReachabilityCorpusAccepting = [0-9]+' `
+        "`$ExpectedReachabilityCorpusAccepting = $accepting" `
+        "Update-SelfTestReachabilityCorpusPins"
+    Set-SelfTestValidatorPin `
+        $CaseRoot `
+        '\$ExpectedReachabilityCorpusDigest = "[0-9a-f]{64}"' `
+        '$ExpectedReachabilityCorpusDigest = "0000000000000000000000000000000000000000000000000000000000000000"' `
+        "Update-SelfTestReachabilityCorpusPins"
+    $probe = Invoke-Validator $CaseRoot
+    $match = [regex]::Match(
+        $probe.output,
+        'reachability-corpus digest mismatch; expected [0-9a-f]{64}, found ([0-9a-f]{64})'
+    )
+    if (-not $match.Success) {
+        throw "could not derive reachability corpus digest from validator probe: $($probe.output)"
+    }
+    Set-SelfTestValidatorPin `
+        $CaseRoot `
+        '\$ExpectedReachabilityCorpusDigest = "[0-9a-f]{64}"' `
+        ('$ExpectedReachabilityCorpusDigest = "' + $match.Groups[1].Value + '"') `
+        "Update-SelfTestReachabilityCorpusPins"
 }
 
 function New-Artifact {
@@ -618,18 +906,43 @@ function Set-FeatureTransition {
 }
 
 function Set-ManifestStatusTotals {
-    param(
-        [string]$CaseRoot,
-        [int]$Unimplemented,
-        [int]$Partial,
-        [int]$Implemented
-    )
+    param([string]$CaseRoot)
+    $totals = Get-CaseStatusTotals $CaseRoot
     $path = Join-Path $CaseRoot "manifest.json"
     $manifest = Read-Json $path
-    $manifest.evidence_policy.status_totals.unimplemented = $Unimplemented
-    $manifest.evidence_policy.status_totals.partial = $Partial
-    $manifest.evidence_policy.status_totals.implemented = $Implemented
+    $manifest.evidence_policy.status_totals.unimplemented = $totals["unimplemented"]
+    $manifest.evidence_policy.status_totals.partial = $totals["partial"]
+    $manifest.evidence_policy.status_totals.implemented = $totals["implemented"]
     Write-Json $path $manifest
+}
+
+function Get-CaseStatusDeclaration {
+    param([string]$CaseRoot)
+    $totals = Get-CaseStatusTotals $CaseRoot
+    return "unimplemented={0},partial={1},implemented={2}" -f
+        $totals["unimplemented"], $totals["partial"], $totals["implemented"]
+}
+
+function Get-StatusTransitionPostconditionFailure {
+    param(
+        [string]$CaseRoot,
+        [bool]$ExpectBom
+    )
+    $manifestPath = Join-Path $CaseRoot "manifest.json"
+    $bytes = [System.IO.File]::ReadAllBytes($manifestPath)
+    $hasBom = $bytes.Length -ge 3 -and
+        $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+    if ($hasBom -ne $ExpectBom) {
+        return "status transition did not preserve the manifest UTF-8 BOM state"
+    }
+    $manifest = Read-Json $manifestPath
+    $totals = Get-CaseStatusTotals $CaseRoot
+    foreach ($status in @("unimplemented", "partial", "implemented")) {
+        if ([int]$manifest.evidence_policy.status_totals.$status -ne [int]$totals[$status]) {
+            return "status transition wrote a manifest total that disagrees with '$status' ledger rows"
+        }
+    }
+    return ""
 }
 
 # Applies a syntactically well-formed "implemented" claim to the first row of the
@@ -643,6 +956,7 @@ function Set-ForgedTransition {
         [switch]$KeepBaselineDifference
     )
     $ledger = Get-FirstLedger $CaseRoot
+    Reset-FeatureToBaseline $ledger.features[0]
     Set-FeatureTransition `
         -Feature $ledger.features[0] `
         -Status "implemented" `
@@ -651,7 +965,7 @@ function Set-ForgedTransition {
         -Pointers $Pointers `
         -KeepBaselineDifference:$KeepBaselineDifference
     Save-FirstLedger $CaseRoot $ledger
-    Set-ManifestStatusTotals $CaseRoot 38 0 9
+    Set-ManifestStatusTotals $CaseRoot
 }
 
 $validResult = Invoke-Validator $SourceRoot
@@ -680,6 +994,7 @@ $cases = @(
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
+            Reset-FirstFeature $caseRoot
             $ledger = Get-FirstLedger $caseRoot
             Set-FeatureTransition `
                 -Feature $ledger.features[0] `
@@ -692,7 +1007,7 @@ $cases = @(
                     (New-Pointer $RealSourcePath "Registration is done; behaviour is not.")
                 )
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 38 1 8
+            Set-ManifestStatusTotals $caseRoot
         }
     },
     [ordered]@{
@@ -701,6 +1016,7 @@ $cases = @(
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
+            Reset-FirstFeature $caseRoot
             $ledger = Get-FirstLedger $caseRoot
             Set-FeatureTransition `
                 -Feature $ledger.features[0] `
@@ -708,7 +1024,7 @@ $cases = @(
                 -EvidenceStatus "partial" `
                 -Artifacts @()
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 38 1 8
+            Set-ManifestStatusTotals $caseRoot
         }
     },
     [ordered]@{
@@ -717,6 +1033,7 @@ $cases = @(
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
+            Reset-FirstFeature $caseRoot
             $ledger = Get-FirstLedger $caseRoot
             Set-FeatureTransition `
                 -Feature $ledger.features[0] `
@@ -724,7 +1041,7 @@ $cases = @(
                 -EvidenceStatus "accepted" `
                 -Artifacts @((New-Artifact $RealTestPath $RealTestName))
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 38 1 8
+            Set-ManifestStatusTotals $caseRoot
         }
     },
     [ordered]@{
@@ -733,6 +1050,7 @@ $cases = @(
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
+            Reset-FirstFeature $caseRoot
             $ledger = Get-FirstLedger $caseRoot
             Set-FeatureTransition `
                 -Feature $ledger.features[0] `
@@ -741,7 +1059,7 @@ $cases = @(
                 -Artifacts @((New-Artifact $RealTestPath $RealTestName)) `
                 -KeepBaselineDifference
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 38 1 8
+            Set-ManifestStatusTotals $caseRoot
         }
     },
     [ordered]@{
@@ -750,6 +1068,7 @@ $cases = @(
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
+            Reset-FirstFeature $caseRoot
             $ledger = Get-FirstLedger $caseRoot
             Set-FeatureTransition `
                 -Feature $ledger.features[0] `
@@ -949,7 +1268,7 @@ $cases = @(
     },
     [ordered]@{
         name = "reachability-corpus-case-deleted"
-        expected_message = "reachability-corpus must contain exactly"
+        expected_message = "reachability-corpus must not drop canonical cases"
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
@@ -1029,16 +1348,49 @@ $cases = @(
     },
     [ordered]@{
         name = "reachability-corpus-case-renamed"
-        expected_message = "reachability-corpus digest mismatch"
+        expected_message = "reachability-corpus must not drop canonical cases"
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
-            # Renaming preserves the count and the accept/reject split, so only
-            # the frozen digest catches it.
+            # Renaming preserves the count and split but drops an accepted
+            # canonical identity.
             $corpusPath = Join-Path $caseRoot "reachability-corpus.json"
             $corpus = Read-Json $corpusPath
             $corpus.cases[0].name = "renamed-case"
             Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
+        name = "reachability-corpus-unregistered-addition-is-rejected"
+        expected_message = "new reachability-corpus cases must be appended to"
+        mutate = {
+            param($caseRoot)
+            $corpusPath = Join-Path $caseRoot "reachability-corpus.json"
+            $corpus = Read-Json $corpusPath
+            $newCase = ConvertFrom-Json (
+                $corpus.cases[0] | ConvertTo-Json -Depth 50
+            )
+            $newCase.name = "future-unregistered-case"
+            $corpus.cases = @($corpus.cases) + @($newCase)
+            Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
+        name = "reachability-corpus-registered-future-addition-passes"
+        expect_success = $true
+        mutate = {
+            param($caseRoot)
+            $name = "future-registered-case"
+            $corpusPath = Join-Path $caseRoot "reachability-corpus.json"
+            $corpus = Read-Json $corpusPath
+            $newCase = ConvertFrom-Json (
+                $corpus.cases[0] | ConvertTo-Json -Depth 50
+            )
+            $newCase.name = $name
+            $corpus.cases = @($corpus.cases) + @($newCase)
+            Write-Json $corpusPath $corpus
+            Add-SelfTestCanonicalReachabilityName $caseRoot $name
+            Update-SelfTestReachabilityCorpusPins $caseRoot
         }
     },
     [ordered]@{
@@ -1486,6 +1838,50 @@ $cases = @(
             )
         }
     },    [ordered]@{
+        name = "implemented-citing-required-features-test-target"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/nonrunning/tests/gated.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-multiline-required-features-test-target"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/nonrunning/tests/multiline_gated.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-default-enabled-required-features-target"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/nonrunning/tests/default_gated.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-empty-required-features-target-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/nonrunning/tests/empty_gate.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
         name = "implemented-citing-autotests-disabled-target"
         expected_message = "is not reached by any cargo test target"
         regenerate_digests = $true
@@ -1714,6 +2110,7 @@ $cases = @(
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
+            Reset-FirstFeature $caseRoot
             $ledger = Get-FirstLedger $caseRoot
             $ledger.features[0] | Add-Member -NotePropertyName "implementation_pointers" -NotePropertyValue @(
                 (New-Pointer $RealSourcePath "Started work.")
@@ -1887,6 +2284,7 @@ $cases = @(
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
+            Reset-FirstFeature $caseRoot
             $ledger = Get-FirstLedger $caseRoot
             Set-FeatureTransition `
                 -Feature $ledger.features[0] `
@@ -1897,7 +2295,7 @@ $cases = @(
                 [pscustomobject][ordered]@{ path = $RealTestPath }
             )
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 38 0 9
+            Set-ManifestStatusTotals $caseRoot
         }
     },
     [ordered]@{
@@ -1905,6 +2303,7 @@ $cases = @(
         expected_message = "must have JSON Schema type object"
         mutate = {
             param($caseRoot)
+            Reset-FirstFeature $caseRoot
             $ledger = Get-FirstLedger $caseRoot
             Set-FeatureTransition `
                 -Feature $ledger.features[0] `
@@ -1913,7 +2312,7 @@ $cases = @(
                 -Artifacts @()
             $ledger.features[0].acceptance_evidence.artifacts = @("crates/claw-security/tests/frozen_gateway_registry.rs")
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 38 0 9
+            Set-ManifestStatusTotals $caseRoot
         }
     },
     [ordered]@{
@@ -1955,6 +2354,7 @@ $cases = @(
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
+            Reset-FirstFeature $caseRoot
             $ledger = Get-FirstLedger $caseRoot
             $ledger.features[0].acceptance_evidence.artifacts = @(
                 (New-Artifact $RealTestPath $RealTestName)
@@ -1968,6 +2368,7 @@ $cases = @(
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
+            Reset-FirstFeature $caseRoot
             $ledger = Get-FirstLedger $caseRoot
             $ledger.features[0].known_differences = @("Quietly reworded to imply progress.")
             Save-FirstLedger $caseRoot $ledger
@@ -1985,10 +2386,14 @@ $cases = @(
     },
     [ordered]@{
         name = "status-totals-not-updated"
-        expected_message = "status_totals count 'unimplemented' must be '38'"
+        expected_message_from_case_root = {
+            param($caseRoot)
+            Get-StaleUnimplementedTotalMessage $caseRoot
+        }
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
+            Reset-FirstFeature $caseRoot
             $ledger = Get-FirstLedger $caseRoot
             Set-FeatureTransition `
                 -Feature $ledger.features[0] `
@@ -2654,6 +3059,237 @@ $cases = @(
             $path = Join-Path $caseRoot "validate-self-test.ps1"
             Add-Content -LiteralPath $path -Value "# harmless-looking comment"
         }
+    },
+    [ordered]@{
+        name = "gutted-readme-is-rejected"
+        expected_message = "README.md digest mismatch"
+        mutate = {
+            param($caseRoot)
+            Set-Content -LiteralPath (Join-Path $caseRoot "README.md") `
+                -Value "# Frozen upstream compatibility contract" -NoNewline
+        }
+    },
+    [ordered]@{
+        name = "reversed-ownership-claim-in-readme-is-rejected"
+        expected_message = "README.md digest mismatch"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "README.md"
+            $text = [System.IO.File]::ReadAllText($path)
+            $mutated = $text.Replace(
+                "co-equal implementations of one enabled-test rule",
+                "one normative and one follower implementation of the enabled-test rule"
+            )
+            if ($mutated -eq $text) {
+                throw "README ownership anchor moved"
+            }
+            [System.IO.File]::WriteAllText($path, $mutated)
+        }
+    },
+    [ordered]@{
+        name = "appended-line-in-readme-survives-digest-regeneration"
+        expected_message = "README.md digest mismatch"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            Add-Content -LiteralPath (Join-Path $caseRoot "README.md") `
+                -Value "A harmless-looking sentence."
+        }
+    },
+    [ordered]@{
+        name = "status-totals-malformed-declaration-leaves-no-residue"
+        expected_message = "-WriteStatusTotals must declare every status"
+        invoke_write_ledger_digests = $true
+        write_status_totals = "unimplemented=3,implemented=44"
+        assert_writer_artifacts_unchanged = $true
+        mutate = {
+            param($caseRoot)
+        }
+    },
+    [ordered]@{
+        name = "status-totals-declaration-contradicting-rows-leaves-no-residue"
+        expected_message = "-WriteStatusTotals declaration disagrees with validated ledger rows"
+        invoke_write_ledger_digests = $true
+        write_status_totals_from_case_root = {
+            param($caseRoot)
+            $totals = Get-CaseStatusTotals $caseRoot
+            "unimplemented={0},partial={1},implemented={2}" -f
+                ($totals["unimplemented"] + 1),
+                $totals["partial"],
+                ($totals["implemented"] - 1)
+        }
+        assert_writer_artifacts_unchanged = $true
+        mutate = {
+            param($caseRoot)
+        }
+    },
+    [ordered]@{
+        name = "status-totals-write-cannot-bless-missing-artifact"
+        expected_message = "does not exist in the working tree"
+        invoke_write_ledger_digests = $true
+        write_status_totals_from_rows = $true
+        assert_writer_artifacts_unchanged = $true
+        mutate = {
+            param($caseRoot)
+            Reset-FirstFeature $caseRoot
+            $ledger = Get-FirstLedger $caseRoot
+            Set-FeatureTransition `
+                $ledger.features[0] `
+                "implemented" `
+                "accepted" `
+                @((New-Artifact "crates/claw-gateway/tests/there_is_no_such_file.rs" "missing")) `
+                @()
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "status-totals-composite-write-preserves-bomless-manifest"
+        expect_success = $true
+        invoke_write_ledger_digests = $true
+        write_status_totals_from_rows = $true
+        assert_after = {
+            param($caseRoot)
+            Get-StatusTransitionPostconditionFailure $caseRoot $false
+        }
+        mutate = {
+            param($caseRoot)
+            Reset-FirstFeature $caseRoot
+            $ledger = Get-FirstLedger $caseRoot
+            Set-FeatureTransition `
+                $ledger.features[0] `
+                "implemented" `
+                "accepted" `
+                @((New-Artifact $RealTestPath $RealTestName)) `
+                @()
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "status-totals-composite-write-preserves-bom-manifest"
+        expect_success = $true
+        invoke_write_ledger_digests = $true
+        write_status_totals_from_rows = $true
+        assert_after = {
+            param($caseRoot)
+            Get-StatusTransitionPostconditionFailure $caseRoot $true
+        }
+        mutate = {
+            param($caseRoot)
+            Reset-FirstFeature $caseRoot
+            $manifestPath = Join-Path $caseRoot "manifest.json"
+            $source = [System.IO.File]::ReadAllBytes($manifestPath)
+            [byte[]]$withBom = New-Object byte[] ($source.Length + 3)
+            $withBom[0] = 0xEF
+            $withBom[1] = 0xBB
+            $withBom[2] = 0xBF
+            [Array]::Copy($source, 0, $withBom, 3, $source.Length)
+            [System.IO.File]::WriteAllBytes($manifestPath, $withBom)
+            $ledger = Get-FirstLedger $caseRoot
+            Set-FeatureTransition `
+                $ledger.features[0] `
+                "implemented" `
+                "accepted" `
+                @((New-Artifact $RealTestPath $RealTestName)) `
+                @()
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "ci-refuses-ledger-writer-before-write"
+        expected_message = "validator writer modes are forbidden in CI"
+        invoke_write_ledger_digests = $true
+        simulate_ci = $true
+        assert_writer_artifacts_unchanged = $true
+        mutate = {
+            param($caseRoot)
+        }
+    },
+    [ordered]@{
+        name = "ci-refuses-composite-status-writer-before-write"
+        expected_message = "validator writer modes are forbidden in CI"
+        invoke_write_ledger_digests = $true
+        write_status_totals_from_rows = $true
+        simulate_ci = $true
+        assert_writer_artifacts_unchanged = $true
+        mutate = {
+            param($caseRoot)
+        }
+    },
+    [ordered]@{
+        name = "ci-refuses-sweep-replay-before-write"
+        expected_message = "validator writer modes are forbidden in CI"
+        invoke_replay_evidence_sweep = $true
+        simulate_ci = $true
+        assert_writer_artifacts_unchanged = $true
+        mutate = {
+            param($caseRoot)
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-record-removed-is-rejected"
+        expected_message = "missing=[evidence-reachability-sweep.tsv]"
+        mutate = {
+            param($caseRoot)
+            Remove-Item -LiteralPath (Join-Path $caseRoot "evidence-reachability-sweep.tsv") -Force
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-outer-digest-tamper-is-rejected"
+        expected_message = "evidence-reachability-sweep.tsv digest mismatch"
+        mutate = {
+            param($caseRoot)
+            Add-Content -LiteralPath (Join-Path $caseRoot "evidence-reachability-sweep.tsv") `
+                -Value "accept`tcrates/not-reviewed.rs"
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-accept-forged-reject-is-rejected"
+        expected_message = "record says 'reject', shipped reachability rule says 'accept'"
+        mutate = {
+            param($caseRoot)
+            Set-SelfTestSweepVerdict $caseRoot $RealTestPath "reject"
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-row-order-is-ordinal"
+        expected_message = "rows must be strictly ascending by path"
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-SelfTestSweepRecord $caseRoot @(
+                "accept`tcrates/synthetic/tests/ignored.rs",
+                "accept`tcrates/synthetic/tests/enabled.rs"
+            )
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-uniform-crlf-passes"
+        expect_success = $true
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $text = ([System.IO.File]::ReadAllText($path) -replace "`r`n", "`n").
+                Replace("`n", "`r`n")
+            Set-SelfTestSweepText $caseRoot $text
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-replay-regenerates-current-tree"
+        expect_success = $true
+        invoke_replay_evidence_sweep = $true
+        mutate = {
+            param($caseRoot)
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-writer-modes-are-exclusive-before-write"
+        expected_message = "-ReplayEvidenceSweep is mutually exclusive with ledger writers"
+        invoke_write_ledger_digests = $true
+        invoke_replay_evidence_sweep = $true
+        assert_writer_artifacts_unchanged = $true
+        mutate = {
+            param($caseRoot)
+        }
     }
 )
 
@@ -2681,36 +3317,113 @@ try {
         $caseRoot = Join-Path $temporaryRoot $case.name
         New-Item -ItemType Directory -Path $caseRoot | Out-Null
         Copy-Item -Path (Join-Path $SourceRoot "*") -Destination $caseRoot -Recurse -Force
-        & $case.mutate $caseRoot
         $caseRepositoryRoot = ""
         if ($case.Contains("repository_root")) {
             $caseRepositoryRoot = [string]$case.repository_root
         }
+        if (-not ([string]$case.name).StartsWith(
+                "evidence-sweep-",
+                [StringComparison]::Ordinal
+            )) {
+            # Unrelated cases need a semantically valid sweep, not hundreds of
+            # repeated whole-tree reachability checks. Keep one accepted row for
+            # the repository root that case actually uses.
+            $sweepRow = if (Test-OrdinalStringEqual $caseRepositoryRoot $SyntheticRoot) {
+                "accept`tcrates/synthetic/tests/enabled.rs"
+            } else {
+                "accept`t$RealTestPath"
+            }
+            Set-SelfTestSweepRecord $caseRoot @($sweepRow)
+            Set-SelfTestSweepExpectedTotals $caseRoot 1 1 0
+        }
+        & $case.mutate $caseRoot
         if ($case.Contains("regenerate_digests") -and $case.regenerate_digests) {
             # Model an attacker who already re-blessed the mutable ledger digests.
             Invoke-Validator $caseRoot -RepositoryRootOverride $caseRepositoryRoot -WriteLedgerDigests | Out-Null
         }
 
-        $result = Invoke-Validator $caseRoot -RepositoryRootOverride $caseRepositoryRoot
+        $invokeWriteLedgerDigests =
+            $case.Contains("invoke_write_ledger_digests") -and
+            [bool]$case.invoke_write_ledger_digests
+        $invokeReplayEvidenceSweep =
+            $case.Contains("invoke_replay_evidence_sweep") -and
+            [bool]$case.invoke_replay_evidence_sweep
+        $simulateCi = $case.Contains("simulate_ci") -and [bool]$case.simulate_ci
+        $writeStatusTotals = ""
+        if ($case.Contains("write_status_totals")) {
+            $writeStatusTotals = [string]$case.write_status_totals
+        } elseif ($case.Contains("write_status_totals_from_rows") -and
+            [bool]$case.write_status_totals_from_rows) {
+            $writeStatusTotals = Get-CaseStatusDeclaration $caseRoot
+        } elseif ($case.Contains("write_status_totals_from_case_root")) {
+            $writeStatusTotals =
+                [string](& $case.write_status_totals_from_case_root $caseRoot)
+        }
+        $assertWriterArtifactsUnchanged =
+            $case.Contains("assert_writer_artifacts_unchanged") -and
+            [bool]$case.assert_writer_artifacts_unchanged
+        $writerSnapshots = [ordered]@{}
+        if ($assertWriterArtifactsUnchanged) {
+            foreach ($relativePath in @(
+                "manifest.json",
+                "ledger-digests.sha256",
+                "evidence-reachability-sweep.tsv"
+            )) {
+                $writerSnapshots[$relativePath] =
+                    [System.IO.File]::ReadAllBytes((Join-Path $caseRoot $relativePath))
+            }
+        }
+
+        $result = Invoke-Validator `
+            $caseRoot `
+            -RepositoryRootOverride $caseRepositoryRoot `
+            -WriteLedgerDigests:$invokeWriteLedgerDigests `
+            -WriteStatusTotals $writeStatusTotals `
+            -ReplayEvidenceSweep:$invokeReplayEvidenceSweep `
+            -SimulateCi:$simulateCi
+        $expectedMessage = [string]$case.expected_message
+        if ($case.Contains("expected_message_from_case_root")) {
+            $expectedMessage =
+                [string](& $case.expected_message_from_case_root $caseRoot)
+        }
         # Every case is evaluated even after one fails, so a single regression
         # cannot hide the status of the cases behind it.
         $failure = ""
+        if ($assertWriterArtifactsUnchanged) {
+            foreach ($relativePath in $writerSnapshots.Keys) {
+                $after = [System.IO.File]::ReadAllBytes(
+                    (Join-Path $caseRoot $relativePath)
+                )
+                if (-not (Test-ByteArrayEqual $writerSnapshots[$relativePath] $after)) {
+                    $failure = "rejected writer invocation changed $relativePath"
+                    break
+                }
+            }
+        }
         if ($case.Contains("expect_success") -and $case.expect_success) {
             $positiveCases += 1
-            if ($result.exit_code -ne 0) {
+            if ($failure.Length -eq 0 -and $result.exit_code -ne 0) {
                 $failure = "positive case unexpectedly failed: $($result.output)"
             }
         } else {
             $negativeCases += 1
-            if ($result.exit_code -eq 0) {
+            if ($failure.Length -eq 0 -and $result.exit_code -eq 0) {
                 $failure = "negative tamper case unexpectedly passed"
-            } else {
+            } elseif ($failure.Length -eq 0 -and $expectedMessage.Length -eq 0) {
+                $failure = "negative tamper case declares no expected rejection reason"
+            } elseif ($failure.Length -eq 0) {
                 $normalizedOutput = [regex]::Replace($result.output, "\s+", " ")
-                $normalizedExpected = [regex]::Replace([string]$case.expected_message, "\s+", " ")
+                $normalizedExpected = [regex]::Replace($expectedMessage, "\s+", " ")
                 if ($normalizedOutput.IndexOf($normalizedExpected, [StringComparison]::Ordinal) -lt 0) {
                     $failure = ("failed for the wrong reason; expected '{0}' in: {1}" -f
                         $normalizedExpected, $normalizedOutput)
                 }
+            }
+        }
+        if ($failure.Length -eq 0 -and $case.Contains("assert_after")) {
+            $postconditionFailure = [string](& $case.assert_after $caseRoot)
+            if ($postconditionFailure.Length -gt 0) {
+                $failure = $postconditionFailure
             }
         }
         if ($failure.Length -eq 0) {

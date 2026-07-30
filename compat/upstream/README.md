@@ -12,9 +12,16 @@ and records, per feature row, whether GTA-Claw actually implements it.
 | `feature-ledger.schema.json` | frozen, digest hardcoded in `validate.ps1` |
 | `enabled-test-oracle.json` (120 cases) | frozen, digest hardcoded in `validate.ps1` |
 | `reachability-corpus.json` (32 cases) | frozen, digest hardcoded in `validate.ps1` |
-| `manifest.json` | only `evidence_policy.status_totals` may change |
+| `evidence-reachability-sweep.tsv` | regenerated only by `validate.ps1 -ReplayEvidenceSweep`; digest, dated commit and reviewed totals are hardcoded in `validate.ps1` |
+| `manifest.json` | only `evidence_policy.status_totals` may change, and only through the composite `validate.ps1 -WriteLedgerDigests -WriteStatusTotals ...` command |
 | `ledgers/*.json` (3 files, 47 rows) | only `status`, `acceptance_evidence.status`, `acceptance_evidence.artifacts`, `implementation_pointers` and `known_differences` may change; every other field, **including `acceptance_evidence.required`**, is frozen by a digest hardcoded in `validate.ps1` |
 | `ledger-digests.sha256` | regenerated only by `validate.ps1 -WriteLedgerDigests` |
+| `validate-self-test.ps1` | frozen, LF-normalised digest hardcoded in `validate.ps1` |
+| `README.md` (this file) | normative and frozen, LF-normalised digest hardcoded in `validate.ps1` |
+
+The last two are trust-root artifacts. A hollowed-out rejection instrument or a
+stale specification can weaken the contract without changing a ledger rule, so
+both require a reviewed digest-pin change.
 
 ## Validation
 
@@ -50,7 +57,7 @@ failing loudly rather than drifting:
 | `String.StartsWith/EndsWith/IndexOf(String)` and `Sort-Object` are culture-sensitive | locale-dependent ordering and matching | `[StringComparison]::Ordinal` and `[StringComparer]::Ordinal` everywhere |
 | Git checks files out CRLF on Windows and LF on Linux | digest changes with the checkout | digests are structural, so line endings never reach a hash; `ledger-digests.sha256` is normalised to LF on read |
 
-Digests are **structural**: every digest is taken over the parsed JSON
+JSON contract digests are **structural**: they are taken over parsed JSON
 re-encoded by `ConvertTo-CanonicalJson` (ordinally sorted keys, invariant scalar
 rendering) and hashed as UTF-8 without a BOM. Insignificant whitespace, indent
 style and line endings are therefore discarded before hashing, so a digest is a
@@ -61,6 +68,14 @@ file checks out CRLF on Windows and LF on Linux. The self-test asserts this end
 to end; see `culture-sensitive-key-sort-is-rejected`,
 `ledger-digest-file-with-crlf-line-endings` and
 `contract-digests-ignore-crlf-checkout`.
+
+Three text artifacts are intentionally byte-oriented after normalising CRLF to
+LF: this README, `validate-self-test.ps1`, and the reachability sweep. The sweep
+also requires valid BOM-less UTF-8 and one uniform line-ending style. The
+manifest status writer is different again: it preserves the input file's UTF-8
+BOM state and every byte outside the three integer tokens. This distinction is
+load-bearing because `[System.IO.File]::ReadAllText` consumes a UTF-8 BOM; a
+string round trip cannot prove byte preservation.
 
 The only thing that legitimately differs between hosts is `repository_root` in
 the JSON report, plus the whitespace of the report itself, because each host
@@ -145,21 +160,22 @@ Because carriage return is ASCII whitespace to the tokenizer, a CRLF checkout on
 Windows and an LF checkout on Linux produce identical tokens and therefore
 identical verdicts.
 
-#### Ownership of the enabled-test rule
+#### Shared enabled-test rule and function mapping
 
-`declares_enabled_test` in `crates/claw-conformance/src/claims.rs` is the
-**normative** implementation. `Test-DeclaresEnabledRustTest` in `validate.ps1`
-is a follower port and has no independent authority: where the two ever disagree,
-the Rust harness is correct and this script is the bug.
+Rust and PowerShell are co-equal implementations of one enabled-test rule.
+Neither side may tighten or loosen it alone; a disagreement is a drift defect,
+not an authority decision.
 
-The two trees are independently owned, so this is a real drift risk. The rule is
-binding in one direction only:
+| Stage | Rust (`crates/claw-conformance/src/claims.rs`) | PowerShell (`validate.ps1`) |
+| --- | --- | --- |
+| enabled-test decision | `declares_enabled_test` | `Test-DeclaresEnabledRustTest` |
+| tokenization | `rust_tokens` | `Get-RustTokens` |
+| item-tree walk | `declares_in_items` | `Test-RustDeclaresInItems` |
 
-- Any change to `declares_enabled_test` must be reported to the coordinating
-  session and re-ported here in the same cycle.
-- This port must never be "improved" unilaterally. Tightening or loosening it
-  here without a matching change in the harness creates exactly the split the
-  port exists to prevent: a row that passes one trust root and fails the other.
+The frozen oracle retains the historical field names
+`normative_implementation` and `follower_implementation` and the commit where
+the original port was taken. Those names are frozen provenance, not present-day
+ownership or permission for unilateral changes.
 
 #### The drift check is mechanical, not manual
 
@@ -176,9 +192,9 @@ harness replays the same file through `declares_enabled_test`. A re-port that
 silently changes behaviour therefore fails a build on both sides instead of
 quietly accepting or rejecting a claim the other side disagrees with.
 
-The `expected` values were **not written by hand**: they were produced by running
-the normative Rust implementation, so the corpus cannot encode an expectation the
-normative side does not actually hold.
+The `expected` values were produced by running the Rust implementation when the
+corpus was created, then frozen. Both current implementations are measured
+against those same recorded decisions.
 
 The corpus is frozen like the inventories. Its digest, its case count and its
 accept/reject split are pinned as constants in `validate.ps1`, and
@@ -261,6 +277,14 @@ rather than recalled:
 - Any target with an explicit `test = false`.
 - Any target with `harness = false`, whose own `main()` replaces the libtest
   harness and makes every `#[test]` item in the file inert.
+- Any target with a non-empty `required-features`, including a multiline TOML
+  array. A plain `cargo test` skips that target unless every named feature is
+  enabled. Presence is read, never resolved: reproducing Cargo's default-feature
+  expansion, transitive feature edges and workspace unification here would
+  create a new way to bless a target Cargo did not build. The target is therefore
+  refused even if the named feature is enabled by default, and an explicit
+  `test = true` cannot override the gate. `required-features = []` gates nothing
+  and remains accepted.
 
 Auto-discovery is suppressed by `autotests = false` and `autobins = false`, and a
 file named by an explicit target section is governed by that section alone —
@@ -320,17 +344,12 @@ Three limits, stated plainly rather than left to be discovered:
 - The rule catches files that **nothing references**, and targets that
   `cargo test` does not run. It does not evaluate `cfg` predicates, so a module
   behind `#[cfg(feature = "off-by-default")]` still counts as referenced even
-  though `cargo test` would not run it by default. Nor does it resolve
-  `required-features`: a target gated on a non-default feature is still treated
-  as a root. `cargo metadata` does not filter on `required-features` either — it
-  reports such targets with `test = true` — so both implementations are
-  permissive here by the same rule. Evaluating either would reject honest
-  evidence, and the disclosed vector is the unreferenced file. The same
-  permissiveness applies when a `cfg` decides the *path* rather than the
-  module's existence: `#[cfg_attr(unix, path = "unix.rs")] mod imp;` is read as
-  a plain `mod imp;`, so `imp.rs` is treated as reachable. That is the honest
-  answer on a non-unix host and a permissive one on unix, which is the same
-  trade made above.
+  though `cargo test` would not run it by default. The same permissiveness applies
+  when a `cfg` decides the *path* rather than the module's existence:
+  `#[cfg_attr(unix, path = "unix.rs")] mod imp;` is read as a plain `mod imp;`,
+  so `imp.rs` is treated as reachable. That is the honest answer on a non-unix
+  host and a permissive one on unix. Target-level `required-features` is not a
+  `cfg` predicate and is handled separately by the fail-closed exclusion above.
 - Reachability is computed within the owning crate: the crate that owns the
   *cited* file must itself reach it. A file pulled in only by a
   `#[path = "..."]` from a *different* crate is not recognised; cite a test in
@@ -342,26 +361,41 @@ Three limits, stated plainly rather than left to be discovered:
 - It proves a file is compiled and a test is enabled. It does not prove the test
   passes; that is `cargo test`'s job.
 
-This rule is **shared, not locally owned**. `crates/claw-conformance` implements
-the same rule — "a target root, or reachable from a target root" — after a
-proposal to require the cited file to *be* a target root was put to the
-compatibility owner and then withdrawn: target-root-only left, at the time it was
-proposed, 225 tests across 34 files in 9 crates with no legal citation at all,
-and the only workaround was widening the visibility of private items in
-production code, which would have let the ledger dictate the API surface.
+Rust and PowerShell implement the same core rule — "a target root, or reachable
+from a target root." The current function mapping is:
+
+| Stage | Rust (`crates/claw-conformance/src/claims.rs`) | PowerShell (`validate.ps1`) |
+| --- | --- | --- |
+| orchestration | `CargoTestTargets::load` | `Assert-EvidenceFileIsCompiled` |
+| workspace/package admission | `CargoWorkspaceSpec::includes_package` | `Test-CratePackageIsBuilt` |
+| test-enabled target roots | target discovery in `CargoTestTargets::load` | `Get-CargoManifestTargetSections`, `Test-CargoSectionRunsTests`, `Get-CrateTargetRootFiles` |
+| module-reference discovery | `rust_module_references_from_tokens` | `Get-RustModuleReferences` |
+| transitive source walk | `reachable_rust_sources` | `Get-CrateCompiledFileSet` |
+| final membership | `CargoTestTargets::contains_compiled_source` | final membership check in `Assert-EvidenceFileIsCompiled` |
+
+The Rust side uses `cargo metadata` and PowerShell models Cargo hermetically, so
+this maps decisions rather than claiming line-for-line mechanics. One disclosed
+gap remains: PowerShell rejects non-empty `required-features` target declarations
+while the Rust loader currently trusts metadata's `target.test` flag. The shared
+corpus has no required-features case and does not arbitrate that gap. Until Rust
+implements the same exclusion, the two are not truthfully identical on that
+shape.
+
+The shared core followed a proposal to require the cited file to *be* a target
+root that was put to the compatibility owner and then withdrawn:
+target-root-only left, at the time it was proposed, 225 tests across 34 files in
+9 crates with no legal citation at all, and the only workaround was widening the
+visibility of private items in production code, which would have let the ledger
+dictate the API surface.
 Re-measured when this rule was settled — 292 tracked `.rs` files at that point,
 counting `#[test]` occurrences in files this rule accepts that are not themselves
 target roots — the cost was **822 tests across 99 files in 17 packages**. The figure is a lower
 bound on the harm and it grows with every crate the fleet adds, which is why it
 is recorded with its method and denominator rather than as a bare number.
 
-The two implementations are therefore intended to be **identical**, not merely
-ordered. A divergence in *either* direction is a defect and must be reported
-rather than managed: if this validator were the looser side, a row it blesses
-could be rejected by the parity report. The specification above is deliberately
-complete enough to be mirrored; the thirty-three `implemented-citing-*` cases in
-`validate-self-test.ps1` are its executable form — nineteen that must be rejected
-and fourteen that must be accepted.
+Outside the disclosed required-features gap, the two implementations are
+intended to be identical, not merely ordered. A divergence in either direction
+is a defect and must be reported rather than managed.
 
 The root set is derived here by reading the manifest rather than by shelling out
 to `cargo metadata`, which keeps this trust root hermetic: it reads files and
@@ -383,7 +417,7 @@ implementations now agree here; the corpus pins all six of those paths so
 neither side can drift back.
 
 A tightening rule needs its false-positive cases pinned as much as its
-true-positive ones. Twelve of the fourteen accepting cases pin reachability — a
+true-positive ones. The accepting cases pin reachability — a
 `mod`-wired module, a `#[path]`-relocated module, a transitive `lib.rs` →
 `nested/mod.rs` → `nested/deep.rs` chain, a `src/bin/` target, a top-level
 `#[path]` sibling, the child of a `#[path]`-named `mod.rs`, a raw-string
@@ -408,24 +442,51 @@ a divergence the corpus does not exercise** — which is why the whole-tree swee
 runs on every change and why its result is reported as a per-file verdict list
 rather than as a count.
 
+#### `evidence-reachability-sweep.tsv` — the checked-in cross-check
+
+The whole-tree verdict list is a committed artifact rather than a number quoted
+in prose. It holds one `<verdict><TAB><path>` row for every tracked non-legacy
+`.rs` file in its cited `base-commit` tree, sorted ordinally, with a header naming
+the generator, commit, date and totals. Regenerate it only with:
+
+```text
+powershell -NoProfile -File compat/upstream/validate.ps1 -ReplayEvidenceSweep
+```
+
+Replay reruns the shipped PowerShell reachability rule over git's tracked Rust
+universe, rewrites the record, prints additions, removals and verdict changes,
+and prints the commit/date/digest pins to review. It is mutually exclusive with
+the ledger and status writers and, like every writer mode, is refused in CI
+before any artifact write.
+
+**The sweep grants no evidence permission.** Citation admission always invokes
+the live rule and never consults this file. Every ordinary run independently
+enforces:
+
+- the LF-normalised pinned digest;
+- one positional canonical header, valid BOM-less UTF-8, uniform LF or CRLF,
+  exactly one final newline, exactly two TAB-separated row fields, and unique
+  strictly ordinal paths;
+- a fresh live verdict for every recorded path, followed only then by the exact
+  reviewed file/accept/reject totals.
+
+A coordinated edit that flips a verdict, repairs the totals and re-pins the
+digest still fails the semantic comparison. A new tracked Rust file absent from
+the dated record is deliberately tolerated, so later tree growth does not
+invalidate a historical measurement; a recorded path becoming absent,
+non-ordinal, non-regular, a reparse point, or differently classified is not.
+Intentional replay surfaces later additions in its differential.
+
+The universe comes from `git ls-files`, not a filesystem walk that reimplements
+ignore rules or admits untracked sources. Replay also refuses to cite `HEAD` if
+any tracked or untracked Rust path differs from it. That keeps `base-commit` a
+truthful claim about the tree swept while allowing the validator and this
+artifact themselves to be edited during review.
+
 #### The sweep is silent on rules the tree never exercises
 
-The converse is equally true, and it is why `reachability-corpus.json` exists.
-Both implementations agree on the real tree: measured at `988c6d6`, **296 files,
-291 accepted, 5 rejected, zero per-file disagreements**. The totals churn on
-every merge and are deliberately pinned nowhere; only the rejection set is
-stable, and each entry names the rule that refuses it — three `build.rs`, one
-`.github/trusted/**` policy snapshot lying outside every Cargo package, and one
-`harness = false` desktop target. A measurement that moves with the tree is
-recorded with the revision it was taken at, or it is not reproducible.
-
-That agreement proves nothing about
-the two rules both sides changed most recently, because neither construct occurs
-anywhere in either tree: scanned at the time of writing, there are **zero inline
-`#[path]` modules and zero ambiguous `foo.rs` + `foo/mod.rs` pairs** in the
-repository. Two implementations could agree 291/5 forever with both fixes never
-once compared. A whole-tree sweep is the highest-yield instrument for rules the
-tree exercises and no instrument at all for rules it does not.
+A whole-tree sweep is high-yield for rules the tree exercises and no instrument
+at all for shapes it does not. That is why `reachability-corpus.json` exists.
 
 `reachability-corpus.json` holds 32 synthetic workspaces — 15 that must be
 accepted and 17 that must be rejected — each a complete set of files, a cited
@@ -440,6 +501,13 @@ exhaustive proof of reachability behaviour outside them, and a green 32/32 must
 never be reported as one. The corpus and the sweep are complementary and neither
 is sufficient on its own: the sweep covers what the tree exercises, the corpus
 covers what it does not, and any rule outside both is pinned by nothing.
+
+Canonical case names are append-only, including future additions.
+`$CanonicalReachabilityCaseNames` and the corpus must be exact sets. Adding a
+case therefore appends its name and updates the count, split and digest pins;
+deleting or renaming any old case requires a conspicuous deletion from the
+never-remove registry. A new corpus case omitted from the registry is rejected,
+so additions cannot enter unprotected and disappear later.
 
 **Neither implementation is normative here.** The `arbiter` field records that
 every expectation was produced by running `cargo` and `rustc` against the
@@ -476,20 +544,10 @@ that reason; a reader may ignore `schema_version`, `purpose`, `rule`, `arbiter`,
 `implementations` and each case's `why` and still see `name`, `files`, `cite` and
 `expect`.
 
-Sharing the file has a cost that must be stated rather than discovered. The
-consumer asserts an exact case count, so **adding a case to this corpus is a
-change that cannot land on either side alone** — the same coupling that already
-applies to `enabled-test-oracle.json` and to `canonical_counts.artifact_json_files`,
-and the reason the artifact count needed a single atomic pull request across two
-owners. The coupling is worth keeping in the shrinking direction: without it,
-cases could be deleted to hide a disagreement in a tree where `validate.ps1` was
-bypassed. It is not worth paying in the growing direction, because a corpus is
-only useful if adding coverage is cheap, and every case added here exists because
-some rule was otherwise pinned by nothing. An exact equality is also strictly
-weaker than the digest this validator already enforces: it cannot detect a case
-being *replaced* by a weaker one at constant count. A lower bound on the consumer
-side preserves the anti-deletion property, drops the coupling on additions, and
-gives up nothing the digest does not already cover.
+Sharing the file means an addition must update consumers that pin an exact count.
+That coupling is explicit rather than hidden: a coverage addition and its new
+canonical registry entry land together, while consumers may use a lower bound
+when they need additions to remain independently deployable.
 
 #### A row may not rewrite its own acceptance bar
 
@@ -572,20 +630,42 @@ anything under `src/`, `compat/legacy/`, `packages/`, `node_modules/` or
    `acceptance_evidence.status`, the `artifacts`, optionally
    `implementation_pointers`, and replace the baseline `known_differences`
    placeholder with the real remaining differences.
-3. Update `manifest.json` `evidence_policy.status_totals` so the three counts
-   still sum to 47 and match reality. The validator cross-checks them.
-4. Regenerate the ledger digests through the reviewed command and review the
-   printed values against the diff:
+3. State the new totals and let the composite reviewed command update both
+   derived files:
 
    ```text
-   powershell -NoProfile -File compat/upstream/validate.ps1 -WriteLedgerDigests
+   powershell -NoProfile -File compat/upstream/validate.ps1 `
+       -WriteLedgerDigests -WriteStatusTotals "unimplemented=3,partial=10,implemented=34"
    ```
 
-   This is the only supported way to change a ledger digest. It rewrites
-   `ledger-digests.sha256` and nothing else: inventory digests, the feature schema
-   digest, the enabled-test oracle corpus digest and `baseline.json` stay
-   hardcoded in `validate.ps1` and are unreachable from this command.
+   You state the totals; the command does not derive the declaration. It checks
+   the declaration against all 47 validated rows, then atomically replaces the
+   digest sidecar and only the three integer tokens in
+   `manifest.evidence_policy.status_totals`. Every other manifest byte, including
+   its UTF-8 BOM state and line endings, is preserved.
+
+   Both reviewed byte sequences are prepared before either file is touched.
+   Every contract and sweep check runs first; a rejected composite transition
+   leaves the manifest and digest sidecar byte-identical, with temporary files
+   removed. If the second replacement itself fails, the first is restored from
+   its original bytes.
+
+4. Review the printed digests, totals and inventory of every non-unimplemented
+   row against the ledger diff.
 5. Re-run `validate.ps1` and `validate-self-test.ps1`.
+
+`-WriteLedgerDigests` may still be run alone. Its historical write ordering is
+deliberate and different: it rewrites the sidecar before the mutable ledger rows
+finish semantic validation so anti-forgery tests can model an attacker who
+already re-blessed those digests. A standalone run that later fails can therefore
+leave `ledger-digests.sha256` changed. Restore it before retrying. It cannot bless
+frozen ledger text because the frozen projections remain hardcoded in the
+validator.
+
+The README, self-test, schema, corpora, sweep pin, inventory digests and baseline
+are unreachable from either ledger writer. If this README changes, update
+`$ExpectedReadmeDigest` in the same reviewed commit before invoking a writer,
+because writer modes enforce the same specification pin as verify mode.
 
 ## Continuous integration
 
@@ -630,16 +710,15 @@ Contract:
 - The `try`/`catch` exists only so the rejection reason is one clean line;
   PowerShell 7's default error view wraps long messages mid-word and buries them
   under source-line art. Exit codes are the same without it.
-- **Never** run `-WriteLedgerDigests` in CI. It rewrites `ledger-digests.sha256`,
-  which is a reviewed, committed artifact; regenerating it inside a job would
-  re-bless whatever the job happens to be looking at.
+- **Never** run `-WriteLedgerDigests`, `-WriteStatusTotals`, or
+  `-ReplayEvidenceSweep` in CI. The validator detects standard CI environment
+  markers and rejects every writer mode before reading or writing a contract
+  artifact.
 
-The adversarial self-test is a separate, slower step. It spawns 257 child
-validator processes — one baseline run against the real tree, one per each of the
-153 cases, and a re-blessing pre-run for the 103 cases that model an attacker who
-had already regenerated the ledger digests — and takes several minutes,
-so prefer a job with a `paths:` filter on `compat/upstream/**` over running it on
-every push:
+The adversarial self-test is a separate, slower step. It spawns one child
+validator per case, plus a baseline run and re-blessing pre-runs for cases that
+model an attacker who already regenerated ledger digests. Prefer a job with a
+`paths:` filter on `compat/upstream/**` over running it on every push:
 
 ```yaml
       - name: Validate the parity validator itself
@@ -648,8 +727,8 @@ every push:
 ```
 
 It exits 0 when every case passes and 1 otherwise, printing `ok`/`FAIL` per case
-followed by an aggregate. It evaluates every case even after one fails, so a
-single regression cannot hide the cases behind it.
+followed by an aggregate carrying the positive and negative counts. It evaluates
+every case even after one fails, so a single regression cannot hide later cases.
 
 ### Where the self-test builds its throwaway trees
 
@@ -681,3 +760,21 @@ wrong reason" rather than pass. Had the harness only checked that the validator
 rejected something, every one of the negative cases would have passed vacuously
 against a fixture that no longer existed — a green anti-forgery suite testing
 nothing.
+
+## Why the specification is digest-pinned
+
+`$ExpectedReadmeDigest` freezes this file as LF-normalised UTF-8 before any
+evidence is judged. Editing the specification therefore requires moving the pin
+in the same reviewed commit; no writer mode can regenerate it.
+
+This is not ceremonial. The README once continued to say the Cargo reachability
+rule was locally owned and unported after the Rust implementation had acquired
+the same core rule. A competent reader could reasonably act on that stale
+ownership claim without re-deriving the program. Pinning makes specification and
+validator changes move together and makes ownership assertions reviewable as
+trust-root edits rather than harmless prose.
+
+The digest cannot prove a sentence was true when written. It does guarantee that
+the rules cannot move while the normative description silently stays behind.
+Claims here therefore prefer stable symbols and measured mechanisms over line
+numbers, file counts, or other citations that decay without changing meaning.
