@@ -258,6 +258,30 @@ exact historical ceiling of 18 `src/**/*.ts` files plus `Dockerfile`, `package.j
 Tracked symbolic links, gitlinks, new package-manager artifacts, and new Node workflow or local
 action debt fail from the base side.
 
+### Atomic Phase-A1 PR226 helper admission
+
+Phase A1 is frozen against current main
+`5e85d6d080712c82dc0814985df1472bdfab5dd9`. PR226 source
+`4f91f20348b030cdf6817bc1bb9c527a999a25d2` contributes only the mode-`100644`
+`crates/claw-windows-file-id/Cargo.toml` and `src/lib.rs` blobs
+`a9fad929ce2befd694bbb5144dd733011ae0e65f` and
+`375c6e7d4043c7168f512656ccc0902f0a9ea598`. Their SHA-256 values are
+`2139338411341e1dae1db88972d05b23ff59ac8b32a10b0ec471b43d0da2af44` and
+`8561dd1f84b565332a48e497c86d8d926b33ee79d026c4336c9cdefb80f3a440`.
+
+The admission adds the exact root member/path dependency, one
+`crates/claw-conformance/Cargo.toml` `cfg(windows)` workspace edge, and their two exact
+lockfile edits. The conformance implementation remains in PR226. Parsed dependency tables reject
+aliases, non-Windows placement, and every second consumer; comments, descriptions, and lookalike
+names grant no authority. The helper itself is an exact two-file fixture with local deny lints,
+`windows-sys 0.61.2` / `windows-link 0.2.1`, one module-scoped unsafe expectation, one unsafe
+block, and one `GetFileInformationByHandleEx(FileIdInfo, FILE_ID_INFO)` boundary.
+
+CODEOWNERS covers only the exact root, conformance-manifest, repository-policy-test, and helper
+surfaces. Its Bootstrap rotation synchronizes exactly the CODEOWNERS payload. The root manifest
+and lock retain their historical archive bytes through two source decisions bound to the current
+main OID, their before/after hashes, and the rotated archive fingerprint.
+
 `crates/claw-repo-policy` is transitionally absent until its accepted product-policy pull request
 lands. Its first appearance must have the exact dependency-free workspace shape, explicit
 ceiling, fixture exceptions, add-fails/delete-passes tests, workflow/action and index tests, and

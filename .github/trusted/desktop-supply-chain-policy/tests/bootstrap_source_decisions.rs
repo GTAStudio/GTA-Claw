@@ -11,7 +11,8 @@ use desktop_supply_chain_policy::bootstrap_decisions::{
 use desktop_supply_chain_policy::changes::{ChangeManifest, ChangedPath};
 use desktop_supply_chain_policy::input::{SafeRoot, sha256};
 use desktop_supply_chain_policy::policy::{
-    BootstrapSnapshotArchive, bootstrap_fingerprint, bootstrap_snapshot,
+    BootstrapSnapshotArchive, WINDOWS_FILE_ID_ADMISSION_BASE_OID, bootstrap_fingerprint,
+    bootstrap_snapshot,
 };
 use desktop_supply_chain_policy::workflows::{
     AUTHORITATIVE_PATH as AUTHORITATIVE_WORKFLOW_PATH, BOOTSTRAP_PATH as BOOTSTRAP_WORKFLOW_PATH,
@@ -21,10 +22,35 @@ use desktop_supply_chain_policy::workflows::{
 const UPSTREAM_WORKFLOW: &str = ".github/workflows/upstream-gateway-reference.yml";
 const RUSTFMT: &str = "rustfmt.toml";
 const ROOT_LOCK: &str = "Cargo.lock";
+const ROOT_MANIFEST: &str = "Cargo.toml";
 const SECURITY_MANIFEST: &str = "crates/claw-security/Cargo.toml";
 const PROTECTED_TREE: &str = ".github/trusted/desktop-supply-chain-policy";
 const CODEOWNERS: &str = ".github/CODEOWNERS";
 const FINGERPRINT_PREFIX: &str = "const BOOTSTRAP_FINGERPRINT: &str =\n    \"";
+const PHASE_A1_BASE_FINGERPRINT: &str =
+    "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3";
+const PHASE_A1_BASE_CODEOWNERS: &[u8] = b"# Security-critical desktop supply-chain ownership.\n\
+/.github/CODEOWNERS @aizhihuxiao\n\
+/.github/workflows/bootstrap-desktop-supply-chain-policy.yml @aizhihuxiao\n\
+/.github/workflows/trusted-desktop-supply-chain-policy.yml @aizhihuxiao\n\
+/.github/trusted/desktop-supply-chain-policy/** @aizhihuxiao\n\
+/.github/workflows/rust.yml @aizhihuxiao\n\
+/.github/workflows/macos-packaging.yml @aizhihuxiao\n\
+/.github/fixtures/cargo-audit/** @aizhihuxiao\n\
+/.github/fixtures/security-tools/** @aizhihuxiao\n\
+/.gitattributes @aizhihuxiao\n\
+/.cargo/audit.toml @aizhihuxiao\n\
+/deny.toml @aizhihuxiao\n\
+rust-toolchain @aizhihuxiao\n\
+/rust-toolchain.toml @aizhihuxiao\n\
+/rustfmt.toml @aizhihuxiao\n\
+/desktop/Cargo.toml @aizhihuxiao\n\
+/desktop/Cargo.lock @aizhihuxiao\n\
+/desktop/deny.toml @aizhihuxiao\n\
+/desktop/apps/gta-claw-desktop/Cargo.toml @aizhihuxiao\n\
+/desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs @aizhihuxiao\n\
+/crates/claw-security/tests/desktop_supply_chain_policy.rs @aizhihuxiao\n\
+/crates/claw-security/tests/fixtures/desktop_supply_chain_policy/** @aizhihuxiao\n";
 
 /// Bootstrap sources that carry no standing preservation and therefore stay fully coupled.
 const FULLY_COUPLED_SOURCES: [&str; 13] = [
@@ -398,6 +424,84 @@ fn unchanged_and_non_bootstrap_changes_need_no_decision() {
             changed_paths: 0,
             synchronized_paths: 0,
             preserved_paths: 0,
+        }
+    );
+}
+
+#[test]
+fn phase_a1_rotates_only_codeowners_and_preserves_exact_root_inputs() {
+    let trusted = snapshot_fixture("phase-a1-trusted");
+    let candidate = snapshot_fixture("phase-a1-candidate");
+
+    write_file(&trusted, CODEOWNERS, PHASE_A1_BASE_CODEOWNERS);
+    replace_fingerprint(&trusted, PHASE_A1_BASE_FINGERPRINT);
+    let trusted_snapshot =
+        bootstrap_snapshot(&SafeRoot::new(&trusted.path).expect("open Phase-A1 protected base"))
+            .expect("generate Phase-A1 protected snapshot");
+    fs::write(trusted.join(BOOTSTRAP_SNAPSHOT_PATH), trusted_snapshot)
+        .expect("write Phase-A1 protected snapshot");
+
+    let candidate_ledger = fs::read_to_string(candidate.join(BOOTSTRAP_SOURCE_DECISIONS_PATH))
+        .expect("read Phase-A1 candidate ledger");
+    let standing = candidate_ledger
+        .find("\n[[standing]]\n")
+        .expect("candidate ledger retains standing decisions");
+    fs::write(
+        trusted.join(BOOTSTRAP_SOURCE_DECISIONS_PATH),
+        format!(
+            "schema_version = 1\ndecisions = []\n{}",
+            &candidate_ledger[standing..]
+        ),
+    )
+    .expect("write Phase-A1 protected ledger");
+
+    for path in [ROOT_LOCK, ROOT_MANIFEST] {
+        write_file(
+            &candidate,
+            path,
+            fs::read(repo_root().join(path)).expect("read admitted root input"),
+        );
+    }
+
+    let before = BootstrapSnapshotArchive::parse(
+        &fs::read(trusted.join(BOOTSTRAP_SNAPSHOT_PATH)).expect("read protected snapshot"),
+    )
+    .expect("parse protected snapshot");
+    let after = BootstrapSnapshotArchive::parse(
+        &fs::read(candidate.join(BOOTSTRAP_SNAPSHOT_PATH)).expect("read admitted snapshot"),
+    )
+    .expect("parse admitted snapshot");
+    let changed = before
+        .entries()
+        .filter_map(|(path, payload)| (after.payload(path) != Some(payload)).then_some(path))
+        .collect::<Vec<_>>();
+    assert_eq!(changed, [CODEOWNERS]);
+    assert_eq!(
+        after.payload(CODEOWNERS),
+        Some(
+            normalize_text(
+                &fs::read(repo_root().join(CODEOWNERS)).expect("read admitted CODEOWNERS")
+            )
+            .as_slice()
+        )
+    );
+
+    let mut phase_a1_manifest = manifest([
+        ('M', CODEOWNERS),
+        ('M', ROOT_LOCK),
+        ('M', ROOT_MANIFEST),
+        ('M', BOOTSTRAP_SNAPSHOT_PATH),
+        ('M', BOOTSTRAP_FINGERPRINT_SOURCE_PATH),
+        ('M', BOOTSTRAP_SOURCE_DECISIONS_PATH),
+    ]);
+    phase_a1_manifest.base = WINDOWS_FILE_ID_ADMISSION_BASE_OID.to_owned();
+    assert_eq!(
+        validate(&trusted, &candidate, &phase_a1_manifest)
+            .expect("accept exact Phase-A1 synchronized/preserved inputs"),
+        BootstrapSourceDecisionEvidence {
+            changed_paths: 3,
+            synchronized_paths: 1,
+            preserved_paths: 2,
         }
     );
 }

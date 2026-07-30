@@ -86,6 +86,92 @@ const ALLOWED_ADVERSARIAL_SHELL_FIXTURES: &[&str] =
 // Every exception must name one inert fixture file. This is intentionally empty:
 // the current compat trees contain JSON contract data, but no script fixtures.
 const ALLOWED_COMPAT_FIXTURES: &[&str] = &[];
+const WINDOWS_FILE_ID_PACKAGE: &str = "claw-windows-file-id";
+const WINDOWS_FILE_ID_CONSUMER_MANIFEST: &str = "crates/claw-conformance/Cargo.toml";
+
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ManifestDependencyEdge {
+    manifest: PathBuf,
+    section: String,
+    assignment: String,
+}
+
+fn dependency_section(section: &str) -> bool {
+    ["dependencies", "dev-dependencies", "build-dependencies"]
+        .iter()
+        .any(|kind| section == *kind || section.ends_with(&format!(".{kind}")))
+}
+
+fn inline_package_is(declaration: &str, package: &str) -> bool {
+    let Some(fields) = declaration
+        .trim()
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        return false;
+    };
+    fields.split(',').any(|field| {
+        field.split_once('=').is_some_and(|(name, value)| {
+            name.trim() == "package" && value.trim().trim_matches(['"', '\'']) == package
+        })
+    })
+}
+
+fn dependency_assignment_is(assignment: &str, package: &str) -> bool {
+    let Some((name, declaration)) = assignment.split_once('=') else {
+        return false;
+    };
+    let name = name.trim().trim_matches(['"', '\'']);
+    name == package
+        || name
+            .strip_suffix(".workspace")
+            .is_some_and(|name| name == package)
+        || inline_package_is(declaration, package)
+}
+
+fn manifest_dependency_edges(
+    manifest: PathBuf,
+    text: &str,
+    package: &str,
+) -> Vec<ManifestDependencyEdge> {
+    let mut section = String::new();
+    let mut edges = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_owned();
+        } else if dependency_section(&section) && dependency_assignment_is(line, package) {
+            edges.push(ManifestDependencyEdge {
+                manifest: manifest.clone(),
+                section: section.clone(),
+                assignment: line.to_owned(),
+            });
+        }
+    }
+    edges
+}
+
+fn lock_package<'a>(lock: &'a str, name: &str, version: &str) -> &'a str {
+    let name_line = format!("name = \"{name}\"");
+    let version_line = format!("version = \"{version}\"");
+    let matches = lock
+        .split("[[package]]")
+        .filter(|package| {
+            let lines = package.lines().map(str::trim).collect::<Vec<_>>();
+            lines.iter().any(|line| *line == name_line)
+                && lines.iter().any(|line| *line == version_line)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matches.len(),
+        1,
+        "lock package must be unique: {name} {version}"
+    );
+    matches[0].trim()
+}
 
 #[test]
 fn repository_legacy_javascript_surface_does_not_grow() {
@@ -166,6 +252,171 @@ fn repository_legacy_javascript_surface_does_not_grow() {
         violations.is_empty(),
         "the legacy JavaScript/Node surface may only shrink; unlisted artifacts are forbidden:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn windows_file_identity_ffi_is_isolated() {
+    let root = workspace_root();
+    let workspace_manifest =
+        fs::read_to_string(root.join("Cargo.toml")).expect("read workspace manifest");
+    let root_edges = manifest_dependency_edges(
+        PathBuf::from("Cargo.toml"),
+        &workspace_manifest,
+        WINDOWS_FILE_ID_PACKAGE,
+    );
+    assert_eq!(
+        root_edges,
+        [ManifestDependencyEdge {
+            manifest: PathBuf::from("Cargo.toml"),
+            section: "workspace.dependencies".to_owned(),
+            assignment: "claw-windows-file-id = { path = \"crates/claw-windows-file-id\", version = \"0.1.0\" }".to_owned(),
+        }],
+        "the root must declare exactly one path-and-version-bound helper edge"
+    );
+
+    let helper_root = root.join("crates/claw-windows-file-id");
+    let helper_manifest =
+        fs::read_to_string(helper_root.join("Cargo.toml")).expect("read helper manifest");
+    let helper_source =
+        fs::read_to_string(helper_root.join("src/lib.rs")).expect("read helper source");
+    let top_level = fs::read_dir(&helper_root)
+        .expect("inventory helper root")
+        .map(|entry| {
+            entry
+                .expect("read helper root entry")
+                .file_name()
+                .into_string()
+                .expect("helper root name is UTF-8")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        top_level,
+        ["Cargo.toml".to_owned(), "src".to_owned()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "helper root inventory changed"
+    );
+    let source_files = fs::read_dir(helper_root.join("src"))
+        .expect("inventory helper source")
+        .map(|entry| {
+            entry
+                .expect("read helper source entry")
+                .file_name()
+                .into_string()
+                .expect("helper source name is UTF-8")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        source_files,
+        ["lib.rs".to_owned()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "helper source inventory changed"
+    );
+
+    let helper_edges = manifest_dependency_edges(
+        PathBuf::from("crates/claw-windows-file-id/Cargo.toml"),
+        &helper_manifest,
+        "windows-sys",
+    );
+    assert_eq!(
+        helper_edges,
+        [ManifestDependencyEdge {
+            manifest: PathBuf::from("crates/claw-windows-file-id/Cargo.toml"),
+            section: "target.'cfg(windows)'.dependencies".to_owned(),
+            assignment: "windows-sys = { version = \"0.61.2\", features = [\"Win32_Foundation\", \"Win32_Storage_FileSystem\"] }".to_owned(),
+        }],
+        "the helper must expose exactly the reviewed Windows API dependency"
+    );
+    assert!(
+        helper_manifest
+            .lines()
+            .map(str::trim)
+            .any(|line| line == "unsafe_code = \"deny\"")
+            && helper_manifest
+                .lines()
+                .map(str::trim)
+                .any(|line| line == "unsafe_op_in_unsafe_fn = \"deny\""),
+        "the helper must deny unsafe outside its local expectation"
+    );
+    assert_eq!(helper_source.matches("#[expect(").count(), 1);
+    assert_eq!(helper_source.matches("unsafe {").count(), 1);
+    assert_eq!(
+        helper_source
+            .matches("GetFileInformationByHandleEx(")
+            .count(),
+        1
+    );
+    assert!(
+        helper_source
+            .lines()
+            .map(str::trim)
+            .any(|line| line == "let mut info = FILE_ID_INFO::default();"),
+        "the helper must fill exactly FILE_ID_INFO"
+    );
+
+    let mut consumer_edges = Vec::new();
+    for parent in ["apps", "crates"] {
+        let mut entries = fs::read_dir(root.join(parent))
+            .expect("inventory first-party manifests")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read first-party manifest entries");
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries {
+            if !entry
+                .file_type()
+                .expect("inspect first-party manifest entry")
+                .is_dir()
+            {
+                continue;
+            }
+            let manifest = entry.path().join("Cargo.toml");
+            if !manifest.is_file() {
+                continue;
+            }
+            let relative = manifest
+                .strip_prefix(&root)
+                .expect("manifest is below workspace")
+                .to_path_buf();
+            consumer_edges.extend(manifest_dependency_edges(
+                relative,
+                &fs::read_to_string(&manifest).expect("read first-party manifest"),
+                WINDOWS_FILE_ID_PACKAGE,
+            ));
+        }
+    }
+    consumer_edges.sort();
+    assert_eq!(
+        consumer_edges,
+        [ManifestDependencyEdge {
+            manifest: PathBuf::from(WINDOWS_FILE_ID_CONSUMER_MANIFEST),
+            section: "target.'cfg(windows)'.dependencies".to_owned(),
+            assignment: "claw-windows-file-id.workspace = true".to_owned(),
+        }],
+        "only the exact conformance cfg(windows) consumer edge is admitted"
+    );
+
+    let lock = fs::read_to_string(root.join("Cargo.lock")).expect("read root lock");
+    assert_eq!(
+        lock_package(&lock, WINDOWS_FILE_ID_PACKAGE, "0.1.0"),
+        "name = \"claw-windows-file-id\"\nversion = \"0.1.0\"\ndependencies = [\n \"windows-sys 0.61.2\",\n]"
+    );
+    assert_eq!(
+        lock_package(&lock, "windows-sys", "0.61.2"),
+        "name = \"windows-sys\"\nversion = \"0.61.2\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc\"\ndependencies = [\n \"windows-link\",\n]"
+    );
+    assert_eq!(
+        lock_package(&lock, "windows-link", "0.2.1"),
+        "name = \"windows-link\"\nversion = \"0.2.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5\""
+    );
+    assert_eq!(
+        lock_package(&lock, "claw-conformance", "0.1.0")
+            .lines()
+            .filter(|line| line.trim() == "\"claw-windows-file-id\",")
+            .count(),
+        1,
+        "the lock must bind one conformance-to-helper edge"
     );
 }
 

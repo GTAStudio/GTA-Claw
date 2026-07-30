@@ -45,17 +45,13 @@ const WINDOWS_FILE_ID_MANIFEST: &str = "crates/claw-windows-file-id/Cargo.toml";
 const WINDOWS_FILE_ID_SOURCE: &str = "crates/claw-windows-file-id/src/lib.rs";
 const WINDOWS_FILE_ID_CONSUMER_MANIFEST: &str = "crates/claw-conformance/Cargo.toml";
 /// Current-main commit against which the Phase-A1 admission was frozen.
-pub const WINDOWS_FILE_ID_ADMISSION_BASE_OID: &str =
-    "5e85d6d080712c82dc0814985df1472bdfab5dd9";
+pub const WINDOWS_FILE_ID_ADMISSION_BASE_OID: &str = "5e85d6d080712c82dc0814985df1472bdfab5dd9";
 /// Immutable PR226 source commit for the exact Windows file-ID helper.
-pub const WINDOWS_FILE_ID_SOURCE_OID: &str =
-    "4f91f20348b030cdf6817bc1bb9c527a999a25d2";
+pub const WINDOWS_FILE_ID_SOURCE_OID: &str = "4f91f20348b030cdf6817bc1bb9c527a999a25d2";
 /// Exact manifest blob at [`WINDOWS_FILE_ID_SOURCE_OID`].
-pub const WINDOWS_FILE_ID_MANIFEST_BLOB: &str =
-    "a9fad929ce2befd694bbb5144dd733011ae0e65f";
+pub const WINDOWS_FILE_ID_MANIFEST_BLOB: &str = "a9fad929ce2befd694bbb5144dd733011ae0e65f";
 /// Exact source blob at [`WINDOWS_FILE_ID_SOURCE_OID`].
-pub const WINDOWS_FILE_ID_SOURCE_BLOB: &str =
-    "375c6e7d4043c7168f512656ccc0902f0a9ea598";
+pub const WINDOWS_FILE_ID_SOURCE_BLOB: &str = "375c6e7d4043c7168f512656ccc0902f0a9ea598";
 /// SHA-256 of the exact helper manifest bytes.
 pub const WINDOWS_FILE_ID_MANIFEST_SHA256: &str =
     "2139338411341e1dae1db88972d05b23ff59ac8b32a10b0ec471b43d0da2af44";
@@ -1242,10 +1238,7 @@ fn windows_file_id_dependency() -> TomlValue {
             "path".to_owned(),
             TomlValue::String(WINDOWS_FILE_ID_MEMBER.to_owned()),
         ),
-        (
-            "version".to_owned(),
-            TomlValue::String("0.1.0".to_owned()),
-        ),
+        ("version".to_owned(), TomlValue::String("0.1.0".to_owned())),
     ]))
 }
 
@@ -1265,10 +1258,7 @@ fn windows_file_id_windows_sys_dependency() -> TomlValue {
                 TomlValue::String("Win32_Storage_FileSystem".to_owned()),
             ]),
         ),
-        (
-            "version".to_owned(),
-            TomlValue::String("0.61.2".to_owned()),
-        ),
+        ("version".to_owned(), TomlValue::String("0.61.2".to_owned())),
     ]))
 }
 
@@ -1318,10 +1308,7 @@ pub fn validate_windows_file_id_boundary(root: &SafeRoot) -> PolicyResult<()> {
     )?;
     require_exact_file(root, WINDOWS_FILE_ID_SOURCE, FINAL_WINDOWS_FILE_ID_SOURCE)?;
     for (path, expected_hash) in [
-        (
-            WINDOWS_FILE_ID_MANIFEST,
-            WINDOWS_FILE_ID_MANIFEST_SHA256,
-        ),
+        (WINDOWS_FILE_ID_MANIFEST, WINDOWS_FILE_ID_MANIFEST_SHA256),
         (WINDOWS_FILE_ID_SOURCE, WINDOWS_FILE_ID_SOURCE_SHA256),
     ] {
         require_sha256(
@@ -1466,9 +1453,7 @@ fn windows_file_id_consumer_edges(
     Ok(edges)
 }
 
-fn windows_file_id_root_dependencies(
-    root: &SafeRoot,
-) -> PolicyResult<Vec<(String, TomlValue)>> {
+fn windows_file_id_root_dependencies(root: &SafeRoot) -> PolicyResult<Vec<(String, TomlValue)>> {
     let manifest = parse_toml(root, ROOT_MANIFEST, DEFAULT_FILE_LIMIT)?;
     let dependencies = manifest
         .get("workspace")
@@ -1477,9 +1462,7 @@ fn windows_file_id_root_dependencies(
         .ok_or_else(|| PolicyError::new("root workspace dependencies are missing"))?;
     Ok(dependencies
         .iter()
-        .filter(|(name, declaration)| {
-            dependency_refers_to_windows_file_id(name, declaration)
-        })
+        .filter(|(name, declaration)| dependency_refers_to_windows_file_id(name, declaration))
         .map(|(name, declaration)| (name.clone(), declaration.clone()))
         .collect())
 }
@@ -1518,10 +1501,7 @@ fn windows_file_id_lock_package() -> TomlValue {
             "name".to_owned(),
             TomlValue::String(WINDOWS_FILE_ID_PACKAGE.to_owned()),
         ),
-        (
-            "version".to_owned(),
-            TomlValue::String("0.1.0".to_owned()),
-        ),
+        ("version".to_owned(), TomlValue::String("0.1.0".to_owned())),
         (
             "dependencies".to_owned(),
             TomlValue::Array(vec![TomlValue::String("windows-sys 0.61.2".to_owned())]),
@@ -1535,10 +1515,7 @@ fn windows_sys_lock_package() -> TomlValue {
             "name".to_owned(),
             TomlValue::String("windows-sys".to_owned()),
         ),
-        (
-            "version".to_owned(),
-            TomlValue::String("0.61.2".to_owned()),
-        ),
+        ("version".to_owned(), TomlValue::String("0.61.2".to_owned())),
         (
             "source".to_owned(),
             TomlValue::String("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
@@ -1546,8 +1523,7 @@ fn windows_sys_lock_package() -> TomlValue {
         (
             "checksum".to_owned(),
             TomlValue::String(
-                "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
-                    .to_owned(),
+                "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc".to_owned(),
             ),
         ),
         (
@@ -1563,10 +1539,7 @@ fn windows_link_lock_package() -> TomlValue {
             "name".to_owned(),
             TomlValue::String("windows-link".to_owned()),
         ),
-        (
-            "version".to_owned(),
-            TomlValue::String("0.2.1".to_owned()),
-        ),
+        ("version".to_owned(), TomlValue::String("0.2.1".to_owned())),
         (
             "source".to_owned(),
             TomlValue::String("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
@@ -1574,8 +1547,7 @@ fn windows_link_lock_package() -> TomlValue {
         (
             "checksum".to_owned(),
             TomlValue::String(
-                "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
-                    .to_owned(),
+                "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5".to_owned(),
             ),
         ),
     ]))
@@ -1614,16 +1586,12 @@ fn validate_windows_file_id_lock_resolution(root: &SafeRoot) -> PolicyResult<()>
             "claw-windows-file-id lock package changed",
         ));
     }
-    if unique_lock_package(packages, "windows-sys", "0.61.2")?
-        != &windows_sys_lock_package()
-    {
+    if unique_lock_package(packages, "windows-sys", "0.61.2")? != &windows_sys_lock_package() {
         return Err(PolicyError::new(
             "windows-sys 0.61.2 lock resolution changed",
         ));
     }
-    if unique_lock_package(packages, "windows-link", "0.2.1")?
-        != &windows_link_lock_package()
-    {
+    if unique_lock_package(packages, "windows-link", "0.2.1")? != &windows_link_lock_package() {
         return Err(PolicyError::new(
             "windows-link 0.2.1 lock resolution changed",
         ));
@@ -1654,8 +1622,7 @@ fn validate_windows_file_id_inactive(root: &SafeRoot) -> PolicyResult<()> {
         .ok_or_else(|| PolicyError::new("root lock package array is missing"))?
         .iter()
         .any(|package| {
-            package.get("name").and_then(TomlValue::as_str)
-                == Some(WINDOWS_FILE_ID_PACKAGE)
+            package.get("name").and_then(TomlValue::as_str) == Some(WINDOWS_FILE_ID_PACKAGE)
                 || package
                     .get("dependencies")
                     .and_then(TomlValue::as_array)
@@ -1832,8 +1799,7 @@ fn validate_windows_file_id_lock_delta(
         .and_then(TomlValue::as_array_mut)
         .ok_or_else(|| PolicyError::new("protected root lock package array is missing"))?;
     if packages.iter().any(|package| {
-        package.get("name").and_then(TomlValue::as_str)
-            == Some(WINDOWS_FILE_ID_PACKAGE)
+        package.get("name").and_then(TomlValue::as_str) == Some(WINDOWS_FILE_ID_PACKAGE)
     }) {
         return Err(PolicyError::new(
             "protected base already contains a partial Windows file-ID lock package",
@@ -1847,7 +1813,9 @@ fn validate_windows_file_id_lock_delta(
                     && package.get("version").and_then(TomlValue::as_str) == Some("0.1.0")
             })
             .and_then(TomlValue::as_table_mut)
-            .ok_or_else(|| PolicyError::new("protected claw-conformance lock package is missing"))?;
+            .ok_or_else(|| {
+                PolicyError::new("protected claw-conformance lock package is missing")
+            })?;
         let dependencies = conformance
             .get_mut("dependencies")
             .and_then(TomlValue::as_array_mut)

@@ -489,6 +489,11 @@ fn validate_policy_source(root: &SafeRoot) -> PolicyResult<()> {
     }
     for required in [
         "#[test]\nfn repository_legacy_javascript_surface_does_not_grow()",
+        "#[test]\nfn windows_file_identity_ffi_is_isolated()",
+        "const WINDOWS_FILE_ID_CONSUMER_MANIFEST: &str = \"crates/claw-conformance/Cargo.toml\";",
+        "fn dependency_assignment_is(assignment: &str, package: &str) -> bool",
+        "assignment: \"claw-windows-file-id.workspace = true\".to_owned()",
+        "helper_source.matches(\"unsafe {\").count(), 1",
         "#[test]\nfn new_typescript_path_outside_legacy_inventory_is_rejected()",
         "fixture.write(\"src/newFeature.ts\", b\"new\");",
         "assert_eq!(violations, [\"src/newFeature.ts\"]);",
