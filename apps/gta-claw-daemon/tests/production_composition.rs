@@ -766,6 +766,7 @@ fn write_config_fixture(path: &Path, model: &str, role_url: &str, teams: bool, w
         ("ENABLE_WHATSAPP", if whatsapp { "true" } else { "false" }),
         ("WHATSAPP_VERIFY_TOKEN", "verify-token"),
         ("WHATSAPP_ACCESS_TOKEN", "access-token"),
+        ("WHATSAPP_APP_SECRET", "app-secret"),
         ("WHATSAPP_PHONE_NUMBER_ID", "phone-id"),
         ("COPILOT_MODEL", model),
         ("AGENT_ROLE_URL", role_url),
