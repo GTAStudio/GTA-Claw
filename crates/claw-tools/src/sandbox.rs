@@ -455,11 +455,12 @@ impl Sandbox {
 
     /// Writes a whole file, refusing links, escapes, and oversized content.
     ///
-    /// Ordering is the security property. The target is opened with no
-    /// destructive flag, then the opened handle itself is re-verified against
-    /// the validated path and the pinned ancestor chain, and only then is the
-    /// file truncated. A process that wins a race to swap a directory therefore
-    /// never gets a file truncated or written.
+    /// Ordering is the security property. Unix writes a new regular file
+    /// relative to the pinned parent and publishes it atomically only after the
+    /// ancestor chain and current leaf have been re-verified. The old leaf is
+    /// never mutated through a handle that can be renamed outside the sandbox.
+    /// Windows opens the target with no destructive flag and without delete
+    /// sharing, re-verifies it, and only then truncates it.
     ///
     /// Unix opens the leaf relative to the pinned parent handle, so renaming an
     /// ancestor cannot redirect creation. If later verification fails after a
@@ -484,26 +485,43 @@ impl Sandbox {
             return Err(SandboxError::FileTooLarge);
         }
         let prepared = self.prepare_write(path, mode)?;
-        let mut file = open_write_no_follow(
-            prepared.pin.handle()?,
-            &prepared.absolute,
-            path.file_name(),
-            mode,
-        )?;
-        let verified = verify_handle_is_not_reparse_point(&file)
-            .and_then(|()| verify_handle_is_regular(&file))
-            .and_then(|()| self.verify_canonical(&prepared.absolute, &path.components))
-            .and_then(|()| prepared.pin.verify())
-            .and_then(|()| verify_handle_matches_path(&file, &prepared.absolute));
-        verified?;
-        // The first mutation of the target happens here, after every check.
-        file.set_len(0).map_err(|error| map_io(&error))?;
-        file.write_all(content).map_err(|error| map_io(&error))?;
-        file.flush().map_err(|error| map_io(&error))?;
-        Ok(ResolvedPath {
-            relative: path.clone(),
-            absolute: prepared.absolute,
-        })
+        #[cfg(unix)]
+        {
+            write_file_atomic(
+                prepared.pin.handle()?,
+                &prepared.pin,
+                path.file_name(),
+                content,
+                mode,
+            )?;
+            return Ok(ResolvedPath {
+                relative: path.clone(),
+                absolute: prepared.absolute,
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            let mut file = open_write_no_follow(
+                prepared.pin.handle()?,
+                &prepared.absolute,
+                path.file_name(),
+                mode,
+            )?;
+            let verified = verify_handle_is_not_reparse_point(&file)
+                .and_then(|()| verify_handle_is_regular(&file))
+                .and_then(|()| self.verify_canonical(&prepared.absolute, &path.components))
+                .and_then(|()| prepared.pin.verify())
+                .and_then(|()| verify_handle_matches_path(&file, &prepared.absolute));
+            verified?;
+            // The first mutation of the target happens here, after every check.
+            file.set_len(0).map_err(|error| map_io(&error))?;
+            file.write_all(content).map_err(|error| map_io(&error))?;
+            file.flush().map_err(|error| map_io(&error))?;
+            return Ok(ResolvedPath {
+                relative: path.clone(),
+                absolute: prepared.absolute,
+            });
+        }
     }
 
     /// Enumerates one directory without following links.
@@ -948,6 +966,161 @@ fn open_directory_no_follow(path: &Path) -> Result<PinnedDirectoryHandle, Sandbo
 #[cfg(not(any(windows, unix)))]
 fn open_directory_no_follow(path: &Path) -> Result<PinnedDirectoryHandle, SandboxError> {
     File::open(path).map_err(|error| map_io(&error))
+}
+
+#[cfg(unix)]
+static WRITE_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Writes into a fresh inode and publishes it relative to the pinned parent.
+///
+/// An existing leaf is never truncated through an open descriptor: Unix permits
+/// that descriptor to be renamed outside the sandbox while it remains writable.
+/// Atomic publication instead unlinks the old name without mutating its inode.
+#[cfg(unix)]
+fn write_file_atomic(
+    parent: &PinnedDirectoryHandle,
+    pin: &DirectoryPin,
+    leaf: &str,
+    content: &[u8],
+    mode: WriteMode,
+) -> Result<(), SandboxError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (mut temporary, temporary_name) = create_write_temporary(parent)?;
+    let operation = (|| {
+        temporary
+            .write_all(content)
+            .map_err(|error| map_io(&error))?;
+        temporary.flush().map_err(|error| map_io(&error))?;
+        verify_handle_is_regular(&temporary)?;
+        verify_handle_matches_pinned_name(parent, &temporary_name, &temporary)?;
+        pin.verify()?;
+
+        if let Some(target_mode) = inspect_unix_write_target(parent, leaf, mode)? {
+            temporary
+                .set_permissions(std::fs::Permissions::from_mode(target_mode))
+                .map_err(|error| map_io(&error))?;
+        }
+        verify_handle_matches_pinned_name(parent, &temporary_name, &temporary)?;
+        pin.verify()?;
+
+        match mode {
+            WriteMode::CreateNew => {
+                rustix::fs::linkat(
+                    parent,
+                    temporary_name.as_str(),
+                    parent,
+                    leaf,
+                    rustix::fs::AtFlags::empty(),
+                )
+                .map_err(map_errno)?;
+                remove_write_temporary(parent, &temporary_name)?;
+            }
+            WriteMode::Overwrite => {
+                rustix::fs::renameat(parent, temporary_name.as_str(), parent, leaf)
+                    .map_err(map_errno)?;
+            }
+        }
+        verify_handle_matches_pinned_name(parent, leaf, &temporary)
+    })();
+
+    match operation {
+        Ok(()) => Ok(()),
+        Err(primary) => match remove_write_temporary(parent, &temporary_name) {
+            Ok(()) => Err(primary),
+            Err(cleanup) => Err(cleanup),
+        },
+    }
+}
+
+#[cfg(unix)]
+fn create_write_temporary(
+    parent: &PinnedDirectoryHandle,
+) -> Result<(File, String), SandboxError> {
+    use rustix::fs::{Mode, OFlags, openat};
+    use std::sync::atomic::Ordering;
+
+    const ATTEMPTS: usize = 128;
+    let permissions = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH;
+    let flags =
+        OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CREATE
+            | OFlags::EXCL;
+    for _ in 0..ATTEMPTS {
+        let sequence = WRITE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let name = format!(".claw-write-{}-{sequence}", std::process::id());
+        match openat(parent, name.as_str(), flags, permissions) {
+            Ok(handle) => return Ok((File::from(handle), name)),
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(map_errno(error)),
+        }
+    }
+    Err(SandboxError::AlreadyExists)
+}
+
+#[cfg(unix)]
+fn inspect_unix_write_target(
+    parent: &PinnedDirectoryHandle,
+    leaf: &str,
+    mode: WriteMode,
+) -> Result<Option<u32>, SandboxError> {
+    use rustix::fs::{AtFlags, FileType};
+
+    let stat = match rustix::fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(map_errno(error)),
+    };
+    match FileType::from_raw_mode(stat.st_mode) {
+        FileType::Symlink => return Err(SandboxError::SymlinkForbidden),
+        FileType::RegularFile => {}
+        _ => return Err(SandboxError::NotAFile),
+    }
+    if mode == WriteMode::CreateNew {
+        return Err(SandboxError::AlreadyExists);
+    }
+    let permissions = u32::try_from(stat.st_mode)
+        .map_err(|_| SandboxError::Io(io::ErrorKind::InvalidData))?
+        & 0o777;
+    Ok(Some(permissions))
+}
+
+#[cfg(unix)]
+fn verify_handle_matches_pinned_name(
+    parent: &PinnedDirectoryHandle,
+    name: &str,
+    file: &File,
+) -> Result<(), SandboxError> {
+    use rustix::fs::{AtFlags, FileType};
+
+    let stat =
+        rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(map_errno)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(SandboxError::RaceDetected);
+    }
+    let opened = identity_of(&file.metadata().map_err(|error| map_io(&error))?);
+    let named = DirectoryIdentity {
+        device: u64::try_from(stat.st_dev)
+            .map_err(|_| SandboxError::Io(io::ErrorKind::InvalidData))?,
+        inode: u64::try_from(stat.st_ino)
+            .map_err(|_| SandboxError::Io(io::ErrorKind::InvalidData))?,
+    };
+    if opened == named {
+        Ok(())
+    } else {
+        Err(SandboxError::RaceDetected)
+    }
+}
+
+#[cfg(unix)]
+fn remove_write_temporary(
+    parent: &PinnedDirectoryHandle,
+    name: &str,
+) -> Result<(), SandboxError> {
+    match rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(error) => Err(map_errno(error)),
+    }
 }
 
 /// Opens a write target relative to its pinned parent without following links.
