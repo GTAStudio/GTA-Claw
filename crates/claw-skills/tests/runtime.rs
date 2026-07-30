@@ -190,6 +190,27 @@ fn manifest_schema_preflight_rejects_limits_before_exact_tree_construction() {
 }
 
 #[test]
+fn manifest_schema_preflight_rejects_unpaired_surrogate_escapes_without_panicking() {
+    for escaped in [r"\ud800", r"\udc00", r"\ud800x", r"\ud800\u0041"] {
+        let manifest = format!(
+            r#"{{
+                "id":"invalid-surrogate",
+                "description":"Reject malformed Unicode.",
+                "parameters":{{"description":"{escaped}"}},
+                "execution":{{"kind":"native","handler":"echo"}}
+            }}"#
+        );
+        assert!(
+            matches!(
+                load_manifest(&manifest),
+                Err(ManifestError::MalformedJson { .. })
+            ),
+            "escape {escaped} must be rejected as malformed JSON"
+        );
+    }
+}
+
+#[test]
 fn exact_parameters_validate_and_encode_without_rounding() {
     let manifest = load_manifest(
         r#"{

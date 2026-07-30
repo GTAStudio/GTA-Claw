@@ -128,7 +128,7 @@ impl ExactJsonDocument {
         raw: &RawValue,
         limits: RawJsonLimits,
     ) -> Result<Self, ExactSchemaDocumentError> {
-        preflight_raw_json(raw.get(), limits).map_err(ExactSchemaDocumentError::Schema)?;
+        preflight_raw_json(raw.get(), limits)?;
         ExactNode::parse_document_bounded(raw, limits)
     }
 
@@ -763,21 +763,23 @@ impl<'a> RawJsonCursor<'a> {
         Self { json, offset: 0 }
     }
 
-    fn next(&mut self) -> Option<RawToken<'a>> {
+    fn next(&mut self) -> Result<Option<RawToken<'a>>, serde_json::Error> {
         let bytes = self.json.as_bytes();
         while bytes.get(self.offset).is_some_and(u8::is_ascii_whitespace) {
             self.offset += 1;
         }
-        let byte = *bytes.get(self.offset)?;
+        let Some(byte) = bytes.get(self.offset).copied() else {
+            return Ok(None);
+        };
         self.offset += 1;
-        Some(match byte {
+        let token = match byte {
             b'{' => RawToken::ObjectStart,
             b'}' => RawToken::ObjectEnd,
             b'[' => RawToken::ArrayStart,
             b']' => RawToken::ArrayEnd,
             b':' => RawToken::Colon,
             b',' => RawToken::Comma,
-            b'"' => self.string_token(),
+            b'"' => return self.string_token().map(Some),
             byte => {
                 let start = self.offset - 1;
                 while bytes.get(self.offset).is_some_and(|byte| {
@@ -791,51 +793,75 @@ impl<'a> RawJsonCursor<'a> {
                     RawToken::Scalar
                 }
             }
-        })
+        };
+        Ok(Some(token))
     }
 
-    fn string_token(&mut self) -> RawToken<'a> {
+    fn string_token(&mut self) -> Result<RawToken<'a>, serde_json::Error> {
         let start = self.offset - 1;
         let bytes = self.json.as_bytes();
         let mut decoded_bytes = 0_usize;
         loop {
-            let byte = bytes[self.offset];
+            let byte = bytes
+                .get(self.offset)
+                .copied()
+                .ok_or_else(invalid_unicode_escape)?;
             self.offset += 1;
             match byte {
                 b'"' => {
-                    return RawToken::String(&self.json[start..self.offset], decoded_bytes);
+                    return Ok(RawToken::String(
+                        &self.json[start..self.offset],
+                        decoded_bytes,
+                    ));
                 }
                 b'\\' => {
-                    let escape = bytes[self.offset];
+                    let escape = bytes
+                        .get(self.offset)
+                        .copied()
+                        .ok_or_else(invalid_unicode_escape)?;
                     self.offset += 1;
                     if escape != b'u' {
                         decoded_bytes += 1;
                         continue;
                     }
-                    let first = decode_hex_quad(bytes, self.offset);
+                    let first =
+                        decode_hex_quad(bytes, self.offset).ok_or_else(invalid_unicode_escape)?;
                     self.offset += 4;
                     if (0xD800..=0xDBFF).contains(&first) {
+                        if bytes.get(self.offset..self.offset + 2) != Some(br"\u") {
+                            return Err(invalid_unicode_escape());
+                        }
                         self.offset += 2;
-                        let second = decode_hex_quad(bytes, self.offset);
+                        let second = decode_hex_quad(bytes, self.offset)
+                            .ok_or_else(invalid_unicode_escape)?;
+                        if !(0xDC00..=0xDFFF).contains(&second) {
+                            return Err(invalid_unicode_escape());
+                        }
                         self.offset += 4;
                         let scalar = 0x1_0000
                             + ((u32::from(first) - 0xD800) << 10)
                             + (u32::from(second) - 0xDC00);
                         decoded_bytes += char::from_u32(scalar)
-                            .expect("serde_json validated the surrogate pair")
+                            .ok_or_else(invalid_unicode_escape)?
                             .len_utf8();
                     } else {
+                        if (0xDC00..=0xDFFF).contains(&first) {
+                            return Err(invalid_unicode_escape());
+                        }
                         decoded_bytes += char::from_u32(u32::from(first))
-                            .expect("serde_json validated the Unicode escape")
+                            .ok_or_else(invalid_unicode_escape)?
                             .len_utf8();
                     }
                 }
                 byte if byte.is_ascii() => decoded_bytes += 1,
                 _ => {
-                    let character = self.json[self.offset - 1..]
+                    let character = self
+                        .json
+                        .get(self.offset - 1..)
+                        .ok_or_else(invalid_unicode_escape)?
                         .chars()
                         .next()
-                        .expect("serde_json validated the UTF-8 string");
+                        .ok_or_else(invalid_unicode_escape)?;
                     let width = character.len_utf8();
                     decoded_bytes += width;
                     self.offset += width - 1;
@@ -845,25 +871,33 @@ impl<'a> RawJsonCursor<'a> {
     }
 }
 
-fn decode_hex_quad(bytes: &[u8], offset: usize) -> u16 {
-    bytes[offset..offset + 4].iter().fold(0_u16, |value, byte| {
-        value * 16
-            + u16::from(match byte {
+fn decode_hex_quad(bytes: &[u8], offset: usize) -> Option<u16> {
+    bytes
+        .get(offset..offset.checked_add(4)?)?
+        .iter()
+        .try_fold(0_u16, |value, byte| {
+            let digit = match byte {
                 b'0'..=b'9' => byte - b'0',
                 b'a'..=b'f' => byte - b'a' + 10,
                 b'A'..=b'F' => byte - b'A' + 10,
-                _ => unreachable!("serde_json validated the hexadecimal escape"),
-            })
-    })
+                _ => return None,
+            };
+            Some(value * 16 + u16::from(digit))
+        })
 }
 
-fn preflight_raw_json(json: &str, limits: RawJsonLimits) -> Result<(), SchemaError> {
+fn invalid_unicode_escape() -> serde_json::Error {
+    <serde_json::Error as serde::de::Error>::custom("invalid Unicode surrogate escape")
+}
+
+fn preflight_raw_json(json: &str, limits: RawJsonLimits) -> Result<(), ExactSchemaDocumentError> {
     let mut cursor = RawJsonCursor::new(json);
     let mut remaining_nodes = limits.max_nodes;
     let mut containers = Vec::new();
     let root = cursor
         .next()
-        .expect("serde_json validated a non-empty document");
+        .map_err(ExactSchemaDocumentError::Json)?
+        .ok_or_else(|| ExactSchemaDocumentError::Json(invalid_unicode_escape()))?;
     start_raw_value(
         root,
         "$".to_owned(),
@@ -871,11 +905,13 @@ fn preflight_raw_json(json: &str, limits: RawJsonLimits) -> Result<(), SchemaErr
         limits,
         &mut remaining_nodes,
         &mut containers,
-    )?;
+    )
+    .map_err(ExactSchemaDocumentError::Schema)?;
     while let Some(container) = containers.pop() {
         let token = cursor
             .next()
-            .expect("serde_json validated the complete document");
+            .map_err(ExactSchemaDocumentError::Json)?
+            .ok_or_else(|| ExactSchemaDocumentError::Json(invalid_unicode_escape()))?;
         match container {
             RawContainer::Array {
                 path,
@@ -888,7 +924,8 @@ fn preflight_raw_json(json: &str, limits: RawJsonLimits) -> Result<(), SchemaErr
                 }
                 let index = next_index.to_string();
                 let child_path =
-                    bounded_raw_child_path(&path, &["[", &index, "]"], limits.max_path_bytes)?;
+                    bounded_raw_child_path(&path, &["[", &index, "]"], limits.max_path_bytes)
+                        .map_err(ExactSchemaDocumentError::Schema)?;
                 containers.push(RawContainer::Array {
                     path,
                     depth,
@@ -902,7 +939,8 @@ fn preflight_raw_json(json: &str, limits: RawJsonLimits) -> Result<(), SchemaErr
                     limits,
                     &mut remaining_nodes,
                     &mut containers,
-                )?;
+                )
+                .map_err(ExactSchemaDocumentError::Schema)?;
             }
             RawContainer::Array {
                 path,
@@ -932,10 +970,12 @@ fn preflight_raw_json(json: &str, limits: RawJsonLimits) -> Result<(), SchemaErr
                         .checked_add(1)
                         .and_then(|length| length.checked_add(decoded_bytes));
                     if minimum_length.is_none_or(|length| length > limits.max_path_bytes) {
-                        return Err(resource_limit("$".to_owned()));
+                        return Err(ExactSchemaDocumentError::Schema(resource_limit(
+                            "$".to_owned(),
+                        )));
                     }
                     let key =
-                        serde_json::from_str(raw_key).expect("serde_json validated the object key");
+                        serde_json::from_str(raw_key).map_err(ExactSchemaDocumentError::Json)?;
                     containers.push(RawContainer::Object {
                         path,
                         depth,
@@ -965,8 +1005,8 @@ fn preflight_raw_json(json: &str, limits: RawJsonLimits) -> Result<(), SchemaErr
                 key: Some(key),
                 state: RawObjectState::Value,
             } => {
-                let child_path =
-                    bounded_raw_child_path(&path, &[".", &key], limits.max_path_bytes)?;
+                let child_path = bounded_raw_child_path(&path, &[".", &key], limits.max_path_bytes)
+                    .map_err(ExactSchemaDocumentError::Schema)?;
                 containers.push(RawContainer::Object {
                     path,
                     depth,
@@ -980,7 +1020,8 @@ fn preflight_raw_json(json: &str, limits: RawJsonLimits) -> Result<(), SchemaErr
                     limits,
                     &mut remaining_nodes,
                     &mut containers,
-                )?;
+                )
+                .map_err(ExactSchemaDocumentError::Schema)?;
             }
             RawContainer::Object {
                 path,
@@ -1002,7 +1043,7 @@ fn preflight_raw_json(json: &str, limits: RawJsonLimits) -> Result<(), SchemaErr
             }
         }
     }
-    let trailing = cursor.next();
+    let trailing = cursor.next().map_err(ExactSchemaDocumentError::Json)?;
     debug_assert!(trailing.is_none());
     Ok(())
 }
