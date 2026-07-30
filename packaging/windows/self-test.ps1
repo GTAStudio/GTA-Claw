@@ -543,14 +543,14 @@ channel = "1.96.0"
             @{
                 Name = 'package import failure'
                 Text = $packageCertificateWindow
-                Deletes = 2
-                Verifications = 2
+                Deletes = 1
+                Verifications = 1
             },
             @{
                 Name = 'package normal cleanup'
                 Text = $packageCleanupWindow
                 Deletes = 1
-                Verifications = 1
+                Verifications = 2
             },
             @{
                 Name = 'bundle import failure'
@@ -562,7 +562,7 @@ channel = "1.96.0"
                 Name = 'bundle normal cleanup'
                 Text = $bundleCleanupWindow
                 Deletes = 1
-                Verifications = 1
+                Verifications = 2
             },
             @{
                 Name = 'final cleanup'
@@ -588,7 +588,9 @@ channel = "1.96.0"
                 throw 'Windows normal/final signing cleanup is not unconditional.'
             }
         }
-        if ([regex]::Matches($workflow, '-DeleteKey').Count -ne 6) {
+        if ([regex]::Matches($workflow, '-DeleteKey').Count -ne 5 -or
+            [regex]::Matches($workflow, 'cleanup-thumbprints=').Count -ne 2 -or
+            [regex]::Matches($workflow, 'Protected .* PFX must contain exactly one certificate').Count -ne 2) {
             throw 'Windows signing identity cleanup does not fail closed and delete private keys.'
         }
     }
