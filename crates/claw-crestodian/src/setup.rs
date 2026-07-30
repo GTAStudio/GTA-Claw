@@ -368,7 +368,11 @@ fn warnings_as_restore_result(warnings: &[claw_config::WriteWarning]) -> Result<
 
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
-    fs::File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)?.sync_all()
 }
 
 #[cfg(not(unix))]
@@ -383,11 +387,15 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use claw_config::WriteWarning;
 
-    use super::warnings_as_restore_result;
+    use super::{restore_path, warnings_as_restore_result};
+
+    static NEXT_RELATIVE_PATH: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn rollback_directory_sync_warning_is_a_restore_failure() {
@@ -398,6 +406,20 @@ mod tests {
         .expect_err("durability warning must be surfaced");
 
         assert!(error.contains("injected directory sync failure"));
+    }
+
+    #[test]
+    fn rollback_removes_a_relative_file_and_syncs_the_current_directory() {
+        let sequence = NEXT_RELATIVE_PATH.fetch_add(1, Ordering::Relaxed);
+        let path = PathBuf::from(format!(
+            ".claw-crestodian-relative-rollback-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::write(&path, b"created during failed setup").expect("write relative rollback target");
+
+        restore_path(&path, None).expect("remove and synchronize relative rollback target");
+
+        assert!(!path.exists());
     }
 }
 

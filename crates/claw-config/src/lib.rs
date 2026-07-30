@@ -43,7 +43,9 @@ pub use domains::{
 };
 pub use error::ConfigError;
 pub use io::{
-    WriteOutcome, WriteWarning, copy_file_atomically, load_file, write_bytes_atomically, write_file,
+    PublicationLock, WriteOutcome, WriteWarning, atomic_exchange_supported, copy_file_atomically,
+    displace_file_atomically, exchange_paths_atomically, load_file, write_bytes_atomically,
+    rename_path_no_replace, write_file,
 };
 pub use layer::{ConfigLayerKind, ConfigLayers, LayeredConfigError, ResolvedConfig};
 pub use migration::{

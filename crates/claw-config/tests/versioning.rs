@@ -96,7 +96,8 @@ fn incompatible_future_version_fails_without_creating_backup() {
         std::fs::read_dir(directory.path())
             .expect("read directory")
             .count(),
-        1
+        1,
+        "unsupported read-only inspection must not allocate a publication lock"
     );
 }
 
@@ -116,6 +117,6 @@ fn current_version_is_validated_without_creating_a_backup() {
             .expect("read directory")
             .count(),
         1,
-        "validation must not allocate a migration backup"
+        "current read-only validation must not allocate a publication lock or backup"
     );
 }

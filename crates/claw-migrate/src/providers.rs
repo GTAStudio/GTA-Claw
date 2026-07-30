@@ -280,6 +280,22 @@ fn finalize_plan(
             "Provider state was detected, but no safe migratable items were found.",
         );
     }
+    for (index, operation) in operations.iter().enumerate() {
+        if let Some(overlap) = operations[index + 1..].iter().find(|other| {
+            operation.target() != other.target()
+                && (operation.target().starts_with(other.target())
+                    || other.target().starts_with(operation.target()))
+        }) {
+            return Err(MigrationError::InvalidInput {
+                path: overlap.target().to_owned(),
+                reason: format!(
+                    "migration plan has overlapping targets {} and {}",
+                    operation.target().display(),
+                    overlap.target().display()
+                ),
+            });
+        }
+    }
     if let Some(target) = first_conflict(&operations, context.overwrite) {
         return rejected_plan(
             provider_id,
@@ -374,29 +390,31 @@ fn build_claude_operations(
                 diagnostics,
             )?;
         }
-        if let Some(home) = root.parent() {
+        if context.source.is_none() {
+            if let Some(home) = root.parent() {
+                add_json_transform(
+                    &mut operations,
+                    &home.join(".claude.json"),
+                    &target
+                        .join("config")
+                        .join("migrations")
+                        .join("claude")
+                        .join("claude.json"),
+                    "claude-user",
+                )?;
+            }
+            let desktop = claude_desktop_config(context.paths);
             add_json_transform(
                 &mut operations,
-                &home.join(".claude.json"),
+                &desktop,
                 &target
                     .join("config")
                     .join("migrations")
                     .join("claude")
-                    .join("claude.json"),
-                "claude-user",
+                    .join("desktop.json"),
+                "claude-desktop",
             )?;
         }
-        let desktop = claude_desktop_config(context.paths);
-        add_json_transform(
-            &mut operations,
-            &desktop,
-            &target
-                .join("config")
-                .join("migrations")
-                .join("claude")
-                .join("desktop.json"),
-            "claude-desktop",
-        )?;
         add_secret_document(
             &mut operations,
             &root.join(".credentials.json"),
@@ -526,7 +544,7 @@ fn build_codex_operations(
             .join("auth.json"),
         "codex-auth",
     );
-    add_copy_checked(
+    collect_copy_entries(
         &mut operations,
         &root.join("sessions"),
         &target.join("sessions").join("codex"),
@@ -827,11 +845,42 @@ fn add_copy_checked(
     if !source.exists() {
         return Ok(());
     }
+
     reject_executable_tree(source)?;
     operations.push(MigrationOperation::CopyPath {
         source: source.to_path_buf(),
         target: target.to_path_buf(),
     });
+    Ok(())
+}
+
+fn collect_copy_entries(
+    operations: &mut Vec<MigrationOperation>,
+    source: &Path,
+    target: &Path,
+) -> Result<(), MigrationError> {
+    let metadata = match fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source_error) => {
+            return Err(MigrationError::Io {
+                action: "inspect source directory",
+                path: source.to_owned(),
+                source: source_error,
+            });
+        }
+    };
+    reject_symlink(source)?;
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    for entry in sorted_entries(source)? {
+        add_copy_checked(
+            operations,
+            &entry.path(),
+            &target.join(entry.file_name()),
+        )?;
+    }
     Ok(())
 }
 

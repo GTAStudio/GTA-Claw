@@ -63,6 +63,15 @@ impl Drop for TestDir {
 pub(crate) struct MemorySecretStore {
     pub(crate) values: BTreeMap<String, SecretValue>,
     pub(crate) fail_put: bool,
+    transactions: BTreeMap<String, MemorySecretTransaction>,
+}
+
+#[derive(Default)]
+struct MemorySecretTransaction {
+    previous: BTreeMap<String, Option<SecretValue>>,
+    staged: BTreeMap<String, SecretValue>,
+    committed: bool,
+    rolled_back: bool,
 }
 
 impl MemorySecretStore {
@@ -82,20 +91,66 @@ impl MemorySecretStore {
 }
 
 impl SecretStore for MemorySecretStore {
-    fn get(&mut self, id: &str) -> Result<Option<SecretValue>, SecretStoreError> {
-        Ok(self.values.get(id).cloned())
+    fn begin_transaction(&mut self, transaction_id: &str) -> Result<(), SecretStoreError> {
+        self.transactions
+            .entry(transaction_id.to_owned())
+            .or_default();
+        Ok(())
     }
 
-    fn put(&mut self, id: &str, value: SecretValue) -> Result<String, SecretStoreError> {
+    fn stage(
+        &mut self,
+        transaction_id: &str,
+        id: &str,
+        value: SecretValue,
+    ) -> Result<String, SecretStoreError> {
         if self.fail_put {
             return Err(SecretStoreError::new("injected put failure"));
         }
-        self.values.insert(id.to_owned(), value);
+        let previous = self.values.get(id).cloned();
+        let transaction = self
+            .transactions
+            .get_mut(transaction_id)
+            .ok_or_else(|| SecretStoreError::new("transaction was not begun"))?;
+        transaction
+            .previous
+            .entry(id.to_owned())
+            .or_insert(previous);
+        transaction.staged.insert(id.to_owned(), value);
         Ok(format!("keyring://gta-claw/{id}"))
     }
 
-    fn remove(&mut self, id: &str) -> Result<(), SecretStoreError> {
-        self.values.remove(id);
+    fn commit_transaction(&mut self, transaction_id: &str) -> Result<(), SecretStoreError> {
+        let transaction = self
+            .transactions
+            .get_mut(transaction_id)
+            .ok_or_else(|| SecretStoreError::new("transaction was not begun"))?;
+        if !transaction.committed {
+            for (id, value) in &transaction.staged {
+                self.values.insert(id.clone(), value.clone());
+            }
+            transaction.committed = true;
+        }
+        Ok(())
+    }
+
+    fn rollback_transaction(&mut self, transaction_id: &str) -> Result<(), SecretStoreError> {
+        let Some(transaction) = self.transactions.get_mut(transaction_id) else {
+            return Ok(());
+        };
+        if transaction.rolled_back {
+            return Ok(());
+        }
+        if transaction.committed {
+            for (id, previous) in &transaction.previous {
+                if let Some(previous) = previous {
+                    self.values.insert(id.clone(), previous.clone());
+                } else {
+                    self.values.remove(id);
+                }
+            }
+        }
+        transaction.rolled_back = true;
         Ok(())
     }
 }
@@ -137,6 +192,13 @@ fn collect_files(root: &Path, current: &Path, found: &mut Vec<String>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".gta-claw.lock"))
+        {
+            continue;
+        }
         if path.is_dir() {
             collect_files(root, &path, found);
         } else if let Ok(relative) = path.strip_prefix(root) {

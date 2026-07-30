@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -10,8 +9,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::io::{atomic_write_bytes, prepare_destination};
-use crate::{CONFIG_SCHEMA_VERSION, ConfigError, WriteOutcome, parse_json5, to_json5};
+use crate::io::{PublicationLock, atomic_write_bytes};
+use crate::{
+    CONFIG_SCHEMA_VERSION, ConfigError, WriteOutcome, displace_file_atomically, parse_json5,
+    to_json5,
+};
 
 static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const RECOVERY_SCHEMA_VERSION: u32 = 1;
@@ -207,9 +209,51 @@ fn migrate_config_file_with_hook(
     path: &Path,
     before_publish: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<ConfigMigrationOutcome, ConfigMigrationError> {
-    let path = prepare_destination(path).map_err(|source| ConfigError::io(path, source))?;
-    let _lock = MigrationLock::acquire(&path)?;
-    if let Some(record) = recover_interrupted_migration(&path)? {
+    migrate_config_file_with_hooks(path, before_publish, |_| Ok(()))
+}
+
+fn migrate_config_file_with_hooks(
+    path: &Path,
+    before_publish: impl FnOnce(&Path) -> io::Result<()>,
+    after_displacement: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<ConfigMigrationOutcome, ConfigMigrationError> {
+    let initial_source = fs::read(path).map_err(|source| ConfigError::io(path, source))?;
+    let initial_text =
+        std::str::from_utf8(&initial_source).map_err(|error| ConfigError::Syntax {
+            source_name: path.display().to_string(),
+            message: error.to_string(),
+        })?;
+    let initial_document =
+        json5::from_str::<Value>(initial_text).map_err(|error| ConfigError::Syntax {
+            source_name: path.display().to_string(),
+            message: error.to_string(),
+        })?;
+    let initial_version = initial_document
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or(ConfigMigrationError::MissingVersion)?;
+    let recovery_exists = match fs::symlink_metadata(recovery_path(path)) {
+        Ok(_) => true,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => false,
+        Err(source) => return Err(recovery_io(&recovery_path(path), &source)),
+    };
+    if !recovery_exists {
+        if initial_version == CONFIG_SCHEMA_VERSION {
+            parse_json5(initial_text, &path.display().to_string())?;
+            return Ok(ConfigMigrationOutcome::Current);
+        }
+        if initial_version != 0 || CONFIG_SCHEMA_VERSION != 1 {
+            return Err(ConfigMigrationError::UnsupportedPath {
+                found: initial_version,
+                current: CONFIG_SCHEMA_VERSION,
+            });
+        }
+    }
+
+    let lock = PublicationLock::acquire(path)?;
+    let path = lock.destination().to_owned();
+    if let Some(record) = recover_interrupted_migration(&lock)? {
         return Ok(ConfigMigrationOutcome::Migrated(record));
     }
 
@@ -255,20 +299,30 @@ fn migrate_config_file_with_hook(
 
     let backup_path = create_artifact(&path, "schema-v0", &source)?;
     let candidate_path = create_artifact(&path, "schema-candidate", candidate_bytes)?;
+    let displaced_path = displacement_path(&path, &candidate_path)?;
     let journal = MigrationRecoveryJournal {
         schema_version: RECOVERY_SCHEMA_VERSION,
         config_path: path.clone(),
         backup_path: backup_path.clone(),
         candidate_path,
+        displaced_path,
         from_version: version,
         to_version: CONFIG_SCHEMA_VERSION,
         source_sha256: source_sha256.clone(),
         target_sha256,
+        conflict_restoration: None,
     };
     persist_recovery_journal(&path, &journal)?;
     before_publish(&recovery_path(&path))
         .map_err(|source| ConfigMigrationError::Config(ConfigError::io(&path, source)))?;
-    publish_candidate(&path, candidate_bytes, &source_sha256)?;
+    match publish_candidate_with_hook(&lock, &journal, after_displacement) {
+        Ok(()) => {}
+        Err(error @ ConfigMigrationError::ConcurrentEdit { .. }) => {
+            retire_recovery_journal(&path, &journal)?;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    }
     cleanup_recovery_journal(&path, &journal)?;
 
     Ok(ConfigMigrationOutcome::Migrated(ConfigMigrationRecord {
@@ -291,70 +345,59 @@ fn migrate_config_file_with_hook(
 pub fn rollback_config_migration(
     record: &ConfigMigrationRecord,
 ) -> Result<(), ConfigMigrationError> {
-    let path = prepare_destination(&record.config_path)
-        .map_err(|source| ConfigError::io(&record.config_path, source))?;
-    let _lock = MigrationLock::acquire(&path)?;
+    let lock = PublicationLock::acquire(&record.config_path)?;
+    let path = lock.destination().to_owned();
     let bytes = fs::read(&record.backup_path)
         .map_err(|source| ConfigError::io(&record.backup_path, source))?;
-    let outcome = atomic_write_bytes(&path, &bytes, || Ok(()))
-        .map_err(|source| ConfigError::io(&path, source))?;
+    let outcome = lock.write_bytes(&bytes)?;
     require_durable(&outcome, &path)?;
     Ok(())
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct MigrationRecoveryJournal {
     schema_version: u32,
     config_path: PathBuf,
     backup_path: PathBuf,
     candidate_path: PathBuf,
+    displaced_path: PathBuf,
     from_version: u32,
     to_version: u32,
     source_sha256: String,
     target_sha256: String,
+    conflict_restoration: Option<ConflictRestoration>,
 }
 
-struct MigrationLock {
-    _file: File,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ConflictRestoration {
+    restored_sha256: String,
+    newer_sha256: String,
+    phase: ConflictRestorationPhase,
 }
 
-impl MigrationLock {
-    fn acquire(path: &Path) -> Result<Self, ConfigMigrationError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|source| ConfigError::io(path, source))?;
-        file.lock()
-            .map_err(|source| ConfigError::io(path, source))?;
-        Ok(Self { _file: file })
-    }
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ConflictRestorationPhase {
+    Prepared,
+    NewerRestored,
 }
 
 fn recover_interrupted_migration(
-    path: &Path,
+    lock: &PublicationLock,
 ) -> Result<Option<ConfigMigrationRecord>, ConfigMigrationError> {
+    let path = lock.destination();
     let journal_path = recovery_path(path);
     let bytes = match fs::read(&journal_path) {
         Ok(bytes) => bytes,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(recovery_io(&journal_path, &source)),
     };
-    let journal: MigrationRecoveryJournal =
+    let mut journal: MigrationRecoveryJournal =
         serde_json::from_slice(&bytes).map_err(|error| ConfigMigrationError::Recovery {
             path: journal_path.clone(),
             message: error.to_string(),
         })?;
     validate_recovery_journal(path, &journal_path, &journal)?;
-
-    let current_sha256 = hash_file(path).map_err(|source| recovery_io(path, &source))?;
-    if current_sha256 == journal.target_sha256 {
-        cleanup_recovery_journal(path, &journal)?;
-        return Ok(Some(journal.record()));
-    }
-    if current_sha256 != journal.source_sha256 {
-        return Err(concurrent_edit(path, &journal.source_sha256)?);
-    }
     if hash_file(&journal.backup_path)
         .map_err(|source| recovery_io(&journal.backup_path, &source))?
         != journal.source_sha256
@@ -364,18 +407,79 @@ fn recover_interrupted_migration(
             message: "original backup digest does not match the recovery journal".to_owned(),
         });
     }
-    if hash_file(&journal.candidate_path)
-        .map_err(|source| recovery_io(&journal.candidate_path, &source))?
-        != journal.target_sha256
-    {
+    let current_sha256 = hash_file(path).map_err(|source| recovery_io(path, &source))?;
+    let candidate_sha256 = optional_hash_file(&journal.candidate_path)?;
+    let displaced_sha256 = if journal.displaced_path == journal.candidate_path {
+        candidate_sha256.clone()
+    } else {
+        optional_hash_file(&journal.displaced_path)?
+    };
+    if journal.conflict_restoration.is_some() {
+        return recover_conflict_restoration(path, &mut journal);
+    }
+    if current_sha256 == journal.target_sha256 {
+        match displaced_sha256 {
+            Some(displaced) if displaced == journal.source_sha256 => {
+                cleanup_recovery_journal(path, &journal)?;
+                return Ok(Some(journal.record()));
+            }
+            Some(displaced) => {
+                let error = concurrent_edit_from_path(
+                    path,
+                    &journal.source_sha256,
+                    &journal.displaced_path,
+                )?;
+                restore_displaced(path, &journal, &displaced)?;
+                retire_recovery_journal(path, &journal)?;
+                return Err(error);
+            }
+            None => {
+                cleanup_recovery_journal(path, &journal)?;
+                return Ok(Some(journal.record()));
+            }
+        }
+    }
+    let candidate_is_target =
+        candidate_sha256.as_deref() == Some(journal.target_sha256.as_str());
+    let no_separate_displacement = journal.displaced_path == journal.candidate_path
+        || displaced_sha256.is_none();
+    let candidate_is_original =
+        candidate_sha256.as_deref() == Some(journal.source_sha256.as_str());
+    if candidate_is_original && current_sha256 != journal.source_sha256 {
+        let error = concurrent_edit(path, &journal.source_sha256)?;
+        retire_recovery_journal(path, &journal)?;
+        return Err(error);
+    }
+    let conflict_restoration_interrupted = current_sha256 != journal.source_sha256
+        && candidate_sha256.is_some()
+        && !candidate_is_target
+        && !candidate_is_original
+        && no_separate_displacement;
+    if conflict_restoration_interrupted {
+        let error = concurrent_edit(path, &journal.source_sha256)?;
+        restore_candidate_over_current(path, &journal, &current_sha256)?;
+        retire_recovery_journal(path, &journal)?;
+        return Err(error);
+    }
+    if candidate_is_target && no_separate_displacement {
+        if current_sha256 != journal.source_sha256 {
+            let error = concurrent_edit(path, &journal.source_sha256)?;
+            retire_recovery_journal(path, &journal)?;
+            return Err(error);
+        }
+    } else {
         return Err(ConfigMigrationError::Recovery {
-            path: journal.candidate_path,
-            message: "candidate digest does not match the recovery journal".to_owned(),
+            path: journal_path,
+            message: "recovery journal artifacts do not match a safe displacement topology"
+                .to_owned(),
         });
     }
-    let candidate = fs::read(&journal.candidate_path)
-        .map_err(|source| recovery_io(&journal.candidate_path, &source))?;
-    publish_candidate(path, &candidate, &journal.source_sha256)?;
+    if let Err(error @ ConfigMigrationError::ConcurrentEdit { .. }) =
+        publish_candidate(lock, &journal)
+    {
+        retire_recovery_journal(path, &journal)?;
+        return Err(error);
+    }
     cleanup_recovery_journal(path, &journal)?;
     Ok(Some(journal.record()))
 }
@@ -408,6 +512,7 @@ fn validate_recovery_journal(
     if journal.config_path != path
         || journal.backup_path.parent() != path.parent()
         || journal.candidate_path.parent() != path.parent()
+        || journal.displaced_path.parent() != path.parent()
     {
         return Err(ConfigMigrationError::Recovery {
             path: journal_path.to_owned(),
@@ -439,39 +544,79 @@ fn persist_recovery_journal(
 }
 
 fn publish_candidate(
-    path: &Path,
-    candidate: &[u8],
-    expected_sha256: &str,
+    lock: &PublicationLock,
+    journal: &MigrationRecoveryJournal,
 ) -> Result<(), ConfigMigrationError> {
-    let conflict = RefCell::new(None);
-    let outcome = atomic_write_bytes(path, candidate, || {
-        let actual_sha256 = hash_file(path)?;
-        if actual_sha256 == expected_sha256 {
-            return Ok(());
-        }
-        let concurrent = fs::read(path)?;
-        let actual_sha256 = digest_bytes(&concurrent);
-        let conflict_backup_path = create_artifact_io(path, "schema-conflict", &concurrent)?;
-        *conflict.borrow_mut() = Some((conflict_backup_path, actual_sha256));
-        Err(io::Error::other(
-            "configuration changed during schema migration",
-        ))
-    });
-    match outcome {
-        Ok(outcome) => require_durable(&outcome, path),
-        Err(_) if conflict.borrow().is_some() => {
-            let (conflict_backup_path, actual_sha256) = conflict
-                .into_inner()
-                .expect("conflict was checked before extraction");
-            Err(ConfigMigrationError::ConcurrentEdit {
-                path: path.to_owned(),
-                conflict_backup_path,
-                expected_sha256: expected_sha256.to_owned(),
-                actual_sha256,
-            })
-        }
-        Err(source) => Err(ConfigMigrationError::Config(ConfigError::io(path, source))),
+    publish_candidate_with_hook(lock, journal, |_| Ok(()))
+}
+
+fn publish_candidate_with_hook(
+    lock: &PublicationLock,
+    journal: &MigrationRecoveryJournal,
+    after_displacement: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), ConfigMigrationError> {
+    let path = lock.destination();
+    if hash_file(&journal.candidate_path)
+        .map_err(|source| recovery_io(&journal.candidate_path, &source))?
+        != journal.target_sha256
+    {
+        return Err(ConfigMigrationError::Recovery {
+            path: journal.candidate_path.clone(),
+            message: "candidate digest does not match recovery journal".to_owned(),
+        });
     }
+    displace_file_atomically(
+        &journal.candidate_path,
+        path,
+        &journal.displaced_path,
+    )
+    .map_err(|source| recovery_io(path, &source))?;
+    sync_parent(path).map_err(|source| recovery_io(path, &source))?;
+    after_displacement(&journal.displaced_path)
+        .map_err(|source| recovery_io(&journal.displaced_path, &source))?;
+    let displaced_sha256 = hash_file(&journal.displaced_path)
+        .map_err(|source| recovery_io(&journal.displaced_path, &source))?;
+    if displaced_sha256 == journal.source_sha256 {
+        return Ok(());
+    }
+    let error =
+        concurrent_edit_from_path(path, &journal.source_sha256, &journal.displaced_path)?;
+    restore_displaced(path, journal, &displaced_sha256)?;
+    Err(error)
+}
+
+fn retire_recovery_journal(
+    path: &Path,
+    journal: &MigrationRecoveryJournal,
+) -> Result<PathBuf, ConfigMigrationError> {
+    let journal_path = recovery_path(path);
+    let retired = (0..128)
+        .find_map(|_| {
+            let sequence = BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let retired = path.with_file_name(format!(
+                ".{}.schema-migration.conflict.{}.{}.json",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("config"),
+                std::process::id(),
+                sequence
+            ));
+            match fs::symlink_metadata(&retired) {
+                Err(source) if source.kind() == io::ErrorKind::NotFound => Some(Ok(retired)),
+                Ok(_) => None,
+                Err(source) => Some(Err(recovery_io(&retired, &source))),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| ConfigMigrationError::Recovery {
+            path: journal_path.clone(),
+            message: "could not allocate a unique retired recovery journal".to_owned(),
+        })?;
+    fs::rename(&journal_path, &retired)
+        .map_err(|source| recovery_io(&journal_path, &source))?;
+    sync_parent(&retired).map_err(|source| recovery_io(&retired, &source))?;
+    cleanup_displacement_artifacts(journal)?;
+    Ok(retired)
 }
 
 fn concurrent_edit(
@@ -489,16 +634,187 @@ fn concurrent_edit(
     })
 }
 
+fn concurrent_edit_from_path(
+    config_path: &Path,
+    expected_sha256: &str,
+    concurrent_path: &Path,
+) -> Result<ConfigMigrationError, ConfigMigrationError> {
+    let concurrent =
+        fs::read(concurrent_path).map_err(|source| ConfigError::io(concurrent_path, source))?;
+    let actual_sha256 = digest_bytes(&concurrent);
+    let conflict_backup_path =
+        create_artifact(config_path, "schema-conflict", &concurrent)?;
+    Ok(ConfigMigrationError::ConcurrentEdit {
+        path: config_path.to_owned(),
+        conflict_backup_path,
+        expected_sha256: expected_sha256.to_owned(),
+        actual_sha256,
+    })
+}
+
+fn restore_displaced(
+    path: &Path,
+    journal: &MigrationRecoveryJournal,
+    expected_restored_sha256: &str,
+) -> Result<(), ConfigMigrationError> {
+    displace_file_atomically(
+        &journal.displaced_path,
+        path,
+        &journal.candidate_path,
+    )
+    .map_err(|source| recovery_io(path, &source))?;
+    sync_parent(path).map_err(|source| recovery_io(path, &source))?;
+    let newly_displaced_sha256 = hash_file(&journal.candidate_path)
+        .map_err(|source| recovery_io(&journal.candidate_path, &source))?;
+    if newly_displaced_sha256 == journal.target_sha256 {
+        return Ok(());
+    }
+
+    restore_candidate_over_current(path, journal, expected_restored_sha256)
+}
+
+fn restore_candidate_over_current(
+    path: &Path,
+    journal: &MigrationRecoveryJournal,
+    expected_current_sha256: &str,
+) -> Result<(), ConfigMigrationError> {
+    backup_concurrent_path(path, &journal.candidate_path)?;
+    let newer_sha256 = hash_file(&journal.candidate_path)
+        .map_err(|source| recovery_io(&journal.candidate_path, &source))?;
+    let mut updated = journal.clone();
+    updated.conflict_restoration = Some(ConflictRestoration {
+        restored_sha256: expected_current_sha256.to_owned(),
+        newer_sha256,
+        phase: ConflictRestorationPhase::Prepared,
+    });
+    persist_recovery_journal(path, &updated)?;
+    complete_newer_restoration(path, &mut updated)
+}
+
+fn complete_newer_restoration(
+    path: &Path,
+    journal: &mut MigrationRecoveryJournal,
+) -> Result<(), ConfigMigrationError> {
+    let state = journal
+        .conflict_restoration
+        .as_ref()
+        .expect("conflict restoration state was persisted")
+        .clone();
+    displace_file_atomically(
+        &journal.candidate_path,
+        path,
+        &journal.displaced_path,
+    )
+    .map_err(|source| recovery_io(path, &source))?;
+    sync_parent(path).map_err(|source| recovery_io(path, &source))?;
+    let twice_displaced_sha256 = hash_file(&journal.displaced_path)
+        .map_err(|source| recovery_io(&journal.displaced_path, &source))?;
+    if twice_displaced_sha256 != state.restored_sha256 {
+        let preserved = backup_concurrent_path(path, &journal.displaced_path)?;
+        return Err(ConfigMigrationError::Recovery {
+            path: journal.displaced_path.clone(),
+            message: format!(
+                "multiple concurrent edits raced conflict restoration; newest displaced bytes \
+                 were preserved at {}",
+                preserved.display()
+            ),
+        });
+    }
+    journal
+        .conflict_restoration
+        .as_mut()
+        .expect("conflict restoration state remains present")
+        .phase = ConflictRestorationPhase::NewerRestored;
+    persist_recovery_journal(path, journal)
+}
+
+fn recover_conflict_restoration(
+    path: &Path,
+    journal: &mut MigrationRecoveryJournal,
+) -> Result<Option<ConfigMigrationRecord>, ConfigMigrationError> {
+    let state = journal
+        .conflict_restoration
+        .as_ref()
+        .expect("caller checked conflict restoration state")
+        .clone();
+    let current_sha256 = hash_file(path).map_err(|source| recovery_io(path, &source))?;
+    let candidate_sha256 = optional_hash_file(&journal.candidate_path)?;
+    let displaced_sha256 = if journal.displaced_path == journal.candidate_path {
+        candidate_sha256.clone()
+    } else {
+        optional_hash_file(&journal.displaced_path)?
+    };
+    let before_newer_restore = current_sha256 == state.restored_sha256
+        && candidate_sha256.as_deref() == Some(state.newer_sha256.as_str());
+    let displaced_holds_restored =
+        displaced_sha256.as_deref() == Some(state.restored_sha256.as_str());
+    let after_newer_restore =
+        current_sha256 == state.newer_sha256 && displaced_holds_restored;
+    if before_newer_restore {
+        complete_newer_restoration(path, journal)?;
+    } else if after_newer_restore {
+        if state.phase != ConflictRestorationPhase::NewerRestored {
+            journal
+                .conflict_restoration
+                .as_mut()
+                .expect("state remains present")
+                .phase = ConflictRestorationPhase::NewerRestored;
+            persist_recovery_journal(path, journal)?;
+        }
+    } else {
+        return Err(ConfigMigrationError::Recovery {
+            path: recovery_path(path),
+            message: "conflict restoration journal does not match a safe B/C topology".to_owned(),
+        });
+    }
+    let restored_path = if optional_hash_file(&journal.displaced_path)?.as_deref()
+        == Some(state.restored_sha256.as_str())
+    {
+        &journal.displaced_path
+    } else {
+        &journal.candidate_path
+    };
+    let error = concurrent_edit_from_path(path, &journal.source_sha256, restored_path)?;
+    retire_recovery_journal(path, journal)?;
+    Err(error)
+}
+
+fn backup_concurrent_path(
+    config_path: &Path,
+    concurrent_path: &Path,
+) -> Result<PathBuf, ConfigMigrationError> {
+    let bytes =
+        fs::read(concurrent_path).map_err(|source| ConfigError::io(concurrent_path, source))?;
+    create_artifact(config_path, "schema-conflict", &bytes)
+}
+
 fn cleanup_recovery_journal(
     path: &Path,
     journal: &MigrationRecoveryJournal,
 ) -> Result<(), ConfigMigrationError> {
     let journal_path = recovery_path(path);
+    cleanup_displacement_artifacts(journal)?;
     remove_if_present(&journal_path)?;
-    sync_parent(&journal_path).map_err(|source| recovery_io(&journal_path, &source))?;
+    sync_parent(&journal_path).map_err(|source| recovery_io(&journal_path, &source))
+}
+
+fn cleanup_displacement_artifacts(
+    journal: &MigrationRecoveryJournal,
+) -> Result<(), ConfigMigrationError> {
     remove_if_present(&journal.candidate_path)?;
+    if journal.displaced_path != journal.candidate_path {
+        remove_if_present(&journal.displaced_path)?;
+    }
     sync_parent(&journal.candidate_path)
         .map_err(|source| recovery_io(&journal.candidate_path, &source))
+}
+
+fn optional_hash_file(path: &Path) -> Result<Option<String>, ConfigMigrationError> {
+    match hash_file(path) {
+        Ok(digest) => Ok(Some(digest)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(recovery_io(path, &source)),
+    }
 }
 
 fn remove_if_present(path: &Path) -> Result<(), ConfigMigrationError> {
@@ -516,6 +832,49 @@ fn recovery_path(path: &Path) -> PathBuf {
             .and_then(|name| name.to_str())
             .unwrap_or("config")
     ))
+}
+
+#[cfg(windows)]
+fn displacement_path(
+    path: &Path,
+    _candidate_path: &Path,
+) -> Result<PathBuf, ConfigMigrationError> {
+    allocate_artifact_path(path, "schema-displaced")
+}
+
+#[cfg(not(windows))]
+fn displacement_path(
+    _path: &Path,
+    candidate_path: &Path,
+) -> Result<PathBuf, ConfigMigrationError> {
+    Ok(candidate_path.to_owned())
+}
+
+#[cfg(windows)]
+fn allocate_artifact_path(
+    path: &Path,
+    label: &str,
+) -> Result<PathBuf, ConfigMigrationError> {
+    for _ in 0..128 {
+        let sequence = BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let artifact = path.with_file_name(format!(
+            "{}.{label}.{}.{}.bak",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("config"),
+            std::process::id(),
+            sequence
+        ));
+        match fs::symlink_metadata(&artifact) {
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(artifact),
+            Ok(_) => {}
+            Err(source) => return Err(recovery_io(&artifact, &source)),
+        }
+    }
+    Err(ConfigMigrationError::Recovery {
+        path: path.to_owned(),
+        message: "could not allocate a unique migration artifact path".to_owned(),
+    })
 }
 
 fn create_artifact(
@@ -640,9 +999,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        ConfigMigrationError, ConfigMigrationOutcome, migrate_config_file,
-        migrate_config_file_with_hook, recovery_path,
+        ConfigMigrationError, ConfigMigrationOutcome, ConflictRestoration,
+        ConflictRestorationPhase, MigrationRecoveryJournal, digest_bytes,
+        displace_file_atomically, migrate_config_file, migrate_config_file_with_hook,
+        migrate_config_file_with_hooks, persist_recovery_journal, recovery_path,
     };
+    use crate::io::publication_lock_path;
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -680,11 +1042,11 @@ mod tests {
             let external = OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(&path)
+                .open(publication_lock_path(&path))
                 .expect("open second lock handle");
             assert!(
                 matches!(external.try_lock(), Err(fs::TryLockError::WouldBlock)),
-                "migration must hold the advisory file lock through CAS"
+                "migration must hold the stable sidecar lock through CAS"
             );
             fs::write(&path, concurrent.as_bytes())
         })
@@ -705,6 +1067,164 @@ mod tests {
             fs::read(conflict_backup_path).expect("read conflict backup"),
             concurrent.as_bytes()
         );
+        assert!(
+            !recovery_path(&path).exists(),
+            "conflicting journal must be retired so retry is not poisoned"
+        );
+
+        let retry = migrate_config_file(&path).expect("retry migrates concurrent bytes");
+        let ConfigMigrationOutcome::Migrated(record) = retry else {
+            panic!("concurrent version-zero bytes must migrate on retry");
+        };
+        assert_eq!(
+            fs::read(record.backup_path).expect("read retry backup"),
+            concurrent.as_bytes()
+        );
+        drop(cleanup);
+    }
+
+    #[test]
+    fn second_concurrent_edit_is_restored_live_and_never_cleaned_as_candidate() {
+        let directory = temporary_directory("second-concurrent");
+        let cleanup = Cleanup(directory.clone());
+        let path = directory.join("config.json5");
+        fs::write(&path, VERSION_ZERO).expect("write original");
+        let concurrent_b = VERSION_ZERO.replace(
+            "https://roles.example.test/default.json",
+            "https://roles.example.test/concurrent-b.json",
+        );
+        let concurrent_c = VERSION_ZERO.replace(
+            "https://roles.example.test/default.json",
+            "https://roles.example.test/concurrent-c.json",
+        );
+
+        let error = migrate_config_file_with_hooks(
+            &path,
+            |_| fs::write(&path, concurrent_b.as_bytes()),
+            |_| fs::write(&path, concurrent_c.as_bytes()),
+        )
+        .expect_err("both concurrent edits must defeat migration CAS");
+
+        let ConfigMigrationError::ConcurrentEdit {
+            conflict_backup_path,
+            ..
+        } = error
+        else {
+            panic!("expected concurrent edit, got {error}");
+        };
+        assert_eq!(
+            fs::read(&path).expect("read newest live edit"),
+            concurrent_c.as_bytes()
+        );
+        assert_eq!(
+            fs::read(conflict_backup_path).expect("read first conflict backup"),
+            concurrent_b.as_bytes()
+        );
+        assert!(!recovery_path(&path).exists());
+        drop(cleanup);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn restart_recognizes_conflict_restoration_interrupted_before_newer_edit_restore() {
+        let directory = temporary_directory("conflict-restore-restart");
+        let cleanup = Cleanup(directory.clone());
+        let path = directory.join("config.json5");
+        fs::write(&path, VERSION_ZERO).expect("write original");
+        let concurrent_b = VERSION_ZERO.replace(
+            "https://roles.example.test/default.json",
+            "https://roles.example.test/concurrent-b.json",
+        );
+        let concurrent_c = VERSION_ZERO.replace(
+            "https://roles.example.test/default.json",
+            "https://roles.example.test/concurrent-c.json",
+        );
+        migrate_config_file_with_hooks(
+            &path,
+            |_| fs::write(&path, concurrent_b.as_bytes()),
+            |_| Err(io::Error::other("crash after first displacement")),
+        )
+        .expect_err("leave first displacement journal active");
+        fs::write(&path, concurrent_c.as_bytes()).expect("publish newer concurrent edit");
+        let mut journal: MigrationRecoveryJournal = serde_json::from_slice(
+            &fs::read(recovery_path(&path)).expect("read active journal"),
+        )
+        .expect("decode active journal");
+        displace_file_atomically(
+            &journal.displaced_path,
+            &path,
+            &journal.candidate_path,
+        )
+        .expect("simulate restoring B before process crashes");
+        journal.conflict_restoration = Some(ConflictRestoration {
+            restored_sha256: digest_bytes(concurrent_b.as_bytes()),
+            newer_sha256: digest_bytes(concurrent_c.as_bytes()),
+            phase: ConflictRestorationPhase::Prepared,
+        });
+        persist_recovery_journal(&path, &journal).expect("persist B/C restoration phase");
+        displace_file_atomically(
+            &journal.candidate_path,
+            &path,
+            &journal.displaced_path,
+        )
+        .expect("simulate restoring C before phase update crashes");
+
+        let error = migrate_config_file(&path)
+            .expect_err("restart reports concurrent edit after restoring C live");
+
+        let ConfigMigrationError::ConcurrentEdit {
+            conflict_backup_path,
+            ..
+        } = error
+        else {
+            panic!("expected concurrent edit, got {error}");
+        };
+        assert_eq!(
+            fs::read(&path).expect("read newest live edit"),
+            concurrent_c.as_bytes()
+        );
+        assert_eq!(
+            fs::read(conflict_backup_path).expect("read B conflict backup"),
+            concurrent_b.as_bytes()
+        );
+        assert!(!recovery_path(&path).exists());
+        drop(cleanup);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn original_bytes_in_candidate_never_overwrite_new_live_edit_on_restart() {
+        let directory = temporary_directory("candidate-original");
+        let cleanup = Cleanup(directory.clone());
+        let path = directory.join("config.json5");
+        fs::write(&path, VERSION_ZERO).expect("write original");
+        migrate_config_file_with_hooks(
+            &path,
+            |_| Ok(()),
+            |_| Err(io::Error::other("crash after migration displacement")),
+        )
+        .expect_err("leave displacement journal active");
+        let journal: MigrationRecoveryJournal = serde_json::from_slice(
+            &fs::read(recovery_path(&path)).expect("read active journal"),
+        )
+        .expect("decode active journal");
+        displace_file_atomically(
+            &journal.displaced_path,
+            &path,
+            &journal.candidate_path,
+        )
+        .expect("simulate original restoration before crash");
+        let newer = VERSION_ZERO.replace(
+            "https://roles.example.test/default.json",
+            "https://roles.example.test/newer-live.json",
+        );
+        fs::write(&path, newer.as_bytes()).expect("write newer live edit");
+
+        migrate_config_file(&path).expect_err("newer live edit must be reported");
+
+        assert_eq!(fs::read(&path).expect("read live bytes"), newer.as_bytes());
+        assert!(!recovery_path(&path).exists());
+        assert!(!journal.candidate_path.exists());
         drop(cleanup);
     }
 
@@ -735,6 +1255,32 @@ mod tests {
             !recovery_path(&path).exists(),
             "completed journal is removed"
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn restart_recognizes_crash_immediately_after_atomic_displacement() {
+        let directory = temporary_directory("exchanged-restart");
+        let cleanup = Cleanup(directory);
+        let path = cleanup.0.join("config.json5");
+        fs::write(&path, VERSION_ZERO).expect("write original");
+
+        migrate_config_file_with_hooks(
+            &path,
+            |_| Ok(()),
+            |_| Err(io::Error::other("injected crash after displacement")),
+        )
+        .expect_err("displacement failpoint interrupts migration");
+        let displaced_target: serde_json::Value =
+            json5::from_str(&fs::read_to_string(&path).expect("read displaced target"))
+                .expect("parse displaced target");
+        assert_eq!(displaced_target["schema_version"], 1);
+        assert!(recovery_path(&path).is_file());
+
+        let outcome = migrate_config_file(&path).expect("restart completes exchanged migration");
+
+        assert!(matches!(outcome, ConfigMigrationOutcome::Migrated(_)));
+        assert!(!recovery_path(&path).exists());
     }
 
     fn temporary_directory(label: &str) -> PathBuf {

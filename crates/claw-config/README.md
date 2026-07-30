@@ -42,9 +42,13 @@ because a model string is returned exactly as the document spelled it.
 
 Layered runtime resolution uses built-in, system, user, workspace, frozen
 legacy environment, then command-line precedence. Nested objects merge
-recursively while arrays and scalars replace lower layers. File migrations hold
-an advisory lock, use digest compare-and-swap, retain exact conflict backups,
-and keep a durable restart journal alongside the exact rollback backup.
+recursively while arrays and scalars replace lower layers. Every publication
+API shares a stable sibling lock. File migrations hold that lock across digest
+compare-and-swap and rename, retain exact conflict backups, retire conflicting
+journals so retries can proceed, and keep a durable restart journal alongside
+the exact rollback backup. Unix cross-type publication uses the native atomic
+exchange primitive. A Windows replacement whose outcome cannot be proven keeps
+its exact `ReplaceFileW` backup instead of deleting uncertain recovery evidence.
 `ConfigHub` and `ConfigFileWatcher`
 publish complete immutable snapshots and ordered typed notifications.
 `ResolvedConfig::environment_diagnostics` records each exact legacy mapping that

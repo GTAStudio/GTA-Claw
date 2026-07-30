@@ -15,6 +15,7 @@ use claw_migrate::{
     MigrationProvider, MigrationStatus, PlanContext, SecretStore, SecretStoreError, SecretValue,
     SystemPlatformPaths, recover_interrupted_migration,
 };
+use sha2::{Digest, Sha256};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -53,34 +54,97 @@ impl Drop for TestDir {
 #[derive(Default)]
 struct MemorySecretStore {
     values: BTreeMap<String, SecretValue>,
+    transactions: BTreeMap<String, MemorySecretTransaction>,
     fail_get: bool,
     fail_put: bool,
+    fail_put_after: Option<usize>,
+    staged_puts: usize,
     fail_remove: bool,
 }
 
+#[derive(Default)]
+struct MemorySecretTransaction {
+    previous: BTreeMap<String, Option<SecretValue>>,
+    staged: BTreeMap<String, SecretValue>,
+    committed: bool,
+    rolled_back: bool,
+}
+
 impl SecretStore for MemorySecretStore {
-    fn get(&mut self, id: &str) -> Result<Option<SecretValue>, SecretStoreError> {
+    fn begin_transaction(&mut self, transaction_id: &str) -> Result<(), SecretStoreError> {
+        self.transactions
+            .entry(transaction_id.to_owned())
+            .or_default();
+        Ok(())
+    }
+
+    fn stage(
+        &mut self,
+        transaction_id: &str,
+        id: &str,
+        value: SecretValue,
+    ) -> Result<String, SecretStoreError> {
         if self.fail_get {
             return Err(SecretStoreError::new("injected get failure"));
         }
-        Ok(self.values.get(id).cloned())
-    }
-
-    fn put(&mut self, id: &str, value: SecretValue) -> Result<String, SecretStoreError> {
-        if self.fail_put {
+        if self.fail_put || self.fail_put_after == Some(self.staged_puts) {
             return Err(SecretStoreError::new("injected put failure"));
         }
-        self.values.insert(id.to_owned(), value);
+        let previous = self.values.get(id).cloned();
+        let transaction = self
+            .transactions
+            .get_mut(transaction_id)
+            .ok_or_else(|| SecretStoreError::new("transaction was not begun"))?;
+        transaction
+            .previous
+            .entry(id.to_owned())
+            .or_insert(previous);
+        transaction.staged.insert(id.to_owned(), value);
+        self.staged_puts += 1;
         Ok(format!("keyring://gta-claw/{id}"))
     }
 
-    fn remove(&mut self, id: &str) -> Result<(), SecretStoreError> {
-        if self.fail_remove {
-            return Err(SecretStoreError::new(format!(
-                "injected remove failure for {id}"
-            )));
+    fn commit_transaction(&mut self, transaction_id: &str) -> Result<(), SecretStoreError> {
+        let transaction = self
+            .transactions
+            .get_mut(transaction_id)
+            .ok_or_else(|| SecretStoreError::new("transaction was not begun"))?;
+        if !transaction.committed {
+            for (id, value) in &transaction.staged {
+                self.values.insert(id.clone(), value.clone());
+            }
+            transaction.committed = true;
         }
-        self.values.remove(id);
+        Ok(())
+    }
+
+    fn rollback_transaction(&mut self, transaction_id: &str) -> Result<(), SecretStoreError> {
+        let Some(transaction) = self.transactions.get_mut(transaction_id) else {
+            return Ok(());
+        };
+        if transaction.rolled_back {
+            return Ok(());
+        }
+        if transaction.committed {
+            if self.fail_remove
+                && transaction
+                    .previous
+                    .values()
+                    .any(Option::is_none)
+            {
+                return Err(SecretStoreError::new(
+                    "injected atomic transaction rollback failure",
+                ));
+            }
+            for (id, previous) in &transaction.previous {
+                if let Some(previous) = previous {
+                    self.values.insert(id.clone(), previous.clone());
+                } else {
+                    self.values.remove(id);
+                }
+            }
+        }
+        transaction.rolled_back = true;
         Ok(())
     }
 }
@@ -101,6 +165,21 @@ fn signer() -> Ed25519ArtifactSigner {
 fn write(path: &Path, content: &str) {
     fs::create_dir_all(path.parent().expect("test file parent")).expect("create test file parent");
     fs::write(path, content).expect("write test file");
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let content_digest = Sha256::digest(bytes);
+    let mut hasher = Sha256::new();
+    hasher.update(b"file\0");
+    hasher.update(content_digest);
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
 }
 
 fn plan_keys(plan: &claw_migrate::MigrationPlan) -> BTreeSet<String> {
@@ -690,7 +769,50 @@ fn secret_store_get_failure_preserves_typed_cause_without_writing() {
 }
 
 #[test]
-fn rollback_reports_every_secret_store_failure() {
+fn staged_secret_failure_never_publishes_the_first_staged_value() {
+    let root = TestDir::new("staged-secret-failure");
+    let source = root.join("codex-home");
+    let target = root.join("target");
+    write(
+        &source.join("config.toml"),
+        "api_key = \"first\"\n[mcp_servers.local.env]\nREGION = \"second\"\n",
+    );
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+    let plan = CodexMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&source),
+            target_root: &target,
+            overwrite: false,
+            signer: &signer,
+        })
+        .expect("plan two staged secrets");
+    let mut secrets = MemorySecretStore {
+        fail_put_after: Some(1),
+        ..MemorySecretStore::default()
+    };
+    let mut apply = ApplyContext {
+        target_root: &target,
+        backup_root: &root.join("backup"),
+        overwrite: false,
+        secret_store: &mut secrets,
+    };
+
+    CodexMigrationProvider
+        .apply(&mut apply, &plan)
+        .expect_err("second staged value fails the transaction");
+
+    assert_eq!(secrets.staged_puts, 1);
+    assert!(
+        secrets.values.is_empty(),
+        "staged values must remain invisible before atomic transaction commit"
+    );
+    assert!(!target.exists());
+}
+
+#[test]
+fn rollback_reports_one_atomic_secret_transaction_failure() {
     let root = TestDir::new("rollback-secret-failures");
     let source = root.join("codex-home");
     let target = root.join("target");
@@ -732,18 +854,19 @@ fn rollback_reports_every_secret_store_failure() {
 
     let error = CodexMigrationProvider
         .rollback(&mut rollback, &receipt)
-        .expect_err("both removals fail");
+        .expect_err("atomic transaction rollback fails");
     match error {
         MigrationError::RollbackFailed { errors } => {
-            assert_eq!(errors.len(), 2);
-            assert!(
-                errors
-                    .iter()
-                    .all(|error| error.contains("secret codex-config-"))
-            );
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].contains("secret transaction codex-"));
         }
         other => panic!("expected aggregate rollback failure, got {other}"),
     }
+    assert_eq!(
+        secrets.values.len(),
+        2,
+        "failed atomic rollback must not remove a subset of committed secrets"
+    );
 }
 
 #[test]
@@ -1038,7 +1161,7 @@ fn restart_recovery_rolls_back_an_uncommitted_durable_manifest() {
     )
     .expect("simulate crash before commit marker");
 
-    recover_interrupted_migration(&receipt.backup_dir).expect("restart rollback");
+    recover_interrupted_migration(&receipt.backup_dir, &mut secrets).expect("restart rollback");
 
     assert_eq!(
         fs::read_to_string(&soul).expect("read restored target"),
@@ -1094,7 +1217,7 @@ fn restart_recovery_preserves_an_unrecognized_concurrent_edit() {
     write(&soul, "Concurrent user edit.");
     let manifest_before = fs::read(&manifest_path).expect("capture manifest");
 
-    let error = recover_interrupted_migration(&receipt.backup_dir)
+    let error = recover_interrupted_migration(&receipt.backup_dir, &mut secrets)
         .expect_err("unknown target digest must block recovery");
 
     assert_eq!(
@@ -1109,6 +1232,253 @@ fn restart_recovery_preserves_an_unrecognized_concurrent_edit() {
         fs::read(manifest_path).expect("manifest remains unchanged"),
         manifest_before
     );
+}
+
+#[test]
+fn restart_recovery_accepts_prior_applied_state_during_repeated_target_update() {
+    let root = TestDir::new("repeated-target-recovery");
+    let target_root = root.join("target");
+    let target = target_root.join("workspace").join("AGENTS.md");
+    let original = b"original instructions\n";
+    let first_applied = b"first imported instructions\n";
+    let second_pending = b"second imported instructions\n";
+    write(&target, std::str::from_utf8(first_applied).expect("UTF-8 fixture"));
+    let backup_dir = root.join("backup").join("repeat-transaction");
+    let backup = backup_dir.join("items").join("0");
+    write(&backup, std::str::from_utf8(original).expect("UTF-8 fixture"));
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "provider_id": "claude",
+        "target_root": target_root.clone(),
+        "secret_transaction_id": "repeat-transaction",
+        "phase": "applying",
+        "created_directories": [],
+        "entries": [{
+            "target": target.clone(),
+            "backup": backup.clone(),
+            "original_sha256": sha256(original),
+            "pending_sha256": sha256(second_pending),
+            "applied": {
+                "kind": "digest",
+                "sha256": sha256(first_applied),
+            },
+            "transition": null,
+            "removal": null,
+        }],
+    });
+    write(
+        &backup_dir.join("manifest.json"),
+        &serde_json::to_string_pretty(&manifest).expect("encode manifest"),
+    );
+    let mut secrets = MemorySecretStore::default();
+
+    recover_interrupted_migration(&backup_dir, &mut secrets)
+        .expect("prior applied digest belongs to the interrupted transaction");
+
+    assert_eq!(fs::read(&target).expect("read restored target"), original);
+}
+
+#[test]
+fn restart_restores_publication_that_crashed_before_applied_state_record() {
+    let root = TestDir::new("publication-before-record");
+    let target_root = root.join("target");
+    let target = target_root.join("config").join("value.json");
+    let original = b"original\n";
+    let pending = b"published-before-record\n";
+    write(&target, std::str::from_utf8(pending).expect("UTF-8 fixture"));
+    let backup_dir = root.join("backup").join("publication-transaction");
+    let backup = backup_dir.join("items").join("0");
+    write(&backup, std::str::from_utf8(original).expect("UTF-8 fixture"));
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "provider_id": "codex",
+        "target_root": target_root,
+        "secret_transaction_id": "publication-transaction",
+        "phase": "applying",
+        "created_directories": [],
+        "entries": [{
+            "target": target.clone(),
+            "backup": backup,
+            "original_sha256": sha256(original),
+            "pending_sha256": sha256(pending),
+            "applied": null,
+            "transition": null,
+            "removal": null,
+        }],
+    });
+    write(
+        &backup_dir.join("manifest.json"),
+        &serde_json::to_string_pretty(&manifest).expect("encode manifest"),
+    );
+    let mut secrets = MemorySecretStore::default();
+
+    recover_interrupted_migration(&backup_dir, &mut secrets)
+        .expect("pending publication remains transaction-owned during restore guard");
+
+    assert_eq!(fs::read(target).expect("read restored target"), original);
+    let recovered: serde_json::Value =
+        serde_json::from_slice(&fs::read(backup_dir.join("manifest.json")).expect("read manifest"))
+            .expect("decode recovered manifest");
+    assert_eq!(recovered["phase"], "rolled_back");
+}
+
+#[test]
+fn restart_commits_staged_secrets_after_filesystem_commit_marker() {
+    let root = TestDir::new("secret-commit-recovery");
+    let target_root = root.join("target");
+    let target = target_root.join("config").join("migrated.json");
+    let migrated = b"{\"secret_ref\":\"keyring://gta-claw/recovered\"}";
+    fs::create_dir_all(target.parent().expect("target parent")).expect("create target parent");
+    fs::write(&target, migrated).expect("write committed filesystem target");
+    let backup_dir = root.join("backup").join("secret-transaction");
+    fs::create_dir_all(&backup_dir).expect("create backup directory");
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "provider_id": "codex",
+        "target_root": target_root.clone(),
+        "secret_transaction_id": "secret-transaction",
+        "phase": "filesystem_committed",
+        "created_directories": [],
+        "entries": [{
+            "target": target.clone(),
+            "backup": null,
+            "original_sha256": null,
+            "pending_sha256": null,
+            "applied": {
+                "kind": "digest",
+                "sha256": sha256(migrated),
+            },
+            "transition": null,
+            "removal": null,
+        }],
+    });
+    write(
+        &backup_dir.join("manifest.json"),
+        &serde_json::to_string_pretty(&manifest).expect("encode manifest"),
+    );
+    let mut secrets = MemorySecretStore::default();
+    secrets
+        .begin_transaction("secret-transaction")
+        .expect("begin transaction");
+    secrets
+        .stage(
+            "secret-transaction",
+            "recovered",
+            SecretValue::new(b"staged-secret"),
+        )
+        .expect("stage secret");
+    assert!(secrets.values.is_empty());
+
+    recover_interrupted_migration(&backup_dir, &mut secrets)
+        .expect("restart completes secret transaction");
+
+    assert_eq!(
+        secrets
+            .values
+            .get("recovered")
+            .expect("committed secret")
+            .expose(),
+        b"staged-secret"
+    );
+    assert_eq!(fs::read(&target).expect("filesystem remains committed"), migrated);
+    let recovered: serde_json::Value =
+        serde_json::from_slice(&fs::read(backup_dir.join("manifest.json")).expect("read manifest"))
+            .expect("decode recovered manifest");
+    assert_eq!(recovered["phase"], "committed");
+}
+
+#[test]
+fn restart_refuses_secret_commit_when_filesystem_commit_was_changed() {
+    let root = TestDir::new("secret-commit-conflict");
+    let target_root = root.join("target");
+    let target = target_root.join("config").join("migrated.json");
+    let migrated = b"{\"secret_ref\":\"keyring://gta-claw/recovered\"}";
+    fs::create_dir_all(target.parent().expect("target parent")).expect("create target parent");
+    fs::write(&target, migrated).expect("write committed filesystem target");
+    let backup_dir = root.join("backup").join("secret-transaction");
+    fs::create_dir_all(&backup_dir).expect("create backup directory");
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "provider_id": "codex",
+        "target_root": target_root,
+        "secret_transaction_id": "secret-transaction",
+        "phase": "filesystem_committed",
+        "created_directories": [],
+        "entries": [{
+            "target": target.clone(),
+            "backup": null,
+            "original_sha256": null,
+            "pending_sha256": null,
+            "applied": {
+                "kind": "digest",
+                "sha256": sha256(migrated),
+            },
+            "transition": null,
+            "removal": null,
+        }],
+    });
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("encode manifest");
+    fs::write(backup_dir.join("manifest.json"), &manifest_bytes).expect("write manifest");
+    let mut secrets = MemorySecretStore::default();
+    secrets
+        .begin_transaction("secret-transaction")
+        .expect("begin transaction");
+    secrets
+        .stage(
+            "secret-transaction",
+            "recovered",
+            SecretValue::new(b"staged-secret"),
+        )
+        .expect("stage secret");
+    fs::write(&target, b"concurrent authored bytes").expect("replace committed target");
+
+    recover_interrupted_migration(&backup_dir, &mut secrets)
+        .expect_err("foreign filesystem state must block secret commit");
+
+    assert!(secrets.values.is_empty());
+    assert_eq!(
+        fs::read(backup_dir.join("manifest.json")).expect("manifest remains pending"),
+        manifest_bytes
+    );
+    assert_eq!(
+        fs::read(target).expect("foreign bytes remain"),
+        b"concurrent authored bytes"
+    );
+}
+
+#[test]
+fn future_recovery_manifest_is_refused_without_changing_any_bytes() {
+    let root = TestDir::new("future-recovery-schema");
+    let target_root = root.join("target");
+    let target = target_root.join("value");
+    write(&target, "authored bytes");
+    let backup_dir = root.join("backup").join("future-transaction");
+    fs::create_dir_all(&backup_dir).expect("create backup directory");
+    let future = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 99,
+        "provider_id": "codex",
+        "target_root": target_root,
+        "secret_transaction_id": "future-transaction",
+        "phase": "applying",
+        "created_directories": [],
+        "entries": [],
+        "future_only": true,
+    }))
+    .expect("encode future manifest");
+    fs::write(backup_dir.join("manifest.json"), &future).expect("write future manifest");
+    let before_target = fs::read(&target).expect("read target before recovery");
+    let mut secrets = MemorySecretStore::default();
+
+    let error = recover_interrupted_migration(&backup_dir, &mut secrets)
+        .expect_err("future recovery schema must fail closed");
+
+    assert!(error.to_string().contains("unsupported migration recovery schema 99"));
+    assert_eq!(
+        fs::read(backup_dir.join("manifest.json")).expect("read unchanged manifest"),
+        future
+    );
+    assert_eq!(fs::read(target).expect("read unchanged target"), before_target);
+    assert!(secrets.values.is_empty());
 }
 
 #[test]

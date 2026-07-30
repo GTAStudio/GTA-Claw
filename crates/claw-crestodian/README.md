@@ -9,10 +9,11 @@ exact pre-setup bytes. Recovery distinguishes missing, corrupt, interrupted,
 and incompatible config/state, refuses unsupported schemas without mutation,
 flushes exact backups before replacement, preserves orphaned atomic-write
 artifacts, and rolls earlier writes back when a later real filesystem operation
-fails while surfacing rollback directory-sync failures. Setup questions expose machine-readable
-constraints for immediate UI validation, and recovery assessments return a
-typed next step. Recovery parses each file from the same bytes it backs up and
-does not create an empty evidence directory when both files were absent.
+fails while surfacing rollback directory-sync failures. Setup questions expose
+machine-readable constraints for immediate UI validation, and recovery
+assessments return a typed next step. Recovery reads a tolerant version prefix
+before strict decoding, parses each current file from the same bytes it backs
+up, and does not create an empty evidence directory when both files were absent.
 
 Remote rescue uses a closed `/crestodian` grammar with no model inference. It
 fails closed for sandboxed, non-owner, anonymous, or disallowed group contexts.

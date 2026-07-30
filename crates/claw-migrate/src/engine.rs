@@ -2,14 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use claw_config::{
-    WriteOutcome, copy_file_atomically as copy_config_file_atomically, write_bytes_atomically,
+    WriteOutcome, atomic_exchange_supported,
+    copy_file_atomically as copy_config_file_atomically, exchange_paths_atomically,
+    rename_path_no_replace, write_bytes_atomically,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
@@ -209,37 +211,42 @@ impl Display for SecretStoreError {
 
 impl Error for SecretStoreError {}
 
-/// Reversible secret persistence port used by apply and rollback.
+/// Durable transactional secret persistence used by apply and recovery.
 pub trait SecretStore {
-    /// Returns an existing value so rollback can restore it.
+    /// Begins or resumes an idempotent durable transaction.
     ///
     /// # Errors
     ///
-    /// Returns a [`SecretStoreError`] when the platform keyring cannot be
-    /// reached or unlocked — for example a locked login keychain, a headless
-    /// session with no secret service running, or a denied access prompt. Apply
-    /// refuses to continue in that case, because without a readable prior value
-    /// rollback could not restore the credential it is about to replace.
-    fn get(&mut self, id: &str) -> Result<Option<SecretValue>, SecretStoreError>;
-    /// Persists a value and returns a safe reference suitable for configuration.
+    /// Returns a [`SecretStoreError`] when the transaction's undo record cannot
+    /// be created or reopened durably.
+    fn begin_transaction(&mut self, transaction_id: &str) -> Result<(), SecretStoreError>;
+    /// Durably stages a value without making it visible to normal reads.
     ///
     /// # Errors
     ///
-    /// Returns a [`SecretStoreError`] when the secret could not be written to
-    /// the platform keyring — the store is locked, unavailable, out of space, or
-    /// rejected the entry. Apply treats this as fatal and rolls back, so the
-    /// plaintext is never written to a configuration file that the keyring does
-    /// not actually back. Unlock the keyring and re-run the migration.
-    fn put(&mut self, id: &str, value: SecretValue) -> Result<String, SecretStoreError>;
-    /// Removes an entry that did not exist before apply.
+    /// Returns a [`SecretStoreError`] when either the value or its exact
+    /// pre-transaction undo state cannot be made durable. Repeated staging of the
+    /// same transaction and key must be idempotent.
+    fn stage(
+        &mut self,
+        transaction_id: &str,
+        id: &str,
+        value: SecretValue,
+    ) -> Result<String, SecretStoreError>;
+    /// Atomically publishes every value staged by a durable transaction.
     ///
     /// # Errors
     ///
-    /// Returns a [`SecretStoreError`] when the keyring entry could not be
-    /// deleted during rollback. Rollback reports it rather than hiding it: the
-    /// filesystem is still restored, but the migrated credential remains in the
-    /// keyring and has to be removed by hand.
-    fn remove(&mut self, id: &str) -> Result<(), SecretStoreError>;
+    /// Returns a [`SecretStoreError`] when commit cannot be confirmed. This
+    /// operation must be idempotent for restart recovery.
+    fn commit_transaction(&mut self, transaction_id: &str) -> Result<(), SecretStoreError>;
+    /// Restores the exact pre-transaction values, even after commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SecretStoreError`] when durable rollback cannot complete.
+    /// This operation must be idempotent.
+    fn rollback_transaction(&mut self, transaction_id: &str) -> Result<(), SecretStoreError>;
 }
 
 /// Artifact signature port.
@@ -357,11 +364,9 @@ pub trait MigrationProvider {
     /// written.
     ///
     /// [`MigrationError::ApplyFailed`] is the only variant that can be raised
-    /// after writing began. It carries the original reason and, in
-    /// `rollback_error`, the reason automatic restoration did not finish. If
-    /// `rollback_error` is `None` the target was restored to its pre-apply state;
-    /// if it is `Some`, the verified backup directory named by the receipt must
-    /// be restored by hand.
+    /// after writing began. It carries the original reason and every automatic
+    /// filesystem or secret-transaction rollback failure. An empty rollback list
+    /// means the target was restored to its pre-apply state.
     fn apply(
         &self,
         context: &mut ApplyContext<'_>,
@@ -383,9 +388,8 @@ pub trait MigrationProvider {
     /// restore that path from the receipt's backup directory yourself.
     /// [`MigrationError::BackupVerification`] means a backup no longer matches
     /// the digest recorded when it was taken, so it is not trustworthy enough to
-    /// restore. [`MigrationError::SecretStore`] means the platform keyring
-    /// entries could not be restored or removed even though the filesystem was;
-    /// unlock the keyring and remove the migrated entries by hand.
+    /// restore. [`MigrationError::SecretStore`] means the durable secret
+    /// transaction could not be rolled back.
     fn rollback(
         &self,
         context: &mut ApplyContext<'_>,
@@ -394,19 +398,25 @@ pub trait MigrationProvider {
         if receipt.provider_id != self.id() {
             return Err(MigrationError::ProviderMismatch);
         }
-        rollback_receipt(context, receipt)
+        let target_root = normalize_target_root(context.target_root)?;
+        if receipt.target_root != target_root {
+            return Err(MigrationError::UnsafeTarget(receipt.target_root.clone()));
+        }
+        rollback_receipt(context, receipt, &target_root)
     }
 }
 
 /// Persistent backup receipt required for rollback.
+#[derive(Clone)]
 pub struct ApplyReceipt {
     /// Provider that created the receipt.
-    pub provider_id: &'static str,
+    pub provider_id: String,
     /// Verified backup directory.
     pub backup_dir: PathBuf,
     target_root: PathBuf,
+    secret_transaction_id: String,
     backups: Vec<BackupEntry>,
-    secrets: Vec<SecretUndo>,
+    created_directories: Vec<PathBuf>,
 }
 
 impl Debug for ApplyReceipt {
@@ -416,8 +426,9 @@ impl Debug for ApplyReceipt {
             .field("provider_id", &self.provider_id)
             .field("backup_dir", &self.backup_dir)
             .field("target_root", &self.target_root)
+            .field("secret_transaction_id", &self.secret_transaction_id)
             .field("backup_count", &self.backups.len())
-            .field("secret_count", &self.secrets.len())
+            .field("created_directory_count", &self.created_directories.len())
             .finish()
     }
 }
@@ -434,59 +445,197 @@ impl Debug for ApplyReceipt {
 /// recovery schema, [`MigrationError::Conflict`] for a target changed outside
 /// the interrupted apply, and the same backup, symlink, and I/O errors as normal
 /// rollback.
-pub fn recover_interrupted_migration(backup_dir: impl AsRef<Path>) -> Result<(), MigrationError> {
-    let backup_dir = backup_dir.as_ref();
+pub fn recover_interrupted_migration(
+    backup_dir: impl AsRef<Path>,
+    secret_store: &mut dyn SecretStore,
+) -> Result<(), MigrationError> {
+    recover_interrupted_migration_with_hook(backup_dir.as_ref(), secret_store, |_| Ok(()))
+}
+
+fn recover_interrupted_migration_with_hook(
+    backup_dir: &Path,
+    secret_store: &mut dyn SecretStore,
+    before_lock: impl FnOnce(&Path) -> Result<(), MigrationError>,
+) -> Result<(), MigrationError> {
     let manifest_path = backup_dir.join("manifest.json");
     reject_symlink(&manifest_path)?;
-    let bytes = read_bytes(&manifest_path)?;
-    let mut manifest: RecoveryManifest =
+    let hint = read_recovery_manifest(&manifest_path)?;
+    before_lock(&manifest_path)?;
+    let backup_root = backup_dir
+        .parent()
+        .ok_or_else(|| MigrationError::UnsafeTarget(backup_dir.to_owned()))?;
+    let _lock = MigrationLock::acquire(&hint.target_root)?;
+    let mut manifest = read_recovery_manifest(&manifest_path)?;
+    if manifest.target_root != hint.target_root {
+        return Err(MigrationError::InvalidInput {
+            path: manifest_path,
+            reason: "migration recovery target changed while acquiring its lock".to_owned(),
+        });
+    }
+    match manifest.phase {
+        RecoveryPhase::Committed | RecoveryPhase::RolledBack => Ok(()),
+        RecoveryPhase::FilesystemCommitted => {
+            let receipt = receipt_from_manifest(backup_dir, &manifest)?;
+            verify_committed_state(&receipt)?;
+            secret_store.commit_transaction(&manifest.secret_transaction_id)?;
+            manifest.phase = RecoveryPhase::Committed;
+            write_recovery_manifest(&backup_dir.join("manifest.json"), &manifest)
+        }
+        RecoveryPhase::Prepared | RecoveryPhase::Applying => {
+            let mut receipt = receipt_from_manifest(backup_dir, &manifest)?;
+            let mut displaced_conflict = None;
+            let published_targets = receipt
+                .backups
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .transition
+                        .as_ref()
+                        .is_some_and(|transition| transition.phase == TransitionPhase::Published)
+                })
+                .map(|entry| entry.target.clone())
+                .collect::<Vec<_>>();
+            for target in published_targets {
+                let entry = receipt
+                    .backups
+                    .iter()
+                    .find(|entry| entry.target == target)
+                    .expect("published target has receipt entry");
+                if transition_rollback_completed(entry)? {
+                    continue;
+                }
+                match validate_displaced_publication(&mut receipt, &target) {
+                    Ok(()) => {}
+                    Err(MigrationError::Conflict(path)) => displaced_conflict = Some(path),
+                    Err(error) => return Err(error),
+                }
+            }
+            let preserved_conflict =
+                finalize_preserved_transition_conflicts(&mut receipt)?;
+            let mut context = ApplyContext {
+                target_root: &manifest.target_root,
+                backup_root,
+                overwrite: true,
+                secret_store,
+            };
+            match rollback_receipt_locked(&mut context, &mut receipt) {
+                Ok(()) => displaced_conflict
+                    .or(preserved_conflict)
+                    .map_or(Ok(()), |path| Err(MigrationError::Conflict(path))),
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+fn transition_rollback_completed(entry: &BackupEntry) -> Result<bool, MigrationError> {
+    let Some(transition) = &entry.transition else {
+        return Ok(false);
+    };
+    if transition.phase != TransitionPhase::Published {
+        return Ok(false);
+    }
+    let target_matches_original = match &entry.digest {
+        Some(expected) => {
+            path_is_occupied(&entry.target) && digest_path(&entry.target)? == *expected
+        }
+        None => !path_is_occupied(&entry.target),
+    };
+    if !target_matches_original {
+        return Ok(false);
+    }
+    let staging_matches_pending = match &entry.pending {
+        Some(expected) if path_is_occupied(&transition.staging) => {
+            digest_path(&transition.staging)? == *expected
+        }
+        Some(_) => true,
+        None => !path_is_occupied(&transition.staging),
+    };
+    let old_absent = transition
+        .old
+        .as_ref()
+        .is_none_or(|old| !path_is_occupied(old) || old == &transition.staging);
+    Ok(staging_matches_pending
+        && (transition.strategy != TransitionStrategy::DisplaceFile || old_absent))
+}
+
+fn finalize_preserved_transition_conflicts(
+    receipt: &mut ApplyReceipt,
+) -> Result<Option<PathBuf>, MigrationError> {
+    let mut conflict = None;
+    for index in 0..receipt.backups.len() {
+        let phase = receipt.backups[index]
+            .transition
+            .as_ref()
+            .map(|transition| transition.phase);
+        if !matches!(
+            phase,
+            Some(TransitionPhase::ConflictRestoring | TransitionPhase::ConflictRestored)
+        ) {
+            continue;
+        }
+        conflict.get_or_insert_with(|| receipt.backups[index].target.clone());
+        if phase == Some(TransitionPhase::ConflictRestoring) {
+            let target_digest = digest_path(&receipt.backups[index].target)?;
+            let conflict_digest = receipt.backups[index]
+                .transition
+                .as_ref()
+                .and_then(|transition| transition.conflict_sha256.as_ref())
+                .ok_or_else(|| MigrationError::Conflict(receipt.backups[index].target.clone()))?;
+            if target_digest != *conflict_digest {
+                restore_transition_conflict(receipt, index)?;
+            }
+        }
+        let transition = receipt.backups[index]
+            .transition
+            .as_ref()
+            .expect("conflict transition remains present")
+            .clone();
+        receipt.backups[index]
+            .transition
+            .as_mut()
+            .expect("conflict transition remains present")
+            .phase = TransitionPhase::RollbackCleaning;
+        write_backup_manifest(receipt, RecoveryPhase::Applying)?;
+        cleanup_path_transition(&transition)?;
+        receipt.backups[index].pending = None;
+        receipt.backups[index].applied = None;
+        receipt.backups[index].transition = None;
+        write_backup_manifest(receipt, RecoveryPhase::Applying)?;
+    }
+    Ok(conflict)
+}
+
+fn read_recovery_manifest(path: &Path) -> Result<RecoveryManifest, MigrationError> {
+    reject_symlink(path)?;
+    let bytes = read_bytes(path)?;
+    let manifest: RecoveryManifest =
         serde_json::from_slice(&bytes).map_err(|error| MigrationError::InvalidInput {
-            path: manifest_path.clone(),
+            path: path.to_owned(),
             reason: format!("migration recovery manifest is malformed: {error}"),
         })?;
     if manifest.schema_version != RECOVERY_SCHEMA_VERSION {
         return Err(MigrationError::InvalidInput {
-            path: manifest_path,
+            path: path.to_owned(),
             reason: format!(
                 "unsupported migration recovery schema {}; supported schema is {}",
                 manifest.schema_version, RECOVERY_SCHEMA_VERSION
             ),
         });
     }
-    if matches!(
-        manifest.phase,
-        RecoveryPhase::Committed | RecoveryPhase::RolledBack
-    ) {
-        return Ok(());
-    }
-
-    let backup_root = backup_dir
-        .parent()
-        .ok_or_else(|| MigrationError::UnsafeTarget(backup_dir.to_owned()))?;
-    let _lock = MigrationLock::acquire(backup_root, &manifest.target_root)?;
-    let actions = recovery_actions(backup_dir, &manifest)?;
-    for action in actions.into_iter().rev() {
-        match action {
-            RecoveryAction::None => {}
-            RecoveryAction::Restore(entry) => restore_backup(&entry)?,
-            RecoveryAction::Remove(path) => remove_path_if_exists(&path)?,
-        }
-    }
-    manifest.phase = RecoveryPhase::RolledBack;
-    write_recovery_manifest(&backup_dir.join("manifest.json"), &manifest)
+    Ok(manifest)
 }
 
-enum RecoveryAction {
-    None,
-    Restore(BackupEntry),
-    Remove(PathBuf),
-}
-
-fn recovery_actions(
+fn receipt_from_manifest(
     backup_dir: &Path,
     manifest: &RecoveryManifest,
-) -> Result<Vec<RecoveryAction>, MigrationError> {
-    let mut actions = Vec::with_capacity(manifest.entries.len());
+) -> Result<ApplyReceipt, MigrationError> {
+    if !manifest.target_root.is_absolute() {
+        return Err(MigrationError::UnsafeTarget(manifest.target_root.clone()));
+    }
+    let created_directories =
+        validate_created_directories(&manifest.created_directories, &manifest.target_root)?;
+    let mut backups = Vec::with_capacity(manifest.entries.len());
     for entry in &manifest.entries {
         ensure_target_within(&manifest.target_root, &entry.target)?;
         ensure_no_symlink_ancestors(&manifest.target_root, &entry.target)?;
@@ -501,49 +650,380 @@ fn recovery_actions(
                 return Err(MigrationError::BackupVerification(backup_dir.to_owned()));
             }
         }
-        let current = if path_is_occupied(&entry.target) {
-            Some(digest_path(&entry.target)?)
-        } else {
-            None
-        };
-        if current == entry.original_sha256 {
-            actions.push(RecoveryAction::None);
-            continue;
-        }
-
-        let intended = entry.pending_sha256.as_ref().or(match &entry.applied {
-            Some(RecoveryAppliedState::Digest(digest)) => Some(digest),
-            _ => None,
+        let transition = entry
+            .transition
+            .as_ref()
+            .map(|transition| validate_recovery_transition(entry, transition))
+            .transpose()?;
+        let removal = entry
+            .removal
+            .as_ref()
+            .map(|removal| validate_recovery_removal(entry, removal))
+            .transpose()?;
+        backups.push(BackupEntry {
+            target: entry.target.clone(),
+            backup: entry.backup.clone(),
+            digest: entry.original_sha256.clone(),
+            pending: entry.pending_sha256.clone(),
+            applied: entry.applied.as_ref().map(|state| match state {
+                RecoveryAppliedState::Absent => AppliedState::Absent,
+                RecoveryAppliedState::Digest(digest) => AppliedState::Digest(digest.clone()),
+                RecoveryAppliedState::Unknown => AppliedState::Unknown,
+            }),
+            transition,
+            removal,
         });
-        let touched_absent = matches!(&entry.applied, Some(RecoveryAppliedState::Absent));
-        let recognized = intended.is_some_and(|expected| current.as_ref() == Some(expected))
-            || current.is_none() && (entry.original_sha256.is_some() || touched_absent);
-        if !recognized || matches!(&entry.applied, Some(RecoveryAppliedState::Unknown)) {
-            return Err(MigrationError::Conflict(entry.target.clone()));
-        }
-        if entry.original_sha256.is_some() {
-            actions.push(RecoveryAction::Restore(BackupEntry {
-                target: entry.target.clone(),
-                backup: entry.backup.clone(),
-                digest: entry.original_sha256.clone(),
-                pending: None,
-                applied: None,
-            }));
-        } else if current.is_some() {
-            actions.push(RecoveryAction::Remove(entry.target.clone()));
-        } else {
-            actions.push(RecoveryAction::None);
-        }
     }
-    Ok(actions)
+    Ok(ApplyReceipt {
+        provider_id: manifest.provider_id.clone(),
+        backup_dir: backup_dir.to_owned(),
+        target_root: manifest.target_root.clone(),
+        secret_transaction_id: manifest.secret_transaction_id.clone(),
+        backups,
+        created_directories,
+    })
 }
 
+fn validate_created_directories(
+    directories: &[PathBuf],
+    target_root: &Path,
+) -> Result<Vec<PathBuf>, MigrationError> {
+    let mut unique = BTreeSet::new();
+    for directory in directories {
+        if !directory.is_absolute()
+            || directory
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        {
+            return Err(MigrationError::UnsafeTarget(directory.clone()));
+        }
+        ensure_target_within(target_root, directory)?;
+        ensure_no_symlink_ancestors(target_root, directory)?;
+        if !unique.insert(directory.clone()) {
+            return Err(MigrationError::InvalidInput {
+                path: directory.clone(),
+                reason: "duplicate created-directory recovery entry".to_owned(),
+            });
+        }
+    }
+    let mut validated = unique.into_iter().collect::<Vec<_>>();
+    validated.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
+    Ok(validated)
+}
+
+fn validate_recovery_transition(
+    entry: &RecoveryManifestEntry,
+    transition: &RecoveryPathTransition,
+) -> Result<PathTransition, MigrationError> {
+    let parent = entry
+        .target
+        .parent()
+        .ok_or_else(|| MigrationError::UnsafeTarget(entry.target.clone()))?;
+    if transition.staging.parent() != Some(parent)
+        || transition.old.as_deref().is_some_and(|old| old.parent() != Some(parent))
+    {
+        return Err(MigrationError::UnsafeTarget(entry.target.clone()));
+    }
+    reject_symlink_if_present(&transition.staging)?;
+    if let Some(old) = &transition.old {
+        reject_symlink_if_present(old)?;
+    }
+    match (transition.strategy, transition.phase) {
+        (TransitionStrategy::Exchange, TransitionPhase::Prepared) => {
+            let target_digest = digest_path(&entry.target)?;
+            let staging_digest = digest_path(&transition.staging)?;
+            let original = entry
+                .original_sha256
+                .as_ref()
+                .ok_or_else(|| MigrationError::Conflict(entry.target.clone()))?;
+            let pending = entry
+                .pending_sha256
+                .as_ref()
+                .ok_or_else(|| MigrationError::Conflict(entry.target.clone()))?;
+            let before_exchange = target_digest == *original && staging_digest == *pending;
+            let after_exchange = target_digest == *pending && staging_digest == *original;
+            if !before_exchange && !after_exchange {
+                return Err(MigrationError::Conflict(entry.target.clone()));
+            }
+        }
+        (TransitionStrategy::Rename, TransitionPhase::Prepared)
+        | (TransitionStrategy::Rename, TransitionPhase::OldMoved) => {
+            if path_is_occupied(&transition.staging)
+                && entry.pending_sha256.as_ref().is_some_and(|expected| {
+                    digest_path(&transition.staging).ok().as_ref() != Some(expected)
+                })
+            {
+                return Err(MigrationError::Conflict(transition.staging.clone()));
+            }
+            if transition.phase == TransitionPhase::OldMoved
+                && let Some(old) = &transition.old
+                && entry
+                    .original_sha256
+                    .as_ref()
+                    .is_none_or(|expected| digest_path(old).ok().as_ref() != Some(expected))
+            {
+                return Err(MigrationError::BackupVerification(old.clone()));
+            }
+        }
+        (TransitionStrategy::Exchange, TransitionPhase::Published) => {
+            let target_digest = digest_path(&entry.target)?;
+            let original = entry
+                .original_sha256
+                .as_ref()
+                .ok_or_else(|| MigrationError::Conflict(entry.target.clone()))?;
+            let pending = entry
+                .pending_sha256
+                .as_ref()
+                .ok_or_else(|| MigrationError::Conflict(entry.target.clone()))?;
+            if target_digest == *original && !path_is_occupied(&transition.staging) {
+                return Ok(PathTransition {
+                    staging: transition.staging.clone(),
+                    old: transition.old.clone(),
+                    phase: transition.phase,
+                    strategy: transition.strategy,
+                    expected_displaced_sha256: transition.expected_displaced_sha256.clone(),
+                    conflict_sha256: transition.conflict_sha256.clone(),
+                });
+            }
+            let staging_digest = digest_path(&transition.staging)?;
+            let forward_exchange = target_digest == *pending;
+            let rollback_exchange = target_digest == *original && staging_digest == *pending;
+            if !forward_exchange && !rollback_exchange {
+                return Err(MigrationError::Conflict(entry.target.clone()));
+            }
+        }
+        (
+            TransitionStrategy::DisplaceFile,
+            TransitionPhase::Prepared | TransitionPhase::Published,
+        ) => {
+            let target_digest = optional_digest_path(&entry.target)?;
+            let staging_digest = optional_digest_path(&transition.staging)?;
+            let old_digest = transition
+                .old
+                .as_ref()
+                .map(|old| optional_digest_path(old))
+                .transpose()?
+                .flatten();
+            let original = entry
+                .original_sha256
+                .as_ref()
+                .ok_or_else(|| MigrationError::Conflict(entry.target.clone()))?;
+            let pending = entry
+                .pending_sha256
+                .as_ref()
+                .ok_or_else(|| MigrationError::Conflict(entry.target.clone()))?;
+            let before = target_digest.as_ref() == Some(original)
+                && staging_digest.as_ref() == Some(pending)
+                && old_digest.is_none();
+            let forward = target_digest.as_ref() == Some(pending)
+                && staging_digest.is_none()
+                && old_digest.is_some();
+            let rolled_back = target_digest.as_ref() == Some(original)
+                && staging_digest.as_ref() == Some(pending)
+                && old_digest.is_none();
+            if !before && !forward && !rolled_back {
+                return Err(MigrationError::Conflict(entry.target.clone()));
+            }
+        }
+        (TransitionStrategy::Rename, TransitionPhase::Published) => {
+            if let Some(old) = &transition.old
+                && path_is_occupied(old)
+                && entry
+                    .original_sha256
+                    .as_ref()
+                    .is_none_or(|expected| digest_path(old).ok().as_ref() != Some(expected))
+            {
+                return Err(MigrationError::BackupVerification(old.clone()));
+            }
+        }
+        (
+            TransitionStrategy::Exchange | TransitionStrategy::DisplaceFile,
+            TransitionPhase::ConflictRestoring | TransitionPhase::ConflictRestored,
+        ) => {
+            let conflict = transition
+                .conflict_sha256
+                .as_ref()
+                .ok_or_else(|| MigrationError::Conflict(entry.target.clone()))?;
+            let pending = entry
+                .pending_sha256
+                .as_ref()
+                .ok_or_else(|| MigrationError::Conflict(entry.target.clone()))?;
+            let target_digest = optional_digest_path(&entry.target)?;
+            let old_digest = transition
+                .old
+                .as_ref()
+                .map(|old| optional_digest_path(old))
+                .transpose()?
+                .flatten();
+            let staging_digest = optional_digest_path(&transition.staging)?;
+            let before_restore = target_digest.as_ref() == Some(pending)
+                && old_digest.as_ref() == Some(conflict);
+            let after_restore = target_digest.as_ref() == Some(conflict)
+                && staging_digest.as_ref() == Some(pending);
+            if !before_restore && !after_restore {
+                return Err(MigrationError::Conflict(entry.target.clone()));
+            }
+        }
+        (
+            TransitionStrategy::Rename,
+            TransitionPhase::ConflictRestoring | TransitionPhase::ConflictRestored,
+        ) => {
+            return Err(MigrationError::InvalidInput {
+                path: entry.target.clone(),
+                reason: "rename transition cannot carry displaced conflict state".to_owned(),
+            });
+        }
+        (_, TransitionPhase::Cleaning) => {}
+        (_, TransitionPhase::RollbackCleaning) => {
+            if entry
+                .original_sha256
+                .as_ref()
+                .is_some_and(|expected| digest_path(&entry.target).ok().as_ref() != Some(expected))
+                || entry.original_sha256.is_none() && path_is_occupied(&entry.target)
+            {
+                return Err(MigrationError::Conflict(entry.target.clone()));
+            }
+        }
+        (
+            TransitionStrategy::Exchange | TransitionStrategy::DisplaceFile,
+            TransitionPhase::OldMoved,
+        ) => {
+            return Err(MigrationError::InvalidInput {
+                path: entry.target.clone(),
+                reason: "exchange transition cannot use old_moved phase".to_owned(),
+            });
+        }
+    }
+    Ok(PathTransition {
+        staging: transition.staging.clone(),
+        old: transition.old.clone(),
+        phase: transition.phase,
+        strategy: transition.strategy,
+        expected_displaced_sha256: transition.expected_displaced_sha256.clone(),
+        conflict_sha256: transition.conflict_sha256.clone(),
+    })
+}
+
+fn validate_recovery_removal(
+    entry: &RecoveryManifestEntry,
+    removal: &RecoveryRemovalTransition,
+) -> Result<RemovalTransition, MigrationError> {
+    let parent = entry
+        .target
+        .parent()
+        .ok_or_else(|| MigrationError::UnsafeTarget(entry.target.clone()))?;
+    if removal.trash.parent() != Some(parent) || entry.original_sha256.is_some() {
+        return Err(MigrationError::UnsafeTarget(entry.target.clone()));
+    }
+    reject_symlink_if_present(&removal.trash)?;
+    Ok(RemovalTransition {
+        trash: removal.trash.clone(),
+        phase: removal.phase,
+    })
+}
+
+fn rollback_path_transition(
+    entry: &BackupEntry,
+    transition: &PathTransition,
+) -> Result<(), MigrationError> {
+    if verify_restored_entry(entry).is_ok() {
+        return Ok(());
+    }
+    if let Some(old) = &transition.old
+        && path_is_occupied(old)
+    {
+        if transition.strategy == TransitionStrategy::Exchange
+            && path_is_occupied(&entry.target)
+        {
+            exchange_paths_atomically(old, &entry.target).map_err(|source| MigrationError::Io {
+                action: "exchange interrupted target with original",
+                path: entry.target.clone(),
+                source,
+            })?;
+            sync_parent_directory(&entry.target)?;
+            return verify_restored_entry(entry);
+        }
+        if transition.strategy == TransitionStrategy::DisplaceFile
+            && path_is_occupied(&entry.target)
+        {
+            claw_config::displace_file_atomically(old, &entry.target, &transition.staging)
+                .map_err(|source| MigrationError::Io {
+                    action: "restore displaced migration file",
+                    path: entry.target.clone(),
+                    source,
+                })?;
+            sync_parent_directory(&entry.target)?;
+            return verify_restored_entry(entry);
+        }
+        let discard = path_is_occupied(&entry.target)
+            .then(|| allocate_transition_path(&entry.target, "discard"))
+            .transpose()?;
+        if let Some(discard) = &discard {
+            fs::rename(&entry.target, discard).map_err(|source| MigrationError::Io {
+                action: "move interrupted target aside",
+                path: entry.target.clone(),
+                source,
+            })?;
+        }
+        fs::rename(old, &entry.target).map_err(|source| MigrationError::Io {
+            action: "restore old migration target name",
+            path: entry.target.clone(),
+            source,
+        })?;
+        sync_parent_directory(&entry.target)?;
+        if let Some(discard) = &discard {
+            remove_path_if_exists(discard)?;
+        }
+        return verify_restored_entry(entry);
+    }
+    if transition.strategy == TransitionStrategy::Rename
+        && transition.old.is_none()
+        && path_is_occupied(&entry.target)
+    {
+        fs::rename(&entry.target, &transition.staging).map_err(|source| MigrationError::Io {
+            action: "move created target to rollback staging",
+            path: entry.target.clone(),
+            source,
+        })?;
+        sync_parent_directory(&entry.target)?;
+        return verify_restored_entry(entry);
+    }
+    Err(MigrationError::BackupVerification(entry.target.clone()))
+}
+
+fn cleanup_path_transition(transition: &PathTransition) -> Result<(), MigrationError> {
+    if path_is_occupied(&transition.staging) {
+        remove_path_if_exists(&transition.staging)?;
+    }
+    if let Some(old) = &transition.old
+        && path_is_occupied(old)
+    {
+        remove_path_if_exists(old)?;
+    }
+    Ok(())
+}
+
+fn verify_restored_entry(entry: &BackupEntry) -> Result<(), MigrationError> {
+    match &entry.digest {
+        Some(expected)
+            if path_is_occupied(&entry.target) && digest_path(&entry.target)? == *expected =>
+        {
+            Ok(())
+        }
+        None if !path_is_occupied(&entry.target) => Ok(()),
+        _ => Err(MigrationError::BackupVerification(entry.target.clone())),
+    }
+}
+
+#[derive(Clone)]
 struct BackupEntry {
     target: PathBuf,
     backup: Option<PathBuf>,
     digest: Option<String>,
     pending: Option<String>,
     applied: Option<AppliedState>,
+    transition: Option<PathTransition>,
+    removal: Option<RemovalTransition>,
 }
 
 #[derive(Clone)]
@@ -553,11 +1033,55 @@ enum AppliedState {
     Unknown,
 }
 
+#[derive(Clone)]
+struct PathTransition {
+    staging: PathBuf,
+    old: Option<PathBuf>,
+    phase: TransitionPhase,
+    strategy: TransitionStrategy,
+    expected_displaced_sha256: Option<String>,
+    conflict_sha256: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum TransitionStrategy {
+    Exchange,
+    DisplaceFile,
+    Rename,
+}
+
+#[derive(Clone)]
+struct RemovalTransition {
+    trash: PathBuf,
+    phase: RemovalPhase,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum RemovalPhase {
+    Planned,
+    Moved,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum TransitionPhase {
+    Prepared,
+    OldMoved,
+    Published,
+    Cleaning,
+    ConflictRestoring,
+    ConflictRestored,
+    RollbackCleaning,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum RecoveryPhase {
     Prepared,
     Applying,
+    FilesystemCommitted,
     Committed,
     RolledBack,
 }
@@ -567,8 +1091,10 @@ struct RecoveryManifest {
     schema_version: u32,
     provider_id: String,
     target_root: PathBuf,
+    secret_transaction_id: String,
     phase: RecoveryPhase,
     entries: Vec<RecoveryManifestEntry>,
+    created_directories: Vec<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -578,6 +1104,24 @@ struct RecoveryManifestEntry {
     original_sha256: Option<String>,
     pending_sha256: Option<String>,
     applied: Option<RecoveryAppliedState>,
+    transition: Option<RecoveryPathTransition>,
+    removal: Option<RecoveryRemovalTransition>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RecoveryPathTransition {
+    staging: PathBuf,
+    old: Option<PathBuf>,
+    phase: TransitionPhase,
+    strategy: TransitionStrategy,
+    expected_displaced_sha256: Option<String>,
+    conflict_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RecoveryRemovalTransition {
+    trash: PathBuf,
+    phase: RemovalPhase,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -593,13 +1137,14 @@ struct MigrationLock {
 }
 
 impl MigrationLock {
-    fn acquire(root: &Path, target_root: &Path) -> Result<Self, MigrationError> {
+    fn acquire(target_root: &Path) -> Result<Self, MigrationError> {
+        let normalized_target = normalize_target_root(target_root)?;
+        let lock_path = migration_lock_path_for_normalized(&normalized_target);
+        let root = lock_path
+            .parent()
+            .expect("migration lock path always has a parent");
         create_dir_all(root)?;
         reject_symlink(root)?;
-        let lock_path = root.join(format!(
-            ".migration-{}.lock",
-            &digest_bytes(target_root.to_string_lossy().as_bytes())[..16]
-        ));
         let existed = path_is_occupied(&lock_path);
         reject_symlink_if_present(&lock_path)?;
         let file = OpenOptions::new()
@@ -625,9 +1170,122 @@ impl MigrationLock {
     }
 }
 
-struct SecretUndo {
-    id: String,
-    previous: Option<SecretValue>,
+fn migration_lock_path(target_root: &Path) -> Result<PathBuf, MigrationError> {
+    Ok(migration_lock_path_for_normalized(&normalize_target_root(
+        target_root,
+    )?))
+}
+
+fn normalize_target_root(target_root: &Path) -> Result<PathBuf, MigrationError> {
+    let name = target_root
+        .file_name()
+        .ok_or_else(|| MigrationError::UnsafeTarget(target_root.to_owned()))?;
+    let parent = target_root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let absolute_parent = if parent.is_absolute() {
+        parent.to_owned()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| MigrationError::Io {
+                action: "resolve current directory",
+                path: parent.to_owned(),
+                source,
+            })?
+            .join(parent)
+    };
+    create_dir_all(&absolute_parent)?;
+    let canonical_parent =
+        fs::canonicalize(&absolute_parent).map_err(|source| MigrationError::Io {
+            action: "canonicalize migration target parent",
+            path: absolute_parent,
+            source,
+        })?;
+    let normalized = canonical_parent.join(name);
+    reject_symlink_if_present(&normalized)?;
+    if path_is_occupied(&normalized) {
+        fs::canonicalize(&normalized).map_err(|source| MigrationError::Io {
+            action: "canonicalize migration target",
+            path: normalized,
+            source,
+        })
+    } else {
+        Ok(normalized)
+    }
+}
+
+fn normalize_plan_target_root(target_root: &Path) -> Result<PathBuf, MigrationError> {
+        let name = target_root
+            .file_name()
+            .ok_or_else(|| MigrationError::UnsafeTarget(target_root.to_owned()))?;
+        let parent = target_root
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let absolute_parent = if parent.is_absolute() {
+            parent.to_owned()
+        } else {
+            std::env::current_dir()
+                .map_err(|source| MigrationError::Io {
+                    action: "resolve current directory",
+                    path: parent.to_owned(),
+                    source,
+                })?
+                .join(parent)
+        };
+        let canonical_parent =
+            fs::canonicalize(&absolute_parent).map_err(|source| MigrationError::Io {
+                action: "canonicalize migration plan target parent",
+                path: absolute_parent,
+                source,
+            })?;
+        let normalized = canonical_parent.join(name);
+        reject_symlink_if_present(&normalized)?;
+        if path_is_occupied(&normalized) {
+            fs::canonicalize(&normalized).map_err(|source| MigrationError::Io {
+                action: "canonicalize migration plan target",
+                path: normalized,
+                source,
+            })
+        } else {
+            Ok(normalized)
+        }
+
+}
+
+fn normalize_directory_root(path: &Path) -> Result<PathBuf, MigrationError> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| MigrationError::Io {
+                action: "resolve current directory",
+                path: path.to_owned(),
+                source,
+            })?
+            .join(path)
+    };
+    create_dir_all(&absolute)?;
+    fs::canonicalize(&absolute).map_err(|source| MigrationError::Io {
+        action: "canonicalize migration directory",
+        path: absolute,
+        source,
+    })
+}
+
+fn migration_lock_path_for_normalized(target_root: &Path) -> PathBuf {
+    let parent = target_root
+        .parent()
+        .expect("normalized migration target always has a parent");
+    #[cfg(any(windows, target_os = "macos"))]
+    let identity = target_root.to_string_lossy().to_lowercase();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let identity = target_root.to_string_lossy();
+    parent.join(format!(
+        ".gta-claw.migration-{}.lock",
+        &digest_bytes(identity.as_bytes())[..16]
+    ))
 }
 
 pub(crate) enum MigrationOperation {
@@ -673,6 +1331,19 @@ pub(crate) enum MigrationOperation {
 
 impl MigrationOperation {
     pub(crate) fn target(&self) -> &Path {
+        match self {
+            Self::CopyPath { target, .. }
+            | Self::AppendFile { target, .. }
+            | Self::GeneratedCommandSkill { target, .. }
+            | Self::TransformJson { target, .. }
+            | Self::TransformText { target, .. }
+            | Self::ImportEnvironment { target, .. }
+            | Self::StoreDocument { target, .. }
+            | Self::WriteBytes { target, .. } => target,
+        }
+    }
+
+    fn target_mut(&mut self) -> &mut PathBuf {
         match self {
             Self::CopyPath { target, .. }
             | Self::AppendFile { target, .. }
@@ -886,6 +1557,16 @@ pub(crate) fn successful_plan(
     mut diagnostics: Vec<Diagnostic>,
     signer: &dyn ArtifactSigner,
 ) -> Result<MigrationPlan, MigrationError> {
+    let original_target_root = target_root;
+    let target_root = normalize_plan_target_root(&original_target_root)?;
+    for operation in &mut operations {
+        let relative = operation
+            .target()
+            .strip_prefix(&original_target_root)
+            .map_err(|_| MigrationError::UnsafeTarget(operation.target().to_owned()))?
+            .to_owned();
+        *operation.target_mut() = target_root.join(relative);
+    }
     for operation in &operations {
         ensure_target_within(&target_root, operation.target())?;
     }
@@ -944,6 +1625,7 @@ pub(crate) fn rejected_plan(
     code: &str,
     message: &str,
 ) -> Result<MigrationPlan, MigrationError> {
+    let target_root = normalize_plan_target_root(&target_root)?;
     let result = MigrationResult {
         contract_version: MIGRATION_CONTRACT_VERSION.to_owned(),
         input: MigrationInput {
@@ -1018,13 +1700,14 @@ fn apply_plan(
     if plan.result.status != MigrationStatus::Migrated || plan.operations.is_empty() {
         return Err(MigrationError::PlanNotApplicable);
     }
-    if plan.target_root != context.target_root {
+    let target_root = normalize_target_root(context.target_root)?;
+    if plan.target_root != target_root {
         return Err(MigrationError::UnsafeTarget(plan.target_root.clone()));
     }
     verify_source_digests(plan)?;
     for operation in &plan.operations {
-        ensure_target_within(context.target_root, operation.target())?;
-        ensure_no_symlink_ancestors(context.target_root, operation.target())?;
+        ensure_target_within(&target_root, operation.target())?;
+        ensure_no_symlink_ancestors(&target_root, operation.target())?;
         if path_is_occupied(operation.target())
             && !context.overwrite
             && !matches!(operation, MigrationOperation::AppendFile { .. })
@@ -1032,10 +1715,10 @@ fn apply_plan(
             return Err(MigrationError::Conflict(operation.target().to_path_buf()));
         }
     }
-    let _lock = MigrationLock::acquire(context.backup_root, context.target_root)?;
+    let _lock = MigrationLock::acquire(&target_root)?;
     verify_source_digests(plan)?;
     for operation in &plan.operations {
-        ensure_no_symlink_ancestors(context.target_root, operation.target())?;
+        ensure_no_symlink_ancestors(&target_root, operation.target())?;
         if path_is_occupied(operation.target())
             && !context.overwrite
             && !matches!(operation, MigrationOperation::AppendFile { .. })
@@ -1043,22 +1726,38 @@ fn apply_plan(
             return Err(MigrationError::Conflict(operation.target().to_owned()));
         }
     }
-    let backup_dir = create_backup_dir(context.backup_root, plan.provider_id)?;
+    let backup_root = normalize_directory_root(context.backup_root)?;
+    let backup_dir = create_backup_dir(&backup_root, plan.provider_id)?;
     let backups = backup_targets(&backup_dir, &plan.operations)?;
     verify_targets_unchanged(&backups)?;
+    let created_directories =
+        collect_missing_target_directories(&plan.operations, &target_root)?;
+    let secret_transaction_id = new_secret_transaction_id(plan.provider_id, &target_root)?;
     let mut receipt = ApplyReceipt {
-        provider_id: plan.provider_id,
+        provider_id: plan.provider_id.to_owned(),
         backup_dir,
-        target_root: context.target_root.to_path_buf(),
+        target_root,
+        secret_transaction_id,
         backups,
-        secrets: Vec::new(),
+        created_directories,
     };
     write_backup_manifest(&receipt, RecoveryPhase::Prepared)?;
-    let apply_result = apply_operations(context, &plan.operations, &mut receipt)
+    let apply_result = context
+        .secret_store
+        .begin_transaction(&receipt.secret_transaction_id)
+        .map_err(MigrationError::from)
+        .and_then(|()| apply_operations(context, &plan.operations, &mut receipt))
         .and_then(|()| verify_source_digests(plan))
+        .and_then(|()| write_backup_manifest(&receipt, RecoveryPhase::FilesystemCommitted))
+        .and_then(|()| {
+            context
+                .secret_store
+                .commit_transaction(&receipt.secret_transaction_id)
+                .map_err(MigrationError::from)
+        })
         .and_then(|()| write_backup_manifest(&receipt, RecoveryPhase::Committed));
     if let Err(error) = apply_result {
-        let rollback_errors = rollback_receipt(context, &receipt)
+        let rollback_errors = rollback_receipt_locked(context, &mut receipt)
             .err()
             .map_or_else(Vec::new, rollback_failure_messages);
         return Err(MigrationError::ApplyFailed {
@@ -1067,6 +1766,42 @@ fn apply_plan(
         });
     }
     Ok(receipt)
+}
+
+fn new_secret_transaction_id(
+    provider_id: &str,
+    target_root: &Path,
+) -> Result<String, MigrationError> {
+    let mut nonce = [0_u8; 16];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| MigrationError::Signing(format!("generate transaction UUID: {error}")))?;
+    nonce[6] = (nonce[6] & 0x0f) | 0x40;
+    nonce[8] = (nonce[8] & 0x3f) | 0x80;
+    let normalized = normalize_target_root(target_root)?;
+    let target_identity = digest_bytes(&raw_os_path_bytes(&normalized));
+    Ok(format_secret_transaction_id(
+        provider_id,
+        &target_identity[..16],
+        std::process::id(),
+        &nonce,
+    ))
+}
+
+fn format_secret_transaction_id(
+    provider_id: &str,
+    target_identity: &str,
+    process_id: u32,
+    nonce: &[u8; 16],
+) -> String {
+    let uuid = encode_hex(nonce);
+    format!(
+        "{provider_id}-{target_identity}-p{process_id}-{}-{}-{}-{}-{}",
+        &uuid[0..8],
+        &uuid[8..12],
+        &uuid[12..16],
+        &uuid[16..20],
+        &uuid[20..32]
+    )
 }
 
 fn verify_source_digests(plan: &MigrationPlan) -> Result<(), MigrationError> {
@@ -1097,7 +1832,6 @@ enum PreparedOperation<'a> {
     Copy {
         source: &'a Path,
         target: &'a Path,
-        sha256: String,
     },
     Bytes {
         target: &'a Path,
@@ -1118,42 +1852,87 @@ impl PreparedOperation<'_> {
         }
     }
 
-    fn sha256(&self) -> String {
+    fn stage(self) -> Result<StagedOperation<'_>, MigrationError> {
         match self {
-            Self::Copy { sha256, .. } => sha256.clone(),
-            Self::Bytes { bytes, .. } => digest_bytes(bytes),
-            Self::GeneratedSkill { bytes, .. } => {
-                let mut hasher = Sha256::new();
-                hasher.update(b"SKILL.md");
-                hasher.update([0]);
-                hasher.update(bytes);
-                hasher.update([0xff]);
-                encode_hex(&hasher.finalize())
+            Self::Copy { source, target, .. } => {
+                reject_symlink(source)?;
+                create_parent(target)?;
+                let staging = if source.is_dir() {
+                    let staging = create_staging_directory(target)?;
+                    copy_directory_contents(source, &staging)?;
+                    set_path_permissions_from(source, &staging)?;
+                    sync_directory(&staging)?;
+                    staging
+                } else if source.is_file() {
+                    let staging = create_staging_file(target)?;
+                    populate_staging_file_from_source(source, &staging)?;
+                    staging
+                } else {
+                    return Err(MigrationError::SourceNotFound {
+                        provider: "migration",
+                        path: source.to_owned(),
+                    });
+                };
+                let digest = digest_path(&staging)?;
+                Ok(StagedOperation {
+                    target,
+                    staging,
+                    digest,
+                })
+            }
+            Self::Bytes { target, bytes } => {
+                create_parent(target)?;
+                let staging = create_staging_file(target)?;
+                populate_staging_file(&staging, &bytes, 0o600)?;
+                let digest = digest_path(&staging)?;
+                Ok(StagedOperation {
+                    target,
+                    staging,
+                    digest,
+                })
+            }
+            Self::GeneratedSkill { target, bytes } => {
+                create_parent(target)?;
+                let staging = create_staging_directory(target)?;
+                write_new_file_durably(&staging.join("SKILL.md"), &bytes, 0o600)?;
+                sync_directory(&staging)?;
+                let digest = digest_path(&staging)?;
+                Ok(StagedOperation {
+                    target,
+                    staging,
+                    digest,
+                })
             }
         }
     }
+}
 
-    fn publish(self) -> Result<(), MigrationError> {
-        match self {
-            Self::Copy { source, target, .. } => copy_path(source, target),
-            Self::Bytes { target, bytes } => write_bytes(target, &bytes),
-            Self::GeneratedSkill { target, bytes } => {
-                publish_single_file_directory(target, "SKILL.md", &bytes)
-            }
-        }
+struct StagedOperation<'a> {
+    target: &'a Path,
+    staging: PathBuf,
+    digest: String,
+}
+
+impl StagedOperation<'_> {
+    fn publish(self, receipt: &mut ApplyReceipt) -> Result<(), MigrationError> {
+        publish_staged_path_transactionally(
+            &self.staging,
+            self.target,
+            receipt,
+            None,
+        )
     }
 }
 
 fn prepare_operation<'a>(
     operation: &'a MigrationOperation,
     store: &mut dyn SecretStore,
-    undo: &mut Vec<SecretUndo>,
+    transaction_id: &str,
 ) -> Result<PreparedOperation<'a>, MigrationError> {
     match operation {
         MigrationOperation::CopyPath { source, target } => Ok(PreparedOperation::Copy {
             source,
             target,
-            sha256: digest_path(source)?,
         }),
         MigrationOperation::AppendFile {
             source,
@@ -1177,7 +1956,7 @@ fn prepare_operation<'a>(
             namespace,
         } => Ok(PreparedOperation::Bytes {
             target,
-            bytes: transform_json_bytes(source, namespace, store, undo)?,
+            bytes: transform_json_bytes(source, namespace, store, transaction_id)?,
         }),
         MigrationOperation::TransformText {
             source,
@@ -1185,7 +1964,7 @@ fn prepare_operation<'a>(
             namespace,
         } => Ok(PreparedOperation::Bytes {
             target,
-            bytes: transform_text_bytes(source, namespace, store, undo)?,
+            bytes: transform_text_bytes(source, namespace, store, transaction_id)?,
         }),
         MigrationOperation::ImportEnvironment {
             source,
@@ -1193,7 +1972,7 @@ fn prepare_operation<'a>(
             namespace,
         } => Ok(PreparedOperation::Bytes {
             target,
-            bytes: import_environment_bytes(source, namespace, store, undo)?,
+            bytes: import_environment_bytes(source, namespace, store, transaction_id)?,
         }),
         MigrationOperation::StoreDocument {
             source,
@@ -1201,7 +1980,7 @@ fn prepare_operation<'a>(
             secret_id,
         } => Ok(PreparedOperation::Bytes {
             target,
-            bytes: stored_document_bytes(source, secret_id, store, undo)?,
+            bytes: stored_document_bytes(source, secret_id, store, transaction_id)?,
         }),
         MigrationOperation::WriteBytes { target, bytes } => Ok(PreparedOperation::Bytes {
             target,
@@ -1216,54 +1995,104 @@ fn apply_operations(
     receipt: &mut ApplyReceipt,
 ) -> Result<(), MigrationError> {
     for operation in operations {
-        let prepared = prepare_operation(operation, context.secret_store, &mut receipt.secrets)?;
-        verify_operation_target(receipt, prepared.target())?;
-        let sha256 = prepared.sha256();
-        record_pending_state(receipt, prepared.target(), &sha256);
+        let _ = verify_operation_target(receipt, operation.target())?;
+        preflight_operation_publication(operation)?;
+        let prepared = prepare_operation(
+            operation,
+            context.secret_store,
+            &receipt.secret_transaction_id,
+        )?;
+        let staged = prepared.stage()?;
+        record_pending_state(receipt, staged.target, &staged.digest);
         write_backup_manifest(receipt, RecoveryPhase::Applying)?;
-        let target = prepared.target().to_path_buf();
-        let result = prepared.publish();
-        record_applied_state(receipt, &target);
-        let recorded = write_backup_manifest(receipt, RecoveryPhase::Applying);
-        result?;
-        recorded?;
+        let target = staged.target.to_path_buf();
+        staged.publish(receipt)?;
+        record_applied_state(receipt, &target)?;
+        write_backup_manifest(receipt, RecoveryPhase::Applying)?;
     }
     Ok(())
 }
 
-fn verify_operation_target(receipt: &ApplyReceipt, target: &Path) -> Result<(), MigrationError> {
+fn preflight_operation_publication(
+    operation: &MigrationOperation,
+) -> Result<(), MigrationError> {
+    preflight_operation_publication_with_exchange(operation, atomic_exchange_supported())
+}
+
+fn preflight_operation_publication_with_exchange(
+    operation: &MigrationOperation,
+    exchange_supported: bool,
+) -> Result<(), MigrationError> {
+    let target = operation.target();
+    if !path_is_occupied(target) || exchange_supported {
+        return Ok(());
+    }
+    let target_metadata = fs::symlink_metadata(target).map_err(|source| MigrationError::Io {
+        action: "inspect publication target",
+        path: target.to_owned(),
+        source,
+    })?;
+    let result_is_directory = match operation {
+        MigrationOperation::CopyPath { source, .. } => {
+            let metadata =
+                fs::symlink_metadata(source).map_err(|source_error| MigrationError::Io {
+                    action: "inspect publication source",
+                    path: source.to_owned(),
+                    source: source_error,
+                })?;
+            metadata.is_dir()
+        }
+        MigrationOperation::GeneratedCommandSkill { .. } => true,
+        MigrationOperation::AppendFile { .. }
+        | MigrationOperation::TransformJson { .. }
+        | MigrationOperation::TransformText { .. }
+        | MigrationOperation::ImportEnvironment { .. }
+        | MigrationOperation::StoreDocument { .. }
+        | MigrationOperation::WriteBytes { .. } => false,
+    };
+    if result_is_directory || target_metadata.is_dir() {
+        return Err(MigrationError::InvalidInput {
+            path: target.to_owned(),
+            reason: "cross-type or directory overwrite requires native atomic exchange".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn verify_operation_target(
+    receipt: &ApplyReceipt,
+    target: &Path,
+) -> Result<Option<String>, MigrationError> {
+    let mut observed = None;
     for backup in receipt
         .backups
         .iter()
         .filter(|entry| entry.target == target)
     {
-        match &backup.applied {
-            Some(AppliedState::Absent) if path_is_occupied(target) => {
-                return Err(MigrationError::Conflict(target.to_owned()));
-            }
-            Some(AppliedState::Absent) => {}
-            Some(AppliedState::Digest(expected)) => {
-                if !path_is_occupied(target) || digest_path(target)? != *expected {
-                    return Err(MigrationError::Conflict(target.to_owned()));
-                }
-            }
-            Some(AppliedState::Unknown) => {
-                return Err(MigrationError::Conflict(target.to_owned()));
-            }
-            None => match &backup.digest {
-                Some(expected)
-                    if !path_is_occupied(target) || digest_path(target)? != *expected =>
-                {
-                    return Err(MigrationError::Conflict(target.to_owned()));
-                }
-                None if path_is_occupied(target) => {
-                    return Err(MigrationError::Conflict(target.to_owned()));
-                }
-                _ => {}
-            },
+        let current = if path_is_occupied(target) {
+            Some(digest_path(target)?)
+        } else {
+            None
+        };
+        let original = match &backup.digest {
+            Some(digest) => current.as_ref() == Some(digest),
+            None => current.is_none(),
+        };
+        let pending = backup
+            .pending
+            .as_ref()
+            .is_some_and(|digest| current.as_ref() == Some(digest));
+        let applied = match &backup.applied {
+            Some(AppliedState::Digest(digest)) => current.as_ref() == Some(digest),
+            Some(AppliedState::Absent) => current.is_none(),
+            Some(AppliedState::Unknown) | None => false,
+        };
+        if !original && !pending && !applied {
+            return Err(MigrationError::Conflict(target.to_owned()));
         }
+        observed = current;
     }
-    Ok(())
+    Ok(observed)
 }
 
 fn record_pending_state(receipt: &mut ApplyReceipt, target: &Path, sha256: &str) {
@@ -1276,56 +2105,128 @@ fn record_pending_state(receipt: &mut ApplyReceipt, target: &Path, sha256: &str)
     }
 }
 
-fn record_applied_state(receipt: &mut ApplyReceipt, target: &Path) {
-    for backup in receipt.backups.iter_mut().filter(|entry| {
-        entry.target == target
-            || entry.target.starts_with(target)
-            || target.starts_with(&entry.target)
-    }) {
-        backup.applied = Some(if path_is_occupied(&backup.target) {
-            digest_path(&backup.target).map_or(AppliedState::Unknown, AppliedState::Digest)
-        } else {
-            AppliedState::Absent
-        });
+fn record_applied_state(
+    receipt: &mut ApplyReceipt,
+    target: &Path,
+) -> Result<(), MigrationError> {
+    for backup in receipt
+        .backups
+        .iter_mut()
+        .filter(|entry| entry.target == target)
+    {
+        let expected = backup
+            .pending
+            .as_ref()
+            .ok_or_else(|| MigrationError::Conflict(backup.target.clone()))?;
+        if !path_is_occupied(&backup.target) || digest_path(&backup.target)? != *expected {
+            return Err(MigrationError::Conflict(backup.target.clone()));
+        }
+        backup.applied = Some(AppliedState::Digest(expected.clone()));
         backup.pending = None;
     }
+    Ok(())
 }
 
 fn rollback_receipt(
     context: &mut ApplyContext<'_>,
     receipt: &ApplyReceipt,
+    target_root: &Path,
 ) -> Result<(), MigrationError> {
+    let _lock = MigrationLock::acquire(target_root)?;
+    let mut receipt = receipt.clone();
+    rollback_receipt_locked(context, &mut receipt)
+}
+
+fn rollback_receipt_locked(
+    context: &mut ApplyContext<'_>,
+    receipt: &mut ApplyReceipt,
+) -> Result<(), MigrationError> {
+    let preserved_conflict = finalize_preserved_transition_conflicts(receipt)?;
     verify_rollback_state(receipt)?;
     write_backup_manifest(receipt, RecoveryPhase::Applying)?;
     let mut errors = Vec::new();
-    for undo in receipt.secrets.iter().rev() {
-        let result = if let Some(previous) = &undo.previous {
-            context
-                .secret_store
-                .put(&undo.id, previous.clone())
-                .map(|_| ())
-        } else {
-            context.secret_store.remove(&undo.id)
-        };
-        if let Err(error) = result {
-            errors.push(format!("secret {}: {error}", undo.id));
-        }
+    if let Err(error) = context
+        .secret_store
+        .rollback_transaction(&receipt.secret_transaction_id)
+    {
+        errors.push(format!(
+            "secret transaction {}: {error}",
+            receipt.secret_transaction_id
+        ));
     }
-    for backup in receipt.backups.iter().rev() {
-        if backup.applied.is_none() {
+    for index in (0..receipt.backups.len()).rev() {
+        let entry = &receipt.backups[index];
+        if entry.applied.is_none()
+            && entry.pending.is_none()
+            && entry.transition.is_none()
+            && entry.removal.is_none()
+        {
             continue;
         }
-        let result = restore_backup(backup);
+        let target = entry.target.clone();
+        let backup = entry.backup.clone();
+        let digest = entry.digest.clone();
+        let transition = entry.transition.clone();
+        let snapshot = entry.clone();
+        let transition_can_restore = transition.as_ref().is_some_and(|transition| {
+            verify_restored_entry(&snapshot).is_ok()
+                || transition.phase != TransitionPhase::Cleaning
+                    && transition
+                    .old
+                    .as_ref()
+                    .is_some_and(|old| path_is_occupied(old))
+        });
+        let result = if transition_can_restore {
+            let transition = transition.expect("transition was checked as present");
+            rollback_path_transition(&snapshot, &transition).and_then(|()| {
+                receipt.backups[index]
+                    .transition
+                    .as_mut()
+                    .expect("transition remains present through rollback cleanup")
+                    .phase = TransitionPhase::RollbackCleaning;
+                write_backup_manifest(receipt, RecoveryPhase::Applying)?;
+                cleanup_path_transition(&transition)?;
+                receipt.backups[index].pending = None;
+                receipt.backups[index].applied = Some(match digest.clone() {
+                    Some(digest) => AppliedState::Digest(digest),
+                    None => AppliedState::Absent,
+                });
+                receipt.backups[index].transition = None;
+                write_backup_manifest(receipt, RecoveryPhase::Applying)
+            })
+        } else if let Some(backup) = backup {
+            if let Some(transition) = &transition {
+                if let Err(error) = cleanup_path_transition(transition) {
+                    errors.push(error.to_string());
+                    continue;
+                }
+            }
+            receipt.backups[index].transition = None;
+            write_backup_manifest(receipt, RecoveryPhase::Applying)
+                .and_then(|()| {
+                    copy_path_for_apply(
+                        &backup,
+                        &target,
+                        receipt,
+                        digest.as_deref(),
+                    )
+                })
+                .and_then(|()| record_applied_state(receipt, &target))
+                .and_then(|()| write_backup_manifest(receipt, RecoveryPhase::Applying))
+        } else {
+            remove_created_target_transactionally(receipt, index)
+        };
         if let Err(error) = result {
             errors.push(error.to_string());
         }
 
-        if backup.backup.is_none() {
-            cleanup_empty_parents(&backup.target, context.target_root);
-        }
+    }
+    if let Err(error) = remove_created_directories_if_empty(receipt) {
+        errors.push(error.to_string());
     }
     if errors.is_empty() {
-        write_backup_manifest(receipt, RecoveryPhase::RolledBack)
+        write_backup_manifest(receipt, RecoveryPhase::RolledBack)?;
+        preserved_conflict.map_or(Ok(()), |path| Err(MigrationError::Conflict(path)))
     } else {
         Err(MigrationError::RollbackFailed { errors })
     }
@@ -1340,22 +2241,72 @@ fn rollback_failure_messages(error: MigrationError) -> Vec<String> {
 
 fn verify_rollback_state(receipt: &ApplyReceipt) -> Result<(), MigrationError> {
     for backup in &receipt.backups {
-        let Some(applied) = &backup.applied else {
+        if backup.applied.is_none() && backup.pending.is_none() && backup.removal.is_none() {
             continue;
+        }
+        let current = if path_is_occupied(&backup.target) {
+            Some(digest_path(&backup.target)?)
+        } else {
+            None
         };
-        match applied {
-            AppliedState::Absent if path_is_occupied(&backup.target) => {
-                return Err(MigrationError::Conflict(backup.target.clone()));
-            }
-            AppliedState::Absent => {}
-            AppliedState::Digest(expected) => {
-                if !path_is_occupied(&backup.target) || digest_path(&backup.target)? != *expected {
-                    return Err(MigrationError::Conflict(backup.target.clone()));
+        let original = match &backup.digest {
+            Some(digest) => current.as_ref() == Some(digest),
+            None => current.is_none(),
+        };
+        let pending = backup
+            .pending
+            .as_ref()
+            .is_some_and(|digest| current.as_ref() == Some(digest));
+        let applied = match &backup.applied {
+            Some(AppliedState::Digest(digest)) => current.as_ref() == Some(digest),
+            Some(AppliedState::Absent) => current.is_none(),
+            Some(AppliedState::Unknown) | None => false,
+        };
+        if let Some(removal) = &backup.removal {
+            let trash_exists = path_is_occupied(&removal.trash);
+            let removal_owned = match removal.phase {
+                RemovalPhase::Planned => {
+                    original || pending || applied || current.is_none() && trash_exists
                 }
-            }
-            AppliedState::Unknown => {
+                RemovalPhase::Moved => current.is_none(),
+            };
+            if !removal_owned {
                 return Err(MigrationError::Conflict(backup.target.clone()));
             }
+            continue;
+        }
+        let transitioning = backup.transition.as_ref().is_some_and(|transition| {
+            transition.old.as_ref().is_some_and(|old| {
+                path_is_occupied(old)
+                    && backup
+                        .digest
+                        .as_ref()
+                        .is_some_and(|expected| digest_path(old).ok().as_ref() == Some(expected))
+            }) || backup.digest.is_none()
+        });
+        if !original && !pending && !applied && !transitioning {
+            return Err(MigrationError::Conflict(backup.target.clone()));
+        }
+        if let (Some(path), Some(expected)) = (&backup.backup, &backup.digest)
+            && digest_path(path)? != *expected
+        {
+            return Err(MigrationError::BackupVerification(path.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn verify_committed_state(receipt: &ApplyReceipt) -> Result<(), MigrationError> {
+    for backup in &receipt.backups {
+        if backup.transition.is_some() || backup.removal.is_some() || backup.pending.is_some() {
+            return Err(MigrationError::Conflict(backup.target.clone()));
+        }
+        match &backup.applied {
+            Some(AppliedState::Absent) if !path_is_occupied(&backup.target) => {}
+            Some(AppliedState::Digest(expected))
+                if path_is_occupied(&backup.target)
+                    && digest_path(&backup.target)? == *expected => {}
+            _ => return Err(MigrationError::Conflict(backup.target.clone())),
         }
         if let (Some(path), Some(expected)) = (&backup.backup, &backup.digest)
             && digest_path(path)? != *expected
@@ -1394,7 +2345,6 @@ fn backup_targets(
         if !seen.insert(target.to_path_buf()) {
             continue;
         }
-
         if path_is_occupied(target) {
             reject_symlink(target)?;
             let backup = backup_dir.join("items").join(entries.len().to_string());
@@ -1410,6 +2360,8 @@ fn backup_targets(
                 digest: Some(backup_digest),
                 pending: None,
                 applied: None,
+                transition: None,
+                removal: None,
             });
         } else {
             entries.push(BackupEntry {
@@ -1418,10 +2370,73 @@ fn backup_targets(
                 digest: None,
                 pending: None,
                 applied: None,
+                transition: None,
+                removal: None,
             });
         }
     }
     Ok(entries)
+}
+
+fn collect_missing_target_directories(
+    operations: &[MigrationOperation],
+    target_root: &Path,
+) -> Result<Vec<PathBuf>, MigrationError> {
+    let mut missing = BTreeSet::new();
+    for operation in operations {
+        let mut current = operation.target().parent();
+        while let Some(directory) = current {
+            if !directory.starts_with(target_root) {
+                break;
+            }
+            reject_symlink_if_present(directory)?;
+            if !path_is_occupied(directory) {
+                missing.insert(directory.to_owned());
+            }
+            if directory == target_root {
+                break;
+            }
+            current = directory.parent();
+        }
+    }
+    let mut directories = missing.into_iter().collect::<Vec<_>>();
+    directories.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
+    Ok(directories)
+}
+
+fn remove_created_directories_if_empty(
+    receipt: &ApplyReceipt,
+) -> Result<(), MigrationError> {
+    for directory in &receipt.created_directories {
+        let metadata = match fs::symlink_metadata(directory) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(MigrationError::Io {
+                    action: "inspect created migration directory",
+                    path: directory.clone(),
+                    source,
+                });
+            }
+        };
+        if is_link_or_reparse(&metadata) || !metadata.is_dir() {
+            return Err(MigrationError::Conflict(directory.clone()));
+        }
+        let mut entries = fs::read_dir(directory).map_err(|source| MigrationError::Io {
+            action: "read created migration directory",
+            path: directory.clone(),
+            source,
+        })?;
+        if entries.next().is_none() {
+            fs::remove_dir(directory).map_err(|source| MigrationError::Io {
+                action: "remove empty created migration directory",
+                path: directory.clone(),
+                source,
+            })?;
+            sync_parent_directory(directory)?;
+        }
+    }
+    Ok(())
 }
 
 fn verify_targets_unchanged(backups: &[BackupEntry]) -> Result<(), MigrationError> {
@@ -1458,14 +2473,28 @@ fn write_backup_manifest(
                 AppliedState::Digest(digest) => RecoveryAppliedState::Digest(digest.clone()),
                 AppliedState::Unknown => RecoveryAppliedState::Unknown,
             }),
+            transition: entry.transition.as_ref().map(|transition| RecoveryPathTransition {
+                staging: transition.staging.clone(),
+                old: transition.old.clone(),
+                phase: transition.phase,
+                strategy: transition.strategy,
+                expected_displaced_sha256: transition.expected_displaced_sha256.clone(),
+                conflict_sha256: transition.conflict_sha256.clone(),
+            }),
+            removal: entry.removal.as_ref().map(|removal| RecoveryRemovalTransition {
+                trash: removal.trash.clone(),
+                phase: removal.phase,
+            }),
         })
         .collect::<Vec<_>>();
     let manifest = RecoveryManifest {
         schema_version: RECOVERY_SCHEMA_VERSION,
         provider_id: receipt.provider_id.to_owned(),
         target_root: receipt.target_root.clone(),
+        secret_transaction_id: receipt.secret_transaction_id.clone(),
         phase,
         entries,
+        created_directories: receipt.created_directories.clone(),
     };
     write_recovery_manifest(&receipt.backup_dir.join("manifest.json"), &manifest)
 }
@@ -1475,36 +2504,6 @@ fn write_recovery_manifest(path: &Path, manifest: &RecoveryManifest) -> Result<(
         MigrationError::Signing(format!("backup manifest serialization: {error}"))
     })?;
     write_bytes(path, &bytes)
-}
-
-fn restore_backup(entry: &BackupEntry) -> Result<(), MigrationError> {
-    if let Some(backup) = &entry.backup {
-        let expected = entry.digest.as_deref().unwrap_or_default();
-        if digest_path(backup)? != expected {
-            return Err(MigrationError::BackupVerification(backup.clone()));
-        }
-        create_parent(&entry.target)?;
-        copy_path(backup, &entry.target)?;
-        if digest_path(&entry.target)? != expected {
-            return Err(MigrationError::BackupVerification(entry.target.clone()));
-        }
-    } else {
-        remove_path_if_exists(&entry.target)?;
-    }
-    Ok(())
-}
-
-fn cleanup_empty_parents(target: &Path, root: &Path) {
-    let mut current = target.parent();
-    while let Some(directory) = current {
-        if directory == root || !directory.starts_with(root) {
-            break;
-        }
-        match fs::remove_dir(directory) {
-            Ok(()) => current = directory.parent(),
-            Err(_) => break,
-        }
-    }
 }
 
 /// Reports whether anything at all occupies `path`.
@@ -1564,7 +2563,7 @@ fn transform_json_bytes(
     source: &Path,
     namespace: &str,
     store: &mut dyn SecretStore,
-    undo: &mut Vec<SecretUndo>,
+    transaction_id: &str,
 ) -> Result<Vec<u8>, MigrationError> {
     let text = read_text(source)?;
     let mut value: Value =
@@ -1572,7 +2571,7 @@ fn transform_json_bytes(
             path: source.to_path_buf(),
             reason: "JSON configuration is malformed".to_owned(),
         })?;
-    redact_json_value(&mut value, namespace, "", false, store, undo)?;
+    redact_json_value(&mut value, namespace, "", false, store, transaction_id)?;
     serde_json::to_vec_pretty(&value).map_err(|_| MigrationError::InvalidInput {
         path: source.to_path_buf(),
         reason: "JSON configuration could not be serialized".to_owned(),
@@ -1585,19 +2584,22 @@ fn redact_json_value(
     pointer: &str,
     secret_container: bool,
     store: &mut dyn SecretStore,
-    undo: &mut Vec<SecretUndo>,
+    transaction_id: &str,
 ) -> Result<(), MigrationError> {
     match value {
         Value::Object(object) => {
             for (key, child) in object {
+                if key.eq_ignore_ascii_case("env_http_headers") {
+                    continue;
+                }
                 let next_pointer = format!("{pointer}/{key}");
-                let child_container =
-                    matches!(key.to_ascii_lowercase().as_str(), "env" | "headers");
+                let child_container = secret_container_key(key);
                 if let Value::String(secret) = child
                     && (secret_container || secret_key(key))
                 {
                     let id = secret_identifier(namespace, &next_pointer);
-                    let reference = route_secret(store, undo, &id, secret.as_bytes())?;
+                    let reference =
+                        route_secret(store, transaction_id, &id, secret.as_bytes())?;
                     *child = Value::String(reference);
                 } else {
                     redact_json_value(
@@ -1606,7 +2608,7 @@ fn redact_json_value(
                         &next_pointer,
                         secret_container || child_container,
                         store,
-                        undo,
+                        transaction_id,
                     )?;
                 }
             }
@@ -1619,13 +2621,13 @@ fn redact_json_value(
                     &format!("{pointer}/{index}"),
                     secret_container,
                     store,
-                    undo,
+                    transaction_id,
                 )?;
             }
         }
         Value::String(secret) if secret_container => {
             let id = secret_identifier(namespace, pointer);
-            let reference = route_secret(store, undo, &id, secret.as_bytes())?;
+            let reference = route_secret(store, transaction_id, &id, secret.as_bytes())?;
             *value = Value::String(reference);
         }
         _ => {}
@@ -1637,7 +2639,7 @@ fn transform_text_bytes(
     source: &Path,
     namespace: &str,
     store: &mut dyn SecretStore,
-    undo: &mut Vec<SecretUndo>,
+    transaction_id: &str,
 ) -> Result<Vec<u8>, MigrationError> {
     let input = read_text(source)?;
     let mut output = String::new();
@@ -1680,7 +2682,7 @@ fn transform_text_bytes(
                     (source, index, normalized_key),
                     namespace,
                     store,
-                    undo,
+                    transaction_id,
                 )?
             } else if secret_key(normalized_key)
                 || secret_container_key(normalized_key)
@@ -1692,7 +2694,8 @@ fn transform_text_bytes(
                     line.to_owned()
                 } else {
                     let id = secret_identifier(namespace, &format!("/{index}/{normalized_key}"));
-                    let reference = route_secret(store, undo, &id, value.as_bytes())?;
+                    let reference =
+                        route_secret(store, transaction_id, &id, value.as_bytes())?;
                     format!("{key}{separator} \"{reference}\"")
                 }
             } else {
@@ -1713,7 +2716,7 @@ fn transform_toml_inline_secret_table(
     location: (&Path, usize, &str),
     namespace: &str,
     store: &mut dyn SecretStore,
-    undo: &mut Vec<SecretUndo>,
+    transaction_id: &str,
 ) -> Result<String, MigrationError> {
     let (source, line_index, container_key) = location;
     let open = raw
@@ -1752,7 +2755,7 @@ fn transform_toml_inline_secret_table(
             namespace,
             &format!("/{line_index}/{container_key}/{entry_key}"),
         );
-        let reference = route_secret(store, undo, &id, plaintext.as_bytes())?;
+        let reference = route_secret(store, transaction_id, &id, plaintext.as_bytes())?;
         replacements.push((value_range, format!("\"{reference}\"")));
     }
 
@@ -1771,7 +2774,7 @@ fn invalid_inline_table(source: &Path, line_index: usize) -> MigrationError {
     MigrationError::InvalidInput {
         path: source.to_owned(),
         reason: format!(
-            "inline env/headers table on line {} is not safely transformable",
+            "inline env/http_headers table on line {} is not safely transformable",
             line_index + 1
         ),
     }
@@ -1857,7 +2860,7 @@ fn import_environment_bytes(
     source: &Path,
     namespace: &str,
     store: &mut dyn SecretStore,
-    undo: &mut Vec<SecretUndo>,
+    transaction_id: &str,
 ) -> Result<Vec<u8>, MigrationError> {
     let input = read_text(source)?;
     let mut references = BTreeMap::new();
@@ -1882,7 +2885,7 @@ fn import_environment_bytes(
         let value = unquote(value.trim());
         if !value.is_empty() {
             let id = secret_identifier(namespace, &format!("/{key}"));
-            let reference = route_secret(store, undo, &id, value.as_bytes())?;
+            let reference = route_secret(store, transaction_id, &id, value.as_bytes())?;
             references.insert(key.to_owned(), reference);
         }
     }
@@ -1895,10 +2898,10 @@ fn stored_document_bytes(
     source: &Path,
     secret_id: &str,
     store: &mut dyn SecretStore,
-    undo: &mut Vec<SecretUndo>,
+    transaction_id: &str,
 ) -> Result<Vec<u8>, MigrationError> {
     let content = read_bytes(source)?;
-    let reference = route_secret(store, undo, secret_id, &content)?;
+    let reference = route_secret(store, transaction_id, secret_id, &content)?;
     let mut object = Map::new();
     object.insert("secret_ref".to_owned(), Value::String(reference));
     serde_json::to_vec_pretty(&Value::Object(object))
@@ -1907,18 +2910,11 @@ fn stored_document_bytes(
 
 fn route_secret(
     store: &mut dyn SecretStore,
-    undo: &mut Vec<SecretUndo>,
+    transaction_id: &str,
     id: &str,
     value: &[u8],
 ) -> Result<String, MigrationError> {
-    if !undo.iter().any(|entry| entry.id == id) {
-        let previous = store.get(id)?;
-        undo.push(SecretUndo {
-            id: id.to_owned(),
-            previous,
-        });
-    }
-    let reference = store.put(id, SecretValue::new(value))?;
+    let reference = store.stage(transaction_id, id, SecretValue::new(value))?;
     if !valid_secret_reference(&reference) {
         return Err(MigrationError::SecretStore(SecretStoreError::new(
             "secret store returned an invalid reference",
@@ -1954,7 +2950,10 @@ fn secret_key(key: &str) -> bool {
 }
 
 fn secret_container_key(key: &str) -> bool {
-    matches!(key.to_ascii_lowercase().as_str(), "env" | "headers")
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "env" | "headers" | "http_headers"
+    )
 }
 
 fn split_assignment(line: &str) -> Option<(&str, char, &str)> {
@@ -2028,28 +3027,44 @@ fn reject_executable_file(path: &Path) -> Result<(), MigrationError> {
 pub(crate) fn digest_path(path: &Path) -> Result<String, MigrationError> {
     reject_symlink(path)?;
     if path.is_file() {
-        let mut hasher = Sha256::new();
-        update_digest_from_file(path, &mut hasher)?;
-        return Ok(encode_hex(&hasher.finalize()));
+        let content_digest = digest_file_content(path)?;
+        return Ok(encode_hex(&domain_file_digest(&content_digest)));
     }
+
     if !path.is_dir() {
         return Err(MigrationError::SourceNotFound {
             provider: "migration",
             path: path.to_path_buf(),
         });
     }
-    let mut hasher = Sha256::new();
-    digest_directory(path, path, &mut hasher)?;
-    Ok(encode_hex(&hasher.finalize()))
+    Ok(encode_hex(&digest_directory(path, path)?))
+}
+
+fn optional_digest_path(path: &Path) -> Result<Option<String>, MigrationError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => digest_path(path).map(Some),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(MigrationError::Io {
+            action: "inspect digest path",
+            path: path.to_owned(),
+            source,
+        }),
+    }
 }
 
 fn digest_directory(
     root: &Path,
     current: &Path,
-    hasher: &mut Sha256,
-) -> Result<(), MigrationError> {
+) -> Result<[u8; 32], MigrationError> {
+    const DIRECTORY_ENTRY: u8 = 1;
+    const FILE_ENTRY: u8 = 2;
+    let mut hasher = Sha256::new();
+    hasher.update(b"directory\0");
     for entry in sorted_entries(current)? {
         let path = entry.path();
+        if is_publication_lock_artifact(&path) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&path).map_err(|source| MigrationError::Io {
             action: "inspect source type",
             path: path.clone(),
@@ -2061,19 +3076,21 @@ fn digest_directory(
         let relative = path
             .strip_prefix(root)
             .map_err(|_| MigrationError::UnsafeTarget(path.clone()))?;
-        hasher.update(path_to_slashes(relative).as_bytes());
-        hasher.update([0]);
+        let raw_path = raw_os_path_bytes(relative);
         if metadata.is_dir() {
-            digest_directory(root, &path, hasher)?;
+            hasher.update([DIRECTORY_ENTRY]);
+            update_length_prefixed(&mut hasher, &raw_path);
+            hasher.update(digest_directory(root, &path)?);
         } else if metadata.is_file() {
-            update_digest_from_file(&path, hasher)?;
+            hasher.update([FILE_ENTRY]);
+            update_length_prefixed(&mut hasher, &raw_path);
+            hasher.update(digest_file_content(&path)?);
         }
-        hasher.update([0xff]);
     }
-    Ok(())
+    Ok(hasher.finalize().into())
 }
 
-fn update_digest_from_file(path: &Path, hasher: &mut Sha256) -> Result<(), MigrationError> {
+fn digest_file_content(path: &Path) -> Result<[u8; 32], MigrationError> {
     let file = File::open(path).map_err(|source| MigrationError::Io {
         action: "open for hashing",
         path: path.to_owned(),
@@ -2081,6 +3098,7 @@ fn update_digest_from_file(path: &Path, hasher: &mut Sha256) -> Result<(), Migra
     })?;
     let mut reader = file;
     let mut buffer = vec![0_u8; HASH_BUFFER_BYTES];
+    let mut hasher = Sha256::new();
     loop {
         let read = reader
             .read(&mut buffer)
@@ -2090,14 +3108,57 @@ fn update_digest_from_file(path: &Path, hasher: &mut Sha256) -> Result<(), Migra
                 source,
             })?;
         if read == 0 {
-            return Ok(());
+            return Ok(hasher.finalize().into());
         }
         hasher.update(&buffer[..read]);
     }
 }
 
+fn update_length_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(
+        u64::try_from(bytes.len())
+            .expect("filesystem path length fits in u64")
+            .to_le_bytes(),
+    );
+    hasher.update(bytes);
+}
+
+#[cfg(unix)]
+fn raw_os_path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn raw_os_path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn raw_os_path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_encoded_bytes().to_vec()
+}
+
 fn digest_bytes(bytes: &[u8]) -> String {
     encode_hex(&Sha256::digest(bytes))
+}
+
+fn digest_path_bytes(bytes: &[u8]) -> String {
+    let content: [u8; 32] = Sha256::digest(bytes).into();
+    encode_hex(&domain_file_digest(&content))
+}
+
+fn domain_file_digest(content_digest: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"file\0");
+    hasher.update(content_digest);
+    hasher.finalize().into()
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -2183,10 +3244,47 @@ fn copy_path(source: &Path, target: &Path) -> Result<(), MigrationError> {
     }
 }
 
+fn copy_path_for_apply(
+    source: &Path,
+    target: &Path,
+    receipt: &mut ApplyReceipt,
+    replacement_pending: Option<&str>,
+) -> Result<(), MigrationError> {
+    reject_symlink(source)?;
+    create_parent(target)?;
+    let staging = if source.is_dir() {
+        let staging = create_staging_directory(target)?;
+        copy_directory_contents(source, &staging)?;
+        set_path_permissions_from(source, &staging)?;
+        sync_directory(&staging)?;
+        staging
+    } else if source.is_file() {
+        let staging = create_staging_file(target)?;
+        populate_staging_file_from_source(source, &staging)?;
+        staging
+    } else {
+        return Err(MigrationError::SourceNotFound {
+            provider: "migration",
+            path: source.to_owned(),
+        });
+    };
+    let staged_digest = digest_path(&staging)?;
+    if replacement_pending.is_some_and(|expected| expected != staged_digest) {
+        return Err(MigrationError::BackupVerification(source.to_owned()));
+    }
+    publish_staged_path_transactionally(
+        &staging,
+        target,
+        receipt,
+        replacement_pending,
+    )
+}
+
 fn copy_directory_atomically(source: &Path, target: &Path) -> Result<(), MigrationError> {
     create_parent(target)?;
     let staging = create_staging_directory(target)?;
     let result = copy_directory_contents(source, &staging)
+        .and_then(|()| set_path_permissions_from(source, &staging))
         .and_then(|()| sync_directory(&staging))
         .and_then(|()| publish_staged_path(&staging, target));
     if result.is_err() && path_is_occupied(&staging) {
@@ -2198,6 +3296,9 @@ fn copy_directory_atomically(source: &Path, target: &Path) -> Result<(), Migrati
 fn copy_directory_contents(source: &Path, target: &Path) -> Result<(), MigrationError> {
     for entry in sorted_entries(source)? {
         let entry_source = entry.path();
+        if is_publication_lock_artifact(&entry_source) {
+            continue;
+        }
         let entry_target = target.join(entry.file_name());
         let metadata =
             fs::symlink_metadata(&entry_source).map_err(|source| MigrationError::Io {
@@ -2214,29 +3315,638 @@ fn copy_directory_contents(source: &Path, target: &Path) -> Result<(), Migration
                 path: entry_target.clone(),
                 source,
             })?;
+            sync_directory(target)?;
             copy_directory_contents(&entry_source, &entry_target)?;
+            set_path_permissions(&entry_target, metadata.permissions())?;
             sync_directory(&entry_target)?;
         } else if metadata.is_file() {
-            copy_file(&entry_source, &entry_target)?;
+            copy_new_file_durably(&entry_source, &entry_target)?;
         }
     }
     Ok(())
 }
 
-fn publish_single_file_directory(
+fn set_path_permissions_from(source: &Path, target: &Path) -> Result<(), MigrationError> {
+    let permissions =
+        fs::symlink_metadata(source).map_err(|source_error| MigrationError::Io {
+            action: "inspect source permissions",
+            path: source.to_owned(),
+            source: source_error,
+        })?
+        .permissions();
+    set_path_permissions(target, permissions)
+}
+
+fn set_path_permissions(
     target: &Path,
-    file_name: &str,
-    bytes: &[u8],
+    permissions: fs::Permissions,
 ) -> Result<(), MigrationError> {
-    create_parent(target)?;
-    let staging = create_staging_directory(target)?;
-    let result = write_bytes(&staging.join(file_name), bytes)
-        .and_then(|()| sync_directory(&staging))
-        .and_then(|()| publish_staged_path(&staging, target));
-    if result.is_err() && path_is_occupied(&staging) {
-        let _ = remove_path_if_exists(&staging);
+    fs::set_permissions(target, permissions).map_err(|source| MigrationError::Io {
+        action: "set staged path permissions",
+        path: target.to_owned(),
+        source,
+    })
+}
+
+#[cfg(unix)]
+fn set_unix_mode(file: &File, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_unix_mode(_file: &File, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
+fn copy_new_file_durably(source: &Path, target: &Path) -> Result<(), MigrationError> {
+    let metadata = fs::symlink_metadata(source).map_err(|source| MigrationError::Io {
+        action: "inspect copy source",
+        path: source.to_owned(),
+        source,
+    })?;
+    if is_link_or_reparse(&metadata) || !metadata.is_file() {
+        return Err(MigrationError::Symlink(source.to_owned()));
     }
-    result
+
+    let mut input = File::open(source).map_err(|source| MigrationError::Io {
+        action: "open copy source",
+        path: source.to_owned(),
+        source,
+    })?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .map_err(|source| MigrationError::Io {
+            action: "create copied file",
+            path: target.to_owned(),
+            source,
+        })?;
+    io::copy(&mut input, &mut output).map_err(|source| MigrationError::Io {
+        action: "copy file contents",
+        path: target.to_owned(),
+        source,
+    })?;
+    output
+        .set_permissions(metadata.permissions())
+        .and_then(|()| output.sync_all())
+        .map_err(|source| MigrationError::Io {
+            action: "synchronize copied file",
+            path: target.to_owned(),
+            source,
+        })
+}
+
+fn write_new_file_durably(
+    path: &Path,
+    bytes: &[u8],
+    unix_mode: u32,
+) -> Result<(), MigrationError> {
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| MigrationError::Io {
+            action: "create staged file",
+            path: path.to_owned(),
+            source,
+        })?;
+    set_unix_mode(&output, unix_mode).map_err(|source| MigrationError::Io {
+        action: "set staged file permissions",
+        path: path.to_owned(),
+        source,
+    })?;
+    output
+        .write_all(bytes)
+        .and_then(|()| output.sync_all())
+        .map_err(|source| MigrationError::Io {
+            action: "synchronize staged file",
+            path: path.to_owned(),
+            source,
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionPoint {
+    Prepared,
+    BeforePublish,
+    Exchanged,
+    OldMoved,
+    Published,
+    Cleaning,
+    Cleaned,
+}
+
+fn publish_staged_path_transactionally(
+    staging: &Path,
+    target: &Path,
+    receipt: &mut ApplyReceipt,
+    replacement_pending: Option<&str>,
+) -> Result<(), MigrationError> {
+    publish_staged_path_transactionally_with_hook(
+        staging,
+        target,
+        receipt,
+        replacement_pending,
+        |_| Ok(()),
+    )
+}
+
+fn publish_staged_path_transactionally_with_hook(
+    staging: &Path,
+    target: &Path,
+    receipt: &mut ApplyReceipt,
+    replacement_pending: Option<&str>,
+    mut hook: impl FnMut(TransitionPoint) -> Result<(), MigrationError>,
+) -> Result<(), MigrationError> {
+    let expected_displaced = verify_operation_target(receipt, target)?;
+    if let Some(expected) = replacement_pending {
+        record_pending_state(receipt, target, expected);
+    }
+    let occupied = path_is_occupied(target);
+    let staging_is_file = fs::symlink_metadata(staging)
+        .map(|metadata| metadata.is_file())
+        .map_err(|source| MigrationError::Io {
+            action: "inspect staged publication",
+            path: staging.to_owned(),
+            source,
+        })?;
+    let target_is_file = if occupied {
+        fs::symlink_metadata(target)
+            .map(|metadata| metadata.is_file())
+            .map_err(|source| MigrationError::Io {
+                action: "inspect publication target",
+                path: target.to_owned(),
+                source,
+            })?
+    } else {
+        false
+    };
+    let strategy = select_transition_strategy(
+        occupied,
+        atomic_exchange_supported(),
+        cfg!(windows),
+        staging_is_file && target_is_file,
+        target,
+    )?;
+    let old = match strategy {
+        TransitionStrategy::Exchange => Some(staging.to_owned()),
+        TransitionStrategy::DisplaceFile => Some(allocate_transition_path(target, "displaced")?),
+        TransitionStrategy::Rename => occupied
+            .then(|| allocate_transition_path(target, "old"))
+            .transpose()?,
+    };
+    set_path_transition(
+        receipt,
+        target,
+        Some(PathTransition {
+            staging: staging.to_owned(),
+            old: old.clone(),
+            phase: TransitionPhase::Prepared,
+            strategy,
+            expected_displaced_sha256: expected_displaced.clone(),
+            conflict_sha256: None,
+        }),
+    )?;
+    write_backup_manifest(receipt, RecoveryPhase::Applying)?;
+    hook(TransitionPoint::Prepared)?;
+    hook(TransitionPoint::BeforePublish)?;
+
+    match strategy {
+        TransitionStrategy::Exchange => {
+            exchange_paths_atomically(staging, target).map_err(|source| MigrationError::Io {
+                action: "exchange staged migration target",
+                path: target.to_owned(),
+                source,
+            })?;
+            hook(TransitionPoint::Exchanged)?;
+        }
+        TransitionStrategy::DisplaceFile => {
+            let old = old.as_ref().expect("file displacement reserves old path");
+            claw_config::displace_file_atomically(staging, target, old).map_err(|source| {
+                MigrationError::Io {
+                    action: "displace staged migration file",
+                    path: target.to_owned(),
+                    source,
+                }
+            })?;
+            hook(TransitionPoint::Exchanged)?;
+        }
+        TransitionStrategy::Rename => {
+            if let Some(old) = &old {
+                reject_symlink(target)?;
+                fs::rename(target, old).map_err(|source| MigrationError::Io {
+                    action: "move old migration target aside",
+                    path: target.to_owned(),
+                    source,
+                })?;
+                set_transition_phase(receipt, target, TransitionPhase::OldMoved)?;
+                write_backup_manifest(receipt, RecoveryPhase::Applying)?;
+                hook(TransitionPoint::OldMoved)?;
+                fs::rename(staging, target).map_err(|source| MigrationError::Io {
+                    action: "publish staged migration target",
+                    path: target.to_owned(),
+                    source,
+                })?;
+            } else {
+                match rename_path_no_replace(staging, target) {
+                    Ok(()) => {}
+                    Err(source) if path_is_occupied(target) => {
+                        let target_metadata =
+                            fs::symlink_metadata(target).map_err(|inspect| MigrationError::Io {
+                                action: "inspect raced publication target",
+                                path: target.to_owned(),
+                                source: inspect,
+                            })?;
+                        let staging_metadata =
+                            fs::symlink_metadata(staging).map_err(|inspect| MigrationError::Io {
+                                action: "inspect raced staging target",
+                                path: staging.to_owned(),
+                                source: inspect,
+                            })?;
+                        let upgraded = select_transition_strategy(
+                            true,
+                            atomic_exchange_supported(),
+                            cfg!(windows),
+                            target_metadata.is_file() && staging_metadata.is_file(),
+                            target,
+                        )?;
+                        let upgraded_old = match upgraded {
+                            TransitionStrategy::Exchange => staging.to_owned(),
+                            TransitionStrategy::DisplaceFile => {
+                                allocate_transition_path(target, "displaced")?
+                            }
+                            TransitionStrategy::Rename => unreachable!("occupied target upgraded"),
+                        };
+                        {
+                            let transition = receipt.backups
+                                .iter_mut()
+                                .find(|entry| entry.target == target)
+                                .and_then(|entry| entry.transition.as_mut())
+                                .ok_or_else(|| MigrationError::Conflict(target.to_owned()))?;
+                            transition.strategy = upgraded;
+                            transition.old = Some(upgraded_old.clone());
+                        }
+                        write_backup_manifest(receipt, RecoveryPhase::Applying)?;
+                        match upgraded {
+                            TransitionStrategy::Exchange => {
+                                exchange_paths_atomically(staging, target).map_err(|source| {
+                                    MigrationError::Io {
+                                        action: "exchange raced migration target",
+                                        path: target.to_owned(),
+                                        source,
+                                    }
+                                })?;
+                            }
+                            TransitionStrategy::DisplaceFile => {
+                                claw_config::displace_file_atomically(
+                                    staging,
+                                    target,
+                                    &upgraded_old,
+                                )
+                                .map_err(|source| MigrationError::Io {
+                                    action: "displace raced migration file",
+                                    path: target.to_owned(),
+                                    source,
+                                })?;
+                            }
+                            TransitionStrategy::Rename => unreachable!("occupied target upgraded"),
+                        }
+                    }
+                    Err(source) => {
+                        return Err(MigrationError::Io {
+                            action: "publish new migration target",
+                            path: target.to_owned(),
+                            source,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    set_transition_phase(receipt, target, TransitionPhase::Published)?;
+    write_backup_manifest(receipt, RecoveryPhase::Applying)?;
+    sync_parent_directory(target)?;
+    hook(TransitionPoint::Published)?;
+    validate_displaced_publication(receipt, target)?;
+
+    if let Some(old) = &old {
+        set_transition_phase(receipt, target, TransitionPhase::Cleaning)?;
+        write_backup_manifest(receipt, RecoveryPhase::Applying)?;
+        hook(TransitionPoint::Cleaning)?;
+        remove_path_if_exists(old)?;
+    }
+    set_path_transition(receipt, target, None)?;
+    write_backup_manifest(receipt, RecoveryPhase::Applying)?;
+    hook(TransitionPoint::Cleaned)
+}
+
+fn validate_displaced_publication(
+        receipt: &mut ApplyReceipt,
+        target: &Path,
+    ) -> Result<(), MigrationError> {
+        let index = receipt
+            .backups
+            .iter()
+            .position(|entry| entry.target == target)
+            .ok_or_else(|| MigrationError::Conflict(target.to_owned()))?;
+        let expected = receipt.backups[index]
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.expected_displaced_sha256.clone());
+        let transition = receipt.backups[index]
+            .transition
+            .as_ref()
+            .expect("expected digest requires transition")
+            .clone();
+        if expected.is_none() && transition.old.is_none() {
+            return Ok(());
+        }
+        let old = transition
+            .old
+            .as_ref()
+            .ok_or_else(|| MigrationError::Conflict(target.to_owned()))?;
+        if !path_is_occupied(old) {
+            return expected.map_or(Ok(()), |_| {
+                Err(MigrationError::Conflict(target.to_owned()))
+            });
+        }
+        let displaced = digest_path(old)?;
+        if expected.as_ref() == Some(&displaced) {
+            return Ok(());
+        }
+        backup_migration_conflict(receipt, old)?;
+        receipt.backups[index]
+            .transition
+            .as_mut()
+            .expect("transition remains present")
+            .conflict_sha256 = Some(displaced.clone());
+        receipt.backups[index]
+            .transition
+            .as_mut()
+            .expect("transition remains present")
+            .phase = TransitionPhase::ConflictRestoring;
+        write_backup_manifest(receipt, RecoveryPhase::Applying)?;
+        restore_transition_conflict(receipt, index)?;
+        Err(MigrationError::Conflict(target.to_owned()))
+    }
+
+fn restore_transition_conflict(
+        receipt: &mut ApplyReceipt,
+        index: usize,
+    ) -> Result<(), MigrationError> {
+        let transition = receipt.backups[index]
+            .transition
+            .as_ref()
+            .expect("conflict restoration requires transition")
+            .clone();
+        let old = transition
+            .old
+            .as_ref()
+            .expect("occupied transition retains displaced object");
+        match transition.strategy {
+            TransitionStrategy::Exchange => {
+                exchange_paths_atomically(old, &receipt.backups[index].target).map_err(|source| {
+                    MigrationError::Io {
+                        action: "restore concurrent migration target",
+                        path: receipt.backups[index].target.clone(),
+                        source,
+                    }
+                })?;
+            }
+            TransitionStrategy::DisplaceFile => {
+                claw_config::displace_file_atomically(
+                    old,
+                    &receipt.backups[index].target,
+                    &transition.staging,
+                )
+                .map_err(|source| MigrationError::Io {
+                    action: "restore concurrent migration file",
+                    path: receipt.backups[index].target.clone(),
+                    source,
+                })?;
+            }
+            TransitionStrategy::Rename => {
+                return Err(MigrationError::InvalidInput {
+                    path: receipt.backups[index].target.clone(),
+                    reason: "rename transition cannot restore displaced conflict".to_owned(),
+                });
+            }
+        }
+        sync_parent_directory(&receipt.backups[index].target)?;
+        let pending = receipt.backups[index]
+            .pending
+            .as_ref()
+            .ok_or_else(|| MigrationError::Conflict(receipt.backups[index].target.clone()))?;
+        if digest_path(&transition.staging)? != *pending {
+            backup_migration_conflict(receipt, &transition.staging)?;
+            return Err(MigrationError::Conflict(
+                receipt.backups[index].target.clone(),
+            ));
+        }
+        receipt.backups[index]
+            .transition
+            .as_mut()
+            .expect("transition remains present")
+            .phase = TransitionPhase::ConflictRestored;
+        write_backup_manifest(receipt, RecoveryPhase::Applying)
+    }
+
+fn backup_migration_conflict(
+        receipt: &ApplyReceipt,
+        source: &Path,
+    ) -> Result<PathBuf, MigrationError> {
+        let directory = receipt.backup_dir.join("conflicts");
+        create_dir_all(&directory)?;
+        let sequence = BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let backup = directory.join(sequence.to_string());
+        copy_path(source, &backup)?;
+        sync_directory(&directory)?;
+        Ok(backup)
+    }
+fn select_transition_strategy(
+    occupied: bool,
+    exchange_supported: bool,
+    file_displacement_supported: bool,
+    file_to_file: bool,
+    target: &Path,
+) -> Result<TransitionStrategy, MigrationError> {
+    match (
+        occupied,
+        exchange_supported,
+        file_displacement_supported && file_to_file,
+    ) {
+        (true, true, _) => Ok(TransitionStrategy::Exchange),
+        (true, false, true) => Ok(TransitionStrategy::DisplaceFile),
+        (true, false, false) => Err(MigrationError::InvalidInput {
+            path: target.to_owned(),
+            reason: "cross-type or directory overwrite requires native atomic exchange".to_owned(),
+        }),
+        (false, _, _) => Ok(TransitionStrategy::Rename),
+    }
+}
+
+fn allocate_transition_path(target: &Path, label: &str) -> Result<PathBuf, MigrationError> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| MigrationError::UnsafeTarget(target.to_owned()))?;
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("target");
+    for _ in 0..128 {
+        let sequence = BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{name}.gta-claw.{label}.{}.{sequence}",
+            std::process::id()
+        ));
+        match fs::symlink_metadata(&candidate) {
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => {}
+            Err(source) => {
+                return Err(MigrationError::Io {
+                    action: "inspect transition path",
+                    path: candidate,
+                    source,
+                });
+            }
+        }
+    }
+    Err(MigrationError::Io {
+        action: "allocate transition path",
+        path: target.to_owned(),
+        source: io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique transition path",
+        ),
+    })
+}
+
+fn set_path_transition(
+    receipt: &mut ApplyReceipt,
+    target: &Path,
+    transition: Option<PathTransition>,
+) -> Result<(), MigrationError> {
+    let entry = receipt
+        .backups
+        .iter_mut()
+        .find(|entry| entry.target == target)
+        .ok_or_else(|| MigrationError::Conflict(target.to_owned()))?;
+    entry.transition = transition;
+    Ok(())
+}
+
+fn set_transition_phase(
+    receipt: &mut ApplyReceipt,
+    target: &Path,
+    phase: TransitionPhase,
+) -> Result<(), MigrationError> {
+    let transition = receipt
+        .backups
+        .iter_mut()
+        .find(|entry| entry.target == target)
+        .and_then(|entry| entry.transition.as_mut())
+        .ok_or_else(|| MigrationError::Conflict(target.to_owned()))?;
+    transition.phase = phase;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemovalPoint {
+    Planned,
+    Renamed,
+    Moved,
+    Cleaned,
+}
+
+fn remove_created_target_transactionally(
+    receipt: &mut ApplyReceipt,
+    index: usize,
+) -> Result<(), MigrationError> {
+    remove_created_target_transactionally_with_hook(receipt, index, |_| Ok(()))
+}
+
+fn remove_created_target_transactionally_with_hook(
+    receipt: &mut ApplyReceipt,
+    index: usize,
+    mut hook: impl FnMut(RemovalPoint) -> Result<(), MigrationError>,
+) -> Result<(), MigrationError> {
+    if receipt.backups[index].removal.is_none() {
+        let expected_owned = receipt.backups[index]
+            .pending
+            .as_ref()
+            .or_else(|| match &receipt.backups[index].applied {
+                Some(AppliedState::Digest(digest)) => Some(digest),
+                _ => None,
+            })
+            .cloned();
+        if path_is_occupied(&receipt.backups[index].target) {
+            let current = digest_path(&receipt.backups[index].target)?;
+            if expected_owned.as_ref() != Some(&current) {
+                return Err(MigrationError::Conflict(
+                    receipt.backups[index].target.clone(),
+                ));
+            }
+        } else if !matches!(
+            receipt.backups[index].applied,
+            Some(AppliedState::Absent)
+        ) {
+            return Err(MigrationError::Conflict(
+                receipt.backups[index].target.clone(),
+            ));
+        }
+    }
+    if receipt.backups[index].removal.is_none() {
+        let target = receipt.backups[index].target.clone();
+        let trash = allocate_transition_path(&target, "rollback-trash")?;
+        receipt.backups[index].removal = Some(RemovalTransition {
+            trash,
+            phase: RemovalPhase::Planned,
+        });
+        write_backup_manifest(receipt, RecoveryPhase::Applying)?;
+        hook(RemovalPoint::Planned)?;
+    }
+
+    let target = receipt.backups[index].target.clone();
+    let trash = receipt.backups[index]
+        .removal
+        .as_ref()
+        .expect("removal was initialized")
+        .trash
+        .clone();
+    let target_exists = path_is_occupied(&target);
+    let trash_exists = path_is_occupied(&trash);
+    if target_exists && trash_exists {
+        return Err(MigrationError::Conflict(target));
+    }
+    if target_exists {
+        fs::rename(&target, &trash).map_err(|source| MigrationError::Io {
+            action: "move created target to rollback trash",
+            path: target.clone(),
+            source,
+        })?;
+        sync_parent_directory(&target)?;
+        hook(RemovalPoint::Renamed)?;
+    }
+
+    receipt.backups[index].pending = None;
+    receipt.backups[index].applied = Some(AppliedState::Absent);
+    receipt.backups[index]
+        .removal
+        .as_mut()
+        .expect("removal remains initialized")
+        .phase = RemovalPhase::Moved;
+    write_backup_manifest(receipt, RecoveryPhase::Applying)?;
+    hook(RemovalPoint::Moved)?;
+
+    if path_is_occupied(&trash) {
+        remove_path_if_exists(&trash)?;
+    }
+    receipt.backups[index].removal = None;
+    write_backup_manifest(receipt, RecoveryPhase::Applying)?;
+    hook(RemovalPoint::Cleaned)
 }
 
 fn create_staging_directory(target: &Path) -> Result<PathBuf, MigrationError> {
@@ -2384,6 +4094,79 @@ fn create_staging_file(target: &Path) -> Result<PathBuf, MigrationError> {
     })
 }
 
+fn populate_staging_file_from_source(
+    source: &Path,
+    staging: &Path,
+) -> Result<(), MigrationError> {
+    let permissions =
+        fs::symlink_metadata(source).map_err(|source_error| MigrationError::Io {
+            action: "inspect staged copy source",
+            path: source.to_owned(),
+            source: source_error,
+        })?
+        .permissions();
+    let mut input = File::open(source).map_err(|source| MigrationError::Io {
+        action: "open staged copy source",
+        path: source.to_owned(),
+        source,
+    })?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(staging)
+        .map_err(|source| MigrationError::Io {
+            action: "open staging file",
+            path: staging.to_owned(),
+            source,
+        })?;
+    output
+        .set_permissions(permissions)
+        .map_err(|source| MigrationError::Io {
+            action: "set staging file permissions",
+            path: staging.to_owned(),
+            source,
+        })?;
+    io::copy(&mut input, &mut output).map_err(|source| MigrationError::Io {
+        action: "copy into staging file",
+        path: staging.to_owned(),
+        source,
+    })?;
+    output.sync_all().map_err(|source| MigrationError::Io {
+        action: "synchronize staging file",
+        path: staging.to_owned(),
+        source,
+    })
+}
+
+fn populate_staging_file(
+    staging: &Path,
+    bytes: &[u8],
+    unix_mode: u32,
+) -> Result<(), MigrationError> {
+    let mut output = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(staging)
+        .map_err(|source| MigrationError::Io {
+            action: "open staging file",
+            path: staging.to_owned(),
+            source,
+        })?;
+    set_unix_mode(&output, unix_mode).map_err(|source| MigrationError::Io {
+        action: "set staging file permissions",
+        path: staging.to_owned(),
+        source,
+    })?;
+    output
+        .write_all(bytes)
+        .and_then(|()| output.sync_all())
+        .map_err(|source| MigrationError::Io {
+            action: "write staging file",
+            path: staging.to_owned(),
+            source,
+        })
+}
+
 fn sorted_entries(path: &Path) -> Result<Vec<fs::DirEntry>, MigrationError> {
     let mut entries = fs::read_dir(path)
         .map_err(|source| MigrationError::Io {
@@ -2495,11 +4278,66 @@ fn create_parent(path: &Path) -> Result<(), MigrationError> {
 }
 
 fn create_dir_all(path: &Path) -> Result<(), MigrationError> {
-    fs::create_dir_all(path).map_err(|source| MigrationError::Io {
-        action: "create directory",
-        path: path.to_path_buf(),
-        source,
-    })
+    create_dir_all_with_hook(path, |_| Ok(()))
+}
+
+fn create_dir_all_with_hook(
+    path: &Path,
+    mut after_parent_sync: impl FnMut(&Path) -> Result<(), MigrationError>,
+) -> Result<(), MigrationError> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(metadata) => {
+                if is_link_or_reparse(&metadata) {
+                    return Err(MigrationError::Symlink(current.to_owned()));
+                }
+                if !metadata.is_dir() {
+                    return Err(MigrationError::Io {
+                        action: "create directory",
+                        path: current.to_owned(),
+                        source: io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "path component is not a directory",
+                        ),
+                    });
+                }
+                break;
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                missing.push(current.to_owned());
+                let Some(parent) = current.parent() else {
+                    break;
+                };
+                if parent.as_os_str().is_empty() {
+                    break;
+                }
+                current = parent;
+            }
+            Err(source) => {
+                return Err(MigrationError::Io {
+                    action: "inspect directory",
+                    path: current.to_owned(),
+                    source,
+                });
+            }
+        }
+    }
+    for directory in missing.into_iter().rev() {
+        fs::create_dir(&directory).map_err(|source| MigrationError::Io {
+            action: "create directory",
+            path: directory.clone(),
+            source,
+        })?;
+        let parent = directory
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        sync_directory(parent)?;
+        after_parent_sync(&directory)?;
+    }
+    Ok(())
 }
 
 fn require_durable_write(path: &Path, outcome: &WriteOutcome) -> Result<(), MigrationError> {
@@ -2565,44 +4403,1105 @@ fn path_to_slashes(path: &Path) -> String {
         .join("/")
 }
 
+fn is_publication_lock_artifact(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".gta-claw.lock"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{MigrationError, publish_staged_path_with_hook};
+    use super::{
+        AppliedState, ApplyContext, ApplyReceipt, BackupEntry, MigrationError, MigrationOperation,
+        PathTransition, PreparedOperation, RecoveryPhase, RemovalPoint, SecretStore,
+        SecretStoreError, SecretValue, TransitionPoint, TransitionStrategy,
+        atomic_exchange_supported, copy_directory_atomically, create_dir_all_with_hook,
+        digest_path, digest_path_bytes, exchange_paths_atomically, migration_lock_path,
+        normalize_plan_target_root, preflight_operation_publication_with_exchange,
+        publish_staged_path_transactionally_with_hook,
+        remove_created_target_transactionally_with_hook, select_transition_strategy,
+        format_secret_transaction_id, new_secret_transaction_id,
+        record_applied_state, recover_interrupted_migration_with_hook, rollback_receipt,
+        rollback_receipt_locked, write_backup_manifest,
+        validate_created_directories,
+    };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn staged_overwrite_failpoint_leaves_the_old_target_visible() {
+    fn every_cross_type_transition_failpoint_recovers_the_old_directory() {
+        let mut failpoints = vec![
+            TransitionPoint::Prepared,
+            TransitionPoint::Published,
+            TransitionPoint::Cleaning,
+            TransitionPoint::Cleaned,
+        ];
+        if atomic_exchange_supported() {
+            failpoints.insert(1, TransitionPoint::Exchanged);
+        } else {
+            failpoints.insert(1, TransitionPoint::OldMoved);
+        }
+        for failpoint in failpoints {
+            let directory = temporary_directory();
+            let cleanup = Cleanup(directory.clone());
+            let target_root = directory.join("target-root");
+            let target = target_root.join("item");
+            fs::create_dir_all(&target).expect("create old directory target");
+            fs::write(target.join("value"), b"old").expect("write old target");
+            let backup_dir = directory.join("backup").join("transaction");
+            let backup = backup_dir.join("items").join("0");
+            fs::create_dir_all(&backup).expect("create backup directory");
+            fs::write(backup.join("value"), b"old").expect("write backup");
+            let staging = target_root.join("staged-file");
+            fs::write(&staging, b"new").expect("write staged file");
+            let mut receipt = ApplyReceipt {
+                provider_id: "test".to_owned(),
+                backup_dir: backup_dir.clone(),
+                target_root: target_root.clone(),
+                secret_transaction_id: "test-transaction".to_owned(),
+                backups: vec![BackupEntry {
+                    target: target.clone(),
+                    backup: Some(backup),
+                    digest: Some(digest_path(&target).expect("digest old target")),
+                    pending: Some(digest_path(&staging).expect("digest staged target")),
+                    applied: None,
+                    transition: None,
+                    removal: None,
+                }],
+                created_directories: Vec::new(),
+            };
+
+            publish_staged_path_transactionally_with_hook(
+                &staging,
+                &target,
+                &mut receipt,
+                None,
+                |reached| {
+                    if reached == failpoint {
+                        Err(MigrationError::Signing(format!(
+                            "injected {failpoint:?} crash"
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect_err("selected transition failpoint must stop publication");
+            if failpoint == TransitionPoint::Published && atomic_exchange_supported() {
+                let old = receipt.backups[0]
+                    .transition
+                    .as_ref()
+                    .and_then(|transition| transition.old.as_ref())
+                    .expect("published exchange retains displaced old path");
+                exchange_paths_atomically(old, &target)
+                    .expect("simulate rollback exchange before recovery process crashes");
+                if old.is_dir() {
+                    fs::remove_dir_all(old).expect("remove exchanged pending directory");
+                } else {
+                    fs::remove_file(old).expect("remove exchanged pending file");
+                }
+            }
+            if failpoint == TransitionPoint::Cleaning {
+                let old = receipt.backups[0]
+                    .transition
+                    .as_ref()
+                    .and_then(|transition| transition.old.as_ref())
+                    .expect("cleaning phase retains old path");
+                fs::remove_file(old.join("value"))
+                    .expect("simulate crash during recursive old-path cleanup");
+            }
+
+            let mut secrets = NoopSecretStore;
+            recover_interrupted_migration_with_hook(
+                &backup_dir,
+                &mut secrets,
+                |_| Ok(()),
+            )
+            .expect("durable transition state restores the old directory");
+            assert_eq!(
+                fs::read(target.join("value")).expect("read restored target"),
+                b"old",
+                "failed to recover after {failpoint:?}"
+            );
+            drop(cleanup);
+        }
+    }
+
+    #[test]
+    fn rollback_cleaning_resumes_partial_pending_directory_deletion() {
+        if !atomic_exchange_supported() {
+            return;
+        }
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let target_root = directory.join("target-root");
+        fs::create_dir(&target_root).expect("create target root");
+        let target = target_root.join("item");
+        fs::write(&target, b"old file").expect("write original file");
+        let backup_dir = directory.join("backup").join("transaction");
+        let backup = backup_dir.join("items").join("0");
+        fs::create_dir_all(backup.parent().expect("backup parent")).expect("create backup parent");
+        fs::write(&backup, b"old file").expect("write exact backup");
+        let staging = target_root.join("staged-directory");
+        fs::create_dir(&staging).expect("create staged directory");
+        fs::write(staging.join("one"), b"one").expect("write first staged file");
+        fs::write(staging.join("two"), b"two").expect("write second staged file");
+        let mut receipt = ApplyReceipt {
+            provider_id: "test".to_owned(),
+            backup_dir: backup_dir.clone(),
+            target_root,
+            secret_transaction_id: "test-transaction".to_owned(),
+            backups: vec![BackupEntry {
+                target: target.clone(),
+                backup: Some(backup),
+                digest: Some(digest_path(&target).expect("digest original")),
+                pending: Some(digest_path(&staging).expect("digest pending directory")),
+                applied: None,
+                transition: None,
+                removal: None,
+            }],
+            created_directories: Vec::new(),
+        };
+        publish_staged_path_transactionally_with_hook(
+            &staging,
+            &target,
+            &mut receipt,
+            None,
+            |point| {
+                if point == TransitionPoint::Published {
+                    Err(MigrationError::Signing(
+                        "crash after forward exchange".to_owned(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("leave published exchange journal");
+        let displaced = receipt.backups[0]
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.old.as_ref())
+            .expect("exchange retains original path")
+            .clone();
+        exchange_paths_atomically(&displaced, &target).expect("restore original file");
+        receipt.backups[0]
+            .transition
+            .as_mut()
+            .expect("transition remains")
+            .phase = TransitionPhase::RollbackCleaning;
+        write_backup_manifest(&receipt, RecoveryPhase::Applying)
+            .expect("persist rollback cleaning");
+        fs::remove_file(displaced.join("one")).expect("partially delete pending directory");
+        let mut secrets = NoopSecretStore;
+
+        recover_interrupted_migration_with_hook(&backup_dir, &mut secrets, |_| Ok(()))
+            .expect("restart finishes pending directory cleanup");
+
+        assert_eq!(fs::read(&target).expect("read restored original"), b"old file");
+        assert!(!displaced.exists());
+        drop(cleanup);
+    }
+
+    #[test]
+    fn recovery_rereads_manifest_after_acquiring_the_target_lock() {
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let target_root = directory.join("target");
+        fs::create_dir(&target_root).expect("create target root");
+        let backup_root = directory.join("backup");
+        let backup_dir = backup_root.join("transaction");
+        fs::create_dir_all(&backup_dir).expect("create backup directory");
+        let receipt = ApplyReceipt {
+            provider_id: "test".to_owned(),
+            backup_dir: backup_dir.clone(),
+            target_root,
+            secret_transaction_id: "test-transaction".to_owned(),
+            backups: Vec::new(),
+            created_directories: Vec::new(),
+        };
+        write_backup_manifest(&receipt, RecoveryPhase::Applying).expect("write applying manifest");
+        let mut secrets = CountingSecretStore::default();
+
+        recover_interrupted_migration_with_hook(&backup_dir, &mut secrets, |manifest_path| {
+            write_backup_manifest(&receipt, RecoveryPhase::Committed)?;
+            assert_eq!(manifest_path, receipt.backup_dir.join("manifest.json"));
+            Ok(())
+        })
+        .expect("locked reread observes committed phase");
+
+        assert_eq!(secrets.rollback_calls, 0);
+        drop(cleanup);
+    }
+
+    #[test]
+    fn public_rollback_holds_the_target_lock_during_secret_rollback() {
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let target_root = directory.join("target");
+        fs::create_dir(&target_root).expect("create target root");
+        let backup_root = directory.join("backup");
+        fs::create_dir(&backup_root).expect("create backup root");
+        let receipt = ApplyReceipt {
+            provider_id: "test".to_owned(),
+            backup_dir: backup_root.join("transaction"),
+            target_root: target_root.clone(),
+            secret_transaction_id: "test-transaction".to_owned(),
+            backups: Vec::new(),
+            created_directories: Vec::new(),
+        };
+        fs::create_dir(&receipt.backup_dir).expect("create receipt directory");
+        write_backup_manifest(&receipt, RecoveryPhase::Committed).expect("write manifest");
+        let mut secrets = LockCheckingSecretStore {
+            lock_path: migration_lock_path(&target_root).expect("derive target lock path"),
+            observed_lock: false,
+        };
+        let mut context = ApplyContext {
+            target_root: &target_root,
+            backup_root: &backup_root,
+            overwrite: true,
+            secret_store: &mut secrets,
+        };
+
+        rollback_receipt(&mut context, &receipt, &target_root)
+            .expect("public rollback succeeds");
+
+        assert!(secrets.observed_lock);
+        drop(cleanup);
+    }
+
+    #[test]
+    fn applied_state_refuses_to_adopt_bytes_that_do_not_match_pending_digest() {
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let target_root = directory.join("target");
+        fs::create_dir(&target_root).expect("create target root");
+        let target = target_root.join("value");
+        fs::write(&target, b"foreign bytes").expect("write foreign target");
+        let expected_path = directory.join("expected");
+        fs::write(&expected_path, b"expected bytes").expect("write expected bytes");
+        let expected = digest_path(&expected_path).expect("digest expected bytes");
+        let mut receipt = ApplyReceipt {
+            provider_id: "test".to_owned(),
+            backup_dir: directory.join("backup"),
+            target_root,
+            secret_transaction_id: "test-transaction".to_owned(),
+            backups: vec![BackupEntry {
+                target: target.clone(),
+                backup: None,
+                digest: None,
+                pending: Some(expected.clone()),
+                applied: None,
+                transition: None,
+                removal: None,
+            }],
+            created_directories: Vec::new(),
+        };
+
+        let error = record_applied_state(&mut receipt, &target)
+            .expect_err("foreign target digest must not become transaction-owned");
+
+        assert!(matches!(error, MigrationError::Conflict(path) if path == target));
+        assert!(receipt.backups[0].applied.is_none());
+        assert_eq!(receipt.backups[0].pending.as_deref(), Some(expected.as_str()));
+        drop(cleanup);
+    }
+
+    #[test]
+    fn source_mutation_after_staging_cannot_change_published_bytes() {
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let source = directory.join("source");
+        let target_root = directory.join("target");
+        fs::create_dir(&target_root).expect("create target root");
+        let target = target_root.join("copied");
+        fs::write(&source, b"reviewed source").expect("write source");
+        let staged = PreparedOperation::Copy {
+            source: &source,
+            target: &target,
+        }
+        .stage()
+        .expect("stage reviewed source");
+        fs::write(&source, b"mutated after staging").expect("mutate source");
+        let backup_dir = directory.join("backup").join("transaction");
+        fs::create_dir_all(&backup_dir).expect("create backup directory");
+        let mut receipt = ApplyReceipt {
+            provider_id: "test".to_owned(),
+            backup_dir,
+            target_root,
+            secret_transaction_id: "test-transaction".to_owned(),
+            backups: vec![BackupEntry {
+                target: target.clone(),
+                backup: None,
+                digest: None,
+                pending: Some(staged.digest.clone()),
+                applied: None,
+                transition: None,
+                removal: None,
+            }],
+            created_directories: Vec::new(),
+        };
+        write_backup_manifest(&receipt, RecoveryPhase::Applying).expect("write pending manifest");
+
+        staged.publish(&mut receipt).expect("publish exact staged output");
+        record_applied_state(&mut receipt, &target).expect("record staged digest");
+
+        assert_eq!(
+            fs::read(target).expect("read published target"),
+            b"reviewed source"
+        );
+        drop(cleanup);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_copy_and_generated_sensitive_files_preserve_reviewed_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let source = directory.join("source");
+        fs::write(&source, b"source").expect("write source");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o640))
+            .expect("set source mode");
+        let copied_target = directory.join("copied");
+        let copied = PreparedOperation::Copy {
+            source: &source,
+            target: &copied_target,
+        }
+        .stage()
+        .expect("stage copy");
+        assert_eq!(
+            fs::symlink_metadata(&copied.staging)
+                .expect("inspect copied staging")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        let source_directory = directory.join("source-directory");
+        fs::create_dir(&source_directory).expect("create source directory");
+        let nested_directory = source_directory.join("read-only-nested");
+        fs::create_dir(&nested_directory).expect("create nested directory");
+        fs::write(nested_directory.join("child"), b"child").expect("write nested child");
+        fs::set_permissions(&nested_directory, fs::Permissions::from_mode(0o555))
+            .expect("set nested read-only mode");
+        fs::set_permissions(&source_directory, fs::Permissions::from_mode(0o555))
+            .expect("set source directory mode");
+        let directory_target = directory.join("copied-directory");
+        let copied_directory = PreparedOperation::Copy {
+            source: &source_directory,
+            target: &directory_target,
+        }
+        .stage()
+        .expect("stage directory copy");
+        assert_eq!(
+            fs::symlink_metadata(&copied_directory.staging)
+                .expect("inspect copied directory staging")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
+        assert_eq!(
+            fs::symlink_metadata(copied_directory.staging.join("read-only-nested"))
+                .expect("inspect copied nested directory")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
+        let backup_target = directory.join("backup-directory");
+        copy_directory_atomically(&source_directory, &backup_target)
+            .expect("backup read-only source directory");
+        assert_eq!(
+            fs::symlink_metadata(&backup_target)
+                .expect("inspect backup directory")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
+        let sensitive_target = directory.join("sensitive");
+        let sensitive = PreparedOperation::Bytes {
+            target: &sensitive_target,
+            bytes: b"secret reference".to_vec(),
+        }
+        .stage()
+        .expect("stage sensitive config");
+        assert_eq!(
+            fs::symlink_metadata(&sensitive.staging)
+                .expect("inspect sensitive staging")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(cleanup);
+    }
+
+    #[test]
+    fn atomic_displacement_preserves_noncooperating_writer_bytes() {
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let target_root = directory.join("target");
+        fs::create_dir(&target_root).expect("create target root");
+        let target = target_root.join("value");
+        fs::write(&target, b"original").expect("write original");
+        let staging = target_root.join("staging");
+        fs::write(&staging, b"migration").expect("write staged migration");
+        let backup_dir = directory.join("backup").join("transaction");
+        let backup = backup_dir.join("items").join("0");
+        fs::create_dir_all(backup.parent().expect("backup parent")).expect("create backup parent");
+        fs::write(&backup, b"original").expect("write exact backup");
+        let mut receipt = ApplyReceipt {
+            provider_id: "test".to_owned(),
+            backup_dir: backup_dir.clone(),
+            target_root,
+            secret_transaction_id: "test-transaction".to_owned(),
+            backups: vec![BackupEntry {
+                target: target.clone(),
+                backup: Some(backup),
+                digest: Some(digest_path(&target).expect("digest original")),
+                pending: Some(digest_path(&staging).expect("digest migration")),
+                applied: None,
+                transition: None,
+                removal: None,
+            }],
+            created_directories: Vec::new(),
+        };
+
+        let error = publish_staged_path_transactionally_with_hook(
+            &staging,
+            &target,
+            &mut receipt,
+            None,
+            |point| {
+                if point == TransitionPoint::BeforePublish {
+                    fs::write(&target, b"concurrent B").map_err(|source| MigrationError::Io {
+                        action: "inject concurrent writer",
+                        path: target.clone(),
+                        source,
+                    })?;
+                }
+                Ok(())
+            },
+        )
+        .expect_err("displaced B must fail migration publication");
+
+        assert!(matches!(error, MigrationError::Conflict(path) if path == target));
+        assert_eq!(fs::read(&target).expect("read live B"), b"concurrent B");
+        let conflict_backup = fs::read_dir(backup_dir.join("conflicts"))
+            .expect("read conflict backups")
+            .map(|entry| entry.expect("conflict entry").path())
+            .find(|path| {
+                path.is_file()
+                    && !path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(".gta-claw.lock"))
+            })
+            .expect("durable B conflict backup");
+        assert_eq!(
+            fs::read(conflict_backup).expect("read B backup"),
+            b"concurrent B"
+        );
+        let mut secrets = NoopSecretStore;
+        recover_interrupted_migration_with_hook(&backup_dir, &mut secrets, |_| Ok(()))
+            .expect_err("recovery reports preserved concurrent B");
+        assert_eq!(fs::read(target).expect("B remains live"), b"concurrent B");
+        drop(cleanup);
+    }
+
+    #[test]
+    fn absent_target_race_is_displaced_and_preserved() {
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let target_root = directory.join("target");
+        fs::create_dir(&target_root).expect("create target root");
+        let target = target_root.join("value");
+        let staging = target_root.join("staging");
+        fs::write(&staging, b"migration").expect("write staged migration");
+        let backup_dir = directory.join("backup").join("transaction");
+        fs::create_dir_all(&backup_dir).expect("create backup directory");
+        let mut receipt = ApplyReceipt {
+            provider_id: "test".to_owned(),
+            backup_dir: backup_dir.clone(),
+            target_root,
+            secret_transaction_id: "test-transaction".to_owned(),
+            backups: vec![BackupEntry {
+                target: target.clone(),
+                backup: None,
+                digest: None,
+                pending: Some(digest_path(&staging).expect("digest migration")),
+                applied: None,
+                transition: None,
+                removal: None,
+            }],
+            created_directories: Vec::new(),
+        };
+
+        publish_staged_path_transactionally_with_hook(
+            &staging,
+            &target,
+            &mut receipt,
+            None,
+            |point| {
+                if point == TransitionPoint::BeforePublish {
+                    fs::write(&target, b"concurrent B").map_err(|source| MigrationError::Io {
+                        action: "inject concurrent writer",
+                        path: target.clone(),
+                        source,
+                    })?;
+                }
+                Ok(())
+            },
+        )
+        .expect_err("absent-target race must become a conflict");
+
+        assert_eq!(fs::read(&target).expect("read live B"), b"concurrent B");
+        assert!(backup_dir.join("conflicts").is_dir());
+        drop(cleanup);
+    }
+
+    #[test]
+    fn preserved_conflict_does_not_short_circuit_other_entry_or_secret_rollback() {
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let target_root = directory.join("target");
+        fs::create_dir(&target_root).expect("create target root");
+        let target_a = target_root.join("a");
+        let target_b = target_root.join("b");
+        fs::write(&target_a, b"applied A").expect("write applied A");
+        fs::write(&target_b, b"concurrent B").expect("write concurrent B");
+        let backup_dir = directory.join("backup").join("transaction");
+        let backup_a = backup_dir.join("items").join("0");
+        let backup_b = backup_dir.join("items").join("1");
+        fs::create_dir_all(backup_a.parent().expect("backup parent"))
+            .expect("create backup parent");
+        fs::write(&backup_a, b"original A").expect("write A backup");
+        fs::write(&backup_b, b"original B").expect("write B backup");
+        let pending_b = target_root.join("pending-b");
+        fs::write(&pending_b, b"migration B").expect("write pending B");
+        let mut receipt = ApplyReceipt {
+            provider_id: "test".to_owned(),
+            backup_dir,
+            target_root: target_root.clone(),
+            secret_transaction_id: "test-transaction".to_owned(),
+            backups: vec![
+                BackupEntry {
+                    target: target_a.clone(),
+                    backup: Some(backup_a),
+                    digest: Some(digest_path_bytes(b"original A")),
+                    pending: None,
+                    applied: Some(AppliedState::Digest(digest_path(&target_a).expect("digest A"))),
+                    transition: None,
+                    removal: None,
+                },
+                BackupEntry {
+                    target: target_b.clone(),
+                    backup: Some(backup_b),
+                    digest: Some(digest_path_bytes(b"original B")),
+                    pending: Some(digest_path(&pending_b).expect("digest pending B")),
+                    applied: None,
+                    transition: Some(PathTransition {
+                        staging: pending_b,
+                        old: None,
+                        phase: TransitionPhase::ConflictRestored,
+                        strategy: TransitionStrategy::Exchange,
+                        expected_displaced_sha256: Some(digest_path_bytes(b"original B")),
+                        conflict_sha256: Some(digest_path(&target_b).expect("digest conflict B")),
+                    }),
+                    removal: None,
+                },
+            ],
+            created_directories: Vec::new(),
+        };
+        fs::create_dir_all(&receipt.backup_dir).expect("create receipt directory");
+        write_backup_manifest(&receipt, RecoveryPhase::Applying).expect("write applying manifest");
+        let mut secrets = CountingSecretStore::default();
+        let mut context = ApplyContext {
+            target_root: &target_root,
+            backup_root: &directory.join("backup"),
+            overwrite: true,
+            secret_store: &mut secrets,
+        };
+
+        rollback_receipt_locked(&mut context, &mut receipt)
+            .expect_err("preserved B conflict is returned after full rollback");
+
+        assert_eq!(fs::read(target_a).expect("read restored A"), b"original A");
+        assert_eq!(fs::read(target_b).expect("read preserved B"), b"concurrent B");
+        assert_eq!(secrets.rollback_calls, 1);
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(receipt.backup_dir.join("manifest.json")).expect("read final manifest"),
+        )
+        .expect("decode final manifest");
+        assert_eq!(manifest["phase"], "rolled_back");
+        drop(cleanup);
+    }
+
+    #[test]
+    fn every_new_directory_component_reports_after_its_parent_is_synced() {
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let nested = directory.join("one").join("two").join("three");
+        let mut synchronized = Vec::new();
+
+        create_dir_all_with_hook(&nested, |created| {
+            synchronized.push(created.to_owned());
+            Ok(())
+        })
+        .expect("create and synchronize every directory component");
+
+        assert_eq!(
+            synchronized,
+            vec![
+                directory.join("one"),
+                directory.join("one").join("two"),
+                nested,
+            ]
+        );
+        drop(cleanup);
+    }
+
+    #[test]
+    fn lexical_aliases_derive_the_same_target_lock() {
+        let relative = Path::new(".claw-migrate-lock-alias");
+        let absolute = std::env::current_dir()
+            .expect("current directory")
+            .join(relative);
+
+        assert_eq!(
+            migration_lock_path(relative).expect("relative lock path"),
+            migration_lock_path(&absolute).expect("absolute lock path")
+        );
+    }
+
+    #[test]
+    fn persisted_target_identity_is_absolute_and_cwd_independent() {
+        let normalized = normalize_plan_target_root(Path::new(".claw-migrate-relative-target"))
+            .expect("normalize relative target");
+        let current = fs::canonicalize(std::env::current_dir().expect("current directory"))
+            .expect("canonical current directory");
+
+        assert!(normalized.is_absolute());
+        assert_eq!(normalized.parent(), Some(current.as_path()));
+    }
+
+    #[test]
+    fn recovery_rejects_created_directories_outside_target_root() {
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let target_root = directory.join("target");
+        let outside = directory.join("outside");
+        let escaped = target_root.join("nested").join("..").join("..").join("outside");
+
+        let error = validate_created_directories(&[outside.clone()], &target_root)
+            .expect_err("manifest must not authorize removing an outside directory");
+
+        assert!(matches!(error, MigrationError::UnsafeTarget(path) if path == outside));
+        assert!(
+            validate_created_directories(&[escaped], &target_root).is_err(),
+            "parent components must not bypass target containment"
+        );
+        drop(cleanup);
+    }
+
+    #[test]
+    fn file_and_directory_digests_are_domain_separated() {
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let file = directory.join("empty-file");
+        let folder = directory.join("empty-directory");
+        fs::write(&file, b"").expect("write empty file");
+        fs::create_dir(&folder).expect("create empty directory");
+
+        assert_ne!(
+            digest_path(&file).expect("digest file"),
+            digest_path(&folder).expect("digest directory")
+        );
+        drop(cleanup);
+    }
+
+    #[test]
+    fn directory_digest_length_prefixes_path_and_content_boundaries() {
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let first = directory.join("first");
+        let second = directory.join("second");
+        fs::create_dir(&first).expect("create first directory");
+        fs::create_dir(&second).expect("create second directory");
+        fs::write(first.join("ab"), b"c").expect("write first layout");
+        fs::write(second.join("a"), b"bc").expect("write second layout");
+
+        assert_ne!(
+            digest_path(&first).expect("digest first layout"),
+            digest_path(&second).expect("digest second layout")
+        );
+        drop(cleanup);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_digest_preserves_non_utf8_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let first = directory.join("first");
+        let second = directory.join("second");
+        fs::create_dir(&first).expect("create first directory");
+        fs::create_dir(&second).expect("create second directory");
+        fs::write(first.join(OsString::from_vec(vec![b'n', 0x80])), b"same")
+            .expect("write first non-UTF8 name");
+        fs::write(second.join(OsString::from_vec(vec![b'n', 0x81])), b"same")
+            .expect("write second non-UTF8 name");
+
+        assert_ne!(
+            digest_path(&first).expect("digest first non-UTF8 layout"),
+            digest_path(&second).expect("digest second non-UTF8 layout")
+        );
+        drop(cleanup);
+    }
+
+    #[test]
+    fn occupied_cross_type_target_is_refused_without_native_exchange() {
+        let target = Path::new("occupied-target");
+
+        let error = select_transition_strategy(true, false, false, false, target)
+            .expect_err("unsupported platform must not use remove-before-rename fallback");
+
+        assert!(matches!(error, MigrationError::InvalidInput { path, .. } if path == target));
+    }
+
+    #[test]
+    fn unsupported_cross_type_is_rejected_before_staging_or_pending_state() {
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let target = directory.join("occupied-directory");
+        fs::create_dir(&target).expect("create occupied directory");
+        fs::write(target.join("old"), b"old").expect("write old tree");
+        let operation = MigrationOperation::WriteBytes {
+            target: target.clone(),
+            bytes: b"new file".to_vec(),
+        };
+        let backup_dir = directory.join("backup").join("transaction");
+        let backup = backup_dir.join("items").join("0");
+        fs::create_dir_all(&backup).expect("create exact backup");
+        fs::write(backup.join("old"), b"old").expect("write exact backup");
+        let mut receipt = ApplyReceipt {
+            provider_id: "test".to_owned(),
+            backup_dir: backup_dir.clone(),
+            target_root: directory.clone(),
+            secret_transaction_id: "test-transaction".to_owned(),
+            backups: vec![BackupEntry {
+                target: target.clone(),
+                backup: Some(backup),
+                digest: Some(digest_path(&target).expect("digest original tree")),
+                pending: None,
+                applied: None,
+                transition: None,
+                removal: None,
+            }],
+            created_directories: Vec::new(),
+        };
+        write_backup_manifest(&receipt, RecoveryPhase::Prepared).expect("write prepared manifest");
+
+        preflight_operation_publication_with_exchange(&operation, false)
+            .expect_err("unsupported cross-type transition must fail in preflight");
+        assert!(receipt.backups[0].pending.is_none());
+        let mut secrets = NoopSecretStore;
+        let mut context = ApplyContext {
+            target_root: &directory,
+            backup_root: &directory.join("backup"),
+            overwrite: true,
+            secret_store: &mut secrets,
+        };
+        rollback_receipt_locked(&mut context, &mut receipt)
+            .expect("untouched original finalizes rollback cleanly");
+
+        assert_eq!(fs::read(target.join("old")).expect("read old tree"), b"old");
+        assert!(
+            fs::read_dir(&directory)
+                .expect("read parent")
+                .all(|entry| {
+                    !entry
+                        .expect("directory entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .contains("migrate-stage")
+                })
+        );
+        drop(cleanup);
+    }
+
+    #[test]
+    fn transaction_id_process_component_prevents_cross_process_reuse() {
+        let nonce = [7_u8; 16];
+
+        assert_ne!(
+            format_secret_transaction_id("codex", "target", 100, &nonce),
+            format_secret_transaction_id("codex", "target", 101, &nonce)
+        );
+    }
+
+    #[test]
+    fn independent_processes_generate_distinct_transaction_ids() {
         let directory = temporary_directory();
         let cleanup = Cleanup(directory.clone());
         let target = directory.join("target");
-        let staging = directory.join("staging");
-        fs::create_dir(&target).expect("create old target");
-        fs::write(target.join("value"), b"old").expect("write old target");
-        fs::create_dir(&staging).expect("create staged target");
-        fs::write(staging.join("value"), b"new").expect("write staged target");
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut identifiers = Vec::new();
+        for index in 0..2 {
+            let output = directory.join(format!("transaction-{index}"));
+            let status = std::process::Command::new(&executable)
+                .arg("engine::tests::transaction_id_child_probe")
+                .arg("--exact")
+                .env("CLAW_MIGRATE_TRANSACTION_PROBE_OUTPUT", &output)
+                .env("CLAW_MIGRATE_TRANSACTION_PROBE_TARGET", &target)
+                .status()
+                .expect("run transaction ID child process");
+            assert!(status.success());
+            identifiers.push(fs::read_to_string(output).expect("read child transaction ID"));
+        }
 
-        let error = publish_staged_path_with_hook(&staging, &target, || {
-            Err(MigrationError::Signing(
-                "injected crash barrier before replacement".to_owned(),
-            ))
-        })
-        .expect_err("failpoint must stop publication");
+        assert_ne!(identifiers[0], identifiers[1]);
+        drop(cleanup);
+    }
 
-        assert!(error.to_string().contains("injected crash barrier"));
+    #[test]
+    fn transaction_id_child_probe() {
+        let Ok(output) = std::env::var("CLAW_MIGRATE_TRANSACTION_PROBE_OUTPUT") else {
+            return;
+        };
+        let target =
+            PathBuf::from(std::env::var("CLAW_MIGRATE_TRANSACTION_PROBE_TARGET").expect("target"));
+        let identifier =
+            new_secret_transaction_id("test", &target).expect("generate transaction ID");
+        fs::write(output, identifier).expect("write transaction ID probe");
+    }
+
+    #[test]
+    fn every_created_tree_removal_failpoint_finishes_from_the_journal() {
+        for failpoint in [
+            RemovalPoint::Planned,
+            RemovalPoint::Renamed,
+            RemovalPoint::Moved,
+            RemovalPoint::Cleaned,
+        ] {
+            let directory = temporary_directory();
+            let cleanup = Cleanup(directory.clone());
+            let target_root = directory.join("target-root");
+            let target = target_root.join("created-tree");
+            fs::create_dir_all(&target).expect("create target tree");
+            fs::write(target.join("child"), b"created").expect("write target child");
+            let backup_dir = directory.join("backup").join("transaction");
+            fs::create_dir_all(&backup_dir).expect("create backup directory");
+            let mut receipt = ApplyReceipt {
+                provider_id: "test".to_owned(),
+                backup_dir: backup_dir.clone(),
+                target_root,
+                secret_transaction_id: "test-transaction".to_owned(),
+                backups: vec![BackupEntry {
+                    target: target.clone(),
+                    backup: None,
+                    digest: None,
+                    pending: None,
+                    applied: Some(AppliedState::Digest(
+                        digest_path(&target).expect("digest created tree"),
+                    )),
+                    transition: None,
+                    removal: None,
+                }],
+                created_directories: Vec::new(),
+            };
+            write_backup_manifest(&receipt, RecoveryPhase::Applying)
+                .expect("write initial applying manifest");
+
+            remove_created_target_transactionally_with_hook(
+                &mut receipt,
+                0,
+                |reached| {
+                    if reached == failpoint {
+                        Err(MigrationError::Signing(format!(
+                            "injected {failpoint:?} removal crash"
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect_err("selected removal failpoint must stop rollback");
+            if failpoint == RemovalPoint::Moved {
+                let trash = receipt.backups[0]
+                    .removal
+                    .as_ref()
+                    .expect("moved phase retains trash")
+                    .trash
+                    .clone();
+                fs::remove_file(trash.join("child"))
+                    .expect("simulate crash during recursive trash deletion");
+            }
+            let mut secrets = NoopSecretStore;
+
+            recover_interrupted_migration_with_hook(
+                &backup_dir,
+                &mut secrets,
+                |_| Ok(()),
+            )
+            .expect("restart finishes journaled created-tree deletion");
+
+            assert!(!target.exists(), "target survived {failpoint:?}");
+            assert!(
+                fs::read_dir(target.parent().expect("target parent"))
+                    .expect("read target parent")
+                    .all(|entry| {
+                        !entry
+                            .expect("directory entry")
+                            .file_name()
+                            .to_string_lossy()
+                            .contains("rollback-trash")
+                    })
+            );
+            drop(cleanup);
+        }
+    }
+
+    #[test]
+    fn absent_target_rollback_preserves_foreign_post_crash_file() {
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let target_root = directory.join("target");
+        fs::create_dir(&target_root).expect("create target root");
+        let target = target_root.join("created");
+        fs::write(&target, b"foreign post-crash bytes").expect("write foreign file");
+        let backup_dir = directory.join("backup").join("transaction");
+        fs::create_dir_all(&backup_dir).expect("create backup directory");
+        let mut receipt = ApplyReceipt {
+            provider_id: "test".to_owned(),
+            backup_dir,
+            target_root,
+            secret_transaction_id: "test-transaction".to_owned(),
+            backups: vec![BackupEntry {
+                target: target.clone(),
+                backup: None,
+                digest: None,
+                pending: Some(encode_hex(&domain_file_digest(
+                    &Sha256::digest(b"transaction bytes").into(),
+                ))),
+                applied: None,
+                transition: None,
+                removal: None,
+            }],
+            created_directories: Vec::new(),
+        };
+
+        let error = remove_created_target_transactionally(&mut receipt, 0)
+            .expect_err("foreign file must block absent-target rollback");
+
+        assert!(matches!(error, MigrationError::Conflict(path) if path == target));
         assert_eq!(
-            fs::read(target.join("value")).expect("read old target"),
-            b"old"
-        );
-        assert_eq!(
-            fs::read(staging.join("value")).expect("read staged target"),
-            b"new"
+            fs::read(target).expect("read preserved foreign bytes"),
+            b"foreign post-crash bytes"
         );
         drop(cleanup);
+    }
+
+    struct NoopSecretStore;
+
+    impl SecretStore for NoopSecretStore {
+        fn begin_transaction(&mut self, _transaction_id: &str) -> Result<(), SecretStoreError> {
+            Ok(())
+        }
+
+        fn stage(
+            &mut self,
+            _transaction_id: &str,
+            id: &str,
+            _value: SecretValue,
+        ) -> Result<String, SecretStoreError> {
+            Ok(format!("keyring://gta-claw/{id}"))
+        }
+
+        fn commit_transaction(&mut self, _transaction_id: &str) -> Result<(), SecretStoreError> {
+            Ok(())
+        }
+
+        fn rollback_transaction(&mut self, _transaction_id: &str) -> Result<(), SecretStoreError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingSecretStore {
+        rollback_calls: usize,
+    }
+
+    impl SecretStore for CountingSecretStore {
+        fn begin_transaction(&mut self, _transaction_id: &str) -> Result<(), SecretStoreError> {
+            Ok(())
+        }
+
+        fn stage(
+            &mut self,
+            _transaction_id: &str,
+            id: &str,
+            _value: SecretValue,
+        ) -> Result<String, SecretStoreError> {
+            Ok(format!("keyring://gta-claw/{id}"))
+        }
+
+        fn commit_transaction(&mut self, _transaction_id: &str) -> Result<(), SecretStoreError> {
+            Ok(())
+        }
+
+        fn rollback_transaction(&mut self, _transaction_id: &str) -> Result<(), SecretStoreError> {
+            self.rollback_calls += 1;
+            Ok(())
+        }
+    }
+
+    struct LockCheckingSecretStore {
+        lock_path: PathBuf,
+        observed_lock: bool,
+    }
+
+    impl SecretStore for LockCheckingSecretStore {
+        fn begin_transaction(&mut self, _transaction_id: &str) -> Result<(), SecretStoreError> {
+            Ok(())
+        }
+
+        fn stage(
+            &mut self,
+            _transaction_id: &str,
+            id: &str,
+            _value: SecretValue,
+        ) -> Result<String, SecretStoreError> {
+            Ok(format!("keyring://gta-claw/{id}"))
+        }
+
+        fn commit_transaction(&mut self, _transaction_id: &str) -> Result<(), SecretStoreError> {
+            Ok(())
+        }
+
+        fn rollback_transaction(&mut self, _transaction_id: &str) -> Result<(), SecretStoreError> {
+            let external = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.lock_path)
+                .expect("open migration lock");
+            self.observed_lock = matches!(
+                external.try_lock(),
+                Err(fs::TryLockError::WouldBlock)
+            );
+            Ok(())
+        }
     }
 
     fn temporary_directory() -> PathBuf {

@@ -3,7 +3,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use claw_config::{ConfigError, ConfigSnapshot, WriteWarning, parse_json5, write_file};
+use claw_config::{
+    CONFIG_SCHEMA_VERSION, ConfigError, ConfigSnapshot, WriteWarning, parse_json5, write_file,
+};
 
 use crate::setup::{read_optional_file, restore_paths};
 use crate::state::{CrestodianState, decode_state, ensure_parent_directory, write_state};
@@ -328,6 +330,18 @@ fn inspect_config_bytes(path: &Path, bytes: Option<&[u8]>) -> ConfigCondition {
             };
         }
     };
+    if let Ok(value) = json5::from_str::<serde_json::Value>(source)
+        && let Some(found) = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+        && found != CONFIG_SCHEMA_VERSION
+    {
+        return ConfigCondition::Incompatible {
+            found,
+            supported: CONFIG_SCHEMA_VERSION,
+        };
+    }
     match parse_json5(source, &path.display().to_string()) {
         Ok(_) => ConfigCondition::Healthy,
         Err(ConfigError::UnsupportedVersion { found, supported }) => {
@@ -352,6 +366,18 @@ fn inspect_state_bytes(path: &Path, bytes: Option<&[u8]>) -> StateCondition {
     let Some(bytes) = bytes else {
         return StateCondition::Missing;
     };
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes)
+        && let Some(found) = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+        && found != CRESTODIAN_STATE_SCHEMA_VERSION
+    {
+        return StateCondition::Incompatible {
+            found,
+            supported: CRESTODIAN_STATE_SCHEMA_VERSION,
+        };
+    }
     match decode_state(path, bytes) {
         Ok(state) if state.schema_version == CRESTODIAN_STATE_SCHEMA_VERSION => {
             StateCondition::Healthy
@@ -367,7 +393,11 @@ fn inspect_state_bytes(path: &Path, bytes: Option<&[u8]>) -> StateCondition {
 }
 
 fn read_recoverable_file(path: &Path) -> Result<Option<Vec<u8>>, CrestodianError> {
-    match fs::metadata(path) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if is_link_or_reparse(&metadata) => Err(CrestodianError::UnsafePath {
+            path: path.to_owned(),
+            message: "recovery target must not be a symlink or reparse point",
+        }),
         Ok(metadata) if metadata.is_file() => read_optional_file(path),
         Ok(_) => Err(CrestodianError::UnsafePath {
             path: path.to_owned(),
@@ -381,6 +411,24 @@ fn read_recoverable_file(path: &Path) -> Result<Option<Vec<u8>>, CrestodianError
         }
         Err(source) => Err(CrestodianError::io(path, source)),
     }
+}
+
+#[cfg(unix)]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn create_backup_directory(config_path: &Path) -> Result<PathBuf, CrestodianError> {

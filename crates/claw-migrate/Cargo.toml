@@ -11,6 +11,7 @@ include = ["Cargo.toml", "src/**", "tests/**"]
 [dependencies]
 claw-config.workspace = true
 ed25519-dalek = { version = "=3.0.0", features = ["zeroize"] }
+getrandom = "=0.3.4"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

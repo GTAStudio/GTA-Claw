@@ -166,7 +166,7 @@ fn codex_apply_routes_auth_binds_sessions_and_quarantines_sidecars() {
                 "secret-document".to_owned(),
                 "config/migrations/codex/auth.json".to_owned()
             ),
-            ("copy".to_owned(), "sessions/codex".to_owned()),
+            ("copy".to_owned(), "sessions/codex/2026".to_owned()),
             (
                 "copy".to_owned(),
                 "reports/migration/codex/archived_sessions".to_owned()
@@ -305,6 +305,10 @@ fn codex_apply_routes_auth_binds_sessions_and_quarantines_sidecars() {
             .expect("roll the Codex migration back");
     }
     assert_eq!(files_under(&target), Vec::<String>::new());
+    assert!(
+        !target.join("sessions").join("codex").exists(),
+        "rollback must remove the parent created for flattened Codex sessions"
+    );
     assert!(secrets.values.is_empty());
 }
 
@@ -521,7 +525,7 @@ fn codex_refuses_to_overwrite_an_existing_target() {
 }
 
 #[test]
-fn codex_inline_env_and_headers_tables_keep_their_toml_shape() {
+fn codex_real_inline_header_tables_preserve_shape_and_environment_names() {
     let root = TestDir::new("codex-inline-tables");
     let source = root.join("codex-home");
     let target = root.join("target");
@@ -530,7 +534,8 @@ fn codex_inline_env_and_headers_tables_keep_their_toml_shape() {
         r#"[mcp_servers.docs]
 command = "docs"
 env = { DOCS_TOKEN = "docs-private", REGION = "us-east-1" }
-headers = { Authorization = "Bearer private", "X-Api-Key" = "header-private" }
+http_headers = { Authorization = "Bearer private", "X-Api-Key" = "header-private" }
+env_http_headers = { Authorization = "DOCS_AUTH_HEADER", "X-Api-Key" = "DOCS_API_KEY_HEADER" }
 "#,
     );
     let platform_paths = paths(&root, HostPlatform::Linux);
@@ -564,10 +569,14 @@ headers = { Authorization = "Bearer private", "X-Api-Key" = "header-private" }
     );
     assert!(migrated.contains("env = { DOCS_TOKEN = \"keyring://"));
     assert!(migrated.contains(", REGION = \"keyring://"));
-    assert!(migrated.contains("headers = { Authorization = \"keyring://"));
+    assert!(migrated.contains("http_headers = { Authorization = \"keyring://"));
     assert!(migrated.contains(", \"X-Api-Key\" = \"keyring://"));
     assert!(!migrated.contains("env = \"keyring://"));
-    assert!(!migrated.contains("headers = \"keyring://"));
+    assert!(!migrated.contains("http_headers = \"keyring://"));
+    assert!(migrated.contains(
+        "env_http_headers = { Authorization = \"DOCS_AUTH_HEADER\", \"X-Api-Key\" = \
+         \"DOCS_API_KEY_HEADER\" }"
+    ));
     for plaintext in [
         "docs-private",
         "us-east-1",
@@ -577,4 +586,6 @@ headers = { Authorization = "Bearer private", "X-Api-Key" = "header-private" }
         assert!(secrets.holds(plaintext));
         assert!(!migrated.contains(plaintext));
     }
+    assert!(!secrets.holds("DOCS_AUTH_HEADER"));
+    assert!(!secrets.holds("DOCS_API_KEY_HEADER"));
 }

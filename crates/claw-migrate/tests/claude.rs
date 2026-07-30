@@ -563,6 +563,69 @@ fn explicit_claude_file_is_isolated_from_default_sources() {
 }
 
 #[test]
+fn explicit_claude_directory_excludes_parent_and_platform_companions() {
+    let root = TestDir::new("claude-explicit-directory");
+    let target = root.join("target");
+    seed_claude_home(&root);
+    let explicit = root.join("isolated").join(".claude");
+    write(
+        &explicit.join("settings.json"),
+        r#"{"model":"claude-explicit","env":{"TOKEN":"directory-only-secret"}}"#,
+    );
+    write(
+        &root.join("isolated").join(".claude.json"),
+        r#"{"env":{"TOKEN":"explicit-parent-must-not-import"}}"#,
+    );
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+    let plan = ClaudeMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&explicit),
+            target_root: &target,
+            overwrite: false,
+            signer: &signer,
+        })
+        .expect("plan only the explicit Claude directory");
+    let mut secrets = MemorySecretStore::default();
+    let mut apply = ApplyContext {
+        target_root: &target,
+        backup_root: &root.join("backup"),
+        overwrite: false,
+        secret_store: &mut secrets,
+    };
+
+    ClaudeMigrationProvider
+        .apply(&mut apply, &plan)
+        .expect("apply isolated explicit directory");
+
+    assert!(secrets.holds("directory-only-secret"));
+    for ambient in [
+        "explicit-parent-must-not-import",
+        "claude-mcp-plaintext",
+        "claude-desktop-plaintext",
+    ] {
+        assert!(!secrets.holds(ambient), "imported ambient secret {ambient}");
+    }
+    assert!(
+        !target
+            .join("config")
+            .join("migrations")
+            .join("claude")
+            .join("claude.json")
+            .exists()
+    );
+    assert!(
+        !target
+            .join("config")
+            .join("migrations")
+            .join("claude")
+            .join("desktop.json")
+            .exists()
+    );
+}
+
+#[test]
 fn missing_explicit_claude_source_never_falls_back_to_defaults() {
     let root = TestDir::new("claude-missing-explicit");
     seed_claude_home(&root);

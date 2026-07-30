@@ -3,8 +3,11 @@
 //! Plans are side-effect free and serialize as the frozen legacy migration
 //! result contract. [`MigrationPlan::report`] adds a diagnostics-oriented
 //! operation summary without changing that frozen shape. Apply creates and
-//! verifies backups before writing, while rollback restores files and
-//! secret-store entries and reports every independent restoration failure.
+//! verifies backups before writing, journals cross-type name transitions, and
+//! commits secrets through a durable transaction. Restart recovery and public
+//! rollback share the same target lock and validated receipt path. Files and
+//! directories occupy separate digest domains, and supported Unix targets use
+//! native path exchange so an overwrite never exposes an absent destination.
 
 mod contract;
 mod engine;

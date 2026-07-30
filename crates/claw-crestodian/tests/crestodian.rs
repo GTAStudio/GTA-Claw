@@ -269,8 +269,10 @@ fn incompatible_config_and_state_are_detected_without_mutation() {
     let directory = common::TestDirectory::create();
     let config_path = directory.path().join("config.json5");
     let state_path = directory.path().join("crestodian.json");
-    let future_config = VALID.replace("schema_version: 1", "schema_version: 99");
-    let future_state = br#"{"schema_version":99,"setup_completed":false,"workspace":null,"last_recovery_unix_ms":null}"#;
+    let future_config = VALID
+        .replace("schema_version: 1", "schema_version: 99")
+        .replace("core: {", "future_only: true,\n  core: {");
+    let future_state = br#"{"schema_version":99,"setup_completed":false,"workspace":null,"last_recovery_unix_ms":null,"future_only":true}"#;
     std::fs::write(&config_path, future_config.as_bytes()).expect("write future config");
     std::fs::write(&state_path, future_state).expect("write future state");
 

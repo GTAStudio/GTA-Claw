@@ -86,8 +86,7 @@ pub fn write_file(
 ) -> Result<WriteOutcome, ConfigError> {
     let path = path.as_ref();
     let contents = to_json5(snapshot)?;
-    atomic_write_bytes(path, contents.as_bytes(), || Ok(()))
-        .map_err(|error| ConfigError::io(path, error))
+    PublicationLock::acquire(path)?.write_bytes(contents.as_bytes())
 }
 
 /// Atomically writes non-secret auxiliary bytes with the same path hardening.
@@ -108,7 +107,7 @@ pub fn write_bytes_atomically(
     contents: &[u8],
 ) -> Result<WriteOutcome, ConfigError> {
     let path = path.as_ref();
-    atomic_write_bytes(path, contents, || Ok(())).map_err(|error| ConfigError::io(path, error))
+    PublicationLock::acquire(path)?.write_bytes(contents)
 }
 
 /// Atomically copies one regular file with the same destination hardening.
@@ -128,25 +127,7 @@ pub fn copy_file_atomically(
 ) -> Result<WriteOutcome, ConfigError> {
     let source = source.as_ref();
     let destination = destination.as_ref();
-    let metadata = fs::symlink_metadata(source).map_err(|error| ConfigError::io(source, error))?;
-    if is_link_or_reparse(&metadata) || !metadata.is_file() {
-        return Err(ConfigError::io(
-            source,
-            unsafe_path("copy source must be a regular file, not a symlink or reparse point"),
-        ));
-    }
-    let permissions = metadata.permissions();
-    let mut input = File::open(source).map_err(|error| ConfigError::io(source, error))?;
-    atomic_replace(
-        destination,
-        |output| {
-            io::copy(&mut input, output)?;
-            output.set_permissions(permissions)?;
-            Ok(())
-        },
-        || Ok(()),
-    )
-    .map_err(|error| ConfigError::io(destination, error))
+    PublicationLock::acquire(destination)?.copy_from(source)
 }
 
 pub(crate) fn atomic_write_bytes(
@@ -154,15 +135,184 @@ pub(crate) fn atomic_write_bytes(
     contents: &[u8],
     precommit: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<WriteOutcome> {
-    atomic_replace(path, |file| file.write_all(contents), precommit)
+    PublicationLock::acquire_io(path)?.write_bytes_with_precommit(contents, precommit)
 }
 
-fn atomic_replace(
-    path: &Path,
+/// Stable sibling-file lock held across a compare/check/publish transaction.
+///
+/// All GTA Claw atomic publication helpers acquire this same lock. Advanced
+/// callers may hold it while re-reading and validating the destination, then
+/// publish through the guard without reopening a race before rename.
+pub struct PublicationLock {
+    destination: PathBuf,
+    _file: File,
+}
+
+impl PublicationLock {
+    /// Acquires the stable publication lock for `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Io`] when the destination or lock path is unsafe,
+    /// cannot be opened, synchronized, or locked.
+    pub fn acquire(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
+        Self::acquire_io(path).map_err(|error| ConfigError::io(path, error))
+    }
+
+    fn acquire_io(path: &Path) -> io::Result<Self> {
+        let destination = prepare_destination(path)?;
+        let lock_path = publication_lock_path(&destination);
+        let existed = match fs::symlink_metadata(&lock_path) {
+            Ok(metadata) => {
+                if is_link_or_reparse(&metadata) || !metadata.is_file() {
+                    return Err(unsafe_path(
+                        "publication lock must be a regular file, not a symlink or reparse point",
+                    ));
+                }
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        let file = if existed {
+            open_publication_lock(&lock_path, false)?
+        } else {
+            match open_publication_lock(&lock_path, true) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(&lock_path)?;
+                    if is_link_or_reparse(&metadata) || !metadata.is_file() {
+                        return Err(unsafe_path(
+                            "publication lock must be a regular file, not a symlink or reparse \
+                             point",
+                        ));
+                    }
+                    open_publication_lock(&lock_path, false)?
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let metadata = fs::symlink_metadata(&lock_path)?;
+        if is_link_or_reparse(&metadata) || !metadata.is_file() {
+            return Err(unsafe_path(
+                "publication lock must remain a regular file while opening",
+            ));
+        }
+        if !existed {
+            sync_parent(&lock_path)?;
+        }
+        file.lock()?;
+        Ok(Self {
+            destination,
+            _file: file,
+        })
+    }
+
+    /// Returns the canonical destination protected by this guard.
+    #[must_use]
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    /// Publishes bytes while retaining this guard's stable lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Io`] when writing, synchronizing, or atomically
+    /// replacing the destination fails.
+    pub fn write_bytes(&self, contents: &[u8]) -> Result<WriteOutcome, ConfigError> {
+        self.write_bytes_with_precommit(contents, || Ok(()))
+            .map_err(|error| ConfigError::io(&self.destination, error))
+    }
+
+    /// Copies one regular source file while retaining this guard's stable lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Io`] when the source is unsafe or any copy,
+    /// synchronization, or publication step fails.
+    pub fn copy_from(&self, source: impl AsRef<Path>) -> Result<WriteOutcome, ConfigError> {
+        let source = source.as_ref();
+        let metadata =
+            fs::symlink_metadata(source).map_err(|error| ConfigError::io(source, error))?;
+        if is_link_or_reparse(&metadata) || !metadata.is_file() {
+            return Err(ConfigError::io(
+                source,
+                unsafe_path("copy source must be a regular file, not a symlink or reparse point"),
+            ));
+        }
+        let permissions = metadata.permissions();
+        let mut input = File::open(source).map_err(|error| ConfigError::io(source, error))?;
+        self.replace(
+            |output| {
+                io::copy(&mut input, output)?;
+                output.set_permissions(permissions)?;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .map_err(|error| ConfigError::io(&self.destination, error))
+    }
+
+    pub(crate) fn write_bytes_with_precommit(
+        &self,
+        contents: &[u8],
+        precommit: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<WriteOutcome> {
+        self.replace(|file| file.write_all(contents), precommit)
+    }
+
+    fn replace(
+        &self,
+        populate: impl FnOnce(&mut File) -> io::Result<()>,
+        precommit: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<WriteOutcome> {
+        atomic_replace_locked(&self.destination, populate, precommit)
+    }
+}
+
+#[cfg(unix)]
+fn open_publication_lock(path: &Path, create_new: bool) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    if create_new {
+        options.create_new(true);
+    }
+    options.open(path)
+}
+
+#[cfg(not(unix))]
+fn open_publication_lock(path: &Path, create_new: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    if create_new {
+        options.create_new(true);
+    }
+    options.open(path)
+}
+
+pub(crate) fn publication_lock_path(destination: &Path) -> PathBuf {
+    destination.with_file_name(format!(
+        ".{}.gta-claw.lock",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config")
+    ))
+}
+
+fn atomic_replace_locked(
+    destination: &Path,
     populate: impl FnOnce(&mut File) -> io::Result<()>,
     precommit: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<WriteOutcome> {
-    let destination = prepare_destination(path)?;
     let existing = fs::symlink_metadata(&destination).ok();
     let (mut temporary, mut file) = TemporaryArtifact::create(&destination, "tmp")?;
 
@@ -257,12 +407,274 @@ fn reject_unsafe_ancestors(path: &Path) -> io::Result<()> {
         }
         let metadata = fs::symlink_metadata(ancestor)?;
         if is_link_or_reparse(&metadata) {
+            if trusted_platform_alias(ancestor)? {
+                continue;
+            }
             return Err(unsafe_path(
                 "destination parent chain must not contain symlinks or reparse points",
             ));
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_platform_alias(path: &Path) -> io::Result<bool> {
+            let expected = if path == Path::new("/var") {
+                Some(Path::new("/private/var"))
+            } else if path == Path::new("/tmp") {
+                Some(Path::new("/private/tmp"))
+            } else {
+                None
+            };
+            expected.map_or(Ok(false), |expected| {
+                Ok(fs::canonicalize(path)? == expected)
+            })
+        }
+
+#[cfg(not(target_os = "macos"))]
+fn trusted_platform_alias(_path: &Path) -> io::Result<bool> {
+            Ok(false)
+        }
+
+/// Returns whether this target provides a native atomic path exchange.
+#[must_use]
+pub const fn atomic_exchange_supported() -> bool {
+            cfg!(all(
+                unix,
+                any(target_os = "linux", target_os = "android", target_vendor = "apple")
+            ))
+        }
+
+/// Atomically exchanges two existing sibling paths.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::Unsupported`] when the target has no native exchange
+/// primitive, and otherwise reports the platform rename failure.
+pub fn exchange_paths_atomically(first: &Path, second: &Path) -> io::Result<()> {
+            let first_parent = first
+                .parent()
+                .ok_or_else(|| unsafe_path("first exchange path has no parent"))?;
+            if second.parent() != Some(first_parent) {
+                return Err(unsafe_path("atomic exchange paths must be siblings"));
+            }
+            let absolute_parent = if first_parent.is_absolute() {
+                first_parent.to_owned()
+            } else {
+                std::env::current_dir()?.join(first_parent)
+            };
+            reject_unsafe_ancestors(&absolute_parent)?;
+            for path in [first, second] {
+                let metadata = fs::symlink_metadata(path)?;
+                if is_link_or_reparse(&metadata) {
+                    return Err(unsafe_path(
+                        "atomic exchange refuses symlinks and reparse points",
+                    ));
+                }
+            }
+            path_exchange::exchange(first, second)
+        }
+
+        /// Atomically publishes `replacement` over `destination` while retaining the
+        /// displaced destination at `displaced`.
+        ///
+        /// On Unix, `displaced` must equal `replacement` and native exchange leaves the
+        /// old destination there. Windows uses `ReplaceFileW` with the caller-journaled
+        /// third path.
+        ///
+        /// # Errors
+        ///
+        /// Returns an operating-system error without silently degrading to a blind
+        /// overwrite.
+        pub fn displace_file_atomically(
+            replacement: &Path,
+            destination: &Path,
+            displaced: &Path,
+        ) -> io::Result<()> {
+            #[cfg(unix)]
+            {
+                if displaced != replacement {
+                    return Err(unsafe_path(
+                        "Unix atomic displacement must reuse the replacement path",
+                    ));
+                }
+                return exchange_paths_atomically(replacement, destination);
+            }
+            #[cfg(windows)]
+            {
+                return windows_replace::replace_to_displacement(
+                    destination,
+                    replacement,
+                    displaced,
+                );
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let _ = (replacement, destination, displaced);
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "atomic file displacement is not available on this platform",
+                ))
+            }
+        }
+
+        /// Renames `from` to `to` only when `to` is still absent.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`io::ErrorKind::AlreadyExists`] when another writer created `to`,
+        /// or [`io::ErrorKind::Unsupported`] where no atomic no-replace primitive exists.
+        pub fn rename_path_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+            #[cfg(unix)]
+            {
+                return path_exchange::no_replace(from, to);
+            }
+            #[cfg(windows)]
+            {
+                return fs::rename(from, to);
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let _ = (from, to);
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "atomic no-replace rename is not available on this platform",
+                ))
+            }
+        }
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+#[expect(
+    unsafe_code,
+    reason = "renameat2 is the only atomic exchange primitive on Linux/Android"
+)]
+mod path_exchange {
+            use std::ffi::CString;
+            use std::io;
+            use std::os::unix::ffi::OsStrExt;
+            use std::path::Path;
+
+            fn c_path(path: &Path) -> io::Result<CString> {
+                CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "path contains an interior NUL byte",
+                    )
+                })
+            }
+
+            pub(super) fn exchange(first: &Path, second: &Path) -> io::Result<()> {
+                let first = c_path(first)?;
+                let second = c_path(second)?;
+                // SAFETY: Both pointers reference live NUL-terminated path buffers.
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_renameat2,
+                        libc::AT_FDCWD,
+                        first.as_ptr(),
+                        libc::AT_FDCWD,
+                        second.as_ptr(),
+                        libc::RENAME_EXCHANGE,
+                    )
+                };
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+
+                pub(super) fn no_replace(from: &Path, to: &Path) -> io::Result<()> {
+                    let from = c_path(from)?;
+                    let to = c_path(to)?;
+                    // SAFETY: Both pointers reference live NUL-terminated path buffers.
+                    let result = unsafe {
+                        libc::syscall(
+                            libc::SYS_renameat2,
+                            libc::AT_FDCWD,
+                            from.as_ptr(),
+                            libc::AT_FDCWD,
+                            to.as_ptr(),
+                            libc::RENAME_NOREPLACE,
+                        )
+                    };
+                    if result == 0 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::last_os_error())
+                    }
+                }
+            }
+        }
+
+#[cfg(all(unix, target_vendor = "apple"))]
+#[expect(
+    unsafe_code,
+    reason = "renamex_np is the only atomic exchange primitive on Apple targets"
+)]
+mod path_exchange {
+            use std::ffi::CString;
+            use std::io;
+            use std::os::unix::ffi::OsStrExt;
+            use std::path::Path;
+
+            fn c_path(path: &Path) -> io::Result<CString> {
+                CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "path contains an interior NUL byte",
+                    )
+                })
+            }
+
+            pub(super) fn exchange(first: &Path, second: &Path) -> io::Result<()> {
+                let first = c_path(first)?;
+                let second = c_path(second)?;
+                // SAFETY: Both pointers reference live NUL-terminated path buffers.
+                let result =
+                    unsafe { libc::renamex_np(first.as_ptr(), second.as_ptr(), libc::RENAME_SWAP) };
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+
+                pub(super) fn no_replace(from: &Path, to: &Path) -> io::Result<()> {
+                    let from = c_path(from)?;
+                    let to = c_path(to)?;
+                    // SAFETY: Both pointers reference live NUL-terminated path buffers.
+                    let result =
+                        unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+                    if result == 0 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::last_os_error())
+                    }
+                }
+            }
+        }
+
+#[cfg(not(all(
+    unix,
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+)))]
+mod path_exchange {
+            use std::io;
+            use std::path::Path;
+
+            pub(super) fn exchange(_first: &Path, _second: &Path) -> io::Result<()> {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "atomic path exchange is not available on this platform",
+                ))
+            }
+
+            pub(super) fn no_replace(_from: &Path, _to: &Path) -> io::Result<()> {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "atomic no-replace rename is not available on this platform",
+                ))
+            }
 }
 
 #[cfg(unix)]
@@ -472,6 +884,42 @@ mod windows_replace {
         replace_with_backup_and_cleanup(destination, replacement, TemporaryArtifact::cleanup)
     }
 
+    pub(super) fn replace_to_displacement(
+        destination: &Path,
+        replacement: &Path,
+        displaced: &Path,
+    ) -> io::Result<()> {
+        match fs::symlink_metadata(displaced) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "journaled displacement path already exists",
+                ));
+            }
+        }
+        let destination_wide = wide(destination);
+        let replacement_wide = wide(replacement);
+        let displaced_wide = wide(displaced);
+        // SAFETY: All buffers are valid NUL-terminated UTF-16 paths for the call.
+        let replaced = unsafe {
+            ReplaceFileW(
+                destination_wide.as_ptr(),
+                replacement_wide.as_ptr(),
+                displaced_wide.as_ptr(),
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        if replaced == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     fn replace_with_backup_and_cleanup(
         destination: &Path,
         replacement: &Path,
@@ -510,7 +958,7 @@ mod windows_replace {
 
         let replace_error = io::Error::last_os_error();
         let replace_error_kind = replace_error.kind();
-        restore_backup(destination, &mut backup).map_err(|restore_error| {
+        resolve_failed_replace(destination, &mut backup).map_err(|restore_error| {
             io::Error::new(
                 replace_error_kind,
                 format!(
@@ -533,17 +981,44 @@ mod windows_replace {
         })
     }
 
-    fn restore_backup(destination: &Path, backup: &mut TemporaryArtifact) -> io::Result<()> {
-        if !backup.path().try_exists()? {
-            backup.disarm();
-            return Ok(());
-        }
-        if destination.try_exists()? {
-            return backup.cleanup();
-        }
-        fs::rename(backup.path(), destination)?;
+    #[cfg(test)]
+    pub(super) fn resolve_injected_uncertain_state(
+        destination: &Path,
+        backup_bytes: &[u8],
+    ) -> (std::path::PathBuf, io::Error) {
+        let mut backup =
+            TemporaryArtifact::reserve_path(destination, "uncertain").expect("reserve backup path");
+        fs::write(backup.path(), backup_bytes).expect("write injected exact backup");
+        let path = backup.path().to_owned();
+        let error = resolve_failed_replace(destination, &mut backup)
+            .expect_err("destination plus backup must remain uncertain");
+        (path, error)
+    }
+
+    fn resolve_failed_replace(
+        destination: &Path,
+        backup: &mut TemporaryArtifact,
+    ) -> io::Result<()> {
+        let backup_path = backup.path().to_owned();
         backup.disarm();
-        Ok(())
+        match fs::symlink_metadata(&backup_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        match fs::symlink_metadata(destination) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::rename(&backup_path, destination)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        Err(io::Error::other(format!(
+            "replacement outcome is uncertain because both destination and exact Windows backup \
+             exist; backup was preserved at {}",
+            backup_path.display()
+        )))
     }
 
     fn wide(path: &Path) -> Vec<u16> {
@@ -559,7 +1034,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{ConfigError, atomic_write_bytes};
+    use super::{
+        ConfigError, atomic_write_bytes, exchange_paths_atomically, publication_lock_path,
+    };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -571,6 +1048,15 @@ mod tests {
         std::fs::write(&path, "old").expect("write old file");
 
         let error = atomic_write_bytes(&path, b"new", || {
+            let external = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(publication_lock_path(&path))
+                .expect("open stable publication lock");
+            assert!(matches!(
+                external.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
             Err(io::Error::other(InjectedPrecommitFailure))
         })
         .map_err(|source| ConfigError::io(&path, source))
@@ -591,7 +1077,54 @@ mod tests {
             .expect("read temporary directory")
             .collect::<Result<Vec<_>, _>>()
             .expect("collect directory entries");
-        assert_eq!(entries.len(), 1, "temporary artifacts must be removed");
+        assert_eq!(
+            entries.len(),
+            2,
+            "only destination and stable lock may remain after temporary cleanup"
+        );
+        drop(cleanup);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn native_exchange_swaps_file_and_directory_without_an_absent_name() {
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let file = directory.join("file");
+        let folder = directory.join("folder");
+        std::fs::write(&file, b"file bytes").expect("write file");
+        std::fs::create_dir(&folder).expect("create directory");
+        std::fs::write(folder.join("child"), b"directory bytes").expect("write child");
+
+        exchange_paths_atomically(&file, &folder).expect("exchange file and directory");
+
+        assert!(file.is_dir());
+        assert_eq!(
+            std::fs::read(file.join("child")).expect("read exchanged directory"),
+            b"directory bytes"
+        );
+        assert_eq!(
+            std::fs::read(&folder).expect("read exchanged file"),
+            b"file bytes"
+        );
+        drop(cleanup);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn standard_var_temp_alias_is_canonicalized_safely() {
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "claw-config-alias-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create raw temp alias directory");
+        let cleanup = Cleanup(directory.clone());
+        let path = directory.join("config.json");
+
+        atomic_write_bytes(&path, b"safe", || Ok(())).expect("write through /var temp alias");
+
+        assert_eq!(std::fs::read(path).expect("read published bytes"), b"safe");
         drop(cleanup);
     }
 
@@ -628,6 +1161,32 @@ mod tests {
         assert!(message.contains("injected backup cleanup failure"));
         assert_eq!(std::fs::read_to_string(&path).expect("read backup"), "old");
         std::fs::remove_file(path).expect("remove retained backup");
+        drop(cleanup);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uncertain_replace_failure_preserves_destination_and_exact_backup() {
+        use super::windows_replace;
+
+        let directory = temporary_directory();
+        let cleanup = Cleanup(directory.clone());
+        let destination = directory.join("config.json5");
+        std::fs::write(&destination, b"possibly-published").expect("write destination");
+
+        let (backup, error) =
+            windows_replace::resolve_injected_uncertain_state(&destination, b"exact-old");
+
+        assert!(error.to_string().contains("outcome is uncertain"));
+        assert_eq!(
+            std::fs::read(destination).expect("destination preserved"),
+            b"possibly-published"
+        );
+        assert_eq!(
+            std::fs::read(&backup).expect("exact backup retained"),
+            b"exact-old"
+        );
+        std::fs::remove_file(backup).expect("remove retained backup");
         drop(cleanup);
     }
 
