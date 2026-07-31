@@ -316,3 +316,30 @@ pub use admin_rpc::{
     BearerAdminRpcAuthenticator, DenyAllAuthenticator, FnAuthenticator, dispatch_status,
     operator_scope_to_security,
 };
+
+#[path = "webhooks/guard.rs"]
+mod webhook_guard;
+
+pub use webhook_guard::{
+    AdmittedWebhook, PathRejection, ReplayPolicy, ResolvedWebhookRoute, SystemWebhookClock,
+    WEBHOOK_DELIVERY_HEADER, WEBHOOK_SECRET_HEADER, WEBHOOK_SESSION_HEADER,
+    WEBHOOK_TIMESTAMP_HEADER, WebhookClock, WebhookConfigError, WebhookGuard, WebhookGuardConfig,
+    WebhookRejection, WebhookRouteBinding,
+};
+
+impl HttpApi {
+    /// Puts a [`WebhookGuard`] in front of every webhook path it covers.
+    ///
+    /// The guard resolves an operator-chosen path to its route, refuses a
+    /// delivery that replays an identifier or claims another session, and only
+    /// then forwards the request to the frozen `/plugins/webhooks/{routeId}`
+    /// dispatcher. Every other route is passed through untouched.
+    #[must_use]
+    pub fn with_webhook_guard(self, guard: WebhookGuard) -> Self {
+        Self {
+            router: webhook_guard::guard_router(self.router, guard),
+            mcp_router: self.mcp_router,
+            watch: self.watch,
+        }
+    }
+}
