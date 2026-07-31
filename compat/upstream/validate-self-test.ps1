@@ -480,6 +480,139 @@ function Write-Json {
     [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Get-Sha256OfText {
+    param([string]$Text)
+    # Mirrors Get-Sha256Text in validate.ps1 deliberately: the self-test must
+    # compute the pin the same way the validator does, or a case would fail on a
+    # hashing difference rather than on the rule it is planted to exercise.
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return (($algorithm.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text)) |
+            ForEach-Object { $_.ToString("x2") }) -join "")
+    } finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Set-SelfTestSweepText {
+    param(
+        [string]$CaseRoot,
+        [string]$Text
+    )
+    $recordPath = Join-Path $CaseRoot "evidence-reachability-sweep.tsv"
+    [System.IO.File]::WriteAllText(
+        $recordPath,
+        $Text,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+
+    $digest = Get-Sha256OfText ($Text -replace "`r`n", "`n")
+    $validatorPath = Join-Path $CaseRoot "validate.ps1"
+    $validator = [System.IO.File]::ReadAllText($validatorPath)
+    $pinPattern = '\$ExpectedEvidenceSweepDigest = "([0-9a-f]{64})"'
+    $pinMatches = [regex]::Matches($validator, $pinPattern)
+    if ($pinMatches.Count -ne 1) {
+        throw "Set-SelfTestSweepText found $($pinMatches.Count) evidence sweep digest pins in $validatorPath"
+    }
+    $updated = [regex]::Replace(
+        $validator,
+        $pinPattern,
+        ('$ExpectedEvidenceSweepDigest = "' + $digest + '"'))
+    if ($updated -eq $validator -and
+        -not (Test-OrdinalStringEqual $pinMatches[0].Groups[1].Value $digest)) {
+        throw "Set-SelfTestSweepText could not re-pin `$ExpectedEvidenceSweepDigest in $validatorPath"
+    }
+    [System.IO.File]::WriteAllText(
+        $validatorPath,
+        $updated,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+}
+
+function Set-SelfTestSweepRecord {
+    param(
+        [string]$CaseRoot,
+        [string[]]$Rows,
+        [ValidateSet("LF", "CRLF")]
+        [string]$LineEndings = "CRLF"
+    )
+    # Writes a well-formed evidence sweep record AND re-pins its digest in the
+    # case's own copy of validate.ps1. Without the re-pin every one of these cases
+    # would stop at the digest, pass, and prove nothing about the rules behind it
+    # -- a negative case that fails for a reason other than the one it names is
+    # the defect this suite exists to find, so it must not be one itself.
+    $accept = @($Rows | Where-Object { $_.StartsWith("accept`t") }).Count
+    $reject = @($Rows | Where-Object { $_.StartsWith("reject`t") }).Count
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("# GTA-Claw acceptance-evidence reachability sweep.")
+    $lines.Add("# Every .rs file in the working tree, judged by the reachability rule shipped in")
+    $lines.Add("# validate.ps1. A cross-check record only: nothing here decides whether a feature")
+    $lines.Add("# row is accepted. Regenerate ONLY through the reviewed command, never by hand:")
+    $lines.Add("#   powershell -NoProfile -File compat/upstream/validate.ps1 -ReplayEvidenceSweep")
+    $lines.Add("# generated-by: validate.ps1 -ReplayEvidenceSweep")
+    $lines.Add("# base-commit: 0000000000000000000000000000000000000000")
+    $lines.Add("# swept-at: 2026-07-26")
+    $lines.Add(("# totals: files={0} accept={1} reject={2}" -f $Rows.Count, $accept, $reject))
+    foreach ($row in $Rows) { $lines.Add($row) }
+    $newline = $(if ($LineEndings -eq "LF") { "`n" } else { "`r`n" })
+    $text = [string]::Join($newline, $lines.ToArray()) + $newline
+    Set-SelfTestSweepText $CaseRoot $text
+}
+
+function Set-SelfTestSweepVerdict {
+    param(
+        [string]$CaseRoot,
+        [string]$Path,
+        [ValidateSet("accept", "reject")]
+        [string]$Verdict
+    )
+    $recordPath = Join-Path $CaseRoot "evidence-reachability-sweep.tsv"
+    $lines = @(([System.IO.File]::ReadAllText($recordPath) -replace "`r`n", "`n") -split "`n")
+    $rows = New-Object System.Collections.Generic.List[string]
+    $found = $false
+    foreach ($line in $lines) {
+        if (-not [regex]::IsMatch($line, '\A(?:accept|reject)\t')) { continue }
+        $rowPath = $line.Substring($line.IndexOf("`t") + 1)
+        if (Test-OrdinalStringEqual $rowPath $Path) {
+            $rows.Add(("{0}`t{1}" -f $Verdict, $rowPath))
+            $found = $true
+        } else {
+            $rows.Add($line)
+        }
+    }
+    if (-not $found) {
+        throw "Set-SelfTestSweepVerdict did not find '$Path' in $recordPath"
+    }
+    Set-SelfTestSweepRecord $CaseRoot $rows.ToArray()
+}
+
+function Set-SelfTestSweepExpectedTotals {
+    param(
+        [string]$CaseRoot,
+        [int]$Files,
+        [int]$Accepted,
+        [int]$Rejected
+    )
+    $validatorPath = Join-Path $CaseRoot "validate.ps1"
+    $validator = [System.IO.File]::ReadAllText($validatorPath)
+    $replacements = [ordered]@{
+        '\$EvidenceSweepExpectedFiles = [0-9]+' = "`$EvidenceSweepExpectedFiles = $Files"
+        '\$EvidenceSweepExpectedAccepted = [0-9]+' = "`$EvidenceSweepExpectedAccepted = $Accepted"
+        '\$EvidenceSweepExpectedRejected = [0-9]+' = "`$EvidenceSweepExpectedRejected = $Rejected"
+    }
+    foreach ($pattern in $replacements.Keys) {
+        if ([regex]::Matches($validator, $pattern).Count -ne 1) {
+            throw "Set-SelfTestSweepExpectedTotals did not find exactly one '$pattern' in $validatorPath"
+        }
+        $validator = [regex]::Replace($validator, $pattern, [string]$replacements[$pattern])
+    }
+    [System.IO.File]::WriteAllText(
+        $validatorPath,
+        $validator,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+}
+
 function Test-OrdinalStringEqual {
     param(
         [AllowNull()]
@@ -488,6 +621,18 @@ function Test-OrdinalStringEqual {
         [string]$Right
     )
     return [StringComparer]::Ordinal.Equals($Left, $Right)
+}
+
+function Test-ByteArrayEqual {
+    param(
+        [byte[]]$Left,
+        [byte[]]$Right
+    )
+    if ($Left.Length -ne $Right.Length) { return $false }
+    for ($index = 0; $index -lt $Left.Length; $index += 1) {
+        if ($Left[$index] -ne $Right[$index]) { return $false }
+    }
+    return $true
 }
 
 function ConvertTo-PowerShellLiteral {
@@ -499,7 +644,8 @@ function Invoke-Validator {
     param(
         [string]$CaseRoot,
         [string]$RepositoryRootOverride,
-        [switch]$WriteLedgerDigests
+        [switch]$WriteLedgerDigests,
+        [switch]$ReplayEvidenceSweep
     )
     # The child is started through System.Diagnostics.Process rather than the
     # PowerShell call operator for three reasons:
@@ -523,6 +669,9 @@ function Invoke-Validator {
         (ConvertTo-PowerShellLiteral $repositoryRoot)
     if ($WriteLedgerDigests) {
         $invocation += " -WriteLedgerDigests"
+    }
+    if ($ReplayEvidenceSweep) {
+        $invocation += " -ReplayEvidenceSweep"
     }
     $command = '$ErrorActionPreference = ''Stop''; try { ' + $invocation +
         ' } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }'
@@ -2654,6 +2803,294 @@ $cases = @(
             $path = Join-Path $caseRoot "validate-self-test.ps1"
             Add-Content -LiteralPath $path -Value "# harmless-looking comment"
         }
+    },
+    # Evidence sweep topology and outer-integrity controls.
+    [ordered]@{
+        name = "evidence-sweep-record-removed-is-rejected"
+        expected_message = "missing=[evidence-reachability-sweep.tsv]"
+        mutate = {
+            param($caseRoot)
+            Remove-Item -LiteralPath (Join-Path $caseRoot "evidence-reachability-sweep.tsv") -Force
+        }
+    },
+    # One flipped verdict, and nothing else touched. This is the cheapest possible
+    # forgery -- relabel a refusal as accepted so a weakened rule looks agreed --
+    # and the digest is what refuses it.
+    [ordered]@{
+        name = "evidence-sweep-refusal-relabelled-accept-is-rejected"
+        expected_message = "evidence-reachability-sweep.tsv digest mismatch"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $text = [System.IO.File]::ReadAllText($path)
+            [System.IO.File]::WriteAllText($path, ($text -replace "(?m)^reject\t", "accept`t"))
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-tamper-survives-digest-regeneration"
+        expected_message = "evidence-reachability-sweep.tsv digest mismatch"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            Add-Content -LiteralPath $path -Value "accept`tcrates/synthetic/src/lib.rs"
+        }
+    },
+    # Every coordinated verdict attack below rewrites the internally consistent
+    # totals and re-pins the outer digest. The only possible refusal is therefore
+    # the independently recomputed semantic verdict.
+    [ordered]@{
+        name = "evidence-sweep-policy-snapshot-refusal-hidden-is-rejected"
+        expected_message = "semantic mismatch for '.github/trusted/desktop-supply-chain-policy/policy/final/desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs': record says 'accept', shipped reachability rule says 'reject'"
+        mutate = {
+            param($caseRoot)
+            Set-SelfTestSweepVerdict $caseRoot `
+                ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs" `
+                "accept"
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-config-build-refusal-hidden-is-rejected"
+        expected_message = "semantic mismatch for 'crates/claw-config/build.rs': record says 'accept', shipped reachability rule says 'reject'"
+        mutate = {
+            param($caseRoot)
+            Set-SelfTestSweepVerdict $caseRoot "crates/claw-config/build.rs" "accept"
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-protocol-build-refusal-hidden-is-rejected"
+        expected_message = "semantic mismatch for 'crates/claw-protocol/build.rs': record says 'accept', shipped reachability rule says 'reject'"
+        mutate = {
+            param($caseRoot)
+            Set-SelfTestSweepVerdict $caseRoot "crates/claw-protocol/build.rs" "accept"
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-desktop-build-refusal-hidden-is-rejected"
+        expected_message = "semantic mismatch for 'desktop/apps/gta-claw-desktop/build.rs': record says 'accept', shipped reachability rule says 'reject'"
+        mutate = {
+            param($caseRoot)
+            Set-SelfTestSweepVerdict $caseRoot "desktop/apps/gta-claw-desktop/build.rs" "accept"
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-harnessless-refusal-hidden-is-rejected"
+        expected_message = "semantic mismatch for 'desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs': record says 'accept', shipped reachability rule says 'reject'"
+        mutate = {
+            param($caseRoot)
+            Set-SelfTestSweepVerdict $caseRoot `
+                "desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs" `
+                "accept"
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-accept-forged-reject-is-rejected"
+        expected_message = "semantic mismatch for '.github/trusted/desktop-supply-chain-policy/src/bootstrap_decisions.rs': record says 'reject', shipped reachability rule says 'accept'"
+        mutate = {
+            param($caseRoot)
+            Set-SelfTestSweepVerdict $caseRoot `
+                ".github/trusted/desktop-supply-chain-policy/src/bootstrap_decisions.rs" `
+                "reject"
+        }
+    },
+    # A semantically consistent undersized record reaches the exact reviewed
+    # totals only after its one row has been independently accepted.
+    [ordered]@{
+        name = "evidence-sweep-record-with-no-refusal-is-rejected"
+        expected_message = "semantic verdicts agree, but the reviewed record must contain exactly 404 files / 399 accept / 5 reject"
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-SelfTestSweepRecord $caseRoot @("accept`tcrates/synthetic/tests/enabled.rs")
+        }
+    },
+    # The direction the digest cannot see: the record stays internally consistent
+    # while the rule underneath it changes. A recorded refusal that the live rule
+    # now accepts must fail by name.
+    [ordered]@{
+        name = "evidence-sweep-refusal-the-rule-now-accepts-is-rejected"
+        expected_message = "semantic mismatch for 'crates/synthetic/tests/enabled.rs': record says 'reject', shipped reachability rule says 'accept'"
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-SelfTestSweepRecord $caseRoot @(
+                "reject`tcrates/synthetic/tests/enabled.rs",
+                "accept`tcrates/synthetic/tests/ignored.rs"
+            )
+        }
+    },
+    # Canonical grammar mutations all re-pin the outer digest, so each planted
+    # defect must be refused by its exact parser layer.
+    [ordered]@{
+        name = "evidence-sweep-reordered-header-is-rejected"
+        expected_message = "generated-by line must be exactly"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $text = [System.IO.File]::ReadAllText($path) -replace "`r`n", "`n"
+            $generated = "# generated-by: validate.ps1 -ReplayEvidenceSweep"
+            $base = "# base-commit: 4ec8a66236ca7ff7e53bba36b59fb8630ddecb71"
+            $text = $text.Replace("$generated`n$base", "$base`n$generated")
+            Set-SelfTestSweepText $caseRoot $text
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-duplicate-header-is-rejected"
+        expected_message = "canonical header line 7 must be '# base-commit:"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $text = [System.IO.File]::ReadAllText($path) -replace "`r`n", "`n"
+            $generated = "# generated-by: validate.ps1 -ReplayEvidenceSweep"
+            $text = $text.Replace("$generated`n", "$generated`n$generated`n")
+            Set-SelfTestSweepText $caseRoot $text
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-extra-header-is-rejected"
+        expected_message = "canonical header line 7 must be '# base-commit:"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $text = [System.IO.File]::ReadAllText($path) -replace "`r`n", "`n"
+            $generated = "# generated-by: validate.ps1 -ReplayEvidenceSweep"
+            $text = $text.Replace("$generated`n", "$generated`n# extra: forbidden`n")
+            Set-SelfTestSweepText $caseRoot $text
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-malformed-header-is-rejected"
+        expected_message = "generated-by line must be exactly"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $text = [System.IO.File]::ReadAllText($path) -replace "`r`n", "`n"
+            $text = $text.Replace(
+                "# generated-by: validate.ps1 -ReplayEvidenceSweep",
+                "# generated-by validate.ps1 -ReplayEvidenceSweep")
+            Set-SelfTestSweepText $caseRoot $text
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-header-after-row-is-rejected"
+        expected_message = "generated-by line must be exactly"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $sourceLines = @(([System.IO.File]::ReadAllText($path) -replace "`r`n", "`n") -split "`n")
+            $lines = New-Object System.Collections.Generic.List[string]
+            foreach ($line in $sourceLines) {
+                if ($line.Length -gt 0) { $lines.Add($line) }
+            }
+            $generated = $lines[5]
+            $lines.RemoveAt(5)
+            $lines.Insert(9, $generated)
+            Set-SelfTestSweepText $caseRoot (($lines -join "`n") + "`n")
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-wrong-generator-is-rejected"
+        expected_message = "generated-by line must be exactly"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $text = [System.IO.File]::ReadAllText($path) -replace "`r`n", "`n"
+            $text = $text.Replace(
+                "# generated-by: validate.ps1 -ReplayEvidenceSweep",
+                "# generated-by: hand-edited")
+            Set-SelfTestSweepText $caseRoot $text
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-row-extra-field-is-rejected"
+        expected_message = "must contain exactly two fields separated by one TAB"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $text = [System.IO.File]::ReadAllText($path) -replace "`r`n", "`n"
+            $row = "reject`t.github/trusted/desktop-supply-chain-policy/policy/final/desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs"
+            $text = $text.Replace($row, "$row`textra")
+            Set-SelfTestSweepText $caseRoot $text
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-row-order-is-ordinal"
+        expected_message = "rows must be strictly ascending by path"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $text = [System.IO.File]::ReadAllText($path) -replace "`r`n", "`n"
+            $first = "reject`t.github/trusted/desktop-supply-chain-policy/policy/final/desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs"
+            $second = "accept`t.github/trusted/desktop-supply-chain-policy/src/bootstrap_decisions.rs"
+            $text = $text.Replace("$first`n$second", "$second`n$first")
+            Set-SelfTestSweepText $caseRoot $text
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-duplicate-row-is-rejected"
+        expected_message = "rows must be strictly ascending by path"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $text = [System.IO.File]::ReadAllText($path) -replace "`r`n", "`n"
+            $row = "reject`t.github/trusted/desktop-supply-chain-policy/policy/final/desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs"
+            $text = $text.Replace("$row`n", "$row`n$row`n")
+            Set-SelfTestSweepText $caseRoot $text
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-relative-segment-is-rejected"
+        expected_message = "must not contain relative segments"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $text = [System.IO.File]::ReadAllText($path) -replace "`r`n", "`n"
+            $row = "accept`t.github/trusted/desktop-supply-chain-policy/src/bootstrap_decisions.rs"
+            $text = $text.Replace($row, "accept`t../bootstrap_decisions.rs")
+            Set-SelfTestSweepText $caseRoot $text
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-mixed-line-endings-are-rejected"
+        expected_message = "mixes LF and CRLF"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $text = [System.IO.File]::ReadAllText($path) -replace "`r`n", "`n"
+            $firstLf = $text.IndexOf("`n", [StringComparison]::Ordinal)
+            $text = $text.Substring(0, $firstLf) + "`r`n" + $text.Substring($firstLf + 1)
+            Set-SelfTestSweepText $caseRoot $text
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-uniform-crlf-passes"
+        expect_success = $true
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $text = ([System.IO.File]::ReadAllText($path) -replace "`r`n", "`n").Replace("`n", "`r`n")
+            Set-SelfTestSweepText $caseRoot $text
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-uniform-lf-passes"
+        expect_success = $true
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $text = [System.IO.File]::ReadAllText($path) -replace "`r`n", "`n"
+            Set-SelfTestSweepText $caseRoot $text
+        }
+    },
+    [ordered]@{
+        name = "evidence-sweep-writer-modes-are-exclusive-before-write"
+        expected_message = "validator write modes are pairwise mutually exclusive and are rejected before any artifact write"
+        invoke_write_ledger_digests = $true
+        invoke_replay_evidence_sweep = $true
+        assert_writer_artifacts_unchanged = $true
+        mutate = {
+            param($caseRoot)
+        }
     }
 )
 
@@ -2681,26 +3118,62 @@ try {
         $caseRoot = Join-Path $temporaryRoot $case.name
         New-Item -ItemType Directory -Path $caseRoot | Out-Null
         Copy-Item -Path (Join-Path $SourceRoot "*") -Destination $caseRoot -Recurse -Force
-        & $case.mutate $caseRoot
         $caseRepositoryRoot = ""
         if ($case.Contains("repository_root")) {
             $caseRepositoryRoot = [string]$case.repository_root
         }
+        if ((Test-OrdinalStringEqual $caseRepositoryRoot $SyntheticRoot) -and
+            -not ([string]$case.name).StartsWith("evidence-sweep-", [StringComparison]::Ordinal)) {
+            # Unrelated reachability/oracle cases run against a deliberately tiny
+            # synthetic repository. Give their copied validator a complete,
+            # semantically checked sweep for that root rather than letting the real
+            # 404-row record fail first on paths the fixture does not contain.
+            Set-SelfTestSweepRecord $caseRoot @("accept`tcrates/synthetic/tests/enabled.rs")
+            Set-SelfTestSweepExpectedTotals $caseRoot 1 1 0
+        }
+        & $case.mutate $caseRoot
         if ($case.Contains("regenerate_digests") -and $case.regenerate_digests) {
             # Model an attacker who already re-blessed the mutable ledger digests.
             Invoke-Validator $caseRoot -RepositoryRootOverride $caseRepositoryRoot -WriteLedgerDigests | Out-Null
         }
 
-        $result = Invoke-Validator $caseRoot -RepositoryRootOverride $caseRepositoryRoot
+        $invokeWriteLedgerDigests =
+            $case.Contains("invoke_write_ledger_digests") -and $case.invoke_write_ledger_digests
+        $invokeReplayEvidenceSweep =
+            $case.Contains("invoke_replay_evidence_sweep") -and $case.invoke_replay_evidence_sweep
+        $assertWriterArtifactsUnchanged =
+            $case.Contains("assert_writer_artifacts_unchanged") -and $case.assert_writer_artifacts_unchanged
+        $ledgerDigestPath = Join-Path $caseRoot "ledger-digests.sha256"
+        $sweepPath = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+        $ledgerDigestBefore = $null
+        $sweepBefore = $null
+        if ($assertWriterArtifactsUnchanged) {
+            $ledgerDigestBefore = [System.IO.File]::ReadAllBytes($ledgerDigestPath)
+            $sweepBefore = [System.IO.File]::ReadAllBytes($sweepPath)
+        }
+
+        $result = Invoke-Validator `
+            $caseRoot `
+            -RepositoryRootOverride $caseRepositoryRoot `
+            -WriteLedgerDigests:$invokeWriteLedgerDigests `
+            -ReplayEvidenceSweep:$invokeReplayEvidenceSweep
         # Every case is evaluated even after one fails, so a single regression
         # cannot hide the status of the cases behind it.
         $failure = ""
-        if ($case.Contains("expect_success") -and $case.expect_success) {
+        if ($assertWriterArtifactsUnchanged) {
+            $ledgerDigestAfter = [System.IO.File]::ReadAllBytes($ledgerDigestPath)
+            $sweepAfter = [System.IO.File]::ReadAllBytes($sweepPath)
+            if (-not (Test-ByteArrayEqual $ledgerDigestBefore $ledgerDigestAfter) -or
+                -not (Test-ByteArrayEqual $sweepBefore $sweepAfter)) {
+                $failure = "mutually exclusive writer invocation changed a protected artifact before failing"
+            }
+        }
+        if ($failure.Length -eq 0 -and $case.Contains("expect_success") -and $case.expect_success) {
             $positiveCases += 1
             if ($result.exit_code -ne 0) {
                 $failure = "positive case unexpectedly failed: $($result.output)"
             }
-        } else {
+        } elseif ($failure.Length -eq 0) {
             $negativeCases += 1
             if ($result.exit_code -eq 0) {
                 $failure = "negative tamper case unexpectedly passed"
