@@ -96,8 +96,27 @@ fn require_clean_stderr(bytes: &[u8], label: &str) -> PolicyResult<()> {
     }
 }
 
-fn verify_pack_storage(checkout: &Path) -> PolicyResult<()> {
-    let pack_root = checkout.join(".git").join("objects").join("pack");
+/// Returns whether a pack-directory entry is Git's own in-flight pack write.
+///
+/// Git writes a new pack to `tmp_pack_XXXXXX` and renames it into place afterwards. That name
+/// carries no extension, so the extension allow-list below rejected it and this gate went red at
+/// random, depending only on whether a write happened to be in flight while the checkout was
+/// inspected. A security gate that fails on timing rather than on content trains reviewers to
+/// retry it, which is worse than the check not existing.
+///
+/// This admits only that one documented name. The entry must still be a regular non-symlink file
+/// and still counts toward the fixed file and byte ceilings, so neither the symlink refusal nor the
+/// storage bound is weakened. Any other unexpected name still fails closed, and should be admitted
+/// deliberately with evidence rather than by widening this predicate.
+fn is_transient_pack_write(name: &str) -> bool {
+    name.starts_with("tmp_pack_")
+}
+
+/// Validates one Git pack directory's entries, kinds and fixed storage ceilings.
+///
+/// Exposed so the rule can be exercised directly against synthetic directories, rather than only
+/// through a real checkout where the transient-write case appears at random.
+pub fn validate_pack_directory(pack_root: &Path) -> PolicyResult<()> {
     if !pack_root.is_dir() {
         return Err(PolicyError::new(format!(
             "Git pack directory is unavailable: {}",
@@ -105,7 +124,7 @@ fn verify_pack_storage(checkout: &Path) -> PolicyResult<()> {
         )));
     }
     let mut entries =
-        fs::read_dir(&pack_root).map_err(|cause| error("read Git pack directory", cause))?;
+        fs::read_dir(pack_root).map_err(|cause| error("read Git pack directory", cause))?;
     let mut count = 0_usize;
     let mut bytes = 0_u64;
     entries.try_for_each(|entry| -> PolicyResult<()> {
@@ -118,9 +137,13 @@ fn verify_pack_storage(checkout: &Path) -> PolicyResult<()> {
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
+        let transient = entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_transient_pack_write);
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
-            || !matches!(extension.as_str(), "pack" | "idx" | "rev")
+            || (!transient && !matches!(extension.as_str(), "pack" | "idx" | "rev"))
         {
             return Err(PolicyError::new(format!(
                 "Git pack directory contains an unexpected entry: {}",
@@ -139,8 +162,11 @@ fn verify_pack_storage(checkout: &Path) -> PolicyResult<()> {
             )));
         }
         Ok(())
-    })?;
-    Ok(())
+    })
+}
+
+fn verify_pack_storage(checkout: &Path) -> PolicyResult<()> {
+    validate_pack_directory(&checkout.join(".git").join("objects").join("pack"))
 }
 
 /// Verifies one checkout's exact HEAD and absence of credential-like local config.
