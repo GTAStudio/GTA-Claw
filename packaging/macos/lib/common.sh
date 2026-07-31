@@ -517,6 +517,41 @@ assert_headless_cargo_tree() {
   fi
 }
 
+# Runs the headless binaries this build produced and checks what they report
+# about themselves.
+#
+# Everything else in this repository inspects a release binary without running
+# it: lipo, otool, codesign and shasum read bytes, `spctl --assess` asks
+# Gatekeeper about a policy, and package.sh's `--version` is a productbuild
+# flag. A binary that cannot execute at all therefore passes every existing
+# check and is archived, signed and published.
+#
+# The reported strings are compared, not just the exit status. `--version`
+# prints the crate version, so a binary left over from another build fails
+# here, and `--probe` prints std::env::consts::ARCH, which is fixed at compile
+# time, so a binary built for another target fails here even when the host can
+# execute it through Rosetta. An exit-status-only check would accept both.
+assert_headless_binaries_execute() {
+  local cli="$1"
+  local daemon="$2"
+  local target="$3"
+  local rust_arch="${target%%-*}"
+  local expected
+  local actual
+
+  expected="gta-claw-cli $VERSION"
+  actual="$("$cli" --version </dev/null)" ||
+    die "packaged gta-claw-cli did not execute: $cli"
+  [[ "$actual" == "$expected" ]] ||
+    die "packaged gta-claw-cli reported '$actual', expected '$expected'"
+
+  expected="healthy runtime=macos-$rust_arch"
+  actual="$("$daemon" --probe </dev/null)" ||
+    die "packaged gta-claw-daemon did not execute: $daemon"
+  [[ "$actual" == "$expected" ]] ||
+    die "packaged gta-claw-daemon reported '$actual', expected '$expected'"
+}
+
 sha256_file() {
   shasum -a 256 "$1" | awk '{ print $1 }'
 }
