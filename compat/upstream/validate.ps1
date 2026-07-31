@@ -46,7 +46,7 @@ $ExpectedOracleCorpusCases = 120
 $ExpectedOracleCorpusTrue = 46
 # The shared reachability corpus is frozen on exactly the same terms. Its
 # expectations were produced by running cargo and rustc against each fixture, so
-# neither resolver is normative for reachability and neither may edit a case to
+# cargo and rustc arbitrate reachability, so neither resolver may edit a case to
 # match itself. -WriteLedgerDigests cannot reach these constants.
 $ExpectedReachabilityCorpusDigest = "70aec3e02f3885970ec37d61421fdc34ea932e591842d6a1669adf0e1f4880dd"
 $ExpectedReachabilityCorpusCases = 32
@@ -1030,10 +1030,10 @@ function Assert-EvidencePathShape {
 # ---------------------------------------------------------------------------
 # Enabled-test oracle.
 #
-# This is a FOLLOWER port of declares_enabled_test in
-# crates/claw-conformance/src/claims.rs, which is the NORMATIVE implementation.
-# When the Rust function changes, this must be re-ported in the same cycle; this
-# script has no independent authority to decide what counts as a real test.
+# This is the PowerShell implementation of the shared enabled-test rule. Its Rust
+# counterpart is declares_enabled_test in crates/claw-conformance/src/claims.rs;
+# rust_tokens / declares_in_items map to Get-RustTokens /
+# Test-RustDeclaresInItems. Neither implementation may change the rule alone.
 # Agreement is not asserted by hand: enabled-test-oracle.json is a shared,
 # frozen fixture corpus that both implementations must classify identically, and
 # Assert-EnabledTestOracle below replays every case on every run.
@@ -1153,19 +1153,16 @@ function Get-RustTokens {
     # collide with a punctuation marker even though identifiers may now contain
     # non-ASCII characters.
     #
-    # "lit" and "oth" are load bearing, not cosmetic. The normative tokenizer
+    # "lit" and "oth" are load bearing, not cosmetic. The Rust tokenizer
     # emits a token for every unrecognised byte, so a stray byte in front of an
     # attribute makes the following item part of the item that stray byte opened
-    # and the test stops being visible. Dropping those bytes silently, as an
-    # earlier port did, accepted sources the normative rule rejects.
+    # and the test stops being visible. Dropping those bytes silently accepts
+    # sources the Rust implementation rejects.
     #
-    # -WithStrings is a LOCAL extension with no counterpart in the normative Rust
-    # tokenizer. It emits "s:<value>" in place of "lit" for quoted strings and
-    # "=" in place of "oth" for an equals sign, so the locally owned Cargo
-    # reachability rule below can read a #[path = "..."] attribute value. It is
-    # otherwise the same stream. The oracle never passes it, so the token stream
-    # the oracle sees stays byte-identical to the Rust original; the differential
-    # is run against the default path to keep that honest.
+    # -WithStrings exposes the Rust tokenizer's StringLiteral and Equals variants
+    # as "s:<value>" and "=" so the shared reachability rule can read a
+    # #[path = "..."] attribute. The enabled-test consumer does not need those
+    # values and uses the opaque "lit" / "oth" form instead.
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Source)
     $length = $bytes.Length
     $tokens = New-Object System.Collections.Generic.List[string]
@@ -1253,7 +1250,7 @@ function Get-RustTokens {
             continue
         }
         # Identifier start: ASCII letter, underscore, or any non-ASCII byte.
-        # Walking non-ASCII a byte at a time is equivalent to the normative
+        # Walking non-ASCII a byte at a time is equivalent to Rust's
         # char::len_utf8 step, because every continuation byte of a multi-byte
         # character is itself >= 0x80 and so is consumed by the same loop.
         if (($byte -ge 65 -and $byte -le 90) -or ($byte -ge 97 -and $byte -le 122) -or $byte -eq 95 -or $byte -ge 128) {
@@ -1296,7 +1293,7 @@ function Get-RustMatchingDelimiter {
     # A typed stack, not a depth counter. Mismatched delimiters return -1 so the
     # caller fails closed. An earlier port counted only the opening delimiter's
     # own kind and ignored the others, which accepted "{ ( }" as balanced; the
-    # normative rule rejects it, and macro scanning makes that reachable.
+    # Rust implementation rejects it, and macro scanning makes that reachable.
     if ($Open -lt 0) {
         return -1
     }
@@ -1679,12 +1676,11 @@ function Test-DeclaresEnabledRustTest {
 
 function Assert-EnabledTestOracle {
     param([object]$Corpus)
-    # Replays the shared fixture corpus on every run. This is the drift detector
-    # between the two independently owned trust roots: crates/claw-conformance
-    # owns the normative rule, this script owns a port of it, and both must
-    # classify all of these cases identically. A re-port that silently changes
-    # behaviour fails here, on the auditor's machine as well as in CI, instead of
-    # quietly accepting or rejecting a parity claim the other side disagrees with.
+    # Replays the shared fixture corpus on every run. Its normative/follower field
+    # names record the original port's frozen provenance, not current ownership:
+    # both implementations must classify every case identically. A change on
+    # either side fails here instead of quietly accepting or rejecting a parity
+    # claim the other side disagrees with.
     Assert-ExactPropertySet $Corpus @(
         "schema_version", "purpose", "normative_implementation",
         "follower_implementation", "expected_is_authoritative_from", "cases"
@@ -1865,8 +1861,12 @@ function Assert-RustTestSymbol {
 # ---------------------------------------------------------------------------
 # Cargo target reachability.
 #
-# LOCALLY OWNED rule. This is NOT part of the ported enabled-test oracle and has
-# no counterpart in crates/claw-conformance yet; see README.md.
+# Shared with crates/claw-conformance. Rust orchestrates this through
+# CargoTestTargets::load and CargoTestTargets::contains_compiled_source; this
+# script orchestrates it through Assert-EvidenceFileIsCompiled, which combines
+# Test-CratePackageIsBuilt with Get-CrateCompiledFileSet. The module walkers map
+# rust_module_references / reachable_rust_sources to Get-RustModuleReferences /
+# Get-CrateCompiledFileSet.
 #
 # A structurally perfect, enabled #[test] in a .rs file that no Cargo target
 # compiles never runs. An author could add crates/foo/src/orphan.rs, never
@@ -2960,9 +2960,9 @@ foreach ($relativePath in $ExpectedJsonPaths) {
     $documents[$relativePath] = Read-Json (Join-Path $Root $relativePath)
 }
 
-# Prove the enabled-test oracle still agrees with the normative Rust rule BEFORE
-# any evidence is judged with it. A drifted oracle must never get the chance to
-# accept or reject a parity claim.
+# Prove both enabled-test implementations still agree with the frozen oracle
+# BEFORE any evidence is judged with either rule. A drifted implementation must
+# never get the chance to accept or reject a parity claim.
 Assert-EnabledTestOracle $documents["enabled-test-oracle.json"]
 Assert-ReachabilityCorpus $documents["reachability-corpus.json"]
 
