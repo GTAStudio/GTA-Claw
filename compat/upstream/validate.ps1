@@ -15,6 +15,24 @@
     digests for review. This is the ONLY supported way to change ledger digests.
     It never touches inventory digests, the schema digest or baseline.json.
 
+.PARAMETER WriteStatusTotals
+    Rewrites manifest.evidence_policy.status_totals so a row transition can change
+    the ledger and the manifest in ONE reviewed step instead of by hand arithmetic.
+
+    It takes the totals you are claiming, in the form
+    "unimplemented=<n>,partial=<n>,implemented=<n>", and refuses to write unless
+    that declaration already matches the rows on disk. The number therefore stays
+    an independent human claim that this script checks; the command only performs
+    the file surgery. Deriving the totals silently would turn the manifest pin into
+    a tautology and would let a stray or mismerged row edit be papered over by
+    reflex, which is exactly what the pin exists to catch.
+
+    It edits nothing but the three integers inside that one object, and it is the
+    last thing the script does, after every evidence rule: it can never bless a row
+    whose cited artifact is missing, legacy TypeScript or not reached by an enabled
+    cargo test target, and a run that rejects the tree for any reason leaves
+    manifest.json exactly as it found it.
+
 .PARAMETER RepositoryRoot
     Repository working tree used to resolve acceptance-evidence paths. Defaults to
     the parent of compat/. The validator self-test passes the real tree explicitly
@@ -25,10 +43,15 @@
 
 .EXAMPLE
     powershell -NoProfile -File compat/upstream/validate.ps1 -WriteLedgerDigests
+
+.EXAMPLE
+    powershell -NoProfile -File compat/upstream/validate.ps1 `
+        -WriteLedgerDigests -WriteStatusTotals "unimplemented=34,partial=5,implemented=8"
 #>
 [CmdletBinding()]
 param(
     [switch]$WriteLedgerDigests,
+    [string]$WriteStatusTotals,
     [string]$RepositoryRoot
 )
 
@@ -63,7 +86,7 @@ $ExpectedReachabilityCorpusAccepting = 15
 # Frozen exactly like the schema and corpus digests: -WriteLedgerDigests cannot
 # reach this constant, so re-blessing a hollowed-out self-test takes a reviewed
 # edit to this line.
-$ExpectedSelfTestDigest = "0da69d4ad9266c7a5cb4516dbf7fd95a4f0c7f0f82f6844bea44116a06956d96"
+$ExpectedSelfTestDigest = "ad2e1147a9d150dbae875caabc76b7710079e4ad1553d0413170c7ef6579143b"
 $LedgerDigestFileName = "ledger-digests.sha256"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
@@ -2561,6 +2584,75 @@ function Write-LedgerDigestFile {
     [System.IO.File]::WriteAllText($AbsolutePath, (Format-LedgerDigestFile $DigestsByPath), $encoding)
 }
 
+function ConvertTo-DeclaredStatusTotals {
+    param([string]$Declaration)
+    # The operator states the totals; this script checks the statement against the
+    # rows. Parsing is deliberately strict: an unparseable claim is a failed claim,
+    # never a silent fall back to whatever happens to be on disk.
+    $declared = [ordered]@{}
+    foreach ($part in ([string]$Declaration -split ",")) {
+        $trimmed = $part.Trim()
+        if ($trimmed.Length -eq 0) { continue }
+        $match = [regex]::Match($trimmed, '\A(?<key>[a-z]+)=(?<value>0|[1-9][0-9]*)\z')
+        if (-not $match.Success) {
+            Fail ("-WriteStatusTotals must be " +
+                "'unimplemented=<n>,partial=<n>,implemented=<n>'; got '$trimmed'")
+        }
+        $key = $match.Groups["key"].Value
+        if ($declared.Contains($key)) {
+            Fail "-WriteStatusTotals declares '$key' more than once"
+        }
+        $declared[$key] = [int]$match.Groups["value"].Value
+    }
+    foreach ($status in $AllowedFeatureStatuses) {
+        if (-not $declared.Contains($status)) {
+            Fail "-WriteStatusTotals must declare every status; '$status' is missing"
+        }
+    }
+    foreach ($key in @($declared.Keys)) {
+        if ($AllowedFeatureStatuses -notcontains $key) {
+            Fail "-WriteStatusTotals declares unknown status '$key'"
+        }
+    }
+    return $declared
+}
+
+function Write-ManifestStatusTotals {
+    param(
+        [string]$AbsolutePath,
+        [System.Collections.IDictionary]$Totals
+    )
+    # Surgical: only the three integers inside the one status_totals object move.
+    # Every other byte, including the line endings this file inherits from
+    # core.autocrlf, is written back unchanged, so the review diff is three lines
+    # rather than a reformatted manifest.
+    $raw = [System.IO.File]::ReadAllText($AbsolutePath)
+    $marker = '"status_totals"'
+    $markerIndex = $raw.IndexOf($marker, [System.StringComparison]::Ordinal)
+    if ($markerIndex -lt 0) {
+        Fail "manifest.json has no status_totals object to rewrite"
+    }
+    $open = $raw.IndexOf("{", $markerIndex)
+    $close = $raw.IndexOf("}", [Math]::Max($open, 0))
+    if ($open -lt 0 -or $close -lt 0) {
+        Fail "manifest.json status_totals object is not well formed"
+    }
+    $block = $raw.Substring($open, $close - $open + 1)
+    foreach ($status in $AllowedFeatureStatuses) {
+        # The opening quote is part of the pattern on purpose: an unanchored
+        # 'implemented' also matches inside 'unimplemented'.
+        $pattern = '("' + [regex]::Escape($status) + '"\s*:\s*)\d+'
+        $matches = [regex]::Matches($block, $pattern)
+        if ($matches.Count -ne 1) {
+            Fail "manifest.json status_totals must name '$status' exactly once"
+        }
+        $block = [regex]::Replace($block, $pattern, ('${1}' + [string]$Totals[$status]))
+    }
+    $updated = $raw.Substring(0, $open) + $block + $raw.Substring($close + 1)
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($AbsolutePath, $updated, $encoding)
+}
+
 function Assert-ExactCounts {
     param(
         [object]$Declared,
@@ -2902,6 +2994,14 @@ function Assert-ManifestDeclarations {
 
 $script:RepositoryRootFull = Resolve-RepositoryRoot $RepositoryRoot
 
+# Parsed before any contract file is read so a malformed claim is rejected on its
+# own terms rather than after a long validation run.
+$WriteStatusTotalsRequested = -not [string]::IsNullOrWhiteSpace($WriteStatusTotals)
+$declaredStatusTotals = $null
+if ($WriteStatusTotalsRequested) {
+    $declaredStatusTotals = ConvertTo-DeclaredStatusTotals $WriteStatusTotals
+}
+
 # Runs before any contract file is read, in both verify and write mode, so a host
 # whose globalisation or JSON behaviour differs from a conforming host fails
 # loudly instead of silently computing a different digest.
@@ -3038,6 +3138,7 @@ if (-not (Test-OrdinalStringEqual ([string]$schema.'$schema') "https://json-sche
 
 $manifest = $documents["manifest.json"]
 Assert-ManifestDeclarations $manifest
+$manifestPath = Join-Path $Root "manifest.json"
 
 $ledgerDigestPath = Join-Path $Root $LedgerDigestFileName
 $computedLedgerDigests = [ordered]@{}
@@ -3063,6 +3164,22 @@ foreach ($spec in $LedgerSpecs) {
 }
 
 if ($WriteLedgerDigests) {
+    # Written here rather than after the remaining checks, and that is deliberate.
+    # This file is a derived fingerprint that is worthless on its own: the frozen
+    # feature text is pinned by $LedgerSpecs.frozen_digest inside this script, which
+    # no write mode can reach, so regenerating it for a tree that is about to be
+    # rejected cannot bless anything. Every downstream path stays fail-closed.
+    #
+    # It is load-bearing for the self-test, which models an attacker who ALREADY
+    # re-blessed the mutable digests before presenting a forgery: 104 negative cases
+    # depend on reaching this state so they can prove which rule still catches them.
+    # Deferring the write makes that state unreachable through the sanctioned
+    # command and silently turns those 104 exact rejection-reason assertions into a
+    # generic digest mismatch, which was measured, not assumed.
+    #
+    # -WriteStatusTotals is NOT written here. status_totals is a declaration about
+    # the contract rather than a fingerprint of it, so a rejected run must leave it
+    # exactly as it was found.
     Write-LedgerDigestFile $ledgerDigestPath $computedLedgerDigests
 } else {
     $storedLedgerDigests = Read-LedgerDigestFile $ledgerDigestPath
@@ -3102,8 +3219,10 @@ if ($LedgerSpecs.Count -ne 3 -or $featureCount -ne 47) {
     Fail "fixed ledger totals must be 3 ledgers and 47 features"
 }
 # Runs in write mode too, so -WriteLedgerDigests cannot re-bless a ledger whose
-# frozen text was edited: the regeneration command can only ever move the file
-# digest for a status or evidence change. It fails before it writes.
+# frozen feature text was edited: the regeneration command can only ever move the
+# file digest for a status or evidence change. The regenerated fingerprint is
+# already on disk by this point and that is harmless, because the frozen digest it
+# is checked against is a constant in this script that no write mode can reach.
 foreach ($spec in $LedgerSpecs) {
     if (-not (Test-OrdinalStringEqual `
                 ([string]$computedFrozenDigests[[string]$spec.path]) `
@@ -3113,7 +3232,14 @@ foreach ($spec in $LedgerSpecs) {
             "implementation_pointers and known_differences may change")
     }
 }
-Assert-ExactCounts $manifest.evidence_policy.status_totals $statusTotals "manifest.evidence_policy.status_totals"
+if ($WriteStatusTotalsRequested) {
+    # The declaration is checked against the rows, exactly as the committed manifest
+    # is in verify mode. The command performs the edit; it does not decide the number.
+    Assert-ExactCounts ([pscustomobject]$declaredStatusTotals) $statusTotals `
+        "-WriteStatusTotals declaration"
+} else {
+    Assert-ExactCounts $manifest.evidence_policy.status_totals $statusTotals "manifest.evidence_policy.status_totals"
+}
 $missingEvidenceCount = $statusTotals["unimplemented"]
 
 $globalRecordIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -3218,16 +3344,39 @@ foreach ($key in $ExpectedCanonicalCounts.Keys) {
     }
 }
 
+# Every rule has now passed. status_totals is a declaration about the contract, not
+# a derived fingerprint of it, so it is written only here: a run that rejects the
+# tree for any reason leaves the manifest exactly as it found it.
 if ($WriteLedgerDigests) {
     Write-Host "Recorded ledger digests in $LedgerDigestFileName; review every line before committing:"
     foreach ($spec in $LedgerSpecs) {
         Write-Host ("  {0}  {1}" -f [string]$computedLedgerDigests[[string]$spec.path], [string]$spec.path)
     }
 }
+if ($WriteStatusTotalsRequested) {
+    Write-ManifestStatusTotals $manifestPath $statusTotals
+    Write-Host "Recorded manifest.evidence_policy.status_totals; paste this into the transition PR:"
+    foreach ($status in $AllowedFeatureStatuses) {
+        Write-Host ("  {0,-15} {1}" -f $status, $statusTotals[$status])
+    }
+    # Named so a reviewer can check the transition against the ledgers directly
+    # instead of trusting the aggregate.
+    foreach ($spec in $LedgerSpecs) {
+        foreach ($feature in @($documents[$spec.path].features)) {
+            if (-not (Test-OrdinalStringEqual ([string]$feature.status) "unimplemented")) {
+                Write-Host ("  {0,-15} {1}" -f [string]$feature.status, [string]$feature.feature_id)
+            }
+        }
+    }
+}
+
+$writeModes = @()
+if ($WriteLedgerDigests) { $writeModes += "write-ledger-digests" }
+if ($WriteStatusTotalsRequested) { $writeModes += "write-status-totals" }
 
 [ordered]@{
     status = "ok"
-    mode = if ($WriteLedgerDigests) { "write-ledger-digests" } else { "verify" }
+    mode = if ($writeModes.Count -eq 0) { "verify" } else { $writeModes -join "+" }
     baseline_sha = $ExpectedSha
     repository_root = $script:RepositoryRootFull
     artifact_json_files = $actualJsonPaths.Count
