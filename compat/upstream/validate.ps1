@@ -63,7 +63,29 @@ $ExpectedReachabilityCorpusAccepting = 15
 # Frozen exactly like the schema and corpus digests: -WriteLedgerDigests cannot
 # reach this constant, so re-blessing a hollowed-out self-test takes a reviewed
 # edit to this line.
-$ExpectedSelfTestDigest = "0da69d4ad9266c7a5cb4516dbf7fd95a4f0c7f0f82f6844bea44116a06956d96"
+$ExpectedSelfTestDigest = "0dfd356bafde08d489f8a4dcb5118b1d13e872e485015229baa133e78e90713c"
+# README.md is the normative specification of every rule in this script, and it is
+# pinned for the same reason the self-test is: it was only presence-checked, so it
+# could stop describing the code without anything noticing. That is not a
+# hypothetical. Its ownership paragraph asserted that the Cargo reachability rule
+# was locally owned and unported for roughly a day after crates/claw-conformance
+# implemented the same rule, and a session read that text, believed it, and
+# reasoned correctly from it to a proposal that would have made this validator
+# reject 225 legitimate tests. A specification that can silently stop describing
+# the code is a supply-chain surface, not a documentation problem: the cheapest
+# way to weaken a gate is to leave a true-sounding sentence about it in place
+# after it stops being true.
+#
+# The cost is real and is accepted deliberately: every prose edit to README.md is
+# now a two-file change, because the digest must be bumped in the same commit.
+# That is the point. A documentation edit that nobody reviews alongside the rule
+# it documents is exactly the edit that produced the incident.
+#
+# LF-normalised for the same reason as the self-test: *.md is not covered by
+# .gitattributes, so a raw byte digest would pass on a Windows checkout and fail
+# under pwsh on Linux CI. Frozen like the schema and corpus digests --
+# -WriteLedgerDigests cannot reach this constant.
+$ExpectedReadmeDigest = "bc43f8c5c98bda648f5b8b3dd5efcd1566ea112b67406d8b177c6e466a829a2b"
 $LedgerDigestFileName = "ledger-digests.sha256"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
@@ -2953,6 +2975,18 @@ $selfTestDigest = Get-Sha256Text $selfTestText
 if (-not (Test-OrdinalStringEqual $selfTestDigest $ExpectedSelfTestDigest)) {
     Fail ("validate-self-test.ps1 digest mismatch; expected {0}, found {1}. The anti-forgery self-test is a frozen trust-root artifact; regenerating it is a reviewed edit to `$ExpectedSelfTestDigest, never an automatic step." -f
         $ExpectedSelfTestDigest, $selfTestDigest)
+}
+
+# README.md is the normative specification these rules are judged against, so it
+# is pinned on the same terms as the self-test. Checked here, immediately after
+# the instrument, because a specification that no longer describes the code is
+# the failure that precedes a weakened rule rather than a consequence of one.
+$readmePath = Join-Path $Root "README.md"
+$readmeText = [System.IO.File]::ReadAllText($readmePath) -replace "`r`n", "`n"
+$readmeDigest = Get-Sha256Text $readmeText
+if (-not (Test-OrdinalStringEqual $readmeDigest $ExpectedReadmeDigest)) {
+    Fail ("README.md digest mismatch; expected {0}, found {1}. README.md is the normative specification of these rules and is frozen with them; editing it is a reviewed edit to `$ExpectedReadmeDigest in the same commit, never an automatic step." -f
+        $ExpectedReadmeDigest, $readmeDigest)
 }
 
 $documents = @{}
