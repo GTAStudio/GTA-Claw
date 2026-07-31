@@ -3,7 +3,7 @@
     "feature_id":  "integration.providers",
     "ledger":  "compat/upstream/ledgers/official-integration.json",
     "ledger_row_modified":  false,
-    "ledger_row_modified_reason":  "compat/upstream/validate.ps1 pins the SHA-256 of the features array (line 1006), requires exactly 16 JSON files under compat/upstream (lines 896-912), and asserts every feature stays status=unimplemented with acceptance_evidence.status=missing and zero artifacts (lines 1017-1021). Editing the row would make the required validate.ps1 gate fail, so the frozen tree is left byte-identical and the evidence lives here.",
+    "ledger_row_modified_reason":  "compat/upstream/validate.ps1 requires manifest.evidence_policy.status_totals in compat/upstream/manifest.json to agree exactly with the lifecycle statuses present across the ledgers, so a row's status and those totals can only change together, atomically, as one coordinated edit to the frozen tree. This session does not make that change unilaterally, so the frozen tree is left byte-identical and the acceptance evidence for integration.providers lives here instead. This note is deliberately stated as a mechanism and cites no line numbers and no counts, because an earlier revision cited both and both went stale.",
     "proposed_status":  "implemented_partial",
     "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
     "frozen_inventory":  "compat/upstream/inventories/providers.json",
