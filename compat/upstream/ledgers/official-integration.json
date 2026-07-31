@@ -17,17 +17,24 @@
                                                                "docs/plugins/plugin-inventory.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "partial",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-plugin-host/tests/plugin_inventory_decisions.rs",
+                                                                           "test":  "every_core_plugin_contract_has_a_registration_or_an_explicit_stub"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-plugin-api/tests/registry_matches_inventory.rs",
+                                                                           "test":  "every_registry_field_matches_the_frozen_row_for_the_same_id"
+                                                                       }
                                                                    ],
                                                      "required":  "Exactly 64 core plugin contracts have Rust registration or explicit compatibility stubs."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "All 64 core plugin contracts are accounted for by a set comparison against the frozen inventory that fails both when a contract is missing and when one is invented, and each decision carries the frozen row own record_id, source_path and package_name. Every one of the 64 is an explicit stub: the install decision is BundledUpstreamNotPorted for all of them and COMPONENT_BACKED_PLUGIN_IDS is empty, so no core plugin has a working Rust registration behind it."
                                                ]
                      },
                      {
@@ -43,17 +50,24 @@
                                                                "docs/plugins/plugin-inventory.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "partial",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-plugin-host/tests/plugin_inventory_decisions.rs",
+                                                                           "test":  "every_official_external_plugin_contract_has_an_install_and_a_compatibility_decision"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-plugin-api/tests/registry_matches_inventory.rs",
+                                                                           "test":  "the_delivery_class_split_matches_the_frozen_rows_one_by_one"
+                                                                       }
                                                                    ],
                                                      "required":  "Exactly 70 official external plugin contracts have install and compatibility decisions."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "All 70 official external plugin contracts carry an install and a compatibility decision, cross-checked as a set against the frozen delivery-class split and against the frozen record identity. Every one of the 70 is declined rather than delivered: the install decision is DeclinedNpmOnDemand for all of them and no artifact is ever acquired, so no official external plugin is installable at this baseline."
                                                ]
                      },
                      {
@@ -69,17 +83,24 @@
                                                                "docs/plugins/plugin-inventory.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-plugin-host/tests/qa_plugin_tooling.rs",
+                                                                           "test":  "exactly_the_three_source_only_qa_contracts_are_represented_in_the_test_tooling"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-plugin-api/tests/registry_matches_inventory.rs",
+                                                                           "test":  "the_delivery_class_split_matches_the_frozen_rows_one_by_one"
+                                                                       }
                                                                    ],
                                                      "required":  "Exactly three source-only QA plugin contracts are represented in test tooling."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "The three source-only QA contracts are represented as test-tooling fixtures; none of them is a port of the upstream QA plugin behaviour."
                                                ]
                      },
                      {
@@ -95,17 +116,24 @@
                                                                "skills"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-skills/tests/bundled_manifests.rs",
+                                                                           "test":  "exactly_fifty_one_bundled_manifests_load_from_the_shipped_assets"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-skills/tests/frozen_inventory.rs",
+                                                                           "test":  "registry_matches_every_frozen_skill_field"
+                                                                       }
                                                                    ],
                                                      "required":  "Exactly 51 bundled skill manifests are discoverable with Rust-native loading tests."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Every bundled manifest is discovered and loaded natively from the shipped assets and compared against the frozen inventory in both directions; the manifests are shipped as assets rather than compiled in, so a stripped install would discover none of them."
                                                ]
                      },
                      {
@@ -122,17 +150,40 @@
                                                                "scripts/lib/official-external-provider-catalog.json"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                                           "test":  "every_frozen_identifier_resolves_canonically_and_near_misses_do_not"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                                           "test":  "the_builtin_alias_table_only_names_frozen_identifiers"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                                           "test":  "every_frozen_provider_is_configurable_exactly_as_its_status_allows"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                                           "test":  "every_frozen_provider_accepts_exactly_its_declared_auth_modes"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-providers/tests/registry_contract.rs",
+                                                                           "test":  "capability_routing_serves_every_client_bearing_frozen_provider"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-providers/tests/frozen_inventory.rs",
+                                                                           "test":  "every_registered_row_reproduces_the_frozen_fields_exactly"
+                                                                       }
                                                                    ],
                                                      "required":  "Provider inventory IDs, aliases, configuration, auth, and capability routing pass fixtures."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Identifiers, aliases, configuration, auth modes and capability routing are proven against the frozen inventory, but the alias table is a Rust-side convenience list checked only for internal consistency: the frozen inventory carries no alias column, so parity with upstream aliases cannot be asserted."
                                                ]
                      },
                      {
@@ -149,17 +200,48 @@
                                                                "scripts/lib/official-external-channel-catalog.json"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-channels/tests/frozen_inventory.rs",
+                                                                           "test":  "frozen_channel_identifiers_are_unique_and_individually_resolvable"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-channels/tests/account_routing.rs",
+                                                                           "test":  "every_frozen_channel_identifier_routes_to_its_own_accounts"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-channels/tests/account_routing.rs",
+                                                                           "test":  "inbound_is_delivered_only_to_the_account_that_owns_it"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-channels/tests/channel_commands.rs",
+                                                                           "test":  "every_frozen_channel_declares_a_command_surface_matching_its_inbound_support"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-channels/tests/channel_commands.rs",
+                                                                           "test":  "help_output_lists_exactly_the_commands_a_channel_offers"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-channels/tests/channel_lifecycle.rs",
+                                                                           "test":  "connection_state_machine_accepts_exactly_the_contract_transitions"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-channels/tests/channel_lifecycle.rs",
+                                                                           "test":  "every_frozen_channel_is_gated_by_the_same_session_lifecycle"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-channels/tests/channel_behavior.rs",
+                                                                           "test":  "qa_channel_round_trips_inbound_and_records_outbound"
+                                                                       }
                                                                    ],
                                                      "required":  "Channel inventory IDs, account routing, inbound/outbound, commands, and lifecycle contracts pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Identity, account routing, command surfaces and the session lifecycle are proven for every frozen channel, but only the channels with an executable adapter carry real inbound and outbound transport: the rest are proven to refuse inbound rather than to carry it."
                                                ]
                      },
                      {
@@ -205,17 +287,36 @@
                                                                "docs/cli/fleet.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "partial",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/fleet.rs",
+                                                                           "test":  "full_create_status_logs_backup_doctor_remove_lifecycle_plans_cleanly"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/fleet.rs",
+                                                                           "test":  "create_plan_matches_the_pinned_argv"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/fleet.rs",
+                                                                           "test":  "status_logs_doctor_and_remove_plans_match_the_pinned_argv"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/fleet.rs",
+                                                                           "test":  "backup_plan_matches_the_pinned_argv_and_mounts_the_data_read_only"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/fleet.rs",
+                                                                           "test":  "values_that_would_inject_a_flag_or_a_mount_option_are_refused"
+                                                                       }
                                                                    ],
                                                      "required":  "Create, status, logs, backup, doctor, and remove tests pass for local container cells."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Create, status, logs, backup, doctor and remove are proven at the argv-planning contract, including a read-only data mount and refusal of values that would inject a flag or a mount option. No container is ever started: no container runtime is available in this environment, so none of the six operations is proven against a real local container cell."
                                                ]
                      },
                      {
@@ -233,17 +334,40 @@
                                                                "src/infra/widearea-dns.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "partial",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/dns_sd.rs",
+                                                                           "test":  "mdns_advertisement_matches_the_pinned_wire_bytes"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/dns_sd.rs",
+                                                                           "test":  "browse_query_matches_the_pinned_wire_bytes"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/dns_sd.rs",
+                                                                           "test":  "wide_area_answer_resolves_the_pinned_srv_txt_and_address_chain"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/dns_sd.rs",
+                                                                           "test":  "txt_record_honours_the_rfc6763_key_value_contract"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/dns_sd.rs",
+                                                                           "test":  "resolution_requires_a_response_and_a_complete_chain"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/dns_sd.rs",
+                                                                           "test":  "srv_target_outside_the_queried_zone_fails_closed"
+                                                                       }
                                                                    ],
                                                      "required":  "mDNS advertise/discover and wide-area DNS-SD fixtures match pinned TXT and resolution contracts."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "mDNS advertisement, browse queries, wide-area SRV/TXT/address resolution, the RFC 6763 key-value contract and out-of-bailiwick refusal are proven byte for byte against pinned wire fixtures. Real multicast advertise and discover interoperability is not proven, and the wire fixtures are restated inside the test rather than extracted from the frozen upstream."
                                                ]
                      },
                      {
@@ -261,17 +385,37 @@
                                                                "src/gateway/node-pairing-ssh-verify.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "partial",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/ssh_known_hosts.rs",
+                                                                           "test":  "known_hosts_grammar_parses_every_line_form"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/ssh_known_hosts.rs",
+                                                                           "test":  "matching_host_and_key_is_accepted_case_insensitively"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/ssh_known_hosts.rs",
+                                                                           "test":  "mismatched_key_for_a_known_host_fails_closed"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/ssh_known_hosts.rs",
+                                                                           "test":  "revoked_key_is_refused_even_when_an_accepting_line_comes_first"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/ssh_known_hosts.rs",
+                                                                           "test":  "unknown_host_is_refused_rather_than_defaulted"
+                                                                       }
                                                                    ],
                                                      "required":  "SSH config, host-key, pairing verification, and tunnel lifecycle tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "The known-hosts configuration grammar and host-key verification, including revocation, certificate-authority lines, hashed hosts and negated patterns, are proven against RFC-checked primitives.",
+                                                   "Pairing verification and the tunnel lifecycle are not proven: no test establishes, maintains or tears down an SSH tunnel, or exercises the pairing exchange."
                                                ]
                      },
                      {
@@ -289,17 +433,37 @@
                                                                "docs/gateway/tailscale.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "partial",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/tailscale.rs",
+                                                                           "test":  "authorised_funnel_and_serve_exposures_produce_the_pinned_plan"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/tailscale.rs",
+                                                                           "test":  "unauthorised_nodes_are_refused_before_any_exposure_is_planned"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/tailscale.rs",
+                                                                           "test":  "funnel_public_port_outside_the_terminated_set_is_refused"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/tailscale.rs",
+                                                                           "test":  "funnel_without_the_node_attribute_is_refused"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-discovery/tests/tailscale.rs",
+                                                                           "test":  "funnel_on_a_tailnet_without_https_is_refused"
+                                                                       }
                                                                    ],
                                                      "required":  "Serve/Funnel, auth policy, status, and cleanup tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "Serve and Funnel exposure planning and the authorization policy are proven fail-closed against a pinned tailnet policy.",
+                                                   "Status reporting and cleanup are not proven: no test reads tailnet status or removes a previously planned exposure."
                                                ]
                      },
                      {
@@ -316,17 +480,25 @@
                                                                "extensions/webhooks/src/http.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "partial",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "tools_admin_mcp_and_webhooks_enforce_and_map_contracts"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-http-api/tests/e2e.rs",
+                                                                           "test":  "registered_endpoint_set_exactly_matches_frozen_inventory"
+                                                                       }
                                                                    ],
                                                      "required":  "Configurable route, secret, replay, body-limit, session binding, and TaskFlow dispatch tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                                   "A configurable route identifier, the shared-secret gate and typed action dispatch with its invalid-request rejection are proven over HTTP.",
+                                                   "Replay protection, an explicit body-size limit and session binding for webhook deliveries are not covered by any test."
                                                ]
                      },
                      {
