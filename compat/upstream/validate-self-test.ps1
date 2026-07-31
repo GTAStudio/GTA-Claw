@@ -1029,16 +1029,49 @@ $cases = @(
     },
     [ordered]@{
         name = "reachability-corpus-case-renamed"
-        expected_message = "reachability-corpus digest mismatch"
+        expected_message = "reachability-corpus must not drop canonical cases"
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
-            # Renaming preserves the count and the accept/reject split, so only
-            # the frozen digest catches it.
+            # Renaming preserves the count and the accept/reject split. It used to be
+            # caught only by the frozen digest, which is too weak a backstop: every
+            # honest corpus addition bumps that same digest, so a rename or a
+            # substitution could ride along inside an ordinary expansion. The
+            # append-only canonical name list now refuses it first, and names the case
+            # that went missing instead of reporting a digest that moved.
             $corpusPath = Join-Path $caseRoot "reachability-corpus.json"
             $corpus = Read-Json $corpusPath
             $corpus.cases[0].name = "renamed-case"
             Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
+        name = "reachability-corpus-case-dropped-with-count-pin-lowered"
+        expected_message = "reachability-corpus must not drop canonical cases"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # The rollback shape the count pin cannot see. Deleting a case alone is
+            # caught by $ExpectedReachabilityCorpusCases, but a claimant removing
+            # coverage would lower that pin in the same change -- it is an ordinary
+            # looking constant edit, and the digest has to move for any corpus edit
+            # anyway. Dropping the count to match the smaller corpus therefore clears
+            # every pin that existed before the canonical name list.
+            $corpusPath = Join-Path $caseRoot "reachability-corpus.json"
+            $corpus = Read-Json $corpusPath
+            $droppedCount = @($corpus.cases).Count - 1
+            $corpus.cases = @($corpus.cases | Select-Object -Skip 1)
+            Write-Json $corpusPath $corpus
+
+            $validatorPath = Join-Path $caseRoot "validate.ps1"
+            $text = [System.IO.File]::ReadAllText($validatorPath)
+            $original = '$ExpectedReachabilityCorpusCases = ' + ($droppedCount + 1)
+            $lowered = '$ExpectedReachabilityCorpusCases = ' + $droppedCount
+            if (-not $text.Contains($original)) {
+                throw "reachability-corpus-case-dropped-with-count-pin-lowered could not find the corpus count pin to lower."
+            }
+            $text = $text.Replace($original, $lowered)
+            [System.IO.File]::WriteAllText($validatorPath, $text, (New-Object System.Text.UTF8Encoding($false)))
         }
     },
     [ordered]@{

@@ -441,6 +441,20 @@ never be reported as one. The corpus and the sweep are complementary and neither
 is sufficient on its own: the sweep covers what the tree exercises, the corpus
 covers what it does not, and any rule outside both is pinned by nothing.
 
+Canonical cases are **append-only**. `$CanonicalReachabilityCaseNames` in
+`validate.ps1` lists every case name that has ever been accepted into the
+corpus, and validation fails naming any that has gone missing. Adding a case
+does not require touching that list; only removing or renaming one does, which
+is the entire point. The count, accept/reject split and digest pins all move
+legitimately whenever a case is added, so before this list a deletion or a
+substitution could ride along inside an otherwise ordinary corpus expansion —
+the count is satisfied by lowering it in the same change, and the digest has to
+move for any corpus edit at all. Reducing coverage now requires deleting a name
+from an explicit never-remove list, a diff no reviewer can mistake for an
+addition. This does not make the reduction impossible, because nothing in a
+file can stop an edit to that same file; it makes it specific and loud, which
+is what a code-owner review needs in order to be able to refuse it.
+
 **Neither implementation is normative here.** The `arbiter` field records that
 every expectation was produced by running `cargo` and `rustc` against the
 fixture, not by asking either resolver what it thinks. Accepting cases place
