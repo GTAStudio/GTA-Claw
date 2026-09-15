@@ -27,7 +27,7 @@ use claw_provider_sdk::{
     BoxFuture as ProviderFuture, CancelToken, CompletionStream, ErrorKind, Provider, ProviderError,
     ProviderPhase, ProviderStatus, RequestContext, StreamEvent,
 };
-use claw_providers::{ProviderLease, ProviderSlot};
+use claw_providers::ProviderSlot;
 use claw_security::audit::{AuditAction, AuditEvent, AuditOutcome, AuditReason, AuditSubject};
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
@@ -677,6 +677,7 @@ impl ProviderPort for ProviderAdapter {
 /// Provider port that can start unauthenticated and atomically activate later.
 pub struct SwappableProvider {
     slot: Arc<ProviderSlot>,
+    shutdown_cancel: CancelToken,
     state: RwLock<SwappableState>,
     history_config: ProviderHistoryConfig,
     model_tools: Arc<dyn ModelToolCatalog>,
@@ -690,6 +691,7 @@ struct SwappableState {
     default_model_locked: bool,
     role_prompt: String,
     generation: u64,
+    retired: bool,
 }
 
 struct ProviderActivationGuard(Option<CancelToken>);
@@ -720,12 +722,14 @@ impl SwappableProvider {
     ) -> Self {
         Self {
             slot: Arc::new(ProviderSlot::new()),
+            shutdown_cancel: CancelToken::new(),
             state: RwLock::new(SwappableState {
                 current: None,
                 default_model: default_model.into(),
                 default_model_locked: false,
                 role_prompt: role_prompt.into(),
                 generation: 0,
+                retired: false,
             }),
             history_config,
             model_tools,
@@ -756,62 +760,83 @@ impl SwappableProvider {
         cancel: CancelToken,
     ) -> Result<(), ProviderError> {
         let mut cancel_on_drop = ProviderActivationGuard(Some(cancel.clone()));
-        let previous = self.slot.active().await;
         let activation =
             RequestContext::with_cancel(cancel).correlation_id("daemon-provider-activation");
-        let lease = self.slot.activate(provider, &activation).await?;
-        loop {
-            let (generation, model, role) = {
-                let state = self.state.read().map_err(|_| provider_slot_error())?;
-                (
-                    state.generation,
-                    state.default_model.clone(),
-                    state.role_prompt.clone(),
-                )
-            };
-            let adapter = Arc::new(ProviderAdapter::new(
-                lease.provider_arc(),
-                model,
-                role,
-                self.history_config,
-                Arc::clone(&self.model_tools),
-                Arc::clone(&self.readiness),
-                Arc::clone(&self.ready_gate),
-            ));
-            if let Err(error) = adapter.initialize(&activation).await {
-                self.restore_slot(previous).await;
-                return Err(error);
+        let publication = self.slot.activate_validated(
+            provider,
+            &activation,
+            |candidate| async {
+                let (generation, model, role) = {
+                    let state = self.state.read().map_err(|_| provider_slot_error())?;
+                    if state.retired {
+                        return Err(ProviderError::new(
+                            ErrorKind::Cancelled,
+                            candidate.id().as_str(),
+                            claw_provider_sdk::Operation::Startup,
+                            "provider has been shut down",
+                        ));
+                    }
+                    (
+                        state.generation,
+                        state.default_model.clone(),
+                        state.role_prompt.clone(),
+                    )
+                };
+                let adapter = Arc::new(ProviderAdapter::new(
+                    candidate,
+                    model,
+                    role,
+                    self.history_config,
+                    Arc::clone(&self.model_tools),
+                    Arc::clone(&self.readiness),
+                    Arc::clone(&self.ready_gate),
+                ));
+                adapter.initialize(&activation).await?;
+                Ok((generation, adapter))
+            },
+            |(generation, adapter)| {
+                let mut state = self.state.write().map_err(|_| provider_slot_error())?;
+                if state.retired || state.generation != generation {
+                    return Err(ProviderError::new(
+                        ErrorKind::Cancelled,
+                        adapter.provider_name(),
+                        claw_provider_sdk::Operation::Startup,
+                        "provider configuration changed before publication",
+                    )
+                    .with_upstream_code("reload_fenced"));
+                }
+                state.current = Some(adapter);
+                Ok(state)
+            },
+        );
+        tokio::select! {
+            biased;
+            () = self.shutdown_cancel.cancelled() => {
+                return Err(ProviderError::new(ErrorKind::Cancelled, "daemon", claw_provider_sdk::Operation::Startup, "provider has been shut down"));
             }
-            lease.ensure_current(self.slot.as_ref(), claw_provider_sdk::Operation::Startup)?;
-            let mut state = self.state.write().map_err(|_| provider_slot_error())?;
-            if state.generation != generation {
-                continue;
-            }
-            state.current = Some(adapter);
-            drop(state);
-            cancel_on_drop.disarm();
-            return Ok(());
+            result = publication => { result?; }
         }
-    }
-
-    async fn restore_slot(&self, previous: Option<ProviderLease>) {
-        if let Some(previous) = previous {
-            let context = RequestContext::new().correlation_id("daemon-provider-rollback");
-            let _ = self.slot.activate(previous.provider_arc(), &context).await;
-        } else {
-            let _ = self.slot.clear().await;
-        }
+        cancel_on_drop.disarm();
+        Ok(())
     }
 
     /// Fences new calls and clears the active provider.
     pub async fn shutdown(&self) {
-        let _ = self.slot.clear().await;
         if let Ok(mut state) = self.state.write() {
-            state.current = None;
-            state.generation = state.generation.saturating_add(1);
+            state.retired = true;
         }
-        self.ready_gate.store(false, Ordering::Release);
-        self.readiness.set("provider", false);
+        self.shutdown_cancel.cancel();
+        let _ = self
+            .slot
+            .clear_with(|| {
+                if let Ok(mut state) = self.state.write() {
+                    state.current = None;
+                    state.generation = state.generation.saturating_add(1);
+                }
+                self.ready_gate.store(false, Ordering::Release);
+                self.readiness.set("provider", false);
+            })
+            .await;
     }
 
     /// Returns the shared provider-generation fence.
@@ -912,8 +937,15 @@ impl SwappableProvider {
 
     /// Publishes provider readiness after every dependent runtime sees activation.
     pub fn mark_ready(&self) {
+        let Ok(state) = self.state.read() else {
+            return;
+        };
+        if state.retired || state.current.is_none() {
+            return;
+        }
         self.ready_gate.store(true, Ordering::Release);
         self.readiness.set("provider", true);
+        drop(state);
     }
 
     /// Clears all retained conversation context.
@@ -2773,6 +2805,181 @@ mod tests {
         assert!(provider.is_active());
         assert_eq!(provider.provider_name(), "smoke");
         assert!(readiness.is_ready());
+    }
+
+    #[tokio::test]
+    async fn provider_preparation_is_cancel_safe_and_configuration_and_shutdown_fenced() {
+        use super::{Provider, ProviderFuture, ProviderStatus, RequestContext};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        struct Candidate {
+            provider: SmokeProvider,
+            starts: AtomicUsize,
+            model_reads: AtomicUsize,
+            entered: Notify,
+            release: Notify,
+        }
+        impl Provider for Candidate {
+            fn id(&self) -> &super::ProviderId {
+                self.provider.id()
+            }
+            fn capabilities(&self) -> super::CapabilitySet {
+                self.provider.capabilities()
+            }
+            fn startup<'a>(
+                &'a self,
+                context: &'a RequestContext,
+            ) -> ProviderFuture<'a, Result<ProviderStatus, super::ProviderError>> {
+                self.starts.fetch_add(1, Ordering::SeqCst);
+                self.provider.startup(context)
+            }
+            fn ping<'a>(
+                &'a self,
+                context: &'a RequestContext,
+            ) -> ProviderFuture<'a, Result<ProviderStatus, super::ProviderError>> {
+                self.provider.ping(context)
+            }
+            fn list_models<'a>(
+                &'a self,
+                _context: &'a RequestContext,
+            ) -> ProviderFuture<'a, Result<Vec<super::ModelDescriptor>, super::ProviderError>>
+            {
+                Box::pin(async move {
+                    self.model_reads.fetch_add(1, Ordering::SeqCst);
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    Ok(self.provider.models.clone())
+                })
+            }
+        }
+        for scenario in [
+            "rejected",
+            "cancelled",
+            "dropped",
+            "reconfigured",
+            "success",
+            "shutdown",
+        ] {
+            let readiness = Arc::new(DependencyReadiness::new(["provider"]));
+            let provider = SwappableProvider::new(
+                "gpt-4o",
+                "original",
+                ProviderHistoryConfig::default(),
+                Arc::new(EmptyModelTools),
+                Arc::clone(&readiness),
+            );
+            provider
+                .activate(Arc::new(SmokeProvider::new().expect("original")))
+                .await
+                .expect("original published");
+            provider.mark_ready();
+            let original = provider.active().expect("current original");
+            let generation = provider.provider_generation();
+            let mut candidate = SmokeProvider::new().expect("candidate");
+            candidate.id = super::ProviderId::new("candidate").expect("candidate ID");
+            if scenario == "rejected" {
+                candidate.models.clear();
+            }
+            let candidate = Arc::new(Candidate {
+                provider: candidate,
+                starts: AtomicUsize::new(0),
+                model_reads: AtomicUsize::new(0),
+                entered: Notify::new(),
+                release: Notify::new(),
+            });
+            let cancel = super::CancelToken::new();
+            let mut pending =
+                Box::pin(provider.activate_with_cancel(candidate.clone(), cancel.clone()));
+            tokio::select! {
+                result = &mut pending => panic!("candidate must wait for models: {result:?}"),
+                () = candidate.entered.notified() => {}
+            }
+            assert!(Arc::ptr_eq(
+                &provider.active().expect("original remains active"),
+                &original
+            ));
+            assert_eq!(provider.provider_generation(), generation);
+            assert!(readiness.is_ready());
+            let output = original
+                .provider
+                .complete(
+                    &super::CompletionRequest::new(
+                        super::ModelId::new("gpt-4o").expect("model"),
+                        vec![super::ChatMessage::user_text("old instance remains usable")],
+                    ),
+                    &RequestContext::new(),
+                )
+                .await
+                .expect("old provider can finish");
+            assert_eq!(output.id, "smoke-response");
+            match scenario {
+                "dropped" => drop(pending),
+                "cancelled" => {
+                    cancel.cancel();
+                    assert!(pending.await.is_err());
+                }
+                "shutdown" => {
+                    let (result, ()) =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                            tokio::join!(pending, provider.shutdown())
+                        })
+                        .await
+                        .expect("shutdown cancels uncooperative model preparation");
+                    assert!(result.is_err());
+                    assert!(!provider.is_active());
+                    provider.mark_ready();
+                    assert!(!readiness.is_ready());
+                    assert_eq!(provider.provider_generation(), generation + 1);
+                    assert!(provider.activate(candidate.clone()).await.is_err());
+                }
+                _ => {
+                    if scenario == "reconfigured" {
+                        provider.set_role_prompt("new reviewed role");
+                    }
+                    candidate.release.notify_one();
+                    assert_eq!(pending.await.is_ok(), scenario == "success", "{scenario}");
+                }
+            }
+            assert_eq!(candidate.starts.load(Ordering::SeqCst), 1);
+            assert_eq!(candidate.model_reads.load(Ordering::SeqCst), 1);
+            if scenario == "success" {
+                assert_eq!(provider.provider_name(), "candidate");
+                assert_eq!(provider.provider_generation(), generation + 1);
+                assert!(!cancel.is_cancelled());
+            } else {
+                assert!(cancel.is_cancelled(), "{scenario}");
+                if scenario != "shutdown" {
+                    assert!(Arc::ptr_eq(
+                        &provider.active().expect("original preserved"),
+                        &original
+                    ));
+                    assert_eq!(provider.provider_generation(), generation);
+                    assert!(readiness.is_ready());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_model_rejection_never_advances_published_generation() {
+        let readiness = Arc::new(DependencyReadiness::new(["provider"]));
+        let provider = SwappableProvider::new(
+            "not-a-live-model",
+            "",
+            ProviderHistoryConfig::default(),
+            Arc::new(EmptyModelTools),
+            Arc::clone(&readiness),
+        );
+        let generation = provider.provider_generation();
+        provider
+            .activate(Arc::new(SmokeProvider::new().expect("local provider")))
+            .await
+            .expect_err("selected model is absent");
+        assert!(!provider.is_active());
+        assert!(!readiness.is_ready());
+        assert_eq!(provider.provider_generation(), generation);
+        assert_eq!(provider.default_model(), "not-a-live-model");
     }
 
     #[tokio::test]

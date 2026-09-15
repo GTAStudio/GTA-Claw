@@ -102,6 +102,7 @@
 | M1-06 / M3-10 | operator status按真实MCP任务报告activeInvocations/收尾状态；stdio取消后待实际任务结束才检验固定句柄释放，daemon235通过/4忽略及严格lint | 仅状态快照非维护锁/远端效果核对，取消仍unknown不可重放；原文件锁失败保留，凭据及完整生命周期仍开放；见[收尾观测记录](ledger/native-mcp-drain-20260915.json) |
 | M1-11 / M3-10 | OAuth新CLI同profile/origin非阻塞进程锁，覆盖login/refresh/logout完整生命周期；Windows锁路径不可替换，真实竞争/中断后释放；四包570通过/7忽略及严格lint | 仅同协调目录的协作CLI，非原生CAS；外部编辑器/旧客户端/直接SDK/macOS仍有边界；见[OAuth协调记录](ledger/native-oauth-coordination-20260915.json) |
 | M3-06 / M3-07 | 原生OpenAI/Anthropic显式策略装配、独立凭据origin、无自动付费重试；目录内其他模型也不能覆盖固定默认模型 | 统一配置、完整能力目录、真实账号与所有流式合同 |
+| M3-06 | 修复候选模型验证前提前发布与回滚重启旧provider：原失败generation 0→2可复现，准备/提交/关闭同锁、配置代次复查及关闭取消；六种受控daemon场景和发布锁/容量边界，providers/daemon479通过/4忽略、严格lint及根全目标check | 统一typed配置/客户端编辑、完整退役清理、真实账号切换和费用仍开放；首个根检查不完整日志保留，见[模型发布记录](ledger/native-provider-publication-20260915.json) |
 | M3-08 | 显式原生Responses、store:false文本/图片/函数历史、终态/片段/usage校验；Chat缺结束信号和坏工具回合拒绝；真实daemon三方言与HTTP取消/断流/并发释放，三包694通过/5忽略及严格lint | reasoning续接/phase、远端内置工具、完整费用unknown/切换与真实账号仍开放；见[Responses记录](ledger/native-provider-responses-20260915.json) |
 | M3-08 | Chat固定response/model/choice及函数ID，拒绝终结后追加、跨索引重用/更换ID和越界；六种真实HTTP错误关闭/不重放，最终三包697通过/5忽略及严格lint | 联合回归出现原生凭据查询失败，仅增诊断后通过，未定位根因；完整方言/费用/真实服务仍开放；见[Chat身份记录](ledger/native-chat-identity-20260915.json) |
 | M3-08 | Anthropic完整消息/块终态、工具延后完成、唯一ID和部分文本；缓存输入三项合计/累计回退溢出拒绝；七种HTTP场景，三包703通过/5忽略及严格lint | 签名thinking续接、完整计价/unknown账单、实号及先前凭据异常仍开放；见[Anthropic记录](ledger/native-anthropic-lifecycle-20260915.json) |

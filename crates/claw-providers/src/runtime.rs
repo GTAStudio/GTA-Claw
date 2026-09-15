@@ -176,6 +176,33 @@ impl ProviderSlot {
         candidate: Arc<dyn Provider>,
         context: &RequestContext,
     ) -> Result<ProviderLease, ProviderError> {
+        self.activate_validated(candidate, context, |_| async { Ok(()) }, |()| Ok(()))
+            .await
+    }
+
+    /// Prepares host state after startup and publishes it with the provider lease.
+    ///
+    /// Both callbacks run under the switch lock. `commit` must check all fallible
+    /// host preconditions before mutation; it runs synchronously immediately before
+    /// the infallible slot publication. Its return value may retain a host lock and
+    /// is dropped only after the new generation is visible. Cancellation or preparation failure leaves
+    /// the old provider and generation unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns startup, preparation or commit errors without publishing a candidate.
+    pub async fn activate_validated<Prepared, Prepare, PrepareFuture, Commit, CommitGuard>(
+        &self,
+        candidate: Arc<dyn Provider>,
+        context: &RequestContext,
+        prepare: Prepare,
+        commit: Commit,
+    ) -> Result<ProviderLease, ProviderError>
+    where
+        Prepare: FnOnce(Arc<dyn Provider>) -> PrepareFuture,
+        PrepareFuture: std::future::Future<Output = Result<Prepared, ProviderError>>,
+        Commit: FnOnce(Prepared) -> Result<CommitGuard, ProviderError>,
+    {
         let switch = tokio::select! {
             biased;
             () = context.cancel().cancelled() => {
@@ -190,6 +217,20 @@ impl ProviderSlot {
         };
         candidate.startup(context).await?;
         candidate.ping(context).await?;
+        let prepared = tokio::select! {
+            biased;
+            () = context.cancel().cancelled() => {
+                return Err(ProviderError::new(ErrorKind::Cancelled, candidate.id().as_str(), Operation::Startup, "provider activation was cancelled before host preparation"));
+            }
+            prepared = prepare(Arc::clone(&candidate)) => prepared?,
+        };
+        let mut active = tokio::select! {
+            biased;
+            () = context.cancel().cancelled() => {
+                return Err(ProviderError::new(ErrorKind::Cancelled, candidate.id().as_str(), Operation::Startup, "provider activation was cancelled before publication"));
+            }
+            active = self.active.write() => active,
+        };
         if context.cancel().is_cancelled() {
             return Err(ProviderError::new(
                 ErrorKind::Cancelled,
@@ -199,17 +240,28 @@ impl ProviderSlot {
             ));
         }
 
-        let mut active = self.active.write().await;
         let generation = ProviderGeneration(
             self.generation
-                .fetch_add(1, Ordering::AcqRel)
-                .saturating_add(1),
+                .load(Ordering::Acquire)
+                .checked_add(1)
+                .filter(|generation| *generation < u64::MAX)
+                .ok_or_else(|| {
+                    ProviderError::new(
+                        ErrorKind::InvalidRequest,
+                        candidate.id().as_str(),
+                        Operation::Startup,
+                        "provider generation capacity is exhausted",
+                    )
+                })?,
         );
         let lease = ProviderLease {
             generation,
             provider: candidate,
         };
+        let committed = commit(prepared)?;
         *active = Some(lease.clone());
+        self.generation.store(generation.get(), Ordering::Release);
+        drop(committed);
         drop(active);
         drop(switch);
         Ok(lease)
@@ -226,9 +278,21 @@ impl ProviderSlot {
     /// The returned lease lets a host perform any adapter-specific terminal
     /// cleanup after the slot has stopped admitting new work.
     pub async fn clear(&self) -> Option<ProviderLease> {
+        self.clear_with(|| {}).await
+    }
+
+    /// Clears synchronous host state under the same lock as provider retirement.
+    ///
+    /// The callback must not block on or reenter this slot. No activation can
+    /// publish between the host-state clear and the lease retirement.
+    pub async fn clear_with(&self, clear_host: impl FnOnce()) -> Option<ProviderLease> {
         let _switch = self.switch.lock().await;
         let mut active = self.active.write().await;
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        clear_host();
+        self.generation.store(
+            self.generation.load(Ordering::Acquire).saturating_add(1),
+            Ordering::Release,
+        );
         active.take()
     }
 
@@ -857,6 +921,208 @@ mod tests {
             .expect_err("failed ping must not replace the provider");
         assert_eq!(error.operation(), Operation::Ping);
         assert_eq!(slot.current_generation(), first_lease.generation());
+    }
+
+    #[tokio::test]
+    async fn activation_host_failures_preserve_the_previous_provider_without_restarting_it() {
+        let slot = ProviderSlot::new();
+        let original = ProbeProvider::new("original", false);
+        let lease = slot
+            .activate(original.clone(), &RequestContext::new())
+            .await
+            .expect("original");
+        let commits = AtomicUsize::new(0);
+        for reject_prepare in [false, true] {
+            let candidate = ProbeProvider::new("candidate", false);
+            let result = slot
+                .activate_validated(
+                    candidate.clone(),
+                    &RequestContext::new(),
+                    |_| async {
+                        if reject_prepare {
+                            Err(ProviderError::new(
+                                ErrorKind::InvalidRequest,
+                                "candidate",
+                                Operation::ListModels,
+                                "model unavailable",
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    |()| {
+                        commits.fetch_add(1, AtomicOrdering::SeqCst);
+                        Err::<(), _>(ProviderError::new(
+                            ErrorKind::Cancelled,
+                            "candidate",
+                            Operation::Startup,
+                            "configuration changed",
+                        ))
+                    },
+                )
+                .await;
+            assert!(result.is_err());
+            assert_eq!(slot.current_generation(), lease.generation());
+            assert_eq!(
+                slot.active().await.expect("old retained").provider().id(),
+                original.id()
+            );
+            assert_eq!(candidate.starts.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(candidate.pings.load(AtomicOrdering::SeqCst), 1);
+        }
+        assert_eq!(commits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(original.starts.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(original.pings.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn activation_cancelled_while_waiting_to_publish_cannot_commit_host_state() {
+        let slot = ProviderSlot::new();
+        let original = ProbeProvider::new("original", false);
+        let lease = slot
+            .activate(original.clone(), &RequestContext::new())
+            .await
+            .expect("original");
+        let held = slot.active.read().await;
+        let prepared = tokio::sync::Notify::new();
+        let cancel = CancelToken::new();
+        let context = RequestContext::with_cancel(cancel.clone());
+        let mut pending = Box::pin(slot.activate_validated(
+            ProbeProvider::new("candidate", false),
+            &context,
+            |_| async {
+                prepared.notify_one();
+                Ok(())
+            },
+            |()| -> Result<(), ProviderError> {
+                panic!("cancelled publication must not commit host state")
+            },
+        ));
+        tokio::select! {
+            result = &mut pending => panic!("publication must wait for reader: {result:?}"),
+            () = prepared.notified() => {}
+        }
+        cancel.cancel();
+        assert_eq!(
+            pending.await.expect_err("cancelled while locked").kind(),
+            ErrorKind::Cancelled
+        );
+        drop(held);
+        assert_eq!(slot.current_generation(), lease.generation());
+        assert_eq!(
+            slot.active().await.expect("old retained").provider().id(),
+            original.id()
+        );
+    }
+
+    #[tokio::test]
+    async fn activation_serializes_host_preparation_and_retirement() {
+        use std::future::Future as _;
+        let slot = ProviderSlot::new();
+        let prepared = tokio::sync::Notify::new();
+        let release = tokio::sync::Notify::new();
+        let context = RequestContext::new();
+        let host_state = AtomicUsize::new(0);
+        let mut first = Box::pin(slot.activate_validated(
+            ProbeProvider::new("first", false),
+            &context,
+            |_| async {
+                prepared.notify_one();
+                release.notified().await;
+                Ok(())
+            },
+            |()| {
+                host_state.store(1, AtomicOrdering::SeqCst);
+                Ok(())
+            },
+        ));
+        tokio::select! {
+            result = &mut first => panic!("preparation must wait: {result:?}"),
+            () = prepared.notified() => {}
+        }
+        let candidate = ProbeProvider::new("second", false);
+        let mut second = Box::pin(slot.activate(candidate.clone(), &context));
+        std::future::poll_fn(|context| {
+            assert!(second.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(candidate.starts.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(slot.current_generation(), ProviderGeneration::NONE);
+        assert_eq!(host_state.load(AtomicOrdering::SeqCst), 0);
+        release.notify_one();
+        let first = first.await.expect("prepared first");
+        let second = second.await.expect("serialized second");
+        assert_eq!(host_state.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(second.generation().get(), first.generation().get() + 1);
+        let retired = slot
+            .clear_with(|| host_state.store(0, AtomicOrdering::SeqCst))
+            .await
+            .expect("retirement");
+        assert_eq!(retired.generation(), second.generation());
+        assert_eq!(host_state.load(AtomicOrdering::SeqCst), 0);
+        assert!(slot.active().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn activation_releases_host_guard_after_generation_and_never_wraps_capacity() {
+        struct CommitGuard<'slot> {
+            slot: &'slot ProviderSlot,
+            released: &'slot AtomicUsize,
+        }
+        impl Drop for CommitGuard<'_> {
+            fn drop(&mut self) {
+                assert_eq!(self.slot.current_generation().get(), 1);
+                self.released.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }
+        let slot = ProviderSlot::new();
+        let released = AtomicUsize::new(0);
+        let lease = slot
+            .activate_validated(
+                ProbeProvider::new("original", false),
+                &RequestContext::new(),
+                |_| async { Ok(()) },
+                |()| {
+                    Ok(CommitGuard {
+                        slot: &slot,
+                        released: &released,
+                    })
+                },
+            )
+            .await
+            .expect("host and slot published");
+        assert_eq!(released.load(AtomicOrdering::SeqCst), 1);
+        slot.generation.store(u64::MAX - 1, Ordering::Release);
+        let result = slot
+            .activate_validated(
+                ProbeProvider::new("candidate", false),
+                &RequestContext::new(),
+                |_| async { Ok(()) },
+                |()| -> Result<(), ProviderError> {
+                    panic!("exhausted generation must refuse before host commit")
+                },
+            )
+            .await;
+        assert_eq!(
+            result.expect_err("capacity refused").kind(),
+            ErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            slot.active()
+                .await
+                .expect("old slot unchanged")
+                .generation(),
+            lease.generation()
+        );
+        slot.clear().await.expect("old instance retired");
+        assert_eq!(slot.current_generation().get(), u64::MAX);
+        assert!(
+            slot.activate(ProbeProvider::new("another", false), &RequestContext::new())
+                .await
+                .is_err()
+        );
+        assert!(slot.active().await.is_none());
     }
 
     #[tokio::test]

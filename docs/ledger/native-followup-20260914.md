@@ -2870,3 +2870,28 @@ Persisted intent is not proof of a sent request. Monetary limits/pricing/invoice
 configuration, full desktop partial paging/export and real account/platform workflows remain open.
 Earlier native credential/OAuth anomalies and supply-chain policy gaps remain unchanged. No real
 account, OS window, device, deployment or production/proxy operation was performed.
+
+## Provider Preparation and Publication
+
+The [publication record](native-provider-publication-20260915.json) records a genuine failing
+baseline: rejecting an unknown configured model changed the provider generation from zero to two.
+SwappableProvider had published its slot before validating the model, then restarted the previous
+provider as rollback. This could disturb generation-bound work even though activation was refused.
+
+ProviderSlot now holds its existing switch lock through asynchronous host preparation and a final
+synchronous commit. The host write guard remains held until the generation is published. Daemon
+preparation validates the exact selected model and rechecks the configuration generation, so failed,
+cancelled, dropped or stale candidates never replace the old active adapter or replay old startup.
+Existing calls retain their original provider instance and may finish normally.
+
+Shutdown retires the owner, cancels pending model preparation and clears host/slot under the same
+lock. Subsequent activation and readiness publication on that retired owner are refused. Controlled
+barriers verify six daemon outcomes and a real local completion on the old provider while the candidate
+is preparing. Slot tests verify serialized preparations, lock-wait cancellation, guard release order,
+old startup counts and generation exhaustion. Cancellation is still not proof of no external effect.
+
+The providers/daemon full cohort passes 479 tests with four existing ignored entries; strict all-target
+Clippy and an independently completed root all-target check pass. The first root-check capture was
+incomplete and is retained separately, not relabeled successful. Unified typed
+configuration, full provider-specific cleanup, monetary budgeting/invoice reconciliation and real
+account/platform acceptance remain open. Earlier credential/OAuth failures remain unresolved.

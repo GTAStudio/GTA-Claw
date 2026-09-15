@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-provider-prepare-before-publication",
+  "capturedOn": "2026-09-15",
+  "baseCommit": "8b24b0bee0a55a15ca976ca6813ae58785b1f216",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "cargoLockSha256": "7460323a924655a77c0c4fec247dd1635d72d7b358b889359e86aaf12100f674",
+  "sourceFiles": [
+    { "path": "crates/claw-providers/src/runtime.rs", "sha256": "089570c0bb382a41e516ba8393184c22b6dcca202cc1fbb1313ca444eb61e65f" },
+    { "path": "apps/gta-claw-daemon/src/adapters/http_api.rs", "sha256": "51c5cf8966f8daf5523b282bb203af1e6077c08ae36b2299a12f9fdf55e1b634" }
+  ],
+  "checks": [
+    {
+      "command": "cargo +stable test -p claw-providers -p gta-claw-daemon --all-targets --no-fail-fast --locked --offline -j 2",
+      "result": "passed", "exitCode": 0, "passed": 479, "failed": 0, "ignored": 4, "testBinaries": 14,
+      "log": "target/native-provider-publication-tests-20260915.log",
+      "sha256": "12c112d36a8195c29c903ed23823f9b4cca871becb1c0c4070f586b87b0b5d32"
+    },
+    {
+      "command": "cargo +stable clippy -p claw-providers -p gta-claw-daemon --all-targets --locked --offline -j 2 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-provider-publication-clippy-20260915.log",
+      "sha256": "1257199abc1f429ad069e59bbfc3bda822f625fd3e3e1e31c5fa38d23b77ddbe"
+    },
+    {
+      "command": "cargo +stable check --workspace --all-targets --locked --offline -j 2",
+      "result": "passed", "exitCode": 0,
+      "scopeNote": "Independent synchronous run completed in 1m45s after confirming no cargo/rustc process remained. Final output is retained in session history; the earlier truncated log is not used as pass evidence"
+    }
+  ],
+  "retainedFailures": [
+    {
+      "command": "cargo +stable test -p gta-claw-daemon --lib provider_model_rejection_never_advances_published_generation --locked --offline -j 2",
+      "log": "target/native-provider-publication-before-20260915.log",
+      "sha256": "46a7e33cf5312f7cb45ef29f5190740d89bb577e33ec89b7beb6ed7b30094ba3",
+      "result": "failed-as-expected",
+      "reason": "Unknown selected model was rejected but published provider generation changed from 0 to 2 through early activation and rollback. The same assertion passes after the fix"
+    },
+    { "reason": "Initial compile used an unsupported SDK ErrorKind variant for generation exhaustion; changed to the existing nonretryable InvalidRequest before focused verification" },
+    { "log": "target/native-provider-publication-root-check-20260915.log", "result": "outcome-unconfirmed", "reason": "First root-check capture ended without final status and no compiler process remained; retained separately from the final successful synchronous check" }
+  ],
+  "behaviorEvidence": [
+    "provider_model_rejection_never_advances_published_generation",
+    "provider_preparation_is_cancel_safe_and_configuration_and_shutdown_fenced",
+    "activation_host_failures_preserve_the_previous_provider_without_restarting_it",
+    "activation_cancelled_while_waiting_to_publish_cannot_commit_host_state",
+    "activation_serializes_host_preparation_and_retirement",
+    "activation_releases_host_guard_after_generation_and_never_wraps_capacity",
+    "generation_leases_fence_stale_session_creation_after_reload",
+    "bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection"
+  ],
+  "notes": [
+    "ProviderSlot now admits host preparation under its existing serialized switch lock after startup/ping and before publication. Synchronous commit can hold a host-state guard through generation publication. Failed preparation or stale configuration never publishes or reactivates the old provider",
+    "SwappableProvider validates selected model and role generation before committing the adapter. Existing provider remains available while candidate prepares; original instances are retained for already-held calls instead of replaying their startup for rollback",
+    "Shutdown marks retirement, cancels pending preparation, and clears host and slot under the same switch lock. New activation and mark_ready on the retired object are refused; a stopped daemon must construct a fresh provider owner",
+    "Deterministic notification barriers cover reject, cancel, dropped waiter, concurrent role change, successful replacement and shutdown of a candidate whose list_models ignores its cancellation token. The old provider actually completes a local request during candidate preparation; candidate startup and model enumeration occur exactly once",
+    "Slot tests cover old provider startup counters, prepare/commit failure, cancellation while active readers hold the publication lock, serialized candidates, host lock release after generation publication and exhaustion without wrapping into a previous generation",
+    "The full cohort retains three native dialects, explicit model pinning, local real HTTP, approval, partial output, journaling, observed thresholds and durable run tests. No real account or paid provider was used",
+    "This is a lifecycle correction, not unified typed provider configuration or monetary-budget completion. No automatic retry, credential-origin expansion, lockfile change, production/proxy operation or deployment"
+  ],
+  "unverified": [
+    "Unified typed model configuration and client editing, real account/capability switch acceptance, full provider-specific cleanup and all platform acceptance",
+    "Per-request external effects after cancellation, monetary reservation/pricing/billing reconciliation and complete M3-06 acceptance",
+    "Earlier native credential/OAuth intermittent failures and cargo-deny supply-chain policy debt remain open"
+  ]
+}
